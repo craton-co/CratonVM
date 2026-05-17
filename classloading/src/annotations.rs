@@ -54,7 +54,7 @@
 //! Every tag is exercised by the integration probe at
 //! `apps/annotation_probe/AnnotationProbe.java`.
 
-use rustjvm_reader::attribute::{Annotation, Attribute, ElementValue, TypeAnnotation};
+use rustjvm_reader::attribute::{Annotation, Attribute, ElementValue, LazyAttribute, TypeAnnotation};
 use rustjvm_reader::field::ClassFileField;
 use rustjvm_reader::method::ClassFileMethod;
 
@@ -71,19 +71,19 @@ use crate::Class;
 /// compared with the prior "build a Vec up front" style.
 #[derive(Debug, Clone, Copy)]
 pub struct AnnotationsView<'a> {
-    attributes: &'a [Attribute],
+    attributes: &'a [LazyAttribute],
 }
 
 impl<'a> AnnotationsView<'a> {
     /// Wrap the attribute slice of a class member.
-    pub fn new(attributes: &'a [Attribute]) -> Self {
+    pub fn new(attributes: &'a [LazyAttribute]) -> Self {
         Self { attributes }
     }
 
     /// Iterate over every `RuntimeVisibleAnnotations` entry.
     pub fn runtime_visible(self) -> impl Iterator<Item = &'a Annotation> {
-        self.attributes.iter().flat_map(|a| match a {
-            Attribute::RuntimeVisibleAnnotations(list) => list.iter(),
+        self.attributes.iter().flat_map(|a| match a.as_decoded() {
+            Some(Attribute::RuntimeVisibleAnnotations(list)) => list.iter(),
             _ => (&[] as &[Annotation]).iter(),
         })
     }
@@ -96,8 +96,8 @@ impl<'a> AnnotationsView<'a> {
     /// whether the compile-time author chose `SOURCE` / `CLASS` /
     /// `RUNTIME`.
     pub fn runtime_invisible(self) -> impl Iterator<Item = &'a Annotation> {
-        self.attributes.iter().flat_map(|a| match a {
-            Attribute::RuntimeInvisibleAnnotations(list) => list.iter(),
+        self.attributes.iter().flat_map(|a| match a.as_decoded() {
+            Some(Attribute::RuntimeInvisibleAnnotations(list)) => list.iter(),
             _ => (&[] as &[Annotation]).iter(),
         })
     }
@@ -125,12 +125,12 @@ impl<'a> AnnotationsView<'a> {
     /// Parameter annotation rows (runtime-visible first, then invisible).
     pub fn parameter_annotations(self) -> Option<&'a [Vec<Annotation>]> {
         for a in self.attributes {
-            if let Attribute::RuntimeVisibleParameterAnnotations(rows) = a {
+            if let Some(Attribute::RuntimeVisibleParameterAnnotations(rows)) = a.as_decoded() {
                 return Some(rows.as_slice());
             }
         }
         for a in self.attributes {
-            if let Attribute::RuntimeInvisibleParameterAnnotations(rows) = a {
+            if let Some(Attribute::RuntimeInvisibleParameterAnnotations(rows)) = a.as_decoded() {
                 return Some(rows.as_slice());
             }
         }
@@ -141,9 +141,11 @@ impl<'a> AnnotationsView<'a> {
     /// intentionally left as raw bytes — see
     /// [`rustjvm_reader::attribute::TypeAnnotation`] for the rationale.
     pub fn type_annotations(self) -> impl Iterator<Item = &'a TypeAnnotation> {
-        self.attributes.iter().flat_map(|a| match a {
-            Attribute::RuntimeVisibleTypeAnnotations(list)
-            | Attribute::RuntimeInvisibleTypeAnnotations(list) => list.iter(),
+        self.attributes.iter().flat_map(|a| match a.as_decoded() {
+            Some(
+                Attribute::RuntimeVisibleTypeAnnotations(list)
+                | Attribute::RuntimeInvisibleTypeAnnotations(list),
+            ) => list.iter(),
             _ => (&[] as &[TypeAnnotation]).iter(),
         })
     }
@@ -151,8 +153,8 @@ impl<'a> AnnotationsView<'a> {
     /// Return the `AnnotationDefault` element value (for annotation-type
     /// element methods), if present.
     pub fn annotation_default(self) -> Option<&'a ElementValue> {
-        self.attributes.iter().find_map(|a| match a {
-            Attribute::AnnotationDefault(ev) => Some(ev),
+        self.attributes.iter().find_map(|a| match a.as_decoded() {
+            Some(Attribute::AnnotationDefault(ev)) => Some(ev),
             _ => None,
         })
     }
@@ -209,8 +211,13 @@ pub fn annotation_descriptor_to_class_name(descriptor: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use rustjvm_reader::attribute::{
-        Annotation, Attribute, ElementValue, ElementValuePair, TypeAnnotation, TypePathEntry,
+        Annotation, Attribute, ElementValue, ElementValuePair, LazyAttribute, TypeAnnotation,
+        TypePathEntry,
     };
+
+    fn decoded(attrs: Vec<Attribute>) -> Vec<LazyAttribute> {
+        attrs.into_iter().map(LazyAttribute::new_decoded).collect()
+    }
 
     fn make_ann(type_index: u16, pairs: Vec<ElementValuePair>) -> Annotation {
         Annotation {
@@ -228,10 +235,10 @@ mod tests {
 
     #[test]
     fn runtime_visible_is_iterable() {
-        let attrs = vec![Attribute::RuntimeVisibleAnnotations(vec![
+        let attrs = decoded(vec![Attribute::RuntimeVisibleAnnotations(vec![
             make_ann(1, vec![]),
             make_ann(2, vec![]),
-        ])];
+        ])]);
         let v = AnnotationsView::new(&attrs);
         let indices: Vec<u16> = v.runtime_visible().map(|a| a.type_index).collect();
         assert_eq!(indices, vec![1, 2]);
@@ -239,10 +246,10 @@ mod tests {
 
     #[test]
     fn runtime_invisible_is_separate_from_visible() {
-        let attrs = vec![
+        let attrs = decoded(vec![
             Attribute::RuntimeVisibleAnnotations(vec![make_ann(1, vec![])]),
             Attribute::RuntimeInvisibleAnnotations(vec![make_ann(2, vec![])]),
-        ];
+        ]);
         let v = AnnotationsView::new(&attrs);
         let visible: Vec<_> = v.runtime_visible().map(|a| a.type_index).collect();
         let invisible: Vec<_> = v.runtime_invisible().map(|a| a.type_index).collect();
@@ -252,10 +259,10 @@ mod tests {
 
     #[test]
     fn all_chains_visible_then_invisible() {
-        let attrs = vec![
+        let attrs = decoded(vec![
             Attribute::RuntimeVisibleAnnotations(vec![make_ann(1, vec![])]),
             Attribute::RuntimeInvisibleAnnotations(vec![make_ann(2, vec![])]),
-        ];
+        ]);
         let v = AnnotationsView::new(&attrs);
         let all: Vec<_> = v.all().map(|a| a.type_index).collect();
         assert_eq!(all, vec![1, 2]);
@@ -263,10 +270,10 @@ mod tests {
 
     #[test]
     fn find_by_type_descriptor_matches_only_visible() {
-        let attrs = vec![
+        let attrs = decoded(vec![
             Attribute::RuntimeVisibleAnnotations(vec![make_ann(1, vec![])]),
             Attribute::RuntimeInvisibleAnnotations(vec![make_ann(2, vec![])]),
-        ];
+        ]);
         let v = AnnotationsView::new(&attrs);
         let pool = |idx: u16| match idx {
             1 => Some("Lfoo/Visible;"),
@@ -286,7 +293,9 @@ mod tests {
             vec![],
             vec![make_ann(2, vec![]), make_ann(3, vec![])],
         ];
-        let attrs = vec![Attribute::RuntimeVisibleParameterAnnotations(rows.clone())];
+        let attrs = decoded(vec![Attribute::RuntimeVisibleParameterAnnotations(
+            rows.clone(),
+        )]);
         let v = AnnotationsView::new(&attrs);
         let got = v.parameter_annotations().unwrap();
         assert_eq!(got.len(), 3);
@@ -297,9 +306,9 @@ mod tests {
 
     #[test]
     fn parameter_annotations_falls_back_to_invisible() {
-        let attrs = vec![Attribute::RuntimeInvisibleParameterAnnotations(vec![
-            vec![make_ann(5, vec![])],
-        ])];
+        let attrs = decoded(vec![Attribute::RuntimeInvisibleParameterAnnotations(
+            vec![vec![make_ann(5, vec![])]],
+        )]);
         let v = AnnotationsView::new(&attrs);
         let got = v.parameter_annotations().unwrap();
         assert_eq!(got.len(), 1);
@@ -308,7 +317,7 @@ mod tests {
 
     #[test]
     fn parameter_annotations_missing_returns_none() {
-        let attrs: Vec<Attribute> = Vec::new();
+        let attrs: Vec<LazyAttribute> = Vec::new();
         let v = AnnotationsView::new(&attrs);
         assert!(v.parameter_annotations().is_none());
     }
@@ -324,7 +333,7 @@ mod tests {
             }],
             annotation: make_ann(1, vec![]),
         };
-        let attrs = vec![Attribute::RuntimeVisibleTypeAnnotations(vec![ta])];
+        let attrs = decoded(vec![Attribute::RuntimeVisibleTypeAnnotations(vec![ta])]);
         let v = AnnotationsView::new(&attrs);
         assert_eq!(v.type_annotations().count(), 1);
     }
@@ -335,7 +344,7 @@ mod tests {
             tag: b's',
             const_value_index: 7,
         };
-        let attrs = vec![Attribute::AnnotationDefault(ev.clone())];
+        let attrs = decoded(vec![Attribute::AnnotationDefault(ev.clone())]);
         let v = AnnotationsView::new(&attrs);
         match v.annotation_default() {
             Some(ElementValue::Const {
@@ -351,7 +360,7 @@ mod tests {
 
     #[test]
     fn annotation_default_is_none_when_absent() {
-        let attrs: Vec<Attribute> = Vec::new();
+        let attrs: Vec<LazyAttribute> = Vec::new();
         let v = AnnotationsView::new(&attrs);
         assert!(v.annotation_default().is_none());
     }

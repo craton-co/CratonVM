@@ -5,13 +5,15 @@
 //! field/method lookup and subclass checking.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use rustjvm_reader::attribute::{Attribute, LazyAttribute};
 use rustjvm_reader::class_access_flags::ClassAccessFlags;
 use rustjvm_reader::class_file_version::ClassFileVersion;
 use rustjvm_reader::constant_pool::ConstantPool;
 use rustjvm_reader::field::ClassFileField;
 use rustjvm_reader::method::ClassFileMethod;
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // ClassState — the class lifecycle state machine (JVM spec 5.5)
@@ -349,6 +351,21 @@ pub struct Class {
     /// becomes the signedBy match key.
     pub code_source: Option<CodeSource>,
 
+    /// Lazy class-level attributes from the parsed class file (JVM spec 4.7).
+    ///
+    /// When the class reader emits `Vec<LazyAttribute>`, it is wired into this
+    /// field as-is. Decoding into a structured [`Attribute`] is deferred to the
+    /// first access via one of the accessor methods below (`source_file()`,
+    /// `signature()`, `nest_host()`, `enclosing_method()`,
+    /// `record_components()`, …). Most attributes on the bootstrap JDK are
+    /// never consumed at runtime, so this skips the parse cost for them.
+    ///
+    /// For backward compatibility with callers that pre-resolve attributes
+    /// into the legacy structured fields (`source_file`, `signature`, …),
+    /// those fields are still consulted as a fallback when this slice is
+    /// empty or does not contain the requested attribute.
+    pub attributes: Vec<LazyAttribute>,
+
     /// RKC16N.3 — Array-class metadata.
     ///
     /// `Some(_)` if and only if this class represents a Java array type
@@ -357,6 +374,33 @@ pub struct Class {
     /// JVMS §5.3.3 forbids any classpath I/O for reference-array types.
     /// `None` for ordinary classes and interfaces.
     pub array_info: Option<ArrayInfo>,
+
+    // ----- Lazy-decode caches (filled on first accessor call) -------------
+    //
+    // Each `OnceLock` memoizes the result of walking `attributes` for the
+    // matching variant, decoding it, and resolving constant-pool indices
+    // into a heap-allocated `String` / domain type. Subsequent calls are
+    // O(1). The caches are `OnceLock` rather than `RwLock` because the
+    // decoded values are immutable (an attribute on a loaded class never
+    // changes shape) and we want lock-free reads after the first hit.
+    //
+    // These fields are `pub` only so external constructors (e.g.
+    // `class_manager`) that build `Class` with struct-literal syntax can
+    // initialize them as `OnceLock::new()`. Callers should NEVER read or
+    // write them directly — use the accessor methods (`source_file()`,
+    // `signature()`, `nest_host()`, `enclosing_method()`,
+    // `record_components()`) instead. The `#[doc(hidden)]` keeps them
+    // out of generated rustdoc.
+    #[doc(hidden)]
+    pub source_file_cache: OnceLock<Option<String>>,
+    #[doc(hidden)]
+    pub signature_cache: OnceLock<Option<String>>,
+    #[doc(hidden)]
+    pub nest_host_cache: OnceLock<Option<String>>,
+    #[doc(hidden)]
+    pub enclosing_method_cache: OnceLock<Option<EnclosingMethodInfo>>,
+    #[doc(hidden)]
+    pub record_components_cache: OnceLock<Vec<RecordComponentInfo>>,
 }
 
 /// RKC16N.3 — Metadata for a synthesised array class.
@@ -465,6 +509,230 @@ impl Class {
         self.fields.get(index).map(|f| Arc::clone(&f.descriptor))
     }
 
+    // ----- Lazy attribute decoding -----------------------------------------
+    //
+    // The class reader produces `Vec<LazyAttribute>` and stuffs it into
+    // `self.attributes`. These accessors walk that slice, decode the first
+    // matching entry on demand, and cache the (resolved) result in a
+    // per-attribute `OnceLock` so subsequent calls are O(1) without locks.
+    //
+    // **Decode-error policy:** an accessor that returns `Option<_>` swallows
+    // a malformed-attribute error and logs a `tracing::warn!`, returning
+    // `None`. This keeps the call site ergonomic — callers that need a
+    // strict failure path can use [`Self::try_decode_attribute`] directly.
+    //
+    // **Eager-decode whitelist (RECOMMENDATION).** Three attributes are
+    // potential eager-decode candidates:
+    //   * `ConstantValue` on static final fields — read once during
+    //     `<clinit>` synthesis. Lazy is still fine: it is decoded exactly
+    //     once per static-final and never again.
+    //   * `Code` on methods — needed by the verifier on first invocation.
+    //     Stays lazy: lots of bootstrap methods are never called.
+    //   * `BootstrapMethods` on classes — needed by the first
+    //     `invokedynamic` that this class executes. Stays lazy.
+    // For each, the consumer (Field init, JIT, interpreter) is responsible
+    // for calling `.decode()` at the exact point of need; we do not
+    // pre-decode here because the data is then held only in the
+    // `LazyAttribute::Decoded` variant inside `attributes`, naturally
+    // memoised for the lifetime of the class.
+
+    /// Find the first lazy attribute by name without decoding it.
+    fn find_attribute(&self, attribute_name: &str) -> Option<&LazyAttribute> {
+        self.attributes
+            .iter()
+            .find(|a| a.name() == attribute_name)
+    }
+
+    /// Lazily decode the first attribute matching `attribute_name` and run
+    /// `extract` on the decoded variant. Returns:
+    ///
+    /// * `Ok(Some(value))` if the attribute was present, decoded
+    ///   successfully, and `extract` returned `Some`.
+    /// * `Ok(None)` if no attribute with that name exists, or `extract`
+    ///   returned `None` (variant mismatch).
+    /// * `Err(_)` if the attribute is present but its body failed to
+    ///   decode.
+    ///
+    /// Callers that want a `None`-on-error semantic should use the
+    /// dedicated accessor methods (`source_file()`, …) which log a
+    /// warning and swallow the error.
+    pub fn try_decode_attribute<T>(
+        &self,
+        attribute_name: &str,
+        extract: impl FnOnce(&Attribute) -> Option<T>,
+    ) -> Result<Option<T>, rustjvm_reader::class_reader_error::ClassReaderError> {
+        let Some(lazy) = self.find_attribute(attribute_name) else {
+            return Ok(None);
+        };
+        // Fast path: already decoded — no work, no clone.
+        if let Some(attr) = lazy.as_decoded() {
+            return Ok(extract(attr));
+        }
+        // Slow path: clone the lazy entry (this clones the raw bytes for
+        // `Raw`) and decode the clone. We do NOT mutate `self.attributes`
+        // because that would require interior mutability across the
+        // whole vector; the cached resolved value is memoised in the
+        // per-accessor `OnceLock` instead, so the decode happens exactly
+        // once for the lifetime of the class even on the slow path.
+        let mut owned = lazy.clone();
+        let decoded = owned.decode(&self.constant_pool)?;
+        Ok(extract(decoded))
+    }
+
+    /// Helper: convenience wrapper for accessors that want
+    /// `Option<T>`-with-warn-on-error semantics. Logs a `warn!` if the
+    /// attribute is present but decoding fails.
+    fn decode_attribute_or_warn<T>(
+        &self,
+        attribute_name: &str,
+        extract: impl FnOnce(&Attribute) -> Option<T>,
+    ) -> Option<T> {
+        match self.try_decode_attribute(attribute_name, extract) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    class = %self.name,
+                    attribute = attribute_name,
+                    error = %err,
+                    "failed to decode class-level attribute; treating as absent",
+                );
+                None
+            }
+        }
+    }
+
+    /// The `SourceFile` attribute value (JVM spec 4.7.10), if present.
+    ///
+    /// Prefers the lazy `attributes` slice; falls back to the legacy
+    /// `source_file` pre-decoded field for callers that have not yet
+    /// migrated to the lazy path.
+    pub fn source_file(&self) -> Option<&str> {
+        let cached = self.source_file_cache.get_or_init(|| {
+            if let Some(name) = self.decode_attribute_or_warn("SourceFile", |attr| match attr {
+                Attribute::SourceFile(name) => Some(name.clone()),
+                _ => None,
+            }) {
+                return Some(name);
+            }
+            // Fallback: legacy pre-decoded field set by `class_manager`.
+            self.source_file.clone()
+        });
+        cached.as_deref()
+    }
+
+    /// The `Signature` attribute value (JVM spec 4.7.9), if present.
+    pub fn signature(&self) -> Option<&str> {
+        let cached = self.signature_cache.get_or_init(|| {
+            if let Some(sig) = self.decode_attribute_or_warn("Signature", |attr| match attr {
+                Attribute::Signature(s) => Some(s.clone()),
+                _ => None,
+            }) {
+                return Some(sig);
+            }
+            self.signature.clone()
+        });
+        cached.as_deref()
+    }
+
+    /// The internal name of the nest host (JEP 181), if a `NestHost`
+    /// attribute is present.
+    pub fn nest_host(&self) -> Option<&str> {
+        let cached = self.nest_host_cache.get_or_init(|| {
+            if let Some(name) = self.decode_attribute_or_warn("NestHost", |attr| match attr {
+                Attribute::NestHost { host_class_index } => self
+                    .constant_pool
+                    .get_class_name(*host_class_index)
+                    .map(|s| s.to_string()),
+                _ => None,
+            }) {
+                return Some(name);
+            }
+            self.nest_host.clone()
+        });
+        cached.as_deref()
+    }
+
+    /// Resolved `EnclosingMethod` info (JVMS §4.7.7) for local/anonymous
+    /// classes, if the attribute is present.
+    pub fn enclosing_method(&self) -> Option<&EnclosingMethodInfo> {
+        let cached = self.enclosing_method_cache.get_or_init(|| {
+            if let Some(info) =
+                self.decode_attribute_or_warn("EnclosingMethod", |attr| match attr {
+                    Attribute::EnclosingMethod {
+                        class_index,
+                        method_index,
+                    } => {
+                        let class_name = self
+                            .constant_pool
+                            .get_class_name(*class_index)?
+                            .to_string();
+                        let (method_name, method_descriptor) = if *method_index == 0 {
+                            (String::new(), String::new())
+                        } else {
+                            self.constant_pool
+                                .get_name_and_type(*method_index)
+                                .map(|(n, d)| (n.to_string(), d.to_string()))
+                                .unwrap_or_default()
+                        };
+                        Some(EnclosingMethodInfo {
+                            class_name,
+                            method_name,
+                            method_descriptor,
+                        })
+                    }
+                    _ => None,
+                })
+            {
+                return Some(info);
+            }
+            self.enclosing_method.clone()
+        });
+        cached.as_ref()
+    }
+
+    /// Resolved record components (JEP 395, Java 16+). Empty for
+    /// non-record classes.
+    pub fn record_components(&self) -> &[RecordComponentInfo] {
+        let cached = self.record_components_cache.get_or_init(|| {
+            if let Some(resolved) = self.decode_attribute_or_warn("Record", |attr| match attr {
+                Attribute::Record(components) => {
+                    let resolved: Vec<RecordComponentInfo> = components
+                        .iter()
+                        .filter_map(|rc| {
+                            let name = self.constant_pool.get_utf8(rc.name_index)?;
+                            let desc = self.constant_pool.get_utf8(rc.descriptor_index)?;
+                            Some(RecordComponentInfo {
+                                name: name.to_string(),
+                                descriptor: desc.to_string(),
+                            })
+                        })
+                        .collect();
+                    Some(resolved)
+                }
+                _ => None,
+            }) {
+                return resolved;
+            }
+            // Fallback to the legacy pre-decoded field.
+            self.record_components.clone()
+        });
+        cached.as_slice()
+    }
+
+    // TODO(lazy-attributes): the following accessors still read directly
+    // from the legacy pre-decoded fields. Migrate them to the
+    // `self.attributes` + `OnceLock` pattern above once the corresponding
+    // call sites are willing to accept the slightly more general return
+    // type (e.g. `&[InnerClassEntry]` instead of `&Vec<InnerClassEntry>`):
+    //   * `NestMembers` → `nest_members` (Vec<String>)
+    //   * `PermittedSubclasses` → `permitted_subclasses` (Vec<String>)
+    //   * `InnerClasses` → `inner_classes` (Vec<InnerClassEntry>)
+    //   * `BootstrapMethods` → `bootstrap_methods`
+    //     (Vec<rustjvm_reader::attribute::BootstrapMethod>)
+    //   * `RuntimeVisibleAnnotations` / `RuntimeInvisibleAnnotations` →
+    //     `annotations` (Vec<Annotation>)
+    //   * `Module` (`module_name`)
+
     // ----- Method lookup ---------------------------------------------------
 
     /// Find a method declared in **this** class by name and descriptor.
@@ -482,7 +750,10 @@ impl Class {
     /// Returns `true` if this class is a record (has Record attribute).
     #[inline]
     pub fn is_record(&self) -> bool {
-        !self.record_components.is_empty()
+        // Uses the lazy accessor so it works for classes that only have
+        // attributes wired in via `self.attributes` (no pre-decoded
+        // `record_components` field).
+        !self.record_components().is_empty()
     }
 
     /// Returns `true` if this class is sealed (has PermittedSubclasses attribute).
@@ -880,7 +1151,13 @@ mod tests {
             is_synthetic_stub: false,
             has_finalizer: false,
             code_source: None,
+            attributes: Vec::new(),
             array_info: None,
+            source_file_cache: OnceLock::new(),
+            signature_cache: OnceLock::new(),
+            nest_host_cache: OnceLock::new(),
+            enclosing_method_cache: OnceLock::new(),
+            record_components_cache: OnceLock::new(),
         }
     }
 

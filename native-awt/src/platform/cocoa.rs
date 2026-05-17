@@ -525,23 +525,91 @@ impl PlatformBackend for CocoaBackend {
         italic: bool,
         color: u32,
     ) -> TextRaster {
-        // Measure first.
-        let (w_f, h_f) = self.measure_text(text, font_family, font_size, bold, italic);
-        let w = (w_f.ceil() as u32).max(1);
-        let h = (h_f.ceil() as u32).max(1);
+        // Port of the X11 fontdue implementation. CoreText / CGBitmapContext
+        // are intentionally avoided here — fontdue (pure Rust) produces
+        // grayscale glyph bitmaps which we pack into the ARGB buffer
+        // expected by `TextRaster` (see backend.rs::TextRaster docs).
+        // Output format and layout match x11.rs::rasterize_text verbatim so
+        // both platforms feed the renderer identically.
+        let settings = fontdue_settings(font_family, font_size, bold, italic);
+        let font = match load_fontdue_font(&settings) {
+            Some(f) => f,
+            None => {
+                return TextRaster {
+                    pixels: vec![],
+                    width: 0,
+                    height: 0,
+                    baseline: 0.0,
+                };
+            }
+        };
 
-        // Create a bitmap context, draw text, read pixels.
-        // Full CG implementation requires objc2-core-graphics.
-        // For now return a measured-but-empty raster — the software
-        // renderer will composite the color.
-        let pixels = vec![0u32; (w * h) as usize];
-        let _ = color; // would be used with CGContextSetFillColor
+        // First pass: measure total width and max ascent/descent.
+        let mut total_advance = 0.0f32;
+        let mut max_ascent = 0i32;
+        let mut max_descent = 0i32;
+
+        let mut glyphs = Vec::new();
+        for ch in text.chars() {
+            let (metrics, bitmap) = font.rasterize(ch, font_size);
+            let ascent = metrics.ymin + metrics.height as i32;
+            if ascent > max_ascent {
+                max_ascent = ascent;
+            }
+            let descent = -metrics.ymin;
+            if descent > max_descent {
+                max_descent = descent;
+            }
+            glyphs.push((metrics, bitmap, total_advance));
+            total_advance += metrics.advance_width;
+        }
+
+        let w = total_advance.ceil() as u32;
+        let h = (max_ascent + max_descent) as u32;
+        if w == 0 || h == 0 {
+            return TextRaster {
+                pixels: vec![],
+                width: 0,
+                height: 0,
+                baseline: 0.0,
+            };
+        }
+
+        let baseline = max_ascent as f32;
+        // Straight (non-premultiplied) ARGB to match the X11 path and the
+        // `TextRaster` docstring at backend.rs ("ARGB pixels"). The
+        // consumer (graphics2d renderer) composites this as a source-over
+        // blend, treating the high byte as straight alpha.
+        let r = ((color >> 16) & 0xFF) as u32;
+        let g = ((color >> 8) & 0xFF) as u32;
+        let b = (color & 0xFF) as u32;
+
+        let mut pixels = vec![0u32; (w * h) as usize];
+
+        for (metrics, bitmap, x_offset) in &glyphs {
+            let glyph_x0 = (*x_offset + metrics.xmin as f32) as i32;
+            let glyph_y0 = max_ascent - (metrics.ymin + metrics.height as i32);
+
+            for gy in 0..metrics.height {
+                for gx in 0..metrics.width {
+                    let px = glyph_x0 + gx as i32;
+                    let py = glyph_y0 + gy as i32;
+                    if px >= 0 && (px as u32) < w && py >= 0 && (py as u32) < h {
+                        let alpha = bitmap[gy * metrics.width + gx] as u32;
+                        if alpha > 0 {
+                            pixels[(py as u32 * w + px as u32) as usize] =
+                                (alpha << 24) | (r << 16) | (g << 8) | b;
+                        }
+                    }
+                }
+            }
+        }
 
         TextRaster {
             pixels,
             width: w,
             height: h,
-            baseline: h_f * 0.8, // approximate
+            baseline,
         }
     }
 
@@ -623,3 +691,75 @@ impl Drop for CocoaBackend {
 // MainThreadMarker guarantees construction happens on the main thread,
 // and the EDT design ensures all subsequent calls are also on that thread.
 unsafe impl Send for CocoaBackend {}
+
+// ---------------------------------------------------------------------------
+// fontdue helpers (mirrors x11.rs — see that file for the canonical impl)
+// ---------------------------------------------------------------------------
+
+struct FontdueSettings {
+    _family: String,
+    _bold: bool,
+    _italic: bool,
+}
+
+fn fontdue_settings(family: &str, _size: f32, bold: bool, italic: bool) -> FontdueSettings {
+    FontdueSettings {
+        _family: family.to_string(),
+        _bold: bold,
+        _italic: italic,
+    }
+}
+
+/// Load (and cache) a system TrueType font for fontdue.
+///
+/// Walks well-known macOS font directories. The result is cached in a
+/// process-global `OnceLock` because reading and parsing a font file is
+/// expensive and the bytes never change for the lifetime of the process.
+///
+/// TODO: respect `FontdueSettings.family/bold/italic` and pick a matching
+/// face. The X11 path has the same TODO — for now we return a single
+/// fallback font for every (family, style) combination, which is enough to
+/// make text appear instead of blank rectangles.
+fn load_fontdue_font(_settings: &FontdueSettings) -> Option<fontdue::Font> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<fontdue::Font>> = OnceLock::new();
+
+    CACHED
+        .get_or_init(|| {
+            // macOS ships with a handful of guaranteed-present system fonts.
+            // We try the most common ones in order; the first that parses
+            // successfully wins. Helvetica.ttc / SFNS variants live in
+            // /System/Library/Fonts, user-installed fonts live in
+            // /Library/Fonts or ~/Library/Fonts.
+            let mut search_paths: Vec<String> = vec![
+                "/System/Library/Fonts/Helvetica.ttc".to_string(),
+                "/System/Library/Fonts/Geneva.ttf".to_string(),
+                "/System/Library/Fonts/Supplemental/Arial.ttf".to_string(),
+                "/System/Library/Fonts/SFNSMono.ttf".to_string(),
+                "/System/Library/Fonts/SFNS.ttf".to_string(),
+                "/System/Library/Fonts/SFNSDisplay.ttf".to_string(),
+                "/System/Library/Fonts/SFNSText.ttf".to_string(),
+                "/Library/Fonts/Arial.ttf".to_string(),
+            ];
+            if let Ok(home) = std::env::var("HOME") {
+                search_paths.push(format!("{home}/Library/Fonts/Arial.ttf"));
+                search_paths.push(format!("{home}/Library/Fonts/Helvetica.ttf"));
+            }
+
+            for path in &search_paths {
+                if let Ok(data) = std::fs::read(path) {
+                    if let Ok(font) = fontdue::Font::from_bytes(
+                        data,
+                        fontdue::FontSettings::default(),
+                    ) {
+                        debug!("cocoa: loaded font for fontdue from {path}");
+                        return Some(font);
+                    }
+                }
+            }
+
+            warn!("cocoa fontdue: no system font found — text will be blank");
+            None
+        })
+        .clone()
+}

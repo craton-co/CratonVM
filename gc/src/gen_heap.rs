@@ -166,7 +166,15 @@ pub struct GenerationalHeap {
     /// Old generation (promoted objects).
     old_gen: Mutex<OldGen>,
     /// Card table covering the old generation's address space.
-    card_table: Mutex<CardTable>,
+    ///
+    /// T5.5.2 (HIGH-1 fix): the table now uses interior mutability for
+    /// all state, so no outer `Mutex` is needed. The mutator write
+    /// barrier calls [`CardTable::thread_local_dirty_addr`] on the
+    /// shared reference (per-thread buffer, no shared lock); the
+    /// collector calls [`CardTable::flush_all`] +
+    /// [`CardTable::drain_pending`] at GC start to fold queued offsets
+    /// into the authoritative bitmap before the dirty-card scan.
+    card_table: CardTable,
     /// Next identity hash code.
     next_hash_code: AtomicI32,
     /// Young GC threshold in bytes.
@@ -181,6 +189,30 @@ pub struct GenerationalHeap {
     concurrent_gc_state: Option<Arc<ConcurrentGcState>>,
     /// Maximum young semi-space size (limits growth).
     max_young_semi_size: usize,
+    /// Primary NUMA node hint for the young-gen slow path.
+    ///
+    /// Records the topology's preferred home node for this heap (defaults
+    /// to 0 on single-node hosts, which covers every current test target).
+    /// On a multi-node host this is the node whose arena the slow path
+    /// would prefer if/when [`try_alloc_young`]/[`refill_tlab`] grow into a
+    /// per-node arena layout.
+    ///
+    /// TODO(numa-multi-arena): replace the single `young_from`/`young_to`
+    /// pair with `Arc<Vec<Mutex<Arena>>>` keyed by node id, and route the
+    /// slow path through `numa::current_thread_node()` for the local arena.
+    /// The fast path (TLAB) is per-thread so already NUMA-local by
+    /// construction; only the refill/spill paths need plumbing. Today this
+    /// field is consumed only by the debug/tracing stub in
+    /// [`numa_slow_path_hint`] so the wiring lands without churning the
+    /// arena layout — see numa_node_hint accessor below.
+    numa_node_hint: usize,
+    /// Total number of NUMA nodes seen at construction time (>=1).
+    ///
+    /// Cached so the slow path doesn't have to re-query
+    /// [`crate::numa::global_topology`] on every allocation. Used by the
+    /// stubbed hint logic to short-circuit on single-node hosts (preserving
+    /// existing behavior exactly).
+    numa_num_nodes: usize,
     /// Phase H (RH.1) statistics — updated during every minor/major GC.
     stats: HeapStats,
 }
@@ -206,18 +238,75 @@ impl GenerationalHeap {
         let old_gen = OldGen::new(old_gen_size);
         let card_table = CardTable::new(old_gen.base_ptr() as usize, old_gen_size);
 
+        // Cache the host NUMA shape at construction. The slow-path
+        // allocator consults this through `numa_slow_path_hint`. On the
+        // ~all-current-targets single-node case the hint is just 0 and
+        // we behave exactly as before (no per-node arena yet — see TODO
+        // on `numa_node_hint`).
+        let topology = crate::numa::global_topology();
+        let numa_num_nodes = topology.num_nodes.max(1);
+        let numa_node_hint = if numa_num_nodes == 1 {
+            0
+        } else {
+            // Multi-node: prefer the node of the constructing thread so
+            // long-lived heap metadata lands near whoever booted the VM.
+            // Falls back to 0 if the platform's current-thread probe is
+            // unavailable, which keeps single-arena behavior stable.
+            let n = crate::numa::NumaTopology::current_thread_node();
+            if n < numa_num_nodes { n } else { 0 }
+        };
+
         Self {
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
-            card_table: Mutex::new(card_table),
+            card_table,
             next_hash_code: AtomicI32::new(1),
             young_gc_threshold: Mutex::new(threshold),
             volatile_lock: Mutex::new(()),
             satb_queue: None,
             concurrent_gc_state: None,
             max_young_semi_size: max_young,
+            numa_node_hint,
+            numa_num_nodes,
             stats: HeapStats::default(),
+        }
+    }
+
+    /// Return the primary NUMA node hint recorded at construction.
+    ///
+    /// Public observer so tests and profiling code can confirm the heap
+    /// picked up the expected node. The field itself remains private to
+    /// keep room for the multi-arena refactor.
+    pub fn numa_node_hint(&self) -> usize {
+        self.numa_node_hint
+    }
+
+    /// Number of NUMA nodes the heap was constructed for (>=1).
+    pub fn numa_num_nodes(&self) -> usize {
+        self.numa_num_nodes
+    }
+
+    /// Compute the node the *calling* thread would prefer for a young-gen
+    /// slow-path allocation, falling back to the heap's primary hint.
+    ///
+    /// This is the seam where the multi-arena refactor will plug in: it
+    /// returns the index that `try_alloc_young`/`refill_tlab` would use to
+    /// pick a per-node arena. Today there is only one arena pair, so the
+    /// return value is consumed only by the tracing stub below — but the
+    /// query path is exercised on every slow-path allocation, which means
+    /// the platform probe and topology cache are validated in production
+    /// long before we flip the multi-arena switch.
+    #[inline]
+    fn numa_slow_path_hint(&self) -> usize {
+        if self.numa_num_nodes <= 1 {
+            return self.numa_node_hint;
+        }
+        let n = crate::numa::NumaTopology::current_thread_node();
+        if n < self.numa_num_nodes {
+            n
+        } else {
+            self.numa_node_hint
         }
     }
 
@@ -245,19 +334,14 @@ impl GenerationalHeap {
         let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
         let ptr = self.alloc_young(total_size);
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: 0,
-            num_slots: u32::try_from(num_fields).unwrap_or(u32::MAX),
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).unwrap_or(u32::MAX),
+        );
 
         // SAFETY: `ptr` was just bump-allocated from the young arena with sufficient
         // size (`HEADER_SIZE + num_fields * SLOT_SIZE`) and 8-byte alignment, so
@@ -333,19 +417,14 @@ impl GenerationalHeap {
         let total_size = HEADER_SIZE + data_size;
         let ptr = self.alloc_young(total_size);
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Array,
+            ObjectKind::Array,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: u32::try_from(length).unwrap_or(u32::MAX),
-            num_slots: u32::try_from(length).unwrap_or(u32::MAX),
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            self.next_hash(),
+            u32::try_from(length).unwrap_or(u32::MAX),
+            u32::try_from(length).unwrap_or(u32::MAX),
+        );
 
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // (`HEADER_SIZE + data_size`) and 8-byte alignment. Writing the header is valid
@@ -363,19 +442,14 @@ impl GenerationalHeap {
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let total_size = HEADER_SIZE + num_fields.checked_mul(SLOT_SIZE)?;
         let ptr = self.try_alloc_young(total_size)?;
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: 0,
-            num_slots: u32::try_from(num_fields).ok()?,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).ok()?,
+        );
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // and 8-byte alignment via `try_alloc_young`. The pointer is exclusively owned,
         // so writing the header and creating an `ObjectRef` are sound.
@@ -395,19 +469,14 @@ impl GenerationalHeap {
         let data_size = array_data_size(length, element_type).ok()?;
         let total_size = HEADER_SIZE.checked_add(data_size)?;
         let ptr = self.try_alloc_young(total_size)?;
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Array,
+            ObjectKind::Array,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: u32::try_from(length).ok()?,
-            num_slots: u32::try_from(length).ok()?,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            self.next_hash(),
+            u32::try_from(length).ok()?,
+            u32::try_from(length).ok()?,
+        );
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // for the array header + data and 8-byte alignment. The pointer is exclusively
         // owned, so writing the header and creating an `ObjectRef` are sound.
@@ -973,7 +1042,10 @@ impl GenerationalHeap {
     ///    reference value to the SATB queue (for concurrent GC correctness).
     #[inline]
     pub fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
-        // Fast path: only care about reference stores
+        // FAST PATH: only reference stores can produce a cross-gen edge.
+        // Bail out BEFORE touching the object header for primitive/null
+        // stores so the barrier cost on the common (primitive) path is
+        // a single tag check.
         let target_ref = match stored_value {
             Value::Object(Some(r)) => r,
             _ => return,
@@ -984,14 +1056,22 @@ impl GenerationalHeap {
         // ObjectHeader within a heap arena.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
 
-        // Card table barrier: source in old gen, target in young gen
+        // Card table barrier: source in old gen, target in young gen.
         if header.gc_flags & GC_FLAG_OLD_GEN != 0 {
             // SAFETY: `target_ref` is a live heap ObjectRef (the value just stored),
             // so its pointer targets a valid ObjectHeader.
             let target_header = unsafe { &*(target_ref.as_ptr() as *const ObjectHeader) };
             if target_header.gc_flags & GC_FLAG_OLD_GEN == 0 {
-                let mut card_table = self.card_table.lock();
-                card_table.mark_dirty(obj_ptr as usize);
+                // T5.5.2 — route through the thread-local batched dirty
+                // path instead of taking the global card_table mutex on
+                // every reference store. The offset is queued in this
+                // mutator's per-thread buffer (no shared lock) and
+                // flushed into the shared `pending_offsets` either when
+                // the buffer hits THREAD_BUFFER_FLUSH_THRESHOLD entries
+                // or when the collector drains at GC start. The shared
+                // `cards` bitmap is updated by `drain_pending` while the
+                // GC holds the card_table mutex exclusively.
+                self.card_table.thread_local_dirty_addr(obj_ptr as usize);
             }
         }
     }
@@ -1139,7 +1219,21 @@ impl GenerationalHeap {
         let mut young_from = self.young_from.lock();
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
-        let mut card_table = self.card_table.lock();
+
+        // T5.5.2 (HIGH-1 fix): drain every mutator's thread-local card
+        // buffer into the authoritative bitmap BEFORE the dirty-card
+        // scan. We're inside the STW collector — the safepoint sync
+        // barrier (which the caller holds before invoking
+        // `collect_garbage`) guarantees every mutator either parked at
+        // a safepoint (flushing its buffer on the way in) or completed
+        // its barrier call before we got here. `flush_all` drains the
+        // calling (collector) thread's buffer for completeness, then
+        // `drain_pending` folds every queued offset — including those
+        // submitted by mutators via auto-flush or safepoint-entry
+        // flush — into the `cards`/`dirty_cards` bitmap.
+        self.card_table.flush_all();
+        self.card_table.drain_pending();
+        let card_table: &CardTable = &self.card_table;
 
         let bytes_before = young_from.used();
         let mut objects_copied: usize = 0;
@@ -1340,19 +1434,28 @@ impl GenerationalHeap {
                 scan_cursor += total_size;
             }
 
-            // Promoted object scan: process any unscanned promoted objects
-            let unscanned: Vec<*mut u8> = pointer_map
-                .values()
-                .filter(|&&new_addr| old_gen.contains(new_addr as *const u8))
-                .filter(|&&new_addr| !scanned_promoted.contains(&new_addr))
-                .map(|&new_addr| new_addr as *mut u8)
-                .collect();
-
-            for obj_ptr in unscanned {
+            // Promoted object scan: process any unscanned promoted objects.
+            //
+            // CRIT-P2 fix: drain the explicit `promoted_worklist` instead of
+            // rebuilding a Vec from `pointer_map.values()` on every outer
+            // iteration (which was O(promoted^2) until fixpoint). Every
+            // `forward_object` call that promotes an object to old gen
+            // pushes its new address onto `promoted_worklist`, so popping
+            // here is true Cheney-style O(promoted) scanning.
+            //
+            // `forward_object` only pushes on a fresh promotion (not on the
+            // already-forwarded re-encounter path), so the worklist holds
+            // each promoted address at most once. The `scanned_promoted`
+            // check below is kept as a defensive idempotency guard.
+            while let Some(obj_ptr) = promoted_worklist.pop() {
+                if !scanned_promoted.insert(obj_ptr as usize) {
+                    // already scanned this cycle
+                    continue;
+                }
                 made_progress = true;
-                scanned_promoted.insert(obj_ptr as usize);
-                // SAFETY: `obj_ptr` is a promoted object in old gen (verified by the
-                // `old_gen.contains` filter above), with a valid copied header.
+                // SAFETY: `obj_ptr` is a promoted object in old gen (it was
+                // pushed only when `forward_object` confirmed the allocation
+                // landed in `old_gen`), with a valid copied header.
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
 
                 // Scan ref slots: ref arrays use compact 8-byte pointers,
@@ -1506,16 +1609,13 @@ impl GenerationalHeap {
                     }
                     scan_cursor += total_size;
                 }
-                // Also scan promoted objects from resurrection
-                let unscanned: Vec<*mut u8> = pointer_map
-                    .values()
-                    .filter(|&&new_addr| old_gen.contains(new_addr as *const u8))
-                    .filter(|&&new_addr| !scanned_promoted.contains(&new_addr))
-                    .map(|&new_addr| new_addr as *mut u8)
-                    .collect();
-                for obj_ptr in unscanned {
+                // Also scan promoted objects from resurrection — drain the
+                // shared worklist (see CRIT-P2 note above on the main scan).
+                while let Some(obj_ptr) = promoted_worklist.pop() {
+                    if !scanned_promoted.insert(obj_ptr as usize) {
+                        continue;
+                    }
                     made_progress = true;
-                    scanned_promoted.insert(obj_ptr as usize);
                     // SAFETY: `obj_ptr` is a promoted old-gen object with a valid copied header.
                     let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                     if header.kind == ObjectKind::Array {
@@ -1613,14 +1713,15 @@ impl GenerationalHeap {
         }
         young_from.reset();
 
-        // Phase 4: Remap monitors and swap young spaces. The
-        // `remap_after_gc` trait signature uses `std::collections::HashMap`,
-        // while our internal `pointer_map` is an `FxHashMap` for speed —
-        // bridge by materialising a std map for the call (and for the
-        // public `GcResult.pointer_map` return value below).
-        let pointer_map_std: HashMap<usize, usize> =
-            pointer_map.iter().map(|(&k, &v)| (k, v)).collect();
-        monitors.remap_after_gc(&pointer_map_std);
+        // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
+        // expected by `MonitorCleanup::remap_after_gc` (defined in
+        // `collector.rs`) and `GcResult.pointer_map` (the public-API field
+        // in `gc.rs`). The conversion is a single O(N) walk — cheap
+        // compared to N SipHash operations across the Cheney scan.
+        let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
+
+        // Phase 4: Remap monitors and swap young spaces
+        monitors.remap_after_gc(&pointer_map);
         std::mem::swap(&mut *young_from, &mut *young_to);
 
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
@@ -1704,10 +1805,7 @@ impl GenerationalHeap {
                     bytes_copied,
                     bytes_freed,
                 },
-                // `GcResult.pointer_map` is `std::collections::HashMap`
-                // (the public-API type); convert from our internal
-                // `FxHashMap` (used for perf-sensitive intra-GC lookups).
-                pointer_map: pointer_map.into_iter().collect(),
+                pointer_map,
             },
             dead_finalizers,
         )
@@ -1940,6 +2038,21 @@ impl GenerationalHeap {
     /// the allocation. The caller should trigger a GC cycle and retry, or
     /// throw `OutOfMemoryError`.
     fn try_alloc_young(&self, size: usize) -> Option<*mut u8> {
+        // NUMA stub: query the preferred node for the calling thread so
+        // the topology probe gets exercised in production. On multi-node
+        // hosts this records when the heap's primary node disagrees with
+        // the caller's node — that delta is the win the multi-arena
+        // upgrade will eventually capture. On single-node hosts (every
+        // current test target) this is two integer compares and a return.
+        let node = self.numa_slow_path_hint();
+        if self.numa_num_nodes > 1 && node != self.numa_node_hint {
+            tracing::trace!(
+                target: "rustjvm::gc::numa",
+                node, primary = self.numa_node_hint, size,
+                "try_alloc_young: cross-node slow path (single-arena fallback)",
+            );
+        }
+
         let ptr = {
             let mut from = self.young_from.lock();
             from.alloc(size, 8)
@@ -1970,6 +2083,19 @@ impl GenerationalHeap {
     /// the zeroed region and `size` is the actual TLAB size (may be smaller
     /// than requested if the arena is nearly full).
     pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
+        // NUMA stub: same shape as try_alloc_young. The TLAB itself is
+        // per-thread so its fast path is already NUMA-local; this records
+        // the *refill* node so that once we land per-node arenas we can
+        // size each node's young-from to match its TLAB refill pressure.
+        let node = self.numa_slow_path_hint();
+        if self.numa_num_nodes > 1 && node != self.numa_node_hint {
+            tracing::trace!(
+                target: "rustjvm::gc::numa",
+                node, primary = self.numa_node_hint, requested_size,
+                "refill_tlab: cross-node refill (single-arena fallback)",
+            );
+        }
+
         let mut from = self.young_from.lock();
         let available = from.remaining();
         if available < 256 {
@@ -2156,6 +2282,31 @@ impl GenerationalHeap {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
         }
 
+        // Round-2 fix (T2-4): explicit atomic load+store for the mark_word
+        // field. The bulk memcpy above is technically UB for `AtomicU64`:
+        // even under STW (no mutator is racing), the memory model still
+        // requires that reads/writes of atomic locations go through atomic
+        // ops. Replicating the mark word atomically materializes the
+        // correct happens-before edge for any observer that may later
+        // perform a CAS on the new copy (monitor inflation, etc.).
+        //
+        // NOTE for future concurrent-GC support: this STW-only protocol is
+        // not sufficient for a concurrent collector. A concurrent
+        // forwarding protocol must instead CAS-install the forwarding
+        // pointer and re-read the mark word if a mutator raced.
+        // SAFETY: both `old_ptr` and `new_ptr` point at a fully written
+        // ObjectHeader whose `mark_word` field lives at MARK_WORD_OFFSET.
+        unsafe {
+            let old_header_ptr = old_ptr as *const ObjectHeader;
+            let new_header_ptr = new_ptr as *mut ObjectHeader;
+            let mark = (*old_header_ptr)
+                .mark_word
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (*new_header_ptr)
+                .mark_word
+                .store(mark, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Update the new header
         // SAFETY: `new_ptr` was just allocated and the object was copied there; its header is valid and mutable.
         let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
@@ -2201,7 +2352,7 @@ impl GenerationalHeap {
         young_from: &Arena,
         extra_roots: &mut Vec<(ObjectRef, usize, usize)>,
     ) {
-        let dirty_indices: Vec<usize> = card_table.dirty_card_indices().collect();
+        let dirty_indices: Vec<usize> = card_table.dirty_card_indices();
         if dirty_indices.is_empty() {
             return;
         }
@@ -2682,11 +2833,18 @@ mod tests {
         heap.set_field(promoted, 0, Value::Object(Some(young_obj)));
         heap.write_barrier(promoted, Value::Object(Some(young_obj)));
 
-        // Card should be dirty
-        let card_table = heap.card_table.lock();
-        let card_idx = (promoted.as_ptr() as usize - card_table.base_addr())
+        // Card should be dirty.
+        //
+        // T5.5.2 (HIGH-1 fix): the write barrier now batches into a
+        // per-thread buffer instead of touching the global card-table
+        // mutex on every store. Drain the buffer manually here so the
+        // bitmap reflects the dirtying — the collector performs the
+        // same flush + drain at GC entry.
+        heap.card_table.flush_all();
+        heap.card_table.drain_pending();
+        let card_idx = (promoted.as_ptr() as usize - heap.card_table.base_addr())
             / crate::card_table::CARD_SIZE;
-        assert!(card_table.is_dirty(card_idx));
+        assert!(heap.card_table.is_dirty(card_idx));
     }
 
     #[test]
@@ -3797,13 +3955,22 @@ mod tests {
         assert!(heap.is_in_old(old1.as_ptr()));
         assert!(heap.is_in_old(old2.as_ptr()));
 
-        // Clear card table
-        heap.card_table.lock().clear_all();
+        // Clear card table.
+        //
+        // T5.5.2 (HIGH-1 fix): the write barrier batches into a
+        // per-thread buffer; observing the bitmap requires draining
+        // the buffer first. Each scenario below flushes + drains
+        // before checking `take_dirty_cards()` so the assertion sees
+        // the post-barrier state, exactly as the collector would at
+        // GC entry.
+        heap.card_table.clear_all();
 
         // Old → Old: should NOT dirty card
         heap.set_field(old1, 1, Value::Object(Some(old2)));
         heap.write_barrier(old1, Value::Object(Some(old2)));
-        assert!(heap.card_table.lock().take_dirty_cards().is_empty(),
+        heap.card_table.flush_all();
+        heap.card_table.drain_pending();
+        assert!(heap.card_table.take_dirty_cards().is_empty(),
             "S29: old→old should not dirty card");
 
         // Young → Young: should NOT dirty card
@@ -3811,19 +3978,25 @@ mod tests {
         let y2 = heap.alloc_object(ClassId::new(0), 1);
         heap.set_field(y1, 1, Value::Object(Some(y2)));
         heap.write_barrier(y1, Value::Object(Some(y2)));
-        assert!(heap.card_table.lock().take_dirty_cards().is_empty(),
+        heap.card_table.flush_all();
+        heap.card_table.drain_pending();
+        assert!(heap.card_table.take_dirty_cards().is_empty(),
             "S29: young→young should not dirty card");
 
         // Non-reference store: should NOT dirty card
         heap.set_field(old1, 0, Value::Int(999));
         heap.write_barrier(old1, Value::Int(999));
-        assert!(heap.card_table.lock().take_dirty_cards().is_empty(),
+        heap.card_table.flush_all();
+        heap.card_table.drain_pending();
+        assert!(heap.card_table.take_dirty_cards().is_empty(),
             "S29: non-ref store should not dirty card");
 
         // Old → Young: SHOULD dirty card
         heap.set_field(old1, 1, Value::Object(Some(y1)));
         heap.write_barrier(old1, Value::Object(Some(y1)));
-        assert!(!heap.card_table.lock().take_dirty_cards().is_empty(),
+        heap.card_table.flush_all();
+        heap.card_table.drain_pending();
+        assert!(!heap.card_table.take_dirty_cards().is_empty(),
             "S29: old→young SHOULD dirty card");
     }
 

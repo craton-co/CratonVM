@@ -14,11 +14,12 @@
 //! copying garbage collector. Allocation is linear in from-space. During
 //! collection, live objects are copied to to-space, then spaces are swapped.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
 use crate::arena::Arena;
+use crate::numa;
 use rustjvm_types::{ClassId, ObjectRef, Value};
 
 // Re-export heap types from the shared types crate.
@@ -52,6 +53,34 @@ pub struct Heap {
     to_space: Mutex<Arena>,
     next_hash_code: AtomicI32,
     gc_threshold: usize,
+
+    // ---- NUMA hint (stub: see TODO below) ---------------------------------
+    //
+    // Snapshot of the host NUMA topology's node count, captured at
+    // `Heap::with_capacity`. Stored so [`Heap::preferred_numa_node`] can
+    // bound `numa::current_thread_node()` against it without re-reading the
+    // `OnceLock` on every alloc.
+    //
+    // The current allocator still funnels every request through the single
+    // `from_space` semi-space — this field is a "design intent" marker, not
+    // an actual per-node partition.
+    //
+    // TODO(NUMA, multi-arena): replace `from_space`/`to_space` with
+    //   `arenas_from: Vec<Mutex<Arena>>` and `arenas_to: Vec<Mutex<Arena>>`,
+    //   each indexed by NUMA node. The fast-path alloc would then dispatch
+    //   to `arenas_from[numa::current_thread_node()]`, falling back to
+    //   round-robin on local OOM. The GC's `collect_garbage` would walk
+    //   every (from, to) pair and swap them in lockstep. This is deferred
+    //   because the existing GC entry points (`crate::gc::collect`,
+    //   `crate::gc::collect_with_finalizers`) take a single `&mut Arena`
+    //   pair, so a full multi-arena rewrite touches the collector crate
+    //   too — out of scope for this single-file change. See `gc/src/numa.rs`
+    //   for `NumaTopology` / `current_thread_node`.
+    num_numa_nodes: usize,
+    /// Last observed NUMA node hint. Updated on the alloc fast-path purely
+    /// for observability / debugging; allocation itself still hits the
+    /// single shared `from_space`.
+    numa_node_hint: AtomicUsize,
 
     // ---- GPU-offload coordination (Part F) --------------------------------
     //
@@ -111,11 +140,21 @@ impl Heap {
     pub fn with_capacity(total_bytes: usize) -> Self {
         let half = total_bytes.max(1024) / 2;
         let threshold = half * GC_THRESHOLD_PERCENT / 100;
+        // Snapshot the host NUMA topology once. On single-node hosts
+        // (the common case for non-Linux platforms) `num_nodes == 1`, so
+        // the alloc fast-path collapses to its original single-arena
+        // behaviour — no regression. See the field-level TODO on `Heap`
+        // for the planned multi-arena partitioning.
+        let topo = numa::global_topology();
+        let num_numa_nodes = topo.num_nodes.max(1);
         Self {
             from_space: Mutex::new(Arena::new(half)),
             to_space: Mutex::new(Arena::new(half)),
             next_hash_code: AtomicI32::new(1),
             gc_threshold: threshold,
+
+            num_numa_nodes,
+            numa_node_hint: AtomicUsize::new(0),
 
             #[cfg(feature = "gpu-offload")]
             gpu_critical_count: std::sync::atomic::AtomicU32::new(0),
@@ -124,6 +163,67 @@ impl Heap {
             #[cfg(feature = "gpu-offload")]
             gpu_blocked_gc_count: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Return the NUMA node this thread should *prefer* for allocation,
+    /// clamped to the topology size captured at heap construction.
+    ///
+    /// On single-node hosts this is always `0`. On multi-node hosts the
+    /// value is derived from [`numa::current_thread_node()`].
+    ///
+    /// Currently informational: the alloc fast-path records this on every
+    /// call (so observers can confirm per-thread node affinity) but the
+    /// underlying arena is still shared. See the field-level TODO on
+    /// [`Heap`] for the full multi-arena plan.
+    #[inline]
+    pub fn preferred_numa_node(&self) -> usize {
+        if self.num_numa_nodes <= 1 {
+            return 0;
+        }
+        let raw = numa::NumaTopology::current_thread_node();
+        if raw < self.num_numa_nodes {
+            raw
+        } else {
+            // current_thread_node returned a node beyond what we
+            // snapshotted (topology changed mid-flight, or platform
+            // returned a stale CPU id). Fold back to node 0 rather
+            // than indexing OOB.
+            0
+        }
+    }
+
+    /// Last NUMA node hint observed by the alloc fast-path. Mainly useful
+    /// for tests / observability — see [`Heap::preferred_numa_node`] for
+    /// the live value.
+    pub fn last_numa_node_hint(&self) -> usize {
+        self.numa_node_hint.load(Ordering::Relaxed)
+    }
+
+    /// Number of NUMA nodes the heap is aware of (>= 1).
+    pub fn num_numa_nodes(&self) -> usize {
+        self.num_numa_nodes
+    }
+
+    /// Allocation fast-path hook: refresh the cached NUMA hint from the
+    /// current OS thread. Cheap on single-node hosts (early return).
+    ///
+    /// TODO(NUMA, multi-arena): once `from_space` is replaced with a
+    /// per-node `Vec<Mutex<Arena>>`, this hook should return the chosen
+    /// arena index and the caller should lock that arena instead of the
+    /// shared `from_space`. Fallback policy on local OOM: round-robin
+    /// over the remaining nodes before giving up (so the heap behaves
+    /// like a unified pool only when every node is exhausted).
+    #[inline]
+    fn refresh_numa_hint(&self) -> usize {
+        if self.num_numa_nodes <= 1 {
+            // Single-node host: avoid the syscall / sysfs read entirely.
+            return 0;
+        }
+        let node = self.preferred_numa_node();
+        // Relaxed: this is purely observational; allocations don't depend
+        // on its value yet, and racing writes between threads are fine.
+        self.numa_node_hint.store(node, Ordering::Relaxed);
+        node
     }
 
     /// Allocate a new Java object with `num_fields` field slots, all zeroed.
@@ -139,19 +239,14 @@ impl Heap {
             .expect("object total size overflow");
         let ptr = self.alloc_zeroed(total_size);
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Reference, // unused for objects
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: 0,
-            num_slots: u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            ObjectKind::Object,
+            ArrayElementType::Reference, // unused for objects
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
+        );
 
         // SAFETY: `ptr` was just returned by `alloc_zeroed`, which guarantees it
         // is valid, non-null, properly aligned (8-byte), and has at least
@@ -224,24 +319,21 @@ impl Heap {
     ) -> Option<ObjectRef> {
         let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
         let total_size = HEADER_SIZE.checked_add(fields_size)?;
+        // See `alloc_zeroed` for the NUMA hint rationale.
+        let _node = self.refresh_numa_hint();
         let mut from = self.from_space.lock();
         let ptr = from.alloc(total_size, 8)?;
         // SAFETY: same as `alloc_object` — ptr is valid, aligned, with sufficient capacity.
         unsafe {
             std::ptr::write_bytes(ptr, 0, total_size);
-            let header = ObjectHeader {
+            let header = ObjectHeader::new(
                 class_id,
-                kind: ObjectKind::Object,
-                element_type: ArrayElementType::Reference,
-                _padding: [0; 2],
-                identity_hash_code: self.next_hash(),
-                array_length: 0,
-                num_slots: u32::try_from(num_fields).ok()?,
-                gc_age: 0,
-                gc_flags: 0,
-                _gc_reserved: [0; 2],
-                forwarding_ptr: std::ptr::null_mut(),
-            };
+                ObjectKind::Object,
+                ArrayElementType::Reference,
+                self.next_hash(),
+                0,
+                u32::try_from(num_fields).ok()?,
+            );
             std::ptr::write(ptr as *mut ObjectHeader, header);
             Some(ObjectRef::from_raw(ptr))
         }
@@ -268,19 +360,14 @@ impl Heap {
         let total_size = HEADER_SIZE + data_size;
         let ptr = self.alloc_zeroed(total_size);
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Array,
+            ObjectKind::Array,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: u32::try_from(length).expect("array length exceeds u32::MAX"),
-            num_slots: u32::try_from(length).expect("array length exceeds u32::MAX"),
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            self.next_hash(),
+            u32::try_from(length).expect("array length exceeds u32::MAX"),
+            u32::try_from(length).expect("array length exceeds u32::MAX"),
+        );
 
         // SAFETY: `ptr` was returned by `alloc_zeroed` — valid, non-null, 8-byte
         // aligned, and has at least `total_size` bytes. The header write is in
@@ -306,24 +393,21 @@ impl Heap {
         }
         let data_size = array_data_size_checked(length, element_type)?;
         let total_size = HEADER_SIZE.checked_add(data_size)?;
+        // See `alloc_zeroed` for the NUMA hint rationale.
+        let _node = self.refresh_numa_hint();
         let mut from = self.from_space.lock();
         let ptr = from.alloc(total_size, 8)?;
         // SAFETY: same as `alloc_array` — ptr is valid, aligned, with sufficient capacity.
         unsafe {
             std::ptr::write_bytes(ptr, 0, total_size);
-            let header = ObjectHeader {
+            let header = ObjectHeader::new(
                 class_id,
-                kind: ObjectKind::Array,
+                ObjectKind::Array,
                 element_type,
-                _padding: [0; 2],
-                identity_hash_code: self.next_hash(),
-                array_length: u32::try_from(length).ok()?,
-                num_slots: u32::try_from(length).ok()?,
-                gc_age: 0,
-                gc_flags: 0,
-                _gc_reserved: [0; 2],
-                forwarding_ptr: std::ptr::null_mut(),
-            };
+                self.next_hash(),
+                u32::try_from(length).ok()?,
+                u32::try_from(length).ok()?,
+            );
             std::ptr::write(ptr as *mut ObjectHeader, header);
             Some(ObjectRef::from_raw(ptr))
         }
@@ -777,6 +861,12 @@ impl Heap {
     /// be allocated (e.g. internal bookkeeping). If this panic fires it means
     /// the heap is genuinely exhausted after GC has already been attempted.
     fn alloc_zeroed(&self, size: usize) -> *mut u8 {
+        // NUMA hint refresh — stub for the planned per-node arena
+        // dispatch. On single-node hosts this is a no-op; on multi-node
+        // hosts it records the calling thread's preferred node so
+        // observers/tests can confirm dispatch intent. See the
+        // `TODO(NUMA, multi-arena)` on `Heap` for the full plan.
+        let _node = self.refresh_numa_hint();
         let mut from = self.from_space.lock();
         let ptr = from.alloc(size, 8).unwrap_or_else(|| {
             // Use process::abort() instead of panic!() to avoid unwinding
@@ -802,6 +892,8 @@ impl Heap {
 
     /// Try to allocate `size` bytes, returning `None` if from-space is full.
     fn try_alloc_zeroed(&self, size: usize) -> Option<*mut u8> {
+        // See `alloc_zeroed` for the NUMA hint rationale.
+        let _node = self.refresh_numa_hint();
         let mut from = self.from_space.lock();
         let ptr = from.alloc(size, 8)?;
         // SAFETY: `ptr` was returned by `Arena::alloc` and points to `size` bytes
@@ -820,19 +912,14 @@ impl Heap {
         let total_size = HEADER_SIZE.checked_add(fields_size)?;
         let ptr = self.try_alloc_zeroed(total_size)?;
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Reference, // unused for objects
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: 0,
-            num_slots: u32::try_from(num_fields).ok()?,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            ObjectKind::Object,
+            ArrayElementType::Reference, // unused for objects
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).ok()?,
+        );
 
         // SAFETY: `ptr` was just returned by `try_alloc_zeroed`, which guarantees
         // it is valid, non-null, properly aligned (8-byte), and has at least
@@ -858,19 +945,14 @@ impl Heap {
         let total_size = HEADER_SIZE.checked_add(data_size)?;
         let ptr = self.try_alloc_zeroed(total_size)?;
 
-        let header = ObjectHeader {
+        let header = ObjectHeader::new(
             class_id,
-            kind: ObjectKind::Array,
+            ObjectKind::Array,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code: self.next_hash(),
-            array_length: u32::try_from(length).ok()?,
-            num_slots: u32::try_from(length).ok()?,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            self.next_hash(),
+            u32::try_from(length).ok()?,
+            u32::try_from(length).ok()?,
+        );
 
         // SAFETY: `ptr` was returned by `try_alloc_zeroed` — valid, non-null,
         // 8-byte aligned, and has at least `total_size` bytes.

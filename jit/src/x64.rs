@@ -61,6 +61,7 @@ use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
 use rustjvm_jit_api::JitRuntimeHelpers;
 #[allow(unused_imports)]
 use rustjvm_types::{ARRAY_LENGTH_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -1600,9 +1601,9 @@ struct ScalarReplacedObject {
 /// Result of scalar replacement planning: which bytecode PCs to rewrite.
 struct ScalarReplacementPlan {
     /// Non-escaping NEW PCs → their scalar-replaced object info.
-    objects: HashMap<usize, ScalarReplacedObject>,
+    objects: FxHashMap<usize, ScalarReplacedObject>,
     /// putfield/getfield PCs that operate on a scalar-replaced object → the NEW PC.
-    field_ops: HashMap<usize, usize>,
+    field_ops: FxHashMap<usize, usize>,
     /// invokespecial PCs whose `<init>()V` call should be skipped.
     init_skips: std::collections::HashSet<usize>,
     /// Total 8-byte frame slots reserved for scalar-replaced fields
@@ -1619,13 +1620,13 @@ fn plan_scalar_replacement(
     code: &[u8],
     code_len: usize,
     non_escaping_new: &std::collections::HashSet<usize>,
-    new_info: &[(usize, u32, usize)],
+    new_info: &[(usize, u32, usize, bool, bool)],
     invoke_info: &[(usize, *const JitInvokeInfo)],
     scalar_base: usize,
 ) -> ScalarReplacementPlan {
     let empty = ScalarReplacementPlan {
-        objects: HashMap::new(),
-        field_ops: HashMap::new(),
+        objects: FxHashMap::default(),
+        field_ops: FxHashMap::default(),
         init_skips: std::collections::HashSet::new(),
         total_slots: 0,
     };
@@ -1634,12 +1635,14 @@ fn plan_scalar_replacement(
     }
 
     // Build objects map with deterministic frame offset assignment.
-    let mut objects: HashMap<usize, ScalarReplacedObject> = HashMap::new();
+    let mut objects: FxHashMap<usize, ScalarReplacedObject> = FxHashMap::default();
     let mut total_slots = 0usize;
     let mut sorted_pcs: Vec<usize> = non_escaping_new.iter().copied().collect();
     sorted_pcs.sort();
     for &new_pc in &sorted_pcs {
-        if let Some(&(_, _, num_fields)) = new_info.iter().find(|(p, _, _)| *p == new_pc) {
+        if let Some(&(_, _, num_fields, _, _)) =
+            new_info.iter().find(|(p, _, _, _, _)| *p == new_pc)
+        {
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
                 objects.insert(new_pc, ScalarReplacedObject { num_fields, field_base_offset });
@@ -1654,7 +1657,7 @@ fn plan_scalar_replacement(
     // Abstract interpretation: track object provenance through stack and locals.
     let mut abs_stack: Vec<Option<usize>> = Vec::with_capacity(16);
     let mut local_prov: [Option<usize>; 256] = [None; 256];
-    let mut field_ops: HashMap<usize, usize> = HashMap::new();
+    let mut field_ops: FxHashMap<usize, usize> = FxHashMap::default();
     let mut init_skips = std::collections::HashSet::new();
 
     let mut pc = 0usize;
@@ -1923,7 +1926,7 @@ fn plan_scalar_replacement(
         .collect();
 
     // Rebuild objects map with only used ones, reassign offsets
-    let mut final_objects: HashMap<usize, ScalarReplacedObject> = HashMap::new();
+    let mut final_objects: FxHashMap<usize, ScalarReplacedObject> = FxHashMap::default();
     let mut final_total = 0usize;
     for &new_pc in &sorted_pcs {
         if used_objects.contains(&new_pc) {
@@ -1939,7 +1942,7 @@ fn plan_scalar_replacement(
     }
 
     // Remap field_ops to only reference final objects
-    let final_field_ops: HashMap<usize, usize> = field_ops.into_iter()
+    let final_field_ops: FxHashMap<usize, usize> = field_ops.into_iter()
         .filter(|(_, new_pc)| final_objects.contains_key(new_pc))
         .collect();
     let final_init_skips: std::collections::HashSet<usize> = init_skips.into_iter()
@@ -2178,7 +2181,7 @@ fn find_fp_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]) -
     }
 
     let mut hoists = Vec::new();
-    let mut hoisted_pcs: HashSet<usize> = HashSet::new();
+    let mut hoisted_pcs: FxHashSet<usize> = FxHashSet::default();
 
     // Sort loops by span size descending (outermost first)
     let mut sorted_loops = loops.to_vec();
@@ -2242,12 +2245,12 @@ fn find_fp_strength_reductions(
     code_len: usize,
     loops: &[(usize, usize)],
     ldc2w_info: &[(usize, i64)],
-) -> HashSet<usize> {
-    let mut pcs = HashSet::new();
+) -> FxHashSet<usize> {
+    let mut pcs = FxHashSet::default();
     let two_bits = 2.0f64.to_bits() as i64; // Cast: JIT ABI convention
 
     // Build a lookup for ldc2_w PCs → resolved value
-    let ldc_map: HashMap<usize, i64> = ldc2w_info.iter().copied().collect();
+    let ldc_map: FxHashMap<usize, i64> = ldc2w_info.iter().copied().collect();
 
     for &(header, back_edge) in loops {
         let loop_end = back_edge + bytecode_len_at(code, back_edge);
@@ -2510,8 +2513,8 @@ fn find_safe_array_accesses(
     back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
-) -> HashSet<usize> {
-    let mut safe_pcs = HashSet::new();
+) -> FxHashSet<usize> {
+    let mut safe_pcs = FxHashSet::default();
 
     let mut pc = header;
     while pc < back_edge_end {
@@ -2653,8 +2656,8 @@ fn analyze_bounds_elimination(
     code: &[u8],
     code_len: usize,
     loops: &[(usize, usize)],
-) -> (HashSet<usize>, Vec<SpeculativeBCEGuard>) {
-    let mut safe_pcs = HashSet::new();
+) -> (FxHashSet<usize>, Vec<SpeculativeBCEGuard>) {
+    let mut safe_pcs = FxHashSet::default();
     let mut speculative_guards: Vec<SpeculativeBCEGuard> = Vec::new();
 
     for &(header, back_edge) in loops {
@@ -2729,7 +2732,7 @@ fn find_speculative_array_accesses(
     back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
-    already_safe: &HashSet<usize>,
+    already_safe: &FxHashSet<usize>,
 ) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
     let mut pc = header;
@@ -2881,15 +2884,25 @@ struct Compiler {
     simd_loops: Vec<SimdIntArraySum>,
     /// Bounds check elimination: bytecode PCs where bounds checks can be skipped
     /// because loop analysis proved the access is always in-bounds.
-    bounds_safe_pcs: HashSet<usize>,
+    bounds_safe_pcs: FxHashSet<usize>,
     /// Deferred out-of-line bounds-check failure stubs: (branch_patch_offset, bc_pc).
     /// After the main bytecode loop, we emit the slow-path code for each.
     bounds_check_stubs: Vec<usize>,
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
-    /// Resolved `new` (0xbb) metadata: (bytecode_pc, class_id_raw, num_fields).
-    new_info: Vec<(usize, u32, usize)>,
+    /// Resolved `new` (0xbb) metadata.
+    ///
+    /// Tuple layout (CRIT-2):
+    ///   (bytecode_pc, class_id_raw, num_fields,
+    ///    has_primitive_init,
+    ///    has_finalizer)
+    ///
+    /// The last two flags gate whether the inline TLAB fast path must
+    /// invoke `jit_post_tlab_init`. When both are `false`, the JIT
+    /// inlines the header completion (identity-hash + num_slots) and
+    /// skips the helper call entirely. See `emit_inline_tlab_new`.
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
     /// Resolved `anewarray` (0xbd) metadata: (bytecode_pc, component_class_id_raw).
     anewarray_info: Vec<(usize, u32)>,
     /// Invoke dispatch info: (bytecode_pc, pointer to leaked JitInvokeInfo).
@@ -2900,6 +2913,19 @@ struct Compiler {
     /// Monomorphic inline cache slots: (bytecode_pc, MIC slot pointer).
     /// For invokevirtual/invokeinterface call sites.
     mic_slots: Vec<(usize, *const super::JitMICSlot)>,
+    /// Polymorphic inline cache slots: (bytecode_pc, PIC slot pointer).
+    /// For invokevirtual/invokeinterface call sites. A populated
+    /// `pic_slots` entry supersedes the MIC for the same `pc` (PIC
+    /// is a 3-entry superset).
+    ///
+    /// HIGH-7 wiring (now active): `jit/src/lib.rs::try_compile`
+    /// eagerly allocates one `Box<JitPICSlot>` per polymorphic call
+    /// site (invokevirtual / invokeinterface) and passes the
+    /// `(pc, *const JitPICSlot)` pairs into `x64::compile()` via the
+    /// new `pic_slots` parameter, which assigns this field. Slots
+    /// start empty; the runtime helper populates them on miss, after
+    /// which subsequent invocations take the inline 3-way cascade.
+    pic_slots: Vec<(usize, *const super::JitPICSlot)>,
     /// Loop unrolling: (header_pc, back_edge_pc, extra_copies).
     /// Small loops where the back-edge goto can be unrolled with extra iterations.
     /// extra_copies is the number of additional body copies (1 for 2x, 3 for 4x).
@@ -2911,9 +2937,9 @@ struct Compiler {
     /// When present, branch emission adds an x86 branch prediction prefix:
     /// - `0x3E` (taken hint) when `is_usually_taken == true`
     /// - `0x2E` (not-taken hint) when `is_usually_taken == false`
-    branch_hints: HashMap<usize, bool>,
+    branch_hints: FxHashMap<usize, bool>,
     /// PGO loop unroll hints: maps back-edge bytecode PC → unroll factor.
-    loop_unroll_hints: HashMap<usize, usize>,
+    loop_unroll_hints: FxHashMap<usize, usize>,
     /// Resolved ldc/ldc_w constants: (bytecode_pc, i64 value).
     ldc_info: Vec<(usize, i64)>,
     /// Resolved ldc2_w constants: (bytecode_pc, i64 value).
@@ -2922,7 +2948,7 @@ struct Compiler {
     helpers: JitRuntimeHelpers,
     /// Expected simulated-stack depth at each forward branch target.
     /// Used to fix up the stack when dead code becomes live at a merge point.
-    branch_target_stack_depth: HashMap<usize, usize>,
+    branch_target_stack_depth: FxHashMap<usize, usize>,
     /// Set to true when an internal error (e.g. stack underflow) is detected
     /// during compilation.  `compile_bytecode` checks this and bails out.
     failed: bool,
@@ -2937,15 +2963,15 @@ struct Compiler {
     /// SIMD: vectorizable double-array sum loops detected during analysis.
     simd_fp_loops: Vec<SimdFpArraySum>,
     /// FP strength reduction: set of bytecode PCs where dmul-by-2.0 is replaced with dadd-self.
-    fp_strength_reduction_pcs: HashSet<usize>,
+    fp_strength_reduction_pcs: FxHashSet<usize>,
     /// Scalar replacement: non-escaping NEW PCs → frame-local field storage.
-    scalar_replaced: HashMap<usize, ScalarReplacedObject>,
+    scalar_replaced: FxHashMap<usize, ScalarReplacedObject>,
     /// Scalar replacement: putfield/getfield PCs that target a scalar-replaced object → NEW PC.
-    scalar_field_ops: HashMap<usize, usize>,
+    scalar_field_ops: FxHashMap<usize, usize>,
     /// Scalar replacement: invokespecial PCs whose `<init>()V` should be skipped.
     scalar_init_skips: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
-    inline_sites: HashMap<usize, crate::InlineSite>,
+    inline_sites: FxHashMap<usize, crate::InlineSite>,
     /// Deferred out-of-line deoptimization stubs: (branch_patch_offset, bci, reason_code).
     /// Speculative guards (e.g. BCE) jump here; the stub calls jit_uncommon_trap and
     /// returns i64::MIN to signal the interpreter to resume.
@@ -3102,7 +3128,7 @@ impl Compiler {
             hoist_offsets,
             callee_saved_base,
             simd_loops: Vec::new(),
-            bounds_safe_pcs: HashSet::new(),
+            bounds_safe_pcs: FxHashSet::default(),
             bounds_check_stubs: Vec::new(),
             speculative_bce_guards: Vec::new(),
             new_info: Vec::new(),
@@ -3110,24 +3136,25 @@ impl Compiler {
             invoke_info: Vec::new(),
             direct_calls: Vec::new(),
             mic_slots: Vec::new(),
+            pic_slots: Vec::new(),
             unroll_loops: Vec::new(),
             body_entry_offset: 0,
-            branch_hints: HashMap::new(),
-            loop_unroll_hints: HashMap::new(),
+            branch_hints: FxHashMap::default(),
+            loop_unroll_hints: FxHashMap::default(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
-            branch_target_stack_depth: HashMap::new(),
+            branch_target_stack_depth: FxHashMap::default(),
             failed: false,
             helpers,
             scratch_xmm_in_use: 0,
             fp_hoist_info: Vec::new(),
             _fp_hoist_offsets: Vec::new(),
             simd_fp_loops: Vec::new(),
-            fp_strength_reduction_pcs: HashSet::new(),
-            scalar_replaced: HashMap::new(),
-            scalar_field_ops: HashMap::new(),
+            fp_strength_reduction_pcs: FxHashSet::default(),
+            scalar_replaced: FxHashMap::default(),
+            scalar_field_ops: FxHashMap::default(),
             scalar_init_skips: std::collections::HashSet::new(),
-            inline_sites: HashMap::new(),
+            inline_sites: FxHashMap::default(),
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
@@ -5183,6 +5210,290 @@ impl Compiler {
     }
 
     // -----------------------------------------------------------------------
+    // Inline TLAB bump-pointer helpers (HIGH-6 JIT audit, object_allocation)
+    // -----------------------------------------------------------------------
+
+    /// Emit `MOV r64, [base + disp32]` using the full disp32 encoding so the
+    /// caller does not have to special-case small displacements (the
+    /// TLAB cursor/end offsets reach into JvmThread which can be hundreds of
+    /// bytes from the struct base).
+    ///
+    /// `dst` and `base` are register numbers 0..=15 (e.g. RAX=0, R10=10).
+    fn emit_mov_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        // REX.W + REX.R for dst >= 8 + REX.B for base >= 8.
+        let mut rex = 0x48u8;
+        if dst >= 8 { rex |= 0x04; }
+        if base >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x8B); // MOV r64, r/m64
+        // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
+        // base==RSP/R12 would require a SIB byte; neither is used here.
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit `MOV [base + disp32], r64` (the bump-commit store).
+    fn emit_mov_mem_disp32_r64(&mut self, base: u8, src: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if src >= 8 { rex |= 0x04; }
+        if base >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        self.buf.emit_byte(0x80 | ((src & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit `MOV DWORD [base + disp32], imm32` — used to splat `class_id`
+    /// into the freshly bumped object header at offset 0.
+    fn emit_mov_dword_mem_disp32_imm32(&mut self, base: u8, disp: i32, imm: i32) {
+        // REX.B only (no .W: 32-bit op).
+        if base >= 8 {
+            self.buf.emit_byte(0x41);
+        }
+        self.buf.emit_byte(0xC7); // MOV r/m32, imm32 (with /0)
+        self.buf.emit_byte(0x80 | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+        self.buf.emit(&imm.to_le_bytes());
+    }
+
+    /// Emit `LEA r64, [base + imm32]` — compute new cursor without
+    /// touching the source register.
+    fn emit_lea_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if dst >= 8 { rex |= 0x04; }
+        if base >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x8D); // LEA r64, m
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit `CMP r64, [base + disp32]` — the TLAB-overflow check.
+    fn emit_cmp_r64_mem_disp32(&mut self, lhs: u8, base: u8, disp: i32) {
+        let mut rex = 0x48u8;
+        if lhs >= 8 { rex |= 0x04; }
+        if base >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x3B); // CMP r64, r/m64
+        self.buf.emit_byte(0x80 | ((lhs & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit `MOV r64, r64` (register-to-register move).
+    fn emit_mov_r64_r64(&mut self, dst: u8, src: u8) {
+        let mut rex = 0x48u8;
+        if src >= 8 { rex |= 0x04; }
+        if dst >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x89); // MOV r/m64, r64
+        self.buf.emit_byte(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
+    /// Emit `ADD r64, imm8` (sign-extended). Used by the TLAB-align step
+    /// (`cursor + 7` before AND with -8).
+    fn emit_add_r64_imm8(&mut self, reg: u8, imm: i8) {
+        let mut rex = 0x48u8;
+        if reg >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x83); // /0 = ADD
+        self.buf.emit_byte(0xC0 | (reg & 7));
+        self.buf.emit_byte(imm as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Emit `AND r64, imm8` (sign-extended). Used by the TLAB-align step
+    /// (`cursor & -8`).
+    fn emit_and_r64_imm8(&mut self, reg: u8, imm: i8) {
+        let mut rex = 0x48u8;
+        if reg >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x83); // /4 = AND
+        self.buf.emit_byte(0xE0 | (reg & 7));
+        self.buf.emit_byte(imm as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Emit `TEST r64, r64` — sets ZF if the register is zero.
+    fn emit_test_r64_r64(&mut self, reg: u8) {
+        let mut rex = 0x48u8;
+        if reg >= 8 { rex |= 0x05; } // REX.W + REX.R + REX.B
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x85); // TEST r/m64, r64
+        self.buf.emit_byte(0xC0 | ((reg & 7) << 3) | (reg & 7));
+    }
+
+    /// Emit `Jcc rel32` and return the byte offset of the 4-byte
+    /// displacement so the caller can patch it once the branch target
+    /// is known. `cc` is the condition-code suffix byte (e.g. 0x84 = JE,
+    /// 0x87 = JA, 0x85 = JNE).
+    fn emit_jcc_rel32_patch(&mut self, cc: u8) -> usize {
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(cc);
+        let patch = self.buf.pos();
+        self.buf.emit(&[0u8; 4]);
+        patch
+    }
+
+    /// Emit `JMP rel32` returning the patch site for the displacement.
+    fn emit_jmp_rel32_patch(&mut self) -> usize {
+        self.buf.emit_byte(0xE9);
+        let patch = self.buf.pos();
+        self.buf.emit(&[0u8; 4]);
+        patch
+    }
+
+    /// Patch a previously-emitted `rel32` displacement so it targets the
+    /// current buffer position.
+    fn patch_rel32_to_here(&mut self, patch: usize) {
+        let rel = (self.buf.pos() as i32) - (patch as i32 + 4); // Cast: x86-64 rel32 displacement
+        self.buf.patch_i32(patch, rel);
+    }
+
+    /// Emit the inline TLAB bump-pointer fast path for the `new` opcode
+    /// (HIGH-6 JIT audit, object_allocation/1000 3-5× gap).
+    ///
+    /// Layout (all rel32 branches, no relocations):
+    /// ```text
+    ///   MOV  RAX, helpers.get_current_thread
+    ///   CALL RAX                            ; RAX = JvmThread*
+    ///   TEST RAX, RAX
+    ///   JE   slow_path                       ; null thread (re-entrant)
+    ///   MOV  R10, RAX                        ; R10 = thread
+    ///   MOV  R11, [R10 + tlab_cursor_off]    ; R11 = cursor
+    ///   LEA  RAX, [R11 + total_size]         ; RAX = new cursor
+    ///   CMP  RAX, [R10 + tlab_end_off]
+    ///   JA   slow_path                       ; TLAB full
+    ///   MOV  [R10 + tlab_cursor_off], RAX    ; commit
+    ///   MOV  DWORD [R11 + 0], class_id_imm   ; write class_id
+    ///   ; Hand off to post-init helper which finishes header + primitive
+    ///   ; defaults + finalizer registration.
+    ///   MOV  ARG0, [RBP - heap_local_off]    ; vm_ptr
+    ///   MOV  ARG1, R11                       ; obj_ptr
+    ///   MOV  ARG2, class_id_imm
+    ///   MOV  ARG3, num_fields_imm
+    ///   CALL helpers.tlab_post_init
+    ///   JMP  done
+    /// slow_path:
+    ///   MOV  ARG0, [RBP - heap_local_off]
+    ///   MOV  ARG1, class_id_imm
+    ///   MOV  ARG2, num_fields_imm
+    ///   CALL helpers.new_object
+    /// done:
+    /// ```
+    ///
+    /// Returns the bumped object pointer (or the slow-path result) in RAX.
+    /// Caller emits the safepoint oop map and pushes RAX.
+    fn emit_inline_tlab_new(
+        &mut self,
+        class_id_raw: u32,
+        num_fields: usize,
+        // CRIT-2 — when both `has_primitive_init` and `has_finalizer`
+        // are statically known false at the call site, the post-init
+        // helper has nothing meaningful to do beyond writing the
+        // identity-hash and num_slots header words. We can emit those
+        // inline and skip the helper call (which otherwise costs a
+        // class_manager.read() and a finalizer-queue lock). When
+        // unknown (the conservative default in `try_compile`), we
+        // still issue the helper call.
+        skip_post_init_helper: bool,
+    ) {
+        // Object total size (header + fields*8). Computed at compile time.
+        let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+        let cursor_off = self.helpers.tlab_cursor_offset_in_thread as i32;
+        let end_off = self.helpers.tlab_end_offset_in_thread as i32;
+        let class_id_off = self.helpers.class_id_offset_in_obj as i32;
+
+        // Step 1: fetch the JvmThread* via the small TLS helper.
+        // (One CALL + one TEST; ~10 cycles overhead.)
+        self.emit_call_absolute(self.helpers.get_current_thread);
+        self.emit_test_r64_r64(RAX);
+        let null_thread_patch = self.emit_jcc_rel32_patch(0x84); // JE slow_path
+
+        // R10 = thread; R11 = cursor.
+        self.emit_mov_r64_r64(R10, RAX);
+        self.emit_mov_r64_mem_disp32(R11, R10, cursor_off);
+
+        // Align cursor up to 8 bytes (matches `Tlab::alloc(_, 8)`'s
+        // behaviour). Without this, an interleaved array allocation that
+        // left the cursor misaligned would force this `new` object onto a
+        // non-8-aligned address — the GC walker assumes 8-aligned object
+        // headers and would mis-decode the layout. Total cost: 2
+        // instructions (8 bytes encoded) — negligible vs the cache miss
+        // the slow path would incur.
+        self.emit_add_r64_imm8(R11, 7);
+        self.emit_and_r64_imm8(R11, -8);
+
+        // RAX = R11 + total_size (new cursor).
+        self.emit_lea_r64_mem_disp32(RAX, R11, total_size as i32); // Cast: x86-64 immediate encoding
+
+        // CMP RAX, [R10 + end_off]; JA slow_path (TLAB exhausted).
+        self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
+        let tlab_full_patch = self.emit_jcc_rel32_patch(0x87); // JA slow_path
+
+        // Commit the bump: [R10 + cursor_off] = RAX.
+        self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
+
+        // Write class_id (4 bytes) at obj_ptr + class_id_off.
+        // The remaining header bytes are correctly zero from TLAB refill;
+        // post_tlab_init writes only identity_hash_code + num_slots.
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            class_id_off,
+            class_id_raw as i32, // Cast: ClassId immediate fits in 32 bits
+        );
+
+        if skip_post_init_helper {
+            // CRIT-2 fast path — no primitive defaults to apply and no
+            // finalizer to register. Inline the only remaining
+            // header-completion work that `jit_post_tlab_init` would
+            // perform: writing `num_slots` at offset 16.
+            //
+            // `identity_hash_code` (offset 8) is left at the TLAB-zeroed
+            // value (0). The contract is lazy mint: `System.
+            // identityHashCode()` and the mark-word lock path detect
+            // hash == 0 and atomically mint a fresh non-zero value on
+            // demand. This matches HotSpot's "displaced hash" treatment
+            // and avoids a `vm.heap.next_identity_hash()` call here that
+            // would touch the global hash counter on every allocation.
+            //
+            // All other header fields (kind=0/Object,
+            // element_type=0/Reference, padding, array_length=0, gc_age=0,
+            // gc_flags=0, forwarding_ptr=null, mark_word=MARK_NEUTRAL)
+            // are already the correct values from the TLAB-zeroed refill.
+            //
+            // Layout reminder (from `types/src/heap_types.rs`):
+            //   off 16: num_slots (u32)
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                16,
+                num_fields as i32, // Cast: x86-64 immediate encoding
+            );
+            // RAX = obj_ptr — both arms converge with RAX holding the
+            // freshly-allocated object pointer.
+            self.emit_mov_r64_r64(RAX, R11);
+        } else {
+            // Hand off to post-init: tlab_post_init(vm_ptr, obj_ptr, cid, nf).
+            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+            self.emit_mov_r64_r64(ARG_REGS[1], R11);
+            self.emit_mov_imm32_sx(ARG_REGS[2], class_id_raw as i32); // Cast: ClassId fits in 32 bits
+            self.emit_mov_imm32_sx(ARG_REGS[3], num_fields as i32); // Cast: x86-64 immediate encoding
+            self.emit_call_absolute(self.helpers.tlab_post_init);
+        }
+
+        // Jump over the slow path; both arms converge with RAX = obj_ptr.
+        let done_patch = self.emit_jmp_rel32_patch();
+
+        // ----- slow_path -----
+        self.patch_rel32_to_here(null_thread_patch);
+        self.patch_rel32_to_here(tlab_full_patch);
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: ClassId fits in 32 bits
+        self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding
+        self.emit_call_absolute(self.helpers.new_object);
+
+        // ----- done -----
+        self.patch_rel32_to_here(done_patch);
+    }
+
+    // -----------------------------------------------------------------------
     // Operand stack helpers
     // -----------------------------------------------------------------------
 
@@ -6806,7 +7117,7 @@ impl Compiler {
         let stubs: Vec<(usize, usize, i64)> = self.deopt_stubs.clone();
 
         // Map from (bci, reason) to the emitted stub offset
-        let mut stub_offsets: HashMap<(usize, i64), usize> = HashMap::new();
+        let mut stub_offsets: FxHashMap<(usize, i64), usize> = FxHashMap::default();
 
         for &(patch_off, bci, reason) in &stubs {
             let key = (bci, reason);
@@ -9930,10 +10241,20 @@ impl Compiler {
                                 .iter()
                                 .find(|&&(mpc, _)| mpc == pc)
                                 .map(|&(_, ptr)| ptr);
+                            // Check for PIC slot at this PC. When both PIC
+                            // and MIC are present (the adaptive recompiler
+                            // promotes MIC → PIC and leaves the old MIC
+                            // slot live as a fallback), PIC takes
+                            // precedence: it caches a 3-entry superset.
+                            let pic_ptr = self
+                                .pic_slots
+                                .iter()
+                                .find(|&&(ppc, _)| ppc == pc)
+                                .map(|&(_, ptr)| ptr);
                             if std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
                                 eprintln!(
-                                    "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} {}.{}{}",
-                                    pc, op, info_ref.invoke_kind, mic_ptr.is_some(),
+                                    "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
+                                    pc, op, info_ref.invoke_kind, mic_ptr.is_some(), pic_ptr.is_some(),
                                     info_ref.class_name, info_ref.method_name, info_ref.descriptor,
                                 );
                             }
@@ -9959,6 +10280,341 @@ impl Compiler {
                                     self.emit_store_local(buf_offset, RAX);
                                 }
                             }
+
+                            // CRIT-8 — Inline MIC fast-path guard.
+                            //
+                            // Layout (verified by `test_jit_mic_slot_offsets` in
+                            // jit/src/lib.rs; struct is `#[repr(C)]`):
+                            //   offset  0  AtomicU32  cached_class_id
+                            //   offset  8  AtomicU64  cached_entry_ptr
+                            //   offset 16  AtomicBool cached_needs_context
+                            //
+                            // HIGH-7 follow-up — Inline 3-way PIC fast-path
+                            // guard. `JitPICSlot` is now `#[repr(C)]` with
+                            // hot atomic fields at the front (see
+                            // `jit/src/lib.rs:1305` and the layout assertion
+                            // `test_jit_pic_slot_offsets`):
+                            //
+                            //   CLASS_ID_OFFSETS     = [0, 4, 8]
+                            //   ENTRY_PTR_OFFSETS    = [16, 24, 32]
+                            //   NEEDS_CONTEXT_OFFSETS = [40, 41, 42]
+                            //
+                            // The Mutex<Option<String>> array (`class_names`)
+                            // is moved to the tail so its unstable layout
+                            // cannot disturb these offsets.
+                            //
+                            // When a PIC slot is allocated at this PC, we
+                            // emit a 3-way cascade in place of the MIC probe.
+                            // PIC supersedes MIC (it is a 3-entry superset)
+                            // so we do not emit BOTH guards.
+                            //
+                            // Hot-path sequence (PIC, ≈5 cycles on slot-0 hit):
+                            //   mov   r10, imm64(pic)
+                            //   mov   rax, [rbp - receiver_spill]
+                            //   mov   eax, [rax]                       ; class_id @ ObjectHeader+0
+                            //   ; --- per slot i in 0..3 ---
+                            //   cmp   eax, [r10 + CLASS_ID_OFFSETS[i]]
+                            //   jne   .try_{i+1}  (or .miss for i==2)
+                            //   cmp   byte [r10 + NEEDS_CONTEXT_OFFSETS[i]], 0
+                            //   je    .miss                            ; only inline ctx=true
+                            //   <load callee-ABI args: vm_ptr + arg_slots[0..n]>
+                            //   call  qword [r10 + ENTRY_PTR_OFFSETS[i]]
+                            //   jmp   .done
+                            //   ; --- end per-slot ---
+                            // .miss:
+                            //   <existing helper-ABI setup>
+                            //   call  jit_invoke_virtual_mic            ; same helper —
+                            //                                            ; it consults the
+                            //                                            ; underlying cache
+                            //                                            ; (MIC or PIC via the
+                            //                                            ; adaptive recompiler).
+                            // .done:
+                            //
+                            // Raw memory loads of the atomics are equivalent
+                            // to `Ordering::Relaxed` reads (no fences). A
+                            // torn class_id or stale entry pointer at worst
+                            // causes a miss → slow path; the helper
+                            // revalidates and re-resolves authoritatively.
+                            // Empty PIC entries hold class_id == 0, which the
+                            // doc reserves for `java.lang.Object` (never a
+                            // dispatch target here), so an empty slot
+                            // naturally fails its CMP and falls through.
+                            //
+                            // Fast-path eligibility (same as MIC):
+                            //   1. pic_ptr OR mic_ptr is Some.
+                            //   2. The receiver exists (n >= 1).
+                            //   3. The cached entry uses the JIT-context ABI
+                            //      (`cached_needs_context == true`); checked
+                            //      inline. Non-ctx callees fall to the
+                            //      helper.
+                            //   4. Total callee-ABI arg count (1 vm_ptr + n)
+                            //      fits in ARG_REGS.
+                            let needs_ctx_arg_count = n + 1; // vm_ptr + n receiver/params
+                            let args_fit = n >= 1 && needs_ctx_arg_count <= ARG_REGS.len();
+                            let pic_inline = pic_ptr.is_some() && args_fit;
+                            let mic_inline = !pic_inline && mic_ptr.is_some() && args_fit;
+                            // `.done` patches collected from each emitted
+                            // fast-path. Multiple in PIC's case (one per
+                            // slot), one in MIC's, none if neither inline
+                            // fires. All are JMP rel32 (5 bytes) so the
+                            // patch records a 4-byte signed displacement at
+                            // `patch_pos`.
+                            let mut done_patches32: Vec<usize> = Vec::new();
+                            // `.done` patches that are JMP rel8 (single
+                            // byte); MIC and the last PIC slot use these
+                            // when the skip distance is small enough.
+                            let mut done_patch: Option<usize> = None;
+                            let mut miss_patches: Vec<usize> = Vec::new();
+
+                            if pic_inline {
+                                let pic = pic_ptr.expect("pic_inline ⇒ pic_ptr Some");
+
+                                // Cache the layout constants locally so a
+                                // future const-rename in lib.rs surfaces as
+                                // a compile error here.
+                                const CLASS_ID_OFFS: [u8; 3] = [0, 4, 8];
+                                const ENTRY_PTR_OFFS: [u8; 3] = [16, 24, 32];
+                                const NEEDS_CTX_OFFS: [u8; 3] = [40, 41, 42];
+
+                                // Compile-time sanity: the byte offsets we
+                                // hardcode in the encodings below must
+                                // match the public constants exported by
+                                // `JitPICSlot`. A mismatch here would
+                                // silently dispatch to a stale entry_ptr.
+                                const _: () = assert!(
+                                    super::JitPICSlot::CLASS_ID_OFFSETS[0] == 0
+                                        && super::JitPICSlot::CLASS_ID_OFFSETS[1] == 4
+                                        && super::JitPICSlot::CLASS_ID_OFFSETS[2] == 8
+                                        && super::JitPICSlot::ENTRY_PTR_OFFSETS[0] == 16
+                                        && super::JitPICSlot::ENTRY_PTR_OFFSETS[1] == 24
+                                        && super::JitPICSlot::ENTRY_PTR_OFFSETS[2] == 32
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[0] == 40
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[1] == 41
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[2] == 42
+                                );
+
+                                // R10 = pic_ptr (imm64, up to 10 bytes)
+                                self.emit_mov_imm64(R10, pic as *const _ as i64); // Cast: function pointer for JIT call target
+
+                                // Load receiver pointer into RAX, then
+                                // class_id from ObjectHeader offset 0.
+                                let receiver_spill =
+                                    args_base_offset + ((n as i32) - 1) * 8; // Cast: x86-64 immediate encoding
+                                self.emit_load_local(RAX, receiver_spill);
+                                // MOV EAX, dword [RAX]  (2 bytes: 8B 00)
+                                self.buf.emit(&[0x8B, 0x00]);
+
+                                // Per-slot cascade. Inter-slot `jne` jumps
+                                // are rel8 and patched once we know the
+                                // start of the next slot. Final slot's
+                                // `jne` and every `je needs_ctx → .miss`
+                                // jump to the shared `.miss` label.
+                                //
+                                // `slot_starts[i]` is the byte position of
+                                // slot i's first emitted byte (the CMP
+                                // opcode); used to resolve inter-slot
+                                // `jne` rel8 patches once all slots are
+                                // emitted.
+                                let mut slot_starts: [usize; 3] = [0; 3];
+                                // (patch_pos, target_slot_index) for each
+                                // inter-slot `jne` rel8 that needs to land
+                                // at the start of slot `target_slot_index`.
+                                let mut next_slot_patches: Vec<(usize, usize)> = Vec::new();
+                                // CRIT-3 — miss branches use rel32 form
+                                // unconditionally. With n>=5 args on Linux
+                                // the cumulative body across all three
+                                // slots + slow-path prelude can exceed 127
+                                // bytes, overflowing the previous rel8
+                                // encoding (`0x74`/`0x75`). The rel32
+                                // forms (`0x0F 0x84`/`0x0F 0x85` + 4-byte
+                                // disp) always fit. `miss_patches_rel32`
+                                // stores the byte offset of the 4-byte
+                                // displacement immediate, patched at the
+                                // shared `.miss` label below.
+                                let mut miss_patches_rel32: Vec<usize> = Vec::new();
+
+                                for i in 0..3usize {
+                                    slot_starts[i] = self.buf.pos();
+
+                                    // CMP EAX, dword [R10 + CLASS_ID_OFFS[i]]
+                                    // Encoding: REX.B (0x41) + 3B /r + modrm
+                                    //   modrm = mod(01) reg(EAX=0) rm(R10's
+                                    //   low 3=010) → 0x42, then disp8.
+                                    self.buf
+                                        .emit(&[0x41, 0x3B, 0x42, CLASS_ID_OFFS[i]]);
+
+                                    if i < 2 {
+                                        // JNE rel8 → start of slot i+1
+                                        // (patched below once slot i+1's
+                                        // start position is known).
+                                        // Inter-slot distances stay small
+                                        // (a single slot body is ~30
+                                        // bytes for n<=5), so rel8 is
+                                        // sufficient here — only the
+                                        // miss/needs_ctx branches need
+                                        // rel32 (see CRIT-3 comment above).
+                                        self.buf.emit(&[0x75, 0x00]);
+                                        let patch = self.buf.pos() - 1;
+                                        next_slot_patches.push((patch, i + 1));
+                                    } else {
+                                        // Final slot: JNE rel32 → .miss
+                                        // (6 bytes: 0x0F 0x85 + i32 disp).
+                                        // Slot 2's miss target sits past
+                                        // slots 0..2 cascades is reachable
+                                        // in rel8 but we keep rel32 for
+                                        // consistency with slot 0/1 and
+                                        // because the slow-path prelude
+                                        // following the cascade can push
+                                        // the distance over 127 bytes.
+                                        self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                                        miss_patches_rel32.push(self.buf.pos() - 4);
+                                    }
+
+                                    // CMP BYTE [R10 + NEEDS_CTX_OFFS[i]], 0
+                                    // 5 bytes: REX.B (0x41) + 80 /7 + modrm
+                                    //   modrm = mod(01) reg(/7=111) rm(010)
+                                    //         = 0b01_111_010 = 0x7A
+                                    //   + disp8 + imm8(0)
+                                    self.buf
+                                        .emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
+
+                                    // JE rel32 → .miss (6 bytes:
+                                    // 0x0F 0x84 + i32 disp).  CRIT-3:
+                                    // rel8 here overflowed in release
+                                    // builds for n>=5 args, silently
+                                    // wrapping into the next slot — UB
+                                    // dispatch. rel32 always fits.
+                                    self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                    miss_patches_rel32.push(self.buf.pos() - 4);
+
+                                    // ---- Set up callee ABI: vm_ptr + n args ----
+                                    self.emit_load_local(
+                                        ARG_REGS[0],
+                                        self.heap_local_offset,
+                                    );
+                                    for j in 0..n {
+                                        let spill_off = args_base_offset
+                                            + ((n - 1 - j) as i32) * 8; // Cast: x86-64 immediate encoding
+                                        self.emit_load_local(ARG_REGS[j + 1], spill_off);
+                                    }
+
+                                    // CALL qword [R10 + ENTRY_PTR_OFFS[i]]
+                                    // 4 bytes: REX.B (0x41) + FF /2 + modrm
+                                    //   modrm = mod(01) reg(/2=010) rm(010)
+                                    //         = 0b01_010_010 = 0x52
+                                    //   + disp8.
+                                    self.buf
+                                        .emit(&[0x41, 0xFF, 0x52, ENTRY_PTR_OFFS[i]]);
+
+                                    // JMP rel32 → .done. Use rel32 because
+                                    // for slots 0 and 1 the skip distance
+                                    // (remaining slot bodies + slow path)
+                                    // routinely exceeds 127 bytes. Slot 2's
+                                    // .done jump is short but we keep rel32
+                                    // uniform — 3 extra bytes total vs
+                                    // branching logic.
+                                    // E9 cd: JMP rel32 (5 bytes).
+                                    self.buf.emit(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                                    done_patches32.push(self.buf.pos() - 4);
+                                }
+
+                                // Resolve inter-slot `jne` rel8 patches now
+                                // that every slot's start is known.
+                                for (jne_patch, target_slot) in &next_slot_patches {
+                                    let slot_start = slot_starts[*target_slot];
+                                    let rel = (slot_start as i64) - (*jne_patch as i64 + 1);
+                                    debug_assert!(
+                                        (-128..=127).contains(&rel),
+                                        "inline PIC inter-slot jne overflowed rel8 ({} bytes)",
+                                        rel
+                                    );
+                                    self.buf.patch_byte(*jne_patch, rel as u8); // Cast: rel8 displacement
+                                }
+
+                                // .miss: patch all `je needs_ctx → .miss`
+                                // and (for slot 2) `jne → .miss` to land
+                                // HERE — the start of the slow-path block
+                                // emitted below.  CRIT-3: these are all
+                                // rel32 form, so the patch site holds a
+                                // 4-byte signed displacement computed
+                                // from the byte AFTER the immediate
+                                // (patch + 4) to the target.
+                                let miss_off = self.buf.pos();
+                                for patch in &miss_patches_rel32 {
+                                    let rel = (miss_off as i64) - (*patch as i64 + 4);
+                                    debug_assert!(
+                                        (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+                                        "inline PIC miss branch overflowed rel32 ({} bytes)",
+                                        rel
+                                    );
+                                    self.buf.patch_i32(*patch, rel as i32); // Cast: rel32 displacement
+                                }
+                                // `miss_patches` (the legacy rel8 vector)
+                                // remains in scope for the MIC arm below;
+                                // PIC inline does not push into it any
+                                // more, so nothing to clear here.
+                            } else if mic_inline {
+                                let mic = mic_ptr.expect("mic_inline ⇒ mic_ptr Some");
+                                // R10 = mic_ptr (imm64, 10 bytes)
+                                self.emit_mov_imm64(R10, mic as *const _ as i64); // Cast: function pointer for JIT call target
+
+                                // Load receiver pointer into RAX. Receiver is
+                                // arg_slots[0], spilled at the *highest* offset
+                                // (lowest address) in the args buffer.
+                                let receiver_spill = args_base_offset + ((n as i32) - 1) * 8; // Cast: x86-64 immediate encoding
+                                self.emit_load_local(RAX, receiver_spill);
+
+                                // MOV EAX, dword [RAX]  — load class_id (ObjectHeader+0).
+                                // 2 bytes: 8B 00
+                                self.buf.emit(&[0x8B, 0x00]);
+
+                                // CMP EAX, dword [R10 + 0]  — vs cached_class_id.
+                                // 3 bytes: REX.B (0x41) + 3B /r + modrm(00 000 010)
+                                self.buf.emit(&[0x41, 0x3B, 0x02]);
+
+                                // JNE rel8 → .miss  (2 bytes, patched)
+                                self.buf.emit(&[0x75, 0x00]);
+                                miss_patches.push(self.buf.pos() - 1);
+
+                                // CMP BYTE [R10 + 16], 0  — gate on cached_needs_context.
+                                // 5 bytes: REX.B (0x41) + 80 /7 + modrm(01 111 010) + disp8 + imm8
+                                self.buf.emit(&[0x41, 0x80, 0x7A, 0x10, 0x00]);
+
+                                // JE rel8 → .miss  (needs_ctx == false ⇒ fall back to helper)
+                                self.buf.emit(&[0x74, 0x00]);
+                                miss_patches.push(self.buf.pos() - 1);
+
+                                // ---- Set up callee ABI: (vm_ptr, arg_slots[0..n]) ----
+                                // vm_ptr → ARG_REGS[0]
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                // arg_slots[i] → ARG_REGS[i + 1]
+                                for i in 0..n {
+                                    let spill_off = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
+                                    self.emit_load_local(ARG_REGS[i + 1], spill_off);
+                                }
+
+                                // CALL qword [R10 + 8]  — cached_entry_ptr.
+                                // 4 bytes: REX.B (0x41) + FF /2 + modrm(01 010 010) + disp8
+                                self.buf.emit(&[0x41, 0xFF, 0x52, 0x08]);
+
+                                // JMP rel8 → .done  (2 bytes, patched)
+                                self.buf.emit(&[0xEB, 0x00]);
+                                done_patch = Some(self.buf.pos() - 1);
+
+                                // .miss: patch both rel8 sites here.
+                                let miss_off = self.buf.pos();
+                                for patch in &miss_patches {
+                                    let rel = (miss_off as i64) - (*patch as i64 + 1);
+                                    debug_assert!(
+                                        (-128..=127).contains(&rel),
+                                        "inline MIC miss branch overflowed rel8 ({} bytes)",
+                                        rel
+                                    );
+                                    self.buf.patch_byte(*patch, rel as u8); // Cast: rel8 displacement
+                                }
+                            }
+
+                            // ---- Slow path: helper ABI setup + call ----
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64); // Cast: function pointer for JIT call target
                             if n > 0 {
@@ -9970,22 +10626,38 @@ impl Compiler {
                             self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
 
                             if let Some(mic) = mic_ptr {
-                                // MIC-optimized dispatch: pass MIC slot as 5th arg
-                                // On Windows x64, 5th arg goes on the stack at [RSP+32]
-                                // But we use a 5-arg helper via emit_call_absolute which
-                                // uses RAX for the call — so we pass mic via stack slot
+                                // MIC-optimized dispatch: pass MIC slot as 5th
+                                // arg and (CRIT-1) PIC slot as 6th arg so the
+                                // helper can populate the inline 3-way cascade
+                                // via `JitPICSlot::install` on every successful
+                                // resolution. A `pic_ptr == 0` tells the helper
+                                // no PIC is installed for this site.
+                                //
+                                // On Windows x64, args 5 and 6 go on the stack
+                                // at [RSP+32] and [RSP+40] (shadow + spill).
+                                // emit_call_absolute uses RAX, so we stage
+                                // each pointer through RAX → memory.
+                                let pic_arg: i64 = pic_ptr
+                                    .map(|p| p as *const _ as i64)
+                                    .unwrap_or(0); // Cast: function pointer for JIT call target
                                 #[cfg(target_os = "windows")]
                                 {
-                                    // 5th arg at [RSP + 32] (shadow space slot)
+                                    // 5th arg at [RSP + 32]
                                     self.emit_mov_imm64(RAX, mic as *const _ as i64); // Cast: function pointer for JIT call target
                                     // MOV [RSP + 32], RAX
                                     self.rex_w();
                                     self.buf.emit(&[0x89, 0x44, 0x24, 0x20]);
+                                    // 6th arg at [RSP + 40]
+                                    self.emit_mov_imm64(RAX, pic_arg);
+                                    // MOV [RSP + 40], RAX
+                                    self.rex_w();
+                                    self.buf.emit(&[0x89, 0x44, 0x24, 0x28]);
                                 }
                                 #[cfg(not(target_os = "windows"))]
                                 {
-                                    // SysV: 5th arg in R8 (already have 4 in RDI,RSI,RDX,RCX)
+                                    // SysV: 5th arg in R8, 6th in R9.
                                     self.emit_mov_imm64(R8, mic as *const _ as i64); // Cast: function pointer for JIT call target
+                                    self.emit_mov_imm64(R9, pic_arg);
                                 }
                                 self.emit_call_absolute(
                                     self.helpers.invoke_virtual_mic,
@@ -9995,6 +10667,35 @@ impl Compiler {
                                 self.emit_call_absolute(
                                     self.helpers.invoke_dispatch,
                                 );
+                            }
+
+                            // .done: patch the fast-path forward JMP(s).
+                            //   - `done_patch`     (rel8, MIC inline)
+                            //   - `done_patches32` (rel32, PIC inline — one
+                            //                       per cache slot)
+                            let done_off = self.buf.pos();
+                            if let Some(patch) = done_patch {
+                                let rel = (done_off as i64) - (patch as i64 + 1);
+                                debug_assert!(
+                                    (-128..=127).contains(&rel),
+                                    "inline MIC done jump overflowed rel8 ({} bytes)",
+                                    rel
+                                );
+                                self.buf.patch_byte(patch, rel as u8); // Cast: rel8 displacement
+                            }
+                            for patch in &done_patches32 {
+                                // `patch` points at the start of the rel32
+                                // immediate (4 bytes); the JMP opcode (E9)
+                                // precedes it by 1 byte. The displacement
+                                // is computed from the byte AFTER the
+                                // immediate (patch + 4) to the target.
+                                let rel = (done_off as i64) - (*patch as i64 + 4);
+                                debug_assert!(
+                                    (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+                                    "inline PIC done jump overflowed rel32 ({} bytes)",
+                                    rel
+                                );
+                                self.buf.patch_i32(*patch, rel as i32); // Cast: rel32 displacement
                             }
                             // T1.1.2 — every virtual/interface dispatch is
                             // a full safepoint: the callee may allocate,
@@ -10069,23 +10770,82 @@ impl Compiler {
                         let resolved = self
                             .new_info
                             .iter()
-                            .find(|(p, _, _)| *p == pc)
+                            .find(|(p, _, _, _, _)| *p == pc)
                             .copied();
-                        let (_, class_id_raw, num_fields) = match resolved {
-                            Some(info) => info,
-                            None => {
-                                return false;
-                            }
-                        };
-                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
-                        self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding
-                        self.emit_call_absolute(self.helpers.new_object);
+                        let (_, class_id_raw, num_fields, has_prim_init, has_finalizer) =
+                            match resolved {
+                                Some(info) => info,
+                                None => {
+                                    return false;
+                                }
+                            };
+
+                        // HIGH-6 JIT audit (object_allocation/1000 3-5x gap):
+                        // emit an inline TLAB bump-pointer fast path when the
+                        // helper table is fully wired AND the class is small
+                        // enough to bump in a single LEA disp32 (< 256 bytes
+                        // total, which covers HashMap.Node, ArrayList$Itr,
+                        // and ~99% of common allocation sites). Larger
+                        // objects and the test-helper path (no `get_current_thread`
+                        // wired) fall through to the unconditional helper call.
+                        //
+                        // The inline path bumps `thread.tlab.cursor`, writes
+                        // `class_id` at obj_ptr+0, then tail-calls
+                        // `jit_post_tlab_init` to finish header + primitive
+                        // defaults + finalizer registration. The bump itself
+                        // is ~6 instructions; HotSpot achieves ~5-7. The
+                        // remaining work (hash mint, num_slots write, class-
+                        // metadata RwLock for primitive defaults) is in the
+                        // post-init helper — kept out of inline because
+                        // synthesising it would require per-field descriptor
+                        // plumbing that isn't currently in `new_info`.
+                        let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+                        let can_inline = self.helpers.get_current_thread != 0
+                            && self.helpers.tlab_post_init != 0
+                            && self.helpers.new_object != 0
+                            && total_size <= 256
+                            && self.needs_heap; // need vm_ptr in heap_local slot
+
+                        if can_inline {
+                            // CRIT-2 — when neither primitive-init nor
+                            // finalizer registration is required, skip
+                            // the `jit_post_tlab_init` helper and write
+                            // identity_hash/num_slots inline. Most JDK
+                            // micro-objects (HashMap.Node, ArrayList$Itr,
+                            // Iterator chains, all-reference field
+                            // bearers) hit this fast path. The
+                            // resolution of these flags currently
+                            // requires extending `cp_new_resolver` (see
+                            // the `new_info` doc in `jit/src/lib.rs`),
+                            // so the conservative default `(true,true)`
+                            // keeps the helper call in place for now.
+                            let skip_helper = !has_prim_init && !has_finalizer;
+                            self.emit_inline_tlab_new(
+                                class_id_raw,
+                                num_fields,
+                                skip_helper,
+                            );
+                        } else {
+                            // Slow path: full helper-call dispatch. Used when
+                            //   - the helper table is partial (tests),
+                            //   - the object exceeds 256 bytes (rare —
+                            //     HotSpot also bails on these),
+                            //   - or the method's prologue did not stash
+                            //     `vm_ptr` in a frame slot.
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
+                            self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding
+                            self.emit_call_absolute(self.helpers.new_object);
+                        }
                         // T1.1.a — `new` is a GC-triggering safepoint.
                         // Emit an oop map for the slots that were live
                         // BEFORE the call (the return value hasn't
                         // been pushed yet, so the stack state here
-                        // reflects the surviving operands).
+                        // reflects the surviving operands). Both arms
+                        // (inline and slow) may trigger GC: the inline
+                        // path's post-init helper can grow the
+                        // finalizer queue and the slow path obviously
+                        // can young-GC.
                         self.emit_oop_map_for_safepoint();
                         self.push_from_rax();
                         // The result is an object reference.
@@ -10457,11 +11217,27 @@ pub fn compile(
     field_info: Vec<(usize, usize, u8)>,
     typecheck_info: Vec<(usize, *const u8, usize)>,
     static_field_info: Vec<(usize, u32, usize, u8, bool)>,
-    new_info: Vec<(usize, u32, usize)>,
+    // CRIT-2 — see `new_info` field doc on the compiler struct.
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
     anewarray_info: Vec<(usize, u32)>,
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     direct_calls: Vec<(usize, super::JitDirectCall)>,
     mic_slots: Vec<(usize, *const super::JitMICSlot)>,
+    // HIGH-7 — Inline 3-way PIC slots passed alongside MIC slots.
+    //
+    // Each entry is `(bytecode_pc, &JitPICSlot as *const _)`. When a
+    // PIC slot is present at a given pc, the codegen in
+    // `Compiler::compile_op_invokevirtual` emits the 3-way inline
+    // cascade in place of the MIC probe (PIC supersedes MIC — it is
+    // a 3-entry superset). The slot itself is allocated and owned by
+    // the caller (`jit/src/lib.rs::try_compile`); it must outlive the
+    // compiled method, which is ensured by attaching the boxed slot
+    // to `CompiledMethod._jit_pic_slots`.
+    //
+    // Callers that don't yet allocate PIC slots (e.g. legacy test
+    // call sites that build short bytecode snippets) pass
+    // `Vec::new()` and the cascade is simply not emitted at any pc.
+    pic_slots: Vec<(usize, *const super::JitPICSlot)>,
     ldc_info: Vec<(usize, i64)>,
     ldc2w_info: Vec<(usize, i64)>,
     branch_hints: HashMap<usize, bool>,
@@ -10644,10 +11420,28 @@ pub fn compile(
         );
     }
     compiler.mic_slots = mic_slots;
+    // HIGH-7 — Inline 3-way PIC fast-path wiring (now active).
+    //
+    // The codegen in `Compiler::compile_op_invokevirtual` (search
+    // `pic_inline`) keys off `compiler.pic_slots`. With the
+    // `pic_slots` parameter now threaded through, callers that
+    // eagerly allocate a `Box<JitPICSlot>` per polymorphic call
+    // site (see `jit/src/lib.rs::try_compile`) activate the inline
+    // cascade. Slots start empty (class_id == 0 at all 3 entries),
+    // so the CMP cascade falls straight through to the helper on
+    // first invocation; once the runtime helper populates a slot,
+    // subsequent dispatches take the inline fast path.
+    if std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
+        eprintln!("[JIT_GEN_INSTALL] pic_slots count={} pcs={:?}",
+            pic_slots.len(),
+            pic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
+        );
+    }
+    compiler.pic_slots = pic_slots;
     compiler.unroll_loops = unroll_loops;
     compiler.simd_loops = simd_loops;
-    compiler.branch_hints = branch_hints;
-    compiler.loop_unroll_hints = loop_unroll_hints;
+    compiler.branch_hints = branch_hints.into_iter().collect();
+    compiler.loop_unroll_hints = loop_unroll_hints.into_iter().collect();
     compiler.ldc_info = ldc_info;
     compiler.ldc2w_info = ldc2w_info;
     compiler.fp_hoist_info = fp_hoist_info;
@@ -10656,7 +11450,7 @@ pub fn compile(
     compiler.scalar_replaced = sr_plan.objects;
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
-    compiler.inline_sites = inline_sites;
+    compiler.inline_sites = inline_sites.into_iter().collect();
     // T5.2.1 + T5.2.14 — transfer the pre-computed analyses.
     compiler.induction_vars = induction_vars;
     compiler.null_check_info = null_check_info;
@@ -11011,6 +11805,17 @@ mod tests {
             uncommon_trap: sentinel,
             math_fma_double: sentinel,
             math_fma_float: sentinel,
+            // Inline TLAB bump wiring is exercised only in the real VM
+            // helper-table path. Tests use the helper-call fallback so
+            // leave the cursor/end offsets at 0 (layout-safe for `Tlab`
+            // with `cursor` at offset 0) and the optional thread-pointer
+            // helper unset — `get_current_thread == 0` tells the JIT to
+            // emit the pre-existing `new_object` call.
+            tlab_cursor_offset_in_thread: 0,
+            tlab_end_offset_in_thread: 8,
+            class_id_offset_in_obj: 0,
+            get_current_thread: 0,
+            tlab_post_init: 0,
         }
     }
 
@@ -11039,6 +11844,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11080,6 +11886,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11117,6 +11924,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11154,6 +11962,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11212,6 +12021,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11293,6 +12103,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11337,6 +12148,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11383,6 +12195,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11426,6 +12239,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11545,6 +12359,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11581,6 +12396,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
                 Vec::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -11620,6 +12436,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11655,6 +12472,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
                 Vec::new(),
                 HashMap::new(),
                 HashMap::new(),
@@ -11694,6 +12512,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11733,6 +12552,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11772,6 +12592,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11810,6 +12631,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11855,6 +12677,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11900,6 +12723,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11946,6 +12770,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -11984,6 +12809,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12009,6 +12835,7 @@ mod tests {
             &code, code_len, 2, 2, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -12052,6 +12879,7 @@ mod tests {
             })],
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12098,6 +12926,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12176,6 +13005,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12212,6 +13042,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12245,6 +13076,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12276,6 +13108,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12315,6 +13148,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12351,6 +13185,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12384,6 +13219,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12417,6 +13253,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12455,6 +13292,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12494,6 +13332,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12529,6 +13368,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12562,6 +13402,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12598,6 +13439,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12635,6 +13477,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12667,6 +13510,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12699,6 +13543,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12734,6 +13579,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12765,6 +13611,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12796,6 +13643,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12828,6 +13676,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12864,6 +13713,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12923,6 +13773,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -12973,6 +13824,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13022,6 +13874,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13059,6 +13912,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13108,6 +13962,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13162,6 +14017,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13220,6 +14076,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13268,6 +14125,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13319,6 +14177,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13378,6 +14237,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13429,6 +14289,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13507,6 +14368,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13564,6 +14426,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13613,6 +14476,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13671,6 +14535,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13720,6 +14585,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -13945,6 +14811,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14085,6 +14952,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14130,6 +14998,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14181,6 +15050,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14237,6 +15107,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14298,6 +15169,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14351,6 +15223,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14398,6 +15271,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14450,6 +15324,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14508,6 +15383,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14578,6 +15454,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14774,6 +15651,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14894,6 +15772,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14944,6 +15823,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -14995,6 +15875,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15048,6 +15929,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15112,6 +15994,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15183,6 +16066,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15400,6 +16284,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15627,6 +16512,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15716,6 +16602,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15832,6 +16719,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -15991,6 +16879,88 @@ mod tests {
         );
     }
 
+    /// HIGH-6 — verify the inline TLAB bump-pointer codegen produces an
+    /// executable method that correctly falls through to the slow path
+    /// when the TLS thread pointer is null (the JE-on-null branch in
+    /// `emit_inline_tlab_new`). Using stubs avoids a full VM init so this
+    /// test is NOT gated behind the `vm-tests` feature.
+    #[test]
+    fn test_inline_tlab_new_falls_through_on_null_thread() {
+        // Stub: pretend there is no current thread (re-entrant or pre-init
+        // state). The inline path must take the JE branch to the slow path
+        // and we then short-circuit with a sentinel `new_object` return.
+        unsafe extern "C" fn null_thread() -> *mut std::ffi::c_void {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn fake_new_object(_vm: i64, _cid: i64, _nf: i64) -> i64 {
+            0xDEAD_BEEFi64
+        }
+        unsafe extern "C" fn unimplemented_post_init(
+            _vm: i64,
+            _obj: i64,
+            _cid: i64,
+            _nf: i64,
+        ) -> i64 {
+            panic!("post_tlab_init must not be called when thread is null");
+        }
+
+        // Build a custom helper table with the inline path WIRED so
+        // `can_inline` is true (get_current_thread, tlab_post_init,
+        // new_object all non-null), but `get_current_thread` returns
+        // null at runtime to force the slow path inside the emitted
+        // inline cascade.
+        let mut helpers = test_helpers();
+        helpers.get_current_thread = null_thread as *const () as usize;
+        helpers.tlab_post_init = unimplemented_post_init as *const () as usize;
+        helpers.new_object = fake_new_object as *const () as usize;
+        // The offsets don't matter — they're only read when the
+        // thread pointer is non-null.
+        helpers.tlab_cursor_offset_in_thread = 0;
+        helpers.tlab_end_offset_in_thread = 8;
+
+        // Method: new #1; astore_1; aload_1; areturn (cls=42, fields=3).
+        let code: Vec<u8> = vec![0xbb, 0x00, 0x01, 0x4c, 0x2b, 0xb0, 0, 0];
+        let code_len = 6;
+        // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
+        // Tests use conservative `(true, true)` so the helper path is exercised.
+        let new_info: Vec<(usize, u32, usize, bool, bool)> = vec![(0, 42, 3, true, true)];
+
+        let compiled = compile(
+            &code,
+            code_len,
+            0,
+            2,
+            true, // needs_heap → can_inline gate passes
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            new_info,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+        )
+        .expect("inline-TLAB new opcode should compile");
+
+        // SAFETY: Calling JIT-compiled machine code with a sentinel VM pointer.
+        // The fake_new_object stub does not touch the pointer.
+        let result = unsafe { compiled.call_with_context(0xCAFE_F00D, &[]) };
+        assert_eq!(
+            result, 0xDEAD_BEEFi64,
+            "inline TLAB cascade must fall through to slow-path fake_new_object \
+             when get_current_thread returns null"
+        );
+    }
+
     #[cfg(feature = "vm-tests")]
     #[test]
     fn test_jit_new_object_codegen() {
@@ -16007,7 +16977,9 @@ mod tests {
         let code_len = 6;
 
         // Provide new_info: class_id=42, num_fields=3
-        let new_info: Vec<(usize, u32, usize)> = vec![(0, 42, 3)];
+        // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
+        // Tests use conservative `(true, true)` so the helper path is exercised.
+        let new_info: Vec<(usize, u32, usize, bool, bool)> = vec![(0, 42, 3, true, true)];
         let compiled = compile(
             &code,
             code_len,
@@ -16024,6 +16996,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16077,6 +17050,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16136,6 +17110,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16194,6 +17169,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16247,6 +17223,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16290,6 +17267,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16344,6 +17322,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(),
             HashMap::new(),
             HashMap::new(),
@@ -16394,7 +17373,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 2, 2, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16427,7 +17408,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 2, 2, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16471,7 +17454,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 3, 3, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16624,7 +17609,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             ldc2w_info, HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16770,7 +17757,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16796,7 +17785,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16823,7 +17814,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 2, 2, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16851,7 +17844,9 @@ mod tests {
         let compiled = compile(
             &code, code_len, 2, 2, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
+            Vec::new(),
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
@@ -16935,7 +17930,8 @@ mod tests {
         let code_len = 18;
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
-        let new_info = vec![(0usize, 1u32, 2usize)]; // 2 fields
+        // CRIT-2 tuple: (pc, class_id, num_fields, has_prim_init, has_finalizer).
+        let new_info = vec![(0usize, 1u32, 2usize, true, true)]; // 2 fields
         // Create invoke_info for <init>()V at PC=4
         let init_info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -16971,7 +17967,8 @@ mod tests {
         ];
         // NOT in non_escaping_new → should produce empty plan
         let non_escaping = std::collections::HashSet::new();
-        let new_info = vec![(0usize, 1u32, 2usize)];
+        // CRIT-2 tuple shape: see compiler struct doc.
+        let new_info = vec![(0usize, 1u32, 2usize, true, true)];
         let plan = plan_scalar_replacement(&code, 8, &non_escaping, &new_info, &[], 0);
         assert!(plan.objects.is_empty());
         assert!(plan.field_ops.is_empty());
@@ -16991,7 +17988,8 @@ mod tests {
         ];
         let mut non_escaping = std::collections::HashSet::new();
         non_escaping.insert(0usize);
-        let new_info = vec![(0usize, 1u32, 2usize)];
+        // CRIT-2 tuple shape: see compiler struct doc.
+        let new_info = vec![(0usize, 1u32, 2usize, true, true)];
         let init_info = Box::leak(Box::new(JitInvokeInfo { // LEAK(intentional): test-only; JitInvokeInfo must outlive JIT-compiled code pointer
             class_name: Box::leak("Test".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
             method_name: Box::leak("<init>".to_string().into_boxed_str()), // LEAK(intentional): test-only; string field of leaked JitInvokeInfo
@@ -17112,6 +18110,7 @@ mod tests {
             code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(), HashMap::new(),
         )
@@ -17339,7 +18338,7 @@ mod tests {
             false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), // pic_slots
             HashMap::new(),
             HashMap::new(),
             &test_helpers(),

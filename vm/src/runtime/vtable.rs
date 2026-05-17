@@ -238,7 +238,15 @@ impl Vtable {
         let key = fast_lookup_key(name, descriptor);
         let candidates = self.fast_lookup.get(&key)?;
         for &slot in candidates {
-            let entry = self.entries.get(slot)?.as_ref()?;
+            // HIGH-6 — verify each candidate; on bucket collision we
+            // continue rather than short-circuit. A `None` or
+            // out-of-range slot here would indicate index/entries
+            // drift, which shouldn't happen under the current insert
+            // paths, but skipping silently keeps the lookup correct.
+            let entry = match self.entries.get(slot).and_then(|e| e.as_ref()) {
+                Some(e) => e,
+                None => continue,
+            };
             if &*entry.method_name == name && &*entry.descriptor == descriptor {
                 return Some(slot);
             }
@@ -480,10 +488,11 @@ impl VtableManager {
     /// marked resolved. Called from the interpreter's `invokevirtual`
     /// and `invokeinterface` sites after Agent Theta wires them in.
     ///
-    /// The only allocation on the hit path is the `String` clones inside
-    /// the returned `VtableEntry` (name + descriptor). Callers that need
-    /// strictly allocation-free dispatch should read the entry via
-    /// `vtable_ref` below.
+    /// HIGH-5 — the returned clone is now O(1): `method_name` and
+    /// `descriptor` are `Arc<str>` so cloning the entry is a pair of
+    /// refcount bumps rather than two heap copies. Callers that don't
+    /// need an owned entry can still prefer `vtable_entry_ref` below
+    /// to avoid even the refcount traffic.
     pub fn resolve_virtual_slot(&self, class_id: u64, slot: usize) -> Option<VtableEntry> {
         let vtable = self.tables.get(&class_id)?;
         let entry = vtable.get(slot)?;
@@ -662,8 +671,8 @@ pub fn vtable_install_adapter(
                                 d.declaring_class_id,
                             ),
                             class_name: Arc::<str>::from(snap.class_name.as_str()),
-                            method_name: Arc::<str>::from(d.method_name.as_str()),
-                            method_descriptor: Arc::<str>::from(d.descriptor.as_str()),
+                            method_name: Arc::clone(&d.method_name),
+                            method_descriptor: Arc::clone(&d.descriptor),
                             source_file: snap.source_file.as_deref().map(Arc::<str>::from),
                             code: padded,
                             exception_table: Arc::<[_]>::from(snap.exception_table.as_slice()),
@@ -681,12 +690,11 @@ pub fn vtable_install_adapter(
                 VtableEntry {
                     declaring_class_id: d.declaring_class_id as u64,
                     method_index: d.method_index,
-                    // HIGH-5 — promote the owned `String` from the
-                    // descriptor into an `Arc<str>` once here so the
-                    // hot-path `VtableEntry::clone()` (called on every
-                    // virtual dispatch) only bumps a refcount.
-                    method_name: Arc::<str>::from(d.method_name),
-                    descriptor: Arc::<str>::from(d.descriptor),
+                    // HIGH-5 — descriptor's `method_name`/`descriptor` are
+                    // already `Arc<str>` (T10.9.E classloading conversion);
+                    // moving them in here is a single refcount transfer.
+                    method_name: d.method_name,
+                    descriptor: d.descriptor,
                     resolved: true,
                     resolved_method,
                     is_native,

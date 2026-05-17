@@ -10,14 +10,48 @@
 //! The EDT does **not** spawn an OS thread itself -- the JVM manages the
 //! thread and calls into this module to pump events.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use rustc_hash::FxHashMap;
+use rustjvm_types::ObjectRef;
 
 use crate::event::{AwtEvent, AwtEventData, PeerId, event_id};
+
+// ---------------------------------------------------------------------------
+// Runnable registry — used by invokeLater / invokeAndWait
+// ---------------------------------------------------------------------------
+//
+// `EventQueue.invokeLater(Runnable)` posts an `InvocationEvent` to the EDT
+// whose `dispatch()` method must eventually call `Runnable.run()` on the EDT.
+//
+// Before round-2 of N2-5 the runnable was thrown away — the EDT just polled
+// the queue, signalled `invokeAndWait` waiters on dequeue, and returned
+// nothing to the Java-side `EventQueue.getNextEvent`.  Every `invokeLater`
+// callback silently disappeared.
+//
+// The fix:
+//   1. `invoke_later` / `invoke_and_wait` register the Runnable here keyed
+//      by a freshly-allocated callback id.
+//   2. The Java-side `EventQueue.getNextEvent` native (see `natives.rs`)
+//      allocates a `java/awt/event/InvocationEvent`, binds its identity
+//      hash to the callback id, and returns it.
+//   3. The EDT calls `InvocationEvent.dispatch()V` (also a native, in
+//      `natives.rs`), which looks up the Runnable, invokes
+//      `run()V` virtually, signals `invoke_and_wait` waiters, and drops
+//      the registry entries.
+
+// ---------------------------------------------------------------------------
+// Completion handles for `invoke_and_wait`
+// ---------------------------------------------------------------------------
+
+/// Shared (mutex, condvar) pair used to signal completion of an
+/// `invoke_and_wait` invocation.  The bool is `true` once the EDT has
+/// (at minimum) dequeued the corresponding invocation event.
+type CompletionHandle = Arc<(Mutex<bool>, Condvar)>;
 
 // ---------------------------------------------------------------------------
 // Thread-local EDT marker
@@ -59,6 +93,22 @@ pub struct EventDispatchThread {
     running: Arc<AtomicBool>,
     wake_sender: Mutex<mpsc::Sender<()>>,
     wake_receiver: Arc<Mutex<mpsc::Receiver<()>>>,
+    /// Side-table of pending `invoke_and_wait` completions keyed by
+    /// callback_id.  Populated by `invoke_and_wait` before posting the
+    /// invocation event; drained and signalled by the `InvocationEvent.
+    /// dispatch()V` native AFTER `Runnable.run()` returns (see
+    /// [`Self::signal_invocation_complete`]).
+    pending_invocations: Mutex<HashMap<u64, CompletionHandle>>,
+    /// Side-table of pending Runnables, keyed by callback_id.  Populated by
+    /// `register_runnable` (called from the `invokeLater` /
+    /// `invokeAndWait` natives); read & removed by the `InvocationEvent.
+    /// dispatch()V` native via [`Self::take_runnable`].
+    runnables: Mutex<FxHashMap<u64, ObjectRef>>,
+    /// Monotonic counter for callback ids.  We can't reuse the Runnable's
+    /// identity hash because (a) two separate `invokeLater(sameRunnable)`
+    /// calls must each dispatch once, and (b) identity hash codes are i32
+    /// and could collide.
+    next_callback_id: AtomicU64,
 }
 
 impl EventDispatchThread {
@@ -70,7 +120,30 @@ impl EventDispatchThread {
             running: Arc::new(AtomicBool::new(false)),
             wake_sender: Mutex::new(tx),
             wake_receiver: Arc::new(Mutex::new(rx)),
+            pending_invocations: Mutex::new(HashMap::new()),
+            runnables: Mutex::new(FxHashMap::default()),
+            // Start above 0 so callers can safely use `0` as "no id".
+            next_callback_id: AtomicU64::new(1),
         }
+    }
+
+    /// Allocate a fresh monotonic callback id.
+    pub fn next_callback_id(&self) -> u64 {
+        self.next_callback_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Register a Runnable ObjectRef under a callback id.  Called from the
+    /// `invokeLater` / `invokeAndWait` natives BEFORE posting the
+    /// corresponding `AwtEvent::invocation` so that the dispatch site
+    /// can always find the Runnable.
+    pub fn register_runnable(&self, callback_id: u64, runnable: ObjectRef) {
+        self.runnables.lock().insert(callback_id, runnable);
+    }
+
+    /// Remove and return the Runnable registered for `callback_id`, if
+    /// any.  Called by `InvocationEvent.dispatch()V`.
+    pub fn take_runnable(&self, callback_id: u64) -> Option<ObjectRef> {
+        self.runnables.lock().remove(&callback_id)
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -86,6 +159,26 @@ impl EventDispatchThread {
         self.running.store(false, Ordering::SeqCst);
         // Wake anyone blocked in `wait_event`.
         let _ = self.wake_sender.lock().send(());
+        // Release every thread blocked in `invoke_and_wait` -- their event
+        // will never be dispatched now, so flip the flag to true and notify
+        // so the caller returns instead of hanging.  Callers should re-check
+        // `is_running()` if they need to distinguish completion from
+        // shutdown.
+        let pending: Vec<CompletionHandle> = {
+            let mut map = self.pending_invocations.lock();
+            map.drain().map(|(_, h)| h).collect()
+        };
+        for handle in pending {
+            let (lock, cv) = &*handle;
+            let mut done = lock.lock();
+            *done = true;
+            cv.notify_all();
+        }
+        // Drop any Runnables that never made it to dispatch.  Without
+        // this, an EDT restart would re-dispatch stale Runnables when
+        // their callback ids happen to be reused (we use a monotonic
+        // counter, so collisions are unlikely — but the leak is real).
+        self.runnables.lock().clear();
     }
 
     /// Returns `true` if the EDT is currently running.
@@ -96,72 +189,163 @@ impl EventDispatchThread {
     // -- posting events -----------------------------------------------------
 
     /// Append an event to the tail of the queue and wake the EDT.
+    ///
+    /// The mpsc wake is **coalesced**: it is only sent when the queue was
+    /// empty before the push.  If the queue already had pending events the
+    /// receiver is either dispatching them right now or will pick the new
+    /// one up on its next loop iteration, so an extra wake is wasted work
+    /// (one syscall per posted event under high-throughput input streams
+    /// like mouse-move/paint).
     pub fn post_event(&self, event: AwtEvent) {
-        self.queue.lock().push_back(event);
-        let _ = self.wake_sender.lock().send(());
+        let was_empty = {
+            let mut q = self.queue.lock();
+            let was_empty = q.is_empty();
+            q.push_back(event);
+            was_empty
+        };
+        if was_empty {
+            let _ = self.wake_sender.lock().send(());
+        }
     }
 
     /// Post an `InvocationEvent` (the equivalent of `EventQueue.invokeLater`).
+    ///
+    /// Low-level form: the caller is responsible for inserting the
+    /// matching Runnable into the registry via [`Self::register_runnable`]
+    /// BEFORE calling this (otherwise the dispatch native will silently
+    /// no-op).  Use [`Self::invoke_later_runnable`] if you have an
+    /// `ObjectRef` in hand.
     pub fn invoke_later(&self, callback_id: u64, peer_id: PeerId) {
         let event = AwtEvent::invocation(peer_id, Self::now(), callback_id);
         self.post_event(event);
     }
 
-    /// Post an `InvocationEvent` and block until it has been consumed by the
-    /// dispatch loop.
+    /// High-level form: allocate a callback id, register the Runnable,
+    /// post the invocation event.  Returns the callback id for callers
+    /// that want to correlate with completion later.
+    pub fn invoke_later_runnable(&self, runnable: ObjectRef, peer_id: PeerId) -> u64 {
+        let id = self.next_callback_id();
+        self.register_runnable(id, runnable);
+        self.invoke_later(id, peer_id);
+        id
+    }
+
+    /// Post an `InvocationEvent` and block until the EDT has dispatched it.
     ///
     /// # Panics
     ///
     /// Panics if called from the EDT (would deadlock).
+    ///
+    /// # Semantics
+    ///
+    /// Returns *after* the matching `InvocationEvent.dispatch()V` native
+    /// has finished running the registered `Runnable` and called
+    /// [`Self::signal_invocation_complete`].  This matches the real
+    /// `EventQueue.invokeAndWait` contract.
+    ///
+    /// If the EDT is stopped before the event is dispatched, all pending
+    /// handles are released via `stop()` so this call returns instead of
+    /// hanging forever.
+    ///
+    /// As with [`Self::invoke_later`], the caller is responsible for
+    /// registering the Runnable via [`Self::register_runnable`] before
+    /// invoking this — use [`Self::invoke_and_wait_runnable`] for the
+    /// runnable-first convenience form.
     pub fn invoke_and_wait(&self, callback_id: u64, peer_id: PeerId) {
         assert!(
             !is_edt(),
             "invoke_and_wait must not be called on the EDT"
         );
 
-        let done = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
-        let done2 = Arc::clone(&done);
+        // Register a completion handle BEFORE posting the event, otherwise
+        // an extremely fast EDT could dispatch and try to signal an entry
+        // that does not yet exist.
+        let handle: CompletionHandle =
+            Arc::new((Mutex::new(false), Condvar::new()));
+        {
+            let mut map = self.pending_invocations.lock();
+            map.insert(callback_id, Arc::clone(&handle));
+        }
 
-        // We wrap the real callback_id with a sentinel that the caller can
-        // watch.  The dispatch loop itself does not know about this --
-        // instead we spin here polling until the event has been dequeued.
         let event = AwtEvent::invocation(peer_id, Self::now(), callback_id);
         self.post_event(event);
 
-        // Spin-wait until the event we just posted is no longer in the queue.
-        // This is correct because `poll_event` / `wait_event` remove the
-        // event, and the caller (Java side) will process it synchronously on
-        // the EDT before the next event is dequeued.
-        loop {
-            {
-                let q = self.queue.lock();
-                let still_queued = q.iter().any(|e| {
-                    if let AwtEventData::Invocation { callback_id: cid } = &e.data {
-                        *cid == callback_id
-                    } else {
-                        false
-                    }
-                });
-                if !still_queued {
-                    break;
-                }
-            }
-            // Avoid busy-waiting -- yield briefly.
-            std::thread::sleep(Duration::from_micros(100));
-            // Also break if the EDT stopped.
-            if !self.is_running() {
-                break;
+        // Block on the condvar until either the event is dispatched
+        // (`signal_invocation_complete` flips the bool) or the EDT shuts
+        // down (`stop` flips the bool for every pending entry).
+        let (lock, cv) = &*handle;
+        let mut done = lock.lock();
+        while !*done {
+            cv.wait(&mut done);
+        }
+    }
+
+    /// High-level form of [`Self::invoke_and_wait`]: registers `runnable`
+    /// under a fresh callback id, posts the invocation event, blocks
+    /// until the `dispatch()V` native finishes running it.
+    pub fn invoke_and_wait_runnable(&self, runnable: ObjectRef, peer_id: PeerId) -> u64 {
+        let id = self.next_callback_id();
+        self.register_runnable(id, runnable);
+        self.invoke_and_wait(id, peer_id);
+        id
+    }
+
+    /// Signal that the invocation registered under `callback_id` has
+    /// completed.  Called by the `InvocationEvent.dispatch()V` native
+    /// AFTER the registered `Runnable.run()` returns, so blocked
+    /// `invoke_and_wait` callers observe true "run finished" semantics.
+    ///
+    /// Returns `true` if a waiter was registered and notified.  Safe to
+    /// call with any callback_id -- unknown ids are silently ignored, so
+    /// `invoke_later` (which never registers a handle) costs only one
+    /// HashMap lookup.
+    pub fn signal_invocation_complete(&self, callback_id: u64) -> bool {
+        let handle = {
+            let mut map = self.pending_invocations.lock();
+            map.remove(&callback_id)
+        };
+        if let Some(handle) = handle {
+            let (lock, cv) = &*handle;
+            let mut done = lock.lock();
+            *done = true;
+            cv.notify_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// If `event` is an invocation event AND no Runnable has been
+    /// registered for it (i.e. there's no dispatch site that will call
+    /// [`Self::signal_invocation_complete`] explicitly), notify the
+    /// waiting `invoke_and_wait` caller on dequeue so it doesn't hang
+    /// forever.  This is the legacy / pure-Rust path; when the natives
+    /// layer drives dispatch through `InvocationEvent.dispatch()V`, that
+    /// native owns the signal and this method's check finds the
+    /// Runnable still registered and stays silent.
+    fn notify_if_invocation(&self, event: &AwtEvent) {
+        if let AwtEventData::Invocation { callback_id } = &event.data {
+            let has_runnable = self.runnables.lock().contains_key(callback_id);
+            if !has_runnable {
+                self.signal_invocation_complete(*callback_id);
             }
         }
-        drop(done2);
-        drop(done);
     }
 
     // -- consuming events ---------------------------------------------------
 
     /// Non-blocking dequeue.  Returns `None` if the queue is empty.
+    ///
+    /// If the dequeued event is an invocation, any `invoke_and_wait` caller
+    /// blocked on it is released.  TODO: ideally this signal would fire
+    /// after `Runnable.run()` returns, not at dequeue time -- see
+    /// [`Self::invoke_and_wait`].
     pub fn poll_event(&self) -> Option<AwtEvent> {
-        self.queue.lock().pop_front()
+        let evt = self.queue.lock().pop_front();
+        if let Some(ref e) = evt {
+            self.notify_if_invocation(e);
+        }
+        evt
     }
 
     /// Blocking dequeue with a timeout (in milliseconds).  Returns `None` if
@@ -171,6 +355,8 @@ impl EventDispatchThread {
         {
             let mut q = self.queue.lock();
             if let Some(evt) = q.pop_front() {
+                drop(q);
+                self.notify_if_invocation(&evt);
                 return Some(evt);
             }
         }
@@ -181,12 +367,20 @@ impl EventDispatchThread {
         drop(recv);
 
         // Check queue again after waking.
-        self.queue.lock().pop_front()
+        let evt = self.queue.lock().pop_front();
+        if let Some(ref e) = evt {
+            self.notify_if_invocation(e);
+        }
+        evt
     }
 
     /// Drain all pending events in one shot.
     pub fn drain_events(&self) -> Vec<AwtEvent> {
-        self.queue.lock().drain(..).collect()
+        let events: Vec<AwtEvent> = self.queue.lock().drain(..).collect();
+        for e in &events {
+            self.notify_if_invocation(e);
+        }
+        events
     }
 
     /// Number of events currently in the queue.
@@ -447,26 +641,57 @@ mod tests {
 
     #[test]
     fn invoke_and_wait_from_non_edt() {
-        let edt = make_edt();
+        let edt = Arc::new(make_edt());
         edt.start();
 
-        // Spawn a consumer that drains the queue.
-        let q = Arc::clone(&edt.queue);
-        let running = Arc::clone(&edt.running);
+        // Spawn a consumer that drains the queue via `poll_event` so the
+        // invocation-completion signal fires.
+        let edt2 = Arc::clone(&edt);
         let consumer = std::thread::spawn(move || {
-            while running.load(Ordering::SeqCst) {
-                let evt = { q.lock().pop_front() };
-                if evt.is_some() {
+            while edt2.is_running() {
+                if edt2.poll_event().is_some() {
                     break; // consumed the invocation event
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
 
-        // This should complete once the consumer drains the event.
+        // This should complete once the consumer dequeues the event and
+        // poll_event signals the completion handle.
         edt.invoke_and_wait(99, PeerId(1));
         consumer.join().unwrap();
         edt.stop();
+    }
+
+    #[test]
+    fn invoke_and_wait_releases_on_stop() {
+        // If the EDT is stopped before the event is dispatched,
+        // `invoke_and_wait` must return instead of hanging.
+        let edt = Arc::new(make_edt());
+        edt.start();
+
+        let edt2 = Arc::clone(&edt);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            edt2.stop();
+        });
+
+        edt.invoke_and_wait(7777, PeerId(2));
+        stopper.join().unwrap();
+    }
+
+    #[test]
+    fn post_event_coalesces_wakes() {
+        // Sanity check: two posts only emit one mpsc wake when the queue
+        // was already non-empty for the second push.
+        let edt = make_edt();
+        edt.post_event(AwtEvent::window(event_id::WINDOW_OPENED, PeerId(1), 0));
+        edt.post_event(AwtEvent::window(event_id::WINDOW_CLOSING, PeerId(1), 1));
+
+        // Drain the wake channel; only the first post should have sent.
+        let recv = edt.wake_receiver.lock();
+        assert!(recv.try_recv().is_ok());
+        assert!(recv.try_recv().is_err());
     }
 
     #[test]
@@ -485,6 +710,83 @@ mod tests {
         assert!(evt.is_some());
         assert_eq!(evt.unwrap().id, event_id::WINDOW_OPENED);
         handle.join().unwrap();
+    }
+
+    /// Build a dummy `ObjectRef` for tests.  Uses an 8-aligned non-null
+    /// fake pointer — never dereferenced.
+    fn fake_object_ref(seed: u64) -> ObjectRef {
+        let ptr = ((seed + 1) << 3) as *mut u8; // guaranteed 8-aligned & non-null
+        unsafe { ObjectRef::from_raw(ptr) }
+    }
+
+    #[test]
+    fn runnable_registry_register_and_take() {
+        let edt = make_edt();
+        let runnable = fake_object_ref(42);
+        let id = edt.next_callback_id();
+        edt.register_runnable(id, runnable);
+        assert_eq!(edt.take_runnable(id), Some(runnable));
+        assert_eq!(edt.take_runnable(id), None, "second take should be empty");
+    }
+
+    #[test]
+    fn next_callback_id_is_monotonic_and_nonzero() {
+        let edt = make_edt();
+        let a = edt.next_callback_id();
+        let b = edt.next_callback_id();
+        assert!(a > 0 && b > a, "ids must be monotonic, got {a} then {b}");
+    }
+
+    #[test]
+    fn notify_if_invocation_skips_when_runnable_pending() {
+        // When a Runnable is registered for the callback id, dequeue must
+        // NOT signal completion -- the dispatch native owns the signal.
+        let edt = make_edt();
+        let runnable = fake_object_ref(7);
+        let id = edt.next_callback_id();
+        edt.register_runnable(id, runnable);
+
+        // Register a completion handle to detect spurious signalling.
+        let handle: CompletionHandle = Arc::new((Mutex::new(false), Condvar::new()));
+        edt.pending_invocations.lock().insert(id, Arc::clone(&handle));
+
+        edt.post_event(AwtEvent::invocation(PeerId(0), 0, id));
+        let _ = edt.poll_event();
+
+        // The Runnable is still registered, so dequeue must have been
+        // silent: the completion handle stays un-flipped.
+        assert!(!*handle.0.lock(), "dequeue must not signal while runnable is pending");
+    }
+
+    #[test]
+    fn signal_invocation_complete_after_dispatch_unblocks_waiter() {
+        // Simulate the natives-driven flow: register, post, dequeue (no
+        // signal because runnable still pending), then explicitly take +
+        // signal as the dispatch native would.
+        let edt = Arc::new(make_edt());
+        edt.start();
+        let runnable = fake_object_ref(123);
+        let id = edt.next_callback_id();
+        edt.register_runnable(id, runnable);
+
+        let edt2 = Arc::clone(&edt);
+        let dispatcher = std::thread::spawn(move || {
+            // Wait for the event to land then "dispatch" it.
+            loop {
+                if let Some(_evt) = edt2.poll_event() {
+                    assert_eq!(edt2.take_runnable(id), Some(runnable));
+                    // pretend Runnable.run() ran here
+                    let signalled = edt2.signal_invocation_complete(id);
+                    assert!(signalled, "waiter should have been registered");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        edt.invoke_and_wait(id, PeerId(0));
+        dispatcher.join().unwrap();
+        edt.stop();
     }
 
     #[test]

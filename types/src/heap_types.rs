@@ -1,7 +1,67 @@
 use crate::ClassId;
+use std::sync::atomic::AtomicU64;
 
 /// Size of `ObjectHeader` in bytes. Must be a multiple of 8 for alignment.
-pub const HEADER_SIZE: usize = 32;
+///
+/// NOTE: This was increased from 32 to 40 bytes when the `mark_word` field
+/// was appended to support thin-lock monitors. Downstream consumers (JIT, GC)
+/// that reference `HEADER_SIZE` will pick up the new size automatically; any
+/// code that hardcoded `32` must be updated.
+pub const HEADER_SIZE: usize = 40;
+
+// JIT x64 emits array element offsets as signed disp8 = HEADER_SIZE as u8.
+// If HEADER_SIZE exceeds 127, disp8 wraps to negative and produces wrong
+// addresses. Bump to disp32 emission in jit/src/x64.rs:6690-6813 before
+// allowing HEADER_SIZE to grow beyond this limit.
+const _: () = assert!(
+    HEADER_SIZE <= 127,
+    "HEADER_SIZE must fit in signed disp8 for JIT array access"
+);
+
+// --- Mark word (thin-lock / monitor inflation) -----------------------------
+//
+// The mark word is a single `AtomicU64` appended to `ObjectHeader`. It encodes
+// one of three states in the low 2 bits:
+//
+//   00 = NEUTRAL      (no lock held)
+//   01 = THIN_LOCKED  (owner thread id + recursion count in upper bits)
+//   10 = INFLATED     (pointer to heap-allocated Monitor in upper 62 bits)
+//   11 = reserved
+//
+// All transitions are performed via atomic CAS on the `mark_word` field.
+
+/// Mark word state: no lock held. Identity hash code may live in upper bits
+/// (caller-managed).
+pub const MARK_NEUTRAL: u64 = 0b00;
+/// Mark word state: object is thin-locked by a single thread.
+pub const MARK_THIN_LOCKED: u64 = 0b01;
+/// Mark word state: object's monitor has been inflated to a heap `Monitor`.
+pub const MARK_INFLATED: u64 = 0b10;
+/// Mask covering the 2-bit state field of the mark word.
+pub const MARK_STATE_MASK: u64 = 0b11;
+
+/// Thin-lock mark word layout:
+///   bits 0-1:   state = `MARK_THIN_LOCKED`
+///   bits 2-9:   recursion count (u8, 0 = held once; max 255 -> 256 nested)
+///   bits 10-41: owner thread id (u32)
+///   bits 42-63: reserved
+pub const THIN_LOCK_RECURSION_SHIFT: u32 = 2;
+pub const THIN_LOCK_RECURSION_MASK: u64 = 0xffu64 << THIN_LOCK_RECURSION_SHIFT;
+pub const THIN_LOCK_OWNER_SHIFT: u32 = 10;
+pub const THIN_LOCK_OWNER_MASK: u64 = 0xffff_ffffu64 << THIN_LOCK_OWNER_SHIFT;
+
+/// Inflated mark word: pointer to `Monitor` (high 62 bits) | `MARK_INFLATED`
+/// (low 2 bits). The `Monitor` struct must be at least 4-byte aligned so the
+/// bottom 2 bits are available for the state tag. (In practice it will be
+/// 8-byte aligned, leaving bit 2 free as well.)
+pub const INFLATED_PTR_MASK: u64 = !MARK_STATE_MASK;
+
+/// Byte offset of `mark_word` within `ObjectHeader`. Documented for downstream
+/// agents (JIT lock fast-path) so they can emit direct atomic loads / CAS.
+///
+/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(40) - 8 = 32. The
+/// `_const_check_mark_word_offset` assertion below pins this at compile time.
+pub const MARK_WORD_OFFSET: usize = 32;
 
 /// Size of each field/array element slot in bytes.
 /// Must be >= size_of::<Value>() (which is 16 bytes: 8 for the payload + 8 for the discriminant).
@@ -33,7 +93,20 @@ const _: () = assert!(
 // Compile-time check that our header is exactly HEADER_SIZE bytes.
 const _: () = assert!(
     std::mem::size_of::<ObjectHeader>() == HEADER_SIZE,
-    "ObjectHeader must be exactly 32 bytes"
+    "ObjectHeader must be exactly HEADER_SIZE bytes"
+);
+
+// Compile-time check that the mark_word lives at the documented offset.
+const _: () = assert!(
+    std::mem::offset_of!(ObjectHeader, mark_word) == MARK_WORD_OFFSET,
+    "MARK_WORD_OFFSET must match ObjectHeader layout"
+);
+
+// Compile-time check that class_id remains at offset 0 -- JIT-emitted code
+// hardcodes this offset and must not be silently broken by field reordering.
+const _: () = assert!(
+    std::mem::offset_of!(ObjectHeader, class_id) == 0,
+    "class_id must remain at offset 0 (JIT contract)"
 );
 
 /// Returns the per-element byte size for a given array element type.
@@ -96,8 +169,8 @@ pub enum ArrayElementType {
 
 /// The header stored at the beginning of every heap-allocated object/array.
 ///
-/// Layout (32 bytes total, 8-byte aligned):
-/// - `class_id`: ClassId (4 bytes)
+/// Layout (40 bytes total, 8-byte aligned):
+/// - `class_id`: ClassId (4 bytes) -- MUST stay at offset 0 (JIT contract)
 /// - `kind`: ObjectKind (1 byte)
 /// - `element_type`: ArrayElementType (1 byte, only meaningful for arrays)
 /// - `_padding`: 2 bytes
@@ -108,8 +181,14 @@ pub enum ArrayElementType {
 /// - `gc_flags`: u8 (1 byte, bit 0 = in old gen)
 /// - `_gc_reserved`: [u8; 2] (2 bytes padding)
 /// - `forwarding_ptr`: *mut u8 (8 bytes, used by GC for object relocation)
+/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 32)
+///
+/// NOTE: `Clone`/`Copy` were removed when `mark_word: AtomicU64` was added,
+/// since atomics are `!Copy`. Header copies must now go through explicit
+/// field-by-field reconstruction (or `std::ptr::copy_nonoverlapping` at the
+/// raw byte level during GC relocation).
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct ObjectHeader {
     pub class_id: ClassId,
     pub kind: ObjectKind,
@@ -122,12 +201,17 @@ pub struct ObjectHeader {
     pub gc_age: u8,
     /// GC flags -- bit 0: object is in old generation.
     pub gc_flags: u8,
-    /// Reserved padding to maintain 32-byte header size.
+    /// Reserved padding to maintain header alignment.
     pub _gc_reserved: [u8; 2],
     /// Forwarding pointer for GC. When an object is copied during collection,
     /// the old header's forwarding_ptr is set to the new location.
     /// Null means the object has not been forwarded.
     pub forwarding_ptr: *mut u8,
+    /// Mark word -- thin-lock owner / recursion / inflated-monitor pointer.
+    /// State encoded in low 2 bits; see `MARK_NEUTRAL` / `MARK_THIN_LOCKED` /
+    /// `MARK_INFLATED`. Always at byte offset `MARK_WORD_OFFSET` (= 32).
+    /// Initialized to `MARK_NEUTRAL` by `ObjectHeader::new`.
+    pub mark_word: AtomicU64,
 }
 
 /// GC flag: object resides in the old generation.
@@ -137,6 +221,37 @@ pub const GC_FLAG_OLD_GEN: u8 = 0x01;
 pub const GC_FLAG_MARKED: u8 = 0x02;
 
 impl ObjectHeader {
+    /// Construct a fresh, unlocked object header. The mark word is initialized
+    /// to `MARK_NEUTRAL` (no lock held, no identity hash installed).
+    ///
+    /// This is the canonical constructor: callers that previously built an
+    /// `ObjectHeader` via struct-literal syntax should migrate to this, since
+    /// the mark-word field is `AtomicU64` (`!Copy`) and cannot be omitted from
+    /// a `..Default::default()` shorthand.
+    pub fn new(
+        class_id: ClassId,
+        kind: ObjectKind,
+        element_type: ArrayElementType,
+        identity_hash_code: i32,
+        array_length: u32,
+        num_slots: u32,
+    ) -> Self {
+        Self {
+            class_id,
+            kind,
+            element_type,
+            _padding: [0; 2],
+            identity_hash_code,
+            array_length,
+            num_slots,
+            gc_age: 0,
+            gc_flags: 0,
+            _gc_reserved: [0; 2],
+            forwarding_ptr: std::ptr::null_mut(),
+            mark_word: AtomicU64::new(MARK_NEUTRAL),
+        }
+    }
+
     /// Returns true if this object has been forwarded by the GC.
     pub fn is_forwarded(&self) -> bool {
         !self.forwarding_ptr.is_null()
@@ -151,34 +266,87 @@ impl ObjectHeader {
     pub fn is_old_gen(&self) -> bool {
         self.gc_flags & GC_FLAG_OLD_GEN != 0
     }
+
+    // --- Mark-word helpers (associated functions, not methods, so callers
+    // can manipulate a previously-loaded `u64` snapshot without re-reading
+    // the atomic on every accessor call -- the typical pattern inside a
+    // CAS loop). -----------------------------------------------------------
+
+    /// Extract the 2-bit state field from a mark word snapshot.
+    #[inline(always)]
+    pub fn mark_state(mark: u64) -> u64 {
+        mark & MARK_STATE_MASK
+    }
+
+    /// Construct a `MARK_THIN_LOCKED` mark word from owner + recursion count.
+    ///
+    /// `recursion = 0` means the lock is held exactly once. Maximum supported
+    /// nesting is `255 + 1 = 256` re-entrant acquisitions; beyond that the
+    /// caller must inflate to a full `Monitor`.
+    #[inline(always)]
+    pub fn make_thin_locked(thread_id: u32, recursion: u8) -> u64 {
+        MARK_THIN_LOCKED
+            | ((recursion as u64) << THIN_LOCK_RECURSION_SHIFT)
+            | ((thread_id as u64) << THIN_LOCK_OWNER_SHIFT)
+    }
+
+    /// Decode the owner thread id from a `MARK_THIN_LOCKED` mark word.
+    /// Result is meaningless if the mark word is not in thin-locked state.
+    #[inline(always)]
+    pub fn thin_lock_owner(mark: u64) -> u32 {
+        ((mark & THIN_LOCK_OWNER_MASK) >> THIN_LOCK_OWNER_SHIFT) as u32
+    }
+
+    /// Decode the recursion count from a `MARK_THIN_LOCKED` mark word.
+    /// Result is meaningless if the mark word is not in thin-locked state.
+    #[inline(always)]
+    pub fn thin_lock_recursion(mark: u64) -> u8 {
+        ((mark & THIN_LOCK_RECURSION_MASK) >> THIN_LOCK_RECURSION_SHIFT) as u8
+    }
+
+    /// Construct a `MARK_INFLATED` mark word pointing at the given `Monitor`.
+    ///
+    /// The pointer must be at least 4-byte aligned so its low 2 bits are
+    /// available for the state tag. `Monitor` should be `#[repr(align(8))]`
+    /// or naturally 8-aligned in practice.
+    #[inline(always)]
+    pub fn make_inflated(monitor_ptr: usize) -> u64 {
+        debug_assert!(
+            monitor_ptr & (MARK_STATE_MASK as usize) == 0,
+            "Monitor pointer must have its low 2 bits clear (>= 4-byte aligned)"
+        );
+        (monitor_ptr as u64) | MARK_INFLATED
+    }
+
+    /// Decode the `Monitor` pointer from a `MARK_INFLATED` mark word.
+    /// Result is meaningless if the mark word is not in inflated state.
+    #[inline(always)]
+    pub fn inflated_monitor(mark: u64) -> *mut () {
+        ((mark & INFLATED_PTR_MASK) as usize) as *mut ()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Helper to create a default ObjectHeader for testing
+    // Helper to create a default ObjectHeader for testing.
     fn make_header() -> ObjectHeader {
-        ObjectHeader {
-            class_id: ClassId::new(1),
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Boolean,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 0,
-            num_slots: 0,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        }
+        ObjectHeader::new(
+            ClassId::new(1),
+            ObjectKind::Object,
+            ArrayElementType::Boolean,
+            0,
+            0,
+            0,
+        )
     }
 
     // -- Constants --
 
     #[test]
-    fn header_size_is_32() {
-        assert_eq!(HEADER_SIZE, 32);
+    fn header_size_is_correct() {
+        assert_eq!(HEADER_SIZE, 40);
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
     }
 
@@ -399,23 +567,183 @@ mod tests {
 
     #[test]
     fn object_header_array_fields() {
-        let header = ObjectHeader {
-            class_id: ClassId::new(5),
-            kind: ObjectKind::Array,
-            element_type: ArrayElementType::Int,
-            _padding: [0; 2],
-            identity_hash_code: 12345,
-            array_length: 100,
-            num_slots: 0,
-            gc_age: 3,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let mut header = ObjectHeader::new(
+            ClassId::new(5),
+            ObjectKind::Array,
+            ArrayElementType::Int,
+            12345,
+            100,
+            0,
+        );
+        header.gc_age = 3;
         assert_eq!(header.kind, ObjectKind::Array);
         assert_eq!(header.element_type, ArrayElementType::Int);
         assert_eq!(header.array_length, 100);
         assert_eq!(header.identity_hash_code, 12345);
         assert_eq!(header.gc_age, 3);
+    }
+
+    // ---------------------------------------------------------------------
+    //  Mark word (thin-lock / monitor) tests
+    // ---------------------------------------------------------------------
+
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn mark_state_constants_are_distinct_and_in_low_two_bits() {
+        assert_eq!(MARK_NEUTRAL, 0b00);
+        assert_eq!(MARK_THIN_LOCKED, 0b01);
+        assert_eq!(MARK_INFLATED, 0b10);
+        assert_eq!(MARK_STATE_MASK, 0b11);
+        // The reserved 0b11 state must not collide with any defined state.
+        assert_ne!(MARK_NEUTRAL, MARK_THIN_LOCKED);
+        assert_ne!(MARK_NEUTRAL, MARK_INFLATED);
+        assert_ne!(MARK_THIN_LOCKED, MARK_INFLATED);
+        // INFLATED_PTR_MASK is the complement of the state mask.
+        assert_eq!(INFLATED_PTR_MASK, !MARK_STATE_MASK);
+        assert_eq!(INFLATED_PTR_MASK & MARK_STATE_MASK, 0);
+    }
+
+    #[test]
+    fn mark_state_round_trips_for_each_variant() {
+        // NEUTRAL: pure zero -> state is NEUTRAL.
+        assert_eq!(ObjectHeader::mark_state(MARK_NEUTRAL), MARK_NEUTRAL);
+        // Even with garbage in the upper bits the state field stays clean.
+        assert_eq!(
+            ObjectHeader::mark_state(0xDEAD_BEEF_DEAD_BE00),
+            MARK_NEUTRAL
+        );
+
+        // THIN_LOCKED with owner + recursion set.
+        let thin = ObjectHeader::make_thin_locked(0x1234_5678, 7);
+        assert_eq!(ObjectHeader::mark_state(thin), MARK_THIN_LOCKED);
+
+        // INFLATED with a fake aligned pointer.
+        let fake_ptr: usize = 0x1_0000; // 8-byte aligned (low 3 bits zero).
+        let inflated = ObjectHeader::make_inflated(fake_ptr);
+        assert_eq!(ObjectHeader::mark_state(inflated), MARK_INFLATED);
+    }
+
+    #[test]
+    fn make_thin_locked_round_trips_owner_and_recursion() {
+        // Edge case: zero owner, zero recursion -> only the state tag is set.
+        let m = ObjectHeader::make_thin_locked(0, 0);
+        assert_eq!(m, MARK_THIN_LOCKED);
+        assert_eq!(ObjectHeader::thin_lock_owner(m), 0);
+        assert_eq!(ObjectHeader::thin_lock_recursion(m), 0);
+
+        // Typical values.
+        let m = ObjectHeader::make_thin_locked(0x1234_5678, 42);
+        assert_eq!(ObjectHeader::mark_state(m), MARK_THIN_LOCKED);
+        assert_eq!(ObjectHeader::thin_lock_owner(m), 0x1234_5678);
+        assert_eq!(ObjectHeader::thin_lock_recursion(m), 42);
+
+        // Maximum values -- exercise field boundaries.
+        let m = ObjectHeader::make_thin_locked(u32::MAX, u8::MAX);
+        assert_eq!(ObjectHeader::mark_state(m), MARK_THIN_LOCKED);
+        assert_eq!(ObjectHeader::thin_lock_owner(m), u32::MAX);
+        assert_eq!(ObjectHeader::thin_lock_recursion(m), u8::MAX);
+
+        // The owner and recursion fields must not overlap each other or the
+        // state tag.
+        let owner_only = ObjectHeader::make_thin_locked(u32::MAX, 0);
+        let rec_only = ObjectHeader::make_thin_locked(0, u8::MAX);
+        assert_eq!(owner_only & MARK_STATE_MASK, MARK_THIN_LOCKED);
+        assert_eq!(rec_only & MARK_STATE_MASK, MARK_THIN_LOCKED);
+        assert_eq!(owner_only & THIN_LOCK_RECURSION_MASK, 0);
+        assert_eq!(rec_only & THIN_LOCK_OWNER_MASK, 0);
+    }
+
+    #[test]
+    fn make_inflated_round_trips_monitor_pointer() {
+        // Use stack-allocated aligned storage so the address is real and
+        // guaranteed 8-aligned.
+        let slot: u64 = 0;
+        let real_ptr = &slot as *const u64 as usize;
+        assert_eq!(
+            real_ptr & (MARK_STATE_MASK as usize),
+            0,
+            "stack u64 should be at least 8-byte aligned"
+        );
+
+        let mark = ObjectHeader::make_inflated(real_ptr);
+        assert_eq!(ObjectHeader::mark_state(mark), MARK_INFLATED);
+        assert_eq!(ObjectHeader::inflated_monitor(mark) as usize, real_ptr);
+
+        // Synthetic aligned pointers covering the upper bits.
+        for &p in &[0x1000usize, 0xDEAD_BEE0usize, usize::MAX & !0b11] {
+            let m = ObjectHeader::make_inflated(p);
+            assert_eq!(ObjectHeader::mark_state(m), MARK_INFLATED);
+            assert_eq!(ObjectHeader::inflated_monitor(m) as usize, p);
+        }
+    }
+
+    #[test]
+    fn mark_word_offset_is_stable() {
+        // The JIT lock fast-path hardcodes this offset; if it ever changes
+        // both the constant and every emitter must be updated together.
+        assert_eq!(MARK_WORD_OFFSET, 32);
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, mark_word),
+            MARK_WORD_OFFSET
+        );
+        // 8-byte aligned so atomic ops are well-defined.
+        assert_eq!(MARK_WORD_OFFSET % 8, 0);
+    }
+
+    #[test]
+    fn class_id_remains_at_offset_zero() {
+        // JIT-emitted code reads class_id at offset 0 from the object base.
+        // Adding the mark word must NOT have disturbed this contract.
+        assert_eq!(std::mem::offset_of!(ObjectHeader, class_id), 0);
+    }
+
+    #[test]
+    fn new_constructor_initializes_mark_word_to_neutral() {
+        let header = make_header();
+        let mark = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(mark, MARK_NEUTRAL);
+        assert_eq!(ObjectHeader::mark_state(mark), MARK_NEUTRAL);
+    }
+
+    #[test]
+    fn mark_word_supports_atomic_cas_transitions() {
+        // Exercises the full state machine path that downstream agents will
+        // drive: NEUTRAL -> THIN_LOCKED -> INFLATED. Each transition uses
+        // compare_exchange to mimic real contended-lock acquisition.
+        let header = make_header();
+
+        // NEUTRAL -> THIN_LOCKED
+        let thin = ObjectHeader::make_thin_locked(99, 0);
+        header
+            .mark_word
+            .compare_exchange(MARK_NEUTRAL, thin, Ordering::AcqRel, Ordering::Acquire)
+            .expect("CAS NEUTRAL->THIN_LOCKED must succeed");
+        let observed = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(ObjectHeader::mark_state(observed), MARK_THIN_LOCKED);
+        assert_eq!(ObjectHeader::thin_lock_owner(observed), 99);
+
+        // THIN_LOCKED -> INFLATED
+        let slot: u64 = 0;
+        let monitor_addr = &slot as *const u64 as usize;
+        let inflated = ObjectHeader::make_inflated(monitor_addr);
+        header
+            .mark_word
+            .compare_exchange(thin, inflated, Ordering::AcqRel, Ordering::Acquire)
+            .expect("CAS THIN_LOCKED->INFLATED must succeed");
+        let observed = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(ObjectHeader::mark_state(observed), MARK_INFLATED);
+        assert_eq!(
+            ObjectHeader::inflated_monitor(observed) as usize,
+            monitor_addr
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Monitor pointer must have its low 2 bits clear")]
+    fn make_inflated_rejects_misaligned_pointer() {
+        // debug_assert! catches this in debug builds; the test runs under
+        // `cargo test` (debug profile) so the panic is observable.
+        let _ = ObjectHeader::make_inflated(0x1001);
     }
 }

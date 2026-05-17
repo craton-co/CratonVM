@@ -22,66 +22,60 @@ impl<'a> ClassFileBuffer<'a> {
         self.data.len() - self.position
     }
 
+    #[inline(always)]
     pub fn read_u8(&mut self) -> Result<u8, ClassReaderError> {
-        if self.position >= self.data.len() {
-            return Err(ClassReaderError::UnexpectedEndOfData {
-                position: self.position,
-            });
-        }
-        let value = self.data[self.position];
-        self.position += 1;
-        Ok(value)
+        let pos = self.position;
+        // `get` lets the compiler elide the redundant index bounds check
+        // that would arise from `self.data[pos]`.
+        let bytes = self
+            .data
+            .get(pos..pos + 1)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
+        self.position = pos + 1;
+        // SAFETY/Justification: explicit length check above guarantees len == 1,
+        // so `try_into` can never fail; `unwrap` compiles to a single load.
+        let arr: [u8; 1] = bytes.try_into().unwrap();
+        Ok(arr[0])
     }
 
+    #[inline(always)]
     pub fn read_u16(&mut self) -> Result<u16, ClassReaderError> {
-        if self.position + 2 > self.data.len() {
-            return Err(ClassReaderError::UnexpectedEndOfData {
-                position: self.position,
-            });
-        }
-        let value = u16::from_be_bytes([self.data[self.position], self.data[self.position + 1]]);
-        self.position += 2;
-        Ok(value)
+        let pos = self.position;
+        let bytes = self
+            .data
+            .get(pos..pos + 2)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
+        self.position = pos + 2;
+        let arr: [u8; 2] = bytes.try_into().unwrap();
+        Ok(u16::from_be_bytes(arr))
     }
 
+    #[inline(always)]
     pub fn read_u32(&mut self) -> Result<u32, ClassReaderError> {
-        if self.position + 4 > self.data.len() {
-            return Err(ClassReaderError::UnexpectedEndOfData {
-                position: self.position,
-            });
-        }
-        let value = u32::from_be_bytes([
-            self.data[self.position],
-            self.data[self.position + 1],
-            self.data[self.position + 2],
-            self.data[self.position + 3],
-        ]);
-        self.position += 4;
-        Ok(value)
+        let pos = self.position;
+        let bytes = self
+            .data
+            .get(pos..pos + 4)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
+        self.position = pos + 4;
+        let arr: [u8; 4] = bytes.try_into().unwrap();
+        Ok(u32::from_be_bytes(arr))
     }
 
     pub fn read_i32(&mut self) -> Result<i32, ClassReaderError> {
         self.read_u32().map(|v| v as i32)
     }
 
+    #[inline(always)]
     pub fn read_i64(&mut self) -> Result<i64, ClassReaderError> {
-        if self.position + 8 > self.data.len() {
-            return Err(ClassReaderError::UnexpectedEndOfData {
-                position: self.position,
-            });
-        }
-        let value = i64::from_be_bytes([
-            self.data[self.position],
-            self.data[self.position + 1],
-            self.data[self.position + 2],
-            self.data[self.position + 3],
-            self.data[self.position + 4],
-            self.data[self.position + 5],
-            self.data[self.position + 6],
-            self.data[self.position + 7],
-        ]);
-        self.position += 8;
-        Ok(value)
+        let pos = self.position;
+        let bytes = self
+            .data
+            .get(pos..pos + 8)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
+        self.position = pos + 8;
+        let arr: [u8; 8] = bytes.try_into().unwrap();
+        Ok(i64::from_be_bytes(arr))
     }
 
     pub fn read_f32(&mut self) -> Result<f32, ClassReaderError> {
@@ -92,24 +86,23 @@ impl<'a> ClassFileBuffer<'a> {
         self.read_i64().map(|v| f64::from_bits(v as u64))
     }
 
+    #[inline(always)]
     pub fn read_bytes(&mut self, count: usize) -> Result<&'a [u8], ClassReaderError> {
-        if self.position + count > self.data.len() {
-            return Err(ClassReaderError::UnexpectedEndOfData {
-                position: self.position,
-            });
-        }
-        let bytes = &self.data[self.position..self.position + count];
-        self.position += count;
+        let pos = self.position;
+        let bytes = self
+            .data
+            .get(pos..pos + count)
+            .ok_or(ClassReaderError::UnexpectedEndOfData { position: pos })?;
+        self.position = pos + count;
         Ok(bytes)
     }
 
     pub fn skip(&mut self, count: usize) -> Result<(), ClassReaderError> {
-        if self.position + count > self.data.len() {
-            return Err(ClassReaderError::UnexpectedEndOfData {
-                position: self.position,
-            });
+        let pos = self.position;
+        if self.data.get(pos..pos + count).is_none() {
+            return Err(ClassReaderError::UnexpectedEndOfData { position: pos });
         }
-        self.position += count;
+        self.position = pos + count;
         Ok(())
     }
 }

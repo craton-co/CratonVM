@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::attribute::Attribute;
+use crate::attribute::{Attribute, LazyAttribute};
 use crate::class_access_flags::MethodAccessFlags;
 
 /// A method in a Java class file (JVM spec 4.6).
@@ -16,7 +16,7 @@ pub struct ClassFileMethod {
     pub access_flags: MethodAccessFlags,
     pub name: Arc<str>,
     pub descriptor: Arc<str>,
-    pub attributes: Vec<Attribute>,
+    pub attributes: Vec<LazyAttribute>,
 }
 
 impl ClassFileMethod {
@@ -36,10 +36,11 @@ impl ClassFileMethod {
         self.access_flags.contains(MethodAccessFlags::SYNCHRONIZED)
     }
 
-    /// Returns the Code attribute, if present.
+    /// Returns the Code attribute, if present and already decoded.
+    /// Lazy attributes must be force-decoded by the caller first.
     pub fn code(&self) -> Option<&crate::attribute::CodeAttribute> {
-        self.attributes.iter().find_map(|a| match a {
-            Attribute::Code(code) => Some(code),
+        self.attributes.iter().find_map(|a| match a.as_decoded() {
+            Some(Attribute::Code(code)) => Some(code),
             _ => None,
         })
     }
@@ -150,7 +151,7 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC,
             name: Arc::from("foo"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(code_attr)],
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(code_attr))],
         };
         let code = m.code().expect("should have Code attribute");
         assert_eq!(code.max_stack, 2);

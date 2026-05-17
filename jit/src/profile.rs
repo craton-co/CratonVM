@@ -403,10 +403,12 @@ mod tests {
 
     /// Tests record into the global ProfileStore — gate must be on or
     /// `record_*` is a no-op.  Each test calls this guard before driving
-    /// the store; using a closure-style helper keeps the gate transition
-    /// localised so concurrent tests in the harness don't observe a
-    /// disabled store mid-run.
+    /// the store; the inner `Mutex` serialises gate transitions so a
+    /// parallel test that depends on the disabled-default doesn't observe
+    /// `true` mid-run.
     fn with_profiling_enabled<R>(f: impl FnOnce() -> R) -> R {
+        static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _g = GATE.lock();
         let prev = is_profiling_enabled();
         enable_profiling(true);
         let r = f();
@@ -464,61 +466,92 @@ mod tests {
 
     #[test]
     fn test_profile_store_branch_accumulates() {
-        let store = ProfileStore::new();
-        let key = make_key(42);
-        for _ in 0..15 {
-            store.record_branch(&key, 10, true);
-        }
-        for _ in 0..5 {
-            store.record_branch(&key, 10, false);
-        }
-        let profile = store.get_profile(&key).unwrap();
-        let counts = &profile.branches[&10];
-        assert_eq!(counts.taken, 15);
-        assert_eq!(counts.not_taken, 5);
-        assert!(!counts.is_usually_taken(), "<20 samples");
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(42);
+            for _ in 0..15 {
+                store.record_branch(&key, 10, true);
+            }
+            for _ in 0..5 {
+                store.record_branch(&key, 10, false);
+            }
+            let profile = store.get_profile(&key).unwrap();
+            let counts = &profile.branches[&10];
+            assert_eq!(counts.taken, 15);
+            assert_eq!(counts.not_taken, 5);
+            assert!(!counts.is_usually_taken(), "<20 samples");
 
-        // Add enough to make it >90% taken.
-        for _ in 0..80 {
-            store.record_branch(&key, 10, true);
-        }
-        let profile = store.get_profile(&key).unwrap();
-        let counts = &profile.branches[&10];
-        // 95 taken / 5 not-taken = 95% > 90% with ≥20 samples
-        assert_eq!(counts.taken, 95);
-        assert!(counts.is_usually_taken());
+            // Add enough to make it >90% taken.
+            for _ in 0..80 {
+                store.record_branch(&key, 10, true);
+            }
+            let profile = store.get_profile(&key).unwrap();
+            let counts = &profile.branches[&10];
+            // 95 taken / 5 not-taken = 95% > 90% with ≥20 samples
+            assert_eq!(counts.taken, 95);
+            assert!(counts.is_usually_taken());
+        });
     }
 
     #[test]
     fn test_profile_store_receiver_accumulates() {
-        let store = ProfileStore::new();
-        let key = make_key(7);
-        for _ in 0..90 {
-            store.record_receiver(&key, 5, 100);
-        }
-        for _ in 0..10 {
-            store.record_receiver(&key, 5, 200);
-        }
-        let profile = store.get_profile(&key).unwrap();
-        let rcounts = &profile.receivers[&5];
-        assert_eq!(dominant_receiver(rcounts, 80), Some(100));
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(7);
+            for _ in 0..90 {
+                store.record_receiver(&key, 5, 100);
+            }
+            for _ in 0..10 {
+                store.record_receiver(&key, 5, 200);
+            }
+            let profile = store.get_profile(&key).unwrap();
+            let rcounts = &profile.receivers[&5];
+            assert_eq!(dominant_receiver(rcounts, 80), Some(100));
+        });
+    }
+
+    /// Disabled-by-default sanity: with PROFILING_ENABLED=false the recorder
+    /// must remain a no-op (no MethodKey clone, no HashMap insert).
+    ///
+    /// Uses the same gate as `with_profiling_enabled` to avoid racing
+    /// against tests that flip the flag on.
+    #[test]
+    fn profiling_disabled_is_noop() {
+        with_profiling_enabled(|| {
+            // Within the guard, switch the gate back off for this scope so
+            // we can assert the no-op behaviour without a parallel test
+            // flipping it on between calls.
+            enable_profiling(false);
+            let store = ProfileStore::new();
+            let key = make_key(123);
+            for _ in 0..100 {
+                store.record_branch(&key, 1, true);
+                store.record_backedge(&key, 1);
+                store.record_receiver(&key, 1, 0);
+                store.record_trip_complete(&key, 1, 4);
+            }
+            assert!(store.get_profile(&key).is_none(),
+                "no profile entry should be created while profiling is disabled");
+        });
     }
 
     // ===== M29 snapshot_all / snapshot_invocation_counts =====
 
     #[test]
     fn m29_snapshot_all_returns_all_methods() {
-        let store = ProfileStore::new();
-        let k1 = make_key(1);
-        let k2 = MethodKey {
-            class_id: 2,
-            method_name: Arc::from("other"),
-            descriptor: Arc::from("(I)V"),
-        };
-        store.record_branch(&k1, 5, true);
-        store.record_branch(&k2, 10, false);
-        let all = store.snapshot_all();
-        assert_eq!(all.len(), 2);
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let k1 = make_key(1);
+            let k2 = MethodKey {
+                class_id: 2,
+                method_name: Arc::from("other"),
+                descriptor: Arc::from("(I)V"),
+            };
+            store.record_branch(&k1, 5, true);
+            store.record_branch(&k2, 10, false);
+            let all = store.snapshot_all();
+            assert_eq!(all.len(), 2);
+        });
     }
 
     #[test]
@@ -542,31 +575,35 @@ mod tests {
 
     #[test]
     fn m29_snapshot_all_preserves_branch_data() {
-        let store = ProfileStore::new();
-        let key = make_key(99);
-        for _ in 0..10 { store.record_branch(&key, 42, true); }
-        for _ in 0..5 { store.record_branch(&key, 42, false); }
-        let all = store.snapshot_all();
-        assert_eq!(all.len(), 1);
-        let (_, profile) = &all[0];
-        let counts = &profile.branches[&42];
-        assert_eq!(counts.taken, 10);
-        assert_eq!(counts.not_taken, 5);
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(99);
+            for _ in 0..10 { store.record_branch(&key, 42, true); }
+            for _ in 0..5 { store.record_branch(&key, 42, false); }
+            let all = store.snapshot_all();
+            assert_eq!(all.len(), 1);
+            let (_, profile) = &all[0];
+            let counts = &profile.branches[&42];
+            assert_eq!(counts.taken, 10);
+            assert_eq!(counts.not_taken, 5);
+        });
     }
 
     #[test]
     fn m29_snapshot_all_preserves_receiver_data() {
-        let store = ProfileStore::new();
-        let key = make_key(88);
-        store.record_receiver(&key, 20, 500);
-        store.record_receiver(&key, 20, 500);
-        store.record_receiver(&key, 20, 600);
-        let all = store.snapshot_all();
-        assert_eq!(all.len(), 1);
-        let (_, profile) = &all[0];
-        let rcounts = &profile.receivers[&20];
-        assert_eq!(rcounts[&500], 2);
-        assert_eq!(rcounts[&600], 1);
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(88);
+            store.record_receiver(&key, 20, 500);
+            store.record_receiver(&key, 20, 500);
+            store.record_receiver(&key, 20, 600);
+            let all = store.snapshot_all();
+            assert_eq!(all.len(), 1);
+            let (_, profile) = &all[0];
+            let rcounts = &profile.receivers[&20];
+            assert_eq!(rcounts[&500], 2);
+            assert_eq!(rcounts[&600], 1);
+        });
     }
 
     // ===== S38 loop trip profile tests =====
@@ -634,59 +671,65 @@ mod tests {
 
     #[test]
     fn s38_profile_store_backedge_accumulates() {
-        let store = ProfileStore::new();
-        let key = make_key(55);
-        for _ in 0..200 {
-            store.record_backedge(&key, 42);
-        }
-        for _ in 0..10 {
-            store.record_trip_complete(&key, 42, 20);
-        }
-        let profile = store.get_profile(&key).unwrap();
-        let ltp = &profile.loops[&42];
-        assert_eq!(ltp.backedge_count, 200);
-        assert_eq!(ltp.entry_count, 10);
-        assert!((ltp.avg_trip_count() - 20.0).abs() < 0.01);
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(55);
+            for _ in 0..200 {
+                store.record_backedge(&key, 42);
+            }
+            for _ in 0..10 {
+                store.record_trip_complete(&key, 42, 20);
+            }
+            let profile = store.get_profile(&key).unwrap();
+            let ltp = &profile.loops[&42];
+            assert_eq!(ltp.backedge_count, 200);
+            assert_eq!(ltp.entry_count, 10);
+            assert!((ltp.avg_trip_count() - 20.0).abs() < 0.01);
+        });
     }
 
     #[test]
     fn s38_snapshot_all_preserves_loop_data() {
-        let store = ProfileStore::new();
-        let key = make_key(66);
-        for _ in 0..100 {
-            store.record_backedge(&key, 10);
-        }
-        store.record_trip_complete(&key, 10, 50);
-        let all = store.snapshot_all();
-        assert_eq!(all.len(), 1);
-        let (_, profile) = &all[0];
-        let ltp = &profile.loops[&10];
-        assert_eq!(ltp.backedge_count, 100);
-        assert_eq!(ltp.entry_count, 1);
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(66);
+            for _ in 0..100 {
+                store.record_backedge(&key, 10);
+            }
+            store.record_trip_complete(&key, 10, 50);
+            let all = store.snapshot_all();
+            assert_eq!(all.len(), 1);
+            let (_, profile) = &all[0];
+            let ltp = &profile.loops[&10];
+            assert_eq!(ltp.backedge_count, 100);
+            assert_eq!(ltp.entry_count, 1);
+        });
     }
 
     /// T10.9.B — smoke test: ProfileStore uses FxHashMap for methods/invocation_counts.
     /// Verifies insert/lookup semantics are preserved after the HashMap → FxHashMap swap.
     #[test]
     fn t10_9_b_fx_hashmap_swap_smoke() {
-        let store = ProfileStore::new();
-        // Populate a few hundred methods and invocation counts.
-        for i in 0..300u32 {
-            let key = make_key(i);
-            store.record_branch(&key, (i as usize) * 4, i % 2 == 0);
-            store.increment_invocation((i as u64) << 32);
-        }
-        // Snapshot should show all 300 methods.
-        let snap = store.snapshot_all();
-        assert_eq!(snap.len(), 300, "every inserted method should be present");
-        let ivc = store.snapshot_invocation_counts();
-        assert_eq!(ivc.len(), 300, "every invocation slot should be present");
-        // Spot-check a specific key survives the hash migration.
-        let k = make_key(42);
-        let profile = store.get_profile(&k).unwrap();
-        assert!(
-            profile.branches.contains_key(&(42usize * 4)),
-            "FxHashMap lookup should find the inserted PC"
-        );
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            // Populate a few hundred methods and invocation counts.
+            for i in 0..300u32 {
+                let key = make_key(i);
+                store.record_branch(&key, (i as usize) * 4, i % 2 == 0);
+                store.increment_invocation((i as u64) << 32);
+            }
+            // Snapshot should show all 300 methods.
+            let snap = store.snapshot_all();
+            assert_eq!(snap.len(), 300, "every inserted method should be present");
+            let ivc = store.snapshot_invocation_counts();
+            assert_eq!(ivc.len(), 300, "every invocation slot should be present");
+            // Spot-check a specific key survives the hash migration.
+            let k = make_key(42);
+            let profile = store.get_profile(&k).unwrap();
+            assert!(
+                profile.branches.contains_key(&(42usize * 4)),
+                "FxHashMap lookup should find the inserted PC"
+            );
+        });
     }
 }

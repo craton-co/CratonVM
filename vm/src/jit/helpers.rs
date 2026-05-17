@@ -6,7 +6,7 @@
 use std::cell::Cell;
 
 use rustjvm_jit::{
-    DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitRuntimeHelpers,
+    DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitPICSlot, JitRuntimeHelpers,
 };
 use rustjvm_types::{
     ArrayElementType, ClassId, ObjectRef, Value,
@@ -237,6 +237,85 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     }
     let obj_ref = heap.alloc_array(ClassId::new(0), elem_type, length as usize);
     obj_ref.as_ptr() as i64
+}
+
+/// JIT inline-TLAB completion helper.
+///
+/// Called from JIT-emitted code AFTER the inline TLAB bump has already
+/// claimed `HEADER_SIZE + num_fields * SLOT_SIZE` bytes at `obj_ptr`
+/// and written only the `class_id` field at offset 0. This helper
+/// finishes the header (kind = Object, identity_hash_code, num_slots —
+/// the surrounding bytes are TLAB-zeroed so `mark_word`, `forwarding_ptr`,
+/// `gc_age`, `gc_flags`, etc. are already correctly initialized),
+/// installs primitive-field typed-zero defaults, and registers the
+/// object with the finalizer queue when its class overrides `finalize()`.
+///
+/// Separating this from `jit_new_object` lets the JIT emit the cheap
+/// bump-pointer prologue inline (~5-7 instructions) and pay a single
+/// call only for the header-completion + primitive-defaults work that
+/// touches the class-metadata `RwLock`.
+///
+/// # Safety
+/// `vm_ptr` must be a valid `SharedVm` pointer; `obj_ptr` must be a
+/// freshly-bumped TLAB allocation of at least `HEADER_SIZE + num_fields
+/// * SLOT_SIZE` zeroed bytes with `class_id` already written at offset 0.
+/// `num_fields` must match the class metadata.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_post_tlab_init(
+    vm_ptr: i64,
+    obj_ptr: i64,
+    class_id_raw: i64,
+    num_fields: i64,
+) -> i64 {
+    let vm = &*(vm_ptr as *const SharedVm);
+    let class_id = ClassId::new(class_id_raw as u32);
+    let raw_ptr = obj_ptr as *mut u8;
+
+    // Finish header: identity_hash_code, num_slots.
+    //
+    // Everything else (kind, element_type, padding, mark_word,
+    // forwarding_ptr, gc_age/flags, array_length) is correctly zero
+    // already from the TLAB refill: `ObjectKind::Object` discriminant
+    // is 0, `ArrayElementType::Reference` is 0, `MARK_NEUTRAL` is 0,
+    // `gc_age=0`/`gc_flags=0`/`array_length=0` match a fresh object.
+    //
+    // Layout reminder (see `types/src/heap_types.rs`):
+    //   off  0: class_id (4 bytes)       — written inline by JIT
+    //   off  4: kind (1)                 — already zero == Object
+    //   off  5: element_type (1)         — already zero == Reference
+    //   off  6: padding (2)              — already zero
+    //   off  8: identity_hash_code (4)
+    //   off 12: array_length (4)         — already zero
+    //   off 16: num_slots (4)
+    //   off 20: gc_age + gc_flags + _gc_reserved — already zero
+    //   off 24: forwarding_ptr (8)       — already zero
+    //   off 32: mark_word (8)            — already zero == MARK_NEUTRAL
+    let hash = vm.heap.next_identity_hash();
+    *(raw_ptr.add(8) as *mut i32) = hash;
+    *(raw_ptr.add(16) as *mut u32) = num_fields as u32;
+
+    // Reconstruct the typed handle and finish init.
+    let obj_ref = rustjvm_types::ObjectRef::from_raw(raw_ptr);
+
+    // Primitive-typed default values walk the class hierarchy under the
+    // class_manager RwLock. Kept here (rather than inlined) because the
+    // JIT cannot synthesise per-field descriptor reads without
+    // pre-resolving the full layout at compile time.
+    jit_init_primitive_fields(vm, obj_ref, class_id);
+
+    // JLS §12.6 finalizer registration. Cold path — most classes do not
+    // override finalize().
+    let has_fin = vm
+        .class_manager
+        .read()
+        .class_store
+        .get(class_id)
+        .map_or(false, |c| c.has_finalizer);
+    if has_fin {
+        vm.register_finalizable(obj_ref.as_ptr() as usize);
+    }
+
+    obj_ptr
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -1402,6 +1481,9 @@ unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usi
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo. args_ptr/num_args form a valid i64 slice.
 // mic_ptr must point to a live JitMICSlot used for monomorphic inline cache dispatch.
+// pic_ptr, when non-zero, must point to a live JitPICSlot co-allocated with the MIC at
+// the same call site; the helper populates its 3-way entries via `install` so the next
+// invocation hits the inline cascade emitted in `jit/src/x64.rs`.
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // matching the compiled method's extern "C" calling convention.
 #[allow(clippy::too_many_arguments)]
@@ -1411,6 +1493,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     args_ptr: i64,
     num_args: i64,
     mic_ptr: i64,
+    pic_ptr: i64,
 ) -> i64 {
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
@@ -1550,6 +1633,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
             mic.cached_needs_context
                 .store(needs_ctx, std::sync::atomic::Ordering::Release);
+            // CRIT-1 — also populate the co-allocated PIC so the
+            // inline 3-way cascade in `jit/src/x64.rs` hits on the
+            // next invocation. Without this the cascade's empty
+            // (class_id == 0) slots always fail and every dispatch
+            // pays the full helper cost. We only install when we
+            // actually have an entry_ptr to publish; a 0 entry_ptr
+            // in a PIC slot would force the inline cascade to call
+            // through a null function pointer.
+            if pic_ptr != 0 && entry_ptr != 0 {
+                let pic = &*(pic_ptr as *const JitPICSlot);
+                pic.install(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
+            }
         }
 
         let invoke_res = crate::vm::invoke_or_native(
@@ -1619,6 +1714,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
     mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
+
+    // CRIT-1 — Populate the co-allocated PIC so the inline 3-way
+    // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
+    // dispatches. Eager allocation made `pic_inline` always-true at
+    // codegen, so the cascade is always emitted but stays cold until
+    // the helper publishes entries here. Mirror the MIC update with
+    // a `pic.install(...)` so the next call with the same receiver
+    // class takes the inline fast path (5 cycles slot-0 hit vs the
+    // full helper call). LFU eviction inside `install` handles
+    // megamorphic spillover automatically.
+    if pic_ptr != 0 && entry_ptr != 0 {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        pic.install(receiver_cid, &class_name, entry_ptr, needs_ctx);
+    }
 
     let method_args: Vec<Value> = values[1..].to_vec();
     let mut full_args = Vec::with_capacity(1 + method_args.len());
@@ -2042,8 +2151,38 @@ mod tests {
     }
 }
 
+/// Return the current thread's `JvmThread` pointer for the JIT inline
+/// TLAB bump-pointer fast path.
+///
+/// Reads the same TLS slot (`JIT_THREAD`) populated by `set_jit_thread`
+/// just before JIT-compiled code runs. The pointer is valid for the
+/// duration of the JIT invocation and is cleared by `clear_jit_thread`
+/// when JIT code returns.
+///
+/// Returning a raw pointer is intentional — the JIT immediately reads
+/// the TLAB cursor/end fields from `[thread + tlab_offset + ..]` and
+/// never dereferences anything outside that two-word window during the
+/// fast path. The slow-path fallback (`jit_new_object`) reaches the
+/// thread via the same TLS slot.
+///
+/// Returns `null` if invoked from a thread that did not call
+/// `set_jit_thread` (defensive — the JIT fast path treats a null thread
+/// pointer as "skip the inline bump, fall through to slow path").
+#[no_mangle]
+pub unsafe extern "C" fn jit_get_current_thread() -> *mut JvmThread {
+    JIT_THREAD.with(|t| t.get())
+}
+
 /// Build the JIT runtime helpers table with real function pointer addresses.
 pub fn build_helpers() -> JitRuntimeHelpers {
+    // Compute the inline-TLAB offset triple once at startup so the JIT
+    // can bake them as immediates. The runtime tests
+    // `Tlab::test_tlab_offsets` and `JvmThread::tlab_offset_matches_field_address`
+    // pin the layout against drift.
+    let tlab_off = JvmThread::tlab_offset();
+    let cursor_in_thread = tlab_off + rustjvm_gc::Tlab::CURSOR_OFFSET;
+    let end_in_thread = tlab_off + rustjvm_gc::Tlab::END_OFFSET;
+
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
@@ -2077,6 +2216,16 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         uncommon_trap: jit_uncommon_trap as *const () as usize,
         math_fma_double: jit_math_fma_double as *const () as usize,
         math_fma_float: jit_math_fma_float as *const () as usize,
+        // HIGH-6 JIT audit — inline TLAB bump-pointer wiring.
+        tlab_cursor_offset_in_thread: cursor_in_thread,
+        tlab_end_offset_in_thread: end_in_thread,
+        // JIT contract: `ObjectHeader.class_id` is at byte offset 0
+        // (enforced by `class_id_remains_at_offset_zero` in
+        // `types/src/heap_types.rs`). Exposed here so the JIT does not
+        // hardcode the constant in a second place.
+        class_id_offset_in_obj: 0,
+        get_current_thread: jit_get_current_thread as *const () as usize,
+        tlab_post_init: jit_post_tlab_init as *const () as usize,
     }
 }
 

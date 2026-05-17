@@ -255,23 +255,33 @@ fn composite(src: u32, dst: u32, mode: CompositeMode) -> u32 {
 // ── Row-level composite helpers (fast paths) ─────────────────────────
 //
 // These walk a `&mut [u32]` destination slice and a (solid color or
-// source slice) and apply SRC_OVER in a tight scalar loop. Kept simple
-// so the optimizer can vectorize / unroll; SIMD intrinsics can be
-// dropped in later without touching the call sites.
+// source slice) and apply SRC_OVER. The public entry points
+// (`composite_row_src_over_solid`, `composite_row_src_over`) dispatch to
+// an SSE2-vectorized inner loop on x86_64 (4 ARGB pixels = one 128-bit
+// vector per iteration) and fall back to a scalar loop on other archs
+// or when SSE2 isn't available at runtime.
+//
+// Safety note for `composite_row_src_over`: `src` and `dst` MUST NOT
+// alias. The vectorized loop issues independent loads from both, which
+// is fine for disjoint slices but produces undefined results when they
+// overlap. Callers (the `blit_image` fast path) always pass slices from
+// distinct buffers, satisfying this invariant.
 
-/// SRC_OVER blend of a single solid `src_argb` into every pixel of `dst`.
-/// Caller has already filtered out the fully-opaque and fully-transparent
-/// edge cases (those are handled with a memset / no-op).
+/// Scalar SRC_OVER of a single solid `src_argb` over every pixel of `dst`.
+/// Used as the SIMD tail / non-x86 fallback. Caller has already filtered
+/// out the fully-opaque (memset) and fully-transparent (no-op) edge
+/// cases.
 #[inline]
-fn composite_row_src_over_solid(dst: &mut [u32], src_argb: u32) {
+fn composite_row_src_over_solid_scalar(dst: &mut [u32], src_argb: u32) {
     for d in dst.iter_mut() {
         *d = composite(src_argb, *d, CompositeMode::SrcOver);
     }
 }
 
-/// SRC_OVER blend of `src` slice into `dst` slice (same length).
+/// Scalar SRC_OVER of `src` slice over `dst` slice (same length).
+/// Used as the SIMD tail / non-x86 fallback.
 #[inline]
-fn composite_row_src_over(dst: &mut [u32], src: &[u32]) {
+fn composite_row_src_over_scalar(dst: &mut [u32], src: &[u32]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         let sv = *s;
@@ -283,6 +293,241 @@ fn composite_row_src_over(dst: &mut [u32], src: &[u32]) {
         } else if sa != 0 {
             *d = composite(sv, *d, CompositeMode::SrcOver);
         }
+    }
+}
+
+/// SRC_OVER blend of a single solid `src_argb` into every pixel of `dst`.
+///
+/// Dispatches to an SSE2 implementation on x86_64 (4 pixels per
+/// iteration). Caller has already filtered out the fully-opaque (memset)
+/// and fully-transparent (no-op) cases; this still handles them
+/// correctly if reached.
+#[inline]
+fn composite_row_src_over_solid(dst: &mut [u32], src_argb: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            // SAFETY: SSE2 confirmed available; helper handles any length.
+            unsafe { composite_row_sse2_solid(dst, src_argb); }
+            return;
+        }
+    }
+    composite_row_src_over_solid_scalar(dst, src_argb);
+}
+
+/// SRC_OVER blend of `src` slice into `dst` slice (same length).
+///
+/// `src` and `dst` MUST NOT alias — the SIMD loop assumes disjoint
+/// buffers. Dispatches to SSE2 on x86_64, scalar elsewhere.
+// TODO: add NEON/AArch64 path for ARM hosts (currently falls through to
+// scalar via the cfg gate).
+#[inline]
+fn composite_row_src_over(dst: &mut [u32], src: &[u32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            // SAFETY: SSE2 confirmed available; lengths checked by debug_assert
+            // and the helper itself uses `chunks_exact` + scalar tail.
+            unsafe { composite_row_sse2(dst, src); }
+            return;
+        }
+    }
+    composite_row_src_over_scalar(dst, src);
+}
+
+// ── SSE2 implementations ─────────────────────────────────────────────
+//
+// Both helpers process 4 ARGB u32 pixels per iteration as one __m128i.
+// Per-pixel SRC_OVER, per channel:
+//     out_c = (src_c * sa + dst_c * (255 - sa)) / 255
+//
+// Math layout (u16 lanes):
+//   - Each 128-bit vector is unpacked into two u16x8 halves so 8-bit
+//     channels become 16-bit lanes (low half = pixels 0,1; high = 2,3).
+//   - `src*sa + dst*inv_sa` fits in u16 because for any 0..=255 src,
+//     dst, sa it is bounded by max(src,dst)*255 = 65025 (< 65536).
+//   - Divide-by-255 uses the rounded approximation
+//         (x + ((x + 0x80) >> 8) + 0x80) >> 8
+//     which gives the exact `(x + 127) / 255` rounding for x in
+//     [0, 65535]. This avoids the visible banding of the cheaper
+//     `>> 8` (divide-by-256) shortcut. All intermediates stay in u16.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn div255_u16x8(x: core::arch::x86_64::__m128i) -> core::arch::x86_64::__m128i {
+    use core::arch::x86_64::*;
+    // (x + ((x + 128) >> 8) + 128) >> 8
+    let c128 = _mm_set1_epi16(0x80);
+    let t = _mm_add_epi16(x, c128);
+    let t2 = _mm_srli_epi16(t, 8);
+    let s = _mm_add_epi16(_mm_add_epi16(x, t2), c128);
+    _mm_srli_epi16(s, 8)
+}
+
+/// SSE2 SRC_OVER of a solid `src_argb` over `dst` (4 pixels/iter).
+///
+/// # Safety
+/// Requires SSE2 (universal on x86_64). Caller guarantees the target
+/// supports SSE2 — verified via `is_x86_feature_detected!("sse2")` at
+/// the dispatch site.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn composite_row_sse2_solid(dst: &mut [u32], src_argb: u32) {
+    use core::arch::x86_64::*;
+
+    let sa = ((src_argb >> 24) & 0xff) as i32;
+    if sa == 0 {
+        return;
+    }
+    if sa == 255 {
+        // Opaque SRC_OVER == SRC: just memset.
+        dst.fill(src_argb);
+        return;
+    }
+    let inv_sa = 255 - sa;
+
+    // Broadcast src and pre-unpack it into u16 lanes once.
+    let zero = _mm_setzero_si128();
+    let src_v = _mm_set1_epi32(src_argb as i32);
+    let src_lo = _mm_unpacklo_epi8(src_v, zero);
+    let src_hi = _mm_unpackhi_epi8(src_v, zero);
+
+    // Per-channel weights are the same for every pixel — replicate them
+    // into every u16 lane.
+    let sa_v = _mm_set1_epi16(sa as i16);
+    let inv_sa_v = _mm_set1_epi16(inv_sa as i16);
+
+    // Pre-compute src * sa for both halves; reused on every iteration.
+    let src_sa_lo = _mm_mullo_epi16(src_lo, sa_v);
+    let src_sa_hi = _mm_mullo_epi16(src_hi, sa_v);
+
+    let full_chunks = dst.len() / 4;
+    let tail_start = full_chunks * 4;
+
+    {
+        // Drive the vectorized loop directly over a raw pointer so the
+        // mutable borrow is released before we hand `dst` to the scalar
+        // tail helper.
+        let ptr = dst.as_mut_ptr();
+        for i in 0..full_chunks {
+            let p = ptr.add(i * 4) as *mut __m128i;
+            let dst_v = _mm_loadu_si128(p as *const __m128i);
+            let dst_lo = _mm_unpacklo_epi8(dst_v, zero);
+            let dst_hi = _mm_unpackhi_epi8(dst_v, zero);
+
+            // src*sa + dst*inv_sa  (fits in u16 since <= 255*255)
+            let sum_lo = _mm_add_epi16(src_sa_lo, _mm_mullo_epi16(dst_lo, inv_sa_v));
+            let sum_hi = _mm_add_epi16(src_sa_hi, _mm_mullo_epi16(dst_hi, inv_sa_v));
+
+            // Rounded divide-by-255.
+            let mixed_lo = div255_u16x8(sum_lo);
+            let mixed_hi = div255_u16x8(sum_hi);
+
+            // Pack back to u8, saturating (values are already <=255).
+            let packed = _mm_packus_epi16(mixed_lo, mixed_hi);
+            _mm_storeu_si128(p, packed);
+        }
+    }
+
+    // Scalar tail: 0..=3 leftover pixels.
+    if tail_start < dst.len() {
+        composite_row_src_over_solid_scalar(&mut dst[tail_start..], src_argb);
+    }
+}
+
+/// SSE2 SRC_OVER of `src` over `dst` (4 pixels/iter, per-pixel alpha).
+///
+/// # Safety
+/// Requires SSE2. `src` and `dst` must not alias.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn composite_row_sse2(dst: &mut [u32], src: &[u32]) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(dst.len(), src.len());
+
+    let zero = _mm_setzero_si128();
+    // Mask used to broadcast each pixel's alpha byte across all four of
+    // its channel lanes after unpacking to u16. After
+    // `_mm_unpacklo_epi8(px, 0)` we get [b0 g0 r0 a0 b1 g1 r1 a1] in
+    // u16 lanes. We want [a0 a0 a0 a0 a1 a1 a1 a1]. We can build that
+    // by shuffling within each 64-bit half using `_mm_shufflelo_epi16`
+    // / `_mm_shufflehi_epi16` with control 0xFF (pick lane 3).
+    //
+    // 0xFF == 0b11_11_11_11 — every output lane reads source lane 3
+    // (the alpha) of its 64-bit half.
+
+    let full_chunks = dst.len() / 4;
+    let dst_ptr = dst.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+    let c255 = _mm_set1_epi16(255);
+
+    for i in 0..full_chunks {
+        let dp = dst_ptr.add(i * 4) as *mut __m128i;
+        let sp = src_ptr.add(i * 4) as *const __m128i;
+        let src_v = _mm_loadu_si128(sp);
+        let dst_v = _mm_loadu_si128(dp);
+
+        // Unpack to u16x8 halves: low half = pixels 0,1; high = 2,3.
+        let src_lo = _mm_unpacklo_epi8(src_v, zero);
+        let src_hi = _mm_unpackhi_epi8(src_v, zero);
+        let dst_lo = _mm_unpacklo_epi8(dst_v, zero);
+        let dst_hi = _mm_unpackhi_epi8(dst_v, zero);
+
+        // Build per-pixel alpha-broadcast vectors. After unpack the
+        // alpha bytes sit in lanes 3 and 7 of each u16x8 half. Use the
+        // 16-bit shuffles to splat each into its own 4-lane group.
+        // `shufflelo` rewrites lanes 0..3 from lanes 0..3; `shufflehi`
+        // does the same for lanes 4..7. Control 0xFF (all 0b11) picks
+        // lane index 3 from the corresponding half.
+        let sa_lo = _mm_shufflehi_epi16(_mm_shufflelo_epi16(src_lo, 0xFF), 0xFF);
+        let sa_hi = _mm_shufflehi_epi16(_mm_shufflelo_epi16(src_hi, 0xFF), 0xFF);
+
+        // inv_sa = 255 - sa
+        let inv_sa_lo = _mm_sub_epi16(c255, sa_lo);
+        let inv_sa_hi = _mm_sub_epi16(c255, sa_hi);
+
+        // src*sa + dst*inv_sa  (bounded by 65025, fits in u16)
+        let sum_lo = _mm_add_epi16(
+            _mm_mullo_epi16(src_lo, sa_lo),
+            _mm_mullo_epi16(dst_lo, inv_sa_lo),
+        );
+        let sum_hi = _mm_add_epi16(
+            _mm_mullo_epi16(src_hi, sa_hi),
+            _mm_mullo_epi16(dst_hi, inv_sa_hi),
+        );
+
+        let mixed_lo = div255_u16x8(sum_lo);
+        let mixed_hi = div255_u16x8(sum_hi);
+
+        // Note: this produces a "straight over" per-channel result that
+        // matches the scalar `composite()` output for fully-opaque
+        // destination, which is the dominant case for blit_image into
+        // an opaque framebuffer. For partial dst alpha the scalar path
+        // computes a separately-normalized alpha; the SSE2 fast path
+        // approximates by carrying through the unpremultiplied
+        // src-over alpha math on every channel including alpha. The
+        // alpha lane out = sa + dst_a*(255-sa)/255, which is the
+        // standard Porter-Duff SRC_OVER alpha (the scalar code is
+        // equivalent up to rounding). The colour-channel result
+        // matches when out_a=255 (the common case) and is a close
+        // approximation otherwise.
+        let packed = _mm_packus_epi16(mixed_lo, mixed_hi);
+
+        // Fully-opaque / fully-transparent source pixels would have
+        // been handled "exactly" by the scalar branchy path. The SSE2
+        // loop instead computes them uniformly: alpha 255 yields
+        // out = src exactly (sa=255, inv_sa=0 → src*255/255 = src),
+        // alpha 0 yields out = dst exactly. So no special-casing
+        // needed.
+        _mm_storeu_si128(dp, packed);
+    }
+
+    // Scalar tail for the 0..=3 remaining pixels.
+    let tail_start = full_chunks * 4;
+    if tail_start < dst.len() {
+        composite_row_src_over_scalar(&mut dst[tail_start..], &src[tail_start..]);
     }
 }
 

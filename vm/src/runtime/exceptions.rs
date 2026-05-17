@@ -8,6 +8,19 @@ use crate::error::{ClassFileError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::{create_java_string, invoke_on_class_shared, SharedVm};
+use std::sync::OnceLock;
+
+/// Cached read of the `RUSTJVM_IAE_TRACE` env var. Env-var lookups are
+/// surprisingly expensive (mutex + string alloc on some platforms); the
+/// exception-throw hot path is sensitive to per-throw overhead, so we read
+/// once at first use and cache the boolean. Process-lifetime cache: setting
+/// the var after the first exception is thrown will have no effect.
+static IAE_TRACE: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn iae_trace_enabled() -> bool {
+    *IAE_TRACE.get_or_init(|| std::env::var("RUSTJVM_IAE_TRACE").is_ok())
+}
 
 /// Resolve `Throwable.detailMessage` (or any inherited String field by
 /// that name) and write `string_ref` to it. Walks the class hierarchy
@@ -179,7 +192,19 @@ pub fn throw_runtime_error(
 ) -> MethodCallFailed {
     // T15: trace the origin of RuntimeErrors so users can see where
     // a silent NPE/IOOBE/etc. is coming from during class init.
-    {
+    //
+    // PERF: the entire preamble is gated behind `tracing::enabled!(DEBUG)`
+    // so the common no-trace path pays only an atomic-bool check. Every
+    // expensive operation here -- `method_name().to_string()`, the
+    // `class_manager.read()` lock + `Arc<str>` clone of `class.name`, the
+    // 15-/20-/25-/30-/40-frame walks that re-acquire the read lock per
+    // frame, and the per-throw `tracing::debug!` formatting -- is now
+    // skipped when DEBUG-level tracing is not active. The env-var checks
+    // are additionally cached in a `OnceLock<bool>` (see
+    // `iae_trace_enabled`) so the eprintln-style stack dumps that only
+    // fire under `RUSTJVM_IAE_TRACE` cost a single atomic load + branch
+    // instead of a syscall + heap alloc.
+    if tracing::enabled!(tracing::Level::DEBUG) {
         let frame = thread.frames.last();
         let method = frame.map(|f| f.method_name().to_string()).unwrap_or_default();
         let pc = frame.map(|f| f.pc).unwrap_or(0);
@@ -248,7 +273,7 @@ pub fn throw_runtime_error(
                 }
             }
             // S111r20: broad NPE trace for spring context NPE hunt
-            if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+            if iae_trace_enabled() {
                 eprintln!("NPE-TRACE msg={:?}", error);
                 for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                     let cn = shared.class_manager.read()
@@ -261,7 +286,7 @@ pub fn throw_runtime_error(
         }
         // S111r19+: trace IAE origins for ConfigurationClassParser hunt
         if matches!(&error, RuntimeError::IllegalArgumentException { .. })
-            && std::env::var("RUSTJVM_IAE_TRACE").is_ok()
+            && iae_trace_enabled()
         {
             eprintln!("IAE-TRACE error={error:?}");
             for (i, f) in thread.frames.iter().enumerate().rev().take(25) {

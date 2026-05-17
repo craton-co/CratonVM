@@ -30,7 +30,9 @@ const MAX_FIELD_COUNT: u16 = u16::MAX;
 const MAX_METHOD_COUNT: u16 = u16::MAX;
 const MAX_INTERFACE_COUNT: u16 = u16::MAX;
 const MAX_ATTRIBUTE_COUNT: u16 = u16::MAX;
-const MAX_EXCEPTION_TABLE_COUNT: u16 = u16::MAX;
+// MAX_EXCEPTION_TABLE_COUNT was used by the eager `Code` parser; that parser
+// now lives in `attribute.rs` (called on-demand via `LazyAttribute::decode`),
+// so the constant is no longer needed here.
 
 /// Validate that a section count does not exceed the given limit.
 fn validate_count(label: &str, count: u16, limit: u16) -> Result<(), ClassReaderError> {
@@ -372,17 +374,40 @@ fn read_method(
     })
 }
 
+/// Read an attribute table into a `Vec<LazyAttribute>`.
+///
+/// For every entry we read only the header (`attribute_name_index`,
+/// `attribute_length`) and the raw body bytes — *no* structural parsing
+/// happens here. The body is wrapped in a [`LazyAttribute::Raw`] that
+/// downstream consumers decode on demand via
+/// [`LazyAttribute::decode`] (which dispatches to
+/// [`decode_attribute`]).
+///
+/// Two correctness checks survive the move to lazy parsing:
+///
+/// 1. **Buffer-bound check before slicing**: `attribute_length` must not
+///    exceed the remaining buffer. This catches truncated class files
+///    immediately rather than at decode time.
+/// 2. **Per-attribute length verification**: by consuming exactly
+///    `attribute_length` bytes via `buf.read_bytes(length)` we guarantee
+///    every subsequent attribute starts at the declared offset. The
+///    *content* validation (sub-parser must consume exactly the body)
+///    moves into `decode_attribute` itself (see `attribute.rs`); both
+///    paths therefore preserve the misalignment-prevention guarantee
+///    that the eager reader had.
 fn read_attributes(
     buf: &mut ClassFileBuffer,
     constant_pool: &ConstantPool,
-) -> Result<Vec<Attribute>, ClassReaderError> {
+) -> Result<Vec<LazyAttribute>, ClassReaderError> {
     let count = buf.read_u16()?;
     validate_count("attributes", count, MAX_ATTRIBUTE_COUNT)?;
     let mut attributes = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
 
     for _ in 0..count {
         let name_index = buf.read_u16()?;
-        let name = constant_pool.get_utf8(name_index).ok_or_else(|| {
+        // Fetch the interned `Arc<str>` directly — constant-pool Utf8 entries
+        // were interned at parse time, so cloning the Arc is a refcount bump.
+        let name = constant_pool.get_utf8_arc(name_index).ok_or_else(|| {
             ClassReaderError::InvalidConstantPool {
                 index: name_index,
                 message: "attribute name must reference a valid Utf8 entry".to_string(),
@@ -390,7 +415,9 @@ fn read_attributes(
         })?;
         let length = buf.read_u32()? as usize;
 
-        // Validate attribute length does not exceed remaining buffer
+        // Validate attribute length does not exceed remaining buffer before
+        // we slice into it. Catches truncated class files (and a hostile
+        // `attribute_length` larger than the file) at read time.
         if length > buf.remaining() {
             return Err(ClassReaderError::InvalidClassData {
                 message: format!(
@@ -400,580 +427,18 @@ fn read_attributes(
             });
         }
 
-        // Snapshot position before dispatching to the sub-parser so we can
-        // verify post-parse that exactly `length` bytes were consumed.
-        // A malicious attribute can declare e.g. `length = 4` while its
-        // structured body actually walks the parser past the declared end,
-        // mis-aligning every subsequent attribute (including Code bodies).
-        let start_pos = buf.position();
+        // Slice exactly `length` bytes for the body. The buffer's
+        // `read_bytes` advances position by `length`, which is precisely
+        // the per-attribute length verification we need: any subsequent
+        // attribute will start at the spec-mandated offset, eliminating
+        // the misalignment attack that the eager path's snapshot/check
+        // wrapper guarded against.
+        let bytes = buf.read_bytes(length)?.to_vec();
 
-        let attr = match name {
-            "Code" => read_code_attribute(buf, constant_pool)?,
-            "SourceFile" => {
-                let source_file_index = buf.read_u16()?;
-                let source_file = constant_pool
-                    .get_utf8(source_file_index)
-                    .ok_or_else(|| ClassReaderError::InvalidConstantPool {
-                        index: source_file_index,
-                        message: "SourceFile must reference a valid Utf8 entry".to_string(),
-                    })?
-                    .to_string();
-                Attribute::SourceFile(source_file)
-            }
-            "ConstantValue" => {
-                let constant_value_index = buf.read_u16()?;
-                Attribute::ConstantValue {
-                    constant_value_index,
-                }
-            }
-            "Deprecated" => Attribute::Deprecated,
-            "Synthetic" => Attribute::Synthetic,
-            "Exceptions" => {
-                let num_exceptions = buf.read_u16()?;
-                let mut exception_indices = Vec::with_capacity((num_exceptions as usize).min(PREALLOC_CAP));
-                for _ in 0..num_exceptions {
-                    exception_indices.push(buf.read_u16()?);
-                }
-                Attribute::Exceptions { exception_indices }
-            }
-            "LineNumberTable" => {
-                let table_length = buf.read_u16()?;
-                let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
-                for _ in 0..table_length {
-                    entries.push(LineNumberEntry {
-                        start_pc: buf.read_u16()?,
-                        line_number: buf.read_u16()?,
-                    });
-                }
-                Attribute::LineNumberTable(entries)
-            }
-            "InnerClasses" => {
-                let num_classes = buf.read_u16()?;
-                let mut classes = Vec::with_capacity((num_classes as usize).min(PREALLOC_CAP));
-                for _ in 0..num_classes {
-                    classes.push(InnerClassInfo {
-                        inner_class_info_index: buf.read_u16()?,
-                        outer_class_info_index: buf.read_u16()?,
-                        inner_name_index: buf.read_u16()?,
-                        inner_class_access_flags: buf.read_u16()?,
-                    });
-                }
-                Attribute::InnerClasses(classes)
-            }
-            "Signature" => {
-                let signature_index = buf.read_u16()?;
-                let signature = constant_pool
-                    .get_utf8(signature_index)
-                    .ok_or_else(|| ClassReaderError::InvalidConstantPool {
-                        index: signature_index,
-                        message: "Signature must reference a valid Utf8 entry".to_string(),
-                    })?
-                    .to_string();
-                Attribute::Signature(signature)
-            }
-            "StackMapTable" => {
-                let data = buf.read_bytes(length)?.to_vec();
-                Attribute::StackMapTable { entries: data }
-            }
-            "BootstrapMethods" => {
-                let num_bootstrap_methods = buf.read_u16()?;
-                let mut methods =
-                    Vec::with_capacity((num_bootstrap_methods as usize).min(PREALLOC_CAP));
-                for _ in 0..num_bootstrap_methods {
-                    let bootstrap_method_ref = buf.read_u16()?;
-                    let num_args = buf.read_u16()?;
-                    let mut bootstrap_arguments = Vec::with_capacity((num_args as usize).min(PREALLOC_CAP));
-                    for _ in 0..num_args {
-                        bootstrap_arguments.push(buf.read_u16()?);
-                    }
-                    methods.push(BootstrapMethod {
-                        bootstrap_method_ref,
-                        bootstrap_arguments,
-                    });
-                }
-                Attribute::BootstrapMethods(methods)
-            }
-            "EnclosingMethod" => Attribute::EnclosingMethod {
-                class_index: buf.read_u16()?,
-                method_index: buf.read_u16()?,
-            },
-            "NestHost" => Attribute::NestHost {
-                host_class_index: buf.read_u16()?,
-            },
-            "NestMembers" => {
-                let num = buf.read_u16()?;
-                let mut classes = Vec::with_capacity((num as usize).min(PREALLOC_CAP));
-                for _ in 0..num {
-                    classes.push(buf.read_u16()?);
-                }
-                Attribute::NestMembers { classes }
-            }
-            "Record" => {
-                let num_components = buf.read_u16()?;
-                let mut components =
-                    Vec::with_capacity((num_components as usize).min(PREALLOC_CAP));
-                for _ in 0..num_components {
-                    let comp_name_index = buf.read_u16()?;
-                    let comp_descriptor_index = buf.read_u16()?;
-                    let comp_attributes = read_attributes(buf, constant_pool)?;
-                    components.push(RecordComponent {
-                        name_index: comp_name_index,
-                        descriptor_index: comp_descriptor_index,
-                        attributes: comp_attributes,
-                    });
-                }
-                Attribute::Record(components)
-            }
-            "PermittedSubclasses" => {
-                let num = buf.read_u16()?;
-                let mut classes = Vec::with_capacity((num as usize).min(PREALLOC_CAP));
-                for _ in 0..num {
-                    classes.push(buf.read_u16()?);
-                }
-                Attribute::PermittedSubclasses { classes }
-            }
-            "Module" => {
-                let name_index = buf.read_u16()?;
-                let flags = buf.read_u16()?;
-                let version_index = buf.read_u16()?;
-
-                let requires_count = buf.read_u16()?;
-                let mut requires = Vec::with_capacity((requires_count as usize).min(PREALLOC_CAP));
-                for _ in 0..requires_count {
-                    requires.push(ModuleRequires {
-                        requires_index: buf.read_u16()?,
-                        requires_flags: buf.read_u16()?,
-                        requires_version_index: buf.read_u16()?,
-                    });
-                }
-
-                let exports_count = buf.read_u16()?;
-                let mut exports = Vec::with_capacity((exports_count as usize).min(PREALLOC_CAP));
-                for _ in 0..exports_count {
-                    let exports_index = buf.read_u16()?;
-                    let exports_flags = buf.read_u16()?;
-                    let to_count = buf.read_u16()?;
-                    let mut exports_to = Vec::with_capacity((to_count as usize).min(PREALLOC_CAP));
-                    for _ in 0..to_count {
-                        exports_to.push(buf.read_u16()?);
-                    }
-                    exports.push(ModuleExports {
-                        exports_index,
-                        exports_flags,
-                        exports_to,
-                    });
-                }
-
-                let opens_count = buf.read_u16()?;
-                let mut opens = Vec::with_capacity((opens_count as usize).min(PREALLOC_CAP));
-                for _ in 0..opens_count {
-                    let opens_index = buf.read_u16()?;
-                    let opens_flags = buf.read_u16()?;
-                    let to_count = buf.read_u16()?;
-                    let mut opens_to = Vec::with_capacity((to_count as usize).min(PREALLOC_CAP));
-                    for _ in 0..to_count {
-                        opens_to.push(buf.read_u16()?);
-                    }
-                    opens.push(ModuleOpens {
-                        opens_index,
-                        opens_flags,
-                        opens_to,
-                    });
-                }
-
-                let uses_count = buf.read_u16()?;
-                let mut uses = Vec::with_capacity((uses_count as usize).min(PREALLOC_CAP));
-                for _ in 0..uses_count {
-                    uses.push(buf.read_u16()?);
-                }
-
-                let provides_count = buf.read_u16()?;
-                let mut provides = Vec::with_capacity((provides_count as usize).min(PREALLOC_CAP));
-                for _ in 0..provides_count {
-                    let provides_index = buf.read_u16()?;
-                    let with_count = buf.read_u16()?;
-                    let mut provides_with = Vec::with_capacity((with_count as usize).min(PREALLOC_CAP));
-                    for _ in 0..with_count {
-                        provides_with.push(buf.read_u16()?);
-                    }
-                    provides.push(ModuleProvides {
-                        provides_index,
-                        provides_with,
-                    });
-                }
-
-                Attribute::Module {
-                    name_index,
-                    flags,
-                    version_index,
-                    requires,
-                    exports,
-                    opens,
-                    uses,
-                    provides,
-                }
-            }
-            "ModulePackages" => {
-                let count = buf.read_u16()?;
-                let mut packages = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
-                for _ in 0..count {
-                    packages.push(buf.read_u16()?);
-                }
-                Attribute::ModulePackages { packages }
-            }
-            "ModuleMainClass" => Attribute::ModuleMainClass {
-                main_class_index: buf.read_u16()?,
-            },
-            "RuntimeVisibleAnnotations" | "RuntimeInvisibleAnnotations" => {
-                let num_annotations = buf.read_u16()?;
-                let mut annotations = Vec::with_capacity((num_annotations as usize).min(PREALLOC_CAP));
-                for _ in 0..num_annotations {
-                    annotations.push(read_annotation(buf)?);
-                }
-                if name == "RuntimeVisibleAnnotations" {
-                    Attribute::RuntimeVisibleAnnotations(annotations)
-                } else {
-                    Attribute::RuntimeInvisibleAnnotations(annotations)
-                }
-            }
-            "RuntimeVisibleParameterAnnotations" | "RuntimeInvisibleParameterAnnotations" => {
-                let num_parameters = buf.read_u8()?;
-                let mut parameter_annotations = Vec::with_capacity((num_parameters as usize).min(PREALLOC_CAP));
-                for _ in 0..num_parameters {
-                    let num_annotations = buf.read_u16()?;
-                    let mut annotations = Vec::with_capacity((num_annotations as usize).min(PREALLOC_CAP));
-                    for _ in 0..num_annotations {
-                        annotations.push(read_annotation(buf)?);
-                    }
-                    parameter_annotations.push(annotations);
-                }
-                if name == "RuntimeVisibleParameterAnnotations" {
-                    Attribute::RuntimeVisibleParameterAnnotations(parameter_annotations)
-                } else {
-                    Attribute::RuntimeInvisibleParameterAnnotations(parameter_annotations)
-                }
-            }
-            "RuntimeVisibleTypeAnnotations" | "RuntimeInvisibleTypeAnnotations" => {
-                let num_annotations = buf.read_u16()?;
-                let mut annotations = Vec::with_capacity((num_annotations as usize).min(PREALLOC_CAP));
-                for _ in 0..num_annotations {
-                    annotations.push(read_type_annotation(buf)?);
-                }
-                if name == "RuntimeVisibleTypeAnnotations" {
-                    Attribute::RuntimeVisibleTypeAnnotations(annotations)
-                } else {
-                    Attribute::RuntimeInvisibleTypeAnnotations(annotations)
-                }
-            }
-            "AnnotationDefault" => {
-                let value = read_element_value(buf)?;
-                Attribute::AnnotationDefault(value)
-            }
-            "LocalVariableTable" => {
-                let table_length = buf.read_u16()?;
-                let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
-                for _ in 0..table_length {
-                    entries.push(LocalVariableEntry {
-                        start_pc: buf.read_u16()?,
-                        length: buf.read_u16()?,
-                        name_index: buf.read_u16()?,
-                        descriptor_index: buf.read_u16()?,
-                        index: buf.read_u16()?,
-                    });
-                }
-                Attribute::LocalVariableTable(entries)
-            }
-            "LocalVariableTypeTable" => {
-                let table_length = buf.read_u16()?;
-                let mut entries = Vec::with_capacity((table_length as usize).min(PREALLOC_CAP));
-                for _ in 0..table_length {
-                    entries.push(LocalVariableTypeEntry {
-                        start_pc: buf.read_u16()?,
-                        length: buf.read_u16()?,
-                        name_index: buf.read_u16()?,
-                        signature_index: buf.read_u16()?,
-                        index: buf.read_u16()?,
-                    });
-                }
-                Attribute::LocalVariableTypeTable(entries)
-            }
-            "MethodParameters" => {
-                let parameters_count = buf.read_u8()?;
-                let mut parameters = Vec::with_capacity((parameters_count as usize).min(PREALLOC_CAP));
-                for _ in 0..parameters_count {
-                    parameters.push(MethodParameter {
-                        name_index: buf.read_u16()?,
-                        access_flags: buf.read_u16()?,
-                    });
-                }
-                Attribute::MethodParameters(parameters)
-            }
-            "LoadableDescriptors" => {
-                // JEP 401 (Valhalla preview, class file 69+ with preview bit):
-                //   u2 number_of_descriptors;
-                //   u2 descriptors[number_of_descriptors];   // CONSTANT_Utf8_info
-                let number_of_descriptors = buf.read_u16()?;
-                let mut descriptors =
-                    Vec::with_capacity((number_of_descriptors as usize).min(PREALLOC_CAP));
-                for _ in 0..number_of_descriptors {
-                    descriptors.push(buf.read_u16()?);
-                }
-                Attribute::LoadableDescriptors { descriptors }
-            }
-            _ => {
-                // Unknown attribute — store raw bytes
-                let data = buf.read_bytes(length)?.to_vec();
-                Attribute::Unknown {
-                    name: name.to_string(),
-                    data,
-                }
-            }
-        };
-
-        // Enforce that the sub-parser consumed exactly `length` bytes.
-        // Any over- or under-read indicates a malformed (or malicious)
-        // attribute body that would mis-align all subsequent attributes.
-        let consumed = buf.position() - start_pos;
-        if consumed != length {
-            return Err(ClassReaderError::InvalidClassData {
-                message: format!(
-                    "attribute '{name}' declared length {length} but sub-parser consumed {consumed} bytes"
-                ),
-            });
-        }
-
-        attributes.push(attr);
+        attributes.push(LazyAttribute::new_raw(name, bytes));
     }
 
     Ok(attributes)
-}
-
-// ---------------------------------------------------------------------------
-// Annotation parsing helpers (JVM spec 4.7.16–4.7.24)
-// ---------------------------------------------------------------------------
-
-/// Read a single annotation structure (4.7.16).
-fn read_annotation(buf: &mut ClassFileBuffer) -> Result<Annotation, ClassReaderError> {
-    let type_index = buf.read_u16()?;
-    let num_element_value_pairs = buf.read_u16()?;
-    let mut element_value_pairs = Vec::with_capacity((num_element_value_pairs as usize).min(PREALLOC_CAP));
-    for _ in 0..num_element_value_pairs {
-        let element_name_index = buf.read_u16()?;
-        let value = read_element_value(buf)?;
-        element_value_pairs.push(ElementValuePair {
-            element_name_index,
-            value,
-        });
-    }
-    Ok(Annotation {
-        type_index,
-        element_value_pairs,
-    })
-}
-
-/// Read an element_value structure (4.7.16.1).
-///
-/// Tag-dispatched recursive parsing. Tags:
-/// - `B`, `C`, `D`, `F`, `I`, `J`, `S`, `Z`, `s` → const_value_index (u16)
-/// - `e` → enum_const { type_name_index, const_name_index }
-/// - `c` → class_info_index (u16)
-/// - `@` → nested annotation
-/// - `[` → array of element_values
-fn read_element_value(buf: &mut ClassFileBuffer) -> Result<ElementValue, ClassReaderError> {
-    let tag = buf.read_u8()?;
-    match tag {
-        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
-            let const_value_index = buf.read_u16()?;
-            Ok(ElementValue::Const {
-                tag,
-                const_value_index,
-            })
-        }
-        b'e' => {
-            let type_name_index = buf.read_u16()?;
-            let const_name_index = buf.read_u16()?;
-            Ok(ElementValue::Enum {
-                type_name_index,
-                const_name_index,
-            })
-        }
-        b'c' => {
-            let class_info_index = buf.read_u16()?;
-            Ok(ElementValue::Class { class_info_index })
-        }
-        b'@' => {
-            let annotation = read_annotation(buf)?;
-            Ok(ElementValue::AnnotationValue(annotation))
-        }
-        b'[' => {
-            let num_values = buf.read_u16()?;
-            let mut values = Vec::with_capacity((num_values as usize).min(PREALLOC_CAP));
-            for _ in 0..num_values {
-                values.push(read_element_value(buf)?);
-            }
-            Ok(ElementValue::Array(values))
-        }
-        _ => Err(ClassReaderError::InvalidClassData {
-            message: format!("invalid element_value tag: 0x{tag:02X} ('{}')", tag as char),
-        }),
-    }
-}
-
-/// Read a type_annotation structure (JVM spec 4.7.20).
-fn read_type_annotation(buf: &mut ClassFileBuffer) -> Result<TypeAnnotation, ClassReaderError> {
-    let target_type = buf.read_u8()?;
-    let target_info = read_target_info(buf, target_type)?;
-    let type_path = read_type_path(buf)?;
-    let annotation = read_annotation(buf)?;
-    Ok(TypeAnnotation {
-        target_type,
-        target_info,
-        type_path,
-        annotation,
-    })
-}
-
-/// Read target_info based on target_type (JVM spec Table 4.7.20-A/B).
-///
-/// There are 14 different forms. We store them as raw bytes — a pragmatic compromise
-/// since full type annotation target info is not needed until verification (Phase 3).
-///
-/// Each match arm validates the expected byte count for its target_type:
-///   0x00, 0x01              -> 1 byte  (type_parameter_target)
-///   0x10                    -> 2 bytes (supertype_target)
-///   0x11, 0x12              -> 2 bytes (type_parameter_bound_target)
-///   0x13..=0x15             -> 0 bytes (empty_target)
-///   0x16                    -> 1 byte  (formal_parameter_target)
-///   0x17                    -> 2 bytes (throws_target)
-///   0x40, 0x41              -> 2 + 6*N bytes (localvar_target)
-///   0x42                    -> 2 bytes (catch_target)
-///   0x43..=0x46             -> 2 bytes (offset_target)
-///   0x47..=0x4B             -> 3 bytes (type_argument_target)
-/// Unknown target_type values return an error.
-fn read_target_info(
-    buf: &mut ClassFileBuffer,
-    target_type: u8,
-) -> Result<Vec<u8>, ClassReaderError> {
-    match target_type {
-        // type_parameter_target: 1 byte (type_parameter_index)
-        0x00 | 0x01 => {
-            let b = buf.read_u8()?;
-            Ok(vec![b])
-        }
-        // supertype_target: 2 bytes (supertype_index)
-        0x10 => {
-            let hi = buf.read_u8()?;
-            let lo = buf.read_u8()?;
-            Ok(vec![hi, lo])
-        }
-        // type_parameter_bound_target: 2 bytes (type_parameter_index, bound_index)
-        0x11 | 0x12 => {
-            let a = buf.read_u8()?;
-            let b = buf.read_u8()?;
-            Ok(vec![a, b])
-        }
-        // empty_target: 0 bytes
-        0x13..=0x15 => Ok(vec![]),
-        // formal_parameter_target: 1 byte (formal_parameter_index)
-        0x16 => {
-            let b = buf.read_u8()?;
-            Ok(vec![b])
-        }
-        // throws_target: 2 bytes (throws_type_index)
-        0x17 => {
-            let hi = buf.read_u8()?;
-            let lo = buf.read_u8()?;
-            Ok(vec![hi, lo])
-        }
-        // localvar_target: variable length (table_length + entries)
-        0x40 | 0x41 => {
-            let table_length = buf.read_u16()?;
-            let byte_count = 6 * table_length as usize; // 3 × u16 per entry
-            let mut data = Vec::with_capacity(2 + byte_count);
-            data.push((table_length >> 8) as u8);
-            data.push(table_length as u8);
-            let raw = buf.read_bytes(byte_count)?;
-            data.extend_from_slice(raw);
-            Ok(data)
-        }
-        // catch_target: 2 bytes (exception_table_index)
-        0x42 => {
-            let hi = buf.read_u8()?;
-            let lo = buf.read_u8()?;
-            Ok(vec![hi, lo])
-        }
-        // offset_target: 2 bytes (offset)
-        0x43..=0x46 => {
-            let hi = buf.read_u8()?;
-            let lo = buf.read_u8()?;
-            Ok(vec![hi, lo])
-        }
-        // type_argument_target: 3 bytes (offset u16 + type_argument_index u8)
-        0x47..=0x4B => {
-            let a = buf.read_u8()?;
-            let b = buf.read_u8()?;
-            let c = buf.read_u8()?;
-            Ok(vec![a, b, c])
-        }
-        _ => Err(ClassReaderError::InvalidClassData {
-            message: format!("unknown type annotation target_type: 0x{target_type:02X}"),
-        }),
-    }
-}
-
-/// Read a type_path structure (JVM spec 4.7.20.2).
-fn read_type_path(buf: &mut ClassFileBuffer) -> Result<Vec<TypePathEntry>, ClassReaderError> {
-    let path_length = buf.read_u8()?;
-    let mut path = Vec::with_capacity((path_length as usize).min(PREALLOC_CAP));
-    for _ in 0..path_length {
-        path.push(TypePathEntry {
-            type_path_kind: buf.read_u8()?,
-            type_argument_index: buf.read_u8()?,
-        });
-    }
-    Ok(path)
-}
-
-fn read_code_attribute(
-    buf: &mut ClassFileBuffer,
-    constant_pool: &ConstantPool,
-) -> Result<Attribute, ClassReaderError> {
-    let max_stack = buf.read_u16()?;
-    let max_locals = buf.read_u16()?;
-
-    let code_length = buf.read_u32()? as usize;
-    // JVM spec 4.7.3: code_length must be > 0 and <= 65535
-    const MAX_CODE_LENGTH: usize = 65535;
-    if code_length == 0 || code_length > MAX_CODE_LENGTH {
-        return Err(ClassReaderError::InvalidClassData {
-            message: format!(
-                "Code attribute code_length {code_length} outside valid range 1..={MAX_CODE_LENGTH}"
-            ),
-        });
-    }
-    let code = buf.read_bytes(code_length)?.to_vec();
-
-    let exception_table_length = buf.read_u16()?;
-    validate_count("exception_table", exception_table_length, MAX_EXCEPTION_TABLE_COUNT)?;
-    let mut exception_table = Vec::with_capacity((exception_table_length as usize).min(PREALLOC_CAP));
-    for _ in 0..exception_table_length {
-        exception_table.push(ExceptionTableEntry {
-            start_pc: buf.read_u16()?,
-            end_pc: buf.read_u16()?,
-            handler_pc: buf.read_u16()?,
-            catch_type: buf.read_u16()?,
-        });
-    }
-
-    let attributes = read_attributes(buf, constant_pool)?;
-
-    Ok(Attribute::Code(CodeAttribute {
-        max_stack,
-        max_locals,
-        code,
-        exception_table,
-        attributes,
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -990,201 +455,19 @@ mod tests {
         buf.push(val as u8);
     }
 
-    // ── Annotation parsing tests ──────────────────────────────────────────
-
-    #[test]
-    fn read_annotation_simple_string_element() {
-        // Annotation: type_index=5, 1 element pair (name_index=10, tag='s', const_value_index=20)
-        let mut data = Vec::new();
-        push_u16(&mut data, 5); // type_index
-        push_u16(&mut data, 1); // num_element_value_pairs
-        push_u16(&mut data, 10); // element_name_index
-        data.push(b's'); // tag
-        push_u16(&mut data, 20); // const_value_index
-
-        let mut buf = ClassFileBuffer::new(&data);
-        let ann = read_annotation(&mut buf).unwrap();
-        assert_eq!(ann.type_index, 5);
-        assert_eq!(ann.element_value_pairs.len(), 1);
-        assert_eq!(ann.element_value_pairs[0].element_name_index, 10);
-        match &ann.element_value_pairs[0].value {
-            ElementValue::Const {
-                tag,
-                const_value_index,
-            } => {
-                assert_eq!(*tag, b's');
-                assert_eq!(*const_value_index, 20);
-            }
-            other => panic!("Expected Const, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_element_value_enum_constant() {
-        // tag='e', type_name_index=3, const_name_index=7
-        let data = [b'e', 0x00, 0x03, 0x00, 0x07];
-        let mut buf = ClassFileBuffer::new(&data);
-        let ev = read_element_value(&mut buf).unwrap();
-        match ev {
-            ElementValue::Enum {
-                type_name_index,
-                const_name_index,
-            } => {
-                assert_eq!(type_name_index, 3);
-                assert_eq!(const_name_index, 7);
-            }
-            other => panic!("Expected Enum, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_element_value_class_literal() {
-        // tag='c', class_info_index=42
-        let data = [b'c', 0x00, 0x2A];
-        let mut buf = ClassFileBuffer::new(&data);
-        let ev = read_element_value(&mut buf).unwrap();
-        match ev {
-            ElementValue::Class { class_info_index } => {
-                assert_eq!(class_info_index, 42);
-            }
-            other => panic!("Expected Class, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_element_value_nested_annotation() {
-        // tag='@', annotation { type_index=8, 0 pairs }
-        let data = [b'@', 0x00, 0x08, 0x00, 0x00];
-        let mut buf = ClassFileBuffer::new(&data);
-        let ev = read_element_value(&mut buf).unwrap();
-        match ev {
-            ElementValue::AnnotationValue(ann) => {
-                assert_eq!(ann.type_index, 8);
-                assert!(ann.element_value_pairs.is_empty());
-            }
-            other => panic!("Expected AnnotationValue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_element_value_array() {
-        // tag='[', 2 elements: (tag='I', index=1), (tag='I', index=2)
-        let mut data = Vec::new();
-        data.push(b'[');
-        push_u16(&mut data, 2); // num_values
-        data.push(b'I');
-        push_u16(&mut data, 1);
-        data.push(b'I');
-        push_u16(&mut data, 2);
-
-        let mut buf = ClassFileBuffer::new(&data);
-        let ev = read_element_value(&mut buf).unwrap();
-        match ev {
-            ElementValue::Array(values) => {
-                assert_eq!(values.len(), 2);
-                match &values[0] {
-                    ElementValue::Const {
-                        tag,
-                        const_value_index,
-                    } => {
-                        assert_eq!(*tag, b'I');
-                        assert_eq!(*const_value_index, 1);
-                    }
-                    other => panic!("Expected Const, got {other:?}"),
-                }
-            }
-            other => panic!("Expected Array, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_element_value_invalid_tag() {
-        let data = [b'X', 0x00, 0x01];
-        let mut buf = ClassFileBuffer::new(&data);
-        assert!(read_element_value(&mut buf).is_err());
-    }
-
-    #[test]
-    fn read_annotation_default_const() {
-        // AnnotationDefault with const int value
-        let mut data = Vec::new();
-        data.push(b'I'); // tag
-        push_u16(&mut data, 42); // const_value_index
-
-        let mut buf = ClassFileBuffer::new(&data);
-        let ev = read_element_value(&mut buf).unwrap();
-        match ev {
-            ElementValue::Const {
-                tag,
-                const_value_index,
-            } => {
-                assert_eq!(tag, b'I');
-                assert_eq!(const_value_index, 42);
-            }
-            other => panic!("Expected Const, got {other:?}"),
-        }
-    }
-
-    // ── Type annotation tests ────────────────────────────────────────────
-
-    #[test]
-    fn read_type_annotation_empty_target() {
-        // target_type=0x13 (empty_target), empty type_path, annotation { type=5, 0 pairs }
-        let mut data = Vec::new();
-        data.push(0x13); // target_type (METHOD_RETURN = empty)
-        data.push(0x00); // type_path length = 0
-        push_u16(&mut data, 5); // annotation type_index
-        push_u16(&mut data, 0); // 0 element value pairs
-
-        let mut buf = ClassFileBuffer::new(&data);
-        let ta = read_type_annotation(&mut buf).unwrap();
-        assert_eq!(ta.target_type, 0x13);
-        assert!(ta.target_info.is_empty());
-        assert!(ta.type_path.is_empty());
-        assert_eq!(ta.annotation.type_index, 5);
-    }
-
-    #[test]
-    fn read_type_annotation_with_type_path() {
-        // target_type=0x00 (type_parameter_target, 1 byte), type_path with 1 entry
-        let mut data = vec![
-            0x00, // target_type
-            0x02, // type_parameter_index = 2
-            0x01, // type_path length = 1
-            0x03, // type_path_kind = 3 (type argument)
-            0x01, // type_argument_index = 1
-        ];
-        push_u16(&mut data, 7); // annotation type_index
-        push_u16(&mut data, 0); // 0 element value pairs
-
-        let mut buf = ClassFileBuffer::new(&data);
-        let ta = read_type_annotation(&mut buf).unwrap();
-        assert_eq!(ta.target_type, 0x00);
-        assert_eq!(ta.target_info, vec![0x02]);
-        assert_eq!(ta.type_path.len(), 1);
-        assert_eq!(ta.type_path[0].type_path_kind, 3);
-        assert_eq!(ta.type_path[0].type_argument_index, 1);
-    }
-
-    #[test]
-    fn read_target_info_type_argument_target() {
-        // target_type=0x47 → 3 bytes (offset u16 + type_argument_index u8)
-        let data = [0x00, 0x0A, 0x01]; // offset=10, type_argument_index=1
-        let mut buf = ClassFileBuffer::new(&data);
-        let info = read_target_info(&mut buf, 0x47).unwrap();
-        assert_eq!(info, vec![0x00, 0x0A, 0x01]);
-    }
-
-    #[test]
-    fn read_target_info_unknown_target_type() {
-        let data = [0xFF];
-        let mut buf = ClassFileBuffer::new(&data);
-        assert!(read_target_info(&mut buf, 0xFF).is_err());
-    }
-
-    // ── Module attribute parsing tests ───────────────────────────────────
+    // ── Attribute parsing tests ──────────────────────────────────────────
+    //
+    // The per-attribute body decoders (annotation parsing, type annotations,
+    // Module, Code, …) live in `reader/src/attribute.rs` after T11 — see
+    // the unit tests there for fine-grained coverage of each decoder. The
+    // tests below exercise the *reader* side: `read_attributes` produces
+    // `LazyAttribute::Raw`, which the consumer decodes on demand. Each test
+    // calls `.decode(cp)` to verify the raw bytes round-trip through
+    // `decode_attribute` correctly.
 
     /// Helper to build a minimal constant pool and parse a single attribute.
+    /// Returns the decoded [`Attribute`] so existing assertions can match
+    /// directly on attribute variants.
     fn parse_single_attribute(attr_name: &str, attr_data: &[u8]) -> Attribute {
         // Build a CP with: [0]=Tombstone, [1]=Utf8(attr_name)
         let cp = ConstantPool::new(vec![
@@ -1209,9 +492,15 @@ mod tests {
         full.extend_from_slice(&raw);
 
         let mut buf = ClassFileBuffer::new(&full);
-        let attrs = read_attributes(&mut buf, &cp).unwrap();
+        let mut attrs = read_attributes(&mut buf, &cp).unwrap();
         assert_eq!(attrs.len(), 1);
-        attrs.into_iter().next().unwrap()
+        // Decode the single lazy attribute and return an owned `Attribute`.
+        // We `decode` then clone out so the caller gets a value (the lazy
+        // attribute is dropped at the end of this function).
+        attrs[0]
+            .decode(&cp)
+            .expect("attribute body must decode")
+            .clone()
     }
 
     #[test]
@@ -1321,6 +610,52 @@ mod tests {
             }
             other => panic!("Expected Module, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_attributes_returns_lazy_raw_by_default() {
+        // Verify that `read_attributes` produces `LazyAttribute::Raw`
+        // entries without decoding them — the whole point of T11.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("ModulePackages".into()),
+        ]);
+        let mut body = Vec::new();
+        push_u16(&mut body, 0); // packages count = 0
+
+        let mut raw = Vec::new();
+        push_u16(&mut raw, 1); // attributes_count
+        push_u16(&mut raw, 1); // name index
+        let len = body.len() as u32;
+        raw.extend_from_slice(&len.to_be_bytes());
+        raw.extend_from_slice(&body);
+
+        let mut buf = ClassFileBuffer::new(&raw);
+        let attrs = read_attributes(&mut buf, &cp).unwrap();
+        assert_eq!(attrs.len(), 1);
+        assert!(
+            !attrs[0].is_decoded(),
+            "attributes must come back lazy, not pre-decoded"
+        );
+        assert_eq!(attrs[0].name(), "ModulePackages");
+    }
+
+    #[test]
+    fn read_attributes_rejects_length_exceeding_buffer() {
+        // attribute_length larger than remaining buffer must fail at read
+        // time, not at decode time — preserving the truncation guard from
+        // the eager reader.
+        let cp = ConstantPool::new(vec![
+            ConstantPoolEntry::Tombstone,
+            ConstantPoolEntry::Utf8("ModulePackages".into()),
+        ]);
+        let mut raw = Vec::new();
+        push_u16(&mut raw, 1); // attributes_count
+        push_u16(&mut raw, 1); // name index
+        // Declared length = 1_000_000, but no body bytes follow.
+        raw.extend_from_slice(&1_000_000_u32.to_be_bytes());
+        let mut buf = ClassFileBuffer::new(&raw);
+        assert!(read_attributes(&mut buf, &cp).is_err());
     }
 
     // ── Resource limits / safety tests ───────────────────────────────────

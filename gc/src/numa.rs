@@ -1,6 +1,13 @@
 //! NUMA-aware allocation (Phase 16.3) and string deduplication (Phase 16.4).
+//!
+//! Real platform NUMA detection lives in [`NumaTopology::detect`] with
+//! per-OS code paths (Linux sysfs, Windows env-based fallback, macOS proxy,
+//! generic single-node fallback). The detected topology is cached in a
+//! `OnceLock` accessible via [`global_topology`] so other crates can share
+//! the result without re-reading sysfs.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // 16.3  NUMA-Aware Allocation
@@ -30,32 +37,98 @@ pub struct NumaNode {
 }
 
 /// Discovered NUMA topology of the host.
+///
+/// Carries both the legacy rich `nodes` view used by [`NumaAllocator`] and the
+/// flat per-node slices required by the cross-crate topology contract
+/// (`num_nodes`, `node_cpus`, `node_memory_bytes`). The two views are kept in
+/// sync by [`NumaTopology::detect`] and the constructor helpers below.
 #[derive(Debug, Clone)]
 pub struct NumaTopology {
+    /// Rich per-node info (CPU lists, memory, etc.).
     pub nodes: Vec<NumaNode>,
+    /// Number of NUMA nodes (mirrors `nodes.len()`; always >= 1).
     pub total_nodes: usize,
+    /// Whether real NUMA hardware was detected (i.e. >1 node).
     pub is_numa_available: bool,
+
+    // ---- Cross-crate contract surface (used by other agents/crates) -------
+
+    /// Number of NUMA nodes (alias for `total_nodes`; always >= 1).
+    pub num_nodes: usize,
+    /// Per-node CPU lists (CPU indices, as `u32`).
+    pub node_cpus: Vec<Vec<u32>>,
+    /// Per-node memory size in bytes (best-effort; 0 if unknown).
+    pub node_memory_bytes: Vec<u64>,
 }
 
 impl NumaTopology {
-    /// Detect the NUMA topology.  Stub implementation returns a single-node
-    /// topology that owns 4 CPUs and 8 GiB of memory.
+    /// Detect the NUMA topology from the host OS.
+    ///
+    /// Per-platform behavior:
+    /// * **Linux**: parses `/sys/devices/system/node/node*/cpulist` and
+    ///   `/sys/devices/system/node/node*/meminfo`.
+    /// * **Windows**: no `windows` crate available in this crate, so falls
+    ///   back to a single-node topology sized from `NUMBER_OF_PROCESSORS`.
+    /// * **macOS / other**: single-node fallback sized from
+    ///   `std::thread::available_parallelism()`.
     pub fn detect() -> Self {
-        let node = NumaNode {
-            id: 0,
-            cpu_count: 4,
-            memory_size_bytes: 8 * 1024 * 1024 * 1024,
-            free_memory_bytes: 6 * 1024 * 1024 * 1024,
-            cpu_ids: vec![0, 1, 2, 3],
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(t) = detect_linux() {
+                return t;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(t) = detect_windows() {
+                return t;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(t) = detect_macos() {
+                return t;
+            }
+        }
+        fallback_single_node()
+    }
+
+    /// Construct a topology from raw per-node CPU lists & memory sizes.
+    /// Used by the platform detection paths to keep both views in sync.
+    fn from_parts(node_cpus: Vec<Vec<u32>>, node_memory_bytes: Vec<u64>) -> Self {
+        let num_nodes = node_cpus.len().max(1);
+        // If detection somehow produced zero nodes, fall back to single-node.
+        let (node_cpus, node_memory_bytes) = if node_cpus.is_empty() {
+            (vec![Vec::<u32>::new()], vec![0u64])
+        } else {
+            (node_cpus, node_memory_bytes)
         };
+        let nodes: Vec<NumaNode> = node_cpus
+            .iter()
+            .enumerate()
+            .map(|(idx, cpus)| {
+                let mem = node_memory_bytes.get(idx).copied().unwrap_or(0);
+                NumaNode {
+                    id: idx,
+                    cpu_count: cpus.len(),
+                    memory_size_bytes: mem,
+                    free_memory_bytes: mem, // best-effort; we don't track free separately
+                    cpu_ids: cpus.iter().map(|&c| c as usize).collect(),
+                }
+            })
+            .collect();
+        let total_nodes = nodes.len();
         NumaTopology {
-            nodes: vec![node],
-            total_nodes: 1,
-            is_numa_available: false,
+            nodes,
+            total_nodes,
+            is_numa_available: total_nodes > 1,
+            num_nodes,
+            node_cpus,
+            node_memory_bytes,
         }
     }
 
-    /// Map a CPU id to the NUMA node that owns it.
+    /// Map a CPU id to the NUMA node that owns it (legacy API).
     pub fn node_for_cpu(&self, cpu_id: usize) -> usize {
         for node in &self.nodes {
             if node.cpu_ids.contains(&cpu_id) {
@@ -65,6 +138,33 @@ impl NumaTopology {
         0 // fallback
     }
 
+    /// Map a CPU index to its NUMA node (cross-crate contract API).
+    ///
+    /// Returns 0 if the CPU is unknown.
+    pub fn node_of_cpu(&self, cpu: u32) -> usize {
+        for (idx, cpus) in self.node_cpus.iter().enumerate() {
+            if cpus.iter().any(|&c| c == cpu) {
+                return idx;
+            }
+        }
+        0
+    }
+
+    /// Return the NUMA node of the calling OS thread (best-effort).
+    ///
+    /// On Linux this parses `/proc/self/status` for the `Cpus_allowed_list:`
+    /// line and reports the node of the first CPU in the affinity mask.
+    /// On other platforms (or on parse failure) this returns 0.
+    pub fn current_thread_node() -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(cpu) = linux_current_cpu_hint() {
+                return global_topology().node_of_cpu(cpu);
+            }
+        }
+        0
+    }
+
     /// Determine the preferred node for a given thread id (simple modular mapping).
     pub fn preferred_node_for_thread(&self, thread_id: u64) -> usize {
         if self.total_nodes == 0 {
@@ -72,6 +172,188 @@ impl NumaTopology {
         }
         (thread_id as usize) % self.total_nodes
     }
+}
+
+// ---------------------------------------------------------------------------
+// Global cached topology
+// ---------------------------------------------------------------------------
+
+static GLOBAL_TOPOLOGY: OnceLock<NumaTopology> = OnceLock::new();
+
+/// Return a process-wide cached `NumaTopology`. Detection runs exactly once.
+pub fn global_topology() -> &'static NumaTopology {
+    GLOBAL_TOPOLOGY.get_or_init(NumaTopology::detect)
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific detection paths
+// ---------------------------------------------------------------------------
+
+/// Best-effort total CPU count, falling back to 1.
+fn available_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Final fallback: one node owning every visible CPU and `total_ram_bytes()`.
+fn fallback_single_node() -> NumaTopology {
+    let n = available_cpu_count();
+    let cpus: Vec<u32> = (0..n as u32).collect();
+    let mem = total_ram_bytes_best_effort();
+    NumaTopology::from_parts(vec![cpus], vec![mem])
+}
+
+/// Best-effort total RAM in bytes (0 if unknown / can't read).
+fn total_ram_bytes_best_effort() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    return parse_kb_value(rest).unwrap_or(0);
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Parse a "<number> kB" tail (whitespace-tolerant) into a byte count.
+#[cfg(any(target_os = "linux", test))]
+fn parse_kb_value(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    let trimmed = trimmed
+        .strip_suffix("kB")
+        .or_else(|| trimmed.strip_suffix("KB"))
+        .unwrap_or(trimmed)
+        .trim();
+    trimmed.parse::<u64>().ok().map(|kb| kb * 1024)
+}
+
+// ---- Linux sysfs parsing --------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn detect_linux() -> Option<NumaTopology> {
+    let entries = std::fs::read_dir("/sys/devices/system/node").ok()?;
+    let mut nodes: Vec<(usize, Vec<u32>, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().into_owned();
+        let Some(id_str) = name.strip_prefix("node") else {
+            continue;
+        };
+        // Require the suffix to be purely numeric to skip files like
+        // "node_online" or "node_possible".
+        let Ok(node_id) = id_str.parse::<usize>() else {
+            continue;
+        };
+        let cpu_path = entry.path().join("cpulist");
+        let mem_path = entry.path().join("meminfo");
+        let cpus = std::fs::read_to_string(&cpu_path)
+            .ok()
+            .and_then(|s| parse_cpulist(s.trim()))
+            .unwrap_or_default();
+        let mem = std::fs::read_to_string(&mem_path)
+            .ok()
+            .and_then(|s| parse_node_meminfo(&s, node_id))
+            .unwrap_or(0);
+        nodes.push((node_id, cpus, mem));
+    }
+    if nodes.is_empty() {
+        return None;
+    }
+    nodes.sort_by_key(|(id, _, _)| *id);
+    // Compact node ids: if Linux exposes only node0,node2 we still produce
+    // a contiguous Vec keyed by detection order — node_of_cpu uses indices.
+    let node_cpus: Vec<Vec<u32>> = nodes.iter().map(|(_, c, _)| c.clone()).collect();
+    let node_mem: Vec<u64> = nodes.iter().map(|(_, _, m)| *m).collect();
+    Some(NumaTopology::from_parts(node_cpus, node_mem))
+}
+
+/// Parse `/sys/devices/system/node/nodeN/cpulist` content.
+///
+/// Format examples: `0-3`, `0-7,16-23`, `2`, empty.
+fn parse_cpulist(s: &str) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    if s.is_empty() {
+        return Some(out);
+    }
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: u32 = lo.trim().parse().ok()?;
+            let hi: u32 = hi.trim().parse().ok()?;
+            if hi < lo {
+                return None;
+            }
+            for c in lo..=hi {
+                out.push(c);
+            }
+        } else {
+            let c: u32 = part.parse().ok()?;
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+/// Parse `Node N MemTotal:       NNN kB` out of a node's meminfo file.
+#[cfg(any(target_os = "linux", test))]
+fn parse_node_meminfo(content: &str, node_id: usize) -> Option<u64> {
+    let needle_prefix = format!("Node {} MemTotal:", node_id);
+    for line in content.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix(&needle_prefix) {
+            return parse_kb_value(rest);
+        }
+    }
+    None
+}
+
+/// Best-effort current-CPU hint by parsing `/proc/self/status`'s
+/// `Cpus_allowed_list:` line and returning the first allowed CPU.
+#[cfg(target_os = "linux")]
+fn linux_current_cpu_hint() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
+            let cpus = parse_cpulist(rest.trim())?;
+            return cpus.into_iter().next();
+        }
+    }
+    None
+}
+
+// ---- Windows fallback -----------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn detect_windows() -> Option<NumaTopology> {
+    // TODO: when the `windows` crate becomes a dependency of `gc/`, switch
+    // to `GetLogicalProcessorInformationEx(RelationNumaNode, ...)` here.
+    // For now: single node sized from NUMBER_OF_PROCESSORS, with all CPUs.
+    let n = std::env::var("NUMBER_OF_PROCESSORS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(available_cpu_count)
+        .max(1);
+    let cpus: Vec<u32> = (0..n as u32).collect();
+    Some(NumaTopology::from_parts(vec![cpus], vec![0]))
+}
+
+// ---- macOS fallback -------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn detect_macos() -> Option<NumaTopology> {
+    // macOS doesn't expose NUMA APIs directly. Without the `libc` crate as
+    // a dependency we can't call `sysctlbyname("hw.packages", ...)` from
+    // here either; rather than guess we fall through to the single-node
+    // fallback shape, which is accurate for virtually all current Macs.
+    let n = available_cpu_count();
+    let cpus: Vec<u32> = (0..n as u32).collect();
+    Some(NumaTopology::from_parts(vec![cpus], vec![0]))
 }
 
 /// Per-node allocation arena tracking.
@@ -432,42 +714,130 @@ mod tests {
     #[test]
     fn test_detect_topology() {
         let topo = NumaTopology::detect();
-        assert_eq!(topo.total_nodes, 1);
-        assert!(!topo.is_numa_available);
-        assert_eq!(topo.nodes.len(), 1);
+        // Real detection: at least one node, with internal views consistent.
+        assert!(topo.total_nodes >= 1);
+        assert_eq!(topo.nodes.len(), topo.total_nodes);
+        assert_eq!(topo.num_nodes, topo.total_nodes);
+        assert_eq!(topo.node_cpus.len(), topo.total_nodes);
+        assert_eq!(topo.node_memory_bytes.len(), topo.total_nodes);
+        assert_eq!(topo.is_numa_available, topo.total_nodes > 1);
+    }
+
+    #[test]
+    fn detect_returns_at_least_one_node() {
+        let topo = NumaTopology::detect();
+        assert!(topo.num_nodes >= 1, "expected >= 1 NUMA node");
+        assert!(!topo.node_cpus.is_empty());
+        // Across all nodes, at least one CPU must be visible somewhere.
+        let total_cpus: usize = topo.node_cpus.iter().map(|c| c.len()).sum();
+        assert!(total_cpus >= 1, "expected at least one CPU across all nodes");
+    }
+
+    #[test]
+    fn current_thread_node_is_valid_index() {
+        let topo = global_topology();
+        let node = NumaTopology::current_thread_node();
+        assert!(
+            node < topo.num_nodes,
+            "current_thread_node returned {} but only {} nodes exist",
+            node,
+            topo.num_nodes
+        );
+    }
+
+    #[test]
+    fn node_of_cpu_dispatches_correctly() {
+        let topo = NumaTopology::detect();
+        // Every CPU listed for a node must round-trip to that node's index.
+        for (node_idx, cpus) in topo.node_cpus.iter().enumerate() {
+            for &cpu in cpus {
+                assert_eq!(
+                    topo.node_of_cpu(cpu),
+                    node_idx,
+                    "cpu {} should map to node {}",
+                    cpu,
+                    node_idx
+                );
+            }
+        }
+        // Unknown CPUs fall back to node 0.
+        assert_eq!(topo.node_of_cpu(u32::MAX), 0);
+    }
+
+    #[test]
+    fn test_global_topology_is_cached() {
+        let t1 = global_topology();
+        let t2 = global_topology();
+        // OnceLock guarantees pointer stability.
+        assert!(std::ptr::eq(t1, t2));
     }
 
     #[test]
     fn test_node_for_cpu_found() {
         let topo = NumaTopology::detect();
+        // CPU 0 always belongs to *some* node; with our layout it's index 0.
         assert_eq!(topo.node_for_cpu(0), 0);
-        assert_eq!(topo.node_for_cpu(3), 0);
     }
 
     #[test]
     fn test_node_for_cpu_fallback() {
         let topo = NumaTopology::detect();
-        // CPU 99 does not exist — should fall back to node 0
-        assert_eq!(topo.node_for_cpu(99), 0);
+        // CPU 9999 should not exist — should fall back to node 0
+        assert_eq!(topo.node_for_cpu(9999), 0);
     }
 
     #[test]
     fn test_preferred_node_single() {
-        let topo = NumaTopology::detect();
+        // Synthetic single-node topology to keep this test deterministic
+        // regardless of the host hardware.
+        let topo = NumaTopology::from_parts(vec![vec![0, 1]], vec![0]);
         assert_eq!(topo.preferred_node_for_thread(0), 0);
         assert_eq!(topo.preferred_node_for_thread(7), 0);
     }
 
     #[test]
+    fn test_parse_cpulist_simple() {
+        assert_eq!(parse_cpulist("0-3").unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(parse_cpulist("5").unwrap(), vec![5]);
+        assert_eq!(parse_cpulist("0-1,4-5").unwrap(), vec![0, 1, 4, 5]);
+        assert_eq!(parse_cpulist("").unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_parse_cpulist_bad() {
+        assert!(parse_cpulist("garbage").is_none());
+        assert!(parse_cpulist("5-3").is_none());
+    }
+
+    #[test]
+    fn test_parse_kb_value() {
+        assert_eq!(parse_kb_value("       1024 kB"), Some(1024 * 1024));
+        assert_eq!(parse_kb_value("0 kB"), Some(0));
+        assert_eq!(parse_kb_value("nonsense"), None);
+    }
+
+    #[test]
+    fn test_parse_node_meminfo() {
+        let sample = "\
+Node 0 MemTotal:       16777216 kB
+Node 0 MemFree:        12345678 kB
+Node 0 MemUsed:         4431538 kB
+";
+        assert_eq!(parse_node_meminfo(sample, 0), Some(16777216u64 * 1024));
+        assert_eq!(parse_node_meminfo(sample, 1), None);
+    }
+
+    /// Synthetic 2-node topology used by several tests below.
+    fn synthetic_two_node() -> NumaTopology {
+        NumaTopology::from_parts(
+            vec![vec![0, 1], vec![2, 3]],
+            vec![4 << 30, 4 << 30],
+        )
+    }
+
+    #[test]
     fn test_preferred_node_multi() {
-        let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![0, 1] },
-                NumaNode { id: 1, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![2, 3] },
-            ],
-            total_nodes: 2,
-            is_numa_available: true,
-        };
+        let topo = synthetic_two_node();
         assert_eq!(topo.preferred_node_for_thread(0), 0);
         assert_eq!(topo.preferred_node_for_thread(1), 1);
         assert_eq!(topo.preferred_node_for_thread(2), 0);
@@ -477,21 +847,15 @@ mod tests {
     fn test_numa_node_properties() {
         let topo = NumaTopology::detect();
         let node = &topo.nodes[0];
-        assert_eq!(node.cpu_count, 4);
-        assert_eq!(node.memory_size_bytes, 8 * 1024 * 1024 * 1024);
+        // Real detection: shape is host-dependent; just sanity-check
+        // internal consistency.
+        assert_eq!(node.cpu_count, node.cpu_ids.len());
         assert!(node.free_memory_bytes <= node.memory_size_bytes);
     }
 
     #[test]
     fn test_node_for_cpu_multi_node() {
-        let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![0, 1] },
-                NumaNode { id: 1, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![2, 3] },
-            ],
-            total_nodes: 2,
-            is_numa_available: true,
-        };
+        let topo = synthetic_two_node();
         assert_eq!(topo.node_for_cpu(2), 1);
         assert_eq!(topo.node_for_cpu(3), 1);
     }
@@ -528,7 +892,8 @@ mod tests {
 
     #[test]
     fn test_allocate_interleaved_single_node() {
-        let topo = NumaTopology::detect();
+        // Use a deterministic single-node topology so this is host-agnostic.
+        let topo = NumaTopology::from_parts(vec![vec![0]], vec![0]);
         let mut alloc = NumaAllocator::new(topo);
         let a1 = alloc.allocate_interleaved(100);
         let a2 = alloc.allocate_interleaved(100);
@@ -539,14 +904,7 @@ mod tests {
 
     #[test]
     fn test_allocate_interleaved_multi_node() {
-        let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![0, 1] },
-                NumaNode { id: 1, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![2, 3] },
-            ],
-            total_nodes: 2,
-            is_numa_available: true,
-        };
+        let topo = synthetic_two_node();
         let mut alloc = NumaAllocator::new(topo);
         let a1 = alloc.allocate_interleaved(64);
         let a2 = alloc.allocate_interleaved(64);
@@ -870,14 +1228,7 @@ mod tests {
 
     #[test]
     fn test_allocator_multi_node_stats() {
-        let topo = NumaTopology {
-            nodes: vec![
-                NumaNode { id: 0, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![0, 1] },
-                NumaNode { id: 1, cpu_count: 2, memory_size_bytes: 4 << 30, free_memory_bytes: 2 << 30, cpu_ids: vec![2, 3] },
-            ],
-            total_nodes: 2,
-            is_numa_available: true,
-        };
+        let topo = synthetic_two_node();
         let mut alloc = NumaAllocator::new(topo);
         alloc.allocate(100, 0);
         alloc.allocate(200, 1);

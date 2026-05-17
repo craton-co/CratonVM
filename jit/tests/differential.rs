@@ -57,6 +57,14 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         uncommon_trap: s,
         math_fma_double: s,
         math_fma_float: s,
+        // Inline TLAB bump wiring — see jit-api/src/lib.rs. Tests use the
+        // helper-call fallback so leave the cursor offset at 0 (Tlab layout),
+        // the end offset at 8, and `get_current_thread = 0` to opt out.
+        tlab_cursor_offset_in_thread: 0,
+        tlab_end_offset_in_thread: 8,
+        class_id_offset_in_obj: 0,
+        get_current_thread: 0,
+        tlab_post_init: 0,
     }
 }
 
@@ -83,6 +91,7 @@ unsafe fn jit_run_no_args(code: &[u8], descriptor: &str, num_locals: usize) -> i
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(), // pic_slots
         Vec::new(),
         Vec::new(),
         HashMap::new(),

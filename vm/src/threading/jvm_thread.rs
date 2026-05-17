@@ -300,6 +300,33 @@ pub struct JvmThread {
 }
 
 impl JvmThread {
+    /// Byte offset of the `tlab` field from the start of `JvmThread`.
+    ///
+    /// Used by the JIT (`jit/src/x64.rs` `new` opcode) to emit an inline
+    /// TLAB bump-pointer fast path. The JIT loads the per-thread TLAB
+    /// cursor/end at `JvmThread base + TLAB_OFFSET + Tlab::CURSOR/END_OFFSET`.
+    ///
+    /// **MSRV note**: this crate targets Rust 1.75. `core::mem::offset_of!`
+    /// is `const` only on 1.77+, so we compute the offset lazily on first
+    /// access via a sentinel `JvmThread::default()` and cache it in a
+    /// [`OnceLock`]. The computation is a single subtraction of two
+    /// `&raw const` pointers — no allocation beyond the one-time default
+    /// thread.
+    ///
+    /// Callers should treat the returned value as effectively `const` and
+    /// cache it themselves (e.g. into a `JitRuntimeHelpers` field at
+    /// helper-table init).
+    pub fn tlab_offset() -> usize {
+        use std::sync::OnceLock;
+        static OFFSET: OnceLock<usize> = OnceLock::new();
+        *OFFSET.get_or_init(|| {
+            let t = JvmThread::default();
+            let base = &t as *const JvmThread as usize;
+            let tlab_addr = &t.tlab as *const rustjvm_gc::Tlab as usize;
+            tlab_addr - base
+        })
+    }
+
     /// Create a new thread with the given id and name.
     pub fn new(thread_id: ThreadId, name: &str) -> Self {
         Self {
@@ -421,6 +448,25 @@ impl std::fmt::Debug for JvmThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JIT contract — `JvmThread::tlab_offset()` must report the actual
+    /// byte offset of the `tlab` field. The JIT-emitted inline bump in
+    /// `jit/src/x64.rs` reads `[thread + tlab_offset + CURSOR_OFFSET]`,
+    /// so a wrong answer here corrupts the heap.
+    #[test]
+    fn tlab_offset_matches_field_address() {
+        let t = JvmThread::default();
+        let base = &t as *const JvmThread as usize;
+        let tlab_addr = &t.tlab as *const rustjvm_gc::Tlab as usize;
+        let expected = tlab_addr - base;
+        assert_eq!(
+            JvmThread::tlab_offset(),
+            expected,
+            "JvmThread::tlab_offset() out of sync with the actual field offset"
+        );
+        // Caching: a second call must return the same value (OnceLock).
+        assert_eq!(JvmThread::tlab_offset(), expected);
+    }
 
     #[test]
     fn thread_creation() {

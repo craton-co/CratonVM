@@ -104,7 +104,11 @@ impl BufferedImageData {
 
     #[inline]
     fn index(&self, x: u32, y: u32) -> usize {
-        assert!(
+        // `debug_assert!` only — in release, the subsequent `pixels[idx]`
+        // indexing already panics on OOB. Keeping a release-mode `assert!`
+        // here forces two bounds checks per pixel and blocks LLVM from
+        // eliding the implicit `Vec` bounds check.
+        debug_assert!(
             x < self.width && y < self.height,
             "pixel ({}, {}) out of bounds ({}x{})",
             x,
@@ -252,6 +256,20 @@ impl Clone for BufferedImageData {
 /// Global registry mapping `ImageId` -> `BufferedImageData`.
 ///
 /// Used by native methods to look up image objects by handle.
+///
+/// TODO(perf): swap `HashMap<u64, _>` for `rustc_hash::FxHashMap<u64, _>`.
+/// IDs are monotonically-increasing sequential `u64`s — SipHash provides no
+/// security benefit here, and FxHash is roughly 2-3x faster for integer keys.
+/// Requires adding `rustc-hash` to `native-awt/Cargo.toml` (the workspace
+/// already pulls it in transitively via wgpu/winit; sibling crates use a
+/// hand-rolled equivalent in `classloading/src/fx_hash.rs`).
+///
+/// TODO(leak): no eviction is wired. `destroy()` exists but is never called
+/// from `natives.rs` — every `java.awt.image.BufferedImage` allocated by the
+/// JVM leaks its pixel buffer until process exit. Either:
+///   (a) hook `BufferedImage.flush()` / finalizer to call `destroy()`, or
+///   (b) bounded LRU, or
+///   (c) weak-ref tied to Java BufferedImage GC (cleanest).
 pub struct ImageRegistry {
     images: HashMap<u64, BufferedImageData>,
     next_id: u64,

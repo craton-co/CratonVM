@@ -1146,6 +1146,7 @@ fn long_arg(args: &[Value], idx: usize) -> i64 {
 }
 
 // --- abs ---
+#[inline(always)]
 pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1154,11 +1155,13 @@ pub(crate) fn native_math_abs_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(v.wrapping_abs())))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_abs_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = long_arg(args, 0);
     Ok(Some(Value::Long(v.wrapping_abs())))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_abs_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -1167,6 +1170,7 @@ pub(crate) fn native_math_abs_float(_ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Float(v.abs())))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_abs_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1176,6 +1180,7 @@ pub(crate) fn native_math_abs_double(_ctx: &mut dyn NativeContext, args: &[Value
 }
 
 // --- max ---
+#[inline(always)]
 pub(crate) fn native_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1188,12 +1193,14 @@ pub(crate) fn native_math_max_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(std::cmp::max(a, b))))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_max_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = long_arg(args, 0);
     let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::max(a, b))))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_max_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -1206,6 +1213,7 @@ pub(crate) fn native_math_max_float(_ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Float(a.max(b))))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_max_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1219,6 +1227,7 @@ pub(crate) fn native_math_max_double(_ctx: &mut dyn NativeContext, args: &[Value
 }
 
 // --- min ---
+#[inline(always)]
 pub(crate) fn native_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1231,12 +1240,14 @@ pub(crate) fn native_math_min_int(_ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(Value::Int(std::cmp::min(a, b))))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_min_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = long_arg(args, 0);
     let b = long_arg(args, 1);
     Ok(Some(Value::Long(std::cmp::min(a, b))))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_min_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -1249,6 +1260,7 @@ pub(crate) fn native_math_min_float(_ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Float(a.min(b))))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_min_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1262,6 +1274,7 @@ pub(crate) fn native_math_min_double(_ctx: &mut dyn NativeContext, args: &[Value
 }
 
 // --- trig and math functions ---
+#[inline(always)]
 pub(crate) fn native_math_sqrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1270,6 +1283,7 @@ pub(crate) fn native_math_sqrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.sqrt())))
 }
 
+#[inline]
 pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1279,9 +1293,24 @@ pub(crate) fn native_math_pow(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
+    // HotSpot-style fast path: integer-valued exponent with finite base.
+    // - Gated on a.is_finite() && b.is_finite() so NaN/±infinity edge cases fall through to powf,
+    //   preserving Java/JLS special-value semantics (e.g. pow(NaN, 0) == 1, pow(±0, neg) == ±inf,
+    //   pow(1, ±inf) == NaN per JLS, etc.).
+    // - b.fract() == 0.0 ensures b is an exact integer (also false for NaN, but we already gated that).
+    // - |b| < 64 keeps powi cheap and avoids producing values that overflow to ±inf when powf
+    //   would have given a finite (but huge) result via continuous exponentiation.
+    // - Negative bases with integer exponents are fine: powi does repeated multiplication, which
+    //   matches Java's result for integer-valued b. Only fractional b on negative a yields NaN in
+    //   Java, and we route those through powf.
+    if a.is_finite() && b.is_finite() && b.fract() == 0.0 && b.abs() < 64.0 {
+        let bi = b as i32;
+        return Ok(Some(Value::Double(a.powi(bi))));
+    }
     Ok(Some(Value::Double(a.powf(b))))
 }
 
+#[inline]
 pub(crate) fn native_math_sin(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1290,6 +1319,7 @@ pub(crate) fn native_math_sin(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Double(v.sin())))
 }
 
+#[inline]
 pub(crate) fn native_math_cos(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1298,6 +1328,7 @@ pub(crate) fn native_math_cos(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Double(v.cos())))
 }
 
+#[inline]
 pub(crate) fn native_math_tan(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1306,6 +1337,7 @@ pub(crate) fn native_math_tan(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Double(v.tan())))
 }
 
+#[inline]
 pub(crate) fn native_math_asin(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1314,6 +1346,7 @@ pub(crate) fn native_math_asin(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.asin())))
 }
 
+#[inline]
 pub(crate) fn native_math_acos(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1322,6 +1355,7 @@ pub(crate) fn native_math_acos(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.acos())))
 }
 
+#[inline]
 pub(crate) fn native_math_atan(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1330,6 +1364,7 @@ pub(crate) fn native_math_atan(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.atan())))
 }
 
+#[inline]
 pub(crate) fn native_math_atan2(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1342,6 +1377,7 @@ pub(crate) fn native_math_atan2(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Double(a.atan2(b))))
 }
 
+#[inline]
 pub(crate) fn native_math_log(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1350,6 +1386,7 @@ pub(crate) fn native_math_log(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Double(v.ln())))
 }
 
+#[inline]
 pub(crate) fn native_math_log10(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1358,6 +1395,7 @@ pub(crate) fn native_math_log10(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Double(v.log10())))
 }
 
+#[inline]
 pub(crate) fn native_math_exp(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1366,6 +1404,7 @@ pub(crate) fn native_math_exp(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Double(v.exp())))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_floor(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1374,6 +1413,7 @@ pub(crate) fn native_math_floor(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Double(v.floor())))
 }
 
+#[inline(always)]
 pub(crate) fn native_math_ceil(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1382,6 +1422,7 @@ pub(crate) fn native_math_ceil(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.ceil())))
 }
 
+#[inline]
 pub(crate) fn native_math_rint(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1391,6 +1432,7 @@ pub(crate) fn native_math_rint(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.round_ties_even())))
 }
 
+#[inline]
 pub(crate) fn native_math_round_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1408,6 +1450,7 @@ pub(crate) fn native_math_round_double(_ctx: &mut dyn NativeContext, args: &[Val
     }
 }
 
+#[inline]
 pub(crate) fn native_math_round_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -1425,6 +1468,7 @@ pub(crate) fn native_math_round_float(_ctx: &mut dyn NativeContext, args: &[Valu
     }
 }
 
+#[inline]
 pub(crate) fn native_math_to_radians(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1433,6 +1477,7 @@ pub(crate) fn native_math_to_radians(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Double(v.to_radians())))
 }
 
+#[inline]
 pub(crate) fn native_math_to_degrees(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1455,6 +1500,7 @@ pub(crate) fn native_math_random(_ctx: &mut dyn NativeContext, _args: &[Value]) 
     Ok(Some(Value::Double(bits.abs().fract())))
 }
 
+#[inline]
 pub(crate) fn native_math_signum_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1472,6 +1518,7 @@ pub(crate) fn native_math_signum_double(_ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Double(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_signum_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -1489,6 +1536,7 @@ pub(crate) fn native_math_signum_float(_ctx: &mut dyn NativeContext, args: &[Val
     Ok(Some(Value::Float(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_cbrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1497,6 +1545,7 @@ pub(crate) fn native_math_cbrt(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.cbrt())))
 }
 
+#[inline]
 pub(crate) fn native_math_ieee_remainder(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1528,6 +1577,7 @@ pub(crate) fn math_overflow_err() -> rustjvm_types::error::MethodCallFailed {
     .into()
 }
 
+#[inline]
 pub(crate) fn native_math_add_exact_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1543,6 +1593,7 @@ pub(crate) fn native_math_add_exact_int(_ctx: &mut dyn NativeContext, args: &[Va
     }
 }
 
+#[inline]
 pub(crate) fn native_math_add_exact_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
@@ -1558,6 +1609,7 @@ pub(crate) fn native_math_add_exact_long(_ctx: &mut dyn NativeContext, args: &[V
     }
 }
 
+#[inline]
 pub(crate) fn native_math_subtract_exact_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1576,6 +1628,7 @@ pub(crate) fn native_math_subtract_exact_int(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_subtract_exact_long(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1594,6 +1647,7 @@ pub(crate) fn native_math_subtract_exact_long(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_multiply_exact_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1612,6 +1666,7 @@ pub(crate) fn native_math_multiply_exact_int(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_multiply_exact_long(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1630,6 +1685,7 @@ pub(crate) fn native_math_multiply_exact_long(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_increment_exact_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1644,6 +1700,7 @@ pub(crate) fn native_math_increment_exact_int(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_increment_exact_long(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1658,6 +1715,7 @@ pub(crate) fn native_math_increment_exact_long(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_decrement_exact_int(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1672,6 +1730,7 @@ pub(crate) fn native_math_decrement_exact_int(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_decrement_exact_long(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1686,6 +1745,7 @@ pub(crate) fn native_math_decrement_exact_long(
     }
 }
 
+#[inline]
 pub(crate) fn native_math_negate_exact_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1697,6 +1757,7 @@ pub(crate) fn native_math_negate_exact_int(_ctx: &mut dyn NativeContext, args: &
     }
 }
 
+#[inline]
 pub(crate) fn native_math_negate_exact_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
@@ -1712,6 +1773,7 @@ pub(crate) fn native_math_negate_exact_long(_ctx: &mut dyn NativeContext, args: 
 // Phase 13 Step 2: Floor/ceil division + toIntExact
 // ---------------------------------------------------------------------------
 
+#[inline]
 pub(crate) fn native_math_floor_div_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1734,6 +1796,7 @@ pub(crate) fn native_math_floor_div_int(_ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Int(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_floor_div_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
@@ -1755,6 +1818,7 @@ pub(crate) fn native_math_floor_div_long(_ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Long(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_floor_mod_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -1776,6 +1840,7 @@ pub(crate) fn native_math_floor_mod_int(_ctx: &mut dyn NativeContext, args: &[Va
     Ok(Some(Value::Int(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_floor_mod_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
@@ -1796,6 +1861,7 @@ pub(crate) fn native_math_floor_mod_long(_ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Long(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_to_int_exact(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Long(v)) => *v,
@@ -1807,6 +1873,7 @@ pub(crate) fn native_math_to_int_exact(_ctx: &mut dyn NativeContext, args: &[Val
     }
 }
 
+#[inline]
 pub(crate) fn native_math_multiply_high(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Long(v)) => *v,
@@ -1824,6 +1891,7 @@ pub(crate) fn native_math_multiply_high(_ctx: &mut dyn NativeContext, args: &[Va
 // Phase 13 Step 3: Advanced math functions
 // ---------------------------------------------------------------------------
 
+#[inline]
 pub(crate) fn native_math_hypot(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1836,6 +1904,7 @@ pub(crate) fn native_math_hypot(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Double(a.hypot(b))))
 }
 
+#[inline]
 pub(crate) fn native_math_log1p(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1844,6 +1913,7 @@ pub(crate) fn native_math_log1p(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Double(v.ln_1p())))
 }
 
+#[inline]
 pub(crate) fn native_math_expm1(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1852,6 +1922,7 @@ pub(crate) fn native_math_expm1(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Double(v.exp_m1())))
 }
 
+#[inline]
 pub(crate) fn native_math_sinh(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1860,6 +1931,7 @@ pub(crate) fn native_math_sinh(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.sinh())))
 }
 
+#[inline]
 pub(crate) fn native_math_cosh(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1868,6 +1940,7 @@ pub(crate) fn native_math_cosh(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.cosh())))
 }
 
+#[inline]
 pub(crate) fn native_math_tanh(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1876,6 +1949,7 @@ pub(crate) fn native_math_tanh(_ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Double(v.tanh())))
 }
 
+#[inline]
 pub(crate) fn native_math_copy_sign_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mag = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1888,6 +1962,7 @@ pub(crate) fn native_math_copy_sign_double(_ctx: &mut dyn NativeContext, args: &
     Ok(Some(Value::Double(mag.copysign(sign))))
 }
 
+#[inline]
 pub(crate) fn native_math_copy_sign_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mag = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -1900,6 +1975,7 @@ pub(crate) fn native_math_copy_sign_float(_ctx: &mut dyn NativeContext, args: &[
     Ok(Some(Value::Float(mag.copysign(sign))))
 }
 
+#[inline]
 pub(crate) fn native_math_next_up_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1923,6 +1999,7 @@ pub(crate) fn native_math_next_up_double(_ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Double(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_next_down_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1946,6 +2023,7 @@ pub(crate) fn native_math_next_down_double(_ctx: &mut dyn NativeContext, args: &
     Ok(Some(Value::Double(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_next_after(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let start = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -1987,6 +2065,7 @@ pub(crate) fn native_math_next_after(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Double(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_ulp_double(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Double(v)) => *v,
@@ -2004,6 +2083,7 @@ pub(crate) fn native_math_ulp_double(_ctx: &mut dyn NativeContext, args: &[Value
     Ok(Some(Value::Double(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_ulp_float(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() {
         Some(Value::Float(v)) => *v,
@@ -2021,6 +2101,7 @@ pub(crate) fn native_math_ulp_float(_ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Float(result)))
 }
 
+#[inline]
 pub(crate) fn native_math_get_exponent_double(
     _ctx: &mut dyn NativeContext,
     args: &[Value],

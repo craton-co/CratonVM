@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::{ObjectRef, Value};
@@ -18,6 +19,35 @@ use crate::graphics2d::Graphics2DState;
 use crate::image::{self, ImageId, ImageType};
 use crate::peer::{self, ComponentType};
 use crate::swing;
+
+// ---------------------------------------------------------------------------
+// InvocationEvent ↔ callback_id side-table
+// ---------------------------------------------------------------------------
+//
+// `EventQueue.getNextEvent` allocates a Java `java/awt/event/InvocationEvent`
+// for each dequeued `AwtEventData::Invocation`.  We bind that Java object's
+// identity hash to the `callback_id` here so the
+// `InvocationEvent.dispatch()V` native (which only receives the event
+// object as `this`) can find the matching Runnable via
+// `edt::get_edt().take_runnable(callback_id)`.
+//
+// A separate side-table (rather than a synthetic field on the event) avoids
+// having to teach the JDK class layout about an extra slot — synthetic
+// fields require coordinating with class-loader synthesis and break when
+// the real-JDK class is loaded.
+
+fn invocation_event_callbacks() -> &'static Mutex<FxHashMap<i32, u64>> {
+    static INSTANCE: OnceLock<Mutex<FxHashMap<i32, u64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn bind_invocation_event(event_hash: i32, callback_id: u64) {
+    invocation_event_callbacks().lock().insert(event_hash, callback_id);
+}
+
+fn take_invocation_event_callback(event_hash: i32) -> Option<u64> {
+    invocation_event_callbacks().lock().remove(&event_hash)
+}
 
 // ---------------------------------------------------------------------------
 // Graphics2D context registry
@@ -916,19 +946,91 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
 fn register_event_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/EventQueue", "isDispatchThread", "()Z",
         |_ctx, _args| bool_ok(edt::is_edt()));
-    registry.register("java/awt/EventQueue", "invokeLater", "(Ljava/lang/Runnable;)V", |ctx, args| {
+    registry.register("java/awt/EventQueue", "invokeLater", "(Ljava/lang/Runnable;)V", |_ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
-            let callback_id = ctx.identity_hash_code(runnable) as u64;
-            edt::get_edt().invoke_later(callback_id, PeerId(0));
+            // Allocate a fresh callback id, register the Runnable, post
+            // an InvocationEvent.  The EDT will dequeue it via
+            // `getNextEvent` and dispatch it through
+            // `InvocationEvent.dispatch()V` (registered below).
+            edt::get_edt().invoke_later_runnable(runnable, PeerId(0));
+        }
+        void_ok()
+    });
+    registry.register("java/awt/EventQueue", "invokeAndWait",
+        "(Ljava/lang/Runnable;)V", |_ctx, args| {
+        if let Some(runnable) = get_obj(args, 0) {
+            // Block until the Runnable's `dispatch()V` native finishes
+            // calling `run()`.  Panics if called on the EDT (matches the
+            // real `EventQueue.invokeAndWait` contract).
+            edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0));
         }
         void_ok()
     });
     registry.register("java/awt/EventQueue", "postEvent", "(Ljava/awt/AWTEvent;)V", |_ctx, _args| void_ok());
-    registry.register("java/awt/EventQueue", "getNextEvent", "()Ljava/awt/AWTEvent;", |_ctx, _args| {
-        let _evt = edt::get_edt().poll_event();
+    registry.register("java/awt/EventQueue", "getNextEvent", "()Ljava/awt/AWTEvent;", |ctx, _args| {
+        // Pull the next event off the EDT queue.  For invocation events
+        // we have to synthesize a Java `InvocationEvent` whose
+        // `dispatch()V` will be called by the EDT dispatch loop —
+        // otherwise the Runnable would be silently discarded.
+        let Some(evt) = edt::get_edt().poll_event() else {
+            return null_ok();
+        };
+        use crate::event::AwtEventData;
+        if let AwtEventData::Invocation { callback_id } = evt.data {
+            let inv = ctx.new_object("java/awt/event/InvocationEvent")?;
+            if let Some(Value::Object(Some(obj))) = &inv {
+                let hash = ctx.identity_hash_code(*obj);
+                bind_invocation_event(hash, callback_id);
+            }
+            return Ok(inv);
+        }
+        // TODO: synthesize Java event objects for the non-invocation
+        // event kinds (Mouse / Key / Window / ...).  The legacy code
+        // returned null here for every event, so callers that drive
+        // dispatch through this method will still observe missing
+        // events — but at least invocation events now flow correctly
+        // and SwingUtilities.invokeLater is no longer a no-op.
         null_ok()
     });
     registry.register("java/awt/EventQueue", "peekEvent", "()Ljava/awt/AWTEvent;", |_ctx, _args| null_ok());
+
+    // -- InvocationEvent.dispatch -------------------------------------------
+    //
+    // The EDT's dispatch loop calls `AWTEvent.dispatch()` on whatever
+    // `EventQueue.getNextEvent` returned.  For InvocationEvents this
+    // native looks the Runnable up by the event object's identity hash,
+    // calls `Runnable.run()` virtually on the EDT, then signals any
+    // `invokeAndWait` waiter and drops both registry entries.
+    registry.register("java/awt/event/InvocationEvent", "dispatch", "()V",
+        |ctx, args| {
+        let Some(this) = get_obj(args, 0) else { return void_ok() };
+        let hash = ctx.identity_hash_code(this);
+        let Some(callback_id) = take_invocation_event_callback(hash) else {
+            // No binding — either this event was not synthesized by us
+            // (a real-JDK class created it directly), or it was already
+            // dispatched.  Nothing to do.
+            return void_ok();
+        };
+        let runnable = edt::get_edt().take_runnable(callback_id);
+        if let Some(runnable) = runnable {
+            // Run on whatever thread invoked us — by contract this is
+            // the EDT, since the EDT dispatch loop is what calls
+            // `dispatch()`.  We propagate failures out of the native so
+            // the EDT's exception handling sees them, but signal
+            // completion in BOTH the success and failure paths
+            // (otherwise an exception in `run()` would hang
+            // `invokeAndWait` forever).
+            let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            edt::get_edt().signal_invocation_complete(callback_id);
+            // Surface any exception thrown by Runnable.run() to the EDT.
+            result?;
+        } else {
+            // Runnable already taken (e.g. dispatched twice).  Still
+            // signal so a waiter doesn't hang.
+            edt::get_edt().signal_invocation_complete(callback_id);
+        }
+        void_ok()
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,10 +1173,19 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register("javax/swing/SwingUtilities", "isEventDispatchThread", "()Z",
         |_ctx, _args| bool_ok(edt::is_edt()));
-    registry.register("javax/swing/SwingUtilities", "invokeLater", "(Ljava/lang/Runnable;)V", |ctx, args| {
+    registry.register("javax/swing/SwingUtilities", "invokeLater", "(Ljava/lang/Runnable;)V", |_ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
-            let callback_id = ctx.identity_hash_code(runnable) as u64;
-            edt::get_edt().invoke_later(callback_id, PeerId(0));
+            // Same plumbing as `EventQueue.invokeLater` — register the
+            // Runnable so `InvocationEvent.dispatch()V` can find it,
+            // then post.
+            edt::get_edt().invoke_later_runnable(runnable, PeerId(0));
+        }
+        void_ok()
+    });
+    registry.register("javax/swing/SwingUtilities", "invokeAndWait",
+        "(Ljava/lang/Runnable;)V", |_ctx, args| {
+        if let Some(runnable) = get_obj(args, 0) {
+            edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0));
         }
         void_ok()
     });

@@ -668,7 +668,7 @@ fn merge_inference_frame(
 mod tests {
     use super::*;
     use crate::class::{Class, ClassId, ClassLoaderId, ClassState};
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+    use rustjvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
     use rustjvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
     use rustjvm_reader::class_file_version::ClassFileVersion;
     use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
@@ -725,7 +725,13 @@ mod tests {
             signature: None,
             has_finalizer: false,
             code_source: None,
+            attributes: Vec::new(),
             array_info: None,
+            source_file_cache: std::sync::OnceLock::new(),
+            signature_cache: std::sync::OnceLock::new(),
+            nest_host_cache: std::sync::OnceLock::new(),
+            enclosing_method_cache: std::sync::OnceLock::new(),
+            record_components_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -738,13 +744,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("test"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
                 code: vec![0xB1], // return
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -759,13 +765,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("zero"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x03, 0xAC], // iconst_0, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -808,13 +814,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x03, 0x60, 0xAC], // iconst_0, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         // iadd pops 2 ints, but only 1 is on the stack в†’ underflow error
@@ -830,13 +836,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("add"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x04, 0x05, 0x60, 0xAC], // iconst_1, iconst_2, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -851,13 +857,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("test"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
                 code: vec![0xB1], // return
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         class.version = ClassFileVersion::JAVA_6;
 
@@ -873,13 +879,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("roundtrip"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
                 code: vec![0x03, 0x3B, 0x1A, 0xAC], // iconst_0, istore_0, iload_0, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -897,13 +903,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("empty"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
                 code: vec![],
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -918,13 +924,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad_pop"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x57, 0xB1], // pop, return
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_err());
@@ -939,13 +945,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad_dup"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x59, 0xB1], // dup, return
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_err());
@@ -960,13 +966,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("double"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x04, 0x59, 0x60, 0xAC], // iconst_1, dup, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -981,13 +987,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("longZero"),
             descriptor: Arc::from("()J"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x09, 0xAD], // lconst_0, lreturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -1002,13 +1008,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("floatZero"),
             descriptor: Arc::from("()F"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x0B, 0xAE], // fconst_0, freturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -1023,13 +1029,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("doubleZero"),
             descriptor: Arc::from("()D"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x0E, 0xAF], // dconst_0, dreturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -1044,13 +1050,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("nullRef"),
             descriptor: Arc::from("()Ljava/lang/Object;"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x01, 0xB0], // aconst_null, areturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -1065,13 +1071,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad_sub"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x04, 0x64, 0xAC], // iconst_1, isub, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_err());
@@ -1086,13 +1092,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("const42"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x10, 0x2A, 0xAC], // bipush 42, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -1107,13 +1113,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("const1000"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x11, 0x03, 0xE8, 0xAC], // sipush 1000, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
 
         assert!(verify_bytecode(&class, &h).is_ok());
@@ -1129,25 +1135,25 @@ mod tests {
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 name: Arc::from("good"),
                 descriptor: Arc::from("()V"),
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
                     code: vec![0xB1], // return
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             },
             ClassFileMethod {
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 name: Arc::from("bad"),
                 descriptor: Arc::from("()I"),
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 0,
                     code: vec![0x03, 0x60, 0xAC], // iconst_0, iadd (underflow), ireturn
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             },
         ]);
 
@@ -1204,7 +1210,7 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("branch"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![
@@ -1217,7 +1223,7 @@ mod tests {
                 ],
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         class.version = ClassFileVersion::JAVA_6;
 
@@ -1250,13 +1256,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from(name),
             descriptor: Arc::from(descriptor),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack,
                 max_locals,
                 code,
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         class.version = ClassFileVersion::JAVA_6;
         class
@@ -1393,7 +1399,7 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![
@@ -1404,7 +1410,7 @@ mod tests {
                 ],
                 exception_table: vec![],
                 attributes: vec![], // no StackMapTable!
-            })],
+            }))],
         }]);
         class.version = ClassFileVersion::JAVA_8;
         let res = verify_pre_java7(&class);
@@ -1677,13 +1683,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x03, 0x04, 0x60, 0xAC], // iconst_0, iconst_1, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
@@ -1697,13 +1703,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
                 code: vec![0x03, 0xAF], // iconst_0; dreturn (needs double)
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
@@ -1811,13 +1817,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("ok"),
             descriptor: Arc::from("()I"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
                 code: vec![0x04, 0x05, 0x60, 0xAC],
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         assert!(verify_bytecode(&class, &MockHierarchy).is_ok());
     }
@@ -1829,13 +1835,13 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("ok"),
             descriptor: Arc::from("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
                 code: vec![0xB1], // return
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         }]);
         assert!(verify_bytecode(&class, &MockHierarchy).is_ok());
     }
@@ -1881,7 +1887,7 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("m"),
             descriptor: Arc::from("(I)J"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 1,
                 code,
@@ -1889,7 +1895,7 @@ mod tests {
                 attributes: vec![Attribute::StackMapTable {
                     entries: stack_map_bytes,
                 }],
-            })],
+            }))],
         }]);
 
         let result = verify_bytecode(&class, &MockHierarchy);

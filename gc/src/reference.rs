@@ -177,7 +177,10 @@ pub struct ReferenceProcessor {
     pending_queues: FxHashMap<usize, Vec<usize>>,
 
     /// Objects awaiting `finalize()`.
-    finalization_queue: Vec<usize>,
+    ///
+    /// Round-2 fix (GC §7): `VecDeque` so `take_pending_finalizer` is O(1)
+    /// pop-front instead of O(n) `Vec::remove(0)`.
+    finalization_queue: std::collections::VecDeque<usize>,
 
     /// Index of soft references by `last_access_time_ms` for efficient
     /// range-based LRU clearing. Maps `(timestamp, index_in_soft_refs)` to
@@ -201,7 +204,7 @@ impl ReferenceProcessor {
             finalizer_refs: Vec::new(),
             soft_ref_lru_policy_ms_per_mb: soft_ref_lru_ms_per_mb,
             pending_queues: FxHashMap::default(),
-            finalization_queue: Vec::new(),
+            finalization_queue: std::collections::VecDeque::new(),
             soft_ref_lru_index: BTreeMap::new(),
             stats: ReferenceProcessingStats::default(),
         }
@@ -275,7 +278,7 @@ impl ReferenceProcessor {
             }
         }
 
-        to_finalize.extend_from_slice(&self.finalization_queue);
+        to_finalize.extend(self.finalization_queue.iter().copied());
 
         // Cleaner actions are the reference_obj addresses of cleared cleaners
         for entry in &self.cleaner_refs {
@@ -389,7 +392,7 @@ impl ReferenceProcessor {
             }
             entry.enqueued = true;
             self.stats.finalizer_refs_enqueued += 1;
-            self.finalization_queue.push(entry.referent);
+            self.finalization_queue.push_back(entry.referent);
             if let Some(q) = entry.queue_addr {
                 self.pending_queues
                     .entry(q)
@@ -518,11 +521,8 @@ impl ReferenceProcessor {
     }
 
     pub fn dequeue_for_finalization(&mut self) -> Option<usize> {
-        if self.finalization_queue.is_empty() {
-            None
-        } else {
-            Some(self.finalization_queue.remove(0))
-        }
+        // Round-2 fix (GC §7): VecDeque::pop_front is O(1) vs old Vec::remove(0) which was O(n).
+        self.finalization_queue.pop_front()
     }
 
     /// Return the referent addresses of all registered (non-cleared, non-enqueued)

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ptr::NonNull;
 
 /// A JVM runtime value.
 ///
@@ -39,18 +40,24 @@ pub enum Value {
 ///
 /// This will be replaced with a proper GC-managed pointer in Phase 6.
 /// For now it's a simple wrapper around a raw pointer.
+///
+/// **A4 (architectural improvement):** the inner pointer is `NonNull<u8>`,
+/// not `*mut u8`. This gives `Option<ObjectRef>` (and thus
+/// `Value::Object(Option<ObjectRef>)`) the niche optimization: the `None`
+/// case occupies the all-zero bit pattern, so the option is pointer-sized
+/// and tag-free. Layout-compatible with `*mut u8` for FFI / casting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectRef {
-    ptr: *mut u8,
+    ptr: NonNull<u8>,
 }
 
-// SAFETY: ObjectRef is a Copy wrapper around a raw pointer.  We implement
+// SAFETY: ObjectRef is a Copy wrapper around a non-null pointer.  We implement
 // Hash based on the pointer value so ObjectRef can be used as a HashMap key
 // (e.g. in SharedVm.class_mirrors_reverse).  Hashing a raw pointer is
 // deterministic within a single process run.
 impl std::hash::Hash for ObjectRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.ptr as usize).hash(state);
+        (self.ptr.as_ptr() as usize).hash(state);
     }
 }
 
@@ -60,28 +67,63 @@ impl ObjectRef {
     /// # Safety
     /// The caller must ensure the pointer is valid and points to a properly allocated object.
     /// The pointer must be non-null and aligned to at least 8 bytes (heap object alignment).
+    ///
+    /// **MED-1:** the null check here is `debug_assert!`-only. All callers
+    /// in the value layer (notably `decode_value` for `VTAG_OBJECT`) already
+    /// null-check upstream and route null bit patterns to `Value::Object(None)`
+    /// without entering this constructor, so the release build elides the
+    /// redundant branch. Debug builds still trip the assert if a caller
+    /// violates the precondition.
     pub unsafe fn from_raw(ptr: *mut u8) -> Self {
-        // T14: Check alignment in all builds, not just debug, to prevent
-        // segfaults from corrupted heap slots during bootstrap.
-        //
-        // The panic hook itself can capture a backtrace via RUST_BACKTRACE=1;
-        // we no longer print an extra forensic trail to stderr here to avoid
-        // polluting stderr on every run.
-        if ptr.is_null() {
-            panic!("ObjectRef::from_raw called with null pointer");
-        }
+        // T14 + MED-1: alignment check stays in release (corrupted slots
+        // are a real failure mode during bootstrap), null check is
+        // debug-only (callers null-check upstream).
+        debug_assert!(
+            !ptr.is_null(),
+            "ObjectRef::from_raw called with null pointer"
+        );
         if (ptr as usize) % 8 != 0 {
             panic!("ObjectRef::from_raw called with unaligned pointer: {ptr:p}");
         }
+        // SAFETY: caller's precondition + debug_assert above guarantee non-null.
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+        }
+    }
+
+    /// Create a new object reference from an already-validated `NonNull<u8>`.
+    ///
+    /// Prefer this over [`from_raw`] when the caller already holds a
+    /// `NonNull` — it avoids re-checking nullness in any build.
+    ///
+    /// # Safety
+    /// The pointer must point to a properly allocated, 8-byte-aligned
+    /// heap object for the lifetime that the returned `ObjectRef` is used.
+    pub unsafe fn from_raw_nonnull(ptr: NonNull<u8>) -> Self {
+        debug_assert!(
+            (ptr.as_ptr() as usize) % 8 == 0,
+            "ObjectRef::from_raw_nonnull called with unaligned pointer: {:p}",
+            ptr.as_ptr()
+        );
         Self { ptr }
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// Return the underlying `NonNull<u8>` without going through a raw pointer round-trip.
+    pub fn as_nonnull(&self) -> NonNull<u8> {
         self.ptr
     }
 }
 
 // SAFETY: ObjectRef implements Send and Sync.
+//
+// `NonNull<u8>` is `!Send + !Sync` by default (same as `*mut u8`), so the
+// `unsafe impl`s below are still required after the A4 switch from
+// `*mut u8` to `NonNull<u8>` — the niche optimization is a layout change,
+// not an auto-trait change.
 //
 // Soundness argument:
 //
@@ -149,10 +191,17 @@ impl Value {
         }
     }
 
-    /// Extract an object reference, or None if this isn't an Object.
-    pub fn as_object(&self) -> Option<Option<ObjectRef>> {
+    /// Extract a non-null object reference.
+    ///
+    /// **MED-P3 flatten:** returns `Some(r)` only when this is a
+    /// `Value::Object(Some(r))` (a real, non-null reference). Returns
+    /// `None` for both `Value::Object(None)` (the JVM `null`) and any
+    /// non-Object variant. Callers that need to distinguish "is this an
+    /// Object slot at all" from "is this null" should match `Value::Object(_)`
+    /// directly or use [`Value::is_null`] together with this accessor.
+    pub fn as_object(&self) -> Option<ObjectRef> {
         match self {
-            Value::Object(r) => Some(*r),
+            Value::Object(r) => *r,
             _ => None,
         }
     }
@@ -274,6 +323,15 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::size_of::<ObjectRef>() == std::mem::size_of::<*mut u8>(),
     "ObjectRef must be pointer-sized"
+);
+// A4: confirm the NonNull niche optimization — Option<ObjectRef> must be
+// pointer-sized (no discriminant tag) because `null` is the niche for the
+// `None` case.  If this assert ever fires, something has been added to
+// ObjectRef (e.g. a non-niche-aware field) that defeats the layout opt
+// and silently inflates Value to 24 bytes — breaking the JIT slot layout.
+const _: () = assert!(
+    std::mem::size_of::<Option<ObjectRef>>() == std::mem::size_of::<*mut u8>(),
+    "Option<ObjectRef> must be pointer-sized (NonNull niche optimization)"
 );
 
 impl fmt::Display for Value {

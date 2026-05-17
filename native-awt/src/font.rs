@@ -6,9 +6,26 @@
 //! values from the OS font engine.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+use rustjvm_types::intern_arc;
+
+// TODO: switch `metrics_cache` to `rustc_hash::FxHashMap` once `rustc-hash`
+// is added to `native-awt/Cargo.toml`. FxHashMap has smaller per-entry
+// overhead than std HashMap (no SipHash random state) which matters for
+// the bounded cache below.
+
+/// Hard cap on entries in the per-engine font metrics cache.
+///
+/// Used as a crude safety bound to prevent unbounded growth from a
+/// pathological app that cycles through many distinct (family, style, size)
+/// triples. When the cache reaches this size, the next insertion clears it
+/// entirely — coarse, but it bounds memory at a constant ceiling and
+/// avoids per-lookup eviction bookkeeping. A proper LRU is a follow-up
+/// (would require adding the `lru` crate to workspace deps).
+const METRICS_CACHE_CAP: usize = 1024;
 
 // ── Style flags (match java.awt.Font) ────────────────────────────────────
 
@@ -60,7 +77,7 @@ impl FontSpec {
 // ── FontMetrics ──────────────────────────────────────────────────────────
 
 /// Computed font metrics for a particular font specification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FontMetrics {
     /// Distance from baseline to top of tallest glyph.
     pub ascent: i32,
@@ -82,8 +99,13 @@ pub struct FontMetrics {
 /// native font rasterizer. For real rendering, the platform backend
 /// replaces these values with OS-provided measurements.
 pub struct FontEngine {
-    /// Cache: (family, style, size) -> metrics.
-    metrics_cache: HashMap<(String, i32, i32), FontMetrics>,
+    /// Cache: (interned family, style, size) -> metrics.
+    ///
+    /// The family name is interned to an `Arc<str>` so the key carries a
+    /// cheap (refcount-bump) clone instead of a fresh `String` allocation
+    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP` to
+    /// prevent unbounded growth.
+    metrics_cache: HashMap<(Arc<str>, i32, i32), FontMetrics>,
 }
 
 /// Logical font family categories.
@@ -102,14 +124,25 @@ impl FontEngine {
     }
 
     /// Get (or compute and cache) metrics for the given font spec.
+    ///
+    /// The family name is interned to a process-global `Arc<str>` so the
+    /// cache key avoids a fresh `String` allocation on every lookup. The
+    /// cache is bounded by [`METRICS_CACHE_CAP`]; if the bound is reached
+    /// the cache is cleared wholesale before insertion (see the constant's
+    /// docs for the trade-off).
     pub fn get_metrics(&mut self, spec: &FontSpec) -> FontMetrics {
-        let key = (spec.family.clone(), spec.style, spec.size);
-        if let Some(m) = self.metrics_cache.get(&key) {
-            return m.clone();
+        let family: Arc<str> = intern_arc(&spec.family);
+        let key = (Arc::clone(&family), spec.style, spec.size);
+        if let Some(m) = self.metrics_cache.get(&key).copied() {
+            return m;
         }
 
         let m = Self::compute_metrics(spec);
-        self.metrics_cache.insert(key, m.clone());
+        if self.metrics_cache.len() >= METRICS_CACHE_CAP {
+            // Coarse eviction: drop everything. See METRICS_CACHE_CAP docs.
+            self.metrics_cache.clear();
+        }
+        self.metrics_cache.insert(key, m);
         m
     }
 
@@ -118,27 +151,43 @@ impl FontEngine {
         if text.is_empty() {
             return 0;
         }
+        // Hoist all per-call lookups out of the per-character path. Each
+        // of these is cheap in isolation but `string_width` is hot in
+        // measure passes during layout, so we compute them exactly once.
         let cat = Self::categorize(&spec.family);
         let size = spec.size as f64;
+        let is_bold = spec.is_bold();
+
+        // Heuristic character count. For ASCII text (the common case for
+        // Swing label/menu strings) `str::len` equals the char count and
+        // skips the full UTF-8 iteration that `chars().count()` requires.
+        // Fall back to `chars().count()` for non-ASCII so multi-byte
+        // glyphs aren't over-counted by their byte length.
+        let char_count = if text.is_ascii() {
+            text.len() as i32
+        } else {
+            text.chars().count() as i32
+        };
 
         match cat {
             FontCategory::Monospaced => {
                 // Every character has the same advance width.
                 let char_w = (0.6 * size).round() as i32;
-                char_w * text.chars().count() as i32
+                char_w * char_count
             }
             _ => {
                 // Proportional: per-character width varies, but we use
                 // a heuristic average. Narrow chars (i, l, 1) are ~0.3*S,
                 // wide chars (M, W) are ~0.8*S. Average ~ 0.55*S for
                 // sans-serif, slightly wider for serif.
-                let avg = match cat {
-                    FontCategory::Serif => 0.58 * size,
-                    _ => 0.55 * size,
+                let avg = if matches!(cat, FontCategory::Serif) {
+                    0.58 * size
+                } else {
+                    0.55 * size
                 };
                 // Bold glyphs are ~5% wider.
-                let multiplier = if spec.is_bold() { 1.05 } else { 1.0 };
-                let total = avg * multiplier * text.chars().count() as f64;
+                let multiplier = if is_bold { 1.05 } else { 1.0 };
+                let total = avg * multiplier * char_count as f64;
                 total.round() as i32
             }
         }

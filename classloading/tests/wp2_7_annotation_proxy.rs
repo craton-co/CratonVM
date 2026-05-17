@@ -21,7 +21,7 @@ use rustjvm_classloading::annotations::{
     class_name_to_annotation_descriptor, field_annotations, method_annotations, AnnotationsView,
 };
 use rustjvm_reader::attribute::{
-    Annotation, Attribute, ElementValue, ElementValuePair,
+    Annotation, ElementValue, ElementValuePair, LazyAttribute,
 };
 use rustjvm_reader::class_file::ClassFile;
 use rustjvm_reader::read_class;
@@ -225,7 +225,7 @@ fn proxy_descriptor_form_strips_l_prefix_and_semicolon() {
 
 #[test]
 fn empty_attribute_list_yields_no_annotations() {
-    let attrs: Vec<Attribute> = Vec::new();
+    let attrs: Vec<LazyAttribute> = Vec::new();
     let view = AnnotationsView::new(&attrs);
     assert_eq!(view.runtime_visible().count(), 0);
     assert_eq!(view.runtime_invisible().count(), 0);

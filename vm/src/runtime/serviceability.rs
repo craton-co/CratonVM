@@ -3027,19 +3027,14 @@ mod tests {
         let mut mem = vec![0u8; total_size];
 
         // Write header
-        let header = ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(99),
-            kind: ObjectKind::Array,
-            element_type: ArrayElementType::Int,
-            _padding: [0; 2],
-            identity_hash_code: 42,
+        let header = ObjectHeader::new(
+            rustjvm_types::ClassId::new(99),
+            ObjectKind::Array,
+            ArrayElementType::Int,
+            42,
             array_length,
-            num_slots: array_length,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            array_length,
+        );
         unsafe {
             std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
         }
@@ -3089,19 +3084,14 @@ mod tests {
         let total_size = HEADER_SIZE + ((data_size + 7) & !7);
         let mut mem = vec![0u8; total_size];
 
-        let header = ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(50),
-            kind: ObjectKind::Array,
-            element_type: ArrayElementType::Reference,
-            _padding: [0; 2],
-            identity_hash_code: 0,
+        let header = ObjectHeader::new(
+            rustjvm_types::ClassId::new(50),
+            ObjectKind::Array,
+            ArrayElementType::Reference,
+            0,
             array_length,
-            num_slots: array_length,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+            array_length,
+        );
         unsafe {
             std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
         }
@@ -3183,19 +3173,14 @@ mod tests {
         // Create a fake heap object
         let total_size = HEADER_SIZE + SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
-        let header = ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(1),
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Boolean,
-            _padding: [0; 2],
-            identity_hash_code: 123,
-            array_length: 0,
-            num_slots: 1,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let header = ObjectHeader::new(
+            rustjvm_types::ClassId::new(1),
+            ObjectKind::Object,
+            ArrayElementType::Boolean,
+            123,
+            0,
+            1,
+        );
         unsafe {
             std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
             // Write an int value (42) at the field slot
@@ -3328,19 +3313,14 @@ mod tests {
         // Create a Derived object with 2 fields (inherited id + own name)
         let total_size = HEADER_SIZE + 2 * SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
-        let header = ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(2),
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Boolean,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 0,
-            num_slots: 2,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let header = ObjectHeader::new(
+            rustjvm_types::ClassId::new(2),
+            ObjectKind::Object,
+            ArrayElementType::Boolean,
+            0,
+            0,
+            2,
+        );
         unsafe {
             std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
         }
@@ -3426,19 +3406,14 @@ mod tests {
 
         let total_size = HEADER_SIZE + SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
-        let header = ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(1),
-            kind: ObjectKind::Object,
-            element_type: ArrayElementType::Boolean,
-            _padding: [0; 2],
-            identity_hash_code: 0,
-            array_length: 0,
-            num_slots: 1,
-            gc_age: 0,
-            gc_flags: 0,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let header = ObjectHeader::new(
+            rustjvm_types::ClassId::new(1),
+            ObjectKind::Object,
+            ArrayElementType::Boolean,
+            0,
+            0,
+            1,
+        );
         unsafe {
             std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
             // Write field value: 0x12345678

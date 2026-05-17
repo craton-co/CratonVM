@@ -2636,9 +2636,11 @@ mod tests {
                 | FieldAccessFlags::FINAL,
             name: std::sync::Arc::from(name),
             descriptor: std::sync::Arc::from(descriptor),
-            attributes: vec![Attribute::ConstantValue {
-                constant_value_index: cv_index,
-            }],
+            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+                Attribute::ConstantValue {
+                    constant_value_index: cv_index,
+                },
+            )],
         };
 
         let fields = vec![
@@ -2692,6 +2694,12 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                attributes: Vec::new(),
+                source_file_cache: std::sync::OnceLock::new(),
+                signature_cache: std::sync::OnceLock::new(),
+                nest_host_cache: std::sync::OnceLock::new(),
+                enclosing_method_cache: std::sync::OnceLock::new(),
+                record_components_cache: std::sync::OnceLock::new(),
             });
             id
         };
