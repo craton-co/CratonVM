@@ -9,17 +9,22 @@
 //! record a [`StreamOp`] on the stream so unit tests can assert the
 //! enqueued byte counts.
 //!
-//! PHASE2-CUDA-TODO: in `cuda` mode every entry point currently
-//! returns `DeviceError::NoDriver`. cudarc 0.13 exposes async host↔
-//! device memcpy via `CudaDevice` (`htod_copy_into` /
-//! `dtoh_sync_copy_into`) but ties the stream to the device's owning
-//! handle, not an arbitrary stream — porting requires the
-//! `backend_cuda.rs` migration first.
+//! In `cuda` mode `from_host_async` allocates a fresh
+//! `sys::CUdeviceptr` via the bridge's `DeviceBufferInner::uninit_raw`
+//! helper, then enqueues a `cuMemcpyHtoDAsync_v2` via
+//! `cudarc::driver::result::memcpy_htod_async` on `stream.raw()`. The
+//! caller is contractually required to keep `host` alive until the
+//! stream has been synchronised — the same contract cudarc itself
+//! documents on `result::memcpy_htod_async`. `to_host_async` is the
+//! mirror via `result::memcpy_dtoh_async`.
 
 use crate::{DeviceBuffer, DeviceContext, Result, Stream, StreamOp};
 
 #[cfg(not(feature = "cuda"))]
 use crate::backend_stub as backend;
+
+#[cfg(feature = "cuda")]
+use crate::backend_cuda as backend;
 
 impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
     /// Allocate a device buffer and upload `host` asynchronously on
@@ -55,13 +60,35 @@ impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
 
         #[cfg(feature = "cuda")]
         {
-            // PHASE2-CUDA-TODO: route through cudarc 0.13's
-            // `CudaDevice::htod_copy_into` against the user-supplied
-            // stream once `backend_cuda.rs` is ported. Today the cuda
-            // backend itself returns NoDriver, so there is no live
-            // device handle to copy to.
-            let _ = (ctx, host, stream, bytes);
-            Err(crate::DeviceError::NoDriver)
+            // 1. Allocate device memory of the right size. We use
+            //    `uninit_raw` (a crate-internal helper) so we don't
+            //    bounce the host bytes through cudarc's owned-Vec
+            //    `htod_copy_into` path, which would require an
+            //    extra clone of `host`.
+            let inner = backend::DeviceBufferInner::<T>::uninit_raw(
+                ctx.inner(),
+                bytes,
+                host.len(),
+            )?;
+            // 2. Enqueue the H→D copy on the caller's stream.
+            //    Contract per cudarc: `host` must remain valid until
+            //    the stream is synchronised. We surface that contract
+            //    via this method's doc comment; the buffer itself
+            //    cannot prove it.
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async::<T>(
+                    inner.raw_ptr(),
+                    host,
+                    stream.raw(),
+                )
+            }
+            .map_err(|e| crate::DeviceError::Memcpy(format!("cuMemcpyHtoDAsync_v2: {e:?}")))?;
+            // 3. Record the op on the stub-mode log (no-op in cuda
+            //    mode because `Stream::record_op` is a no-op there,
+            //    but kept symmetric with the stub path).
+            let _ = bytes;
+            stream.record_op(StreamOp::UploadAsync { bytes });
+            Ok(DeviceBuffer(inner))
         }
     }
 
@@ -84,12 +111,29 @@ impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
 
         #[cfg(feature = "cuda")]
         {
-            // PHASE2-CUDA-TODO: pair of `from_host_async` — cudarc
-            // 0.13's async D→H is `CudaDevice::dtoh_sync_copy_into`
-            // with `is_async = true`; needs the backend migration
-            // first.
-            let _ = (dst, stream, bytes);
-            Err(crate::DeviceError::NoDriver)
+            if dst.len() != self.len() {
+                return Err(crate::DeviceError::Memcpy(format!(
+                    "to_host_async length mismatch: dst.len()={}, slice.len()={}",
+                    dst.len(),
+                    self.len()
+                )));
+            }
+            // Bind to the buffer's owning context before submitting.
+            // The buffer's `raw_ptr()` is only valid in that context.
+            self.0
+                .device_arc()
+                .bind_to_thread()
+                .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async::<T>(
+                    dst,
+                    self.0.raw_ptr(),
+                    stream.raw(),
+                )
+            }
+            .map_err(|e| crate::DeviceError::Memcpy(format!("cuMemcpyDtoHAsync_v2: {e:?}")))?;
+            stream.record_op(StreamOp::DownloadAsync { bytes });
+            Ok(())
         }
     }
 }

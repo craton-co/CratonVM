@@ -11,15 +11,13 @@
 //! entries to its op log so tests can inspect cross-stream
 //! dependencies without a real GPU.
 //!
-//! PHASE2-CUDA-TODO: in `cuda` mode every entry point currently
-//! returns `DeviceError::NoDriver`. The pre-existing `backend_cuda.rs`
-//! in this workspace was written against a cudarc API surface (named
-//! `CudaContext`, `result::event::*`, `cudarc::driver::sys::CUevent`)
-//! that does not exist on the pinned `cudarc = "0.13"`; once the
-//! backend is ported, this module should grow a real `EventCuda`
-//! holding `cudarc::driver::sys::CUevent` and route through cudarc's
-//! `result::event::create/destroy/synchronize/query` and
-//! `result::event::record` / `result::stream::wait_event`.
+//! In `cuda` mode `Event` wraps a raw `sys::CUevent` created via
+//! `cudarc::driver::result::event::create` and forwards `synchronize`
+//! / `query` / `destroy` to the same `result::event` namespace.
+//! `Stream::record_event` calls `result::event::record(event, stream)`
+//! and `Stream::wait_event` calls `result::stream::wait_event(stream,
+//! event, CU_EVENT_WAIT_DEFAULT)` on the raw `sys::CUstream` exposed
+//! by `Stream::raw()`.
 
 use crate::{DeviceContext, DeviceError, Result, Stream};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -54,20 +52,33 @@ pub(crate) struct EventStub {
     pub(crate) recorded_on: std::sync::Mutex<Option<u32>>,
 }
 
-// PHASE2-CUDA-TODO: `EventCuda` should hold a `cudarc::driver::sys::CUevent`
-// (or an `Arc<cudarc::driver::CudaEvent>` if a future cudarc adds a
-// safe wrapper) once `backend_cuda.rs` is ported to the cudarc 0.13
-// API. Today it is a zero-sized marker so the module compiles under
-// the `cuda` feature.
+// cudarc 0.13 has no `CudaEvent` safe wrapper, so we hold the raw
+// `sys::CUevent` directly and free it in `Drop`. The event is bound
+// to the device's primary context — we retain an `Arc<CudaDevice>`
+// to keep that context alive for the event's lifetime.
 #[cfg(feature = "cuda")]
 struct EventCuda {
-    _marker: (),
+    cu_event: cudarc::driver::sys::CUevent,
+    device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
 }
 
 #[cfg(feature = "cuda")]
 unsafe impl Send for EventCuda {}
 #[cfg(feature = "cuda")]
 unsafe impl Sync for EventCuda {}
+
+#[cfg(feature = "cuda")]
+impl Drop for EventCuda {
+    fn drop(&mut self) {
+        // Bind to the owning context before destroying — same pattern
+        // cudarc uses in `CudaDevice::drop` (which destroys the
+        // per-device sync event).
+        let _ = self.device.bind_to_thread();
+        unsafe {
+            let _ = cudarc::driver::result::event::destroy(self.cu_event);
+        }
+    }
+}
 
 impl Event {
     /// Create a fresh event. The event is NOT yet recorded — call
@@ -89,11 +100,23 @@ impl Event {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn new(_ctx: &DeviceContext) -> Result<Self> {
-        // PHASE2-CUDA-TODO: cuEventCreate via cudarc 0.13's
-        // `result::event::create`. Stubbed until `backend_cuda.rs`
-        // exposes a working device context.
-        Err(DeviceError::NoDriver)
+    pub fn new(ctx: &DeviceContext) -> Result<Self> {
+        let device = ctx.inner().device().clone();
+        device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+        // `CU_EVENT_DISABLE_TIMING` matches cudarc's own per-device
+        // sync event: we don't want the (slightly more expensive)
+        // timing variant since the bridge never measures elapsed
+        // GPU time.
+        let cu_event = cudarc::driver::result::event::create(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        )
+        .map_err(|e| DeviceError::Driver(format!("cuEventCreate: {e:?}")))?;
+        Ok(Self {
+            inner: EventCuda { cu_event, device },
+            id: next_event_id(),
+        })
     }
 
     /// Unique id (test / debug aid). Stable for the lifetime of the
@@ -121,9 +144,12 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn synchronize(&self) -> Result<()> {
-        // PHASE2-CUDA-TODO: cuEventSynchronize via
-        // `cudarc::driver::result::event::synchronize`.
-        Err(DeviceError::NoDriver)
+        // `cuEventSynchronize` is a host-side wait: returns when the
+        // event has completed on whatever stream recorded it. If the
+        // event was never recorded the call returns immediately (the
+        // CUDA driver treats an unrecorded event as already-complete).
+        unsafe { cudarc::driver::result::event::synchronize(self.inner.cu_event) }
+            .map_err(|e| DeviceError::Driver(format!("cuEventSynchronize: {e:?}")))
     }
 
     /// Returns `true` if the recorded work has completed. Returns
@@ -144,9 +170,22 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn query(&self) -> Result<bool> {
-        // PHASE2-CUDA-TODO: cuEventQuery via
-        // `cudarc::driver::result::event::query`.
-        Err(DeviceError::NoDriver)
+        // cudarc's `result::event::query` returns `Ok(())` when the
+        // event has fired and an `Err(CUDA_ERROR_NOT_READY)` when it
+        // is still in flight. We map the not-ready code to
+        // `Ok(false)` so callers don't have to grep for the specific
+        // driver error variant; anything else is a genuine failure.
+        match unsafe { cudarc::driver::result::event::query(self.inner.cu_event) } {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                use cudarc::driver::sys::CUresult;
+                if e.0 == CUresult::CUDA_ERROR_NOT_READY {
+                    Ok(false)
+                } else {
+                    Err(DeviceError::Driver(format!("cuEventQuery: {e:?}")))
+                }
+            }
+        }
     }
 }
 
@@ -178,10 +217,15 @@ impl Stream {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn record_event(&self, _event: &Event) -> Result<()> {
-        // PHASE2-CUDA-TODO: cuEventRecord via
-        // `cudarc::driver::result::event::record(event_handle, stream_handle)`.
-        Err(DeviceError::NoDriver)
+    pub fn record_event(&self, event: &Event) -> Result<()> {
+        // `cuEventRecord(event, stream)` enqueues the event onto the
+        // stream's command queue. Subsequent `cuEventQuery` /
+        // `cuEventSynchronize` calls observe completion of any work
+        // ahead of this point on the stream.
+        unsafe {
+            cudarc::driver::result::event::record(event.inner.cu_event, self.raw())
+        }
+        .map_err(|e| DeviceError::Driver(format!("cuEventRecord: {e:?}")))
     }
 
     /// Make this stream wait for `event`. All subsequent work on this
@@ -201,10 +245,19 @@ impl Stream {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn wait_event(&self, _event: &Event) -> Result<()> {
-        // PHASE2-CUDA-TODO: cuStreamWaitEvent via
-        // `cudarc::driver::result::stream::wait_event(stream, event, flags)`.
-        Err(DeviceError::NoDriver)
+    pub fn wait_event(&self, event: &Event) -> Result<()> {
+        // `cuStreamWaitEvent(stream, event, CU_EVENT_WAIT_DEFAULT)`
+        // inserts a barrier on this stream that blocks all subsequent
+        // submissions until `event` fires on whichever stream
+        // recorded it. The wait itself does not block the host.
+        unsafe {
+            cudarc::driver::result::stream::wait_event(
+                self.raw(),
+                event.inner.cu_event,
+                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| DeviceError::Driver(format!("cuStreamWaitEvent: {e:?}")))
     }
 }
 

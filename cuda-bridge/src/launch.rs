@@ -8,10 +8,13 @@
 //! In stub mode the call records a `StreamOp::Launch { kernel, grid,
 //! block }` on the stream and returns `Ok(())`.
 //!
-//! PHASE2-CUDA-TODO: in `cuda` mode this currently returns
-//! `DeviceError::NoDriver`. cudarc 0.13's stream-bound launch path is
-//! via `LaunchAsync::launch` on `(CudaFunction, &CudaStream)`;
-//! porting requires the `backend_cuda.rs` migration first.
+//! In `cuda` mode this calls the same `cuLaunchKernel`-driving helper
+//! the default-stream `launch_raw` uses (`backend_cuda::
+//! launch_on_raw_stream`), passing `stream.raw()` instead of the
+//! device's default stream. The kernel-arg packing rules are
+//! identical between the two paths — `KernelArg::DevicePtr(u64)`
+//! storage cells fed into a `Vec<*mut c_void>` and submitted via
+//! `cudarc::driver::result::launch_kernel`.
 
 use crate::{DeviceContext, DeviceModule, KernelArgs, LaunchConfig, Result, Stream, StreamOp};
 
@@ -44,15 +47,35 @@ impl DeviceModule {
 
         #[cfg(feature = "cuda")]
         {
-            // PHASE2-CUDA-TODO: mirror `backend_cuda::launch_raw` but
-            // dispatch on `stream.raw()` once a cudarc 0.13 backend
-            // exists. cudarc 0.13's stream-launch path is
-            // `<CudaFunction as LaunchAsync<_>>::launch(func, args, cfg)`
-            // on `&CudaStream`; the `args` packing must match
-            // `KernelArg::DevicePtr(u64)` (tuple variant, see
-            // `lib.rs`).
-            let _ = (ctx, kernel, cfg, args, stream);
-            Err(crate::DeviceError::NoDriver)
+            // Bind the calling thread to the buffer's owning context
+            // before submission. `launch_on_raw_stream` itself doesn't
+            // bind — for the default-stream path the caller is
+            // `backend_cuda::launch_raw` which does the bind; here we
+            // do the same.
+            ctx.inner()
+                .device()
+                .bind_to_thread()
+                .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
+            // Reach into the private inner module handle via this
+            // crate-local module's privilege over the lib.rs items
+            // it descends from. `DeviceModule(backend::
+            // DeviceModuleInner)` exposes its sole field with default
+            // (module-private) visibility, but `launch.rs` is a child
+            // of the crate root and so sees it.
+            let module: &crate::backend_cuda::DeviceModuleInner = &self.0;
+            crate::backend_cuda::launch_on_raw_stream(
+                module,
+                kernel,
+                cfg,
+                args,
+                stream.raw(),
+            )?;
+            stream.record_op(StreamOp::Launch {
+                kernel: kernel.to_string(),
+                grid: cfg.grid,
+                block: cfg.block,
+            });
+            Ok(())
         }
     }
 }
