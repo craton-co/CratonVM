@@ -48,7 +48,7 @@ impl DeviceModuleInner {
 }
 
 pub(crate) struct DeviceBufferInner<T> {
-    _phantom: PhantomData<T>,
+    pub(crate) _phantom: PhantomData<T>,
 }
 
 impl<T> DeviceBufferInner<T> {

@@ -5,9 +5,11 @@
 //! barriers. The bridge exposes the same public surface in both build
 //! modes:
 //!
-//! - `cuda` feature: wraps a real `cudarc::driver::CudaStream` created
-//!   from the [`DeviceContext`]'s underlying `CudaContext`. Calls
-//!   forward to the driver.
+//! - `cuda` feature: PHASE2-CUDA-TODO — wraps a real cudarc stream
+//!   once the cudarc 0.13 `CudaDevice`/`fork_default_stream` migration
+//!   in `backend_cuda.rs` lands. Currently every cuda-mode entry point
+//!   returns `DeviceError::NoDriver` so the `--features cuda` build
+//!   compiles cleanly.
 //! - stub (no `cuda` feature): records operations into an in-memory log
 //!   so tests and host-side orchestration code (e.g. dependency-graph
 //!   construction in `gpu-offload`) can exercise the API without a
@@ -24,9 +26,6 @@
 //! expose a `#[cfg(test)] for_test()` constructor on the stub backend.
 
 use crate::{DeviceContext, Result};
-
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
 
 #[cfg(not(feature = "cuda"))]
 use std::sync::{
@@ -89,16 +88,20 @@ impl StreamStub {
 }
 
 // ── cuda-mode internals ───────────────────────────────────────────────
+//
+// PHASE2-CUDA-TODO: `StreamCuda` should hold an `Arc<cudarc::driver::CudaStream>`
+// once `backend_cuda.rs` is migrated to the cudarc 0.13 API. Today it
+// is a zero-sized marker so the module compiles under the `cuda`
+// feature.
+
+#[cfg(feature = "cuda")]
+pub(crate) struct StreamCuda {
+    id: u32,
+}
 
 #[cfg(feature = "cuda")]
 static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
-
-#[cfg(feature = "cuda")]
-pub(crate) struct StreamCuda {
-    raw: Arc<cudarc::driver::CudaStream>,
-    id: u32,
-}
 
 // ── Public Stream type ────────────────────────────────────────────────
 
@@ -121,31 +124,26 @@ pub struct Stream {
 impl Stream {
     /// Create a new stream bound to `ctx`.
     ///
-    /// In `cuda` mode this creates a fresh `CudaStream` on the device
-    /// underlying `ctx`. In stub mode this returns a logging stream
-    /// with a fresh id; however, since [`DeviceContext::new`] itself
-    /// returns `NoDriver` in stub mode, this entry point is only
-    /// reachable from real (`cuda`-feature) code paths. Tests can use
-    /// the crate-internal `for_test()` constructor on the stub
-    /// backend.
+    /// In `cuda` mode this would create a fresh `CudaStream` on the
+    /// device underlying `ctx`. PHASE2-CUDA-TODO: today it returns
+    /// `NoDriver` because `backend_cuda` itself does not yet expose
+    /// the cudarc 0.13 device handle. In stub mode this returns a
+    /// logging stream with a fresh id; however, since
+    /// [`DeviceContext::new`] itself returns `NoDriver` in stub mode,
+    /// this entry point is only reachable from real (`cuda`-feature)
+    /// code paths. Tests can use the crate-internal `for_test()`
+    /// constructor on the stub backend.
     #[cfg(feature = "cuda")]
-    pub fn new(ctx: &DeviceContext) -> Result<Self> {
-        use crate::DeviceError;
-        // Seam owned by Item P2-5: `DeviceContextInner` must expose
-        // `pub(crate) fn cuda_context(&self) -> &std::sync::Arc<cudarc::driver::CudaContext>`
-        // so this constructor can call `CudaContext::new_stream()`.
-        // Until P2-5 lands that accessor, this `cuda`-feature branch
-        // does not compile; the rest of the workspace continues to
-        // build in stub mode (the default) without issue.
-        let cuda_ctx: &Arc<cudarc::driver::CudaContext> = ctx.0.cuda_context();
-        let raw = cuda_ctx
-            .new_stream()
-            .map_err(|e| DeviceError::Driver(format!("CudaContext::new_stream: {e}")))?;
+    pub fn new(_ctx: &DeviceContext) -> Result<Self> {
+        // PHASE2-CUDA-TODO: implement against cudarc 0.13 `CudaDevice::
+        // fork_default_stream` once `backend_cuda.rs` is ported. The
+        // current stub returns NoDriver so the build compiles.
         let id = CUDA_STREAM_ID_COUNTER
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self {
-            inner: StreamCuda { raw, id },
-        })
+        let _ = id; // suppress dead_code until the cuda body lands
+        Err(crate::DeviceError::Driver(
+            "Stream::new: cuda backend not yet implemented (PHASE2-CUDA-TODO)".to_string(),
+        ))
     }
 
     /// Create a new stream bound to `ctx` (stub mode).
@@ -172,14 +170,13 @@ impl Stream {
     ///
     /// In stub mode this records [`StreamOp::Synchronize`] in the log
     /// and returns `Ok(())` — there is no real driver to call. In
-    /// `cuda` mode this forwards to `cuStreamSynchronize` via cudarc.
+    /// `cuda` mode this forwards to `cuStreamSynchronize` via cudarc
+    /// (PHASE2-CUDA-TODO: currently NoDriver).
     #[cfg(feature = "cuda")]
     pub fn synchronize(&self) -> Result<()> {
-        use crate::DeviceError;
-        self.inner
-            .raw
-            .synchronize()
-            .map_err(|e| DeviceError::Driver(format!("stream synchronize: {e}")))
+        // PHASE2-CUDA-TODO: forward to cudarc's `CudaStream::synchronize`
+        // once the cudarc 0.13 migration lands.
+        Err(crate::DeviceError::NoDriver)
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -228,13 +225,6 @@ impl Stream {
             .lock()
             .expect("stream op log poisoned")
             .push(op);
-    }
-
-    /// Raw cudarc stream handle. Used by the `cuda`-backed async
-    /// memcpy and launch helpers in sibling Phase 2 items.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn raw(&self) -> &Arc<cudarc::driver::CudaStream> {
-        &self.inner.raw
     }
 }
 

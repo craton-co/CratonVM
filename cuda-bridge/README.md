@@ -111,10 +111,10 @@ The op log captures one variant per enqueue or synchronization call:
 
 | Variant         | Captures                                                       |
 | --------------- | -------------------------------------------------------------- |
-| `HtoDAsync`     | byte count and element type tag for `from_host_async` copies.  |
-| `DtoHAsync`     | byte count and element type tag for `to_host_async` copies.    |
-| `Launch`        | kernel name and `LaunchConfig` passed to `launch_on_stream`.   |
-| `RecordEvent`   | event id recorded into the stream.                             |
-| `WaitEvent`     | event id the stream is gated on.                               |
+| `UploadAsync`   | byte count of `from_host_async` (H→D) copies.                  |
+| `DownloadAsync` | byte count of `to_host_async` (D→H) copies.                    |
+| `Launch`        | kernel name, `grid` and `block` dims passed to `launch_on_stream`. |
+| `EventRecord`   | event id recorded into the stream.                             |
+| `EventWait`     | event id the stream is gated on.                               |
 | `Synchronize`   | a host-side `stream.synchronize()` call.                       |
 

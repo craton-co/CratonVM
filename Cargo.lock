@@ -1015,6 +1015,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jit-cuda"
 version = "0.2.0"
 dependencies = [
+ "craton-gpu",
  "rustjvm-jit-api",
  "rustjvm-reader",
  "rustjvm-types",

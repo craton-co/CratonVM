@@ -85,9 +85,32 @@ impl DeviceContext {
         backend::DeviceContextInner::new(device_ordinal).map(Self)
     }
 
+    /// Probe-and-attach helper used by Phase 2 integration tests.
+    ///
+    /// Equivalent to [`DeviceContext::new(0)`][Self::new]. In stub
+    /// mode this returns `Err(DeviceError::NoDriver)`, which is the
+    /// signal `tests/stub_op_log.rs` uses to skip its body on hosts
+    /// without a driver. Named to mirror the spec wording so the
+    /// integration tests read naturally even when the underlying
+    /// backend is stubbed.
+    pub fn probe() -> Result<Self> {
+        Self::new(0)
+    }
+
     /// Synchronize: wait for all in-flight work on this context to drain.
     pub fn synchronize(&self) -> Result<()> {
         self.0.synchronize()
+    }
+
+    /// Crate-internal accessor used by `stream.rs` / `event.rs` /
+    /// `async_memcpy.rs` to reach the backend handle without exposing
+    /// it publicly. PHASE2-CUDA-TODO: today the cuda backend handle is
+    /// an opaque placeholder; once `backend_cuda.rs` is migrated to
+    /// cudarc 0.13 this is where stream/event constructors will pull
+    /// the `Arc<CudaDevice>` from.
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> &backend::DeviceContextInner {
+        &self.0
     }
 }
 
@@ -171,7 +194,7 @@ pub(crate) enum KernelArg {
 /// `f32`, `f64`, `u8`, `i16`). The bridge does no bounds checking on
 /// the host side — the kernel is responsible for staying within
 /// `len()`.
-pub struct DeviceBuffer<T>(backend::DeviceBufferInner<T>);
+pub struct DeviceBuffer<T>(pub(crate) backend::DeviceBufferInner<T>);
 
 impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.

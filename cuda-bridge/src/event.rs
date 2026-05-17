@@ -11,12 +11,15 @@
 //! entries to its op log so tests can inspect cross-stream
 //! dependencies without a real GPU.
 //!
-//! In `cuda` mode the type wraps a raw `cudarc::driver::sys::CUevent`
-//! created via `cuEventCreate`. Operations route through the unsafe
-//! `cudarc::driver::result::event::*` and `result::stream::wait_event`
-//! shims because cudarc 0.13 does not expose a safe `CudaEvent`
-//! wrapper — only the low-level handle and unsafe driver-result
-//! functions.
+//! PHASE2-CUDA-TODO: in `cuda` mode every entry point currently
+//! returns `DeviceError::NoDriver`. The pre-existing `backend_cuda.rs`
+//! in this workspace was written against a cudarc API surface (named
+//! `CudaContext`, `result::event::*`, `cudarc::driver::sys::CUevent`)
+//! that does not exist on the pinned `cudarc = "0.13"`; once the
+//! backend is ported, this module should grow a real `EventCuda`
+//! holding `cudarc::driver::sys::CUevent` and route through cudarc's
+//! `result::event::create/destroy/synchronize/query` and
+//! `result::event::record` / `result::stream::wait_event`.
 
 use crate::{DeviceContext, DeviceError, Result, Stream};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -46,54 +49,25 @@ pub struct Event {
 }
 
 #[cfg(not(feature = "cuda"))]
-struct EventStub {
+pub(crate) struct EventStub {
     /// `Some(stream_id)` after a successful `Stream::record_event`.
-    recorded_on: std::sync::Mutex<Option<u32>>,
+    pub(crate) recorded_on: std::sync::Mutex<Option<u32>>,
 }
 
-// PHASE2-GUESS: The Phase 2 spec text in §2.4 reads
-// `EventCuda { raw: cudarc::driver::CudaEvent }`, but cudarc 0.13.9
-// (the version pinned in `cuda-bridge/Cargo.toml`) does NOT export a
-// safe `CudaEvent` wrapper — only the raw `sys::CUevent` handle and
-// the unsafe `result::event::*` shims. We mirror the pattern already
-// established in `backend_cuda.rs` for `CudaStream` access and hold
-// the raw handle directly, with a `Drop` impl that calls
-// `cuEventDestroy_v2`. If a future cudarc adds a safe wrapper this
-// type can be swapped without touching the public API.
+// PHASE2-CUDA-TODO: `EventCuda` should hold a `cudarc::driver::sys::CUevent`
+// (or an `Arc<cudarc::driver::CudaEvent>` if a future cudarc adds a
+// safe wrapper) once `backend_cuda.rs` is ported to the cudarc 0.13
+// API. Today it is a zero-sized marker so the module compiles under
+// the `cuda` feature.
 #[cfg(feature = "cuda")]
 struct EventCuda {
-    raw: cudarc::driver::sys::CUevent,
+    _marker: (),
 }
 
-// CUevent is a raw pointer (`*mut CUevent_st`). The CUDA driver is
-// thread-safe with respect to event operations on a context bound to
-// the calling thread (cudarc handles the thread binding internally),
-// so we hand-roll the Send/Sync markers the same way other cudarc
-// handles are treated. Without this `Event` would not be usable
-// across thread boundaries — and the whole point of events is to
-// synchronise between threads / streams.
 #[cfg(feature = "cuda")]
 unsafe impl Send for EventCuda {}
 #[cfg(feature = "cuda")]
 unsafe impl Sync for EventCuda {}
-
-#[cfg(feature = "cuda")]
-impl Drop for EventCuda {
-    fn drop(&mut self) {
-        // Safety: `self.raw` was returned by `cuEventCreate` in
-        // `Event::new` and has not been destroyed yet (this is the
-        // sole drop site). cuda docs explicitly allow destroying an
-        // event that has not completed.
-        unsafe {
-            let _ = cudarc::driver::result::event::destroy(self.raw);
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_err<E: std::fmt::Display>(stage: &'static str) -> impl FnOnce(E) -> DeviceError {
-    move |e| DeviceError::Driver(format!("{stage}: {e}"))
-}
 
 impl Event {
     /// Create a fresh event. The event is NOT yet recorded — call
@@ -116,18 +90,10 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn new(_ctx: &DeviceContext) -> Result<Self> {
-        // Default flags: timing enabled, no blocking sync, not
-        // inter-process. Matches CUDA's default event behaviour.
-        // PHASE2-GUESS: We do not yet expose a way to disable timing;
-        // a future API may add an `Event::new_with_flags` variant.
-        let raw = cudarc::driver::result::event::create(
-            cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
-        )
-        .map_err(cuda_err("cuEventCreate"))?;
-        Ok(Self {
-            inner: EventCuda { raw },
-            id: next_event_id(),
-        })
+        // PHASE2-CUDA-TODO: cuEventCreate via cudarc 0.13's
+        // `result::event::create`. Stubbed until `backend_cuda.rs`
+        // exposes a working device context.
+        Err(DeviceError::NoDriver)
     }
 
     /// Unique id (test / debug aid). Stable for the lifetime of the
@@ -155,11 +121,9 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn synchronize(&self) -> Result<()> {
-        // Safety: `self.inner.raw` is a valid event created in
-        // `Event::new` and not yet destroyed (Drop runs after this
-        // borrow ends).
-        unsafe { cudarc::driver::result::event::synchronize(self.inner.raw) }
-            .map_err(cuda_err("cuEventSynchronize"))
+        // PHASE2-CUDA-TODO: cuEventSynchronize via
+        // `cudarc::driver::result::event::synchronize`.
+        Err(DeviceError::NoDriver)
     }
 
     /// Returns `true` if the recorded work has completed. Returns
@@ -180,28 +144,9 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn query(&self) -> Result<bool> {
-        // `cuEventQuery` returns `CUDA_SUCCESS` (mapped to `Ok(())`
-        // by cudarc) when all captured work has finished, or
-        // `CUDA_ERROR_NOT_READY` while still running. Anything else
-        // is a real error and we surface it.
-        //
-        // Safety: `self.inner.raw` is a valid event created in
-        // `Event::new` and not yet destroyed.
-        match unsafe { cudarc::driver::result::event::query(self.inner.raw) } {
-            Ok(()) => Ok(true),
-            Err(e) => {
-                // CUDA_ERROR_NOT_READY = 600. Use the discriminant on
-                // the inner sys::CUresult so we don't depend on the
-                // exact enum-variant path which can shift across
-                // sys_NNNN cfg gates.
-                let code = e.0 as u32;
-                if code == 600 {
-                    Ok(false)
-                } else {
-                    Err(DeviceError::Driver(format!("cuEventQuery: {e}")))
-                }
-            }
-        }
+        // PHASE2-CUDA-TODO: cuEventQuery via
+        // `cudarc::driver::result::event::query`.
+        Err(DeviceError::NoDriver)
     }
 }
 
@@ -213,8 +158,8 @@ impl Stream {
     /// 2. Appends `StreamOp::EventRecord { event_id: event.id() }`
     ///    to this stream's op log.
     ///
-    /// In cuda mode this calls `cuEventRecord` on the stream's raw
-    /// handle. Returns once the *queue* of operations has been
+    /// In cuda mode this would call `cuEventRecord` on the stream's
+    /// raw handle. Returns once the *queue* of operations has been
     /// updated — it does not wait for the event to fire.
     #[cfg(not(feature = "cuda"))]
     pub fn record_event(&self, event: &Event) -> Result<()> {
@@ -233,16 +178,10 @@ impl Stream {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn record_event(&self, event: &Event) -> Result<()> {
-        // Safety: `event.inner.raw` and the stream handle returned
-        // by `self.raw()` are both valid (Drop on either would run
-        // strictly after this call returns), and `cuEventRecord` is
-        // safe to call with a valid (event, stream) pair on the
-        // currently bound context.
-        unsafe {
-            cudarc::driver::result::event::record(event.inner.raw, self.raw().stream)
-        }
-        .map_err(cuda_err("cuEventRecord"))
+    pub fn record_event(&self, _event: &Event) -> Result<()> {
+        // PHASE2-CUDA-TODO: cuEventRecord via
+        // `cudarc::driver::result::event::record(event_handle, stream_handle)`.
+        Err(DeviceError::NoDriver)
     }
 
     /// Make this stream wait for `event`. All subsequent work on this
@@ -262,18 +201,10 @@ impl Stream {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn wait_event(&self, event: &Event) -> Result<()> {
-        // Safety: same as `record_event`. Pass the default wait
-        // flags, matching the pattern in cudarc's own
-        // `CudaStream::wait_for_default`.
-        unsafe {
-            cudarc::driver::result::stream::wait_event(
-                self.raw().stream,
-                event.inner.raw,
-                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-            )
-        }
-        .map_err(cuda_err("cuStreamWaitEvent"))
+    pub fn wait_event(&self, _event: &Event) -> Result<()> {
+        // PHASE2-CUDA-TODO: cuStreamWaitEvent via
+        // `cudarc::driver::result::stream::wait_event(stream, event, flags)`.
+        Err(DeviceError::NoDriver)
     }
 }
 
@@ -295,25 +226,6 @@ mod tests {
 
     #[test]
     fn event_new_assigns_unique_ids() {
-        // We cannot construct a real `DeviceContext` in stub mode
-        // (probe / new return NoDriver), so we route through a
-        // helper that builds one via the public API. Because
-        // `DeviceContext::new` itself returns NoDriver in stub mode,
-        // we fall back to checking the id allocator directly via
-        // two separate `Event` constructions: the ctx is never
-        // touched by stub `Event::new`, so we can pass a synthesised
-        // one obtained from probing — but probe also fails. The
-        // cleanest path: skip the ctx requirement by calling
-        // `Event::new` with a dummy context built from
-        // `Stream::for_test`'s sibling. Item P2-1 owns the test
-        // constructor; until it lands, we sidestep by using
-        // `make_event_id_only()` style — but the simplest correct
-        // approach is: ctx isn't read in stub mode, so we obtain
-        // one via the same workaround the integration tests use,
-        // i.e., a probe-or-skip pattern. For this purely-local
-        // unit test we construct two events back to back and
-        // require their ids differ; if probe fails we silently
-        // pass (consistent with the integration-test convention).
         let ctx = match crate::DeviceContext::new(0) {
             Ok(c) => c,
             Err(_) => return, // stub path: nothing to verify without a ctx
