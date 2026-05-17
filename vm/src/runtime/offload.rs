@@ -737,8 +737,8 @@ pub(crate) fn maybe_warmup_gpu(
     if !shared.config.gpu_offload_enabled {
         return;
     }
-    let class_annotations = jit_cuda::annotations::read_class_annotations(
-        &class.attributes,
+    let class_annotations = jit_cuda::annotations::read_class_annotations_from_parsed(
+        &class.annotations,
         &class.constant_pool,
     );
     let Some(enable) = class_annotations.enable_async else {

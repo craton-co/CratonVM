@@ -37,10 +37,10 @@ pub enum GridShape {
     /// space is the length of the longest array parameter.
     #[default]
     Elementwise,
-    /// Reserved — a tiled grid (per-block reductions, stencils).
-    Tiled,
-    /// Reserved — a single launch with a custom grid configuration.
-    Custom,
+    /// Row-per-thread shape — each CUDA thread handles a row of a 2D output.
+    RowPerThread,
+    /// Block-reduction shape — block-wide reductions land here.
+    BlockReduction,
 }
 
 /// How aggressively the analyzer should admit a `@GpuKernel`-marked
@@ -53,13 +53,14 @@ pub enum AdmissionHint {
     /// Default — reject any non-elementwise pattern.
     #[default]
     Strict,
-    /// Allow new-array opcodes inside the kernel (PHASE1: still rejected
-    /// by the emitter; recorded for the next phase).
+    /// Allow primitive-array `new int[n]` where `n` is derived from a
+    /// method parameter — the emitter treats it as the output buffer.
     AllowAllocation,
-    /// Allow calls into other classes (PHASE1: still rejected).
-    AllowInvoke,
-    /// Allow synchronized blocks (PHASE1: still rejected).
-    AllowSynchronized,
+    /// Skip the implicit divisor-zero guard on idiv/ldiv/irem/lrem.
+    AllowDivByZero,
+    /// Allow `invokestatic` to the five Math.{sqrt,sin,cos,exp,log}(D)D
+    /// intrinsics. Other invoke variants still reject.
+    AllowIntrinsicCalls,
 }
 
 // ---------------------------------------------------------------------
@@ -81,12 +82,12 @@ pub struct GpuKernelAttrs {
 
 impl Default for GpuKernelAttrs {
     fn default() -> Self {
-        // Spec §2.1 defaults.
+        // Spec §2.1 defaults: 0 = "JVM picks the block dimension".
         Self {
             grid: GridShape::Elementwise,
-            block_x: 256,
-            block_y: 1,
-            block_z: 1,
+            block_x: 0,
+            block_y: 0,
+            block_z: 0,
             shared_bytes: 0,
             admit: AdmissionHint::Strict,
         }
@@ -170,13 +171,34 @@ pub fn read_method_annotations(
     out
 }
 
-/// Read the GPU-relevant annotations off a class.
+/// Read the GPU-relevant annotations off a class from its raw
+/// `Attribute` table. Used when the caller only has unparsed
+/// attributes available (e.g. in tests).
 pub fn read_class_annotations(
     class_attributes: &[Attribute],
     cp: &ConstantPool,
 ) -> ClassAnnotations {
     let mut out = ClassAnnotations::default();
     for ann in iter_annotations(class_attributes) {
+        let Some(desc) = cp.get_utf8(ann.type_index) else {
+            continue;
+        };
+        if desc == ENABLE_GPU_ASYNC_DESC {
+            out.enable_async = Some(parse_enable_gpu_async(ann, cp));
+        }
+    }
+    out
+}
+
+/// Read the GPU-relevant annotations off a class given a pre-parsed
+/// `Annotation` slice. Used when the caller has a runtime `Class` in
+/// hand (the classloader stores the annotations pre-parsed there).
+pub fn read_class_annotations_from_parsed(
+    annotations: &[Annotation],
+    cp: &ConstantPool,
+) -> ClassAnnotations {
+    let mut out = ClassAnnotations::default();
+    for ann in annotations {
         let Some(desc) = cp.get_utf8(ann.type_index) else {
             continue;
         };
@@ -258,8 +280,8 @@ fn as_enum_const_name<'a>(value: &'a ElementValue, cp: &'a ConstantPool) -> Opti
 fn parse_grid_shape(value: &ElementValue, cp: &ConstantPool) -> GridShape {
     match as_enum_const_name(value, cp) {
         Some("ELEMENTWISE") => GridShape::Elementwise,
-        Some("TILED") => GridShape::Tiled,
-        Some("CUSTOM") => GridShape::Custom,
+        Some("ROW_PER_THREAD") => GridShape::RowPerThread,
+        Some("BLOCK_REDUCTION") => GridShape::BlockReduction,
         _ => GridShape::default(),
     }
 }
@@ -268,8 +290,8 @@ fn parse_admission_hint(value: &ElementValue, cp: &ConstantPool) -> AdmissionHin
     match as_enum_const_name(value, cp) {
         Some("STRICT") => AdmissionHint::Strict,
         Some("ALLOW_ALLOCATION") => AdmissionHint::AllowAllocation,
-        Some("ALLOW_INVOKE") => AdmissionHint::AllowInvoke,
-        Some("ALLOW_SYNCHRONIZED") => AdmissionHint::AllowSynchronized,
+        Some("ALLOW_DIV_BY_ZERO") => AdmissionHint::AllowDivByZero,
+        Some("ALLOW_INTRINSIC_CALLS") => AdmissionHint::AllowIntrinsicCalls,
         _ => AdmissionHint::default(),
     }
 }
@@ -394,9 +416,10 @@ mod tests {
         assert_eq!(k, GpuKernelAttrs::default());
         assert_eq!(k.grid, GridShape::Elementwise);
         assert_eq!(k.admit, AdmissionHint::Strict);
-        assert_eq!(k.block_x, 256);
-        assert_eq!(k.block_y, 1);
-        assert_eq!(k.block_z, 1);
+        // Spec §2.1: 0 means "JVM picks the block dimension".
+        assert_eq!(k.block_x, 0);
+        assert_eq!(k.block_y, 0);
+        assert_eq!(k.block_z, 0);
         assert_eq!(k.shared_bytes, 0);
         assert!(m.gpu_exclude.is_none());
     }
@@ -423,9 +446,9 @@ mod tests {
         let m = read_method_annotations(&[ria(vec![ann])], &cp);
         let k = m.gpu_kernel.expect("@GpuKernel must be detected");
         assert_eq!(k.admit, AdmissionHint::AllowAllocation);
-        // Untouched fields still take their defaults.
+        // Untouched fields still take their defaults (spec §2.1: 0).
         assert_eq!(k.grid, GridShape::Elementwise);
-        assert_eq!(k.block_x, 256);
+        assert_eq!(k.block_x, 0);
     }
 
     #[test]

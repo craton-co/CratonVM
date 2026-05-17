@@ -81,13 +81,15 @@ fn fixture_exists(class_name: &str) -> bool {
 /// `OffloadCache` API only needs `(class_id, class_name,
 /// method_index, &ClassFileMethod)`, so we don't go through the heavy
 /// `rustjvm_classloading::Class` path.
-fn load_methods(class_name: &str) -> (Vec<ClassFileMethod>, String) {
+fn load_methods(
+    class_name: &str,
+) -> (Vec<ClassFileMethod>, String, rustjvm_reader::ConstantPool) {
     let path = fixture_path(class_name);
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
     let cf = read_class(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-    (cf.methods, cf.this_class)
+    (cf.methods, cf.this_class, cf.constant_pool)
 }
 
 /// Pick the (first) method with a given name. Phase 1 fixtures each
@@ -140,7 +142,7 @@ fn admit_allocation_eligible() {
         eprintln!("[annotations] skipping admit_allocation_eligible: fixture missing");
         return;
     }
-    let (methods, class_name) = load_methods("AdmitAllocation");
+    let (methods, class_name, cp) = load_methods("AdmitAllocation");
     let (_idx, method) = method_by_name(&methods, "doubled");
 
     // PHASE1-GUESS: once Item 3 lands the annotation-aware entry
@@ -164,7 +166,7 @@ fn admit_allocation_eligible() {
     let cache = cache_with_gpu_requested();
     if cache.has_device() {
         // Real GPU attached — should compile and hit.
-        match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, 0, method) {
+        match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, 0, method, &cp) {
             LookupOutcome::Hit(_) => {}
             other => panic!(
                 "expected Hit on GPU box for AdmitAllocation, got {}",
@@ -172,7 +174,7 @@ fn admit_allocation_eligible() {
             ),
         }
     } else {
-        match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, 0, method) {
+        match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, 0, method, &cp) {
             LookupOutcome::Skip => {}
             other => panic!(
                 "expected Skip on no-device box for AdmitAllocation, got {}",
@@ -192,7 +194,7 @@ fn excluded_kernel_blacklisted() {
         eprintln!("[annotations] skipping excluded_kernel_blacklisted: fixture missing");
         return;
     }
-    let (methods, class_name) = load_methods("ExcludedKernel");
+    let (methods, class_name, cp) = load_methods("ExcludedKernel");
     let (idx, method) = method_by_name(&methods, "add");
 
     let cache = cache_with_gpu_requested();
@@ -200,7 +202,7 @@ fn excluded_kernel_blacklisted() {
     // `lookup_or_compile`. Pre-landing, this assertion will fail
     // because the no-device fast path returns Skip first; that is
     // exactly what the `#[ignore]` is for.
-    match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, idx, method) {
+    match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, idx, method, &cp) {
         LookupOutcome::Blacklisted => {}
         other => panic!(
             "expected Blacklisted for @GpuExclude method, got {}",
@@ -220,11 +222,11 @@ fn excluded_and_kernel_exclude_wins() {
         );
         return;
     }
-    let (methods, class_name) = load_methods("ExcludedAndKernel");
+    let (methods, class_name, cp) = load_methods("ExcludedAndKernel");
     let (idx, method) = method_by_name(&methods, "add");
 
     let cache = cache_with_gpu_requested();
-    match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, idx, method) {
+    match cache.lookup_or_compile(TEST_CLASS_ID, &class_name, idx, method, &cp) {
         LookupOutcome::Blacklisted => {}
         other => panic!(
             "expected Blacklisted: @GpuExclude must take priority over @GpuKernel; got {}",
@@ -244,7 +246,7 @@ fn warmup_class_compiles_two() {
         eprintln!("[annotations] skipping warmup_class_compiles_two: fixture missing");
         return;
     }
-    let (_methods, _class_name) = load_methods("WarmupTwo");
+    let (_methods, _class_name, _cp) = load_methods("WarmupTwo");
 
     let cache = cache_with_gpu_requested();
     if !cache.has_device() {
@@ -281,7 +283,7 @@ fn strict_rejects_allocation() {
         );
         return;
     }
-    let (methods, _class_name) = load_methods("StrictRejectsAllocation");
+    let (methods, _class_name, _cp) = load_methods("StrictRejectsAllocation");
     let (_idx, method) = method_by_name(&methods, "doubled");
 
     // PHASE1-GUESS: the annotation-aware analyzer must observe a
