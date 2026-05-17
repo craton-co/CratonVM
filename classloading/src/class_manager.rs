@@ -1536,6 +1536,32 @@ impl ClassManager {
             },
         )?;
 
+        // Round-2 fix (CRIT): also force-decode method- and field-level
+        // LazyAttributes. Without this, `ClassFileMethod::code()` /
+        // `ClassFileField::constant_value_index()` return None for all
+        // production-loaded classes (they only return Some on
+        // `LazyAttribute::Decoded`), which silently disables the bytecode
+        // verifier and breaks interp/JIT method-dispatch fallback.
+        // The lazy-attribute win was a measurement mistake: methods/fields
+        // are universally accessed at class-link time, so deferring decode
+        // saves nothing. Decode eagerly at load.
+        for method in class_file.methods.iter_mut() {
+            force_decode_all(&mut method.attributes, &class_file.constant_pool).map_err(
+                |e| VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: name.to_string(),
+                    message: format!("method '{}' attribute decode failed: {e}", method.name),
+                }),
+            )?;
+        }
+        for field in class_file.fields.iter_mut() {
+            force_decode_all(&mut field.attributes, &class_file.constant_pool).map_err(
+                |e| VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: name.to_string(),
+                    message: format!("field '{}' attribute decode failed: {e}", field.name),
+                }),
+            )?;
+        }
+
         // WP2.3: Class-name match check. If the caller asked for class
         // `name` but the class file's `this_class` says something
         // else, the JVMS requires a `NoClassDefFoundError`
