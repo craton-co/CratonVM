@@ -63,32 +63,53 @@ pub enum RegionType {
 /// Stored as a set of (source_region_index, card_offset) pairs. This is a
 /// simplified hash-set RSet — production G1 uses a multi-level structure
 /// (sparse → fine → coarse) for space efficiency.
-#[derive(Debug, Default, Clone)]
+///
+/// Round-9 gc CRIT-8 (post_write_barrier_rset hot path): `sources` lives
+/// behind a `parking_lot::Mutex` so that `add_reference` takes `&self`
+/// and can be called from the per-thread cache fast path in
+/// `G1Collector::post_write_barrier_rset` without re-acquiring the
+/// heap-wide `regions` mutex. The Vec backing the G1 regions is created
+/// once with all entries and never reallocated, so a cached `*const
+/// G1Region` (and therefore `*const RememberedSet`) is stable for the
+/// lifetime of the mutator phase.
+#[derive(Debug, Default)]
 pub struct RememberedSet {
     /// Set of (source_region_index) that have references into this region.
     /// T10.9.B: FxHashSet — source region indices are internal.
-    sources: FxHashSet<usize>,
+    ///
+    /// `parking_lot::Mutex` is uncontended-fast and lets the write
+    /// barrier mutate via `&self`. The RSet for any given target
+    /// region is only contended when many mutator threads
+    /// simultaneously store cross-region refs whose target happens to
+    /// land in that one region — a low-frequency case compared with
+    /// per-thread same-region successive stores (handled by the
+    /// caller's TLS pointer cache without touching this mutex at all).
+    sources: parking_lot::Mutex<FxHashSet<usize>>,
 }
 
 impl RememberedSet {
     /// Record that `source_region` has a reference into this region.
-    pub fn add_reference(&mut self, source_region: usize) {
-        self.sources.insert(source_region);
+    pub fn add_reference(&self, source_region: usize) {
+        self.sources.lock().insert(source_region);
     }
 
     /// Clear the remembered set.
-    pub fn clear(&mut self) {
-        self.sources.clear();
+    pub fn clear(&self) {
+        self.sources.lock().clear();
     }
 
     /// Number of distinct source regions.
     pub fn source_count(&self) -> usize {
-        self.sources.len()
+        self.sources.lock().len()
     }
 
-    /// Iterate over source region indices.
-    pub fn sources(&self) -> impl Iterator<Item = usize> + '_ {
-        self.sources.iter().copied()
+    /// Snapshot the source region indices.
+    ///
+    /// Returns an owned `Vec` so the caller does not need to hold the
+    /// internal mutex across iteration (and so the signature does not
+    /// leak a `MutexGuard` lifetime).
+    pub fn sources(&self) -> Vec<usize> {
+        self.sources.lock().iter().copied().collect()
     }
 }
 

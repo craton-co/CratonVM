@@ -49,8 +49,12 @@ use rustjvm_types::error::{MethodCallResult};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectRef, Value};
 
+// Round-9 MED-3: migrated `SEED_TABLE` from `std::sync::RwLock` to
+// `parking_lot::RwLock` — removes poison handling (which the file already
+// drained with `unwrap_or_else(into_inner)`) and matches the doc comment that
+// already claimed parking-lot semantics.
 use rustc_hash::FxHashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
 // OS entropy helpers
@@ -176,7 +180,8 @@ fn scramble_seed(user_seed: i64) -> u64 {
 static SEED_TABLE: RwLock<Option<FxHashMap<usize, u64>>> = RwLock::new(None);
 
 fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, u64>) -> R) -> R {
-    let mut g = SEED_TABLE.write().unwrap_or_else(|e| e.into_inner());
+    // Round-9 MED-3: parking_lot — no poison handling.
+    let mut g = SEED_TABLE.write();
     if g.is_none() {
         *g = Some(FxHashMap::default());
     }

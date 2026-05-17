@@ -17,13 +17,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// Round-7 HIGH-1 fix: migrated `SharedResolutionState`'s three RwLocks
-// (`global_methods`, `global_fields`, `promoted_invokes`) from
-// `std::sync::RwLock` to `parking_lot::RwLock` to drop the
-// pthread_rwlock + poisoning overhead — every other workspace lock is
-// already `parking_lot`. (Original comment said "four"; the fourth was
-// folded into a sibling struct during the round-7 cleanup and never
-// existed in this file as landed — round-8 Bug 7 doc fix.)
+// Round-9 MED-1: doc cleanup. `SharedResolutionState` below holds three
+// `parking_lot::RwLock` maps (`global_methods`, `global_fields`,
+// `promoted_invokes`); the struct definition at the bottom of this file is the
+// source of truth. parking_lot drops the pthread_rwlock + poisoning overhead
+// that the std lock would impose — every other workspace lock is already
+// parking_lot.
 use parking_lot::RwLock;
 
 use super::fx_collections::{fx_hashmap, FxBuildHasher, FxHashMap, FxHasher};

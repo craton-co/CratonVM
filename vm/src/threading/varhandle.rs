@@ -371,7 +371,8 @@ impl AtomicOperations {
                 heap slot; use `NativeContext::compare_and_swap_value` or an \
                 atomic ref into the heap instead. See round-9 CRIT-3."
     )]
-    pub fn compare_and_set_int(
+    #[cfg(test)]
+    pub(crate) fn compare_and_set_int(
         current: i32,
         expected: i32,
         new_value: i32,
@@ -383,8 +384,13 @@ impl AtomicOperations {
         // We retain the algebra for the in-file unit tests so the deprecation
         // is visible at compile time without breaking the existing test
         // surface; production callers should never reach this code.
-        debug_assert!(
-            std::thread::panicking() || cfg!(test),
+        //
+        // Round-9 CRIT-3 follow-up: the function is now `#[cfg(test)]` +
+        // `pub(crate)` so it cannot be reached from any production build,
+        // and the runtime guard is a hard panic (not a debug_assert) for
+        // belt-and-braces against future test scaffolding that misuses it.
+        assert!(
+            cfg!(test),
             "AtomicOperations::compare_and_set_int called outside tests — \
              this helper does not publish; see round-9 CRIT-3."
         );
@@ -402,15 +408,16 @@ impl AtomicOperations {
         note = "operates on a stack-local AtomicI32 and never publishes to the \
                 heap slot; use `NativeContext::compare_and_swap_value` instead."
     )]
-    pub fn compare_and_exchange_int(
+    #[cfg(test)]
+    pub(crate) fn compare_and_exchange_int(
         current: i32,
         expected: i32,
         new_value: i32,
         success: Ordering,
         failure: Ordering,
     ) -> i32 {
-        debug_assert!(
-            std::thread::panicking() || cfg!(test),
+        assert!(
+            cfg!(test),
             "AtomicOperations::compare_and_exchange_int called outside tests — \
              this helper does not publish; see round-9 CRIT-3."
         );
@@ -459,14 +466,15 @@ impl AtomicOperations {
                 heap slot; use `NativeContext::compare_and_swap_value` instead. \
                 See round-9 CRIT-3."
     )]
-    pub fn compare_and_set_long(
+    #[cfg(test)]
+    pub(crate) fn compare_and_set_long(
         current: i64,
         expected: i64,
         new_value: i64,
         ordering: Ordering,
     ) -> (bool, i64) {
-        debug_assert!(
-            std::thread::panicking() || cfg!(test),
+        assert!(
+            cfg!(test),
             "AtomicOperations::compare_and_set_long called outside tests — \
              this helper does not publish; see round-9 CRIT-3."
         );
@@ -484,15 +492,16 @@ impl AtomicOperations {
         note = "operates on a stack-local AtomicI64 and never publishes to the \
                 heap slot; use `NativeContext::compare_and_swap_value` instead."
     )]
-    pub fn compare_and_exchange_long(
+    #[cfg(test)]
+    pub(crate) fn compare_and_exchange_long(
         current: i64,
         expected: i64,
         new_value: i64,
         success: Ordering,
         failure: Ordering,
     ) -> i64 {
-        debug_assert!(
-            std::thread::panicking() || cfg!(test),
+        assert!(
+            cfg!(test),
             "AtomicOperations::compare_and_exchange_long called outside tests — \
              this helper does not publish; see round-9 CRIT-3."
         );

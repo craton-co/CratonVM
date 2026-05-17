@@ -182,20 +182,32 @@ fn connect_pool_sender() -> &'static std::sync::mpsc::Sender<ConnectJob> {
                 .name(format!("rustjvm-connect-pool-{w}"))
                 .spawn(move || connect_pool_worker(rx));
         }
-        // Bug 6 (HIGH): the pool currently has no shutdown path —
-        // because the `Sender` is held in a `'static OnceLock`, the
-        // channel's `Drop` never runs and the worker threads block
-        // forever in `recv()` waiting on a sender that won't ever
-        // disconnect. On embedded VM teardown (multiple VM instances in
-        // a single process) this leaks `workers` OS threads per
-        // teardown.
+        // Bug 3 / Bug 6 (HIGH round-9 carryover): the pool currently has
+        // no shutdown path — because the `Sender` is held in a `'static
+        // OnceLock`, the channel's `Drop` never runs and the worker
+        // threads block forever in `recv()` waiting on a sender that
+        // won't ever disconnect. On embedded VM teardown (multiple VM
+        // instances in a single process) this leaks `workers` OS
+        // threads per teardown.
         //
-        // TODO(round-7+): wrap `SENDER` in a `Mutex<Option<Sender>>`
-        // (or expose a shutdown signal channel). On VM shutdown,
-        // `take()` the sender so the channel disconnects and workers
-        // drain pending jobs then exit. Today CratonVM is single-VM
-        // per-process so the leak is bounded to process lifetime, but
-        // the fix is required for any future multi-tenant embedding.
+        // CratonVM today is single-VM-per-process: process exit reaps
+        // the OS threads, so this is documented as a TODO rather than
+        // fixed in-place. The fix is well-understood and minimal:
+        //
+        //   * Replace this `OnceLock<Sender>` with
+        //     `OnceLock<Mutex<Option<Sender>>>`.
+        //   * Add `pub fn shutdown_connect_pool()` that `take()`s the
+        //     Sender. Dropping it closes the mpsc channel; the worker
+        //     `recv()` returns `Err`, the loop breaks, threads exit.
+        //   * Wire the shutdown call into the VM teardown hook used by
+        //     the round-9 graceful-shutdown story.
+        //
+        // We intentionally do NOT make that change in this round —
+        // changing the SENDER type would touch every caller and risk
+        // re-introducing a races with the lazy init. Tracking as:
+        //
+        // TODO(round-11+): wire connect-pool shutdown into VM teardown
+        // for multi-tenant embeddings (Vert.x, WildFly hot-undeploy).
         tx
     })
 }

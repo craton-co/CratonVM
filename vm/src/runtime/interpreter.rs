@@ -2105,8 +2105,12 @@ pub fn execute(
                             class_name_arc, method_name_arc, descriptor_arc,
                         );
                         let mut jfr = shared.flight_recorder.lock();
-                        rustjvm_jfr::builtin::emit_compilation_event(
-                            &mut jfr, buf.as_str(),
+                        // Round-9 HIGH-5: convert the scratch buffer to an
+                        // `Arc<str>` once and pass it to the `_arc` variant so
+                        // the emit path doesn't re-do `Arc::from(&str)`.
+                        let method_arc: Arc<str> = Arc::from(buf.as_str());
+                        rustjvm_jfr::builtin::emit_compilation_event_arc(
+                            &mut jfr, method_arc,
                             1, // compile_id
                             2, // tier (C2-equivalent)
                             true, // success
@@ -2250,15 +2254,42 @@ pub fn execute(
                     // returns; without this hoist, the flag would leak to the
                     // next unrelated JIT helper call. The drain runs before any
                     // normal-return path so the NPE surfaces at the right method.
-                    if crate::jit::helpers::take_jit_pending_npe() {
-                        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    //
+                    // Round-9/10 HIGH fix: route the NPE through the JIT'd
+                    // method's exception table instead of throwing it past
+                    // the method boundary. Building a real
+                    // java/lang/NullPointerException object and stashing it
+                    // into `jit_early_exception` reuses the existing
+                    // post-frame-push routing at ~line 2340, which calls
+                    // `find_exception_handler_any_pc` against the about-to-be-
+                    // pushed frame. Without this, an in-method
+                    // `try { ... } catch (NullPointerException npe) { ... }`
+                    // surrounding a JIT'd null-array store would silently
+                    // bubble the NPE to the caller instead of running the
+                    // catch block. The `InternalError` fallback handles the
+                    // rt.jar-not-loaded boot path (no NPE class yet).
+                    let npe_routed = if crate::jit::helpers::take_jit_pending_npe() {
+                        match crate::runtime::exceptions::throw_runtime_error(
+                            shared,
+                            thread,
                             RuntimeError::NullPointerException { message: None },
-                        )));
-                    }
+                        ) {
+                            MethodCallFailed::ExceptionThrown(exc) => {
+                                jit_early_exception = Some(exc);
+                                true
+                            }
+                            other => return Err(other),
+                        }
+                    } else {
+                        false
+                    };
                     // Deopt sentinel: i64::MIN means the JIT method was deoptimized
                     // via jit_uncommon_trap.  Fall through to the interpreter to
                     // re-execute the method from scratch.
-                    if result != i64::MIN {
+                    // If an NPE was routed above, also fall through so the
+                    // post-frame-push exception handler walker (~line 2340)
+                    // gets a chance to catch it in the JIT'd method.
+                    if !npe_routed && result != i64::MIN {
                     return match ret_type {
                         // Cast: JIT ABI -- i64 register convention
                         b'I' | b'Z' | b'B' | b'C' | b'S' => Ok(Some(Value::Int(result as i32))),
@@ -6768,8 +6799,14 @@ fn execute_instruction(
                         };
                         if let Some(class_name) = static_name {
                             // Best-effort detailMessage extraction (slot 1
-                            // per Throwable layout). Use an empty
-                            // Arc<str> on miss to avoid extra work.
+                            // per Throwable layout). Round-5 HIGH-4 fix
+                            // (2026-05-17): cache the empty-message Arc<str>
+                            // in a `OnceLock` so the no-detail path is a
+                            // refcount bump instead of an allocation.
+                            static EMPTY_MSG: std::sync::OnceLock<Arc<str>> =
+                                std::sync::OnceLock::new();
+                            let empty_msg =
+                                EMPTY_MSG.get_or_init(|| Arc::from(""));
                             let message: Arc<str> = match shared.heap.get_field(obj_ref, 1) {
                                 Value::Object(Some(msg_ref)) => {
                                     Arc::from(
@@ -6777,7 +6814,7 @@ fn execute_instruction(
                                             .unwrap_or_default(),
                                     )
                                 }
-                                _ => Arc::from(""),
+                                _ => Arc::clone(empty_msg),
                             };
                             let now_ns = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -11523,7 +11560,52 @@ fn try_osr(
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
-        crate::jit::helpers::stash_jit_pending_npe();
+        // Round-9/10 HIGH fix: route the NPE through the OSR'd method's
+        // own exception table before falling back to the re-stash. The
+        // OSR target IS the method whose code raised the NPE, so the
+        // current frame's exception table is exactly the one that
+        // should be searched. If we find a typed handler whose
+        // `[start_pc, end_pc)` range covers `entry_pc` (our best-known
+        // throw site — the back-edge OSR entry, which dominates the
+        // failing helper call), we jump the interpreter PC there and
+        // resume in the catch block by returning `None` (OSR rejected;
+        // continue interpreting the same frame at its new PC).
+        //
+        // The re-stash fallback (no in-frame handler found) preserves
+        // the round-9 invariant that the NPE survives the
+        // OSR→interpreter handoff and gets surfaced by the next JIT
+        // helper return drain (~line 2253 / ~12723) so it does not
+        // disappear silently.
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::NullPointerException { message: None },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
+                    shared,
+                    &thread.frames[frame_idx],
+                    entry_pc,
+                    exc,
+                ) {
+                    let frame = &mut thread.frames[frame_idx];
+                    frame.stack.clear();
+                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
+                    frame.pc = handler_pc;
+                    fire_jvmti_exception_catch(frame, handler_pc);
+                    return None;
+                }
+                // No in-frame handler — fall back to re-stash so the
+                // NPE is not lost across the OSR→interpreter handoff.
+                crate::jit::helpers::stash_jit_pending_exception(exc);
+            }
+            _ => {
+                // Couldn't construct a Java NPE object (e.g. rt.jar not
+                // loaded) — re-stash the raw flag as before so the next
+                // JIT drain still surfaces it.
+                crate::jit::helpers::stash_jit_pending_npe();
+            }
+        }
         return None;
     }
     if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
@@ -12274,10 +12356,16 @@ pub fn try_jit_compile_callee(
             .unwrap_or_default()
             .as_nanos() as u64; // Cast: duration to u64 nanoseconds
         let mut jfr = shared.flight_recorder.lock();
-        let method_desc = format!("{}::{}{}", cached.class_name, cached.method_name, cached.method_descriptor);
-        rustjvm_jfr::builtin::emit_compilation_event(
+        // Round-9 HIGH-5: build the Arc<str> once and hand ownership to the
+        // `_arc` variant instead of letting `emit_compilation_event` reallocate
+        // a fresh Arc from `&str` internally.
+        let method_desc: Arc<str> = Arc::from(format!(
+            "{}::{}{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        ));
+        rustjvm_jfr::builtin::emit_compilation_event_arc(
             &mut jfr,
-            &method_desc,
+            method_desc,
             1,     // compile_id
             4,     // compile_level (C2 equivalent)
             true,  // succeeded
@@ -12720,10 +12808,29 @@ fn execute_jit_call(
     // surfacing the NPE at the wrong PC / wrong method. The drain must
     // happen before *any* normal-return early-return. If a void-return
     // store helper set the flag, we surface the NPE here.
+    //
+    // Round-9/10 HIGH fix: route the NPE through the JIT'd method's
+    // exception table (mirroring the `take_jit_pending_exception` path
+    // above) so an in-method `catch (NullPointerException ...)` actually
+    // observes the throw. Without this, a try/catch wrapped around a
+    // JIT'd null-array store would silently propagate the NPE past the
+    // catch and surface it in the caller. `usize::MAX` for `throw_pc`
+    // means the routing function skips catch-all (`finally`) entries
+    // (which can't safely match without a known PC) but still matches
+    // typed handlers by exception class.
     if crate::jit::helpers::take_jit_pending_npe() {
-        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
             RuntimeError::NullPointerException { message: None },
-        )));
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                return route_jit_exception_through_method(
+                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                );
+            }
+            other => return Err(other),
+        }
     }
 
     // Deopt sentinel: i64::MIN means the method was deoptimized — fall through

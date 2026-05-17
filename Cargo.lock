@@ -1931,6 +1931,7 @@ dependencies = [
 name = "rustjvm-native-collections"
 version = "0.2.0"
 dependencies = [
+ "parking_lot",
  "rustjvm-native-api",
  "rustjvm-types",
 ]

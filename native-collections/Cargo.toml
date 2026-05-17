@@ -16,6 +16,7 @@ synthetic-jdk = []
 [dependencies]
 rustjvm-types = { path = "../types" }
 rustjvm-native-api = { path = "../native-api" }
+parking_lot.workspace = true
 
 [lints]
 workspace = true

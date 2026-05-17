@@ -526,8 +526,12 @@ fn lk_define_hidden_class_with_class_data(
 // Concurrent access is rare (one entry per hidden class), so a Mutex-
 // guarded HashMap is sufficient — no contention concerns.
 
+// Round-9 MED-2: migrated `class_data_store` from `std::sync::Mutex` to
+// `parking_lot::Mutex` — removes poison handling and yields a smaller, faster
+// lock. The map is keyed by `ClassId` (a `u32`), which is GC-stable, so no
+// further key change is required.
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 fn class_data_store() -> &'static Mutex<HashMap<u32, ObjectRef>> {
     static STORE: std::sync::OnceLock<Mutex<HashMap<u32, ObjectRef>>> =
@@ -536,9 +540,7 @@ fn class_data_store() -> &'static Mutex<HashMap<u32, ObjectRef>> {
 }
 
 fn store_class_data(cid: rustjvm_types::ClassId, data: ObjectRef) {
-    let mut g = class_data_store()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut g = class_data_store().lock();
     g.insert(cid.as_u32(), data);
 }
 
@@ -549,7 +551,6 @@ fn store_class_data(cid: rustjvm_types::ClassId, data: ObjectRef) {
 pub fn get_class_data(cid: rustjvm_types::ClassId) -> Option<ObjectRef> {
     class_data_store()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
         .get(&cid.as_u32())
         .copied()
 }

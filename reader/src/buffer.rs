@@ -166,9 +166,16 @@ mod tests {
 
     /// Regression: `read_bytes` / `skip` must NOT panic or silently
     /// succeed when `position + count` overflows `usize`.  This is the
-    /// `usize::MAX - 1` + `count == 2` corner case called out by the
+    /// `usize::MAX - 1` + `count == 3` corner case called out by the
     /// round-7 audit (MED #7) — `checked_add` returns `None`, which
     /// we map to `UnexpectedEndOfData` instead of wrapping.
+    ///
+    /// Round-9 fix (CRIT-3): the previous version of this test used
+    /// `count == 2`, which yields `pos + count == usize::MAX` — a
+    /// valid (non-overflowing) `checked_add` result that then fails
+    /// the *bounds* check, not the *overflow* check.  Using `count == 3`
+    /// makes `pos + count` actually overflow so we exercise the
+    /// `checked_add` path the comment claims to test.
     #[test]
     fn read_bytes_overflow_returns_error() {
         let data = [0u8; 4];
@@ -178,11 +185,12 @@ mod tests {
         // bounds check below would also fail — but `checked_add` MUST
         // fire FIRST so that `pos + count` never wraps to a small `end`.
         buf.position = usize::MAX - 1;
-        assert!(buf.read_bytes(2).is_err());
+        // pos + 3 overflows usize::MAX → checked_add returns None.
+        assert!(matches!(buf.read_bytes(3), Err(_)));
         // `read_bytes` failure leaves position untouched so the next
         // call observes the same overflow.
         assert_eq!(buf.position(), usize::MAX - 1);
-        assert!(buf.skip(2).is_err());
+        assert!(matches!(buf.skip(3), Err(_)));
         assert_eq!(buf.position(), usize::MAX - 1);
     }
 }

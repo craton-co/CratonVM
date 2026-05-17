@@ -1991,7 +1991,18 @@ fn register_object_input(r: &mut NativeMethodRegistry) {
     // surfaced through `Object readObject() throws ClassNotFoundException`.
     // Return null so downstream `if (obj == null) { ... fallback ... }`
     // branches fire instead of unwinding through the interface default.
-    // TODO: implement deserialization for at least String/Integer/Long primitives.
+    //
+    // Round-9 MED-9 follow-up: a real primitive-aware deserializer lives on
+    // `ObjectInputStream` (concrete subclass), where `ois_read_value` /
+    // `ois_read_object` decode `TC_STRING`/`TC_OBJECT` for String, Integer,
+    // Long and friends — see :860-987 in this file. That path is only
+    // reachable when the call lands on the concrete `ObjectInputStream`
+    // override; here we are the bare interface default with no backing
+    // stream pointer in `args[0]` to drive a decode. Returning null is
+    // therefore the only correct behaviour at this layer: any caller that
+    // expected real bytes already dispatched virtually to the OIS subclass
+    // before reaching this default. Verified safe for JNDI bootstrap which
+    // null-checks the return value (InitialContext.getURLOrDefaultInitCtx).
     r.register(cls, "readObject", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });

@@ -34,6 +34,7 @@ use crate::class::{
 };
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
+    BUILTIN_LOADER_DELEGATION_CHAIN,
 };
 use crate::module::{
     descriptor_from_module_attribute, package_of, packages_from_module_packages_attribute,
@@ -72,11 +73,12 @@ impl<'a> ClassStoreHierarchy<'a> {
         // insert side, where callers already hold an `Arc<str>` and only
         // need a refcount bump.
         let probe: Arc<str> = Arc::from(name);
-        for loader_id in &[
-            ClassLoaderId::Bootstrap,
-            ClassLoaderId::Extension,
-            ClassLoaderId::Application,
-        ] {
+        // Round 9 audit fix (HIGH #6): iterate over the canonical
+        // `BUILTIN_LOADER_DELEGATION_CHAIN` constant instead of re-inlining
+        // the same 3-element array (Bootstrap, Extension, Application).
+        // Adding a new built-in loader (e.g. JEP-261 platform loader) now
+        // only requires editing the constant in `loaders.rs`.
+        for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
             if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
                 return Some(id);
             }
@@ -1188,11 +1190,10 @@ impl ClassManager {
         // Probe the three built-in loaders first with a single Arc
         // allocation (refcount-shared across all three lookups).
         let probe: Arc<str> = Arc::from(name);
-        for loader_id in &[
-            ClassLoaderId::Bootstrap,
-            ClassLoaderId::Extension,
-            ClassLoaderId::Application,
-        ] {
+        // Round 9 audit fix (HIGH #6): iterate over the canonical
+        // `BUILTIN_LOADER_DELEGATION_CHAIN` constant rather than re-inlining
+        // the (Bootstrap, Extension, Application) array.
+        for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
             if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
                 return Some(id);
             }
@@ -2986,33 +2987,31 @@ impl ClassManager {
         &self,
         class_id: ClassId,
     ) -> Arc<std::sync::atomic::AtomicU8> {
-        // Fast path: read lock + clone existing Arc if present. Round-8
-        // CRIT fix: this lock is `parking_lot::RwLock`, so the uncontended
-        // shared-read acquire is a single CAS (no poison check, no futex
-        // syscall, no `Result` unwrap). The overwhelming majority of
-        // dispatches hit this branch because every class an app actually
-        // touches gets a handle entry created the first time
-        // `ensure_class_initialized` runs against it, and the entry is
-        // never removed.
+        // Round-9 classloading CRIT-1 fix (audit `round9-classloading-reader.md`):
+        // probe the per-`Class` embedded `init_state` Arc FIRST — that path
+        // takes no `init_states` lock at all and is the canonical home of
+        // the AtomicU8 fast-path cache. The previous order probed the
+        // side-table first, which made the embedded atomic dead code for
+        // every real class (every class touched during init had a
+        // side-table entry auto-populated by `set_class_init_state`, so
+        // the side-table branch always won).
         //
-        // Round 8 audit fix (CRIT #4): side-table is consulted first
-        // for back-compat (any handle minted before the Class was
-        // registered into the store must remain the canonical one).
-        // If no side-table entry exists, return the per-`Class`
-        // embedded `init_state: Arc<AtomicU8>` — this is the new
-        // canonical fast-path home and avoids the RwLock + FxHashMap
-        // probe entirely for the common case.
+        // The side-table is now SECONDARY: it backs only synthetic /
+        // pre-registration classes for which no `Class` instance lives in
+        // the `class_store`. Those are rare (a handful of early-boot
+        // bootstrap stubs); the steady-state hot path skips the
+        // `init_states` lock entirely.
+        if let Some(class) = self.class_store.get(class_id) {
+            return Arc::clone(&class.init_state);
+        }
+        // Fallback: synthetic class with no `Class` entry. Use the
+        // side-table. Read-lock fast path; write-lock insert on miss.
         {
             let guard = self.init_states.read();
             if let Some(handle) = guard.get(&class_id) {
                 return Arc::clone(handle);
             }
         }
-        if let Some(class) = self.class_store.get(class_id) {
-            return Arc::clone(&class.init_state);
-        }
-        // Slow path: upgrade to write lock and insert. Re-check inside
-        // the lock to handle a sibling thread racing the same insert.
         let mut guard = self.init_states.write();
         Arc::clone(
             guard
@@ -3030,7 +3029,20 @@ impl ClassManager {
     /// UNINITIALIZED so the fast path falls through to the slow path,
     /// which reports the error). `Release` ordering pairs with
     /// `Acquire` reads on the fast path.
+    ///
+    /// Round-9 classloading CRIT-1 fix: write directly to the per-`Class`
+    /// embedded atomic when the `Class` exists (the common case). Only
+    /// fall back to the side-table for synthetic / pre-registration
+    /// classes with no `Class` entry. This stops auto-populating the
+    /// side-table for every real class — which was the bug that made
+    /// the embedded `init_state: Arc<AtomicU8>` dead code on the hot
+    /// `class_init_state_handle` fast path.
     pub fn set_class_init_state(&self, class_id: ClassId, state: u8) {
+        if let Some(class) = self.class_store.get(class_id) {
+            class.init_state.store(state, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        // Synthetic / pre-registration class: route through the side-table.
         let handle = self.class_init_state_handle(class_id);
         handle.store(state, std::sync::atomic::Ordering::Release);
     }
@@ -3816,12 +3828,11 @@ impl ClassManager {
             vec![slash, dot]
         };
 
-        // Built-in loaders probed first (parent-delegation order).
-        const BUILTIN_LOADERS: &[ClassLoaderId] = &[
-            ClassLoaderId::Bootstrap,
-            ClassLoaderId::Extension,
-            ClassLoaderId::Application,
-        ];
+        // Round 9 audit fix (HIGH #6): use the canonical
+        // `BUILTIN_LOADER_DELEGATION_CHAIN` constant instead of the
+        // (now-deleted) inline `BUILTIN_LOADERS` array. Parent-delegation
+        // order is encoded in the constant: Bootstrap → Extension →
+        // Application.
 
         for key in &keys {
             // Round 8 audit fix (HIGH #6): route through `intern_arc` so
@@ -3833,7 +3844,7 @@ impl ClassManager {
             // through to a full `str` comparison on every loader-tuple
             // lookup.
             let arc_key: Arc<str> = rustjvm_types::intern_arc(key.as_str());
-            for loader_id in BUILTIN_LOADERS {
+            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
                 if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
                     if let Some(class) = self.get_class(id) {
                         if class.hidden {

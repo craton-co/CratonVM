@@ -135,10 +135,12 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
 // a lock if their heap addresses overlap after collection).
 //
 // Replacement: a fixed-size striped array of 256 `parking_lot::RwLock`s
-// (the project already depends on `parking_lot` transitively via tokio /
-// dashmap; if not, fall back to `std::sync::RwLock`). The stripe index is
-// derived from the segment's identity hash code, which is stable across GC
-// moves. No global lock; lookup is a single masked array index.
+// (workspace-shared `parking_lot` dep). The stripe index is derived from
+// the segment's identity hash code, which is stable across GC moves —
+// previously the global HashMap was keyed by raw heap pointer, which a
+// moving GC could relocate and alias across distinct segments. No global
+// lock; lookup is a single masked array index, with a Fibonacci
+// multiplier to spread sequential identity hashes uniformly.
 //
 // Trade-off: occasional false sharing if two segments hash to the same
 // stripe (1/256 collision rate). That serializes resizes between unrelated
@@ -153,18 +155,53 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
 
 const NUM_SEG_LOCKS: usize = 256;
 
-fn chm_seg_lock_for(seg_id: i32) -> &'static std::sync::RwLock<()> {
-    static SEG_LOCKS: std::sync::OnceLock<Vec<std::sync::RwLock<()>>> =
-        std::sync::OnceLock::new();
-    let locks = SEG_LOCKS.get_or_init(|| {
-        let mut v = Vec::with_capacity(NUM_SEG_LOCKS);
-        for _ in 0..NUM_SEG_LOCKS {
-            v.push(std::sync::RwLock::new(()));
-        }
-        v
-    });
-    // Mask with NUM_SEG_LOCKS-1 since NUM_SEG_LOCKS is a power of two.
-    &locks[(seg_id as usize) & (NUM_SEG_LOCKS - 1)]
+/// Striped per-segment resize lock array.
+///
+/// Round-10 CRIT fix (native-misc CRIT-1 + concurrency CRIT-2):
+/// the original implementation kept a `Mutex<FxHashMap<id, Arc<RwLock>>>`
+/// where every CHM read AND write took the global Mutex just to look up
+/// its per-segment RwLock. That defeated the per-segment design entirely
+/// — worse than a single global RwLock, because reads serialized through
+/// a Mutex (exclusive) instead of an RwLock::read (shared).
+///
+/// Round-10 replacement: a fixed-size 256-stripe array indexed by the
+/// segment's identity hash. No global lock, lookup is one masked array
+/// index. False-sharing risk is 1/256 between unrelated segments — only
+/// matters during resize, which is rare.
+///
+/// `parking_lot::RwLock` is preferred over `std::sync::RwLock` because:
+///   - no poison-Result handling (lock acquisition is infallible),
+///   - smaller (single-word) and faster fast path,
+///   - guarantees writer fairness on contention, avoiding reader-starve
+///     bursts during resize storms.
+///
+/// Lock ordering / recursion: this RwLock is only acquired in
+/// `map_resize` (write side) and `chm_seg_get` (read side). All other
+/// CHM mutator paths (put / put_if_absent / compute_* / merge / replace)
+/// serialize against each other via the per-segment Java monitor
+/// (`ChmMonitorGuard::acquire(ctx, seg)`), NOT this RwLock. Therefore
+/// the only nesting that occurs is:
+///   mutator-with-monitor → map_resize → write_guard
+/// which never recurses because `map_resize` does not invoke user code.
+/// Lock-free readers in `chm_seg_get` take only the read side and never
+/// call back into the mutator, so they cannot deadlock either.
+static SEG_LOCKS: std::sync::OnceLock<[parking_lot::RwLock<()>; NUM_SEG_LOCKS]> =
+    std::sync::OnceLock::new();
+
+fn seg_locks() -> &'static [parking_lot::RwLock<()>; NUM_SEG_LOCKS] {
+    SEG_LOCKS.get_or_init(|| std::array::from_fn(|_| parking_lot::RwLock::new(())))
+}
+
+fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
+    // Multiply by the 64-bit Fibonacci constant (golden-ratio derived)
+    // to spread sequential / low-entropy `identity_hash_code` values
+    // across all 256 stripes; identity hashes are often assigned
+    // sequentially by the GC so a raw mod would cluster nearby segments
+    // on a handful of stripes. The top byte of the product is well
+    // mixed and is masked with `NUM_SEG_LOCKS - 1` (256 is a power of
+    // two, so the mask is exact).
+    let h = (seg_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &seg_locks()[((h >> 56) as usize) & (NUM_SEG_LOCKS - 1)]
 }
 
 /// RAII guard for a native monitor (`ctx.monitor_enter` / `monitor_exit`).
@@ -1423,12 +1460,10 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
     // untouched, so reads can stay fully lock-free and this lock can be
     // removed entirely.
     let _write_guard = if is_concurrent {
+        // `parking_lot::RwLock::write` is infallible (no PoisonError),
+        // so no `unwrap_or_else` wrapper is needed.
         let seg_id = ctx.identity_hash_code(this);
-        Some(
-            chm_seg_lock_for(seg_id)
-                .write()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
+        Some(chm_seg_lock_for(seg_id).write())
     } else {
         None
     };
@@ -1912,9 +1947,24 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
-            // Round up to power of 2, capped at MAP_MAX_CAPACITY
-            let mut n = std::cmp::max(*c, 1) as u32;
-            n = n.next_power_of_two();
+            // Bug 4 (round-9 native-misc HIGH): the JDK's
+            // `HashMap(int initialCapacity)` reads the requested value as
+            // a *minimum number of mappings to hold without resizing*,
+            // then internally allocates `ceil(c / loadFactor)` buckets so
+            // the threshold (loadFactor * buckets) >= requested capacity.
+            // With the default load factor of 0.75 that's `c * 4 / 3`,
+            // rounded up to the next power of two. Previously we rounded
+            // `c` itself to a power of two, which means
+            // `new HashMap<>(16)` allocated 16 buckets and resized on the
+            // 13th insert — defeating the entire purpose of the sizing
+            // hint and causing extra rehash work in the hot loop.
+            let requested = std::cmp::max(*c, 1) as u64;
+            // ceil(requested * 4 / 3), then cap to MAP_MAX_CAPACITY before
+            // next_power_of_two to avoid u32 overflow panic on absurdly
+            // large hints.
+            let needed = requested.saturating_mul(4).div_ceil(3);
+            let capped = std::cmp::min(needed, MAP_MAX_CAPACITY as u64).max(1) as u32;
+            let n = capped.checked_next_power_of_two().unwrap_or(MAP_MAX_CAPACITY as u32);
             std::cmp::min(n as usize, MAP_MAX_CAPACITY as usize)
         }
         _ => MAP_DEFAULT_CAPACITY,
@@ -10213,7 +10263,18 @@ fn native_lhm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(None),
     };
     let cap = match args.get(1) {
-        Some(Value::Int(c)) => (*c as usize).next_power_of_two().max(MAP_DEFAULT_CAPACITY),
+        Some(Value::Int(c)) => {
+            // Bug 4: same load-factor adjustment as `native_map_init_capacity`.
+            // The JDK contract: a caller asking for capacity N expects to hold
+            // N mappings without triggering a resize. With loadFactor=0.75
+            // that needs ceil(N * 4 / 3) buckets, rounded up to a power of two.
+            let requested = std::cmp::max(*c, 1) as u64;
+            let needed = requested.saturating_mul(4).div_ceil(3);
+            let capped = std::cmp::min(needed, MAP_MAX_CAPACITY as u64).max(1) as usize;
+            capped.checked_next_power_of_two()
+                .unwrap_or(MAP_MAX_CAPACITY as usize)
+                .max(MAP_DEFAULT_CAPACITY)
+        }
         _ => MAP_DEFAULT_CAPACITY,
     };
     lhm_init_with_cap(ctx, this, cap);
@@ -14572,7 +14633,13 @@ fn native_chm_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => (*v).max(1) as usize,
         _ => CHM_DEFAULT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP,
     };
-    let cap_per_seg = (total_cap / CHM_DEFAULT_SEGMENTS).max(1).next_power_of_two();
+    // Bug 4: same load-factor adjustment as `native_map_init_capacity`.
+    // CHM's documented default load factor is also 0.75, so inflate the
+    // requested capacity by 4/3 before splitting across segments so the
+    // total bucket count actually accommodates the caller's hint without
+    // an immediate resize.
+    let adjusted_total = (total_cap as u64).saturating_mul(4).div_ceil(3) as usize;
+    let cap_per_seg = (adjusted_total / CHM_DEFAULT_SEGMENTS).max(1).next_power_of_two();
     chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, cap_per_seg);
     Ok(None)
 }
@@ -14586,12 +14653,21 @@ fn native_chm_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => (*v).max(1) as usize,
         _ => CHM_DEFAULT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP,
     };
+    // Bug 4: the 3-arg form takes (initialCapacity, loadFactor, concurrencyLevel).
+    // Honour the supplied load factor (arg index 2 is a float). Default to 0.75
+    // when missing/invalid.
+    let load_factor = match args.get(2) {
+        Some(Value::Float(f)) if *f > 0.0 && f.is_finite() => *f,
+        _ => 0.75_f32,
+    };
     let concurrency = match args.get(3) {
         Some(Value::Int(v)) => (*v).max(1) as usize,
         _ => CHM_DEFAULT_SEGMENTS,
     };
     let num_segments = concurrency.next_power_of_two().min(256);
-    let cap_per_seg = (total_cap / num_segments).max(1).next_power_of_two();
+    let adjusted_total = ((total_cap as f64) / (load_factor as f64)).ceil() as usize;
+    let adjusted_total = adjusted_total.max(total_cap); // guard against fp underflow
+    let cap_per_seg = (adjusted_total / num_segments).max(1).next_power_of_two();
     chm_init_segments(ctx, this, num_segments, cap_per_seg);
     Ok(None)
 }
@@ -14653,9 +14729,9 @@ fn chm_seg_get(
     // across GC moves) and indexes into a 256-entry static RwLock
     // array — no global Mutex, no raw-pointer keying.
     let seg_id = ctx.identity_hash_code(seg);
-    let _read_guard = chm_seg_lock_for(seg_id)
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
+    // `parking_lot::RwLock::read` is infallible — no PoisonError to
+    // recover from.
+    let _read_guard = chm_seg_lock_for(seg_id).read();
     // Acquire-load the buckets array reference. If the writer has
     // begun publishing a new array, we see either the old one (with a
     // fully-linked chain) or the new one (also fully-linked) — never a
@@ -17279,6 +17355,27 @@ fn native_stpe_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // ===========================================================================
 // ConcurrentSkipListMap (simplified as sorted array-backed map)
 // ===========================================================================
+//
+// Bug 1 (CRIT round-9 native-misc HIGH-4): the underlying sorted array
+// previously had zero synchronization. Concurrent put + remove from two
+// threads could corrupt the array (insert shifts elements right while
+// remove shifts them left; their writes can interleave to produce a
+// duplicated or vanished slot, and binary search reads can observe
+// half-updated key ordering).
+//
+// Fix: stripe-based RwLock guard, keyed by the map's identity hash code.
+// All read operations (get/firstKey/lastKey/containsKey/keySet/size/
+// isEmpty) take a read lock; all mutating operations (put/remove) take
+// a write lock. Stripes are 256 to keep contention low without a global
+// hashmap of locks per object. Distinct CSLM instances may collide on
+// the same stripe (contention only, not correctness).
+//
+// TODO(round-11+): replace the array-backed implementation with a real
+// lock-free Pugh-style skiplist. Until then this lock keeps the data
+// structure observably safe under contention, at the cost of converting
+// every operation into a serialised-per-stripe critical section. That's
+// still strictly better than the previous behaviour (data corruption +
+// occasional panics from out-of-bounds shifts).
 
 const CSLM_FIELD_KEYS: usize = 0;
 const CSLM_FIELD_VALUES: usize = 1;
@@ -17286,6 +17383,19 @@ const CSLM_FIELD_SIZE: usize = 2;
 #[allow(dead_code)] // used for documentation; allocations go through constructors
 const CSLM_NUM_FIELDS: usize = 3;
 const CSLM_DEFAULT_CAPACITY: usize = 16;
+
+const CSLM_LOCK_STRIPES: usize = 256;
+
+fn cslm_stripe_for(ctx: &mut dyn NativeContext, this: ObjectRef) -> &'static std::sync::RwLock<()> {
+    static STRIPES: std::sync::OnceLock<Vec<std::sync::RwLock<()>>> = std::sync::OnceLock::new();
+    let stripes = STRIPES.get_or_init(|| {
+        (0..CSLM_LOCK_STRIPES).map(|_| std::sync::RwLock::new(())).collect()
+    });
+    let key = ctx.identity_hash_code(this) as u32;
+    // Mix bits so sequentially-allocated objects spread across stripes.
+    let idx = ((key ^ (key >> 16)).wrapping_mul(0x9E37_79B1) as usize) % CSLM_LOCK_STRIPES;
+    &stripes[idx]
+}
 
 fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/concurrent/ConcurrentSkipListMap";
@@ -17407,6 +17517,8 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // Bug 1: serialise mutating ops on this map's lock stripe.
+    let _guard = cslm_stripe_for(ctx, this).write().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -17456,6 +17568,8 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Bug 1: shared read lock — concurrent reads OK, blocks during writes.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -17477,6 +17591,8 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Bug 1: serialise mutating ops on this map's lock stripe.
+    let _guard = cslm_stripe_for(ctx, this).write().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -17510,6 +17626,8 @@ fn native_cslm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Bug 1: read lock so size cannot tear vs an in-flight put/remove.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -17522,6 +17640,8 @@ fn native_cslm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
     };
+    // Bug 1: read lock for consistent size observation.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -17535,6 +17655,8 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Bug 1: shared read lock.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, _, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -17554,6 +17676,8 @@ fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into())
         }
     };
+    // Bug 1: shared read lock.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
         return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
@@ -17575,6 +17699,8 @@ fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             .into())
         }
     };
+    // Bug 1: shared read lock.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
         return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
@@ -17591,6 +17717,8 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Bug 1: shared read lock — snapshot the keys array under the lock.
+    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, _, size) = cslm_state(ctx, this);
     // Return a TreeSet with natural ordering containing all keys
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);

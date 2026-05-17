@@ -221,14 +221,28 @@ impl Tlab {
     /// The unused tail space is wasted but will be reclaimed at GC time
     /// when the arena is reset.
     ///
-    /// Round-5 #9 / round-7 #9: callers that retire a live TLAB during a
-    /// GC cycle (i.e. the backing arena will be heap-walked before reset)
-    /// should call [`Self::install_tail_filler`] **before** retiring so the
-    /// heap iterator can skip the unused tail as a single synthetic
-    /// `int[]` filler object instead of stopping at the first byte of
-    /// garbage. The plain `retire` path here remains the right choice
-    /// when the arena is immediately reset (no walk needed).
+    /// Round-9 gc HIGH-6: wire `install_tail_filler` into the retire path
+    /// so a concurrent heap walker that visits the backing arena between
+    /// this call and the arena reset can step over the unused tail as a
+    /// single synthetic `int[]` instead of stopping at the first byte of
+    /// garbage past the cursor. Before this round, `install_tail_filler`
+    /// existed but had no production callers (round-7 wave-2 claimed the
+    /// fix but never wired it). The filler is harmless when the arena is
+    /// reset immediately after retire — it's just a one-time header
+    /// write — so always installing it is strictly safer than the
+    /// "callers should remember" contract that nobody honoured.
+    ///
+    /// # Safety considerations
+    /// `install_tail_filler` requires the TLAB backing memory to still be
+    /// valid (not yet reset) and unique to this thread. Both hold at
+    /// every production retire point: the arena owns the buffer and is
+    /// not reset until the next GC cycle, and the TLAB is per-thread
+    /// (`unsafe impl Send`, never shared). For TLABs that are already
+    /// empty (start/cursor/end null), the filler call short-circuits via
+    /// the leading null check inside `install_tail_filler`.
     pub fn retire(&mut self) {
+        // SAFETY: see method-level note — backing memory valid, single owner.
+        unsafe { self.install_tail_filler(TLAB_FILLER_CLASS_ID); }
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();

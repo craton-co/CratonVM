@@ -75,7 +75,10 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::{MethodCallResult, RuntimeError};
 use rustjvm_types::{ObjectRef, Value};
 
-use std::sync::RwLock;
+// Round-9 MED-2: migrated `CIPHER_TABLE` from `std::sync::RwLock` to
+// `parking_lot::RwLock` — removes the per-access `unwrap_or_else(into_inner)`
+// poison dance and yields a smaller, faster lock.
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -125,7 +128,8 @@ struct CipherState {
 static CIPHER_TABLE: RwLock<Option<FxHashMap<usize, CipherState>>> = RwLock::new(None);
 
 fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, CipherState>) -> R) -> R {
-    let mut g = CIPHER_TABLE.write().unwrap_or_else(|e| e.into_inner());
+    // Round-9 MED-2: parking_lot — no poison handling.
+    let mut g = CIPHER_TABLE.write();
     if g.is_none() {
         *g = Some(FxHashMap::default());
     }
@@ -133,7 +137,8 @@ fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, CipherState>) -> R) 
 }
 
 fn with_table_read<R>(f: impl FnOnce(&FxHashMap<usize, CipherState>) -> R) -> R {
-    let g = CIPHER_TABLE.read().unwrap_or_else(|e| e.into_inner());
+    // Round-9 MED-2: parking_lot — no poison handling.
+    let g = CIPHER_TABLE.read();
     match g.as_ref() {
         Some(t) => f(t),
         None => f(&FxHashMap::default()),

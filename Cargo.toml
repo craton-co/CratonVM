@@ -82,6 +82,20 @@ opt-level = 3
 [profile.dev.package.flate2]
 opt-level = 3
 
+# Round-10 cross-cutting: with the round-9 benchmark additions (~163 LOC) +
+# steady native-builtins growth, MSVC link.exe hits LNK1140 ("too many
+# modules for program database") for the cli binaries when dev profile uses
+# `debug = 2` (full debug info, the cargo default). Drop to line-tables-only
+# — keeps file:line in backtraces but excludes per-symbol DWARF/CodeView
+# records that overflow the PDB module table on Windows. Linux/macOS pay no
+# cost; Windows builds again. Override locally with `cargo build --profile dev-full`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev-full]
+inherits = "dev"
+debug = 2
+
 # Round-7 cross-cutting Fix 1: cargo defaults (lto=false, codegen-units=16)
 # defeat most cross-crate inlining. The VM has hundreds of `#[inline(always)]`
 # annotations on small hot-path helpers (interpreter dispatch, TLAB bump,
