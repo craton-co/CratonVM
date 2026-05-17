@@ -12,6 +12,19 @@
 //!   (the directory is always created so `env!()` in lib.rs has a
 //!   valid value).
 //!
+//! The same two paths are *also* emitted as cargo build-script
+//! metadata via the `links = "craton-gpu-annotations"` declaration
+//! in `Cargo.toml`:
+//!
+//! * `cargo:annotations_dir=...`
+//! * `cargo:annotations_jar=...`
+//!
+//! Cargo exposes these to dependents' build scripts as env vars
+//! `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR` /
+//! `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR`. The `rustc-env` form
+//! alone is not enough — cargo intentionally does NOT propagate
+//! `rustc-env=` vars to dependents' build scripts.
+//!
 //! The build script is intentionally resilient: a missing `javac`,
 //! a missing `jar`, or a complete absence of `.java` sources only
 //! produces a `cargo:warning=`. It never fails the build.
@@ -44,13 +57,21 @@ fn main() {
 
     let java_root = PathBuf::from("src/main/java");
 
-    // Helper: emit the env vars and return early.
+    // Helper: emit ALL four lines (two rustc-env, two cargo metadata)
+    // and return. The rustc-env lines feed `env!()` in this crate's
+    // own `src/lib.rs`; the `cargo:annotations_*` lines feed
+    // `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*` in dependents'
+    // build.rs (via the `links` key in Cargo.toml).
     let emit_env = |jar: &str, dir: &Path| {
         println!("cargo:rustc-env=CRATON_GPU_ANNOTATIONS_JAR={}", jar);
         println!(
             "cargo:rustc-env=CRATON_GPU_ANNOTATIONS_DIR={}",
             dir.display()
         );
+        // Build-script metadata for dependents (see Cargo.toml `links`).
+        // Empty strings are fine — dependents must tolerate them.
+        println!("cargo:annotations_jar={}", jar);
+        println!("cargo:annotations_dir={}", dir.display());
     };
 
     // 1. Is javac on PATH?
