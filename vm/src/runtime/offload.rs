@@ -1267,26 +1267,45 @@ pub fn dispatch_method_from_native(
             Value::Float(v) => kernel_args = kernel_args.push_f32(f32::from_bits(v.to_bits())),
             Value::Double(v) => kernel_args = kernel_args.push_f64(f64::from_bits(v.to_bits())),
             Value::Object(Some(obj_ref)) => {
-                let element_type = match shared.heap.array_element_type(*obj_ref) {
-                    Some(t) => t,
-                    None => {
+                // First: is it a primitive array?
+                if let Some(element_type) = shared.heap.array_element_type(*obj_ref) {
+                    match marshal_array_arg(shared, ctx, *obj_ref, element_type, &token) {
+                        Ok((args_after, wb)) => {
+                            kernel_args = args_after(kernel_args);
+                            writebacks.push(wb);
+                        }
+                        Err(msg) => {
+                            drop(token);
+                            return record_failed_submission(Some(stream.clone()), msg);
+                        }
+                    }
+                    continue;
+                }
+                // Second: is it a boxed primitive? Java's varargs
+                // autobox `int` → Integer, etc.
+                match try_unbox_primitive(shared, *obj_ref) {
+                    Some(Value::Int(v)) => kernel_args = kernel_args.push_i32(v),
+                    Some(Value::Long(v)) => kernel_args = kernel_args.push_i64(v),
+                    Some(Value::Float(v)) => kernel_args = kernel_args.push_f32(v),
+                    Some(Value::Double(v)) => kernel_args = kernel_args.push_f64(v),
+                    _ => {
                         drop(token);
                         return record_failed_submission(
                             Some(stream.clone()),
-                            format!("submitMethod: arg #{i} is not an array"),
+                            format!(
+                                "submitMethod: arg #{i} is neither a primitive array nor a boxed primitive",
+                            ),
                         );
                     }
-                };
-                match marshal_array_arg(shared, ctx, *obj_ref, element_type, &token) {
-                    Ok((args_after, wb)) => {
-                        kernel_args = args_after(kernel_args);
-                        writebacks.push(wb);
-                    }
-                    Err(msg) => {
-                        drop(token);
-                        return record_failed_submission(Some(stream.clone()), msg);
-                    }
                 }
+                continue;
+            }
+            Value::Object(None) => {
+                drop(token);
+                return record_failed_submission(
+                    Some(stream.clone()),
+                    format!("submitMethod: arg #{i} is null"),
+                );
             }
             _ => {
                 drop(token);
@@ -1378,6 +1397,60 @@ impl MarshalWriteback {
                 Ok(())
             }
         }
+    }
+}
+
+/// Phase 6 #2: detect Java's autoboxed primitives and unwrap them
+/// to the underlying `Value::Int/Long/Float/Double`. Java's
+/// `Object[] args` always boxes scalars passed via varargs (`int 5`
+/// becomes `Integer.valueOf(5)`), so without this every scalar arg
+/// to `submitMethod` would be misclassified as "not an array".
+///
+/// Returns `None` if the object is not one of the eight wrapper
+/// classes, or if its `value` field (slot 0) doesn't carry a
+/// primitive variant. Byte/Short/Character/Boolean wrappers all
+/// store an `Int` internally (matching the JVM's stack
+/// representation) and surface here as `Value::Int(...)`.
+#[cfg(feature = "gpu-offload")]
+fn try_unbox_primitive(
+    shared: &crate::vm::SharedVm,
+    obj_ref: rustjvm_types::ObjectRef,
+) -> Option<rustjvm_types::Value> {
+    let cid = shared.heap.class_id_of(obj_ref);
+    let cm = shared.class_manager.read();
+    let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
+    drop(cm);
+    let inner = shared.heap.get_field(obj_ref, 0);
+    match cls_name.as_str() {
+        "java/lang/Integer"
+        | "java/lang/Byte"
+        | "java/lang/Short"
+        | "java/lang/Boolean"
+        | "java/lang/Character" => match inner {
+            rustjvm_types::Value::Int(_) => Some(inner),
+            _ => None,
+        },
+        "java/lang/Long" => match inner {
+            rustjvm_types::Value::Long(_) => Some(inner),
+            // Some MethodHandle paths store the long as Int — coerce.
+            rustjvm_types::Value::Int(v) => Some(rustjvm_types::Value::Long(v as i64)),
+            _ => None,
+        },
+        "java/lang/Float" => match inner {
+            rustjvm_types::Value::Float(_) => Some(inner),
+            rustjvm_types::Value::Int(v) => {
+                Some(rustjvm_types::Value::Float(f32::from_bits(v as u32)))
+            }
+            _ => None,
+        },
+        "java/lang/Double" => match inner {
+            rustjvm_types::Value::Double(_) => Some(inner),
+            rustjvm_types::Value::Long(v) => {
+                Some(rustjvm_types::Value::Double(f64::from_bits(v as u64)))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
