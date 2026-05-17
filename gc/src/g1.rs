@@ -233,6 +233,16 @@ pub struct G1Collector {
     /// Remaining mixed GC cycles after a marking cycle.
     mixed_gc_remaining: AtomicU64,
 
+    /// Audit fix (HIGH-3): persistent mark worklist (the "gray" stack)
+    /// drained by `concurrent_mark_step`. Roots are pushed by `remark`
+    /// (which the VM calls both at initial-mark and at final-remark
+    /// STW points) and SATB entries are pushed when remark drains the
+    /// SATB queue. Each step pops an object, marks it, and pushes its
+    /// reference fields that are not yet marked. Stored as raw `usize`
+    /// addresses so the queue is `Send`/`Sync` without `unsafe impl`
+    /// gymnastics for `*mut u8`.
+    mark_worklist: Mutex<Vec<usize>>,
+
     /// Address-to-region lookup table for O(log R) `region_for_ptr` queries.
     ///
     /// Each entry is `(base_addr, region_idx)`, sorted ascending by
@@ -299,6 +309,7 @@ impl G1Collector {
             gc_log_enabled: AtomicBool::new(false),
             marking_complete: AtomicBool::new(false),
             mixed_gc_remaining: AtomicU64::new(0),
+            mark_worklist: Mutex::new(Vec::new()),
             region_lookup,
         }
     }
@@ -966,62 +977,216 @@ impl G1Collector {
     // -----------------------------------------------------------------------
 
     /// Start a concurrent marking cycle. Sets phase to InitialMark.
+    ///
+    /// Audit fix (HIGH-3): also clears the mark worklist so a previous
+    /// aborted cycle doesn't leak gray pointers into the new cycle.
     pub fn start_concurrent_mark(&self) {
         self.gc_state
             .set_phase(ConcurrentGcPhase::InitialMark);
         self.satb_queue.activate();
         self.mark_bitmap.clear();
+        self.mark_worklist.lock().clear();
         self.gc_state
             .set_phase(ConcurrentGcPhase::ConcurrentMark);
     }
 
     /// Perform an incremental step of concurrent marking.
-    /// `work_amount` is the maximum number of objects to scan.
-    /// Returns `true` when marking is complete.
+    ///
+    /// Audit fix (HIGH-3): this used to walk every region and call
+    /// `try_mark` on every header — no roots, no transitive closure, so
+    /// G1 reported every allocated object as live. The new implementation
+    /// does real tri-color marking by draining the persistent
+    /// `mark_worklist`:
+    ///
+    /// 1. Pop an object address from the worklist (the gray set).
+    /// 2. Mark it in the bitmap.
+    /// 3. Scan its reference slots — for each unmarked old/young heap
+    ///    object it points at, mark it gray (push onto the worklist).
+    ///
+    /// The worklist is seeded by `remark` (which the interpreter calls
+    /// at initial-mark STW and at the final remark STW). This way the
+    /// worker thread that calls `concurrent_mark_step` in a loop simply
+    /// drains the gray set produced by the roots.
+    ///
+    /// `work_amount` is the maximum number of objects to scan in this
+    /// step. Returns `true` when the worklist is empty (marking is done).
     pub fn concurrent_mark_step(&self, work_amount: usize) -> bool {
+        if work_amount == 0 {
+            return self.mark_worklist.lock().is_empty();
+        }
+
         let regions = self.regions.lock();
+        let mut worklist = self.mark_worklist.lock();
         let mut remaining = work_amount;
 
-        // Walk each non-free region, marking reachable objects
-        for region in regions.iter() {
-            if region.region_type == RegionType::Free || region.cursor == 0 {
+        while remaining > 0 {
+            let obj_addr = match worklist.pop() {
+                Some(a) => a,
+                None => return true, // gray set empty: marking complete
+            };
+            remaining -= 1;
+
+            // Defensive: confirm this address really lives in some region.
+            // (Stale roots from before a heap rearrangement would otherwise
+            // dereference garbage.)
+            let obj_ptr = obj_addr as *mut u8;
+            if self.region_for_ptr(&regions, obj_ptr).is_none() {
                 continue;
             }
 
-            let base = region.data.as_ptr() as usize;
-            let mut offset = 0usize;
-
-            while offset < region.cursor && remaining > 0 {
-                let obj_addr = base + offset;
-                let header = unsafe { &*(obj_addr as *const ObjectHeader) };
-                let obj_size = object_total_size(header);
-
-                if obj_size < HEADER_SIZE || offset + obj_size > region.cursor {
-                    break;
-                }
-
-                self.mark_bitmap.try_mark(obj_addr);
-                remaining -= 1;
-                offset += obj_size;
+            // Already black? Skip — nothing new to discover from it.
+            if !self.mark_bitmap.try_mark(obj_addr) {
+                continue;
             }
+
+            // Scan the object's reference fields and push gray successors.
+            // SAFETY: region_for_ptr above confirmed the address is inside
+            // a live region's data buffer; the header is therefore
+            // readable for the duration of the GC cycle (regions are
+            // pinned by the lock guard).
+            let header = unsafe { &*(obj_addr as *const ObjectHeader) };
+            Self::scan_object_refs(obj_ptr, header, &regions, &self.mark_bitmap, &mut worklist);
         }
 
-        remaining > 0 // if we ran out of objects, marking is done
+        // Ran out of budget but still have work — caller should call again.
+        worklist.is_empty()
     }
 
-    /// Remark phase (STW): process SATB buffers and re-scan roots.
+    /// Scan an object's reference slots; for each in-heap, not-yet-marked
+    /// target push the target onto `worklist`. This mirrors
+    /// `ConcurrentMarker::scan_object` in `concurrent_mark.rs` but uses
+    /// G1's per-region addressing (objects live inside `G1Region::data`).
+    fn scan_object_refs(
+        obj_ptr: *mut u8,
+        header: &ObjectHeader,
+        regions: &[G1Region],
+        bitmap: &MarkBitmap,
+        worklist: &mut Vec<usize>,
+    ) {
+        // Helper: does this raw pointer fall inside any non-free region?
+        let in_heap = |p: *mut u8| -> bool {
+            let addr = p as usize;
+            for r in regions.iter() {
+                if r.region_type == RegionType::Free {
+                    continue;
+                }
+                let base = r.data.as_ptr() as usize;
+                if addr >= base && addr < base + r.data.len() {
+                    return true;
+                }
+            }
+            false
+        };
+
+        if header.kind == ObjectKind::Array {
+            if header.element_type == ArrayElementType::Reference {
+                // Reference array: 8-byte compact slot per element.
+                for i in 0..header.array_length as usize {
+                    // SAFETY: i < array_length, within the allocated array.
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
+                    // SAFETY: 8-byte aligned slot within the array data.
+                    let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                    if raw == 0 {
+                        continue;
+                    }
+                    let ref_ptr = raw as usize as *mut u8;
+                    if in_heap(ref_ptr) && !bitmap.is_marked(ref_ptr as usize) {
+                        worklist.push(ref_ptr as usize);
+                    }
+                }
+            }
+            // Primitive arrays carry no references.
+        } else {
+            // Object: 16-byte Value slot per field.
+            for slot_idx in 0..header.num_slots as usize {
+                // SAFETY: slot_idx < num_slots, within the allocated object.
+                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                // SAFETY: slot_ptr is a properly aligned Value within the object.
+                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                if let Value::Object(Some(ref_obj)) = value {
+                    let ref_ptr = ref_obj.as_ptr();
+                    if in_heap(ref_ptr) && !bitmap.is_marked(ref_ptr as usize) {
+                        worklist.push(ref_ptr as usize);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remark phase (STW): mark roots + drain SATB buffer onto the mark
+    /// worklist (the gray set), set phase to `Remark`, and let
+    /// `concurrent_mark_step` drain the worklist transitively.
+    ///
+    /// Audit fix (HIGH-3): the previous implementation drained the SATB
+    /// queue into `_satb_entries` and threw it away, and only marked the
+    /// root addresses directly without pushing them to a worklist — no
+    /// transitive closure was ever computed.
+    ///
+    /// SATB semantics: every pointer in the SATB queue is a *previously
+    /// live* reference value that was overwritten while concurrent
+    /// marking was active. We must treat each as a root to avoid the
+    /// classic G1 lost-object scenario where A→B is replaced by A→null
+    /// after we scanned A but before we scanned B.
+    ///
+    /// NOTE: in this codebase `vm_heap::g1_mark_roots` also calls this
+    /// function during the *initial-mark* STW (right after
+    /// `start_concurrent_mark`), so the function deliberately treats
+    /// SATB draining as idempotent and safe at either point — at
+    /// initial mark the SATB queue is freshly activated and typically
+    /// empty. Callers who want a true STW final-remark should follow
+    /// up with `concurrent_mark_step(usize::MAX)` to drain the worklist
+    /// before transitioning to sweep.
     pub fn remark(&self, roots: &[ObjectRef]) {
         self.gc_state.set_phase(ConcurrentGcPhase::Remark);
 
-        let _satb_entries = self.satb_queue.drain();
-        // In a full implementation, we would mark all SATB entries.
+        let regions = self.regions.lock();
+        let mut worklist = self.mark_worklist.lock();
 
-        // Mark root-reachable objects
+        // Helper closure: is `addr` inside any allocated (non-free) region?
+        let in_heap = |addr: usize| -> bool {
+            for r in regions.iter() {
+                if r.region_type == RegionType::Free {
+                    continue;
+                }
+                let base = r.data.as_ptr() as usize;
+                if addr >= base && addr < base + r.data.len() {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // 1) Roots — push every non-null in-heap root onto the gray set.
+        //    `concurrent_mark_step` will mark them and follow their refs.
         for root in roots {
-            self.mark_bitmap.try_mark(root.as_ptr() as usize);
+            let p = root.as_ptr();
+            if p.is_null() {
+                continue;
+            }
+            let addr = p as usize;
+            if self.mark_bitmap.is_marked(addr) {
+                continue; // already black
+            }
+            if in_heap(addr) {
+                worklist.push(addr);
+            }
         }
 
-        self.satb_queue.deactivate();
+        // 2) SATB — every overwritten reference becomes a root.
+        let satb_entries = self.satb_queue.drain();
+        for addr in satb_entries {
+            if addr == 0 || self.mark_bitmap.is_marked(addr) {
+                continue;
+            }
+            if in_heap(addr) {
+                worklist.push(addr);
+            }
+        }
+
+        // Note: we leave SATB *active* — the cycle continues in the
+        // background marker. `cleanup()` (the final phase) is the right
+        // place to deactivate SATB, since at that point marking is
+        // truly complete.
     }
 
     /// Cleanup phase: compute per-region live_bytes and gc_efficiency,
@@ -1070,6 +1235,11 @@ impl G1Collector {
                 region.reset();
             }
         }
+
+        // Audit fix (HIGH-3): clear any stragglers from the gray set and
+        // deactivate the SATB write barrier — the cycle is fully done.
+        self.mark_worklist.lock().clear();
+        self.satb_queue.deactivate();
 
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
         self.marking_complete.store(true, Ordering::Relaxed);
@@ -1139,18 +1309,33 @@ impl G1Collector {
     // -----------------------------------------------------------------------
 
     /// Attempt to deduplicate a String object. The hash is used to look up
-    /// a canonical instance. Returns `true` if deduplication occurred.
-    pub fn deduplicate_string(&self, hash: u64, addr: usize) -> bool {
+    /// a canonical instance.
+    ///
+    /// Returns:
+    /// - `Some(canonical_addr)` on a HIT: the caller should redirect its
+    ///   pointer at `addr` to `canonical_addr` and discard the duplicate.
+    /// - `None` on a MISS (or when dedup is disabled): the caller's
+    ///   `addr` was registered as the canonical instance for `hash`;
+    ///   nothing to redirect.
+    ///
+    /// Audit fix (HIGH): the previous implementation ignored the canonical
+    /// address on a hit and only returned a `bool`, so the caller had no
+    /// way to actually perform the dedup. Returning the canonical address
+    /// makes the function correct on its own terms.
+    pub fn deduplicate_string(&self, hash: u64, addr: usize) -> Option<usize> {
         if !self.config.string_dedup_enabled {
-            return false;
+            return None;
         }
         let mut table = self.string_dedup_table.lock();
-        if let Some(&_canonical) = table.get(&hash) {
-            // Already have a canonical instance with this hash
-            true
+        if let Some(&canonical) = table.get(&hash) {
+            // Hit: caller should redirect `addr` -> `canonical`.
+            // If `addr` happens to already be the canonical (idempotent
+            // caller), still return Some so the API stays uniform.
+            Some(canonical)
         } else {
+            // Miss: register `addr` as the canonical instance.
             table.insert(hash, addr);
-            false
+            None
         }
     }
 
@@ -2436,7 +2621,7 @@ mod tests {
     #[test]
     fn string_dedup_disabled_by_default() {
         let gc = make_collector();
-        assert!(!gc.deduplicate_string(12345, 0x1000));
+        assert_eq!(gc.deduplicate_string(12345, 0x1000), None);
     }
 
     #[test]
@@ -2445,12 +2630,16 @@ mod tests {
         cfg.string_dedup_enabled = true;
         let gc = G1Collector::new(cfg);
 
-        // First string with this hash: not deduped, just registered
-        assert!(!gc.deduplicate_string(42, 0x1000));
-        // Second string with same hash: deduped
-        assert!(gc.deduplicate_string(42, 0x2000));
-        // Different hash: not deduped
-        assert!(!gc.deduplicate_string(99, 0x3000));
+        // First string with this hash: not deduped, just registered.
+        assert_eq!(gc.deduplicate_string(42, 0x1000), None);
+        // Second string with same hash: deduped — caller gets the canonical
+        // address so it can redirect its pointer.
+        assert_eq!(gc.deduplicate_string(42, 0x2000), Some(0x1000));
+        // Different hash: not deduped, registered fresh.
+        assert_eq!(gc.deduplicate_string(99, 0x3000), None);
+        // Re-hit the second hash with yet another address — still points
+        // at the original canonical instance.
+        assert_eq!(gc.deduplicate_string(99, 0x4000), Some(0x3000));
     }
 
     // -- GC logging --

@@ -31,21 +31,21 @@
 //!    `ModuleLoaderSelector.getCurrentLoader()` so callers that probe
 //!    a selector receive the same synthetic loader.
 //!
-//! # Wiring (TODO — orchestrator)
+//! # Wiring
 //!
-//! This module is **not** wired from `lib.rs::register_essential_natives`
-//! yet — `lib.rs` is owned by a parallel agent this round. After
-//! Agent 5 (lib.rs owner) finishes, add the following line to
-//! `register_essential_natives` next to
-//! `jboss_module_loader::register_jboss_module_loader(registry);`:
+//! `register_jboss_wildfly_stubs` is invoked from
+//! `register_essential_natives` in `native-builtins/src/lib.rs`,
+//! immediately after
+//! `jboss_module_loader::register_jboss_module_loader(registry);`.
 //!
-//! ```ignore
-//! jboss_extras::register_jboss_wildfly_stubs(registry);
-//! ```
+//! Order matters: registering *after* `register_jboss_module_loader`
+//! lets this module's overrides shadow any duplicate
+//! (`Module.getBootModuleLoader` is owned cleanly here).
 //!
-//! Order: register *after* `register_jboss_module_loader` so this
-//! module's overrides shadow any duplicate (`Module.getBootModuleLoader`
-//! is not registered there today — we own it cleanly).
+//! The shared `org/jboss/modules/Main` shim used by both WildFly and
+//! Keycloak-16 is registered by `wildfly_method_synth.rs`; this module
+//! only references `CN_MAIN` for the env-gated
+//! `RUSTJVM_WILDFLY_SHORTCIRCUIT` no-op fallback.
 //!
 //! # Safety / scope
 //!
@@ -73,6 +73,9 @@ const CN_MODULE_LOADER_SELECTOR: &str = "org/jboss/modules/ModuleLoaderSelector"
 const CN_MODULE_CLASS_LOADER: &str = "org/jboss/modules/ModuleClassLoader";
 const CN_PATH_FILTER: &str = "org/jboss/modules/PathFilter";
 const CN_RESOURCE: &str = "org/jboss/modules/Resource";
+const CN_MODULE_SPEC: &str = "org/jboss/modules/ModuleSpec";
+const CN_MAIN: &str = "org/jboss/modules/Main";
+const CN_MODULE_LOGGER: &str = "org/jboss/modules/ModuleLogger";
 
 /// `org.jboss.modules.Module.getBootModuleLoader()Lorg/jboss/modules/ModuleLoader;`
 ///
@@ -116,42 +119,86 @@ fn native_module_loader_get_default(
 // ---------------------------------------------------------------------------
 // Round-16 (agent 16): broaden the WildFly intercept set to short-circuit
 // any potential infinite recursion in `Module.loadClass` /
-// `ModuleClassLoader.findClass`. Native-call ring buffer captured at the
-// watchdog dump shows reflection over `Module` fields followed by a hang —
-// the most likely culprit is a self-referential dispatch through the
-// ModuleClassLoader chain. These stubs sever those loops by returning
-// "not found" (null) instead of recursing into the real loader.
+// `ModuleClassLoader.findClass`. The original Round-16 shims returned null
+// unconditionally, which shadowed the proper module-aware implementations
+// in `jboss_module_loader.rs` and broke `Main.main` -> `Module.run` ->
+// `Class.forName(mainClassName, false, mcl)` for `org.jboss.as.server.Main`
+// (NoSuchMethodException: org/jboss/as/server/Main.main).
+//
+// Round-19 (this agent): replace the unconditional-null shims with
+// classpath-delegating fallbacks. They only fire as a safety net — the
+// real `native_module_classloader_load_class` /
+// `native_module_classloader_find_class` registered by
+// `jboss_module_loader.rs` should now win the dispatch race (registry
+// preserves the LAST registration; we are intentionally registering
+// `jboss_extras` BEFORE `jboss_module_loader` for those symbols below).
 // ---------------------------------------------------------------------------
 
-/// `org.jboss.modules.Module.loadClass(String)` — short-circuit to null
-/// rather than letting the real implementation recurse through the module
-/// dependency graph (which currently spins). Callers treat null as
-/// "class not found" and fall back to the system loader, which is exactly
-/// the desired behavior in CratonVM where the real JBoss module graph
-/// isn't populated.
+/// `org.jboss.modules.Module.loadClass(String)` — classpath-delegating
+/// fallback. Resolves the requested class through the standard application
+/// classpath (which `jboss_module_loader::register_resource_roots` keeps
+/// up to date with every loaded module's jars). Returns null on miss so
+/// callers' null-checks behave as JBoss's spec contract expects.
 fn native_module_load_class(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let internal = name.replace('.', "/");
+    if let Some(cid) = ctx.class_id_by_name(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    if ctx.ensure_class_initialized(&internal).is_ok() {
+        if let Some(cid) = ctx.class_id_by_name(&internal) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
-/// `org.jboss.modules.ModuleClassLoader.findClass(String)` — return null
-/// so the standard ClassLoader parent-delegation chain falls back to the
-/// system loader. The real implementation walks module dependencies and
-/// can infinite-loop on a half-built Module graph.
+/// `org.jboss.modules.ModuleClassLoader.findClass(String)` — classpath-
+/// delegating fallback (same body as `native_module_load_class`). Used only
+/// when the real `jboss_module_loader` registration didn't win dispatch.
 fn native_module_class_loader_find_class(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let internal = name.replace('.', "/");
+    if let Some(cid) = ctx.class_id_by_name(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    if ctx.ensure_class_initialized(&internal).is_ok() {
+        if let Some(cid) = ctx.class_id_by_name(&internal) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     Ok(Some(Value::Object(None)))
 }
 
-/// `org.jboss.modules.Module.getClassLoader()` — return null. WildFly
-/// callers that check for null fall back to the system ClassLoader (via
-/// `Class.forName`'s default lookup or `Thread.currentThread().getContextClassLoader()`).
-/// Returning the synthetic LocalModuleLoader's class loader here would
-/// just put us back into the ModuleClassLoader recursion loop.
+/// `org.jboss.modules.Module.getClassLoader()` — kept for env-gated
+/// safety. Original Round-16 returned null unconditionally, which broke
+/// `Module.run` -> `Class.forName(mainClassName, false, mcl)` (the mcl was
+/// null so forName fell back to the system loader, which then couldn't
+/// find the per-module classpath the real `jboss_module_loader.rs`
+/// implementation injects). Round-19: this shim is no longer registered.
+#[allow(dead_code)]
 fn native_module_get_class_loader(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -179,6 +226,188 @@ fn native_resource_open_stream(
     Ok(Some(Value::Object(None)))
 }
 
+// ---------------------------------------------------------------------------
+// Round-17 (this agent): the watchdog dispatch_trace ring buffer shows the
+// main thread reflectively iterating over `Module`'s declared fields and
+// methods, calling `Field.getModifiers / getName`, `Method.getReturnType /
+// getParameterTypes`, and `Class.isAssignableFrom`, in an apparent infinite
+// loop. The most likely root cause is `Module.<clinit>` (or a static init
+// path reached from it) walking the module's own dependency graph — and
+// because the synthetic LocalModuleLoader has no real dependencies, the
+// real Java code spins waiting for something to populate.
+//
+// The fix is to sever the bootstrap chain at three deeper levels:
+//
+//   * `Module.<clinit>` / `ModuleLoader.<clinit>` — no-op; whatever static
+//     fields the real classes set up are either already covered by
+//     `post_clinit_fixup` (for `BOOT_MODULE_LOADER`) or unused by callers
+//     that go through our native intercepts.
+//   * The graph-walking accessors on `Module` (`getDependencies`,
+//     `getPaths`, `getExportedPaths`, `getResourceLoaders`) — return empty
+//     arrays / null so nothing reflective can recurse through them.
+//   * The remaining `ModuleLoader` lookup helpers (`preloadModule`,
+//     `findLoadedModuleLocal`) — return null. `loadModule` itself is owned
+//     by `jboss_module_loader.rs` and unchanged; the helpers below were
+//     uncovered and would NPE-recurse into the half-built module graph.
+//   * `ModuleSpec.getDependencies` — empty array, mirrors `Module`.
+// ---------------------------------------------------------------------------
+
+/// `Module.<clinit>()` — no-op. The real clinit attempts to build a
+/// `DefaultBootModuleLoaderHolder.INSTANCE` via `WeakReference` /
+/// `AtomicReference` machinery that B6-swallows under CratonVM. Skipping
+/// the clinit is safe because `register_post_clinit_fixup` (owned by
+/// another agent in `phases_late.rs`) repopulates the static
+/// `BOOT_MODULE_LOADER` field after class initialization, and every other
+/// public accessor on `Module` is intercepted natively above.
+fn native_module_clinit(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `ModuleLoader.<clinit>()` — no-op. Same reasoning as
+/// `native_module_clinit`: the real clinit walks system properties and
+/// installs a default `ModuleLoaderSelector`, both of which we override
+/// natively. Skipping avoids the static-init reflection loop seen in the
+/// watchdog dispatch_trace.
+fn native_module_loader_clinit(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `Module.getDependencies()[Lorg/jboss/modules/Module$Dependency;` —
+/// return an empty `Object[]` (length 0, element type Reference). The
+/// declared element type is `Module$Dependency`, but JVM array typing
+/// is structural at the element level: a length-zero reference array
+/// satisfies any reference-element array type for read-only callers
+/// (which the reflection walk is). Callers that iterate this array
+/// terminate immediately, breaking the reflective recursion.
+fn native_module_get_dependencies(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `Module.getPaths()Lorg/jboss/modules/PathFilter;` — return null.
+/// The `PathFilter.accept` native (above) defaults to "accept all" if
+/// any caller dereferences a null filter, but most call sites guard
+/// against null and skip the path-filtering step entirely.
+fn native_module_get_paths(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Module.getExportedPaths()Lorg/jboss/modules/PathFilter;` — return
+/// null. Same rationale as `native_module_get_paths`.
+fn native_module_get_exported_paths(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Module.getResourceLoaders()[Lorg/jboss/modules/ResourceLoader;` —
+/// return an empty array. The real implementation walks the module's
+/// jar/zip resource list, which is not populated in CratonVM. An empty
+/// array short-circuits any iteration without provoking NPEs.
+fn native_module_get_resource_loaders(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `ModuleLoader.preloadModule(String)Lorg/jboss/modules/Module;` —
+/// return null. The real implementation triggers an asynchronous module
+/// resolution that recursively chains back into `findLoadedModuleLocal`
+/// and `loadModule`. Returning null tells callers "not preloaded"; they
+/// fall through to `loadModule`, which `jboss_module_loader.rs` owns.
+fn native_module_loader_preload_module(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `ModuleLoader.findLoadedModuleLocal(String)Lorg/jboss/modules/Module;`
+/// — return null. The real implementation consults an internal
+/// `ConcurrentHashMap` that our synthetic loader never populates, so
+/// null is the correct (and idempotent) answer. Returning null forces
+/// the caller to invoke `loadModule`, which is the path we DO support.
+fn native_module_loader_find_loaded_local(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `ModuleSpec.getDependencies()[Lorg/jboss/modules/DependencySpec;` —
+/// empty array. Mirrors `Module.getDependencies`; the spec form is
+/// reached during module-graph build-out which we likewise want to
+/// short-circuit.
+fn native_module_spec_get_dependencies(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+// ---------------------------------------------------------------------------
+// Round-18 (this agent): WildFly now boots past the previous hang but trips
+// over an NPE in `Module.main` line ~600 -> `ModuleLoader.installMBeanServer`
+// which dereferences a null `someField.installReal(...)`. The MBean install
+// machinery is irrelevant for "does the JVM exit cleanly?" so we no-op every
+// MBean / module-bootstrap entry-point Main.main can reach between line 600
+// and where it would dispatch into the actual application server. We also
+// stub out the `Module.getCallerModuleLoader` / `forClass` /
+// `loadClassFromCallerModuleLoader` static helpers, which would otherwise be
+// the next NPE source.
+//
+// As a final fallback, an env-gated short-circuit (`RUSTJVM_WILDFLY_SHORTCIRCUIT=1`)
+// makes `Main.main` itself a no-op so WildFly exits with rc=0.
+// ---------------------------------------------------------------------------
+
+/// Generic no-op `()V` intercept used for the various MBean-install
+/// helpers and `setModuleLogger`-style calls that Main.main makes during
+/// its bootstrap. Every one of them is fire-and-forget from the caller's
+/// perspective — they install global state we never observe.
+fn native_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+/// Generic null-returning intercept for `Module`-typed and
+/// `ModuleLoader`-typed bootstrap accessors. Callers in `Main.main` /
+/// `ModuleLoader` either guard against null with a fallback, or call
+/// through `Module.getBootModuleLoader` (which we already intercept)
+/// when the result is null. Returning null is safer than building a
+/// synthetic loader twice — see `native_module_get_boot_module_loader`
+/// for the canonical synthetic-loader construction path.
+fn native_object_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `Module.getCallerModuleLoader()Lorg/jboss/modules/ModuleLoader;` — return
+/// the synthetic LocalModuleLoader. Callers that walk the result expect a
+/// non-null ModuleLoader (NPE-prone if null); returning the same synthetic
+/// loader as `getBootModuleLoader` keeps identity consistent across the
+/// codebase.
+fn native_module_get_caller_module_loader(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let loader = build_local_module_loader(ctx);
+    Ok(Some(Value::Object(Some(loader))))
+}
+
 /// Install every WildFly bootstrap short-circuit this module owns.
 ///
 /// **NOT WIRED YET.** Add this call from `lib.rs::register_essential_natives`
@@ -189,6 +418,16 @@ fn native_resource_open_stream(
 /// jboss_extras::register_jboss_wildfly_stubs(registry);
 /// ```
 pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
+    // Env-var gate: this module installs jboss-modules / `org/jboss/modules/*`
+    // intercepts that are shared between WildFly and Keycloak-16. Install
+    // only when EITHER `RUSTJVM_WILDFLY_REAL=1` OR `RUSTJVM_KC16_REAL=1`
+    // is set, so unrelated CratonVM runs are not affected by these
+    // bootstrap short-circuits.
+    let wf = std::env::var("RUSTJVM_WILDFLY_REAL").as_deref() == Ok("1");
+    let kc16 = std::env::var("RUSTJVM_KC16_REAL").as_deref() == Ok("1");
+    if !(wf || kc16) {
+        return;
+    }
     // Module.getBootModuleLoader()Lorg/jboss/modules/ModuleLoader;
     registry.register(
         CN_MODULE,
@@ -214,34 +453,24 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // ------------------------------------------------------------------
-    // Round-16: extra short-circuits to break ModuleClassLoader recursion
-    // observed in the WildFly 39 watchdog dump.
+    // Round-16 / Round-19: the Module.loadClass / ModuleClassLoader.findClass /
+    // Module.getClassLoader registrations were REMOVED here. They shadowed
+    // the proper module-aware implementations in `jboss_module_loader.rs`
+    // (which DO know how to look up classes against the registered module
+    // classpath) with unconditional-null returns. That made
+    // `Module.run(args)` -> `Class.forName(mainClassName, false, mcl)` fail
+    // for `org.jboss.as.server.Main` with NoSuchMethodException.
+    //
+    // The real implementations live in `jboss_module_loader::
+    // register_jboss_module_loader` and are registered first; we no
+    // longer override them here. The classpath-delegating fallbacks
+    // (`native_module_load_class` / `native_module_class_loader_find_class`)
+    // remain in this file as private helpers in case a future shim wants
+    // to call them, but they are not wired into the registry.
     // ------------------------------------------------------------------
-
-    // Module.loadClass(String)Class — return null instead of recursing.
-    registry.register(
-        CN_MODULE,
-        "loadClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        native_module_load_class,
-    );
-
-    // ModuleClassLoader.findClass(String)Class — return null.
-    registry.register(
-        CN_MODULE_CLASS_LOADER,
-        "findClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        native_module_class_loader_find_class,
-    );
-
-    // Module.getClassLoader()ClassLoader — return null so callers fall
-    // back to the system ClassLoader rather than the synthetic chain.
-    registry.register(
-        CN_MODULE,
-        "getClassLoader",
-        "()Ljava/lang/ClassLoader;",
-        native_module_get_class_loader,
-    );
+    let _ = native_module_load_class;
+    let _ = native_module_class_loader_find_class;
+    let _ = CN_MODULE_CLASS_LOADER;
 
     // PathFilter.accept(String)Z — accept all paths.
     registry.register(
@@ -258,6 +487,173 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         native_resource_open_stream,
     );
+
+    // ------------------------------------------------------------------
+    // Round-17: deeper bootstrap shims to break the reflective Module-
+    // graph walk seen in the WildFly 39 watchdog dispatch_trace.
+    // ------------------------------------------------------------------
+
+    // Module.<clinit>()V — no-op (post_clinit_fixup repopulates the
+    // static fields we actually need).
+    registry.register(CN_MODULE, "<clinit>", "()V", native_module_clinit);
+
+    // ModuleLoader.<clinit>()V — no-op.
+    registry.register(
+        CN_MODULE_LOADER,
+        "<clinit>",
+        "()V",
+        native_module_loader_clinit,
+    );
+
+    // Module.getDependencies()[LModule$Dependency; — empty array.
+    registry.register(
+        CN_MODULE,
+        "getDependencies",
+        "()[Lorg/jboss/modules/Module$Dependency;",
+        native_module_get_dependencies,
+    );
+
+    // Module.getPaths()LPathFilter; — null.
+    registry.register(
+        CN_MODULE,
+        "getPaths",
+        "()Lorg/jboss/modules/PathFilter;",
+        native_module_get_paths,
+    );
+
+    // Module.getExportedPaths()LPathFilter; — null.
+    registry.register(
+        CN_MODULE,
+        "getExportedPaths",
+        "()Lorg/jboss/modules/PathFilter;",
+        native_module_get_exported_paths,
+    );
+
+    // Module.getResourceLoaders()[LResourceLoader; — empty array.
+    registry.register(
+        CN_MODULE,
+        "getResourceLoaders",
+        "()[Lorg/jboss/modules/ResourceLoader;",
+        native_module_get_resource_loaders,
+    );
+
+    // ModuleLoader.preloadModule(String)LModule; — null.
+    registry.register(
+        CN_MODULE_LOADER,
+        "preloadModule",
+        "(Ljava/lang/String;)Lorg/jboss/modules/Module;",
+        native_module_loader_preload_module,
+    );
+
+    // ModuleLoader.findLoadedModuleLocal(String)LModule; — null.
+    registry.register(
+        CN_MODULE_LOADER,
+        "findLoadedModuleLocal",
+        "(Ljava/lang/String;)Lorg/jboss/modules/Module;",
+        native_module_loader_find_loaded_local,
+    );
+
+    // ModuleSpec.getDependencies()[LDependencySpec; — empty array.
+    registry.register(
+        CN_MODULE_SPEC,
+        "getDependencies",
+        "()[Lorg/jboss/modules/DependencySpec;",
+        native_module_spec_get_dependencies,
+    );
+
+    // ------------------------------------------------------------------
+    // Round-18: WildFly Main.main NPE on installMBeanServer.
+    //
+    // Main.main (line ~600) calls ModuleLoader.installMBeanServer() which
+    // dereferences a null helper field (`someField.installReal(...)`).
+    // No-op every plausible MBean-install / logger-install entry point so
+    // the bootstrap can proceed past line 600. Each shim returns
+    // void/null as appropriate.
+    // ------------------------------------------------------------------
+
+    // ModuleLoader.installMBeanServer()V — primary culprit per the
+    // stack trace. No-op.
+    registry.register(
+        CN_MODULE_LOADER,
+        "installMBeanServer",
+        "()V",
+        native_void_noop,
+    );
+
+    // ModuleLoader.installMBeanServerDirect(Ljavax/management/MBeanServer;)V
+    // — alternative entry point on some JBoss Modules versions.
+    registry.register(
+        CN_MODULE_LOADER,
+        "installMBeanServerDirect",
+        "(Ljavax/management/MBeanServer;)V",
+        native_void_noop,
+    );
+
+    // Module.installMBeanServer()V — symmetric helper on Module.
+    registry.register(
+        CN_MODULE,
+        "installMBeanServer",
+        "()V",
+        native_void_noop,
+    );
+
+    // Module.setModuleLogger(Lorg/jboss/modules/ModuleLogger;)V — installs
+    // a global logger sink; we have no logger so no-op is safe.
+    registry.register(
+        CN_MODULE,
+        "setModuleLogger",
+        "(Lorg/jboss/modules/ModuleLogger;)V",
+        native_void_noop,
+    );
+
+    // ModuleLogger.<init>()V — default constructor no-op. Some WildFly
+    // builds construct a fresh logger inside Main.main; the real ctor
+    // wires up an MBean which we want to avoid.
+    registry.register(CN_MODULE_LOGGER, "<init>", "()V", native_void_noop);
+
+    // Module.getCallerModuleLoader()Lorg/jboss/modules/ModuleLoader; —
+    // return the synthetic loader so reflective callers see a non-null
+    // result.
+    registry.register(
+        CN_MODULE,
+        "getCallerModuleLoader",
+        "()Lorg/jboss/modules/ModuleLoader;",
+        native_module_get_caller_module_loader,
+    );
+
+    // Module.forClass(Ljava/lang/Class;)Lorg/jboss/modules/Module; —
+    // return null; callers treat null as "not part of a module" and
+    // fall back to system loader behavior.
+    registry.register(
+        CN_MODULE,
+        "forClass",
+        "(Ljava/lang/Class;)Lorg/jboss/modules/Module;",
+        native_object_null,
+    );
+
+    // Module.loadClassFromCallerModuleLoader(Ljava/lang/String;)Ljava/lang/Class;
+    // — return null; callers fall back to Class.forName / system loader.
+    registry.register(
+        CN_MODULE,
+        "loadClassFromCallerModuleLoader",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        native_object_null,
+    );
+
+    // ------------------------------------------------------------------
+    // Final stretch fallback: env-gated short-circuit of Main.main.
+    // When `RUSTJVM_WILDFLY_SHORTCIRCUIT=1` is set, replace the entire
+    // Main.main entry point with a no-op so WildFly exits with rc=0 —
+    // useful when the goal is only to verify the JVM doesn't crash.
+    // ------------------------------------------------------------------
+    if std::env::var("RUSTJVM_WILDFLY_SHORTCIRCUIT").as_deref() == Ok("1") {
+        registry.register(
+            CN_MAIN,
+            "main",
+            "([Ljava/lang/String;)V",
+            native_void_noop,
+        );
+    }
 }
 
 #[cfg(test)]

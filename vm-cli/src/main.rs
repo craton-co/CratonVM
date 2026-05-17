@@ -538,8 +538,60 @@ fn run() -> Result<()> {
         let manifest = ClassPath::read_jar_manifest(jar_path)
             .ok_or_else(|| anyhow::anyhow!("Cannot read manifest from {}", jar_path.display()))?;
 
-        // Build classpath: JAR itself + manifest Class-Path entries
-        let mut cp = vec![jar_path.to_string_lossy().into_owned()];
+        // JN3: ClassPath::new only accepts entries whose extension is `.jar`
+        // (or `.jmod`/`modules`). WARs, EARs, and other Java archive types
+        // are silently dropped — so `--jar jenkins.war` would never have
+        // its contents indexed and `executable.Main` (the launcher class
+        // declared in `Main-Class`) could not be resolved.
+        //
+        // Work around this in the CLI by materialising any non-`.jar`
+        // archive as a sibling temp file with a `.jar` extension and
+        // adding that path to the classpath instead. The original `jar_path`
+        // is still used for manifest parsing (which doesn't care about the
+        // extension), and the `Class-Path` manifest header is resolved
+        // relative to the original file's parent so sibling lookups still
+        // work.
+        let cp_entry_for_archive = match jar_path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("jar") => jar_path.to_path_buf(),
+            _ => {
+                // Copy <name>.<ext> to <tmp>/<name>.jar so ClassPath::new
+                // recognises it. The temp file lives for the process
+                // lifetime (the OS reclaims it on exit; we don't bother
+                // with explicit cleanup because the orchestrator runs
+                // short-lived CLI invocations).
+                let stem = jar_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("app");
+                // Disambiguate with PID + a millisecond timestamp to
+                // avoid clobbering when multiple VMs run concurrently.
+                let pid = std::process::id();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let tmp = std::env::temp_dir()
+                    .join(format!("rustjvm-{pid}-{now_ms}-{stem}.jar"));
+                std::fs::copy(jar_path, &tmp).with_context(|| {
+                    format!(
+                        "failed to stage {} as {} for classpath registration",
+                        jar_path.display(),
+                        tmp.display()
+                    )
+                })?;
+                tracing::debug!(
+                    "JN3: staged non-.jar archive {} → {} so ClassPath accepts it",
+                    jar_path.display(),
+                    tmp.display()
+                );
+                tmp
+            }
+        };
+
+        // Build classpath: JAR (or staged .jar copy) itself + manifest Class-Path entries.
+        // The manifest's Class-Path header is still resolved relative to the
+        // user-supplied path so sibling JARs are found at their real locations.
+        let mut cp = vec![cp_entry_for_archive.to_string_lossy().into_owned()];
         cp.extend(manifest.resolve_class_path(jar_path));
 
         // KC26: For Quarkus applications, the RunnerClassLoader normally loads

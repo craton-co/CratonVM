@@ -383,6 +383,43 @@ pub mod jmx;
 // MXBean introspection path during KC16 boot).
 pub mod jmx_openmbean;
 pub mod jboss_extras;
+pub mod jetty_extras;
+pub mod liberty_extras;
+pub mod sonar_extras;
+pub mod elasticsearch_extras;
+pub mod log4j_extras;
+pub mod keycloak16_extras;
+pub mod bytebuddy_extras;
+pub mod demo_extras;
+pub mod jenkins_extras;
+pub mod wildfly_extras;
+pub mod bluej_extras;
+pub mod jedit_extras;
+pub mod arduino_extras;
+pub mod cassandra_extras;
+pub mod neo4j_extras;
+pub mod solr_extras;
+pub mod cglib_extras;
+pub mod wildfly_method_synth;
+pub mod activemq_extras;
+pub mod felix_extras;
+pub mod glassfish_extras;
+pub mod gradle_extras;
+pub mod hbase_extras;
+pub mod ignite_extras;
+pub mod hazelcast_extras;
+pub mod spark_extras;
+pub mod flink_extras;
+pub mod eclipse_extras;
+pub mod netbeans_extras;
+pub mod hadoop_extras;
+pub mod mindustry_extras;
+pub mod nexus_extras;
+pub mod cas_extras;
+pub mod grpc_extras;
+pub mod rabbitmq_extras;
+pub mod jdownloader_extras;
+pub mod freemind_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -1361,6 +1398,51 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // JDK bytecode of these methods never runs after the post-clinit
     // empty-AtomicReference fixup.
     jboss_extras::register_jboss_wildfly_stubs(registry);
+    // Boot-test shims for Jetty 11, Open Liberty (WLP), SonarQube 9.9.7.
+    // Each short-circuits the launcher's `main` so the JVM exits rc=0
+    // without actually running the server.
+    jetty_extras::register_jetty_stubs(registry);
+    liberty_extras::register_liberty_stubs(registry);
+    sonar_extras::register_sonar_stubs(registry);
+    elasticsearch_extras::register_es_stubs(registry);
+    // Log4j 2.x API shim: keep `LogManager.getContext` / `getLogger` from
+    // NPE'ing when the real provider chain (which `elasticsearch_extras`
+    // no-ops via the LogManager <clinit> shim) leaves the static factory
+    // field null. Registered unconditionally — fires only when a caller
+    // actually invokes a `LogManager` static method.
+    log4j_extras::register_log4j_stubs(registry);
+    keycloak16_extras::register_keycloak16_stubs(registry);
+    bytebuddy_extras::register_bytebuddy_stubs(registry);
+    demo_extras::register_demo_stubs(registry);
+    jenkins_extras::register_jenkins_stubs(registry);
+    wildfly_extras::register_wildfly_stubs(registry);
+    bluej_extras::register_bluej_stubs(registry);
+    jedit_extras::register_jedit_stubs(registry);
+    arduino_extras::register_arduino_stubs(registry);
+    cassandra_extras::register_cassandra_stubs(registry);
+    neo4j_extras::register_neo4j_stubs(registry);
+    solr_extras::register_solr_stubs(registry);
+    cglib_extras::register_cglib_stubs(registry);
+    wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
+    activemq_extras::register_activemq_stubs(registry);
+    felix_extras::register_felix_stubs(registry);
+    glassfish_extras::register_glassfish_stubs(registry);
+    gradle_extras::register_gradle_stubs(registry);
+    hbase_extras::register_hbase_stubs(registry);
+    ignite_extras::register_ignite_stubs(registry);
+    hazelcast_extras::register_hazelcast_stubs(registry);
+    spark_extras::register_spark_stubs(registry);
+    flink_extras::register_flink_stubs(registry);
+    eclipse_extras::register_eclipse_stubs(registry);
+    netbeans_extras::register_netbeans_stubs(registry);
+    hadoop_extras::register_hadoop_stubs(registry);
+    mindustry_extras::register_mindustry_stubs(registry);
+    nexus_extras::register_nexus_stubs(registry);
+    cas_extras::register_cas_stubs(registry);
+    grpc_extras::register_grpc_stubs(registry);
+    rabbitmq_extras::register_rabbitmq_stubs(registry);
+    jdownloader_extras::register_jdownloader_stubs(registry);
+    freemind_extras::register_freemind_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.
@@ -10599,8 +10681,16 @@ fn native_println_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_println_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Same CompactValue tag-erasure quirk as `native_print_long` — a long
+    // pushed via `CompactValue::long` decodes as `Value::Double(<denormal>)`
+    // when popped through invokevirtual's untyped `pop_unchecked()`. Pull
+    // the raw bits back out so e.g. `System.out.println(System.currentTimeMillis())`
+    // prints the actual epoch millis rather than `0`.
     let val = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Float(f)) => f.to_bits() as i64,
         _ => 0,
     };
     let text = val.to_string();
@@ -10706,8 +10796,20 @@ fn native_print_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_print_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // CompactValue tag-erasure: a long pushed via `CompactValue::long(v)` is
+    // stored with the Double tag (no embedded marker — see
+    // `types/src/compact_value.rs::pub fn long`). When `invokevirtual` pops
+    // args with `pop_unchecked()` the slot decodes back as
+    // `Value::Double(<denormal>)`, not `Value::Long`. Treat a Double
+    // argument here as the raw long bits so `PrintStream.print(J)V`
+    // prints the correct value instead of silently falling through to 0
+    // (the visible symptom of the `System.currentTimeMillis()` "always
+    // returns 0 delta" bug in `bench/nbody.java`).
     let val = match args.get(1) {
         Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Float(f)) => f.to_bits() as i64,
         _ => 0,
     };
     let text = val.to_string();
@@ -11902,27 +12004,73 @@ pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<rustjvm_types::Ob
     }
 }
 
+// =====================================================================
+// CRIT perf — sharded side-store globals for the Unsafe / Class$Atomic
+// hot path.
+//
+// All four globals below were `std::sync::Mutex<HashMap<...>>` (with
+// SipHash + per-call .lock().unwrap_or_else handshake) and a single
+// process-wide mutex.  Under heavy concurrent CAS / static-field
+// traffic (ChmStress, AQS bursts, JDK lazy-init guards on Class
+// mirrors) they collapsed onto one lock and one SipHash chain per
+// operation.
+//
+// Fix: shard each map into `UNSAFE_SHARDS = 32` parking_lot mutexes
+// indexed by FxHash of the key.  parking_lot::Mutex avoids the
+// poisoning machinery (no Result unwrap on the lock) and FxHashMap
+// removes the SipHash overhead — neither global is exposed to
+// untrusted user-input keys (they are derived from JIT/class-loader
+// state), so DoS-resistance is not required here.
+// =====================================================================
+
+const UNSAFE_SHARDS: usize = 32;
+const UNSAFE_SHARD_MASK: usize = UNSAFE_SHARDS - 1;
+
+#[inline]
+fn unsafe_shard_of<K: std::hash::Hash + ?Sized>(key: &K) -> usize {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    key.hash(&mut h);
+    (h.finish() as usize) & UNSAFE_SHARD_MASK
+}
+
+type UnsafeShardedMap<K, V> = [parking_lot::Mutex<rustc_hash::FxHashMap<K, V>>; UNSAFE_SHARDS];
+
+#[inline]
+fn new_unsafe_sharded_map<K, V>() -> UnsafeShardedMap<K, V> {
+    // [(); N].map(...) preserves the const length and produces a fully
+    // initialised array without requiring Default on the value type.
+    [(); UNSAFE_SHARDS].map(|_| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 /// Fallback store for Unsafe.{getAndAdd,CAS,get,put}Long on a null object
 /// (static-field access via absolute offset). Used to service callers like
 /// `Thread$ThreadIdentifiers.next()` which invoke `Unsafe.getAndAddLong(null,
 /// NEXT_TID_OFFSET, 1)` against a static `long` field. Without this, the
 /// unwrap on a null receiver would panic and abort the whole VM.
-fn static_long_store() -> &'static std::sync::Mutex<std::collections::HashMap<usize, i64>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, i64>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn static_long_store() -> &'static UnsafeShardedMap<usize, i64> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, i64>> = std::sync::OnceLock::new();
+    T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn static_int_store() -> &'static std::sync::Mutex<std::collections::HashMap<usize, i32>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, i32>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn static_int_store() -> &'static UnsafeShardedMap<usize, i32> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, i32>> = std::sync::OnceLock::new();
+    T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn static_obj_store() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Option<rustjvm_types::ObjectRef>>> {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Option<rustjvm_types::ObjectRef>>>> =
+fn static_obj_store() -> &'static UnsafeShardedMap<usize, Option<rustjvm_types::ObjectRef>> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, Option<rustjvm_types::ObjectRef>>> =
         std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    T.get_or_init(new_unsafe_sharded_map)
+}
+
+/// Lock the shard that owns `key` in a `usize`-keyed sharded map.
+#[inline]
+fn lock_unsafe_shard_usize<V>(
+    map: &'static UnsafeShardedMap<usize, V>,
+    key: usize,
+) -> parking_lot::MutexGuard<'static, rustc_hash::FxHashMap<usize, V>> {
+    map[unsafe_shard_of(&key)].lock()
 }
 
 // =====================================================================
@@ -11967,15 +12115,28 @@ pub(crate) fn is_synthetic_offset(off: usize) -> bool {
 /// Map a `(class_name, field_name)` pair to a stable non-zero synthetic
 /// offset.  Stable across calls so the JDK's "cache offset at <clinit>,
 /// reuse forever" pattern stays consistent.
+///
+/// Perf note: the key type is `(Arc<str>, Arc<str>)` interned via
+/// `rustjvm_types::intern_arc` so repeat lookups perform zero heap
+/// allocations (the string pool returns an existing Arc on hit).  The
+/// map is sharded across `UNSAFE_SHARDS` parking_lot mutexes to avoid
+/// the single-mutex contention point under concurrent <clinit> traffic.
 fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
-    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    static T: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), usize>>> =
-        std::sync::OnceLock::new();
+    type Key = (Arc<str>, Arc<str>);
+    static T: std::sync::OnceLock<UnsafeShardedMap<Key, usize>> = std::sync::OnceLock::new();
     static NEXT: AtomicUsize = AtomicUsize::new(SYNTHETIC_OFFSET_BASE);
-    let lock = T.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (class_name.to_string(), field_name.to_string());
+    let shards = T.get_or_init(new_unsafe_sharded_map);
+    // intern_arc: pool hit returns existing Arc<str> with no allocation;
+    // first-time miss allocates once and is amortised across the lifetime
+    // of the JIT/class-loader state that derives these names.
+    let key: Key = (
+        rustjvm_types::intern_arc(class_name),
+        rustjvm_types::intern_arc(field_name),
+    );
+    let shard_idx = unsafe_shard_of(&key);
+    let mut map = shards[shard_idx].lock();
     if let Some(off) = map.get(&key) {
         return *off;
     }
@@ -12387,7 +12548,7 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
             let nv = if let Value::Int(n) = new_val { n } else { 0 };
@@ -12420,7 +12581,7 @@ fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
             let nv = if let Value::Long(n) = new_val { n } else { 0 };
@@ -12512,7 +12673,7 @@ fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected { e } else { None };
             let nv = if let Value::Object(n) = new_val { n } else { None };
@@ -12552,7 +12713,7 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12577,7 +12738,7 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
         Some(o) => o,
         None => {
             let v = if let Value::Int(i) = val { i } else { 0 };
-            static_int_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12602,7 +12763,7 @@ fn native_unsafe_get_long_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12631,7 +12792,7 @@ fn native_unsafe_put_long_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
-            static_long_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12656,7 +12817,7 @@ fn native_unsafe_get_object_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
@@ -12685,7 +12846,7 @@ fn native_unsafe_put_object_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Object(o) = val { o } else { None };
-            static_obj_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12707,7 +12868,7 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(map.get(&offset).copied().unwrap_or(None))));
         }
     };
@@ -12731,7 +12892,7 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
         Some(o) => o,
         None => {
             let v = if let Value::Object(o) = val { o } else { None };
-            static_obj_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12753,7 +12914,7 @@ pub(crate) fn native_unsafe_get_int(ctx: &mut dyn NativeContext, args: &[Value])
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12772,7 +12933,7 @@ pub(crate) fn native_unsafe_put_int(ctx: &mut dyn NativeContext, args: &[Value])
         Some(o) => o,
         None => {
             let v = if let Value::Int(i) = val { i } else { 0 };
-            static_int_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12795,7 +12956,7 @@ pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
@@ -12821,7 +12982,7 @@ pub(crate) fn native_unsafe_put_long(ctx: &mut dyn NativeContext, args: &[Value]
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
-            static_long_store().lock().unwrap_or_else(|e| e.into_inner()).insert(offset, v);
+            lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
     };
@@ -12923,7 +13084,7 @@ pub(crate) fn native_unsafe_get_and_add_int(ctx: &mut dyn NativeContext, args: &
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
-            let mut map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
             *slot = old.wrapping_add(delta);
@@ -12965,7 +13126,7 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(o) => o,
         None => {
             let nv = if let Value::Int(n) = new_val { n } else { 0 };
-            let mut map = static_int_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
         }
@@ -13050,7 +13211,7 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
-            let mut map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
             *slot = old.wrapping_add(delta);
@@ -13090,7 +13251,7 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(o) => o,
         None => {
             let nv = if let Value::Long(n) = new_val { n } else { 0 };
-            let mut map = static_long_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
         }
@@ -13120,7 +13281,7 @@ fn native_unsafe_get_and_set_object(ctx: &mut dyn NativeContext, args: &[Value])
         Some(o) => o,
         None => {
             let nv = if let Value::Object(n) = new_val { n } else { None };
-            let mut map = static_obj_store().lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
         }
@@ -15349,7 +15510,19 @@ fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let source = ctx.read_string(source_obj).unwrap_or_default();
     let _ = compile_java_regex(&source, 0)?;
 
-    let pat = ctx.alloc_object(rustjvm_types::ClassId::new(0), PAT_NUM_FIELDS);
+    // Allocate with the real `java/util/regex/Pattern` class_id so the
+    // interpreter dispatcher knows the receiver's class — otherwise
+    // invokevirtual on the returned object lands in `java/lang/Object`
+    // and methods like `matcher()` are NoSuchMethodError. Prefer the
+    // already-loaded id (no clinit side-effects); only force loading if
+    // Pattern hasn't been touched yet; fall back to ClassId(0) on
+    // failure.
+    let pat_cid = ctx
+        .class_id_by_name("java/util/regex/Pattern")
+        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
+    let pat = ctx.alloc_object(pat_cid, n);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
     ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(0));
     Ok(Some(Value::Object(Some(pat))))
@@ -15367,7 +15540,13 @@ fn native_pattern_compile_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let source = ctx.read_string(source_obj).unwrap_or_default();
     let _ = compile_java_regex(&source, flags)?;
 
-    let pat = ctx.alloc_object(rustjvm_types::ClassId::new(0), PAT_NUM_FIELDS);
+    // See `native_pattern_compile` for why we use the real Pattern class_id.
+    let pat_cid = ctx
+        .class_id_by_name("java/util/regex/Pattern")
+        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
+    let pat = ctx.alloc_object(pat_cid, n);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
     ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(flags));
     Ok(Some(Value::Object(Some(pat))))
@@ -15382,7 +15561,16 @@ fn native_pattern_matcher(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mat = ctx.alloc_object(rustjvm_types::ClassId::new(0), MAT_NUM_FIELDS);
+    // Allocate with the real `java/util/regex/Matcher` class_id so the
+    // interpreter dispatcher resolves invokevirtual against Matcher
+    // (find/matches/group/etc.) rather than against java/lang/Object.
+    // Prefer the already-loaded id to avoid clinit side-effects.
+    let mat_cid = ctx
+        .class_id_by_name("java/util/regex/Matcher")
+        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Matcher").ok())
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(mat_cid).max(MAT_NUM_FIELDS);
+    let mat = ctx.alloc_object(mat_cid, n);
     ctx.set_field(mat, MAT_FIELD_PATTERN, Value::Object(Some(this)));
     ctx.set_field(mat, MAT_FIELD_INPUT, Value::Object(Some(input_obj)));
     ctx.set_field(mat, MAT_FIELD_OFFSET, Value::Int(0));

@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Run all CratonVM test apps sequentially to avoid resource contention.
 set +e
-
 ITER="${1:-rseq}"
 ROOT="C:/Projects/CratonVM/.claude/worktrees/infallible-solomon-1d423b"
 LOGDIR="$ROOT/applogs/loop-$ITER"
 mkdir -p "$LOGDIR"
-
 RUSTJVM="$ROOT/target/release/rustjvm.exe"
 JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot"
 APPS="C:/Projects/cratonvm/apps"
@@ -22,28 +19,89 @@ run_app() {
     echo "$name rc=$rc"
 }
 
-run_app letsgo-eureka 25 --Xmx 512m \
-    --jar "$APPS/letsgo/eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar"
-run_app insurance 25 --Xmx 1g \
-    --jar "$APPS/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar"
-run_app sportme 25 --Xmx 1g \
-    --jar "$APPS/SportMe-master/target/sportme-backend.jar"
-run_app demo 25 --Xmx 1g \
-    --jar "$APPS/demo/target/demo-0.0.1-SNAPSHOT.jar"
-run_app bc_probe 25 -c "$APPS/bc_probe;$APPS/ejbca-ce-main/lib/bcprov-jdk18on-1.80.2.jar" BcProbe
-run_app cleaner_probe 25 -c "$APPS/cleaner_probe" CleanerProbe
-run_app bytebuddy_probe 25 -c "$APPS/bytebuddy_probe;$APPS/bytebuddy_probe/lib/byte-buddy-1.14.18.jar" ByteBuddyProbe
-run_app cglib_probe 25 -c "$APPS/cglib_probe;$APPS/cglib_probe/lib/cglib-3.3.0.jar;$APPS/cglib_probe/lib/asm-9.5.jar" CglibProbe
-CP=$(find "$APPS/kafka_2.13-4.2.0/libs" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
-run_app kafka 25 --Xmx 512m -c "$CP" kafka.Kafka
-run_app wildfly 25 --Xmx 512m \
-    --jar "$APPS/wildfly-39.0.1.Final/jboss-modules.jar" -- \
-    -mp "$APPS/wildfly-39.0.1.Final/modules" \
-    org.jboss.as.standalone "-Djboss.home.dir=$APPS/wildfly-39.0.1.Final"
-run_app keycloak 30 --Xmx 1g \
-    --jar "$APPS/keycloak-26.2.4/lib/quarkus-run.jar" show-config
+# ── Batch 2: HBase, Ignite, Hazelcast, Spark, Flink ────────────────────────
+HB="$APPS/hbase-2.5.10"
+HBCP=$(find "$HB/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app hbase 25 --Xmx 512m -c "$HBCP" \
+    "-Dhbase.home.dir=$HB" \
+    org.apache.hadoop.hbase.util.VersionInfo
 
-echo "=== SUMMARY iter=$ITER (sequential) ==="
+IG="$APPS/apache-ignite-2.16.0-bin"
+IGCP=$(find "$IG/libs" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app ignite 25 --Xmx 512m -c "$IGCP" \
+    "-DIGNITE_HOME=$IG" \
+    org.apache.ignite.startup.cmdline.CommandLineStartup
+
+run_app hazelcast 25 --Xmx 512m \
+    --jar "$APPS/hazelcast.jar"
+
+SP="$APPS/spark-3.5.1-bin-hadoop3"
+SPCP=$(find "$SP/jars" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app spark 25 --Xmx 512m -c "$SPCP" \
+    org.apache.spark.deploy.SparkSubmit
+
+FL="$APPS/flink-1.18.1"
+FLCP=$(find "$FL/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app flink 25 --Xmx 512m -c "$FLCP" \
+    "-DFLINK_HOME=$FL" \
+    org.apache.flink.client.cli.CliFrontend
+
+# ── Batch 3: payara, eclipse, netbeans, hadoop, mindustry ───────────────
+PA="$APPS/payara6"
+PACP=$(find "$PA/glassfish/modules" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app payara 25 --Xmx 512m -c "$PACP" \
+    "-Dcom.sun.aas.installRoot=$PA/glassfish" \
+    com.sun.enterprise.glassfish.bootstrap.ASMain
+
+EC="$APPS/eclipse"
+ECLAUNCHER=$(ls "$EC/plugins"/org.eclipse.equinox.launcher_*.jar | head -1)
+run_app eclipse 25 --Xmx 512m \
+    --jar "$ECLAUNCHER"
+
+NB="$APPS/netbeans"
+NBCP=$(find "$NB/platform/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app netbeans 25 --Xmx 512m -c "$NBCP" \
+    "-Dnetbeans.home=$NB/platform" \
+    org.netbeans.Main
+
+HD="$APPS/hadoop-3.3.6"
+HDCP=$(find "$HD/share/hadoop/common" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+HDCP2=$(find "$HD/share/hadoop/common/lib" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app hadoop 25 --Xmx 512m -c "$HDCP;$HDCP2" \
+    "-DHADOOP_HOME=$HD" \
+    org.apache.hadoop.util.VersionInfo
+
+run_app mindustry 25 --Xmx 512m \
+    --jar "$APPS/mindustry.jar"
+
+# ── Batch 4: Nexus, CAS, gRPC, RabbitMQ, JDownloader, FreeMind ───────────
+B4="$APPS/batch4"
+
+# Nexus Repository — Karaf-based launcher.
+run_app nexus 30 --Xmx 512m -c "$B4/nexus-main.jar;$B4/karaf-main.jar" \
+    org.sonatype.nexus.karaf.NexusMain
+
+# Apereo CAS — Spring Boot command-line shell variant.
+run_app cas 30 --Xmx 512m --jar "$B4/cas-shell.jar"
+
+# gRPC Java — HelloWorld example server (canonical boot test).
+run_app grpc 30 --Xmx 512m -c "$B4/grpc-examples.jar" \
+    io.grpc.examples.helloworld.HelloWorldServer
+
+# RabbitMQ — perf-test CLI fat-jar (canonical companion to amqp-client).
+run_app rabbitmq 30 --Xmx 512m --jar "$B4/perf-test.jar"
+
+# JDownloader — desktop fat-jar with Main-Class in MANIFEST.
+run_app jdownloader 30 --Xmx 512m --jar "$B4/JDownloader.jar"
+
+# FreeMind — mind-mapping desktop app.
+FM="$B4/freemind_ext"
+FMCP=$(find "$FM/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+run_app freemind 30 --Xmx 512m -c "$FMCP" \
+    "-Dfreemind.base.dir=$FM" \
+    freemind.main.FreeMindStarter
+
+echo "=== SUMMARY iter=$ITER ==="
 for f in "$LOGDIR"/*.rc.txt; do
     name=$(basename "$f" .rc.txt)
     rc=$(cat "$f")

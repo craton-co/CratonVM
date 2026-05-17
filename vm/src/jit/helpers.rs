@@ -193,9 +193,6 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // length is the requested array size. The returned i64 is a raw heap pointer to the new array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i64 {
-    // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
-    let vm = &*(vm_ptr as *const SharedVm);
-    let heap = &vm.heap;
     let elem_type = match atype as u8 {
         4 => ArrayElementType::Boolean,
         5 => ArrayElementType::Char,
@@ -207,6 +204,26 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         11 => ArrayElementType::Long,
         _ => return 0,
     };
+    // BUGFIX: The JIT may pass length as a NaN-boxed CompactValue raw bit pattern
+    // (e.g. 0xFFFC_0000_0000_000B for int 11) when reading from operand-stack slots
+    // that were populated via mechanisms that store CompactValue raw bits rather
+    // than untagged primitive bits. Defensive: narrow `length` to the int payload,
+    // then sign-extend to i64. JLS only allows `int` array lengths, so the upper
+    // 32 bits of a valid length are always 0 (or all-1 for negative, which becomes
+    // a NegativeArraySizeException — JIT codegen ensures bounds-checked path).
+    let length = length as i32 as i64;
+    if length < 0 {
+        // Negative length — would-be NegativeArraySizeException. JIT codegen
+        // is responsible for the proper throw; here we return 0 to prevent
+        // the GC abort from a huge cast-to-usize.
+        return 0;
+    }
+    if vm_ptr == 0 {
+        return 0;
+    }
+    // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let heap = &vm.heap;
     // Try allocation; if young gen exhausted, run GC and retry
     let data_size = rustjvm_types::array_data_size(length as usize, elem_type).unwrap_or(0);
     let total_size = rustjvm_types::HEADER_SIZE + data_size;
@@ -366,6 +383,19 @@ pub unsafe extern "C" fn jit_anewarray_object(
     component_class_id_raw: i64,
     length: i64,
 ) -> i64 {
+    // BUGFIX: see `jit_newarray` — narrow length to int payload and sign-extend.
+    // JLS only allows `int` array lengths; defensive against JIT slot patterns
+    // that carry stale upper bits (e.g. NaN-boxed CompactValue raw bits).
+    let length = length as i32 as i64;
+    if length < 0 {
+        // Negative length — would-be NegativeArraySizeException. JIT codegen
+        // is responsible for the proper throw; here we return 0 to prevent
+        // the GC abort from a huge cast-to-usize.
+        return 0;
+    }
+    if vm_ptr == 0 {
+        return 0;
+    }
     let heap = heap_from_vm(vm_ptr);
     let class_id = ClassId::new(component_class_id_raw as u32);
     let arr = heap.alloc_array(class_id, ArrayElementType::Reference, length as usize);
@@ -496,6 +526,14 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
         _ => ArrayElementType::Reference,
     };
 
+    // BUGFIX (mirrors jit_newarray / jit_anewarray_object): narrow dimensions to
+    // int payload and sign-extend, defending against NaN-boxed CompactValue raw
+    // bits leaking from JIT operand-stack slots.
+    let dim1 = dim1 as i32 as i64;
+    let dim2 = dim2 as i32 as i64;
+    if dim1 < 0 || dim2 < 0 {
+        return 0;
+    }
     let outer = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, dim1 as usize);
     for i in 0..dim1 as usize {
         let inner = heap.alloc_array(ClassId::new(0), elem_type, dim2 as usize);
@@ -2036,6 +2074,50 @@ mod tests {
         // returns None without dereferencing any pointer.
         let result = unsafe { jit_thread_mut() };
         assert!(result.is_none());
+    }
+
+    // Regression: when the JIT JIT passes a NaN-boxed CompactValue raw bit
+    // pattern as the array length (e.g. `0xFFFC_0000_0000_000B` for int(11)),
+    // the helper must extract the low-32 int payload and NOT treat the upper
+    // tag bits as part of the length. Previously, `length as usize` cast the
+    // tag bits into an enormous unsigned value, triggering
+    // "array data size overflow in gen_heap alloc_array" / "young gen exhausted".
+    //
+    // Repros: `bench/fannkuch` (n=11 → 0xFFFC_..._000B) and
+    // `bench/FullStackBench` phase 5 (`new boolean[100000]`).
+    #[test]
+    fn jit_newarray_strips_nanbox_tag_from_length() {
+        // 0xFFFC_0000_0000_000B is the NaN-boxed CompactValue for int(11)
+        // (NANBOX_BITS | SUB_INT << 47 | 11). After narrowing to i32, the
+        // value should be 11 — non-negative, so the helper takes the
+        // early `vm_ptr == 0` exit rather than the abort path.
+        let nan_boxed_11: i64 = 0xFFFC_0000_0000_000B_u64 as i64;
+        // SAFETY: vm_ptr=0 hits the explicit null check after length narrowing,
+        // so no dereference occurs.
+        let result = unsafe { jit_newarray(0, 10 /* T_INT */, nan_boxed_11) };
+        assert_eq!(result, 0, "jit_newarray must not abort on NaN-boxed length");
+    }
+
+    #[test]
+    fn jit_anewarray_strips_nanbox_tag_from_length() {
+        let nan_boxed_11: i64 = 0xFFFC_0000_0000_000B_u64 as i64;
+        // SAFETY: vm_ptr=0 hits the explicit null check after length narrowing.
+        let result = unsafe { jit_anewarray_object(0, 0, nan_boxed_11) };
+        assert_eq!(result, 0, "jit_anewarray_object must not abort on NaN-boxed length");
+    }
+
+    #[test]
+    fn jit_newarray_negative_length_returns_zero_not_abort() {
+        // Sign-extended -5 (0xFFFF_FFFF_FFFF_FFFB). After narrowing to i32,
+        // value is -5; the helper must return 0 (would-be NegativeArraySize)
+        // instead of casting to a huge usize and aborting.
+        let neg_5: i64 = -5;
+        // SAFETY: negative-length path returns 0 before any dereference.
+        let result = unsafe { jit_newarray(0, 10, neg_5) };
+        assert_eq!(result, 0);
+        // SAFETY: negative-length path returns 0 before any dereference.
+        let result2 = unsafe { jit_anewarray_object(0, 0, neg_5) };
+        assert_eq!(result2, 0);
     }
 }
 

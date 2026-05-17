@@ -8,7 +8,6 @@
 //!
 //! TLABs dramatically reduce lock contention on the allocation path.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Default TLAB size: 256 KB — large enough to amortize the lock cost
@@ -145,7 +144,7 @@ impl Tlab {
     /// memory that will not be accessed by any other thread until this
     /// TLAB is retired.
     pub unsafe fn new(ptr: *mut u8, size: usize) -> Self {
-        let pressure = TlabPressureTracker::new();
+        let mut pressure = TlabPressureTracker::new();
         pressure.begin_refill(size);
         Self {
             start: ptr,
@@ -158,6 +157,14 @@ impl Tlab {
     /// Try to bump-allocate `size` bytes with 8-byte alignment from this TLAB.
     ///
     /// Returns `None` if the TLAB doesn't have enough space.
+    ///
+    /// **Fast path** (post CRIT-1 fix): load `cursor`, add `size`, compare
+    /// to `end`, branch on overflow, store `cursor`, then update three
+    /// plain-integer counters on the `pressure` tracker. No atomics, no
+    /// mutex, no helper call — the compiler can inline the whole bump
+    /// path including the counter bumps. The `Tlab` is per-thread
+    /// (`unsafe impl Send`) and only ever borrowed `&mut` from its
+    /// owning thread, so the pressure counters need no synchronization.
     #[inline(always)]
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         debug_assert!(align.is_power_of_two());
@@ -169,7 +176,14 @@ impl Tlab {
         }
         let ptr = aligned as *mut u8;
         self.cursor = new_cursor as *mut u8;
-        self.pressure.record_allocation(size);
+        // Inlined `pressure.record_allocation(size)` — direct field
+        // updates so the bump path is a pure pointer-bump + bounds-check
+        // + a few register-sized adds with no helper call boundary.
+        self.pressure.allocations_since_last_refill += size as u64;
+        self.pressure.alloc_count += 1;
+        if size > LARGE_ALLOC_THRESHOLD {
+            self.pressure.large_alloc_count += 1;
+        }
         Some(ptr)
     }
 
@@ -196,14 +210,14 @@ impl Tlab {
     /// the per-thread [`TlabPressureTracker`] which applies the
     /// grow/shrink heuristic. Call this after retiring the current TLAB
     /// and before requesting a fresh buffer from the arena.
-    pub fn next_refill_size(&self) -> usize {
+    pub fn next_refill_size(&mut self) -> usize {
         self.pressure.next_refill_size()
     }
 
     /// T5.5.1 — Notify the tracker that a new TLAB of `size` bytes has
     /// been installed. Resets internal counters and starts the
     /// fill-time clock for the new window.
-    pub fn begin_refill(&self, size: usize) {
+    pub fn begin_refill(&mut self, size: usize) {
         self.pressure.begin_refill(size);
     }
 
@@ -247,79 +261,13 @@ pub fn max_tlab_size() -> usize {
     MAX_TLAB_SIZE
 }
 
-/// T5.5.1 — Adaptive TLAB sizing based on allocation pressure.
-///
-/// Tracks the number of TLAB refills since the last GC and uses an
-/// exponential moving average to adapt the TLAB size. High refill
-/// rates (= high allocation pressure) scale up toward `MAX_TLAB_SIZE`;
-/// low rates scale down toward `MIN_TLAB_SIZE`.
-///
-/// The controller is per-thread. Call `record_refill()` each time a
-/// TLAB is exhausted and refilled, and `recommended_size()` to get
-/// the next TLAB chunk size.
-pub struct AdaptiveTlabSizer {
-    /// Exponential moving average of refills per GC epoch.
-    refill_rate_ema: f64,
-    /// Number of refills since the last GC epoch reset.
-    refills_this_epoch: u32,
-    /// Current recommended TLAB size (bytes).
-    current_size: usize,
-}
-
-impl AdaptiveTlabSizer {
-    pub fn new() -> Self {
-        Self {
-            refill_rate_ema: 0.0,
-            refills_this_epoch: 0,
-            current_size: DEFAULT_TLAB_SIZE,
-        }
-    }
-
-    /// Record a TLAB refill event. Call this each time the thread
-    /// exhausts its current TLAB and requests a new one from the arena.
-    pub fn record_refill(&mut self) {
-        self.refills_this_epoch += 1;
-    }
-
-    /// Called at the end of a GC epoch to update the EMA and
-    /// recompute the recommended TLAB size.
-    pub fn end_epoch(&mut self) {
-        let alpha = 0.3; // EMA smoothing factor
-        self.refill_rate_ema =
-            alpha * (self.refills_this_epoch as f64) + (1.0 - alpha) * self.refill_rate_ema;
-        self.refills_this_epoch = 0;
-
-        // Scale linearly between MIN and MAX based on refill rate.
-        // At ≤ 2 refills/epoch → MIN; at ≥ 20 refills/epoch → MAX.
-        let low = 2.0;
-        let high = 20.0;
-        let t = ((self.refill_rate_ema - low) / (high - low)).clamp(0.0, 1.0);
-        self.current_size =
-            MIN_TLAB_SIZE + ((MAX_TLAB_SIZE - MIN_TLAB_SIZE) as f64 * t) as usize;
-        // Round to 4 KB boundary for page alignment.
-        self.current_size = (self.current_size + 4095) & !4095;
-    }
-
-    /// The recommended TLAB size for the next refill.
-    pub fn recommended_size(&self) -> usize {
-        self.current_size
-    }
-}
-
-impl Default for AdaptiveTlabSizer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // T5.5.1 — TlabPressureTracker: per-thread, event-driven adaptive sizing
 // ---------------------------------------------------------------------------
 
 /// T5.5.1 — Per-thread allocation-pressure tracker for TLAB sizing.
 ///
-/// Unlike [`AdaptiveTlabSizer`] (which updates at GC epoch boundaries),
-/// this tracker reacts to each TLAB refill. It records the wall-clock
+/// This tracker reacts to each TLAB refill. It records the wall-clock
 /// time the current TLAB has been in use and the number/size classes
 /// of allocations made against it. When the TLAB is retired the tracker
 /// decides whether the next refill should grow, shrink, or stay the
@@ -337,52 +285,65 @@ impl Default for AdaptiveTlabSizer {
 /// - **Keep** — neither trigger hit.
 pub struct TlabPressureTracker {
     /// Total bytes allocated against the current TLAB since the last refill.
-    pub allocations_since_last_refill: AtomicUsize,
+    ///
+    /// CRIT-1 fix: this was an `AtomicUsize` but the `Tlab` that owns
+    /// the tracker is per-thread (`unsafe impl Send for Tlab`) and is
+    /// only ever borrowed `&mut` from its owning thread. The atomic
+    /// served no purpose and roughly doubled the cost of `Tlab::alloc`.
+    pub allocations_since_last_refill: u64,
     /// Size of the most recent TLAB refill (bytes). Starts at
     /// [`DEFAULT_TLAB_SIZE`] so the first refill uses a sane default.
-    pub last_refill_size: AtomicUsize,
+    pub last_refill_size: usize,
     /// Number of allocation calls against the current TLAB.
-    pub alloc_count: AtomicUsize,
+    pub alloc_count: u64,
     /// Number of allocations > [`LARGE_ALLOC_THRESHOLD`] bytes against
     /// the current TLAB.
-    pub large_alloc_count: AtomicUsize,
+    pub large_alloc_count: u64,
     /// Instant the current TLAB was handed to the thread. Used to
     /// compute wall-clock fill time.
-    refill_started_at: parking_lot::Mutex<Instant>,
+    ///
+    /// CRIT-1 fix: was `parking_lot::Mutex<Instant>`. There is no
+    /// second writer — the field is exclusive to the owning thread.
+    refill_started_at: Instant,
 }
 
 impl TlabPressureTracker {
     /// Create a new tracker, seeded with the default TLAB size.
     pub fn new() -> Self {
         Self {
-            allocations_since_last_refill: AtomicUsize::new(0),
-            last_refill_size: AtomicUsize::new(DEFAULT_TLAB_SIZE),
-            alloc_count: AtomicUsize::new(0),
-            large_alloc_count: AtomicUsize::new(0),
-            refill_started_at: parking_lot::Mutex::new(Instant::now()),
+            allocations_since_last_refill: 0,
+            last_refill_size: DEFAULT_TLAB_SIZE,
+            alloc_count: 0,
+            large_alloc_count: 0,
+            refill_started_at: Instant::now(),
         }
     }
 
     /// Record one allocation of `size` bytes against the current TLAB.
+    ///
+    /// Note: `Tlab::alloc` inlines these field updates directly rather
+    /// than calling through this helper, so that the bump fast path
+    /// avoids any function-call boundary. This method remains for
+    /// callers that want to record allocations outside `Tlab::alloc`
+    /// (e.g. tests, slow-path bookkeeping).
     #[inline]
-    pub fn record_allocation(&self, size: usize) {
-        self.allocations_since_last_refill
-            .fetch_add(size, Ordering::Relaxed);
-        self.alloc_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_allocation(&mut self, size: usize) {
+        self.allocations_since_last_refill += size as u64;
+        self.alloc_count += 1;
         if size > LARGE_ALLOC_THRESHOLD {
-            self.large_alloc_count.fetch_add(1, Ordering::Relaxed);
+            self.large_alloc_count += 1;
         }
     }
 
     /// Mark the beginning of a new TLAB lifetime. Call this after a
     /// refill so that the next call to [`next_refill_size`] can measure
     /// how long the just-retired TLAB was in use.
-    pub fn begin_refill(&self, refill_size: usize) {
-        self.last_refill_size.store(refill_size, Ordering::Relaxed);
-        self.allocations_since_last_refill.store(0, Ordering::Relaxed);
-        self.alloc_count.store(0, Ordering::Relaxed);
-        self.large_alloc_count.store(0, Ordering::Relaxed);
-        *self.refill_started_at.lock() = Instant::now();
+    pub fn begin_refill(&mut self, refill_size: usize) {
+        self.last_refill_size = refill_size;
+        self.allocations_since_last_refill = 0;
+        self.alloc_count = 0;
+        self.large_alloc_count = 0;
+        self.refill_started_at = Instant::now();
     }
 
     /// Compute the next TLAB refill size based on the heuristic.
@@ -395,14 +356,10 @@ impl TlabPressureTracker {
     /// The returned value is guaranteed to satisfy
     /// `MIN_TLAB_SIZE <= size <= MAX_TLAB_SIZE`.
     pub fn next_refill_size(&self) -> usize {
-        let elapsed_ms = self
-            .refill_started_at
-            .lock()
-            .elapsed()
-            .as_millis();
-        let alloc_count = self.alloc_count.load(Ordering::Relaxed);
-        let large_allocs = self.large_alloc_count.load(Ordering::Relaxed);
-        let current = self.last_refill_size.load(Ordering::Relaxed);
+        let elapsed_ms = self.refill_started_at.elapsed().as_millis();
+        let alloc_count = self.alloc_count as usize;
+        let large_allocs = self.large_alloc_count as usize;
+        let current = self.last_refill_size;
 
         // Grow when: fast fill OR few-but-large allocations dominated.
         let grow = elapsed_ms < FAST_REFILL_THRESHOLD_MS
@@ -434,17 +391,11 @@ impl std::fmt::Debug for TlabPressureTracker {
         f.debug_struct("TlabPressureTracker")
             .field(
                 "allocations_since_last_refill",
-                &self.allocations_since_last_refill.load(Ordering::Relaxed),
+                &self.allocations_since_last_refill,
             )
-            .field(
-                "last_refill_size",
-                &self.last_refill_size.load(Ordering::Relaxed),
-            )
-            .field("alloc_count", &self.alloc_count.load(Ordering::Relaxed))
-            .field(
-                "large_alloc_count",
-                &self.large_alloc_count.load(Ordering::Relaxed),
-            )
+            .field("last_refill_size", &self.last_refill_size)
+            .field("alloc_count", &self.alloc_count)
+            .field("large_alloc_count", &self.large_alloc_count)
             .finish()
     }
 }
@@ -533,29 +484,23 @@ mod tests {
     #[test]
     fn pressure_tracker_defaults_to_default_size() {
         let t = TlabPressureTracker::new();
-        assert_eq!(
-            t.last_refill_size.load(Ordering::Relaxed),
-            DEFAULT_TLAB_SIZE
-        );
-        assert_eq!(t.allocations_since_last_refill.load(Ordering::Relaxed), 0);
+        assert_eq!(t.last_refill_size, DEFAULT_TLAB_SIZE);
+        assert_eq!(t.allocations_since_last_refill, 0);
     }
 
     #[test]
     fn pressure_tracker_records_allocations() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.record_allocation(64);
         t.record_allocation(2048); // > LARGE_ALLOC_THRESHOLD
-        assert_eq!(
-            t.allocations_since_last_refill.load(Ordering::Relaxed),
-            64 + 2048
-        );
-        assert_eq!(t.alloc_count.load(Ordering::Relaxed), 2);
-        assert_eq!(t.large_alloc_count.load(Ordering::Relaxed), 1);
+        assert_eq!(t.allocations_since_last_refill, 64 + 2048);
+        assert_eq!(t.alloc_count, 2);
+        assert_eq!(t.large_alloc_count, 1);
     }
 
     #[test]
     fn pressure_tracker_doubles_on_few_large_allocs() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(64 * 1024); // start at 64 KB
         // A handful of large allocations → high pressure.
         for _ in 0..4 {
@@ -569,7 +514,7 @@ mod tests {
 
     #[test]
     fn pressure_tracker_doubles_on_fast_refill() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(32 * 1024);
         // Simulate many allocations but start-time stays recent → elapsed < 1ms.
         for _ in 0..200 {
@@ -582,7 +527,7 @@ mod tests {
 
     #[test]
     fn pressure_tracker_halves_on_few_allocations() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(64 * 1024);
         // Only 2 allocations over the window → shrink.
         t.record_allocation(64);
@@ -595,7 +540,7 @@ mod tests {
 
     #[test]
     fn pressure_tracker_respects_max_cap() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(MAX_TLAB_SIZE);
         for _ in 0..2 {
             t.record_allocation(512);
@@ -636,7 +581,7 @@ mod tests {
     fn t19_min_cap_floor_respected() {
         // Pressure tracker must not undercut MIN_TLAB_SIZE.
         assert_eq!(min_tlab_size(), 8 * 1024);
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(MIN_TLAB_SIZE);
         t.record_allocation(16);
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -648,7 +593,7 @@ mod tests {
         // Simulate the allocation-storm pattern: 2 tiny objects
         // per iteration, 10 k iterations, nearly zero wall clock.
         // The pressure tracker should grow the TLAB at least twice.
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(64 * 1024);
         // Fast-fill: elapsed_ms < 1 → grow to 128 KB.
         for _ in 0..500 {
@@ -671,7 +616,7 @@ mod tests {
         // after repeated fast refills. This is the adaptive target
         // the T19.3.G1 fix requires so KC26 static-init doesn't
         // refill every ~3 ms.
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         let mut size = MIN_TLAB_SIZE;
         t.begin_refill(size);
         // Each loop iteration models filling a TLAB and asking for
@@ -726,7 +671,7 @@ mod tests {
         // If a thread goes idle (alloc_count = 1) the TLAB must
         // shrink toward MIN so we don't hold 1 MB of arena per
         // sleeping thread.
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(MAX_TLAB_SIZE);
         t.record_allocation(16);
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -752,22 +697,22 @@ mod tests {
         // begin_refill must reset the fill-time clock: the timer
         // recorded before the second begin_refill must not leak into
         // the window the tracker measures after it.
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(MIN_TLAB_SIZE);
         std::thread::sleep(std::time::Duration::from_millis(2));
         // The second begin_refill snapshot must capture a fresh
         // Instant; fill-time elapsed is measured from that snapshot
         // and the counters reset to zero.
         t.begin_refill(64 * 1024);
-        assert_eq!(t.alloc_count.load(Ordering::Relaxed), 0);
-        assert_eq!(t.large_alloc_count.load(Ordering::Relaxed), 0);
+        assert_eq!(t.alloc_count, 0);
+        assert_eq!(t.large_alloc_count, 0);
         // A second begin_refill must also reset last_refill_size.
-        assert_eq!(t.last_refill_size.load(Ordering::Relaxed), 64 * 1024);
+        assert_eq!(t.last_refill_size, 64 * 1024);
     }
 
     #[test]
     fn pressure_tracker_respects_min_floor() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.begin_refill(MIN_TLAB_SIZE);
         t.record_allocation(16); // one small alloc → shrink trigger
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -777,13 +722,13 @@ mod tests {
 
     #[test]
     fn pressure_tracker_begin_refill_resets_counters() {
-        let t = TlabPressureTracker::new();
+        let mut t = TlabPressureTracker::new();
         t.record_allocation(128);
         t.record_allocation(128);
         t.begin_refill(16 * 1024);
-        assert_eq!(t.allocations_since_last_refill.load(Ordering::Relaxed), 0);
-        assert_eq!(t.alloc_count.load(Ordering::Relaxed), 0);
-        assert_eq!(t.large_alloc_count.load(Ordering::Relaxed), 0);
-        assert_eq!(t.last_refill_size.load(Ordering::Relaxed), 16 * 1024);
+        assert_eq!(t.allocations_since_last_refill, 0);
+        assert_eq!(t.alloc_count, 0);
+        assert_eq!(t.large_alloc_count, 0);
+        assert_eq!(t.last_refill_size, 16 * 1024);
     }
 }

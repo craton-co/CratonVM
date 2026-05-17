@@ -164,6 +164,108 @@ fn native_nano_time() {
 }
 
 // ---------------------------------------------------------------------------
+// PrintStream.print(J)V / println(J)V — CompactValue tag-erasure regression.
+//
+// `bench/nbody.java` ran for ~73 seconds of wall time and printed
+// `Time: 0 ms`. Tracing showed:
+//   - `System.currentTimeMillis()` correctly returned distinct epoch millis
+//     on both calls,
+//   - `lsub` correctly computed the delta (~95 sec),
+//   - `lstore 4` / `lload 4` round-tripped the long,
+//   - but `invokevirtual PrintStream.print(J)V` arrived at the native
+//     with `args[1] = Value::Double(<denormal>)`, not `Value::Long(delta)`.
+//
+// Root cause: `CompactValue::long(v)` stores the long as untagged raw bits
+// (see `types/src/compact_value.rs::pub fn long` — `tag()` returns Double
+// for it). `invokevirtual_cached` pops args with `pop_unchecked()`
+// (= `to_value()`), which trusts the tag and yields `Value::Double` with
+// the long's bits reinterpreted as f64. `native_print_long` only matched
+// `Some(Value::Long(v))` and silently fell through to `0`.
+//
+// The fix in `native-builtins/src/lib.rs::native_print_long` /
+// `native_println_long` accepts `Value::Double` and recovers the raw
+// long bits via `d.to_bits() as i64`. The two tests below pin that fix.
+// (The deeper invoke-arg-popping bug is a separate, orchestrator-owned
+// `vm_exec.rs` change.)
+mod print_long_compact_tag_regression {
+    use rustjvm_native_api::NativeMethodRegistry;
+    use rustjvm_vm::config::VmConfig;
+    use rustjvm_vm::types::Value;
+    use rustjvm_vm::vm::NativeContextImpl;
+    use rustjvm_vm::{ClassId, JvmThread, SharedVm, ThreadId};
+    use std::sync::Arc;
+
+    fn run_print(method: &str, arg: Value) -> Vec<String> {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let mut registry = NativeMethodRegistry::new();
+        rustjvm_native_builtins::register_essential_natives(&mut registry);
+        let callback = registry
+            .find("java/io/PrintStream", method, "(J)V")
+            .unwrap_or_else(|| panic!("PrintStream.{method}(J)V must be registered"));
+        let mut ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        let args = [Value::Object(Some(dummy_ps)), arg];
+        callback(&mut ctx, &args).expect("native should not error");
+        thread.printed_lines.clone()
+    }
+
+    /// `print(J)V` with a Double-tagged arg (CompactValue::long round-trip)
+    /// must print the decimal long, not `0` or a denormal float.
+    #[test]
+    fn print_long_recovers_long_bits_from_double_tagged_arg() {
+        // 94_423 ms = a typical nbody-style elapsed delta in millis.
+        let bits: i64 = 94_423;
+        let lines = run_print("print", Value::Double(f64::from_bits(bits as u64)));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("94423"),
+            "Double-tagged long arg must print decimal long, got {lines:?}"
+        );
+    }
+
+    /// Same for `println(J)V` — the print path used by
+    /// `System.out.println(System.currentTimeMillis())`.
+    #[test]
+    fn println_long_recovers_long_bits_from_double_tagged_arg() {
+        // Mid-2026 epoch millis (41-bit value, doesn't fit in i32).
+        let bits: i64 = 1_778_976_926_542;
+        let lines = run_print("println", Value::Double(f64::from_bits(bits as u64)));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("1778976926542"),
+            "Double-tagged long arg must println decimal long, got {lines:?}"
+        );
+    }
+
+    /// Sanity: a properly-tagged `Value::Long(v)` is still handled.
+    #[test]
+    fn print_long_still_handles_long_tagged_arg() {
+        let lines = run_print("print", Value::Long(-42));
+        assert_eq!(lines.last().map(String::as_str), Some("-42"));
+    }
+
+    /// Sanity: simulates the exact symptom from `bench/nbody.java` —
+    /// `currentTimeMillis()` returns two distinct values; their delta
+    /// (after `CompactValue::long` round-trip) lands as `Value::Double`
+    /// in the print arg, and must still print as a positive elapsed
+    /// millis count.
+    #[test]
+    fn nbody_elapsed_delta_print_round_trip() {
+        let t0: i64 = 1_778_975_441_124;
+        let t1: i64 = 1_778_975_549_372;
+        let delta = t1 - t0;
+        assert_eq!(delta, 108_248);
+        let arg = Value::Double(f64::from_bits(delta as u64));
+        let lines = run_print("print", arg);
+        assert_eq!(lines.last().map(String::as_str), Some("108248"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // JNI name mangling unit tests
 // ---------------------------------------------------------------------------
 
