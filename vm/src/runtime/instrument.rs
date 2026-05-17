@@ -211,6 +211,10 @@ pub fn approximate_object_size(
                 aligned as i64
             }
         },
+        // Round-9 GC fix: humongous continuation regions get a filler header.
+        // Instrumentation should report the region body bytes (we don't have
+        // access to region size here so report header-only as a best effort).
+        ObjectKind::HumongousFiller => 0,
     };
     let total = header + body;
     // Guarantee strictly positive — even a zero-length empty array has

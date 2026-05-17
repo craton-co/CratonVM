@@ -38,9 +38,9 @@ regex = "1"
 # (fast, DFA) and only fall back to `fancy-regex` (NFA + backtracking) when
 # the simpler engine rejects the pattern.
 fancy-regex = "0.13"
-parking_lot = "0.12"
+parking_lot.workspace = true
 # WP4.2: VarHandle metadata side-table.
-rustc-hash = "1.1"
+rustc-hash.workspace = true
 # Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 native-tls = "0.2"

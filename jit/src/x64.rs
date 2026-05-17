@@ -3676,7 +3676,13 @@ impl Compiler {
         self.buf.emit_byte(0xD6);
         // ModRM r/m=101 (RBP), reg=xmm&7.
         let reg = xmm & 7;
-        if (-128..=127).contains(&offset) {
+        // Round-9 LOW fix: mirror the `(-127..=128)` guard from
+        // `modrm_rbp_disp`. `offset` is the positive depth-from-RBP;
+        // the disp byte stores `-offset` as i8, so we need
+        // `-offset` in `-128..=127`, i.e. `offset` in `-127..=128`.
+        // The prior `(-128..=127)` was off-by-one (round-8 fixed it
+        // in modrm_rbp_disp but missed these MOVQ helpers).
+        if (-127..=128).contains(&offset) {
             // mod=01, disp8.  (Matches modrm_rbp_disp encoding semantics.)
             self.buf.emit_byte(0x45 | (reg << 3));
             self.buf.emit_byte((-offset) as u8); // Cast: x86-64 immediate encoding
@@ -3703,7 +3709,9 @@ impl Compiler {
         self.buf.emit_byte(0x0F);
         self.buf.emit_byte(0x7E);
         let reg = xmm & 7;
-        if (-128..=127).contains(&offset) {
+        // Round-9 LOW fix: see `emit_movq_mem_rbp_from_xmm` —
+        // mirrors the `(-127..=128)` guard from `modrm_rbp_disp`.
+        if (-127..=128).contains(&offset) {
             self.buf.emit_byte(0x45 | (reg << 3));
             self.buf.emit_byte((-offset) as u8); // Cast: x86-64 immediate encoding
         } else {
@@ -7358,6 +7366,31 @@ impl Compiler {
         self.null_check_store_stubs.push(patch_offset);
     }
 
+    /// Round-9 HIGH fix (asymmetric coverage): emit an inline null check
+    /// on the array receiver (assumed already in RAX) for an inline
+    /// array-LOAD opcode (iaload / aaload / baload / caload / saload /
+    /// laload / faload / daload). The round-8 stub covered only stores;
+    /// loads still relied on the page-fault path that
+    /// `emit_null_check_array_store`'s doc rightly calls out as broken
+    /// (the signal handler at `vm/src/runtime/crash_handler.rs` re-raises
+    /// rather than throwing NPE, killing the VM).
+    ///
+    /// Loads have identical pre-state to stores (`RAX = array_ptr` at
+    /// the bounds-check site) and the desired failure outcome is the
+    /// same — set `JIT_PENDING_NPE`, deopt out with `RAX = i64::MIN`,
+    /// run the epilogue. We therefore reuse the SAME shared stub by
+    /// pushing the JZ patch offset into the same `null_check_store_stubs`
+    /// vector; both loads and stores branch to it.
+    fn emit_null_check_array_load(&mut self) {
+        // TEST RAX, RAX  (48 85 C0)
+        self.buf.emit(&[0x48, 0x85, 0xC0]);
+        // JZ rel32 → shared null-check stub (patched later)
+        self.buf.emit(&[0x0F, 0x84]);
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+        self.null_check_store_stubs.push(patch_offset);
+    }
+
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
     ///
     /// Loads array length from header offset 12, compares index (unsigned) against length.
@@ -7600,6 +7633,17 @@ impl Compiler {
     /// add a dedicated `set_npe_and_return` helper to keep this change
     /// surface tiny — the `bastore` helper short-circuits on null after
     /// setting the flag, so the call has no other side effects.
+    ///
+    /// ABI CONTRACT (round-9 jit HIGH fix, audit `round9-jit.md`): this
+    /// stub depends on `helpers.bastore` accepting `(array_ptr=0, index=?,
+    /// val=?)` and returning without dereferencing — only `array_ptr` is
+    /// explicitly zeroed below (the other two argument registers retain
+    /// whatever value the original inline-store codegen left in them, which
+    /// may be poison). The helper's matching contract is documented inline
+    /// at `vm/src/jit/helpers.rs::jit_bastore`: it MUST handle `array_ptr
+    /// == 0` by setting the pending-NPE flag and returning WITHOUT reading
+    /// `index` or `val`. If either the helper signature or its null-guard
+    /// short-circuit changes, update both sites in lock-step.
     fn emit_null_check_store_stubs(&mut self) {
         if self.null_check_store_stubs.is_empty() {
             return;
@@ -8588,6 +8632,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §iaload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     self.emit_int_aload_regs();
                     self.push_from_rax();
@@ -8600,6 +8646,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §aaload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     self.emit_ref_aload_regs();
                     self.push_from_rax();
@@ -8614,6 +8662,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §laload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     self.emit_long_aload_regs();
                     self.push_from_rax();
@@ -8626,6 +8676,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §faload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     // Float is 4 bytes, same as int; value is stored as bit pattern
                     self.emit_int_aload_regs();
@@ -8639,6 +8691,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §daload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     // Double is 8 bytes, same as long; value is stored as bit pattern
                     self.emit_long_aload_regs();
@@ -8652,6 +8706,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §baload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     self.emit_byte_aload_regs();
                     self.push_from_rax();
@@ -8664,6 +8720,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §caload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     self.emit_char_aload_regs();
                     self.push_from_rax();
@@ -8676,6 +8734,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-9 HIGH fix: NPE on null array (JVMS §saload).
+                    self.emit_null_check_array_load();
                     self.emit_bounds_check(pc);
                     self.emit_short_aload_regs();
                     self.push_from_rax();
@@ -10597,13 +10657,16 @@ impl Compiler {
                             // Round-8 Bug 8 — branchless Math.min(int,int) /
                             // Math.max(int,int) via CMOV. Pop b then a (a is
                             // the deeper operand, the leftmost arg in the JLS
-                            // signature). Compare EAX (a) against ECX (b); on
-                            // min we keep b in EAX iff b < a (CMOVL EAX, ECX
-                            // means "if SF≠OF after `cmp eax,ecx`, load ECX
-                            // into EAX" — that fires when ECX < EAX, i.e.
-                            // when b < a, which is exactly the case where
-                            // min(a,b) == b). The max variant uses CMOVG with
-                            // the same operand layout.
+                            // signature). After `CMP EAX, ECX` (a vs b):
+                            //   * CMOVL EAX, ECX fires when `a < b` and
+                            //     overwrites EAX (=a) with ECX (=b) — i.e.
+                            //     keeps the LARGER value in EAX. This is MAX.
+                            //   * CMOVG EAX, ECX fires when `a > b` and
+                            //     overwrites EAX (=a) with ECX (=b) — i.e.
+                            //     keeps the SMALLER value in EAX. This is MIN.
+                            // Round-9 CRIT fix: the previous version had these
+                            // two swapped, so `Math.min(3, 5)` returned 5 and
+                            // `Math.max(3, 5)` returned 3.
                             let b_slot = self.pop_stack();
                             let a_slot = self.pop_stack();
                             self.load_slot_to_reg(RAX, a_slot);
@@ -10611,9 +10674,9 @@ impl Compiler {
                             // CMP EAX, ECX — sets flags for signed compare.
                             self.emit_cmp_r32_r32(RAX, RCX);
                             let cc = if callee_entry == super::MATH_MIN_INT_INTRINSIC {
-                                0x4Cu8 // CMOVL — load b iff b < a (min)
+                                0x4Fu8 // CMOVG — if a > b, replace a with b (keep smaller)
                             } else {
-                                0x4Fu8 // CMOVG — load b iff b > a (max)
+                                0x4Cu8 // CMOVL — if a < b, replace a with b (keep larger)
                             };
                             // CMOVcc EAX, ECX (32-bit, no REX.W): 0F 4c C1
                             self.buf.emit(&[0x0F, cc, 0xC1]);
@@ -10624,6 +10687,8 @@ impl Compiler {
                             // Round-8 Bug 8 — 64-bit Math.min(long,long) /
                             // Math.max(long,long) via REX.W CMP + CMOV. Same
                             // semantics as the int variants but 64-bit.
+                            // Round-9 CRIT fix: opcodes were swapped (see int
+                            // variant above for the full rationale).
                             let b_slot = self.pop_stack();
                             let a_slot = self.pop_stack();
                             self.load_slot_to_reg(RAX, a_slot);
@@ -10631,9 +10696,9 @@ impl Compiler {
                             // CMP RAX, RCX (REX.W): 48 39 C8
                             self.buf.emit(&[0x48, 0x39, 0xC8]);
                             let cc = if callee_entry == super::MATH_MIN_LONG_INTRINSIC {
-                                0x4Cu8 // CMOVL
+                                0x4Fu8 // CMOVG — if a > b, replace a with b (keep smaller)
                             } else {
-                                0x4Fu8 // CMOVG
+                                0x4Cu8 // CMOVL — if a < b, replace a with b (keep larger)
                             };
                             // CMOVcc RAX, RCX (REX.W): 48 0F 4c C1
                             self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
@@ -13823,6 +13888,91 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result2 = unsafe { compiled.call(&[input2]) };
         assert!((f64::from_bits(result2 as u64) - std::f64::consts::SQRT_2).abs() < 1e-14); // Cast: JIT ABI convention
+    }
+
+    #[test]
+    fn test_compile_math_min_max_int_intrinsic() {
+        // int min_f(int a, int b) { return Math.min(a, b); }
+        // int max_f(int a, int b) { return Math.max(a, b); }
+        // Bytecode: iload_0 (0x1a), iload_1 (0x1b), invokestatic (0xb8, 0x00, 0x01),
+        //           ireturn (0xac)
+        // Round-9 CRIT regression test for the swapped CMOVL/CMOVG opcodes in
+        // the MATH_MIN_INT_INTRINSIC / MATH_MAX_INT_INTRINSIC arms. Before the
+        // fix, Math.min(3, 5) returned 5 and Math.max(3, 5) returned 3.
+        let code: Vec<u8> = vec![0x1a, 0x1b, 0xb8, 0x00, 0x01, 0xac, 0, 0];
+        let code_len = 6;
+
+        // Math.min variant
+        let compiled_min = compile(
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(),
+            vec![(2, crate::JitDirectCall {
+                entry: crate::MATH_MIN_INT_INTRINSIC,
+                needs_context: false,
+                num_params: 2,
+                return_type: b'I',
+            })],
+            Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let r1 = unsafe { compiled_min.call(&[3, 5]) };
+        assert_eq!(r1, 3, "Math.min(3, 5) must be 3 (was {r1})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let r2 = unsafe { compiled_min.call(&[5, 3]) };
+        assert_eq!(r2, 3, "Math.min(5, 3) must be 3 (was {r2})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let r3 = unsafe { compiled_min.call(&[-7, 4]) };
+        assert_eq!(r3, -7, "Math.min(-7, 4) must be -7 (was {r3})");
+
+        // Math.max variant
+        let compiled_max = compile(
+            &code,
+            code_len,
+            2,
+            2,
+            false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(),
+            vec![(2, crate::JitDirectCall {
+                entry: crate::MATH_MAX_INT_INTRINSIC,
+                needs_context: false,
+                num_params: 2,
+                return_type: b'I',
+            })],
+            Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let m1 = unsafe { compiled_max.call(&[3, 5]) };
+        assert_eq!(m1, 5, "Math.max(3, 5) must be 5 (was {m1})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let m2 = unsafe { compiled_max.call(&[5, 3]) };
+        assert_eq!(m2, 5, "Math.max(5, 3) must be 5 (was {m2})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let m3 = unsafe { compiled_max.call(&[-7, 4]) };
+        assert_eq!(m3, 4, "Math.max(-7, 4) must be 4 (was {m3})");
     }
 
     #[test]

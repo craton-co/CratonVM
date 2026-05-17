@@ -259,16 +259,19 @@ impl Vtable {
     }
 
     /// Get the vtable entry at the given slot index.
+    #[inline]
     pub fn get(&self, slot: usize) -> Option<&VtableEntry> {
         self.entries.get(slot).and_then(|e| e.as_ref())
     }
 
     /// Number of slots in the vtable.
+    #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the vtable is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -281,6 +284,7 @@ impl Vtable {
     }
 
     /// The class ID this vtable belongs to.
+    #[inline]
     pub fn class_id(&self) -> u64 {
         self.class_id
     }
@@ -354,6 +358,7 @@ impl Itable {
     /// CRIT — zero allocation. The fast-path key is a 128-bit
     /// `(class_id, fxhash(name)^fxhash(descriptor))` derived directly
     /// from the input `&str` slices.
+    #[inline]
     pub fn lookup(
         &self,
         interface_class_id: u64,

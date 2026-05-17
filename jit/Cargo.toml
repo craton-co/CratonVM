@@ -13,8 +13,8 @@ categories.workspace = true
 rustjvm-types = { path = "../types" }
 rustjvm-reader = { path = "../reader" }
 rustjvm-jit-api = { path = "../jit-api" }
-parking_lot = "0.12"
-rustc-hash = "1.1"
+parking_lot.workspace = true
+rustc-hash.workspace = true
 
 [features]
 vm-tests = []

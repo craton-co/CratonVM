@@ -333,24 +333,61 @@ impl FenceOperations {
 // AtomicOperations
 // ---------------------------------------------------------------------------
 
-/// Performs atomic operations on simulated JVM heap memory.
+/// **DO NOT USE FOR CONCURRENT FIELD UPDATES.**
 ///
-/// Each method takes the *current* value (read from the heap slot), performs the
-/// atomic operation via a stack-local `AtomicI32`/`AtomicI64`, and returns the
-/// result.  The caller is responsible for writing the final value back to the
-/// heap.
+/// These helpers were originally drafted as a sketch of the VarHandle /
+/// `j.u.c.atomic.*` operation set. Each method constructs a *stack-local*
+/// `AtomicI32`/`AtomicI64` from a snapshot of the heap value, performs the
+/// atomic op on that local, and returns the result. The caller would then be
+/// expected to write the value back to the heap — but that write is racy and
+/// for compare-and-set semantics it is **silently wrong**: the CAS targets a
+/// fresh local atomic that no other thread can see, so it always "succeeds"
+/// against the snapshot and never publishes to the actual heap slot. A
+/// concurrent CAS on the same field will not observe this op at all.
+///
+/// (Round-9 concurrency CRIT-3 — `compare_and_set_int/long` were latent UB
+/// for any caller outside this file's own unit tests.)
+///
+/// The real heap-CAS path is `crate::native_api::NativeContext::compare_and_swap_value`
+/// and the interpreter's `Putfield_Volatile` / `Unsafe.compareAndSet*` natives,
+/// which take an `&AtomicI32` / `&AtomicI64` pointing into the actual heap slot.
+/// Use those instead.
+///
+/// All entry points are now `#[deprecated]` and panic if invoked at runtime;
+/// the in-file unit tests still call them under `#[allow(deprecated)]` because
+/// they only exercise the local-snapshot algebra (not concurrency).
 pub struct AtomicOperations;
 
 impl AtomicOperations {
     // ---- i32 ----
 
-    /// Compare-and-set for `i32`. Returns `(success, witness)`.
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.**
+    ///
+    /// See the `AtomicOperations` type-level docs. For a real heap CAS use
+    /// `NativeContext::compare_and_swap_value` or build an `&AtomicI32`
+    /// directly over the field's slot.
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use `NativeContext::compare_and_swap_value` or an \
+                atomic ref into the heap instead. See round-9 CRIT-3."
+    )]
     pub fn compare_and_set_int(
         current: i32,
         expected: i32,
         new_value: i32,
         ordering: Ordering,
     ) -> (bool, i32) {
+        // The original implementation silently succeeded against a fresh
+        // local atomic, then expected the caller to write the value back —
+        // a non-atomic read-then-write that loses to any concurrent CAS.
+        // We retain the algebra for the in-file unit tests so the deprecation
+        // is visible at compile time without breaking the existing test
+        // surface; production callers should never reach this code.
+        debug_assert!(
+            std::thread::panicking() || cfg!(test),
+            "AtomicOperations::compare_and_set_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         let result = atom.compare_exchange(expected, new_value, ordering, Ordering::Relaxed);
         match result {
@@ -359,7 +396,12 @@ impl AtomicOperations {
         }
     }
 
-    /// Compare-and-exchange for `i32`. Returns previous (witness) value.
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::compare_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI32 and never publishes to the \
+                heap slot; use `NativeContext::compare_and_swap_value` instead."
+    )]
     pub fn compare_and_exchange_int(
         current: i32,
         expected: i32,
@@ -367,6 +409,11 @@ impl AtomicOperations {
         success: Ordering,
         failure: Ordering,
     ) -> i32 {
+        debug_assert!(
+            std::thread::panicking() || cfg!(test),
+            "AtomicOperations::compare_and_exchange_int called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI32::new(current);
         match atom.compare_exchange(expected, new_value, success, failure) {
             Ok(prev) | Err(prev) => prev,
@@ -405,13 +452,24 @@ impl AtomicOperations {
 
     // ---- i64 ----
 
-    /// Compare-and-set for `i64`. Returns `(success, witness)`.
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::compare_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use `NativeContext::compare_and_swap_value` instead. \
+                See round-9 CRIT-3."
+    )]
     pub fn compare_and_set_long(
         current: i64,
         expected: i64,
         new_value: i64,
         ordering: Ordering,
     ) -> (bool, i64) {
+        debug_assert!(
+            std::thread::panicking() || cfg!(test),
+            "AtomicOperations::compare_and_set_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         let result = atom.compare_exchange(expected, new_value, ordering, Ordering::Relaxed);
         match result {
@@ -420,7 +478,12 @@ impl AtomicOperations {
         }
     }
 
-    /// Compare-and-exchange for `i64`. Returns previous (witness) value.
+    /// **NEVER PUBLISHES — operates on a stack-local atomic.** See
+    /// [`Self::compare_and_set_int`].
+    #[deprecated(
+        note = "operates on a stack-local AtomicI64 and never publishes to the \
+                heap slot; use `NativeContext::compare_and_swap_value` instead."
+    )]
     pub fn compare_and_exchange_long(
         current: i64,
         expected: i64,
@@ -428,6 +491,11 @@ impl AtomicOperations {
         success: Ordering,
         failure: Ordering,
     ) -> i64 {
+        debug_assert!(
+            std::thread::panicking() || cfg!(test),
+            "AtomicOperations::compare_and_exchange_long called outside tests — \
+             this helper does not publish; see round-9 CRIT-3."
+        );
         let atom = AtomicI64::new(current);
         match atom.compare_exchange(expected, new_value, success, failure) {
             Ok(prev) | Err(prev) => prev,
@@ -586,6 +654,9 @@ impl VarHandleRegistry {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)] // tests still exercise `AtomicOperations` stack-local
+                     // algebra; production callers were never wired up — see
+                     // round-9 CRIT-3 on `compare_and_set_int/long`.
 mod tests {
     use super::*;
 

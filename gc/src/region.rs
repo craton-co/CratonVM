@@ -312,6 +312,33 @@ impl RegionHeap {
         // Any byte handed out by an allocator path is therefore already
         // zero. The previous explicit `write_bytes` here was redundant
         // and costly for humongous objects (multi-MB zero pass twice).
+        //
+        // Round-9 gc CRIT-1: install a HumongousFiller sentinel at the
+        // start of every continuation region so walkers iterate it as a
+        // single dark region instead of decoding zeroed bytes as a chain
+        // of phantom Object headers. The first region (`start`) holds the
+        // real application header at the aligned offset and must not be
+        // touched here.
+        for i in 1..regions_needed {
+            let region_addr = base + (start + i) * self.region_size;
+            if self.regions[start + i].top >= HEADER_SIZE {
+                let filler = ObjectHeader::new(
+                    rustjvm_types::ClassId::new(0),
+                    ObjectKind::HumongousFiller,
+                    ArrayElementType::Reference,
+                    0,
+                    0,
+                    0,
+                );
+                // SAFETY: region_addr is the base of a continuation region
+                // we just claimed; the first HEADER_SIZE bytes are exclusive
+                // to this allocation.
+                unsafe {
+                    std::ptr::write(region_addr as *mut ObjectHeader, filler);
+                }
+            }
+        }
+
         Some(ptr)
     }
 
@@ -801,6 +828,14 @@ fn object_total_size(header: &ObjectHeader) -> usize {
     } else {
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }
+}
+
+/// Round-9 gc CRIT-1: returns true for the synthetic walker sentinel that
+/// covers a humongous-continuation region. Walkers MUST break out of the
+/// per-region iteration when they observe this.
+#[inline]
+fn is_humongous_filler(header: &ObjectHeader) -> bool {
+    matches!(header.kind, ObjectKind::HumongousFiller)
 }
 
 /// Scan an object's reference fields, returning addresses of referenced objects.

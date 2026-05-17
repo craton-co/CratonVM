@@ -1908,18 +1908,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .set_interrupted_flag(tid, pre_interrupted.clone());
 
         let thread_obj_for_spawn = thread_obj;
-        // Child Java threads get the same native stack budget as the main-vm
-        // thread in `vm-cli/src/main.rs`. HotSpot's `-Xss` default is 1-2 MiB
-        // depending on platform; we use 2 MiB. The previous 64 MiB reservation
-        // was 64x HotSpot for no measured benefit and exploded VSZ on workloads
-        // that spawn many threads (web servers, GC workers, etc.). Stack size
-        // honours `RUST_MIN_STACK` so any test or workload that genuinely needs
-        // more (e.g. recursive parser combinators) can override. A future
-        // `-Xss` CLI flag should drive this knob instead of the env var.
+        // Round-9 misc HIGH fix (audit `round9-misc.md`): this knob sizes the
+        // *native Rust stack* for the carrier OS thread that hosts a Java
+        // thread — it is NOT the Java `-Xss` budget. CratonVM's interpreter
+        // recurses in Rust at ~2-4 KiB per Java frame (recursive
+        // `execute_frame` + invoke dispatch + the JIT entry trampoline), so a
+        // 2 MiB native stack maps to roughly 500-1000 Java frames before
+        // overflow. That blows up on real-world clinit cascades — Quarkus,
+        // WildFly, and the JDK module loader all push past 1000 nested
+        // <clinit> frames during cold start. Use Rust's 8 MiB default to give
+        // the recursive interpreter enough headroom; this still honours
+        // `RUST_MIN_STACK` for tests that want to dial it down. A future
+        // `-Xss` CLI flag will gate the *Java* stack-depth limit
+        // (`max_stack_depth` in `JvmConfig`) independently of this native
+        // budget.
         let child_stack_size = std::env::var("RUST_MIN_STACK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(2 * 1024 * 1024);
+            .unwrap_or(8 * 1024 * 1024);
         let thread_name_for_builder = name.clone();
         let handle = std::thread::Builder::new()
             .name(thread_name_for_builder)

@@ -15,8 +15,8 @@ thiserror.workspace = true
 # SipHash to `parking_lot::RwLock<FxHashMap<Arc<str>, ()>>`. Reads no longer
 # serialize on the global Mutex, and FxHash is ~3-5x faster than SipHash for the
 # short ASCII strings (class names, descriptors) that dominate class loading.
-parking_lot = "0.12"
-rustc-hash = "1.1"
+parking_lot.workspace = true
+rustc-hash.workspace = true
 
 [lints]
 workspace = true

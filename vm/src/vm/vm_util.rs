@@ -558,8 +558,11 @@ fn initialize_class_shared(
                     .unwrap_or_default().as_nanos() as u64;
                 let duration_ns = init_start.elapsed().as_nanos() as u64;
                 let mut jfr = shared.flight_recorder.lock();
-                rustjvm_jfr::builtin::emit_class_load_event(
-                    &mut jfr, &class_name_for_jfr, "app", "app",
+                // Round-9 HIGH-5 fix (2026-05-17): use `_arc` to skip the
+                // per-event `Arc::from(&str)` clone — `class_name_for_jfr`
+                // is already `Arc<str>` (cloned from `Class.name`).
+                rustjvm_jfr::builtin::emit_class_load_event_arc(
+                    &mut jfr, class_name_for_jfr.clone(), "app", "app",
                     now_ns.saturating_sub(duration_ns), duration_ns,
                 );
                 Ok(())
@@ -1021,8 +1024,10 @@ fn initialize_class_shared(
             .unwrap_or_default().as_nanos() as u64;
         let duration_ns = init_start.elapsed().as_nanos() as u64;
         let mut jfr = shared.flight_recorder.lock();
-        rustjvm_jfr::builtin::emit_class_load_event(
-            &mut jfr, &class_name_for_jfr, "app", "app",
+        // Round-9 HIGH-5 fix (2026-05-17): use `_arc` variant — name is
+        // already `Arc<str>` from `Class.name.clone()`.
+        rustjvm_jfr::builtin::emit_class_load_event_arc(
+            &mut jfr, class_name_for_jfr.clone(), "app", "app",
             now_ns.saturating_sub(duration_ns), duration_ns,
         );
         Ok(())

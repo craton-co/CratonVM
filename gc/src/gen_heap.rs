@@ -564,9 +564,12 @@ impl GenerationalHeap {
 
         // Validate the discriminated-union tag. Object/Array are the only
         // valid kinds; anything else means we landed in the middle of a
-        // field or in stale memory.
+        // field or in stale memory. HumongousFiller is a synthetic
+        // walker-sentinel (round-9 gc CRIT-1) and never represents a
+        // real object reachable from a root.
         match header.kind {
             ObjectKind::Object | ObjectKind::Array => {}
+            ObjectKind::HumongousFiller => return None,
         }
         // Cap num_slots at a sanity limit so a stale word can't fool us
         // into "validating" a slot count that would exceed the arena.

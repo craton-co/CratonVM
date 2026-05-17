@@ -2275,7 +2275,13 @@ pub fn emit_physical_memory_event(
     used_size: i64,
     time_ns: u64,
 ) {
-    if !crate::is_enabled() { return; }
+    // Round-9 CRIT-2 fix (2026-05-17): PhysicalMemory is a one-shot startup
+    // event emitted from vm_init for diagnostic/posterity purposes — it
+    // records host RAM totals to the repository regardless of whether any
+    // recording has been started. The previous `is_enabled()` gate caused
+    // the wired emit to no-op in vm-cli (which never calls start_recording),
+    // making `emit_physical_memory_event` dead code. The repository ingest
+    // path itself is safe for un-recorded pushes; skip the global gate here.
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.PhysicalMemory") {
         // Field order matches registration at builtin.rs line 709:

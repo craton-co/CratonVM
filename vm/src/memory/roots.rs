@@ -160,6 +160,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     address never causes a wrong relocation.
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
 
+    // 15. Round-9 CRIT GC-correctness fix: process-global Integer.valueOf
+    //     (-128..=127) and Boolean.TRUE/FALSE caches. These live in
+    //     `native-builtins/src/lang_math.rs` and previously used
+    //     `thread_local!`, which (a) violated the JLS-mandated
+    //     cross-thread `==` identity for boxed primitives and (b) was
+    //     invisible to the GC root scanner — under a moving collector the
+    //     cached ObjectRefs would point at relocated or reclaimed memory
+    //     after the first compaction.
+    rustjvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
+
     roots
 }
 

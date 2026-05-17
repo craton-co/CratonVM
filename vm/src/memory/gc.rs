@@ -207,6 +207,15 @@ pub fn update_all_roots(
         }
     }
 
+    // 15. Round-9 CRIT GC-correctness fix: re-point the process-global
+    //     Integer.valueOf / Boolean.TRUE/FALSE caches living in
+    //     `native-builtins/src/lang_math.rs`. They are reported as roots
+    //     by `roots.rs` step 15, so the cached objects survive GC — but
+    //     under a moving collector their addresses change and we must
+    //     remap them here, otherwise the next cache lookup returns a
+    //     stale pointer.
+    rustjvm_native_builtins::lang_math::gc_update_value_of_cache_refs(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
 }

@@ -2075,22 +2075,47 @@ pub fn execute(
                 };
                 // Record JFR compilation event — flight_recorder lock taken
                 // *after* the JIT cache write has been released.
+                //
+                // Round-9 cross-cutting LOW-11: the previous implementation
+                // called `format!("{}.{}:{}", ...)` here which allocated a
+                // fresh `String` on every JIT compile. A thread-local scratch
+                // buffer lets us `write!` the formatted key into a reused
+                // allocation, then borrow it as `&str` for the emit call.
+                // The buffer is cleared (not freed) on each entry so capacity
+                // carries across compiles.
                 {
                     let now_ns = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default().as_nanos() as u64; // Cast: duration to u64 nanoseconds
-                    let method_key = format!("{}.{}:{}", class_name_arc, method_name_arc, descriptor_arc);
-                    let mut jfr = shared.flight_recorder.lock();
-                    rustjvm_jfr::builtin::emit_compilation_event(
-                        &mut jfr, &method_key,
-                        1, // compile_id
-                        2, // tier (C2-equivalent)
-                        true, // success
-                        false, // not OSR
-                        // Truncation-checked: code_size to i32; JVM method code limited to 64K
-                        i32::try_from(code_size).unwrap_or(i32::MAX), 0, // code_size, inlined_bytes
-                        now_ns, 0, // start_time, duration (not tracked)
-                    );
+                    thread_local! {
+                        static METHOD_KEY_SCRATCH: std::cell::RefCell<String> =
+                            std::cell::RefCell::new(String::with_capacity(256));
+                    }
+                    METHOD_KEY_SCRATCH.with(|cell| {
+                        use std::fmt::Write as _;
+                        let mut buf = cell.borrow_mut();
+                        buf.clear();
+                        // `write!` into a `String` is infallible; discard the
+                        // formatter `Result` rather than `unwrap`-ing it so we
+                        // stay clean under the file-level
+                        // `clippy::unwrap_used = deny`.
+                        let _ = write!(
+                            &mut *buf,
+                            "{}.{}:{}",
+                            class_name_arc, method_name_arc, descriptor_arc,
+                        );
+                        let mut jfr = shared.flight_recorder.lock();
+                        rustjvm_jfr::builtin::emit_compilation_event(
+                            &mut jfr, buf.as_str(),
+                            1, // compile_id
+                            2, // tier (C2-equivalent)
+                            true, // success
+                            false, // not OSR
+                            // Truncation-checked: code_size to i32; JVM method code limited to 64K
+                            i32::try_from(code_size).unwrap_or(i32::MAX), 0, // code_size, inlined_bytes
+                            now_ns, 0, // start_time, duration (not tracked)
+                        );
+                    });
                 }
                 cached_result
             });
@@ -7090,19 +7115,19 @@ fn execute_instruction(
                     format!("monitorexit in {cls}.{mth} pc={pc_snap}")
                 })?
             };
-            // Round-7 HIGH (vm #5): when JFR is currently enabled, consult
-            // the per-monitor JFR-enter-recorded flag *before* releasing
-            // the monitor — the release zeroes the flag atomically with the
-            // entry_count → 0 transition. The result is intentionally
-            // ignored today (no paired exit event is emitted yet), but the
-            // gate forces any future `emit_monitor_exit_event` to consult
-            // the enter-time snapshot rather than re-reading the global JFR
-            // flag, which may have flipped on mid-critical-section and
-            // would otherwise produce an orphan exit event without a
-            // matching enter event in the flight recorder.
-            if rustjvm_jfr::is_enabled() {
-                let _ = shared.monitors.jfr_enter_recorded(obj_ref);
-            }
+            // Round-9 JFR MED-6 fix (audit `round9-jfr.md`): the previous
+            // code read `monitors.jfr_enter_recorded(obj_ref)` and discarded
+            // the result with `let _ =`, justifying it as a "load-bearing
+            // probe for a future exit-event emission". That justification was
+            // wrong on two counts: (a) the read happens behind
+            // `is_enabled()`, so disabling JFR mid-critical-section would
+            // have skipped the probe entirely (defeating its stated purpose),
+            // and (b) the monitor table's per-entry flag is reset atomically
+            // by `exit()` on the entry_count→0 transition anyway. The probe
+            // produced zero side effects and only paid for an extra lock
+            // acquire. If/when a paired `monitorexit` event is wired in, the
+            // emission site must consult the snapshot itself — there's no
+            // value in a dead pre-read here.
             shared.monitors.exit(obj_ref, thread.thread_id)?;
         }
 
@@ -11474,19 +11499,37 @@ fn try_osr(
     }));
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
-    // Check for pending Java exception from JIT dispatch callbacks.
-    if let Some(_exc) = crate::jit::helpers::take_jit_pending_exception() {
-        // OSR path cannot propagate exceptions directly; return None to
-        // fall back to the interpreter which will handle the exception.
+    // Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): the previous OSR
+    // exit drain *consumed* the pending-exception, pending-NPE, and
+    // pending-AIOOBE flags with `let _ =` / `if let Some(_exc)` on the
+    // (false) assumption that falling back to the interpreter "re-executes
+    // from the interpreter PC, which will issue the same null-deref / oob
+    // access and surface the exception". That assumption is wrong: OSR
+    // hands control back at the back-edge PC, NOT at the JIT helper's PC,
+    // so the failing access is never re-executed and the exception was
+    // silently lost (visible only as a wrong-result or downstream NPE at
+    // an unrelated site).
+    //
+    // The fix: take the flags so we can inspect them, but if any were set,
+    // re-stash them onto the same TLS slot via the new
+    // `stash_jit_pending_*` helpers. The interpreter dispatch loop drains
+    // `take_jit_pending_exception` and the NPE / AIOOBE flags at the next
+    // JIT helper return (see lines ~2249 / ~2267 and the post-JIT path at
+    // ~12696). Re-stashing preserves the exception across the
+    // OSR→interpreter handoff without expanding the OSR signature
+    // (`Option<Option<Value>>`, no error channel).
+    if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+        crate::jit::helpers::stash_jit_pending_exception(exc);
         return None;
     }
-    // Clear any pending NPE / AIOOBE from a JIT array helper. The OSR fast
-    // path cannot route them directly; falling back to the interpreter
-    // (return None) re-executes from the interpreter PC, which will issue
-    // the same null-deref / oob access and surface the exception through
-    // the interpreter's own throw path.
-    let _ = crate::jit::helpers::take_jit_pending_npe();
-    let _ = crate::jit::helpers::take_jit_pending_aioobe();
+    if crate::jit::helpers::take_jit_pending_npe() {
+        crate::jit::helpers::stash_jit_pending_npe();
+        return None;
+    }
+    if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+        crate::jit::helpers::stash_jit_pending_aioobe(index, length);
+        return None;
+    }
     let result_i64 = match result_i64 {
         Ok(Some(v)) => v,
         Ok(None) => return None,

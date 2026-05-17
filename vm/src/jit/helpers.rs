@@ -87,6 +87,31 @@ fn set_jit_pending_exception(exc: ObjectRef) {
     JIT_PENDING_EXCEPTION.with(|e| e.set(Some(exc)));
 }
 
+/// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
+/// taken pending Java exception. Used by `try_osr` when the OSR return path
+/// drained the flag but cannot return an error from its own signature — the
+/// exception must be re-posted so the interpreter dispatch loop drains it on
+/// the next iteration via `take_jit_pending_exception`. Crate-pub because
+/// only the OSR entry path should use it; ordinary JIT helpers set the flag
+/// directly via the private `set_jit_pending_exception` above.
+pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
+    set_jit_pending_exception(exc);
+}
+
+/// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
+/// taken pending-NPE flag. See `stash_jit_pending_exception` for the OSR
+/// drain-without-route rationale.
+pub(crate) fn stash_jit_pending_npe() {
+    set_jit_pending_npe();
+}
+
+/// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
+/// taken pending-AIOOBE payload. See `stash_jit_pending_exception` for the
+/// OSR drain-without-route rationale.
+pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
+    JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+}
+
 /// Take (consume) any pending Java exception set by JIT dispatch.
 /// Returns `Some(ObjectRef)` if an exception was pending, `None` otherwise.
 pub fn take_jit_pending_exception() -> Option<ObjectRef> {
@@ -726,6 +751,19 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
 // pointer to a byte/boolean array object. Null aborts the process — see comment.
 // Out-of-bounds is handled gracefully.
+//
+// Round-9 jit HIGH fix (audit `round9-jit.md`, fragile-ABI item): this helper
+// is part of an undocumented ABI contract relied on by the inline null-check
+// failure stub in `jit/src/x64.rs::emit_null_check_store_stubs`. That stub
+// calls `helpers.bastore(0, 0, 0)` after zeroing only the `array_ptr` argument
+// register — `index` and `val` are left undefined / zeroed only by happenstance
+// of the calling convention's volatile-register set. THIS HELPER MUST handle
+// `array_ptr == 0` by setting the pending-NPE flag and returning WITHOUT
+// reading `index` or `val`, regardless of their content. The null-guard short
+// circuit below is therefore load-bearing for that codegen path; do not move
+// any read of `index` or `val` above the null check, do not "optimize" the
+// null check away even if profiling shows nulls are rare, and do not change
+// the signature without also updating `emit_null_check_store_stubs` to match.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §bastore: throw NullPointerException on null array reference.
