@@ -12169,52 +12169,68 @@ fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
 }
 
 /// Per-object side store for fields stored at a synthetic offset.  Keyed
-/// by `(ObjectRef-as-usize, offset)` so each receiver has its own slot and
+/// by `(identity_hash, offset)` so each receiver has its own slot and
 /// CAS sees a consistent value across the load and the compare-and-store.
 ///
 /// Round-8 Bug 4: migrated from `std::sync::Mutex<HashMap<...>>` (poisoning
 /// + SipHash overhead) to `parking_lot::Mutex<FxHashMap<...>>`. Keys are
-/// derived from VM-internal pointers and synthetic offsets, never from
-/// untrusted user input, so DoS-resistance via SipHash is not required.
+/// derived from VM-internal identity hashes and synthetic offsets, never
+/// from untrusted user input, so DoS-resistance via SipHash is not required.
+///
+/// Round-9 native-builtins HIGH (Bug 7): the key changed from
+/// `(ObjectRef-as-usize, offset)` to `(i32-identity-hash, usize-offset)`.
+/// Round-8 fixed only the *Mutex* type; the raw-pointer key remained
+/// vulnerable to the same GC-relocation aliasing that took out the
+/// LongAdder cells — after a moving GC, two unrelated objects can land at
+/// the same address and silently share a side-store slot. JVM identity
+/// hash is GC-stable, so it is the correct key.
 fn synthetic_field_store()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(usize, usize), Value>>
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(i32, usize), Value>>
 {
     static T: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<(usize, usize), Value>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<(i32, usize), Value>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-#[inline]
-fn obj_key(obj: rustjvm_types::ObjectRef) -> usize {
-    // We only use the address as a hash-map key; never dereferenced here.
-    obj.as_ptr() as usize
-}
-
-pub(crate) fn synthetic_get(obj: rustjvm_types::ObjectRef, offset: usize) -> Value {
+pub(crate) fn synthetic_get(
+    ctx: &mut dyn NativeContext,
+    obj: rustjvm_types::ObjectRef,
+    offset: usize,
+) -> Value {
+    // Round-9 Bug 7: identity hash is GC-stable; raw pointer is not.
+    let id = ctx.identity_hash_code(obj);
     let map = synthetic_field_store().lock();
-    map.get(&(obj_key(obj), offset))
+    map.get(&(id, offset))
         .copied()
         .unwrap_or(Value::Object(None))
 }
 
-pub(crate) fn synthetic_put(obj: rustjvm_types::ObjectRef, offset: usize, val: Value) {
+pub(crate) fn synthetic_put(
+    ctx: &mut dyn NativeContext,
+    obj: rustjvm_types::ObjectRef,
+    offset: usize,
+    val: Value,
+) {
+    let id = ctx.identity_hash_code(obj);
     let mut map = synthetic_field_store().lock();
-    map.insert((obj_key(obj), offset), val);
+    map.insert((id, offset), val);
 }
 
 /// CAS on the synthetic per-object slot.  Returns true on success.  The
 /// expected/new pair may be Object, Int or Long; the comparison is by the
 /// raw bit pattern (Object identity for refs, value for primitives).
 pub(crate) fn synthetic_cas(
+    ctx: &mut dyn NativeContext,
     obj: rustjvm_types::ObjectRef,
     offset: usize,
     expected: Value,
     new_val: Value,
 ) -> bool {
+    let id = ctx.identity_hash_code(obj);
     let mut map = synthetic_field_store().lock();
     let cur = map
-        .get(&(obj_key(obj), offset))
+        .get(&(id, offset))
         .copied()
         .unwrap_or(Value::Object(None));
     let eq = match (cur, expected) {
@@ -12226,7 +12242,7 @@ pub(crate) fn synthetic_cas(
         _ => false,
     };
     if eq {
-        map.insert((obj_key(obj), offset), new_val);
+        map.insert((id, offset), new_val);
     }
     eq
 }
@@ -12245,22 +12261,33 @@ pub(crate) fn synthetic_cas(
 
 // Round-8 Bug 4: migrated from `std::sync::Mutex<HashMap<...>>` (poisoning
 // + SipHash) to `parking_lot::Mutex<FxHashMap<...>>`. Keys are
-// VM-internal (Class mirror ptr + slot tag) so SipHash DoS-resistance is
-// not required. See the cluster-comment above `static_long_store` for
-// the wider rationale.
+// VM-internal (Class mirror identity hash + slot tag) so SipHash
+// DoS-resistance is not required. See the cluster-comment above
+// `static_long_store` for the wider rationale.
+//
+// Round-9 native-builtins HIGH (Bug 7): the key changed from
+// `(Class-mirror-ptr, slot_tag)` to `(i32-identity-hash, slot_tag)`. The
+// raw-pointer key was vulnerable to GC moves — a Class mirror surviving a
+// G1 evacuation lands at a different address, breaking the side-store
+// lookup and making the CAS loop livelock again. Identity hash is
+// GC-stable.
 fn class_atomic_side_store()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(i32, u8), Option<rustjvm_types::ObjectRef>>>
 {
-    // Key: (Class mirror ptr, slot tag). Tag distinguishes the three
-    // slots (reflectionData=0, annotationType=1, annotationData=2).
+    // Key: (Class mirror identity hash, slot tag). Tag distinguishes the
+    // three slots (reflectionData=0, annotationType=1, annotationData=2).
     static T: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<(i32, u8), Option<rustjvm_types::ObjectRef>>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 #[inline]
-fn class_atomic_cas_impl(args: &[Value], slot_tag: u8) -> MethodCallResult {
+fn class_atomic_cas_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    slot_tag: u8,
+) -> MethodCallResult {
     // Static method: args[0]=Class mirror, args[1]=expected, args[2]=new.
     let class_ref = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -12274,7 +12301,8 @@ fn class_atomic_cas_impl(args: &[Value], slot_tag: u8) -> MethodCallResult {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
-    let key = (class_ref.as_ptr() as usize, slot_tag);
+    // Round-9 Bug 7: key by identity hash, not raw pointer.
+    let key = (ctx.identity_hash_code(class_ref), slot_tag);
     let mut map = class_atomic_side_store().lock();
     let cur = map.get(&key).copied().unwrap_or(None);
     if cur == expected {
@@ -12296,7 +12324,8 @@ fn native_class_atomic_cas_reflection_data(
     // the value stored by the CAS. Without this mirror-write the cas
     // succeeds once, then `newReflectionData()`'s `while(true)` loop
     // livelocks forever (T20.RD on WildFly / SportMe bootstrap).
-    let result = class_atomic_cas_impl(args, 0)?;
+    // Round-9 Bug 7: thread ctx through so the side store keys by identity hash.
+    let result = class_atomic_cas_impl(ctx, args, 0)?;
     if let Some(Value::Int(1)) = result {
         if let (Some(Value::Object(Some(class_mirror))), Some(Value::Object(new_soft_ref))) =
             (args.first(), args.get(2))
@@ -12397,8 +12426,9 @@ fn native_class_new_reflection_data(
 
     // 5. Mirror into the cas side store so future casReflectionData
     //    calls observe the current value.
+    // Round-9 Bug 7: key by identity hash, not raw pointer.
     {
-        let key = (this.as_ptr() as usize, 0u8);
+        let key = (ctx.identity_hash_code(this), 0u8);
         let mut map = class_atomic_side_store().lock();
         map.insert(key, Some(soft_ref));
     }
@@ -12407,17 +12437,19 @@ fn native_class_new_reflection_data(
 }
 
 fn native_class_atomic_cas_annotation_type(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    class_atomic_cas_impl(args, 1)
+    // Round-9 Bug 7: ctx is now required for identity-hash keying.
+    class_atomic_cas_impl(ctx, args, 1)
 }
 
 fn native_class_atomic_cas_annotation_data(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    class_atomic_cas_impl(args, 2)
+    // Round-9 Bug 7: ctx is now required for identity-hash keying.
+    class_atomic_cas_impl(ctx, args, 2)
 }
 
 fn native_unsafe_object_field_offset(
@@ -12590,7 +12622,9 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
         }
     };
     if is_synthetic_offset(offset) {
-        let ok = synthetic_cas(obj, offset, expected, new_val);
+        // Round-9 Bug 7: pass ctx so the side store can use a GC-stable
+        // identity hash instead of a raw pointer.
+        let ok = synthetic_cas(ctx, obj, offset, expected, new_val);
         return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
     }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
@@ -12623,7 +12657,9 @@ fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     if is_synthetic_offset(offset) {
-        let ok = synthetic_cas(obj, offset, expected, new_val);
+        // Round-9 Bug 7: pass ctx so the side store can use a GC-stable
+        // identity hash instead of a raw pointer.
+        let ok = synthetic_cas(ctx, obj, offset, expected, new_val);
         return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
     }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
@@ -12719,7 +12755,9 @@ fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // AbstractClassLoaderValue) don't livelock when the field's real heap
     // slot is unknown to our layout.  See `synthetic_offset_for` above.
     if is_synthetic_offset(offset) {
-        let ok = synthetic_cas(obj, offset, expected, new_val);
+        // Round-9 Bug 7: pass ctx so the side store can use a GC-stable
+        // identity hash instead of a raw pointer.
+        let ok = synthetic_cas(ctx, obj, offset, expected, new_val);
         return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
     }
     // ConcurrentHashMap.casTabAt passes byte offsets into an Object[] array,
@@ -12750,7 +12788,7 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
         }
     };
     if is_synthetic_offset(offset) {
-        return Ok(Some(match synthetic_get(obj, offset) {
+        return Ok(Some(match synthetic_get(ctx, obj, offset) {
             Value::Int(v) => Value::Int(v),
             _ => Value::Int(0),
         }));
@@ -12775,7 +12813,7 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
         }
     };
     if is_synthetic_offset(offset) {
-        synthetic_put(obj, offset, val);
+        synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
@@ -12800,7 +12838,7 @@ fn native_unsafe_get_long_volatile(
         }
     };
     if is_synthetic_offset(offset) {
-        return Ok(Some(match synthetic_get(obj, offset) {
+        return Ok(Some(match synthetic_get(ctx, obj, offset) {
             Value::Long(v) => Value::Long(v),
             Value::Int(v) => Value::Long(v as i64),
             _ => Value::Long(0),
@@ -12829,7 +12867,7 @@ fn native_unsafe_put_long_volatile(
         }
     };
     if is_synthetic_offset(offset) {
-        synthetic_put(obj, offset, val);
+        synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
@@ -12854,7 +12892,7 @@ fn native_unsafe_get_object_volatile(
         }
     };
     if is_synthetic_offset(offset) {
-        return Ok(Some(recover_object_arg(synthetic_get(obj, offset))));
+        return Ok(Some(recover_object_arg(synthetic_get(ctx, obj, offset))));
     }
     let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
@@ -12883,7 +12921,7 @@ fn native_unsafe_put_object_volatile(
         }
     };
     if is_synthetic_offset(offset) {
-        synthetic_put(obj, offset, val);
+        synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
@@ -12905,7 +12943,7 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
         }
     };
     if is_synthetic_offset(offset) {
-        return Ok(Some(recover_object_arg(synthetic_get(obj, offset))));
+        return Ok(Some(recover_object_arg(synthetic_get(ctx, obj, offset))));
     }
     let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
@@ -12929,7 +12967,7 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
         }
     };
     if is_synthetic_offset(offset) {
-        synthetic_put(obj, offset, val);
+        synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {

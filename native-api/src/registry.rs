@@ -684,6 +684,83 @@ pub trait NativeContext {
     /// Get the ClassIds of directly implemented/extended interfaces.
     fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId>;
 
+    // -- LinkResolver wiring for Java-side reflection natives -----------
+    //
+    // Round 9 audit fix (HIGH #7): Java-side reflection
+    // (`Class.getDeclaredMethod`, `Class.getMethod`,
+    // `Class.getDeclaredField`, `Class.getField`) re-walks the entire
+    // metadata + hierarchy on every probe. Spring / Hibernate /
+    // ByteBuddy run thousands of identical `(class_id, name, desc)`
+    // probes during cold start. Round-8 wired JNI's `GetMethodID` /
+    // `GetFieldID` into the per-VM `LinkResolver`; these helpers
+    // extend the same cache to the Java-side natives.
+    //
+    // The trait methods are intentionally narrow: probe + insert.
+    // The native code keeps owning the actual hierarchy walk (it has
+    // synthetic-method awareness, ByteBuddy reentrancy guards, and
+    // shim short-circuits that the LinkResolver layer doesn't model).
+    // The default implementations are no-ops so the existing
+    // `MockNativeContext` and other test contexts compile unchanged
+    // and behave as if the cache is permanently empty (correct but
+    // slow — no caching).
+    //
+    // The `index_or_slot` payload is overloaded:
+    //   * for **method** lookups it is the position within the
+    //     declaring class's `methods` vec (matches the JNI shape);
+    //   * for **field** lookups it is the absolute heap slot index
+    //     (matches `LinkResolver`'s `absolute_index`).
+    // The boolean is `is_static` (only meaningful for fields; ignored
+    // for methods).
+
+    /// Probe the per-VM `LinkResolver` for a previously-resolved
+    /// reflective method `(class_id, name, descriptor)` triple. Returns
+    /// `Some((declaring_class_id, method_index))` on cache hit,
+    /// `None` on cold miss (caller should walk the hierarchy and call
+    /// [`Self::link_resolver_insert_method`] with the result).
+    fn link_resolver_get_method(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+    ) -> Option<(ClassId, u32)> {
+        None
+    }
+
+    /// Populate the LinkResolver method cache. `index` is the position
+    /// of the resolved method inside `declaring`'s `methods` vec.
+    fn link_resolver_insert_method(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+        _declaring: ClassId,
+        _index: u32,
+    ) {
+    }
+
+    /// Probe the LinkResolver field cache. Returns
+    /// `Some((declaring_class_id, absolute_index, is_static))` on hit.
+    fn link_resolver_get_field(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+    ) -> Option<(ClassId, u32, bool)> {
+        None
+    }
+
+    /// Populate the LinkResolver field cache.
+    fn link_resolver_insert_field(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+        _declaring: ClassId,
+        _absolute_index: u32,
+        _is_static: bool,
+    ) {
+    }
+
     /// Get the raw access_flags bits for a class.
     fn class_access_flags(&self, class_id: ClassId) -> u16;
 

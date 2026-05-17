@@ -4207,12 +4207,35 @@ fn native_period_zero_const(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 /// for the lifetime of the table. The cache itself is a `parking_lot
 /// ::Mutex<FxHashMap>` consistent with the other side tables in the
 /// crate.
-fn dtf_pattern_cache(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<String, ObjectRef>> {
-    static CACHE: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<String, ObjectRef>>,
-    > = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+///
+/// Round-9 native-builtins MED-8 fix: bound the cache. User-driven patterns
+/// (per-request format strings, JSP scriptlets, log-pattern shenanigans)
+/// could otherwise grow the table without bound, leaking the underlying
+/// process-lifetime arena slot per distinct string. Use a parallel
+/// `VecDeque<String>` as a FIFO insertion-order tracker and cap at 1024
+/// patterns; the oldest entry is evicted on overflow. Hits do not refresh
+/// the FIFO order (true LRU would require an extra removal per hit and
+/// the hot path is read-heavy — FIFO is the cheap, correct-enough bound).
+const DTF_PATTERN_CACHE_CAP: usize = 1024;
+
+struct DtfPatternCache {
+    map: rustc_hash::FxHashMap<String, ObjectRef>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl DtfPatternCache {
+    fn new() -> Self {
+        Self {
+            map: rustc_hash::FxHashMap::default(),
+            order: std::collections::VecDeque::with_capacity(DTF_PATTERN_CACHE_CAP),
+        }
+    }
+}
+
+fn dtf_pattern_cache() -> &'static parking_lot::Mutex<DtfPatternCache> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<DtfPatternCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(DtfPatternCache::new()))
 }
 
 fn native_dtf_of_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4225,7 +4248,7 @@ fn native_dtf_of_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Round-7 MED-13: cached lookup keyed by pattern string.
     {
         let cache = dtf_pattern_cache().lock();
-        if let Some(obj) = cache.get(&pattern) {
+        if let Some(obj) = cache.map.get(&pattern) {
             return Ok(Some(Value::Object(Some(*obj))));
         }
     }
@@ -4233,9 +4256,17 @@ fn native_dtf_of_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     {
         let mut cache = dtf_pattern_cache().lock();
         // Insert if still missing — another thread may have raced us. We
-        // accept the rare double-allocation on contention (no eviction
-        // needed since cache misses are bounded by distinct patterns).
-        cache.entry(pattern).or_insert(obj);
+        // accept the rare double-allocation on contention.
+        if !cache.map.contains_key(&pattern) {
+            // Round-9 MED-8 — bound cache size with FIFO eviction.
+            if cache.order.len() >= DTF_PATTERN_CACHE_CAP {
+                if let Some(victim) = cache.order.pop_front() {
+                    cache.map.remove(&victim);
+                }
+            }
+            cache.map.insert(pattern.clone(), obj);
+            cache.order.push_back(pattern);
+        }
     }
     Ok(Some(Value::Object(Some(obj))))
 }

@@ -1849,9 +1849,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let mut jfr = self.shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_thread_start_event(
+            // Round-9 HIGH-5: build the Arc once and hand ownership to the
+            // `_arc` variant so the emit doesn't reallocate from `&str`.
+            let name_arc: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
+            rustjvm_jfr::builtin::emit_thread_start_event_arc(
                 &mut jfr,
-                &name,
+                name_arc,
                 if is_virtual { "virtual" } else { "platform" },
                 tid.0,
                 now_ns,
@@ -2015,8 +2018,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 let mut jfr = shared_arc.flight_recorder.lock();
-                rustjvm_jfr::builtin::emit_thread_end_event(
-                    &mut jfr, &name, tid.0, now_ns,
+                // Round-9 HIGH-5: prefer the `_arc` variant.
+                let name_arc: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
+                rustjvm_jfr::builtin::emit_thread_end_event_arc(
+                    &mut jfr, name_arc, tid.0, now_ns,
                 );
             }
             // Fire JVMTI ThreadEnd event
@@ -2544,6 +2549,98 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         cm.get_class(class_id)
             .map(|c| c.interfaces.clone())
             .unwrap_or_default()
+    }
+
+    // -- LinkResolver wiring (round-9 HIGH #7) -------------------------
+    //
+    // Probe / insert into the per-VM `LinkResolver` cache for Java-side
+    // reflection natives. Mirrors the JNI `GetMethodID` / `GetFieldID`
+    // wiring (round-8 CRIT #2) so Spring / Hibernate / ByteBuddy
+    // identical-triple probes through `Class.getDeclaredMethod` etc.
+    // hit the same cache as their JNI counterparts.
+
+    fn link_resolver_get_method(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(ClassId, u32)> {
+        use rustjvm_classloading::resolution::ResolvedMember;
+        match self.shared.link_resolver.get(class_id, name, descriptor)? {
+            ResolvedMember::Method { declaring_class_id, index } => {
+                Some((declaring_class_id, index))
+            }
+            // A cached `NotFound` is a legitimate hit — return `None` so
+            // the caller short-circuits without re-walking the hierarchy.
+            // The caller distinguishes "cache cold miss" from "cache hit:
+            // not found" by checking `link_resolver_get_method` once and
+            // proceeding to the metadata walk only if `None` came back
+            // (the walk re-confirms NotFound and re-inserts; the cost is
+            // a single redundant cold-miss walk in the rare case the
+            // class genuinely lacks the member).
+            ResolvedMember::NotFound => None,
+            // Method probe matched a Field entry — should never happen
+            // for properly-keyed lookups but degrade safely.
+            ResolvedMember::Field { .. } => None,
+        }
+    }
+
+    fn link_resolver_insert_method(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+        declaring: ClassId,
+        index: u32,
+    ) {
+        use rustjvm_classloading::resolution::ResolvedMember;
+        self.shared.link_resolver.insert(
+            class_id,
+            rustjvm_types::intern_arc(name),
+            rustjvm_types::intern_arc(descriptor),
+            ResolvedMember::Method {
+                declaring_class_id: declaring,
+                index,
+            },
+        );
+    }
+
+    fn link_resolver_get_field(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(ClassId, u32, bool)> {
+        use rustjvm_classloading::resolution::ResolvedMember;
+        match self.shared.link_resolver.get(class_id, name, descriptor)? {
+            ResolvedMember::Field { declaring_class_id, absolute_index, is_static } => {
+                Some((declaring_class_id, absolute_index, is_static))
+            }
+            ResolvedMember::NotFound => None,
+            ResolvedMember::Method { .. } => None,
+        }
+    }
+
+    fn link_resolver_insert_field(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+        declaring: ClassId,
+        absolute_index: u32,
+        is_static: bool,
+    ) {
+        use rustjvm_classloading::resolution::ResolvedMember;
+        self.shared.link_resolver.insert(
+            class_id,
+            rustjvm_types::intern_arc(name),
+            rustjvm_types::intern_arc(descriptor),
+            ResolvedMember::Field {
+                declaring_class_id: declaring,
+                absolute_index,
+                is_static,
+            },
+        );
     }
 
     fn class_access_flags(&self, class_id: ClassId) -> u16 {

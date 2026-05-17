@@ -1010,10 +1010,38 @@ pub fn emit_thread_start_event(
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
         // `thread_name` is the user-supplied Java thread name — still Arc.
-        // TODO (round-7 wave-3): plumb Arc<str> from the Thread object's
-        // interned name field via an `emit_thread_start_event_arc` variant.
+        // Round-9 HIGH-5: callers that already hold an `Arc<str>` should
+        // prefer `emit_thread_start_event_arc` below to avoid this realloc.
         let mut fields = Vec::with_capacity(2);
         fields.push(EventValue::String(Arc::from(thread_name)));
+        fields.push(EventValue::Str(parent_thread_name));
+        let event = EventInstance {
+            type_id,
+            start_time: timestamp_ns,
+            end_time: timestamp_ns, // instant event
+            thread_id,
+            fields,
+        };
+        crate::repository::push_to_thread_ring(event);
+    }
+}
+
+/// Round-9 HIGH-5: `emit_thread_start_event` variant accepting a pre-interned
+/// `Arc<str>` for the thread name. Use this from sites where the Thread
+/// object's interned name is already in hand (skips the per-event
+/// `Arc::from(&str)` reallocation).
+pub fn emit_thread_start_event_arc(
+    recorder: &mut FlightRecorder,
+    thread_name: Arc<str>,
+    parent_thread_name: &'static str,
+    thread_id: u64,
+    timestamp_ns: u64,
+) {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadStart") {
+        let mut fields = Vec::with_capacity(2);
+        fields.push(EventValue::String(thread_name));
         fields.push(EventValue::Str(parent_thread_name));
         let event = EventInstance {
             type_id,
@@ -1114,11 +1142,34 @@ pub fn emit_thread_end_event(
     if !crate::is_enabled() { return; }
     static ID: OnceLock<EventTypeId> = OnceLock::new();
     if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
-        // TODO (round-7 wave-3): add `emit_thread_end_event_arc(thread_name:
-        // Arc<str>, ...)` so callers can plumb the interned Thread.name from
-        // the Thread object's constant-pool entry.
+        // Round-9 HIGH-5: prefer `emit_thread_end_event_arc` below when the
+        // Thread name is already interned as an `Arc<str>`.
         let mut fields = Vec::with_capacity(1);
         fields.push(EventValue::String(Arc::from(thread_name)));
+        let event = EventInstance {
+            type_id,
+            start_time: timestamp_ns,
+            end_time: timestamp_ns, // instant event
+            thread_id,
+            fields,
+        };
+        crate::repository::push_to_thread_ring(event);
+    }
+}
+
+/// Round-9 HIGH-5: `emit_thread_end_event` variant accepting a pre-interned
+/// `Arc<str>` for the thread name.
+pub fn emit_thread_end_event_arc(
+    recorder: &mut FlightRecorder,
+    thread_name: Arc<str>,
+    thread_id: u64,
+    timestamp_ns: u64,
+) {
+    if !crate::is_enabled() { return; }
+    static ID: OnceLock<EventTypeId> = OnceLock::new();
+    if let Some(type_id) = cached_event_id(&ID, recorder, "jdk.ThreadEnd") {
+        let mut fields = Vec::with_capacity(1);
+        fields.push(EventValue::String(thread_name));
         let event = EventInstance {
             type_id,
             start_time: timestamp_ns,

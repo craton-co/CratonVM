@@ -607,7 +607,7 @@ impl G1Collector {
         // (Collect rset sources before mutating regions)
         let mut rset_sources: Vec<(usize, Vec<usize>)> = Vec::new();
         for &cset_idx in &cset {
-            let sources: Vec<usize> = regions[cset_idx].rset.sources().collect();
+            let sources: Vec<usize> = regions[cset_idx].rset.sources();
             if !sources.is_empty() {
                 rset_sources.push((cset_idx, sources));
             }
@@ -876,6 +876,10 @@ impl G1Collector {
                 for s in regions[cset_idx].rset.sources() {
                     set.insert(s);
                 }
+                // Round-9 gc CRIT-8: `sources()` now returns an owned Vec
+                // (the underlying FxHashSet lives behind a per-RSet mutex);
+                // iteration above is over the snapshot and does not hold
+                // the RSet lock across the body.
             }
             set
         };
@@ -1677,7 +1681,12 @@ impl G1Collector {
         let _stragglers = self.satb_queue.deactivate_and_drain();
 
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
-        self.marking_complete.store(true, Ordering::Relaxed);
+        // Round-9 HIGH-1: Release publishes marking_complete=true so any
+        // subsequent RSet writes / mutator-side reads of the flag observe
+        // all of the prior cycle's effects (gray set drained, SATB queue
+        // deactivated, phase set to Idle). Paired with Acquire load in
+        // `needs_mixed_gc` and any other consumer.
+        self.marking_complete.store(true, Ordering::Release);
         self.mixed_gc_remaining
             .store(self.config.mixed_gc_count_target as u64, Ordering::Relaxed);
     }
@@ -1871,7 +1880,10 @@ impl G1Collector {
 
     /// Check if mixed GC is needed (marking is complete and cycles remain).
     fn needs_mixed_gc(&self) -> bool {
-        self.marking_complete.load(Ordering::Relaxed)
+        // Round-9 HIGH-1: Acquire pairs with the Release publish in
+        // `finish_mark_cycle` so this reader observes the fully-drained
+        // gray set and deactivated SATB queue before acting on the flag.
+        self.marking_complete.load(Ordering::Acquire)
             && self.mixed_gc_remaining.load(Ordering::Relaxed) > 0
     }
 
@@ -2030,20 +2042,80 @@ impl G1Collector {
     }
 
     /// Post-write barrier: track cross-region references in remembered sets.
+    ///
+    /// Round-9 gc CRIT-8 — hot path: a per-thread cache of the
+    /// last-touched destination region pointer avoids re-acquiring the
+    /// heap-wide `regions` mutex on every reference store. Same-region
+    /// successive stores (the dominant pattern: tight loops populating
+    /// one array, append-to-list, etc.) hit the cache and take only the
+    /// per-RSet inner mutex.
+    ///
+    /// SAFETY invariant: the `Vec<G1Region>` backing `self.regions` is
+    /// created once in `G1Collector::new` with all `region_count`
+    /// entries and is **never resized** thereafter (`grep -n
+    /// 'regions.\\(push\\|resize\\|extend\\)' gc/src/g1.rs` returns no
+    /// matches). Therefore `&regions[i]` is address-stable for the
+    /// entire `G1Collector` lifetime, and a raw `*const G1Region`
+    /// captured under one lock acquisition remains valid for later
+    /// dereference even after the lock is released, as long as the
+    /// collector itself is still alive. The cached pointer is keyed by
+    /// both region index AND collector identity (the `*const Self`)
+    /// so a stale cache from a previous collector instance never
+    /// resurrects a dangling pointer.
     pub fn post_write_barrier_rset(&self, src_obj: ObjectRef, stored_ref: ObjectRef) {
         let src_addr = src_obj.as_ptr() as usize;
         let dst_addr = stored_ref.as_ptr() as usize;
 
-        let mut regions = self.regions.lock();
-        let src_region = self.region_for_ptr_with_regions(&regions, src_addr);
-        let dst_region = self.region_for_ptr_with_regions(&regions, dst_addr);
+        // O(log R) lookups via the cached `region_lookup` table; these do
+        // NOT take any lock (the lookup table is immutable post-`new`).
+        let src_region = self.lookup_region_for_addr(src_addr);
+        let dst_region = self.lookup_region_for_addr(dst_addr);
 
-        // Only record cross-region references
-        if let (Some(src_idx), Some(dst_idx)) = (src_region, dst_region) {
-            if src_idx != dst_idx {
-                regions[dst_idx].rset.add_reference(src_idx);
-            }
+        // Only record cross-region references.
+        let (src_idx, dst_idx) = match (src_region, dst_region) {
+            (Some(s), Some(d)) if s != d => (s, d),
+            _ => return,
+        };
+
+        let collector_id = self as *const Self as usize;
+
+        thread_local! {
+            // (collector_id, region_idx, *const G1Region). `Cell` is
+            // sufficient — the pointer is `Copy` and never escapes
+            // the with() block other than as a deref-then-call.
+            static LAST_RSET_TARGET: std::cell::Cell<Option<(usize, usize, *const G1Region)>>
+                = const { std::cell::Cell::new(None) };
         }
+
+        let hit = LAST_RSET_TARGET.with(|cell| {
+            if let Some((cached_collector, cached_idx, cached_ptr)) = cell.get() {
+                if cached_collector == collector_id && cached_idx == dst_idx {
+                    // SAFETY: see method-level invariant. `cached_ptr`
+                    // was captured from `&regions[dst_idx]` (Vec never
+                    // reallocates) and the collector identity check
+                    // rules out reuse across collector instances.
+                    // `add_reference` takes `&self` (interior
+                    // `parking_lot::Mutex` on the FxHashSet — see
+                    // `RememberedSet`).
+                    unsafe { (*cached_ptr).rset.add_reference(src_idx); }
+                    return true;
+                }
+            }
+            false
+        });
+        if hit {
+            return;
+        }
+
+        // Cache miss: take the regions lock just long enough to capture
+        // the stable pointer, populate the TLS cache, then perform the
+        // RSet add via the same `&self` interior-mutex path.
+        let regions = self.regions.lock();
+        let region_ptr: *const G1Region = &regions[dst_idx];
+        LAST_RSET_TARGET.with(|cell| {
+            cell.set(Some((collector_id, dst_idx, region_ptr)));
+        });
+        regions[dst_idx].rset.add_reference(src_idx);
     }
 
     /// Find which region contains the given address (by raw address).
@@ -2289,25 +2361,37 @@ impl GarbageCollector for G1Collector {
         // this read. See `crate::collector::volatile_stripe_lock` for the
         // design rationale.
         //
-        // Round-8 Bug 5: removed the bracketing `fence(SeqCst)` pair. The
-        // mutex acquire/release in `volatile_stripe_lock` is already a full
-        // JMM ordering edge — a mutex lock is Acquire-ordered and unlock is
-        // Release-ordered, which together synthesise happens-before between
-        // any prior unlock on the same lock and the current critical
-        // section. The standalone SeqCst fences added nothing beyond what
-        // the mutex pair already guarantees and measurably cost an `mfence`
-        // on x86 per volatile op.
+        // Round-9 HIGH-3: restore the bracketing `fence(SeqCst)` pair.
+        // Round-8 removed it on the (incorrect) premise that the mutex
+        // acquire/release JMM edge subsumed it. It does not: parking_lot's
+        // mutex acquire is Acquire-ordered and release is Release-ordered,
+        // which gives happens-before WITHIN A SINGLE STRIPE but does NOT
+        // establish a global total order across distinct stripes. JLS
+        // §17.4.5 requires a total order over all `volatile` accesses
+        // (synchronization order), so an IRIW-style observer can otherwise
+        // see two volatile writes on different stripes in opposite orders
+        // from two reader threads — a JMM violation. The SeqCst fence pair
+        // adds the cross-stripe total order the per-stripe Acquire/Release
+        // alone cannot supply, on top of which the lock still provides
+        // 16-byte slot atomicity.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let _guard = crate::collector::volatile_stripe_lock(obj, index);
-        self.get_field(obj, index)
+        let v = self.get_field(obj, index);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        v
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
         // Pair with `get_field_volatile`: the stripe lock makes the 16-byte
-        // `Value` write appear atomic to a concurrent volatile reader.
-        // Round-8 Bug 5: the bracketing `fence(SeqCst)` pair was redundant
-        // with the mutex acquire/release JMM edge — see `get_field_volatile`.
+        // `Value` write appear atomic to a concurrent volatile reader, and
+        // the bracketing SeqCst fences guarantee the JLS §17.4.5 total order
+        // across distinct stripes (the lock alone is per-stripe HB only).
+        // Round-9 HIGH-3: round-8 removed these fences and reintroduced an
+        // IRIW-observable JMM hole — see `get_field_volatile` for details.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let _guard = crate::collector::volatile_stripe_lock(obj, index);
         self.set_field(obj, index, value);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     fn array_length(&self, obj: ObjectRef) -> usize {
@@ -3376,7 +3460,7 @@ mod tests {
         rset.add_reference(1); // duplicate
         assert_eq!(rset.source_count(), 2);
 
-        let sources: Vec<usize> = rset.sources().collect();
+        let sources: Vec<usize> = rset.sources();
         assert!(sources.contains(&1));
         assert!(sources.contains(&3));
 

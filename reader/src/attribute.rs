@@ -10,6 +10,65 @@ use crate::constant_pool::ConstantPool;
 /// malformed attribute bodies. Mirrors the constant in `class_reader.rs`.
 const PREALLOC_CAP: usize = 1024;
 
+// ---------------------------------------------------------------------------
+// Canonical attribute-name interned arcs for Arc::ptr_eq dispatch.
+//
+// Round 9 audit fix (MED #9): hoist the 28+2 LazyLock<Arc<str>>
+// declarations out of `decode_attribute_body` so they're created exactly
+// once per process (instead of being function-local statics that, while
+// also initialized once, lived inside the body and bloated the
+// function-scope namespace). Identical semantics — these are still
+// `LazyLock<Arc<str>>` populated by `rustjvm_types::intern_arc(...)` and
+// match the constant-pool-interned `Arc<str>` the lazy decode path
+// hands us — but now the symbols are visible to the whole module and
+// don't need re-declaring if we add another dispatch site.
+//
+// Round 9 audit fix (HIGH #4): the original `Arc::ptr_eq` dispatch
+// omitted `ModulePackages` + `ModuleMainClass`, so module-info classes
+// (`module-info.class` from JPMS, JDK 9+) paid the `&**name`
+// string-compare slow path on every load. JDK ships hundreds of
+// module-info classes; the canonical names below short-circuit the
+// dispatch.
+// ---------------------------------------------------------------------------
+use std::sync::LazyLock;
+macro_rules! canon {
+    ($name:ident, $s:expr) => {
+        static $name: LazyLock<Arc<str>> =
+            LazyLock::new(|| rustjvm_types::intern_arc($s));
+    };
+}
+canon!(CANON_CODE, "Code");
+canon!(CANON_SOURCE_FILE, "SourceFile");
+canon!(CANON_LINE_NUMBER_TABLE, "LineNumberTable");
+canon!(CANON_LOCAL_VARIABLE_TABLE, "LocalVariableTable");
+canon!(CANON_LOCAL_VARIABLE_TYPE_TABLE, "LocalVariableTypeTable");
+canon!(CANON_STACK_MAP_TABLE, "StackMapTable");
+canon!(CANON_CONSTANT_VALUE, "ConstantValue");
+canon!(CANON_EXCEPTIONS, "Exceptions");
+canon!(CANON_SIGNATURE, "Signature");
+canon!(CANON_INNER_CLASSES, "InnerClasses");
+canon!(CANON_BOOTSTRAP_METHODS, "BootstrapMethods");
+canon!(CANON_DEPRECATED, "Deprecated");
+canon!(CANON_SYNTHETIC, "Synthetic");
+canon!(CANON_NEST_HOST, "NestHost");
+canon!(CANON_NEST_MEMBERS, "NestMembers");
+canon!(CANON_RUNTIME_VISIBLE_ANNOTATIONS, "RuntimeVisibleAnnotations");
+canon!(CANON_RUNTIME_INVISIBLE_ANNOTATIONS, "RuntimeInvisibleAnnotations");
+canon!(CANON_METHOD_PARAMETERS, "MethodParameters");
+canon!(CANON_ENCLOSING_METHOD, "EnclosingMethod");
+canon!(CANON_RUNTIME_VISIBLE_PARAMETER_ANNOTATIONS, "RuntimeVisibleParameterAnnotations");
+canon!(CANON_RUNTIME_INVISIBLE_PARAMETER_ANNOTATIONS, "RuntimeInvisibleParameterAnnotations");
+canon!(CANON_RUNTIME_VISIBLE_TYPE_ANNOTATIONS, "RuntimeVisibleTypeAnnotations");
+canon!(CANON_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS, "RuntimeInvisibleTypeAnnotations");
+canon!(CANON_ANNOTATION_DEFAULT, "AnnotationDefault");
+canon!(CANON_MODULE, "Module");
+canon!(CANON_RECORD, "Record");
+canon!(CANON_PERMITTED_SUBCLASSES, "PermittedSubclasses");
+canon!(CANON_SOURCE_DEBUG_EXTENSION, "SourceDebugExtension");
+// Round 9 audit fix (HIGH #4): module-info attributes — previously missing.
+canon!(CANON_MODULE_PACKAGES, "ModulePackages");
+canon!(CANON_MODULE_MAIN_CLASS, "ModuleMainClass");
+
 /// Attributes attached to class files, fields, methods, and code (JVM spec 4.7).
 ///
 /// Attributes provide additional metadata. Some are critical for execution (Code),
@@ -698,47 +757,11 @@ fn decode_attribute_body(
     // string `match` below remains as a fallback for non-canonical
     // names (vendor / unknown attributes) and for the rare callers
     // that pass an `Arc<str>` that wasn't routed through `intern_arc`.
-    use std::sync::LazyLock;
-    macro_rules! canon {
-        ($name:ident, $s:expr) => {
-            static $name: LazyLock<Arc<str>> =
-                LazyLock::new(|| rustjvm_types::intern_arc($s));
-        };
-    }
-    canon!(CANON_CODE, "Code");
-    canon!(CANON_SOURCE_FILE, "SourceFile");
-    canon!(CANON_LINE_NUMBER_TABLE, "LineNumberTable");
-    canon!(CANON_LOCAL_VARIABLE_TABLE, "LocalVariableTable");
-    canon!(CANON_LOCAL_VARIABLE_TYPE_TABLE, "LocalVariableTypeTable");
-    canon!(CANON_STACK_MAP_TABLE, "StackMapTable");
-    canon!(CANON_CONSTANT_VALUE, "ConstantValue");
-    canon!(CANON_EXCEPTIONS, "Exceptions");
-    canon!(CANON_SIGNATURE, "Signature");
-    canon!(CANON_INNER_CLASSES, "InnerClasses");
-    canon!(CANON_BOOTSTRAP_METHODS, "BootstrapMethods");
-    canon!(CANON_DEPRECATED, "Deprecated");
-    canon!(CANON_SYNTHETIC, "Synthetic");
-    canon!(CANON_NEST_HOST, "NestHost");
-    canon!(CANON_NEST_MEMBERS, "NestMembers");
-    canon!(CANON_RUNTIME_VISIBLE_ANNOTATIONS, "RuntimeVisibleAnnotations");
-    canon!(CANON_RUNTIME_INVISIBLE_ANNOTATIONS, "RuntimeInvisibleAnnotations");
-    canon!(CANON_METHOD_PARAMETERS, "MethodParameters");
-    canon!(CANON_ENCLOSING_METHOD, "EnclosingMethod");
-    // Round 8 audit fix (HIGH #5): the previous `Arc::ptr_eq` dispatch
-    // omitted these names, so any class carrying them paid the `&**name`
-    // string-compare slow path on the dispatch — measurable on
-    // method-annotation-heavy code (Spring, Jakarta EE, JUnit) where
-    // every parameter-annotated method hits the parameter-annotations
-    // dispatch and every annotation-default method hits AnnotationDefault.
-    canon!(CANON_RUNTIME_VISIBLE_PARAMETER_ANNOTATIONS, "RuntimeVisibleParameterAnnotations");
-    canon!(CANON_RUNTIME_INVISIBLE_PARAMETER_ANNOTATIONS, "RuntimeInvisibleParameterAnnotations");
-    canon!(CANON_RUNTIME_VISIBLE_TYPE_ANNOTATIONS, "RuntimeVisibleTypeAnnotations");
-    canon!(CANON_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS, "RuntimeInvisibleTypeAnnotations");
-    canon!(CANON_ANNOTATION_DEFAULT, "AnnotationDefault");
-    canon!(CANON_MODULE, "Module");
-    canon!(CANON_RECORD, "Record");
-    canon!(CANON_PERMITTED_SUBCLASSES, "PermittedSubclasses");
-    canon!(CANON_SOURCE_DEBUG_EXTENSION, "SourceDebugExtension");
+    //
+    // Round 9 audit fix (MED #9): the canonical `LazyLock<Arc<str>>`
+    // declarations live at module scope so they're initialized once
+    // globally instead of inside every function-scope (still once-only
+    // but bloats the function namespace and makes them hard to share).
 
     // Pick a string discriminant by Arc-ptr-eq first; fall through to
     // the `&**name` deref for the slow path. The selected string is
@@ -800,6 +823,12 @@ fn decode_attribute_body(
         "PermittedSubclasses"
     } else if Arc::ptr_eq(name, &CANON_SOURCE_DEBUG_EXTENSION) {
         "SourceDebugExtension"
+    } else if Arc::ptr_eq(name, &CANON_MODULE_PACKAGES) {
+        // Round 9 audit fix (HIGH #4): ModulePackages — JPMS module-info.
+        "ModulePackages"
+    } else if Arc::ptr_eq(name, &CANON_MODULE_MAIN_CLASS) {
+        // Round 9 audit fix (HIGH #4): ModuleMainClass — JPMS module-info.
+        "ModuleMainClass"
     } else {
         &**name
     };

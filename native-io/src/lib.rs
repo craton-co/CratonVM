@@ -1349,6 +1349,17 @@ fn native_br_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // TODO(round-10 native-misc HIGH-5): BufferedReader.read() currently
+    // dispatches one native call per character. The underlying
+    // `FileEntry::FileRead` is wrapped in a `BufReader`, so we do not
+    // incur a syscall per call — but we DO incur a full FFI dispatch
+    // + Mutex acquisition per character, which is dramatically slower
+    // than the JDK's in-Java buffered char[]. A proper fix routes via
+    // a synthetic Java-side `char[] cb` + `pos`/`count` fields populated
+    // by a single bulk `read_bytes(buf)` call, so that 99% of `read()`
+    // calls return from a Java-side index increment without any native
+    // crossing. Tracked separately; this single-byte path remains as
+    // the slow correctness fallback.
     let result = ctx.fd_table().read_byte(fd).map_err(io_err)?;
     Ok(Some(Value::Int(result)))
 }

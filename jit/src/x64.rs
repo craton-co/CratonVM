@@ -13976,6 +13976,92 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_math_min_max_long_intrinsic() {
+        // long min_f(long a, long b) { return Math.min(a, b); }
+        // long max_f(long a, long b) { return Math.max(a, b); }
+        // Bytecode: lload_0 (0x1e), lload_2 (0x20), invokestatic (0xb8, 0x00, 0x01),
+        //           lreturn (0xad). Long uses 2 local slots per arg, so the
+        //           second arg lives at slot 2 (lload_2), and max_locals is 4.
+        // Round-9 CRIT regression test for the swapped CMOVL/CMOVG opcodes in
+        // the MATH_MIN_LONG_INTRINSIC / MATH_MAX_LONG_INTRINSIC arms — same
+        // bug as the int variants but on the 64-bit REX.W CMOV path.
+        let code: Vec<u8> = vec![0x1e, 0x20, 0xb8, 0x00, 0x01, 0xad, 0, 0];
+        let code_len = 6;
+
+        // Math.min(long, long) variant
+        let compiled_min = compile(
+            &code,
+            code_len,
+            4, // param_slots: 2 longs * 2 slots each
+            4, // max_locals
+            false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(),
+            vec![(2, crate::JitDirectCall {
+                entry: crate::MATH_MIN_LONG_INTRINSIC,
+                needs_context: false,
+                num_params: 2,
+                return_type: b'J',
+            })],
+            Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let r1 = unsafe { compiled_min.call(&[3i64, 5i64]) };
+        assert_eq!(r1, 3, "Math.min(3L, 5L) must be 3 (was {r1})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let r2 = unsafe { compiled_min.call(&[5i64, 3i64]) };
+        assert_eq!(r2, 3, "Math.min(5L, 3L) must be 3 (was {r2})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let r3 = unsafe { compiled_min.call(&[-7i64, 4i64]) };
+        assert_eq!(r3, -7, "Math.min(-7L, 4L) must be -7 (was {r3})");
+
+        // Math.max(long, long) variant
+        let compiled_max = compile(
+            &code,
+            code_len,
+            4,
+            4,
+            false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(),
+            vec![(2, crate::JitDirectCall {
+                entry: crate::MATH_MAX_LONG_INTRINSIC,
+                needs_context: false,
+                num_params: 2,
+                return_type: b'J',
+            })],
+            Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let m1 = unsafe { compiled_max.call(&[3i64, 5i64]) };
+        assert_eq!(m1, 5, "Math.max(3L, 5L) must be 5 (was {m1})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let m2 = unsafe { compiled_max.call(&[5i64, 3i64]) };
+        assert_eq!(m2, 5, "Math.max(5L, 3L) must be 5 (was {m2})");
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        let m3 = unsafe { compiled_max.call(&[-7i64, 4i64]) };
+        assert_eq!(m3, 4, "Math.max(-7L, 4L) must be 4 (was {m3})");
+    }
+
+    #[test]
     fn test_compile_dreturn() {
         // double f(double x) { return x; }
         // dload_0 (0x26), dreturn (0xaf)

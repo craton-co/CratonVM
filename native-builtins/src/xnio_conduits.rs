@@ -185,13 +185,17 @@ impl Pipe {
     /// Mark the writer side closed — subsequent reads drain the buffer then
     /// return EOF.
     pub fn close_write(&self) {
-        self.eof.store(true, Ordering::SeqCst);
+        // Round-9 HIGH-2: Release pairs with the Acquire load in `read`
+        // below — the only flag-vs-flag ordering needed here is that any
+        // writes made to the buffer before close are visible after the
+        // reader observes eof=true.
+        self.eof.store(true, Ordering::Release);
     }
 
     fn read(&self, dst: &mut [u8]) -> std::io::Result<usize> {
         let mut g = self.buf.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
-            return if self.eof.load(Ordering::SeqCst) {
+            return if self.eof.load(Ordering::Acquire) {
                 Ok(0) // EOF
             } else {
                 Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
@@ -259,7 +263,9 @@ fn sink_channels() -> &'static Mutex<HashMap<u64, Arc<SinkChannel>>> {
 
 fn next_channel_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
-    N.fetch_add(1, Ordering::SeqCst)
+    // Round-9 HIGH-2: only uniqueness is required — no cross-variable
+    // ordering — so Relaxed is sufficient.
+    N.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Register a new source channel for the given transport. Returns the id.
@@ -505,8 +511,11 @@ fn transport_shutdown_write(transport: &ConduitTransport) {
             let _ = stream.shutdown(std::net::Shutdown::Write);
         }
         ConduitTransport::Pipe(p) => {
-            p.fin_sent.store(true, Ordering::SeqCst);
-            p.eof.store(true, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release pairs with Acquire in any reader of
+            // fin_sent / eof. Both flags only need single-variable
+            // happens-before semantics.
+            p.fin_sent.store(true, Ordering::Release);
+            p.eof.store(true, Ordering::Release);
         }
     }
 }
@@ -526,7 +535,9 @@ pub fn source_channel_read(
         Some(c) => c,
         None => return Err(buf_overflow("read: unknown source channel")),
     };
-    if ch.shutdown.load(Ordering::SeqCst) {
+    // Round-9 HIGH-2: Acquire — pairs with the Release store in
+    // `native_source_shutdown_reads`.
+    if ch.shutdown.load(Ordering::Acquire) {
         return Ok(-1);
     }
     let remaining = bb_remaining(ctx, buf);
@@ -567,7 +578,9 @@ pub fn sink_channel_write(
         Some(c) => c,
         None => return Err(buf_overflow("write: unknown sink channel")),
     };
-    if ch.shutdown.load(Ordering::SeqCst) {
+    // Round-9 HIGH-2: Acquire — pairs with the Release store in
+    // `native_sink_shutdown_writes`.
+    if ch.shutdown.load(Ordering::Acquire) {
         return Err(RuntimeError::IOException {
             message: "ClosedChannelException: write after shutdown".into(),
         });
@@ -581,8 +594,11 @@ pub fn sink_channel_write(
         Ok(n) => n as i32,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
             // Kernel buffer full — Undertow should `resumeWrites` + retry.
+            // Round-9 HIGH-2: buffered_bytes is a single-variable counter
+            // read by `flush()`; AcqRel matches its role as a RMW that both
+            // publishes the new count and observes prior writes.
             ch.buffered_bytes
-                .fetch_add(src.len() as u64, Ordering::SeqCst);
+                .fetch_add(src.len() as u64, Ordering::AcqRel);
             return Ok(0);
         }
         Err(e) => {
@@ -598,8 +614,9 @@ pub fn sink_channel_write(
     // Count any bytes that didn't make it as buffered (retry-required).
     let short = remaining - n;
     if short > 0 {
+        // Round-9 HIGH-2: AcqRel — single-variable counter.
         ch.buffered_bytes
-            .fetch_add(short as u64, Ordering::SeqCst);
+            .fetch_add(short as u64, Ordering::AcqRel);
     }
     let new_pos = bb_position(ctx, buf) + n;
     bb_set_position(ctx, buf, new_pos);
@@ -647,16 +664,20 @@ pub fn dispatch_channel_event<K: SelectionKeyLike>(
     if ready & OP_READ != 0 {
         if let Some((src_id, src_obj)) = key.source_attachment() {
             let ch = get_source_channel(src_id);
+            // Round-9 HIGH-2: Acquire — pairs with the Release store from
+            // the suspend / resume natives.
             let suspended = ch
                 .as_ref()
-                .map(|c| c.read_suspended.load(Ordering::SeqCst))
+                .map(|c| c.read_suspended.load(Ordering::Acquire))
                 .unwrap_or(true);
             if suspended {
                 stats.skipped_suspended += 1;
             } else {
                 ctx.set_field(src_obj, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
                 if let Some(c) = &ch {
-                    c.read_ready.store(true, Ordering::SeqCst);
+                    // Release publishes the field write above before any
+                    // reader observes read_ready=true.
+                    c.read_ready.store(true, Ordering::Release);
                 }
                 let listener = match ctx.get_field(src_obj, SRC_FIELD_READ_LISTENER) {
                     Value::Object(Some(o)) => Some(o),
@@ -694,16 +715,19 @@ pub fn dispatch_channel_event<K: SelectionKeyLike>(
     if ready & OP_WRITE != 0 {
         if let Some((sink_id, sink_obj)) = key.sink_attachment() {
             let ch = get_sink_channel(sink_id);
+            // Round-9 HIGH-2: Acquire — pairs with the Release store from
+            // the suspend / resume natives.
             let suspended = ch
                 .as_ref()
-                .map(|c| c.write_suspended.load(Ordering::SeqCst))
+                .map(|c| c.write_suspended.load(Ordering::Acquire))
                 .unwrap_or(true);
             if suspended {
                 stats.skipped_suspended += 1;
             } else {
                 ctx.set_field(sink_obj, SINK_FIELD_WRITE_READY_FLAG, Value::Int(1));
                 if let Some(c) = &ch {
-                    c.write_ready.store(true, Ordering::SeqCst);
+                    // Release publishes the field write above.
+                    c.write_ready.store(true, Ordering::Release);
                 }
                 let listener = match ctx.get_field(sink_obj, SINK_FIELD_WRITE_LISTENER) {
                     Value::Object(Some(o)) => Some(o),
@@ -827,7 +851,8 @@ fn native_source_resume_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ctx.set_field(this, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
     if let Some(id) = source_id_of(ctx, this) {
         if let Some(ch) = get_source_channel(id) {
-            ch.read_suspended.store(false, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            ch.read_suspended.store(false, Ordering::Release);
         }
     }
     Ok(None)
@@ -838,7 +863,8 @@ fn native_source_suspend_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     ctx.set_field(this, SRC_FIELD_READ_SUSPENDED, Value::Int(1));
     if let Some(id) = source_id_of(ctx, this) {
         if let Some(ch) = get_source_channel(id) {
-            ch.read_suspended.store(true, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            ch.read_suspended.store(true, Ordering::Release);
         }
     }
     Ok(None)
@@ -848,7 +874,9 @@ fn native_source_shutdown_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     if let Some(id) = source_id_of(ctx, this) {
         if let Some(ch) = get_source_channel(id) {
-            ch.shutdown.store(true, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release — paired with Acquire in
+            // source_channel_read.
+            ch.shutdown.store(true, Ordering::Release);
         }
     }
     Ok(None)
@@ -921,7 +949,8 @@ fn native_sink_resume_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     ctx.set_field(this, SINK_FIELD_WRITE_SUSPENDED, Value::Int(0));
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
-            ch.write_suspended.store(false, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            ch.write_suspended.store(false, Ordering::Release);
         }
     }
     Ok(None)
@@ -932,7 +961,8 @@ fn native_sink_suspend_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ctx.set_field(this, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
-            ch.write_suspended.store(true, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release — paired with Acquire in dispatch.
+            ch.write_suspended.store(true, Ordering::Release);
         }
     }
     Ok(None)
@@ -942,7 +972,9 @@ fn native_sink_shutdown_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = obj_arg(args, 0)?;
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
-            ch.shutdown.store(true, Ordering::SeqCst);
+            // Round-9 HIGH-2: Release — paired with Acquire in
+            // sink_channel_write.
+            ch.shutdown.store(true, Ordering::Release);
             transport_shutdown_write(&ch.transport);
         }
     }
@@ -962,7 +994,9 @@ fn native_sink_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(c) => c,
         None => return Ok(Some(Value::Int(1))),
     };
-    let drained = ch.buffered_bytes.load(Ordering::SeqCst) == 0;
+    // Round-9 HIGH-2: Acquire — paired with the AcqRel RMW in
+    // sink_channel_write that publishes the buffered count.
+    let drained = ch.buffered_bytes.load(Ordering::Acquire) == 0;
     Ok(Some(Value::Int(if drained { 1 } else { 0 })))
 }
 
@@ -1245,7 +1279,7 @@ mod tests {
         assert_eq!(n, 0, "write on full pipe must return 0");
         let ch = get_sink_channel(id).unwrap();
         assert_eq!(
-            ch.buffered_bytes.load(Ordering::SeqCst),
+            ch.buffered_bytes.load(Ordering::Acquire),
             4,
             "buffered_bytes must reflect the 4 bytes that didn't go out"
         );
@@ -1286,7 +1320,7 @@ mod tests {
         get_source_channel(id)
             .unwrap()
             .read_suspended
-            .store(false, Ordering::SeqCst);
+            .store(false, Ordering::Release);
         let listener = ctx.create_string("listener");
         ctx.set_field(ch_obj, SRC_FIELD_READ_LISTENER, Value::Object(Some(listener)));
 
@@ -1317,7 +1351,7 @@ mod tests {
         get_source_channel(id)
             .unwrap()
             .read_suspended
-            .store(false, Ordering::SeqCst);
+            .store(false, Ordering::Release);
         let listener = ctx.create_string("listener");
         ctx.set_field(ch_obj, SRC_FIELD_READ_LISTENER, Value::Object(Some(listener)));
 
@@ -1390,7 +1424,7 @@ mod tests {
 
         assert_eq!(ctx.get_field(ch_obj, SRC_FIELD_READ_SUSPENDED), Value::Int(0));
         let reg = get_source_channel(id).unwrap();
-        assert!(!reg.read_suspended.load(Ordering::SeqCst));
+        assert!(!reg.read_suspended.load(Ordering::Acquire));
 
         let key = FakeKey {
             ready: OP_READ,
@@ -1412,12 +1446,12 @@ mod tests {
         native_sink_shutdown_writes(&mut ctx, &[Value::Object(Some(ch_obj))]).unwrap();
 
         assert!(
-            pipe.fin_sent.load(Ordering::SeqCst),
+            pipe.fin_sent.load(Ordering::Acquire),
             "shutdown must set fin_sent on the pipe"
         );
-        assert!(pipe.eof.load(Ordering::SeqCst));
+        assert!(pipe.eof.load(Ordering::Acquire));
         let reg = get_sink_channel(id).unwrap();
-        assert!(reg.shutdown.load(Ordering::SeqCst));
+        assert!(reg.shutdown.load(Ordering::Acquire));
 
         // A subsequent write must be rejected rather than silently lost.
         let buf = make_byte_buffer(&mut ctx, 4);
@@ -1451,7 +1485,7 @@ mod tests {
         get_sink_channel(id)
             .unwrap()
             .buffered_bytes
-            .store(17, Ordering::SeqCst);
+            .store(17, Ordering::Release);
         let r = native_sink_flush(&mut ctx, &[Value::Object(Some(ch_obj))])
             .unwrap()
             .unwrap();

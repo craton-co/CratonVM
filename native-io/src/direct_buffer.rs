@@ -250,6 +250,11 @@ fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     // `Unsafe.setMemory(addr, n, 0)`.  Doing it here at the source
     // means callers don't have to issue a separate native.
     unsafe { std::ptr::write_bytes(addr, 0, usize_size) };
+    // Bug 2: a recycled address from the pool may still be marked
+    // freed from a prior cycle. Clear it so a legitimate later free
+    // of *this* allocation is not rejected and so the freed-set
+    // tracks only currently-freed memory (bounded by churn).
+    clear_freed(addr as u64);
     Ok(addr as u64)
 }
 
@@ -517,6 +522,10 @@ fn record_unsafe_alloc(addr: u64, size: i64) {
     if let Ok(mut g) = unsafe_allocs().lock() {
         g.insert(addr, size);
     }
+    // Bug 2: `dbb_allocate` already clears the freed-set entry for `addr`
+    // before returning; nothing to do here. (Kept as a comment so a future
+    // refactor that decouples Unsafe.allocateMemory from `dbb_allocate`
+    // remembers to re-add `clear_freed(addr)` here.)
 }
 
 fn take_unsafe_alloc(addr: u64) -> Option<i64> {
@@ -531,17 +540,31 @@ fn take_unsafe_alloc(addr: u64) -> Option<i64> {
 /// handed to two distinct Java allocations simultaneously.
 ///
 /// We track recently-freed addresses in a set and refuse to double-free.
-/// The set is bounded (capped at ~4096 entries — old entries are dropped
-/// FIFO via a small Vec) to keep memory bounded even for long-lived VMs
-/// that churn millions of Unsafe allocations.
-const FREED_SET_CAP: usize = 4096;
-
-fn freed_addrs() -> &'static Mutex<(FxHashMap<u64, ()>, std::collections::VecDeque<u64>)> {
-    static F: OnceLock<Mutex<(FxHashMap<u64, ()>, std::collections::VecDeque<u64>)>> =
-        OnceLock::new();
-    F.get_or_init(|| {
-        Mutex::new((FxHashMap::default(), std::collections::VecDeque::new()))
-    })
+///
+/// Bug 2 (CRIT round-9 native-misc CRIT-9): the previous implementation
+/// kept a 4096-entry FIFO of freed addresses. Under high churn
+/// (millions of Unsafe.allocateMemory/freeMemory cycles per second), an
+/// address freed > 4096 distinct frees ago is evicted from the FIFO,
+/// and a subsequent rogue double-free path would no longer be caught —
+/// reintroducing the pool corruption this guard was added to prevent.
+///
+/// Switch to an unbounded `FxHashSet<u64>`. Trade-off:
+///   * Memory grows unbounded in pathological scenarios (the set tracks
+///     every distinct address that has ever been freed).
+///   * In practice, allocators recycle addresses heavily, so we
+///     proactively remove an address from the freed set the moment it
+///     is *re-allocated* (see `record_unsafe_alloc`). Under a healthy
+///     churn workload the set's size stays bounded by the live-but-freed
+///     working set + the small number of re-issued-but-not-yet-touched
+///     addresses, which is exactly what we want.
+///   * Correctness is now preserved indefinitely — no FIFO horizon.
+///
+/// Alternative considered: per-address generation counter (CAS on free).
+/// Rejected for round-10 in favour of the simpler set; revisit if memory
+/// turns out to be a concern.
+fn freed_addrs() -> &'static Mutex<rustc_hash::FxHashSet<u64>> {
+    static F: OnceLock<Mutex<rustc_hash::FxHashSet<u64>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(rustc_hash::FxHashSet::default()))
 }
 
 /// Returns `true` if this addr was already freed (caller should skip).
@@ -551,18 +574,18 @@ fn mark_freed_or_check(addr: u64) -> bool {
         Ok(g) => g,
         Err(_) => return false, // poisoned — best-effort: allow the free
     };
-    if g.0.contains_key(&addr) {
-        return true;
+    // `HashSet::insert` returns `false` when the value was already
+    // present — that's exactly the "already freed" signal we need.
+    !g.insert(addr)
+}
+
+/// Remove `addr` from the freed-set. Called when an address is handed
+/// back out by `Unsafe.allocateMemory` so the set doesn't grow without
+/// bound in churn workloads where the allocator recycles addresses.
+fn clear_freed(addr: u64) {
+    if let Ok(mut g) = freed_addrs().lock() {
+        g.remove(&addr);
     }
-    g.0.insert(addr, ());
-    g.1.push_back(addr);
-    // Bound the set: evict oldest entries past the cap.
-    while g.1.len() > FREED_SET_CAP {
-        if let Some(old) = g.1.pop_front() {
-            g.0.remove(&old);
-        }
-    }
-    false
 }
 
 /// `dbb_free_explicit(addr, size)` — escape hatch for Java callers

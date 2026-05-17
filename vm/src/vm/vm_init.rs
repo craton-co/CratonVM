@@ -499,7 +499,10 @@ pub struct SharedVm {
     /// condvar until the initializing thread completes (success or error).
     /// Entries are removed once initialization finishes.
     /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub class_init_waiters: parking_lot::Mutex<FxHashMap<ClassId, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
+    /// Round-9 HIGH-4: inner `std::sync::Mutex<bool>` + `std::sync::Condvar`
+    /// migrated to `parking_lot` equivalents — removes poison handling and
+    /// yields a smaller, faster condvar with the same wait/notify API.
+    pub class_init_waiters: parking_lot::Mutex<FxHashMap<ClassId, Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>>,
 
     /// Diagnostic counters — atomic counters for bytecodes, GC, classes, etc.
     pub diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters,
@@ -3527,31 +3530,35 @@ impl Vm {
         shared.set_init_level(1);
 
         // Round-5 MED-fix (Bug 6, 2026-05-17): emit a one-shot
-        // `jdk.PhysicalMemory` event at startup. The emit fn was
-        // previously dead code. Gated by `rustjvm_jfr::is_enabled()` so a
-        // VM started without an active recording pays only one
-        // Acquire-load + branch. We deliberately do not poll periodically
-        // here — the chunk-rollover sampler would live in the JFR crate
-        // itself; this single emission unblocks the consumer side
-        // (`jdk.PhysicalMemory` is an EveryChunk event and at least one
-        // sample is the minimum useful payload).
-        if rustjvm_jfr::is_enabled() {
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            // VM `max_heap_size` as a stand-in for total physical memory
-            // until the platform sysinfo dependency lands. `used_size` is
-            // also reported as `max_heap_size` (no precise allocator
-            // accounting at startup); this keeps the schema honest about
-            // scope while keeping the field non-zero so the consumer-side
-            // schema check passes.
-            let total = shared.config.max_heap_size as i64;
-            let mut jfr = shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_physical_memory_event(
-                &mut jfr, total, total, now_ns,
-            );
-        }
+        // `jdk.PhysicalMemory` event at startup so any later JFR dump
+        // captures the host-RAM totals as an EveryChunk diagnostic.
+        //
+        // Round-5 CRIT-fix (Bug 2, 2026-05-17 follow-up): drop the
+        // surrounding `rustjvm_jfr::is_enabled()` gate. vm-cli never calls
+        // `start_recording`, so the gate kept this call permanently
+        // disabled and made the wired emit dead code. The emit function
+        // itself bypasses the global gate (see
+        // `emit_physical_memory_event` in jfr/src/builtin.rs) and writes
+        // to the calling thread's bounded SPSC ring; the event lives
+        // there until a subsequent drain forwards it to whichever
+        // recording is active at dump time. The cost when no recording
+        // ever starts is one ring slot — negligible.
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        // VM `max_heap_size` as a stand-in for total physical memory
+        // until the platform sysinfo dependency lands. `used_size` is
+        // also reported as `max_heap_size` (no precise allocator
+        // accounting at startup); this keeps the schema honest about
+        // scope while keeping the field non-zero so the consumer-side
+        // schema check passes.
+        let total = shared.config.max_heap_size as i64;
+        let mut jfr = shared.flight_recorder.lock();
+        rustjvm_jfr::builtin::emit_physical_memory_event(
+            &mut jfr, total, total, now_ns,
+        );
+        drop(jfr);
 
         Self {
             shared,

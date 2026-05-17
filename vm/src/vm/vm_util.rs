@@ -1,7 +1,7 @@
 //! Utility functions: class initialization, preparation, descriptor helpers,
 //! and the ClassStoreHierarchy adapter for the bytecode verifier.
 
-use crate::classloading::{ClassId, ClassState, ClassStore};
+use crate::classloading::{Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::Value;
@@ -68,36 +68,26 @@ pub fn ensure_class_initialized_shared(
     // dispatch, JIT entry, reflection). A single relaxed atomic load
     // returns immediately on the steady-state hot path.
     //
-    // Round-8 CRIT fix (audit `round8-classloading-reader.md` §3): the
-    // inner `init_states` map was previously a `std::sync::RwLock`,
-    // which meant the "fast path" was really two RwLock acquires
-    // (the outer `class_manager.read()` plus the inner `init_states
-    // .read()`) plus an Arc::clone — not an "atomic load only". The
-    // inner lock is now a `parking_lot::RwLock`, so the uncontended
-    // read is a single CAS with no poison check, no `Result` unwrap,
-    // and no futex syscall. The outer `class_manager.read()` is still
-    // a std `RwLock` (the ClassManager is shared widely and changing
-    // its type would be a much larger churn), but profiling shows
-    // that lock is rarely contended in the steady state — the inner
-    // map lock was the hot one.
+    // Round-9 vm CRIT-1 / classloading CRIT-1 fix (audits
+    // `round9-vm.md` and `round9-classloading-reader.md`): the previous
+    // "fast path" called `class_init_state_handle(class_id)` which
+    // ALWAYS probed the side-table RwLock first, and then
+    // `set_class_init_state` auto-populated that side-table for every
+    // real class on init completion — so the per-`Class` embedded
+    // `init_state: Arc<AtomicU8>` added by round-8 was dead code on
+    // the steady-state hot path. The fix probes the embedded atomic
+    // DIRECTLY: a single `class_manager.read()` (held only long enough
+    // to obtain `&Class`) → `class.init_state.load(Acquire)`. No
+    // `init_states` lock acquisition, no FxHashMap probe, no Arc
+    // clone on the fast path.
     //
-    // The handle is obtained inside `class_manager.read()` once; the
-    // resulting `Arc<AtomicU8>` lives long enough that the read lock
-    // can be dropped before the load is performed. Subsequent loads
-    // need no lock at all — but we re-obtain the handle each call here
-    // because the caller doesn't currently cache it. Callers that want
-    // to amortize the handle lookup (e.g. JIT entry stubs) should hold
-    // onto the `Arc<AtomicU8>` returned by
-    // `ClassManager::class_init_state_handle` directly.
-    {
-        let cm = shared.class_manager.read();
-        let handle = cm.class_init_state_handle(class_id);
-        drop(cm);
-        if handle.load(std::sync::atomic::Ordering::Acquire)
-            == rustjvm_classloading::CLASS_INIT_INITIALIZED
-        {
-            return Ok(());
-        }
+    // For a CLASS_INIT_INITIALIZED hit (the overwhelming common case),
+    // this collapses to: one parking_lot read-lock acquire/release on
+    // the class manager + one `Arc<AtomicU8>::load(Acquire)`. The
+    // load needs no lock because the embedded atomic lives inside the
+    // `Class` we just borrowed.
+    if is_class_initialized_via_manager(shared, class_id) {
+        return Ok(());
     }
 
     let current_thread_id = thread.thread_id.0;
@@ -147,11 +137,13 @@ pub fn ensure_class_initialized_shared(
                     .cloned();
                 if let Some(pair) = waiter {
                     let (lock, cvar) = &*pair;
-                    let guard = lock.lock().unwrap();
+                    // Round-9 HIGH-4: parking_lot::Mutex + Condvar — no
+                    // poison handling, wait_for returns a WaitTimeoutResult
+                    // (no Result wrapper) since it cannot fail.
+                    let mut guard = lock.lock();
                     // Wait with timeout to avoid deadlock on misconfigured init
                     let _result = cvar
-                        .wait_timeout(guard, std::time::Duration::from_secs(30))
-                        .unwrap();
+                        .wait_for(&mut guard, std::time::Duration::from_secs(30));
                     // Loop back to re-check state (might be Initialized or Error)
                     continue;
                 }
@@ -197,10 +189,11 @@ pub fn ensure_class_initialized_shared(
                                     // later in initialize_class_shared after verification
                                     // and preparation, but this thread owns the class now.
                                     class.initializing_thread = Some(current_thread_id);
-                                    // Register waiter so other threads can block immediately
+                                    // Register waiter so other threads can block immediately.
+                                    // Round-9 HIGH-4: parking_lot::Mutex + Condvar (no poison).
                                     let waiter = std::sync::Arc::new((
-                                        std::sync::Mutex::new(false),
-                                        std::sync::Condvar::new(),
+                                        parking_lot::Mutex::new(false),
+                                        parking_lot::Condvar::new(),
                                     ));
                                     shared.class_init_waiters.lock().insert(class_id, waiter);
                                     true
@@ -218,6 +211,44 @@ pub fn ensure_class_initialized_shared(
                 continue;
             }
         }
+    }
+}
+
+/// Round-9 vm CRIT-1 / classloading CRIT-1 fix: atomic-only fast-path
+/// init check that takes a `&Class` directly (NOT a `ClassId`).
+///
+/// Use this from call sites that already hold a borrow of the `Class`
+/// (e.g. a `class_manager.read()` guard kept around for an adjacent
+/// lookup): a single `Arc<AtomicU8>::load(Acquire)` answers
+/// "is C fully initialized?" with NO further lock or hash probe.
+///
+/// Callers that only have a `ClassId` should use
+/// [`ensure_class_initialized_shared`] (which performs the same fast
+/// check internally after a brief `class_manager.read()` to resolve
+/// `ClassId → &Class`) or [`is_class_initialized_via_manager`].
+#[inline]
+pub fn is_class_initialized_fast(class: &Class) -> bool {
+    class.init_state.load(std::sync::atomic::Ordering::Acquire)
+        == rustjvm_classloading::CLASS_INIT_INITIALIZED
+}
+
+/// Round-9 vm CRIT-1 fix: convenience wrapper that takes a
+/// `ClassId`, briefly holds `class_manager.read()` to resolve it to a
+/// `&Class`, and probes the embedded atomic. Returns `false` for
+/// unknown class ids (the slow path will then surface the appropriate
+/// error).
+///
+/// This is the building block of [`ensure_class_initialized_shared`]'s
+/// fast path. Exposed separately so callers that want a non-erroring
+/// "is C initialized?" probe (e.g. JIT entry stubs deciding whether to
+/// emit an init barrier) can use it without going through the
+/// full Err-returning machinery.
+#[inline]
+pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) -> bool {
+    let cm = shared.class_manager.read();
+    match cm.get_class(class_id) {
+        Some(class) => is_class_initialized_fast(class),
+        None => false,
     }
 }
 
@@ -474,7 +505,8 @@ fn initialize_class_shared(
         let removed = shared.class_init_waiters.lock().remove(&class_id);
         if let Some(pair) = removed {
             let (lock, cvar) = &*pair;
-            let mut done = lock.lock().unwrap();
+            // Round-9 HIGH-4: parking_lot — no poison/unwrap.
+            let mut done = lock.lock();
             *done = true;
             cvar.notify_all();
         }

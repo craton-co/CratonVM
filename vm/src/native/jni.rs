@@ -1474,20 +1474,30 @@ extern "C" fn jni_get_field_id(
     _env: JNIEnv,
     clazz: JClass,
     name: *const c_char,
-    _sig: *const c_char,
+    sig: *const c_char,
 ) -> JFieldID {
     let name_str = match unsafe { cstr_to_str(name) } {
         Some(s) => s,
         None => return 0,
     };
+    // Round 9 audit fix (HIGH #5): include the JNI-supplied signature in
+    // the LinkResolver cache key. The previous version dropped the
+    // signature and keyed only on `(class_id, name)`; for a class that
+    // shadows an inherited field with a different *type* (legal in JVMS
+    // §5.4.3.2 — fields are uniquely identified by `(name, descriptor)`),
+    // the first JNI `GetFieldID` query would populate the cache with one
+    // resolution and every subsequent call — even one passing a
+    // different signature — would short-circuit to that wrong entry.
+    //
+    // Tolerate a null signature by mapping it to "" — pre-fix callers
+    // could legitimately pass NULL since the parameter was ignored; we
+    // keep that behaviour by treating NULL as a distinct ("no signature
+    // assertion") cache key.
+    let sig_str = unsafe { cstr_to_str(sig) }.unwrap_or("");
     if clazz == 0 {
         return 0;
     }
     // Round 8 audit fix (CRIT #2): probe the per-VM `LinkResolver`.
-    // The signature `_sig` parameter is currently ignored by lookup
-    // (matching the existing impl above), so we pass an empty
-    // descriptor as the cache key's third element — for fields the
-    // (class, name) pair is unique within a class anyway.
     with_shared_vm(|shared| {
         use rustjvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
@@ -1496,7 +1506,7 @@ extern "C" fn jni_get_field_id(
             shared.link_resolver.resolve_or_compute(
                 class_id,
                 name_str,
-                "",
+                sig_str,
                 || {
                     let result = find_field_recursive(
                         class_id, name_str, &cm.class_store,
@@ -1517,7 +1527,7 @@ extern "C" fn jni_get_field_id(
                     };
                     (
                         rustjvm_types::intern_arc(name_str),
-                        rustjvm_types::intern_arc(""),
+                        rustjvm_types::intern_arc(sig_str),
                         resolved,
                     )
                 },

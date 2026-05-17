@@ -273,11 +273,28 @@ impl SatbQueue {
     ///
     /// Round-5 CRIT #4: this is the safe pairing for `activate`. The
     /// state machine guarantees no log push from a mutator that observed
-    /// the gate as "active" can be stranded after the drain returns —
-    /// the second drain pass catches anything that landed in shards
-    /// during the first pass.
+    /// the gate as "active" can be stranded after the drain returns.
     ///
-    /// Returns the concatenated entries from both drain passes.
+    /// Round-9 gc HIGH-4: a simple "drain twice" pattern still races
+    /// with a late writer that observed ACTIVE before the CAS, took the
+    /// slow shard-lock path between the two drains, and was preempted
+    /// just before its `shards[s].lock()` succeeded. Both drain passes
+    /// could complete with the late writer's `flush()` still pending in
+    /// the OS scheduler, then the writer's `extend` lands in a shard
+    /// *after* the second drain finishes but *before* we flip to
+    /// INACTIVE. The entry is now stranded.
+    ///
+    /// Fix: after the first drain, walk every shard taking its mutex
+    /// exclusively. Holding `shards[s].lock()` excludes any concurrent
+    /// `flush()` on the same shard — `flush()` blocks waiting for our
+    /// lock, so by the time we drop it the late writer either (a)
+    /// blocked before pushing and will see INACTIVE on retry of the
+    /// `is_active()` gate it must check before logging next time, or
+    /// (b) had already pushed and we drained it inside the critical
+    /// section. Either way, no entry survives unobserved past the
+    /// INACTIVE store.
+    ///
+    /// Returns the concatenated entries from all drain passes.
     pub fn deactivate_and_drain(&self) -> Vec<usize> {
         // 1. Transition ACTIVE -> DRAINING.  If the gate is already
         //    INACTIVE (double-stop), just drain once for safety and
@@ -289,17 +306,37 @@ impl SatbQueue {
             Ordering::Acquire,
         );
 
-        // 2. First drain pass.
-        let mut first = self.drain();
+        // 2. First drain pass — quickly empties the bulk of pending
+        //    entries without holding any lock across multiple shards.
+        let mut all = self.drain();
 
-        // 3. Second drain pass to catch late writers that observed
-        //    ACTIVE/DRAINING before any subsequent INACTIVE store.
-        let second = self.drain();
-        first.extend(second);
+        // 3. Hold each shard lock exclusively and drain any late entries
+        //    that arrived after step 2. Holding the lock excludes
+        //    `flush()` on the same shard: any racing writer that picked
+        //    this shard either pushed before we acquired (drained here)
+        //    or is now blocked on `shards[s].lock()` and will not push
+        //    until we drop the guard at the end of this iteration.
+        //    Combined with the INACTIVE store in step 4 (Release-ordered
+        //    against the writer's subsequent Acquire-load of `state` in
+        //    `is_active()`), this gives the happens-before edge that
+        //    prevents stranded entries.
+        for shard in self.shards.iter() {
+            let mut guard = shard.lock();
+            if !guard.is_empty() {
+                let late = std::mem::take(&mut *guard);
+                all.extend(late);
+            }
+            // Implicit drop(guard) here releases the shard mutex for
+            // unrelated future use; ordering against `state` store
+            // below is provided by the SeqCst-equivalent lock release
+            // + the Release store.
+        }
 
-        // 4. Finally flip to INACTIVE.
+        // 4. Finally flip to INACTIVE.  Release-ordered: pairs with the
+        //    Acquire load in `is_active()` so any subsequent mutator
+        //    observation sees INACTIVE happens-after the drain.
         self.state.store(SATB_INACTIVE, Ordering::Release);
-        first
+        all
     }
 
     /// Flush a per-thread buffer's entries into the global queue.

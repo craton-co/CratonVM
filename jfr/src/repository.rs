@@ -588,28 +588,39 @@ impl Drop for SpscEventRing {
         // a warning and leak the slot storage — slots are tiny (1024 *
         // sizeof(EventInstance)) and leaking on shutdown is preferable to
         // UAF.
-        // Round-9 CRIT-1 fix (2026-05-17): the previous 10k spin cap was too
-        // tight for a full 1024-slot ring under contended dumps — drainers
-        // copying the full ring would routinely outlast the cap, causing the
-        // shutdown path to leak slot memory rather than wait. Use exponential
-        // backoff (spin_loop → yield_now ramp) and a 1M-iteration safety cap,
-        // which gives drainers plenty of time while still preventing an
-        // infinite hang on a buggy consumer.
+        // Round-9 CRIT-1 fix (2026-05-17), reinforced (Bug 1 round-5):
+        // tiered backoff (spin_loop → yield_now → park_timeout). Under contended
+        // dumps of a full 1024-slot ring the consumer can hold `consumer_busy`
+        // for tens of microseconds; a tight spin cap caused the shutdown path
+        // to leak slot memory rather than wait. The ramp:
+        //   - spins 0..64           : exponential `spin_loop` (1..1024 iters)
+        //   - spins 64..1024        : `thread::yield_now` (cooperative)
+        //   - spins 1024..10_000_000: `park_timeout(10us)` (~100 seconds total)
+        //                             — park-timeout sleeps even without a
+        //                             paired `unpark`, so no signal channel
+        //                             is needed; we just re-check the gate
+        //                             after each sleep.
+        //   - beyond                : warn + leak slot storage (avoids UAF
+        //                             on a wedged consumer at shutdown).
         let mut spins = 0u32;
         let mut backoff = 1u32;
         while self.consumer_busy.load(Ordering::Acquire) {
-            for _ in 0..backoff {
-                std::hint::spin_loop();
-            }
-            if backoff >= 64 {
+            if spins < 64 {
+                for _ in 0..backoff {
+                    std::hint::spin_loop();
+                }
+                backoff = backoff.saturating_mul(2).min(1024);
+            } else if spins < 1024 {
                 std::thread::yield_now();
-            }
-            spins += 1;
-            backoff = backoff.saturating_mul(2).min(1024);
-            if spins > 1_000_000 {
+            } else if spins < 10_000_000 {
+                // park_timeout sleeps for ~10us per iteration regardless of
+                // unpark; the bound gives drainers up to ~100s before we
+                // give up. After parking, re-check consumer_busy via loop.
+                std::thread::park_timeout(std::time::Duration::from_micros(10));
+            } else {
                 eprintln!(
                     "WARN: SpscEventRing dropped with consumer still active \
-                     after 1M iterations; leaking slot storage to avoid \
+                     after exhaustive backoff; leaking slot storage to avoid \
                      use-after-free"
                 );
                 // Replace slots with an empty box so `Drop` for the field
@@ -619,6 +630,7 @@ impl Drop for SpscEventRing {
                 std::mem::forget(leaked);
                 return;
             }
+            spins += 1;
         }
         // Consumer gate is clear and `&mut self` guarantees no further
         // entrance — single-threaded teardown from here.

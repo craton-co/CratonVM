@@ -3182,6 +3182,44 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 // --- Typed Field getters (getInt, getLong, getFloat, getDouble, getBoolean) ---
 
+/// Round-9 native-builtins HIGH-7 fix: enforce JDK descriptor compatibility
+/// matrix for `Field.getInt/getLong/getFloat/getDouble/getByte/getShort/getChar`.
+///
+/// Per `java.lang.reflect.Field` javadoc the typed getters apply the JLS
+/// "widening primitive conversion" matrix. The previous implementation only
+/// inspected the underlying `Value` variant, which silently let boolean fields
+/// (stored as `Value::Int(0|1)`) slip through `Field.getInt`, diverging from
+/// the JDK which throws `IllegalArgumentException` with the canonical
+/// "Attempt to get <T> field with illegal data type conversion" message.
+///
+/// `accepted` is the set of descriptor characters that the caller's typed
+/// getter is allowed to widen from. e.g. for `getInt`: `&['B','S','C','I']`.
+/// Reference / array descriptors (descriptors starting with `L` or `[`) are
+/// always rejected — typed primitive getters can never read a reference.
+fn validate_field_descriptor(
+    descriptor: &str,
+    accepted: &[u8],
+    java_method: &str,
+) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+    // Empty descriptor means the meta lookup failed; fall back to the value-
+    // variant check downstream rather than throwing here.
+    if descriptor.is_empty() {
+        return Ok(());
+    }
+    let first = descriptor.as_bytes()[0];
+    if accepted.contains(&first) {
+        return Ok(());
+    }
+    // JDK-canonical message: "Attempt to get <prim> field with illegal data
+    // type conversion" — the JDK actually emits a slightly different phrasing
+    // depending on the source/target pair, but every variant is an IAE and
+    // mentions both the Field method and the underlying type. Match closely.
+    Err(illegal_arg_exc(format!(
+        "Attempt to get {} field on Field.{}: incompatible descriptor `{}`",
+        descriptor, java_method, descriptor
+    )))
+}
+
 fn field_get_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3229,6 +3267,18 @@ pub(crate) fn native_field_get_int(ctx: &mut dyn NativeContext, args: &[Value]) 
     // Value::Int on our stack) — but NOT long, float, or double, per
     // `java.lang.reflect.Field.getInt` javadoc (IllegalArgumentException on
     // non-int-compatible types).
+    //
+    // Round-9 native-builtins HIGH-7 fix: also reject boolean (`Z`) fields,
+    // which are stored as `Value::Int(0|1)` and previously slipped through
+    // the variant-only check. Validate the field *descriptor* first.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getInt: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"BSCI", "getInt")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         Value::Int(_) => Ok(Some(val)),
@@ -3239,7 +3289,15 @@ pub(crate) fn native_field_get_int(ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_field_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Accepts byte/short/char/int/long (widening).
+    // Accepts byte/short/char/int/long (widening). Rejects boolean/float/double/refs.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getLong: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"BSCIJ", "getLong")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         Value::Long(_) => Ok(Some(val)),
@@ -3251,7 +3309,15 @@ pub(crate) fn native_field_get_long(ctx: &mut dyn NativeContext, args: &[Value])
 }
 
 pub(crate) fn native_field_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Accepts byte/short/char/int/long/float (widening).
+    // Accepts byte/short/char/int/long/float (widening). Rejects boolean/double/refs.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getFloat: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"BSCIJF", "getFloat")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         Value::Float(_) => Ok(Some(val)),
@@ -3264,7 +3330,15 @@ pub(crate) fn native_field_get_float(ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 pub(crate) fn native_field_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Accepts every numeric primitive (widening to double).
+    // Accepts every numeric primitive (widening to double). Rejects boolean/refs.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getDouble: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"BSCIJFD", "getDouble")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         Value::Double(_) => Ok(Some(val)),
@@ -3397,6 +3471,15 @@ pub(crate) fn native_field_set_boolean(ctx: &mut dyn NativeContext, args: &[Valu
 // --- Remaining typed Field getters: byte / short / char ---
 
 pub(crate) fn native_field_get_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Field.getByte: only `B` is JLS-legal (no widening from C/S/I — those throw IAE).
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getByte: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"B", "getByte")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         Value::Int(v) => Ok(Some(Value::Int((v as i8) as i32))),
@@ -3407,6 +3490,16 @@ pub(crate) fn native_field_get_byte(ctx: &mut dyn NativeContext, args: &[Value])
 }
 
 pub(crate) fn native_field_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Field.getShort: accepts byte (widening) or short. Rejects char (JLS forbids
+    // char→short narrowing without explicit cast), int, long, boolean, refs.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getShort: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"BS", "getShort")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         Value::Int(v) => Ok(Some(Value::Int((v as i16) as i32))),
@@ -3417,6 +3510,16 @@ pub(crate) fn native_field_get_short(ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 pub(crate) fn native_field_get_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Field.getChar: only `C` is legal — char is unsigned 16-bit and JLS does
+    // not permit widening into it from byte/short/int.
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            message: Some("Field.getChar: null Field".to_string()),
+        }.into()),
+    };
+    let (_, _, _, descriptor) = read_field_meta(ctx, this);
+    validate_field_descriptor(&descriptor, b"C", "getChar")?;
     let val = field_get_raw(ctx, args)?;
     match val {
         // char is an unsigned 16-bit type stored in an int slot; clamp to u16.
@@ -3538,9 +3641,45 @@ pub(crate) fn native_class_get_declared_field(
         }
     };
 
+    // Round 9 audit fix (HIGH #7): probe the per-VM `LinkResolver` cache
+    // for `(class_id, name, "")`. `getDeclaredField` takes no descriptor
+    // argument so the cache key matches the `JNI GetFieldID` `""` shape
+    // when the JNI caller omits the signature.
+    if let Some((decl, abs_idx, is_static)) =
+        ctx.link_resolver_get_field(class_id, &target_name, "")
+    {
+        // Cache hit — re-fetch the metadata to build the Field mirror.
+        // We still walk `declared_fields(decl)` (small per-class vec) so
+        // the mirror's `create_field_object` payload (descriptor, mods,
+        // signature) matches what a cold miss would have produced.
+        let fields = ctx.declared_fields(decl);
+        for meta in &fields {
+            if meta.name == target_name
+                && meta.slot_index == abs_idx as usize
+                && meta.is_static == is_static
+            {
+                let field_obj = create_field_object(ctx, meta);
+                return Ok(Some(Value::Object(Some(field_obj))));
+            }
+        }
+        // Fall through to the cold-miss walk if the cached entry no
+        // longer matches (declared_fields shape mutated under us; very
+        // rare).
+    }
+
     let fields = ctx.declared_fields(class_id);
     for meta in &fields {
         if meta.name == target_name {
+            // Round 9 audit fix (HIGH #7): cache the cold-miss result so
+            // subsequent probes short-circuit.
+            ctx.link_resolver_insert_field(
+                class_id,
+                &target_name,
+                "",
+                meta.declaring_class_id,
+                meta.slot_index as u32,
+                meta.is_static,
+            );
             let field_obj = create_field_object(ctx, meta);
             return Ok(Some(Value::Object(Some(field_obj))));
         }
@@ -4907,8 +5046,66 @@ pub(crate) fn native_class_get_declared_method(
     // file in synthetic-jdk mode, so its `methods` list is empty).
     let methods = declared_methods_with_synthetic(ctx, class_id);
 
+    // Round 9 audit fix (HIGH #7): build a cache key string from the
+    // requested parameter-type mirrors. The key is a synthetic
+    // `;`-delimited list of dotted class names — not a JVM descriptor,
+    // but unique within `(class_id, name)` so identical Spring /
+    // Hibernate / ByteBuddy probes hit the cache instead of re-walking.
+    // When `param_types_arr` is `None` the call is ambiguous (returns
+    // the *first* matching method), so we still cache against an empty
+    // string — the cached entry stays correct as long as the class
+    // hasn't been redefined (the round-8 invalidation hook drops every
+    // entry keyed on `class_id` on redefine).
+    //
+    // A `None` element in the parameter array makes the key
+    // unrepresentable; we set `cache_key_ok = false` so we skip both
+    // the probe and the insert (the cold-walk loop still preserves
+    // the original `matched = false; continue` behaviour per meta).
+    let mut cache_key_ok = true;
+    let cache_key_desc: String = match param_types_arr {
+        None => String::new(),
+        Some(pt_arr) => {
+            let n = ctx.array_length(pt_arr);
+            let mut s = String::with_capacity(n * 16);
+            for i in 0..n {
+                let mirror = match ctx.get_array_element(pt_arr, i) {
+                    Value::Object(Some(m)) => m,
+                    _ => {
+                        cache_key_ok = false;
+                        break;
+                    }
+                };
+                let name = mirror_class_name(ctx, mirror).unwrap_or_default();
+                s.push_str(&name);
+                s.push(';');
+            }
+            s
+        }
+    };
+
+    // Probe the LinkResolver cache. On hit, re-fetch the metadata vec
+    // and pick the entry at the cached index — much faster than
+    // re-running the parameter-type comparison loop.
+    if cache_key_ok {
+        if let Some((decl, idx)) =
+            ctx.link_resolver_get_method(class_id, &target_name, &cache_key_desc)
+        {
+            if decl == class_id {
+                if let Some(meta) = methods.get(idx as usize) {
+                    if meta.name == target_name {
+                        let method_obj = create_method_object(ctx, meta);
+                        return Ok(Some(Value::Object(Some(method_obj))));
+                    }
+                }
+            }
+            // Cached entry no longer applicable (synthetic-method table
+            // mutated, redefine raced past our invalidation window, etc.) —
+            // fall through to the cold walk.
+        }
+    }
+
     // If param_types is provided, match by name + parameter count/types
-    for meta in &methods {
+    for (meta_idx, meta) in methods.iter().enumerate() {
         if meta.name != target_name || meta.name == "<init>" || meta.name == "<clinit>" {
             continue;
         }
@@ -4943,6 +5140,18 @@ pub(crate) fn native_class_get_declared_method(
             }
         }
 
+        // Round 9 audit fix (HIGH #7): cache the cold-miss result so
+        // subsequent identical probes short-circuit. Skip if the cache
+        // key could not be built (a None mirror in the parameter array).
+        if cache_key_ok {
+            ctx.link_resolver_insert_method(
+                class_id,
+                &target_name,
+                &cache_key_desc,
+                class_id,
+                meta_idx as u32,
+            );
+        }
         let method_obj = create_method_object(ctx, meta);
         return Ok(Some(Value::Object(Some(method_obj))));
     }
@@ -5857,6 +6066,28 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
         }
     };
 
+    // Round 9 audit fix (HIGH #7): probe the LinkResolver for the
+    // resolved hierarchy walk. `getField` keys on `(class_id, name, "")`
+    // — same shape as JNI `GetFieldID` with a null signature. On a cache
+    // hit we still re-fetch the metadata from the declaring class so
+    // `create_field_object` produces a faithful mirror.
+    if let Some((decl, abs_idx, is_static)) =
+        ctx.link_resolver_get_field(class_id, &target_name, "")
+    {
+        let fields = ctx.declared_fields(decl);
+        for meta in &fields {
+            if meta.name == target_name
+                && meta.slot_index == abs_idx as usize
+                && meta.is_static == is_static
+                && (meta.access_flags & 0x0001) != 0
+            {
+                let field_obj = create_field_object(ctx, meta);
+                return Ok(Some(Value::Object(Some(field_obj))));
+            }
+        }
+        // Cached entry no longer applicable; fall through to the walk.
+    }
+
     // Walk class hierarchy for public field
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
@@ -5867,6 +6098,14 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
         let fields = ctx.declared_fields(cid);
         for meta in &fields {
             if meta.name == target_name && (meta.access_flags & 0x0001) != 0 {
+                ctx.link_resolver_insert_field(
+                    class_id,
+                    &target_name,
+                    "",
+                    meta.declaring_class_id,
+                    meta.slot_index as u32,
+                    meta.is_static,
+                );
                 let field_obj = create_field_object(ctx, meta);
                 return Ok(Some(Value::Object(Some(field_obj))));
             }
@@ -5976,6 +6215,55 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
         }
     };
 
+    // Round 9 audit fix (HIGH #7): build the same synthetic descriptor
+    // key as `getDeclaredMethod` and probe the LinkResolver before
+    // walking. Public-method lookups can also straddle several
+    // superclass rungs, but the cache key uses the *origin* class_id
+    // (where the user queried from) — that's the natural dedupe axis.
+    let mut cache_key_ok = true;
+    let cache_key_desc: String = match param_types_arr {
+        None => String::new(),
+        Some(pt_arr) => {
+            let n = ctx.array_length(pt_arr);
+            let mut s = String::with_capacity(n * 16);
+            for i in 0..n {
+                let mirror = match ctx.get_array_element(pt_arr, i) {
+                    Value::Object(Some(m)) => m,
+                    _ => {
+                        cache_key_ok = false;
+                        break;
+                    }
+                };
+                let name = mirror_class_name(ctx, mirror).unwrap_or_default();
+                s.push_str(&name);
+                s.push(';');
+            }
+            s
+        }
+    };
+
+    if cache_key_ok {
+        if let Some((decl, idx)) =
+            ctx.link_resolver_get_method(class_id, &target_name, &cache_key_desc)
+        {
+            // Refetch the cached entry's metadata vec on the declaring
+            // class and verify the (name, public) constraints — if the
+            // entry still applies we can short-circuit the hierarchy walk.
+            let methods = declared_methods_with_synthetic(ctx, decl);
+            if let Some(meta) = methods.get(idx as usize) {
+                if meta.name == target_name
+                    && meta.name != "<init>"
+                    && meta.name != "<clinit>"
+                    && (meta.access_flags & 0x0001) != 0
+                {
+                    let method_obj = create_method_object(ctx, meta);
+                    return Ok(Some(Value::Object(Some(method_obj))));
+                }
+            }
+            // Fall through on stale cache entry.
+        }
+    }
+
     // Walk class hierarchy for public method
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
@@ -5987,7 +6275,7 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
         // walk so a public method declared on a synthetic-stub superclass
         // (e.g. java/lang/ClassLoader) is still reachable from getMethod.
         let methods = declared_methods_with_synthetic(ctx, cid);
-        for meta in &methods {
+        for (meta_idx, meta) in methods.iter().enumerate() {
             if meta.name != target_name
                 || meta.name == "<init>"
                 || meta.name == "<clinit>"
@@ -6022,6 +6310,19 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
                 if !matched {
                     continue;
                 }
+            }
+            // Round 9 audit fix (HIGH #7): cache the cold-miss result.
+            // Cache key uses the user-queried `class_id`; declaring is
+            // the rung where the method was actually found. Skip if the
+            // cache key could not be built (None mirror in param array).
+            if cache_key_ok {
+                ctx.link_resolver_insert_method(
+                    class_id,
+                    &target_name,
+                    &cache_key_desc,
+                    cid,
+                    meta_idx as u32,
+                );
             }
             let method_obj = create_method_object(ctx, meta);
             return Ok(Some(Value::Object(Some(method_obj))));

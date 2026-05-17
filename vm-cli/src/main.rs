@@ -1982,19 +1982,23 @@ fn main() {
         }
     }));
 
-    // The interpreter uses recursive Rust calls for Java method invocations.
-    // Deep Java call stacks (e.g. Quarkus bootstrap) can exceed the default
-    // 8 MB Rust stack.  Spawn the real entry point on a thread with 2 MiB —
-    // matching HotSpot's `-Xss` default. The previous 64 MiB reservation was
-    // 64x what HotSpot ships and a 64x VSZ overhead for no measurable benefit
-    // (deep clinit chains observed in BouncyCastle / WildFly bootstrap fit
-    // comfortably under 2 MiB). Override via `RUST_MIN_STACK` if a test or
-    // workload needs more (mirrors child-thread sizing in
-    // `vm/src/vm/vm_exec.rs`).
+    // Round-9 misc HIGH fix (audit `round9-misc.md`): this is the *Rust
+    // native stack* for the main carrier thread — it is NOT the Java
+    // `-Xss` budget. The CratonVM interpreter recurses in Rust at
+    // ~2-4 KiB per Java frame (recursive `execute_frame` + invoke
+    // dispatch + JIT entry trampoline). A 2 MiB native stack only fits
+    // ~500-1000 nested Java frames before overflow, which Quarkus /
+    // WildFly / JDK module-loader clinit chains routinely exceed during
+    // cold start (observed >1000 nested `<clinit>` frames). Use Rust's
+    // 8 MiB default to match the child-thread sizing in
+    // `vm/src/vm/vm_exec.rs`; override via `RUST_MIN_STACK` if a test
+    // or workload wants to dial it down. The eventual `-Xss` CLI flag
+    // will gate the *Java* stack-depth limit (`max_stack_depth` in
+    // `JvmConfig`) independently of this native budget.
     let main_stack_size = std::env::var("RUST_MIN_STACK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(2 * 1024 * 1024);
+        .unwrap_or(8 * 1024 * 1024);
     let builder = std::thread::Builder::new()
         .name("main-vm".into())
         .stack_size(main_stack_size);
