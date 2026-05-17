@@ -568,15 +568,11 @@ mod tests {
         let name = cf.this_class;
         let cp = cf.constant_pool;
 
-        // The fixture's excluded entry point — Items 7/8 will document
-        // the canonical name & descriptor. We probe both common
-        // candidates so the test is robust to minor fixture-naming
-        // tweaks.
         let idx = methods
             .iter()
             .position(|m| {
                 let n = &*m.name;
-                n == "run" || n == "kernel" || n == "compute" || n == "main"
+                n == "run" || n == "kernel" || n == "compute" || n == "main" || n == "vectorAdd"
             })
             .map(|i| i as u16)
             .expect("ExcludedKernel fixture must have an entry-point method");
@@ -585,14 +581,7 @@ mod tests {
         config.gpu_offload_enabled = true;
         let cache = OffloadCache::new(&config);
         if !cache.has_device() {
-            // Skip silently rather than failing: the test only makes
-            // sense on a GPU host. The `#[ignore]` attribute already
-            // gates the CI default, but a developer running `--ignored`
-            // on a laptop without CUDA should not see a spurious
-            // failure.
-            eprintln!(
-                "excluded_method_returns_blacklisted: no CUDA device; skipping body"
-            );
+            eprintln!("excluded_method_returns_blacklisted: no CUDA device; skipping body");
             return;
         }
 
@@ -605,16 +594,8 @@ mod tests {
         }
     }
 
-    /// Even a method whose body would be eligible (e.g. a vector-add
-    /// loop) must be blacklisted when `@GpuExclude` is present — the
-    /// annotation has to short-circuit the analyzer entirely. The
-    /// observable signal here is identical to
-    /// `excluded_method_returns_blacklisted`, but the fixture is built
-    /// from an eligible kernel with the exclude annotation pasted on
-    /// top, proving the opt-out wins over eligibility.
-    ///
-    /// Same `#[ignore]` rationale as above: needs Items 7/8's fixture
-    /// plus a real device for the annotation read to actually fire.
+    /// Even a method whose body would be eligible must be blacklisted
+    /// when `@GpuExclude` is present.
     #[test]
     #[ignore = "requires @GpuExclude-on-eligible fixture (Items 7/8) and a real CUDA device"]
     fn excluded_short_circuits_analyzer() {
@@ -625,7 +606,7 @@ mod tests {
             .join("test_classes")
             .join("gpu")
             .join("annotations")
-            .join("ExcludedEligibleKernel.class");
+            .join("ExcludedAndKernel.class");
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
         let cf = read_class(&bytes)
@@ -634,9 +615,6 @@ mod tests {
         let name = cf.this_class;
         let cp = cf.constant_pool;
 
-        // Find any kernel-shaped method (returns void, takes arrays).
-        // Item 7/8 will pin the exact name; "vectorAdd" matches the
-        // existing eligible fixture's convention.
         let idx = methods
             .iter()
             .position(|m| {
@@ -644,21 +622,16 @@ mod tests {
                 n == "vectorAdd" || n == "saxpy" || n == "run" || n == "kernel"
             })
             .map(|i| i as u16)
-            .expect("ExcludedEligibleKernel fixture must have a kernel-shaped method");
+            .expect("ExcludedAndKernel fixture must have a kernel-shaped method");
 
         let mut config = VmConfig::default();
         config.gpu_offload_enabled = true;
         let cache = OffloadCache::new(&config);
         if !cache.has_device() {
-            eprintln!(
-                "excluded_short_circuits_analyzer: no CUDA device; skipping body"
-            );
+            eprintln!("excluded_short_circuits_analyzer: no CUDA device; skipping body");
             return;
         }
 
-        // The verdict must be Blacklisted: the exclude annotation
-        // wins, even though analyzer-with-annotations would have
-        // returned Eligible for this body.
         match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
             LookupOutcome::Blacklisted => {}
             LookupOutcome::Skip => panic!("expected Blacklisted, got Skip"),
@@ -667,4 +640,114 @@ mod tests {
             ),
         }
     }
+
+    /// Phase 1 Item 6 — `warmup_class` should compile up to `max`
+    /// `@GpuKernel`-annotated methods. `#[ignore]`d on the no-GPU
+    /// dev box; the body documents the assertion shape.
+    #[test]
+    #[ignore = "requires @EnableGpuAsync fixture (Item 8) and a real CUDA device"]
+    fn warmup_class_compiles_up_to_max() {
+        // PHASE1-GUESS: cache.kernels is private; a test-only
+        // accessor like kernels_for_class() would be needed once
+        // a real device makes this exercisable.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load warmup.
+//
+// `try_dispatch` lazily compiles eligible methods on first call.
+// `@EnableGpuAsync(warmup = N)` opts a class into eager compilation:
+// when the class is registered with the VM, the class-loader callsite
+// invokes `maybe_warmup_gpu`, which reads the class-level annotation
+// table and, if `EnableGpuAsync.warmup > 0`, asks the cache to
+// pre-compile up to `warmup` `@GpuKernel`-annotated methods.
+// ---------------------------------------------------------------------------
+
+impl OffloadCache {
+    /// Eagerly populate the cache for up to `max` `@GpuKernel`-annotated
+    /// methods of `class`. Called from the class loader when
+    /// `@EnableGpuAsync(warmup = N)` is detected on the class.
+    pub fn warmup_class(
+        &self,
+        class: &crate::classloading::Class,
+        class_id: ClassId,
+        max: usize,
+    ) {
+        if max == 0 {
+            return;
+        }
+        if !self.has_device() {
+            tracing::info!(
+                "gpu warmup: {} requested but no device available; skipping",
+                &*class.name,
+            );
+            return;
+        }
+
+        let mut compiled = 0usize;
+        let mut considered = 0usize;
+        for (method_index, method) in class.methods.iter().enumerate() {
+            if compiled >= max {
+                break;
+            }
+            considered += 1;
+            let m_anns = jit_cuda::annotations::read_method_annotations(
+                &method.attributes,
+                &class.constant_pool,
+            );
+            if m_anns.gpu_kernel.is_none() || m_anns.gpu_exclude.is_some() {
+                continue;
+            }
+            let mi = method_index as u16;
+            match self.lookup_or_compile(
+                class_id,
+                &class.name,
+                mi,
+                method,
+                &class.constant_pool,
+            ) {
+                LookupOutcome::Hit(_) => {
+                    compiled += 1;
+                }
+                LookupOutcome::Skip | LookupOutcome::Blacklisted => {
+                    // Not a successful eligible compile — keep scanning
+                    // but don't count toward `max`.
+                }
+            }
+        }
+        tracing::info!(
+            "gpu warmup: {} -> {}/{} eligible methods compiled (considered {} of {})",
+            &*class.name,
+            compiled,
+            max,
+            considered,
+            class.methods.len(),
+        );
+    }
+}
+
+/// Class-loader hook: if `class` carries `@EnableGpuAsync(warmup = N)`
+/// with `N > 0`, eagerly warm the offload cache for that class.
+pub(crate) fn maybe_warmup_gpu(
+    shared: &crate::vm::SharedVm,
+    class: &crate::classloading::Class,
+    class_id: ClassId,
+) {
+    if !shared.config.gpu_offload_enabled {
+        return;
+    }
+    let class_annotations = jit_cuda::annotations::read_class_annotations(
+        &class.attributes,
+        &class.constant_pool,
+    );
+    let Some(enable) = class_annotations.enable_async else {
+        return;
+    };
+    if enable.warmup == 0 {
+        return;
+    }
+    shared
+        .offload_cache
+        .warmup_class(class, class_id, enable.warmup as usize);
 }

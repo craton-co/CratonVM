@@ -2690,6 +2690,26 @@ impl SharedVm {
             if let Some(sup) = superclass {
                 let _evicted_sup = self.invalidate_jit_for_class(&sup);
             }
+
+            // Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load
+            // warmup. If the class is annotated, eagerly pre-compile up
+            // to `N` `@GpuKernel`-annotated methods so the first call
+            // does not pay the analyzer + PTX lowering cost. Cheap when
+            // offload is off — `maybe_warmup_gpu` short-circuits on the
+            // `gpu_offload_enabled` flag.
+            //
+            // The class manager read-lock is held for the duration of
+            // the warmup; the inner `lookup_or_compile` only touches
+            // the `OffloadCache`'s own locks (`kernels`, `blacklist`)
+            // so there is no re-entrancy risk against the manager.
+            #[cfg(feature = "gpu-offload")]
+            {
+                let class_id = *class_id;
+                let cm = self.class_manager.read();
+                if let Some(class) = cm.get_class(class_id) {
+                    crate::runtime::offload::maybe_warmup_gpu(self, class, class_id);
+                }
+            }
         }
 
         // Mark done and notify all waiters for this class
