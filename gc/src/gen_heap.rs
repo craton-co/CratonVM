@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::sync::Arc;
 
@@ -1094,20 +1095,44 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
-        // NEW-1.5: If any thread is currently inside a JIT call, warn but
-        // proceed with GC anyway. The conservative root scanner may treat
-        // a coincidental integer as a heap pointer (keeping an extra object
-        // alive), but that is a minor leak — far better than OOM / abort.
-        // The previous behaviour of *skipping GC entirely* caused
-        // deterministic OutOfMemoryError whenever any JIT-compiled method
-        // was on the call stack (the interpreter's maybe_gc could never
-        // actually collect). TODO: remove this warning once precise JIT
-        // oop maps land.
+        // SAFETY: If any thread is currently inside a JIT call, we MUST NOT
+        // run a moving collection. JIT frames hold raw object pointers in
+        // their spill slots which are NOT visible to the conservative root
+        // scanner — a Cheney copy would relocate those objects but leave the
+        // JIT frame holding the stale (pre-move) address. Subsequent reads
+        // through that spill slot would dereference freed memory, and writes
+        // would corrupt unrelated allocations.
+        //
+        // Until precise JIT oop maps are wired into the GC (so spill slots
+        // can be rewritten with forwarded pointers — see
+        // `find_oop_map_for_pc` in `jit/src/lib.rs`), the only safe response
+        // is to skip this collection cycle entirely. We do NOT install
+        // forwarding pointers, do NOT swap spaces, and do NOT reset arenas.
+        //
+        // The mutator will continue allocating from the (possibly full)
+        // young gen. If the young gen is exhausted before quiescence ends
+        // the allocator will surface OOM to the caller — that is strictly
+        // safer than silently corrupting live JIT-managed pointers.
+        //
+        // TODO: Skipped collection because JIT quiescence is active. Remove
+        // once precise JIT oop maps land.
         if crate::gc_quiescence::is_active() {
             tracing::warn!(
-                "GC running while JIT frames are active (depth={}) — \
-                 conservative roots may over-retain",
+                "GC skipped: JIT frames are active (depth={}) — moving \
+                 collection would invalidate raw pointers held in JIT spill \
+                 slots. Retrying once quiescence ends.",
                 crate::gc_quiescence::depth(),
+            );
+            return (
+                GcResult {
+                    stats: crate::gc::GcStats {
+                        objects_copied: 0,
+                        bytes_copied: 0,
+                        bytes_freed: 0,
+                    },
+                    pointer_map: HashMap::new(),
+                },
+                Vec::new(),
             );
         }
 
@@ -1118,7 +1143,17 @@ impl GenerationalHeap {
 
         let bytes_before = young_from.used();
         let mut objects_copied: usize = 0;
-        let mut pointer_map = HashMap::new();
+        // CRIT-P2 fix: use FxHashMap to avoid SipHash overhead on every
+        // forwarded pointer (N hash ops per GC for N live objects).
+        // Converted back to std HashMap at the end for public-API
+        // compatibility (`GcResult.pointer_map` and `MonitorCleanup`).
+        let mut pointer_map: FxHashMap<usize, usize> = FxHashMap::default();
+        // CRIT-P2 fix: explicit worklist of promoted (old-gen) objects awaiting
+        // a scan. Replaces the O(promoted^2) filter loop that previously
+        // rebuilt `Vec<unscanned>` from `pointer_map.values()` per iteration.
+        // Populated by `forward_object` whenever an object is promoted to
+        // old gen; popped by the alternating Cheney scan below.
+        let mut promoted_worklist: Vec<*mut u8> = Vec::new();
 
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
@@ -1217,7 +1252,9 @@ impl GenerationalHeap {
         //     that lands in young_to (needs Cheney scan) or gets promoted
         //     itself (needs another promoted scan iteration).
         let mut scan_cursor: usize = 0;
-        let mut scanned_promoted: HashSet<usize> = HashSet::new();
+        // CRIT-P2 fix: FxHashSet (replaces std HashSet/SipHash) for cheap
+        // dedup of promoted-object scans.
+        let mut scanned_promoted: FxHashSet<usize> = FxHashSet::default();
         // Accumulate old-gen addresses needing card dirty marks after GC.
         // These arise when a promoted object contains a reference that was
         // forwarded to young to-space (old→young cross-gen reference).
@@ -1429,7 +1466,7 @@ impl GenerationalHeap {
                                     if young_from.contains(ref_ptr) {
                                         let new_ref_ptr = Self::forward_object(
                                             &young_from, &mut young_to, &mut old_gen,
-                                            ref_ptr, &mut objects_copied, &mut pointer_map,
+                                            ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
                                         );
                                         // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
                                         unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
@@ -1484,7 +1521,7 @@ impl GenerationalHeap {
                                     if young_from.contains(ref_ptr) {
                                         let new_ref_ptr = Self::forward_object(
                                             &young_from, &mut young_to, &mut old_gen,
-                                            ref_ptr, &mut objects_copied, &mut pointer_map,
+                                            ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
                                         );
                                         // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
                                         unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
@@ -1972,7 +2009,8 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
         objects_copied: &mut usize,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut FxHashMap<usize, usize>,
+        promoted_worklist: &mut Vec<*mut u8>,
     ) -> *mut u8 {
         // SAFETY: `old_ptr` points to a live young-gen object; its header is valid.
         let header = unsafe { &*(old_ptr as *const ObjectHeader) };
@@ -2106,7 +2144,8 @@ impl GenerationalHeap {
         let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
         new_header.forwarding_ptr = std::ptr::null_mut();
 
-        if should_promote && old_gen.contains(new_ptr) {
+        let landed_in_old_gen = should_promote && old_gen.contains(new_ptr);
+        if landed_in_old_gen {
             // Mark as old gen
             new_header.gc_flags |= GC_FLAG_OLD_GEN;
         } else {
@@ -2121,6 +2160,14 @@ impl GenerationalHeap {
 
         pointer_map.insert(old_ptr as usize, new_ptr as usize);
         *objects_copied += 1;
+        // CRIT-P2 fix: enqueue promoted objects so the alternating Cheney
+        // loop can scan them in O(1) per object instead of re-filtering
+        // `pointer_map.values()` per iteration. Young to-space copies are
+        // already handled by the bump-cursor Cheney scan in the caller, so
+        // we only enqueue when the object actually landed in old gen.
+        if landed_in_old_gen {
+            promoted_worklist.push(new_ptr);
+        }
 
         debug_assert!(young_from.contains(old_ptr));
 

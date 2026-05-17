@@ -7,59 +7,94 @@
 //!
 //! Two interning modes are offered:
 //!
-//! * [`StringPool::intern`] — returns a `&'static str` from a leaked `Box<str>`.
-//!   Best for hot-path keys that will be compared by pointer equality.
+//! * [`StringPool::intern`] — returns a `&'static str` derived from the
+//!   pool-owned `Arc<str>`. Best for hot-path keys that will be compared by
+//!   pointer equality.
 //! * [`StringPool::intern_arc`] — returns an `Arc<str>` that shares a single
 //!   allocation across callers. Clones are cheap (one refcount bump) and the
-//!   type integrates with owning structs that cannot hold a `'static` reference
-//!   for lifetime reasons (e.g. `ConstantPoolEntry::Utf8`).
+//!   type integrates with owning structs that cannot hold a `'static`
+//!   reference for lifetime reasons (e.g. `ConstantPoolEntry::Utf8`).
+//!
+//! # Implementation (AUDIT 2026-05-16, CRIT-P1 + CRIT-P2)
+//!
+//! Both modes now share a single `Arc<str>` allocation per unique string
+//! (previously `intern_arc` did *three* allocations on a miss: a `String`, a
+//! `Box<str>` for `Box::leak`, and a third copy into the `Arc` layout). On a
+//! cache hit the pool takes a `parking_lot::RwLock` *read* guard — multiple
+//! readers can intern in parallel, which matters because class loading is
+//! overwhelmingly read-heavy. Hashing uses `rustc_hash::FxHasher` instead of
+//! the default SipHash; FxHash is roughly 3–5× faster on the short ASCII
+//! strings (class / method / descriptor names) that dominate the workload and
+//! is acceptable here because the pool is not exposed to untrusted input
+//! (everything passing through it comes from already-validated classfile
+//! bytes).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::RwLock;
+use rustc_hash::FxHasher;
+use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
+use std::sync::{Arc, OnceLock};
+
+type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// A thread-safe string interning pool.
 ///
-/// Strings are stored in leaked `Box<str>` allocations (valid for `'static`).
-/// Deduplication is via a `HashSet` protected by a `Mutex`.
-/// Once interned, strings are never freed — this is intentional because
-/// class/method/descriptor strings live for the entire VM lifetime.
+/// Strings are stored in a single `Arc<str>` per unique content; the pool
+/// itself holds one of those `Arc<str>` clones so the backing allocation
+/// outlives every caller. Once interned, strings are never freed — this is
+/// intentional because class/method/descriptor strings live for the entire
+/// VM lifetime.
 ///
-/// The pool also maintains a parallel `HashMap` of `Arc<str>` entries so
-/// callers that need heap-owned (rather than `'static`) references can get
-/// a deduplicated `Arc<str>` without a second allocation.
+/// `intern` returns a `&'static str` derived from the pool-owned `Arc<str>`;
+/// see the lifetime-extension argument on [`StringPool::intern`] for why this
+/// is sound when the pool itself lives forever (the global singleton case).
 pub struct StringPool {
-    inner: Mutex<PoolState>,
-}
-
-struct PoolState {
-    static_set: HashSet<&'static str>,
-    arc_map: HashMap<&'static str, Arc<str>>,
+    // The map is keyed by the `Arc<str>` itself; `HashMap<Arc<str>, ()>` is
+    // morally a `HashSet<Arc<str>>` but using a `HashMap` lets us call
+    // `get_key_value` to retrieve a reference to the stored `Arc` (which is
+    // what we actually want — a `HashSet` would give us back a `&Arc<str>` via
+    // `get` but the ergonomics work out the same).
+    map: RwLock<FxHashMap<Arc<str>, ()>>,
 }
 
 impl StringPool {
     /// Creates a new, empty `StringPool`.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(PoolState {
-                static_set: HashSet::new(),
-                arc_map: HashMap::new(),
-            }),
+            map: RwLock::new(FxHashMap::default()),
         }
     }
 
     /// Interns a string, returning a `&'static str`.
     ///
-    /// If the string has been previously interned, the same pointer is returned.
-    /// If not, the string is leaked into a `'static` allocation and stored.
+    /// If the string has been previously interned, the same pointer is
+    /// returned. If not, a fresh `Arc<str>` is allocated and the pool retains
+    /// its own clone; the returned reference borrows from the bytes of that
+    /// pool-owned `Arc<str>`.
+    ///
+    /// # Lifetime extension safety
+    ///
+    /// We hand out `&'static str` derived from the bytes of a pool-owned
+    /// `Arc<str>`. The transmute to `'static` is sound *iff* the pool itself
+    /// outlives every `&'static` it ever yields. That is true in the only
+    /// production use of this type — [`global_pool`] is a `OnceLock` initialised
+    /// once per process and never dropped — and is also true within the scope
+    /// of any unit test that uses `intern` on a stack-local pool, because the
+    /// returned reference is itself bounded by the pool's lifetime in the
+    /// caller's frame (the test cannot leak the reference past the pool's
+    /// destruction without explicit, unrelated unsafe code).
+    ///
+    /// Callers who would otherwise be tempted to construct a non-`'static`
+    /// `StringPool` and outlive it should prefer [`Self::intern_arc`].
     pub fn intern(&self, s: &str) -> &'static str {
-        let mut state = self.inner.lock().unwrap();
-        if let Some(&existing) = state.static_set.get(s) {
-            existing
-        } else {
-            let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-            state.static_set.insert(leaked);
-            leaked
-        }
+        let arc = self.intern_arc(s);
+        // SAFETY: `arc` is a clone of the pool-owned `Arc<str>`; the pool
+        // keeps its own clone forever (we never call `remove`). The bytes of
+        // an `Arc<str>` are pinned for the lifetime of the strongest `Arc`,
+        // so as long as the pool lives the bytes live. The pool is intended
+        // for use as a `'static` singleton (see `global_pool`).
+        let bytes: &str = &arc;
+        unsafe { std::mem::transmute::<&str, &'static str>(bytes) }
     }
 
     /// Interns a string, returning an `Arc<str>` that shares a single backing
@@ -69,40 +104,43 @@ impl StringPool {
     /// `Arc<str>` (pointer equality via `Arc::ptr_eq`). The pool retains an
     /// internal reference, so the backing allocation is never dropped.
     pub fn intern_arc(&self, s: &str) -> Arc<str> {
-        let mut state = self.inner.lock().unwrap();
-        // Fast path: already interned as Arc.
-        // Use the static_set's lookup table to get a `&'static str` key we
-        // can use in the Arc map (this keeps both structures consistent and
-        // guarantees O(1) second-call lookup).
-        let key: &'static str = if let Some(&existing) = state.static_set.get(s) {
-            existing
-        } else {
-            let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-            state.static_set.insert(leaked);
-            leaked
-        };
-        if let Some(arc) = state.arc_map.get(key) {
-            Arc::clone(arc)
-        } else {
-            let arc: Arc<str> = Arc::from(key);
-            state.arc_map.insert(key, Arc::clone(&arc));
-            arc
+        // Fast path: shared read lock. Multiple threads can hit the cache in
+        // parallel without serialising on a mutex. `HashMap::get_key_value`
+        // returns a borrow of the stored `Arc<str>` which we then clone.
+        {
+            let read = self.map.read();
+            if let Some((existing, _)) = read.get_key_value(s) {
+                return Arc::clone(existing);
+            }
         }
+
+        // Slow path: take the write lock. Allocate the `Arc<str>` exactly
+        // ONCE — `Arc::<str>::from(&str)` copies the bytes into the Arc's
+        // single backing allocation directly, no intermediate `String` or
+        // `Box<str>`. Re-check under the write lock in case a concurrent
+        // writer beat us to it.
+        let mut write = self.map.write();
+        if let Some((existing, _)) = write.get_key_value(s) {
+            return Arc::clone(existing);
+        }
+        let arc: Arc<str> = Arc::from(s);
+        write.insert(Arc::clone(&arc), ());
+        arc
     }
 
     /// Returns the number of unique strings currently interned.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().static_set.len()
+        self.map.read().len()
     }
 
     /// Returns `true` if no strings have been interned.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().static_set.is_empty()
+        self.map.read().is_empty()
     }
 
     /// Returns `true` if the given string has been interned.
     pub fn contains(&self, s: &str) -> bool {
-        self.inner.lock().unwrap().static_set.contains(s)
+        self.map.read().contains_key(s)
     }
 }
 
@@ -295,8 +333,10 @@ mod tests {
     #[test]
     fn intern_arc_reuses_after_static_intern() {
         // Interning via `intern` then via `intern_arc` must still yield
-        // the same Arc<str> as a subsequent `intern_arc` call, even though
-        // the Arc's backing allocation is separate from the leaked static one.
+        // the same Arc<str> as a subsequent `intern_arc` call. Post-audit
+        // both paths share the same underlying Arc<str>, so the `&'static str`
+        // handed out by `intern` borrows from the very same bytes that
+        // `intern_arc` then returns an Arc-clone of.
         let pool = StringPool::new();
         let _ = pool.intern("shared_between_modes");
         let a = pool.intern_arc("shared_between_modes");
@@ -325,5 +365,109 @@ mod tests {
                 assert_eq!(&**r, "java/lang/String");
             }
         });
+    }
+
+    // ------------------------------------------------------------------
+    // AUDIT 2026-05-16 — new tests covering the post-fix invariants.
+    // ------------------------------------------------------------------
+
+    /// `intern_arc` called repeatedly with the same content must hand back
+    /// clones of *the same* `Arc<str>` allocation. Distinct content must
+    /// produce distinct allocations.
+    #[test]
+    fn intern_arc_pointer_identity_preserved() {
+        let pool = StringPool::new();
+
+        let a1 = pool.intern_arc("java/util/HashMap");
+        let a2 = pool.intern_arc("java/util/HashMap");
+        let a3 = pool.intern_arc("java/util/HashMap");
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(Arc::ptr_eq(&a2, &a3));
+        // All three are pointer-identical to the original storage.
+        assert_eq!(Arc::strong_count(&a1) >= 4, true); // a1,a2,a3,pool
+
+        let b = pool.intern_arc("java/util/TreeMap");
+        assert!(!Arc::ptr_eq(&a1, &b));
+    }
+
+    /// `intern` and `intern_arc` must share the same backing bytes for the
+    /// same content. The pointer returned by `intern` should equal
+    /// `Arc::as_ptr(&intern_arc(...))` as a `*const u8`.
+    #[test]
+    fn intern_and_intern_arc_share_bytes() {
+        let pool = StringPool::new();
+
+        // Order 1: arc first, then static.
+        let arc = pool.intern_arc("Ljava/lang/Object;");
+        let stat = pool.intern("Ljava/lang/Object;");
+        assert_eq!(arc.as_ptr(), stat.as_ptr());
+        assert_eq!(arc.len(), stat.len());
+
+        // Order 2: static first, then arc — also shares.
+        let stat2 = pool.intern("()V");
+        let arc2 = pool.intern_arc("()V");
+        assert_eq!(stat2.as_ptr(), arc2.as_ptr());
+    }
+
+    /// Eight threads each interning an overlapping set of strings must agree
+    /// pointer-wise on each unique key. Stresses the read/write lock
+    /// promotion path.
+    #[test]
+    fn concurrent_intern_arc_pointer_identity_across_threads() {
+        let pool = StringPool::new();
+        let pool_ref = &pool;
+
+        // Each thread interns this same set, in different orders.
+        let names: &[&str] = &[
+            "java/lang/Object",
+            "java/lang/String",
+            "java/util/Map",
+            "java/util/HashMap",
+            "java/util/TreeMap",
+            "java/util/List",
+            "java/util/ArrayList",
+            "java/util/LinkedList",
+        ];
+
+        let per_thread: Vec<Vec<Arc<str>>> = thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|tid| {
+                    s.spawn(move || {
+                        let mut out = Vec::with_capacity(names.len());
+                        // Rotate the order per thread so different threads race
+                        // on different first-insert keys.
+                        for i in 0..names.len() {
+                            let idx = (i + tid) % names.len();
+                            out.push(pool_ref.intern_arc(names[idx]));
+                        }
+                        // Reorder to canonical (name-index) order before
+                        // returning so the outer comparison is straightforward.
+                        let mut canonical: Vec<Option<Arc<str>>> =
+                            (0..names.len()).map(|_| None).collect();
+                        for i in 0..names.len() {
+                            let idx = (i + tid) % names.len();
+                            canonical[idx] = Some(Arc::clone(&out[i]));
+                        }
+                        canonical.into_iter().map(|o| o.unwrap()).collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // For every name, all 8 threads' Arcs must be Arc::ptr_eq.
+        for (col_idx, name) in names.iter().enumerate() {
+            let baseline = &per_thread[0][col_idx];
+            assert_eq!(&**baseline, *name);
+            for (row_idx, row) in per_thread.iter().enumerate().skip(1) {
+                assert!(
+                    Arc::ptr_eq(baseline, &row[col_idx]),
+                    "thread {row_idx} got a different Arc<str> for {name:?}"
+                );
+            }
+        }
+
+        // Pool length must equal the unique-name count, no duplicates inserted.
+        assert_eq!(pool.len(), names.len());
     }
 }

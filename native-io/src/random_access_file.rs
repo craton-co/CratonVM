@@ -40,7 +40,28 @@ use rustjvm_types::{ObjectRef, Value};
 // Handle table
 // ---------------------------------------------------------------------------
 
-/// Module-local handle table: integer id -> open File.
+/// Java spec for `RandomAccessFile` modes:
+///   "rws" => O_SYNC  → every write syncs data + metadata (`sync_all`)
+///   "rwd" => O_DSYNC → every write syncs data only      (`sync_data`)
+/// Per-write sync is required by the spec; performance is the caller's
+/// problem (they explicitly asked for durable writes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncMode {
+    /// `O_DSYNC` — `sync_data()` after each write (data only).
+    Data,
+    /// `O_SYNC`  — `sync_all()`  after each write (data + metadata).
+    Full,
+}
+
+/// Per-handle state: the open `File` plus the sync mode requested at
+/// open time. `None` sync_mode means no per-write sync (plain "r" or
+/// "rw" modes).
+struct RafHandle {
+    file: File,
+    sync_mode: Option<SyncMode>,
+}
+
+/// Module-local handle table: integer id -> RafHandle.
 ///
 /// Starts at 1000 to stay clear of the 0..3 stdio reservations and the
 /// small fd_table space (which starts at 3 and rarely exceeds a few
@@ -49,14 +70,14 @@ use rustjvm_types::{ObjectRef, Value};
 /// never read each other's ids.
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1000);
 
-fn handle_map() -> &'static Mutex<HashMap<i64, File>> {
-    static MAP: std::sync::OnceLock<Mutex<HashMap<i64, File>>> = std::sync::OnceLock::new();
+fn handle_map() -> &'static Mutex<HashMap<i64, RafHandle>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<i64, RafHandle>>> = std::sync::OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn alloc_handle(file: File) -> i64 {
+fn alloc_handle(file: File, sync_mode: Option<SyncMode>) -> i64 {
     let h = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    handle_map().lock().insert(h, file);
+    handle_map().lock().insert(h, RafHandle { file, sync_mode });
     h
 }
 
@@ -65,11 +86,33 @@ where
     F: FnOnce(&mut File) -> R,
 {
     let mut map = handle_map().lock();
-    map.get_mut(&handle).map(f)
+    map.get_mut(&handle).map(|h| f(&mut h.file))
+}
+
+/// Look up the configured sync mode for an open handle.
+fn handle_sync_mode(handle: i64) -> Option<SyncMode> {
+    handle_map().lock().get(&handle).and_then(|h| h.sync_mode)
+}
+
+/// Run an fsync corresponding to the handle's sync mode. No-op if
+/// the handle was opened in a non-sync mode ("r" / "rw").
+fn sync_for_handle(handle: i64) -> Result<(), std::io::Error> {
+    let mode = match handle_sync_mode(handle) {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    let mut map = handle_map().lock();
+    let Some(h) = map.get_mut(&handle) else {
+        return Ok(());
+    };
+    match mode {
+        SyncMode::Data => h.file.sync_data(),
+        SyncMode::Full => h.file.sync_all(),
+    }
 }
 
 fn remove_handle(handle: i64) -> Option<File> {
-    handle_map().lock().remove(&handle)
+    handle_map().lock().remove(&handle).map(|h| h.file)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,12 +226,21 @@ fn native_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     if mode_bits & O_RDWR != 0 {
         opts.write(true).create(true);
     }
-    // O_SYNC / O_DSYNC are best-effort; std::fs doesn't expose sync
-    // flags portably. Leave as a no-op.
-    let _ = (O_SYNC, O_DSYNC);
+    // Translate O_SYNC / O_DSYNC into a per-handle sync mode that the
+    // write paths honour. std::fs doesn't expose O_SYNC portably at
+    // open time, so we emulate by calling sync_all / sync_data after
+    // every byte/buffer write. Per Java spec for "rws"/"rwd" this is
+    // mandatory for durability — performance is the caller's choice.
+    let sync_mode = if mode_bits & O_SYNC != 0 {
+        Some(SyncMode::Full)
+    } else if mode_bits & O_DSYNC != 0 {
+        Some(SyncMode::Data)
+    } else {
+        None
+    };
 
     let file = opts.open(&path_str).map_err(|_| fnf(&path_str))?;
-    let handle = alloc_handle(file);
+    let handle = alloc_handle(file, sync_mode);
     write_handle(ctx, this, handle);
     Ok(None)
 }
@@ -271,7 +323,13 @@ fn native_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         None => return Ok(None),
     };
     match with_file(handle, |f| f.write_all(&[byte])) {
-        Some(Ok(())) => Ok(None),
+        Some(Ok(())) => {
+            // Honour O_SYNC / O_DSYNC: per Java RandomAccessFile spec,
+            // "rws" and "rwd" modes require that every write reach
+            // stable storage before the call returns.
+            sync_for_handle(handle).map_err(io_err)?;
+            Ok(None)
+        }
         Some(Err(e)) => Err(io_err(e)),
         None => Ok(None),
     }
@@ -310,7 +368,11 @@ fn native_writeBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         None => return Ok(None),
     };
     match with_file(handle, |f| f.write_all(&buf)) {
-        Some(Ok(())) => Ok(None),
+        Some(Ok(())) => {
+            // Honour O_SYNC / O_DSYNC — see native_write0 above.
+            sync_for_handle(handle).map_err(io_err)?;
+            Ok(None)
+        }
         Some(Err(e)) => Err(io_err(e)),
         None => Ok(None),
     }
@@ -456,7 +518,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let file = File::open(&path).unwrap();
-        let h = alloc_handle(file);
+        let h = alloc_handle(file, None);
         assert!(handle_map().lock().contains_key(&h));
 
         let mut buf = [0u8; 5];
@@ -475,7 +537,7 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"0123456789").unwrap();
         let file = File::open(tmp.path()).unwrap();
-        let h = alloc_handle(file);
+        let h = alloc_handle(file, None);
 
         let len = with_file(h, |f| f.metadata().unwrap().len()).unwrap();
         assert_eq!(len, 10);

@@ -140,7 +140,26 @@ impl KernelArgs {
     }
 
     pub fn push_device_ptr<T>(mut self, buf: &DeviceBuffer<T>) -> Self {
-        self.raw.push(KernelArg::DevicePtr(buf.0.device_ptr()));
+        // AUDIT 2026-05-16 (CRIT-1 fix): plumb the stream-ordering guard
+        // returned by `CudaSlice::device_ptr` into the `KernelArg` so it
+        // outlives the eventual kernel launch. See the note on
+        // `KernelArg::DevicePtr` and `DeviceBufferInner::device_ptr_arg`
+        // in `backend_cuda.rs` for the underlying race this prevents.
+        //
+        // Under the real `cuda` backend we ask the buffer for both the
+        // address and the `SyncRecord` guard. In stub mode the buffer
+        // exposes only a bare `u64` (always 0); there is no real
+        // allocation to guard so the variant has no record field.
+        #[cfg(feature = "cuda")]
+        {
+            let (addr, _record) = buf.0.device_ptr_arg();
+            self.raw.push(KernelArg::DevicePtr { addr, _record });
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.raw
+                .push(KernelArg::DevicePtr { addr: buf.0.device_ptr() });
+        }
         self
     }
 
@@ -165,9 +184,40 @@ impl KernelArgs {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+// AUDIT 2026-05-16 (CRIT-1 fix): under the `cuda` feature, the
+// `DevicePtr` variant carries both the raw address and the stream-
+// ordering guard returned by `cudarc::CudaSlice::device_ptr` (named
+// `SyncRecord` in cudarc 0.13). The `_record` field is load-bearing
+// **only** via its `Drop` — cudarc uses it to keep the device
+// allocation alive (stream-ordered) until the launch that reads `addr`
+// has actually completed. Dropping it before `builder.launch(...)`
+// returns is a future use-after-free the moment a second stream is
+// introduced. Hence: no `Copy`, no `Clone` on the variant — every
+// guard must reach the launch site exactly once.
+//
+// In stub mode (no `cuda` feature) the variant degenerates to a bare
+// `u64` since there is no real allocation to guard.
+//
+// `Debug` is intentionally NOT derived: `SyncRecord` is an opaque
+// cudarc internal that may not implement `Debug` across versions, and
+// the enum is purely an internal staging type — nobody formats it.
 pub(crate) enum KernelArg {
-    DevicePtr(u64),
+    #[cfg(feature = "cuda")]
+    DevicePtr {
+        addr: u64,
+        // Load-bearing via `Drop` only — never read.
+        #[allow(dead_code)]
+        _record: cudarc::driver::SyncRecord,
+    },
+    #[cfg(not(feature = "cuda"))]
+    DevicePtr {
+        // Never read in stub mode — the stub `launch_raw` returns
+        // `NoDriver` without inspecting args. We still carry the field
+        // so the variant shape matches the real backend for any future
+        // code that pattern-matches across both cfgs.
+        #[allow(dead_code)]
+        addr: u64,
+    },
     I32(i32),
     I64(i64),
     F32(f32),

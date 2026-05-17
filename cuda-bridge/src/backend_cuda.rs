@@ -98,53 +98,46 @@ impl DeviceModuleInner {
             shared_mem_bytes: cfg.shared_bytes,
         };
         let mut builder = ctx.stream.launch_builder(func);
-        // The argument-builder API requires each value to live as long
-        // as the builder. We stage values in `holders` keyed by index.
-        let mut i32_h = Vec::new();
-        let mut i64_h = Vec::new();
-        let mut f32_h = Vec::new();
-        let mut f64_h = Vec::new();
-        let mut ptr_h = Vec::new();
+        // AUDIT 2026-05-16 (CRIT-1 fix): `args` is bound here for the
+        // whole body of `launch_raw` and only goes out of scope after
+        // `builder.launch(...)` returns. That keeps every
+        // `KernelArg::DevicePtr { _record, .. }` (and its embedded
+        // `cudarc::driver::SyncRecord`) alive across the launch, which
+        // is the entire point of plumbing the record through — it is
+        // load-bearing via `Drop` ordering. Do not refactor this into
+        // a function that consumes `args` before `launch` is called.
+        let args = args;
+        // The argument-builder API requires each scalar to be referenced
+        // by a stable address that outlives the builder. The struct
+        // variants in `args.raw` already own their bytes by-value, so
+        // we hand the builder direct references into them. For
+        // `DevicePtr` we need a `u64` address slot the builder can
+        // reference, which we keep in a parallel vec alongside `args`.
+        let mut ptr_h: Vec<u64> = Vec::new();
+        for a in &args.raw {
+            if let KernelArg::DevicePtr { addr, .. } = a {
+                ptr_h.push(*addr);
+            }
+        }
+        // Bind in original order. Each `builder.arg(&...)` borrows from
+        // either `args.raw` (scalars) or `ptr_h` (addresses); both
+        // outlive `builder.launch(...)` below.
+        let mut ip = 0usize;
         for a in &args.raw {
             match a {
                 KernelArg::I32(v) => {
-                    i32_h.push(*v);
+                    builder.arg(v);
                 }
                 KernelArg::I64(v) => {
-                    i64_h.push(*v);
+                    builder.arg(v);
                 }
                 KernelArg::F32(v) => {
-                    f32_h.push(*v);
+                    builder.arg(v);
                 }
                 KernelArg::F64(v) => {
-                    f64_h.push(*v);
+                    builder.arg(v);
                 }
-                KernelArg::DevicePtr(p) => {
-                    ptr_h.push(*p);
-                }
-            }
-        }
-        // Bind in original order.
-        let (mut ii, mut il, mut ff, mut fd, mut ip) = (0, 0, 0, 0, 0);
-        for a in &args.raw {
-            match a {
-                KernelArg::I32(_) => {
-                    builder.arg(&i32_h[ii]);
-                    ii += 1;
-                }
-                KernelArg::I64(_) => {
-                    builder.arg(&i64_h[il]);
-                    il += 1;
-                }
-                KernelArg::F32(_) => {
-                    builder.arg(&f32_h[ff]);
-                    ff += 1;
-                }
-                KernelArg::F64(_) => {
-                    builder.arg(&f64_h[fd]);
-                    fd += 1;
-                }
-                KernelArg::DevicePtr(_) => {
+                KernelArg::DevicePtr { .. } => {
                     builder.arg(&ptr_h[ip]);
                     ip += 1;
                 }
@@ -155,6 +148,11 @@ impl DeviceModuleInner {
                 .launch(cudarc_cfg)
                 .map_err(map_err("kernel launch"))?;
         }
+        // Explicit drop site: `args` (with its SyncRecords) and `ptr_h`
+        // are dropped here, AFTER the launch has been submitted. Do not
+        // move this drop earlier — see the audit note above.
+        drop(ptr_h);
+        drop(args);
         Ok(())
     }
 }
@@ -209,23 +207,26 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static> DeviceBufferInner<T>
         self.slice.len()
     }
 
-    pub(crate) fn device_ptr(&self) -> u64 {
-        // CudaSlice exposes a CUdeviceptr; cast to u64 for our arg list.
-        //
-        // AUDIT 2026-05-16: cudarc 0.13's `device_ptr` returns
-        // `(CUdeviceptr, SyncRecord)` where the SyncRecord is a stream-
-        // ordering handle. Dropping it the instant we return the bare
-        // `u64` is unsafe if the buffer is freed while a launched kernel
-        // is still using the pointer — the SyncRecord is what prevents
-        // that race in cudarc's tracking. The current backend serializes
-        // launch + memcpy through `ctx.default_stream()`, which keeps
-        // operations stream-ordered, so the race is masked today. A
-        // future change that introduces multiple streams MUST plumb the
-        // SyncRecord through `KernelArgs::push_device_ptr` (e.g. as
-        // `KernelArg::DevicePtr { addr, _record }`) so the record lives
-        // as long as the launch.
-        // FIXME(audit-2026-05-16): plumb SyncRecord through KernelArgs.
-        let (ptr, _record) = self.slice.device_ptr(&self.stream);
-        ptr
+    /// Return both the raw device address and the cudarc-issued
+    /// stream-ordering guard. The caller MUST keep the guard alive
+    /// until any kernel launch that consumes the address has been
+    /// submitted (and ideally until the launch builder is dropped).
+    ///
+    /// AUDIT 2026-05-16 (CRIT-1 fix): cudarc 0.13's `device_ptr`
+    /// returns `(CUdeviceptr, SyncRecord)` where the `SyncRecord` is
+    /// a stream-ordering handle. The previous version of this
+    /// function discarded the record and returned a bare `u64`,
+    /// which masked a future use-after-free: the moment a second
+    /// stream is introduced (async memcpy, multi-kernel pipelining,
+    /// GC-driven copy-back), dropping the record between the
+    /// `device_ptr` call and `builder.launch(...)` lets cudarc free
+    /// the underlying allocation while the launch is still in
+    /// flight. With the default single-stream setup the operations
+    /// are stream-ordered and the race is masked, but this is a
+    /// time-bomb; the fix plumbs the record all the way through
+    /// `KernelArg::DevicePtr` so it lives at least as long as the
+    /// `KernelArgs` `Vec` held during `launch_raw`.
+    pub(crate) fn device_ptr_arg(&self) -> (u64, cudarc::driver::SyncRecord) {
+        self.slice.device_ptr(&self.stream)
     }
 }

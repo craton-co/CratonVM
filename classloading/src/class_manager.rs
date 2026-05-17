@@ -49,23 +49,29 @@ use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
 /// for unresolved references during Pass 3.
 struct ClassStoreHierarchy<'a> {
     class_store: &'a ClassStore,
-    loaded_classes: &'a FxHashMap<(ClassLoaderId, String), ClassId>,
+    loaded_classes: &'a FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
 }
 
 impl<'a> ClassStoreHierarchy<'a> {
     fn lookup(&self, name: &str) -> Option<ClassId> {
+        // T10.9.E: probe with an `Arc<str>` constructed from `&str`. This is
+        // a single allocation per probe — no worse than the prior
+        // `name.to_string()`. The win from the conversion comes from the
+        // insert side, where callers already hold an `Arc<str>` and only
+        // need a refcount bump.
+        let probe: Arc<str> = Arc::from(name);
         for loader_id in &[
             ClassLoaderId::Bootstrap,
             ClassLoaderId::Extension,
             ClassLoaderId::Application,
         ] {
-            if let Some(&id) = self.loaded_classes.get(&(*loader_id, name.to_string())) {
+            if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
                 return Some(id);
             }
         }
         // Fall back to scanning every loader (custom loaders).
         for ((_, class_name), &id) in self.loaded_classes.iter() {
-            if class_name == name {
+            if &**class_name == name {
                 return Some(id);
             }
         }

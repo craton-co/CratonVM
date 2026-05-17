@@ -518,12 +518,12 @@ impl<'a> Emitter<'a> {
             0x69 => self.binop_i64("mul.lo.s64")?,
             0x6A => self.binop_f32("mul.f32")?,
             0x6B => self.binop_f64("mul.f64")?,
-            0x6C => self.binop_i32("div.s32")?,
-            0x6D => self.binop_i64("div.s64")?,
+            0x6C => self.div_or_rem_i32("div.s32", true)?,
+            0x6D => self.div_or_rem_i64("div.s64", true)?,
             0x6E => self.binop_f32("div.f32")?,
             0x6F => self.binop_f64("div.f64")?,
-            0x70 => self.binop_i32("rem.s32")?,
-            0x71 => self.binop_i64("rem.s64")?,
+            0x70 => self.div_or_rem_i32("rem.s32", false)?,
+            0x71 => self.div_or_rem_i64("rem.s64", false)?,
             // AUDIT 2026-05-16: PTX has no `rem.f32`/`rem.f64` mnemonic.
             // Emitting one made ptxas reject every kernel that hit this
             // path. Reject upstream so the analyzer skips these methods
@@ -839,6 +839,128 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// AUDIT 2026-05-16: Java throws ArithmeticException on integer
+    /// divide-by-zero and silently wraps `INT_MIN / -1`. PTX
+    /// `div.s32`/`rem.s32` are undefined in both cases. Guard with
+    /// predicates that branch to the deopt exit (`bounds_fail_label`,
+    /// which sets the failure flag and returns — the VM then re-runs
+    /// the method on the CPU with proper Java semantics).
+    fn div_or_rem_i32(&mut self, mnemonic: &str, is_div: bool) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?; // divisor
+        let a = self.stack.pop()?; // dividend
+        self.used_bounds_label = true;
+        // Zero-divisor guard (applies to both div and rem).
+        let p_zero = self.regs.fresh_reg(RegKind::Pred);
+        writeln!(
+            self.body,
+            "    setp.eq.s32 {}, {}, 0;",
+            p_zero.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    @{} bra {};",
+            p_zero.name, self.bounds_fail_label
+        )
+        .unwrap();
+        // INT_MIN / -1 overflow guard (div only; Java rem of INT_MIN by
+        // -1 is defined as 0 so PTX rem.s32 needs no extra guard once
+        // the divisor is non-zero).
+        if is_div {
+            let p_min = self.regs.fresh_reg(RegKind::Pred);
+            let p_neg1 = self.regs.fresh_reg(RegKind::Pred);
+            let p_overflow = self.regs.fresh_reg(RegKind::Pred);
+            // PTX accepts hex literals for setp immediates; using
+            // 0x80000000 avoids parsing `-2147483648` (where the
+            // unary-minus operand 2147483648 overflows i32 in some
+            // assemblers).
+            writeln!(
+                self.body,
+                "    setp.eq.s32 {}, {}, 0x80000000;",
+                p_min.name, a.name
+            )
+            .unwrap();
+            writeln!(
+                self.body,
+                "    setp.eq.s32 {}, {}, -1;",
+                p_neg1.name, b.name
+            )
+            .unwrap();
+            writeln!(
+                self.body,
+                "    and.pred {}, {}, {};",
+                p_overflow.name, p_min.name, p_neg1.name
+            )
+            .unwrap();
+            writeln!(
+                self.body,
+                "    @{} bra {};",
+                p_overflow.name, self.bounds_fail_label
+            )
+            .unwrap();
+        }
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// AUDIT 2026-05-16: 64-bit twin of `div_or_rem_i32`. LONG_MIN is
+    /// -9223372036854775808 and the divide-by-zero / overflow rules
+    /// match the 32-bit case (JLS §15.17.2).
+    fn div_or_rem_i64(&mut self, mnemonic: &str, is_div: bool) -> Result<(), LoweringError> {
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        self.used_bounds_label = true;
+        let p_zero = self.regs.fresh_reg(RegKind::Pred);
+        writeln!(
+            self.body,
+            "    setp.eq.s64 {}, {}, 0;",
+            p_zero.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    @{} bra {};",
+            p_zero.name, self.bounds_fail_label
+        )
+        .unwrap();
+        if is_div {
+            let p_min = self.regs.fresh_reg(RegKind::Pred);
+            let p_neg1 = self.regs.fresh_reg(RegKind::Pred);
+            let p_overflow = self.regs.fresh_reg(RegKind::Pred);
+            // LONG_MIN as hex (see s32 comment above for rationale).
+            writeln!(
+                self.body,
+                "    setp.eq.s64 {}, {}, 0x8000000000000000;",
+                p_min.name, a.name
+            )
+            .unwrap();
+            writeln!(
+                self.body,
+                "    setp.eq.s64 {}, {}, -1;",
+                p_neg1.name, b.name
+            )
+            .unwrap();
+            writeln!(
+                self.body,
+                "    and.pred {}, {}, {};",
+                p_overflow.name, p_min.name, p_neg1.name
+            )
+            .unwrap();
+            writeln!(
+                self.body,
+                "    @{} bra {};",
+                p_overflow.name, self.bounds_fail_label
+            )
+            .unwrap();
+        }
+        let r = self.regs.fresh_reg(RegKind::S64);
+        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
     fn unop_i32(&mut self, mnemonic: &str) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S32);
@@ -875,11 +997,19 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?; // shift count (s32)
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S32);
-        // PTX shifts want a u32 shift amount — `setp.b32` reinterpret
-        // is implicit when the source register is already 32-bit. We
-        // just emit directly; PTX accepts either signedness for the
-        // count operand.
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        // AUDIT 2026-05-16: JLS §5.4.2 requires the shift count to be
+        // masked by 0x1F for 32-bit shifts; PTX `shl/shr` with a count
+        // ≥ the operand width is undefined. Mask explicitly into a
+        // fresh register before issuing the shift.
+        let masked = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    and.b32 {}, {}, 31;",
+            masked.name, b.name
+        )
+        .unwrap();
+        // PTX shifts accept either signedness for the count operand.
+        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, masked.name).unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -889,7 +1019,17 @@ impl<'a> Emitter<'a> {
         let b = self.stack.pop()?;
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S64);
-        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, b.name).unwrap();
+        // AUDIT 2026-05-16: JLS §5.4.2 requires the shift count to be
+        // masked by 0x3F for 64-bit shifts. PTX 64-bit shifts still
+        // take a 32-bit count operand, so the mask stays in s32.
+        let masked = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    and.b32 {}, {}, 63;",
+            masked.name, b.name
+        )
+        .unwrap();
+        writeln!(self.body, "    {} {}, {}, {};", mnemonic, r.name, a.name, masked.name).unwrap();
         self.stack.push(r);
         Ok(())
     }

@@ -270,6 +270,49 @@ fn native_fc_unmap0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 // ---------------------------------------------------------------------------
+// force0 — fsync. Critical for `FileChannel.force(metaData)` durability.
+//
+// Java contract: when `metaData == true` we must flush both data AND
+// file metadata (mtime, size, etc.) to stable storage — i.e. `fsync`.
+// When `false` only data needs to reach disk — i.e. `fdatasync` on
+// Linux / `FlushFileBuffers` on Windows (which always syncs both).
+//
+// We map these to `std::fs::File::sync_all` / `sync_data` which delegate
+// to the right syscall per platform. A silent no-op here is a critical
+// durability bug — callers that ran `FileChannel.force(true)` would
+// believe their data was on disk when it was only in the page cache.
+// ---------------------------------------------------------------------------
+
+/// `force0(FileDescriptor, boolean metaData) -> int`
+///
+/// Returns 0 on success. Throws IOException on sync failure.
+fn native_fc_force0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = fd_arg(args, 0)?;
+    let meta_data = match args.get(1) {
+        Some(Value::Int(v)) => *v != 0,
+        _ => false,
+    };
+    let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
+        return Err(io_error("force0: FileDescriptor has no open handle"));
+    };
+    // Clone the underlying File so we can issue the sync syscall
+    // without holding the FdTable mutex across it. `clone_file`
+    // flushes BufWriter-backed entries first, so any buffered bytes
+    // are in the kernel page cache before we ask for sync.
+    let file = ctx
+        .fd_table()
+        .clone_file(fd)
+        .map_err(|e| io_error(format!("force0: clone fd: {e}")))?;
+    let sync_res = if meta_data {
+        file.sync_all()
+    } else {
+        file.sync_data()
+    };
+    sync_res.map_err(|e| io_error(format!("force0: {e}")))?;
+    Ok(Some(Value::Int(0)))
+}
+
+// ---------------------------------------------------------------------------
 // transferTo0 / maxDirectTransferSize0 — WP3.6
 // ---------------------------------------------------------------------------
 
@@ -536,6 +579,10 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
             native_fc_transfer_to0,
         );
         r.register(cls, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
+        // force0 — fsync. Canonical real implementation lives here
+        // (was a silent no-op stub in `nio_native.rs`, which lost
+        // data on crash for callers of `FileChannel.force`).
+        r.register(cls, "force0", "(Ljava/io/FileDescriptor;Z)I", native_fc_force0);
     }
 
     // --- legacy FileChannelImpl surface (older JDKs / fallback). The

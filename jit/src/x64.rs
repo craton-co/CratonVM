@@ -5667,56 +5667,45 @@ impl Compiler {
                     cpc += 1;
                 }
 
-                // idiv
+                // idiv — JVMS-compliant: guards divide-by-zero (→ deopt to
+                // throw ArithmeticException) and INT_MIN / -1 (→ INT_MIN,
+                // matches dividend) before issuing CDQ; IDIV ECX.
                 0x6c => {
                     let top = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
-                    // CDQ (sign-extend EAX → EDX:EAX)
-                    self.buf.emit_byte(0x99);
-                    // IDIV ECX
-                    self.buf.emit(&[0xF7, 0xF9]);
-                    // Sign-extend EAX to RAX
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]);
+                    self.emit_safe_idiv(cpc, /*is_64bit*/ false, /*is_rem*/ false);
                     self.push_from_rax();
                     cpc += 1;
                 }
 
-                // ldiv
+                // ldiv — JVMS-compliant guards; emits CQO; IDIV RCX with the
+                // LONG_MIN / -1 overflow special-case materialised inline.
                 0x6d => {
                     let top = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
-                    // CQO (sign-extend RAX → RDX:RAX)
-                    self.rex_w(); self.buf.emit_byte(0x99);
-                    // IDIV RCX
-                    self.rex_w(); self.buf.emit(&[0xF7, 0xF9]);
+                    self.emit_safe_idiv(cpc, /*is_64bit*/ true, /*is_rem*/ false);
                     self.push_from_rax();
                     cpc += 1;
                 }
 
-                // irem
+                // irem — JVMS-compliant guards; INT_MIN % -1 yields 0.
                 0x70 => {
                     let top = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
-                    self.buf.emit_byte(0x99); // CDQ
-                    self.buf.emit(&[0xF7, 0xF9]); // IDIV ECX
-                    // Result in EDX (remainder)
-                    self.emit_mov_reg_reg(RAX, RDX);
-                    self.rex_w(); self.buf.emit(&[0x63, 0xC0]); // MOVSXD RAX, EAX
+                    self.emit_safe_idiv(cpc, /*is_64bit*/ false, /*is_rem*/ true);
                     self.push_from_rax();
                     cpc += 1;
                 }
 
-                // lrem
+                // lrem — JVMS-compliant guards; LONG_MIN % -1 yields 0.
                 0x71 => {
                     let top = self.pop_stack();
                     self.pop_to_rax();
                     self.load_slot_to_reg(RCX, top);
-                    self.rex_w(); self.buf.emit_byte(0x99); // CQO
-                    self.rex_w(); self.buf.emit(&[0xF7, 0xF9]); // IDIV RCX
-                    self.emit_mov_reg_reg(RAX, RDX);
+                    self.emit_safe_idiv(cpc, /*is_64bit*/ true, /*is_rem*/ true);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -6496,7 +6485,9 @@ impl Compiler {
     /// RAX=array, RCX=index, RDX=value (raw pointer, 0 for null).
     ///
     /// Emits: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
-    #[allow(dead_code)] // kept for potential future inline aastore optimization
+    ///
+    /// Wired into the `aastore` opcode arm; the GC write-barrier is emitted
+    /// separately as a call to `self.helpers.write_barrier` after the store.
     fn emit_ref_astore_regs(&mut self) {
         // MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
         // REX.W + 0x89 + ModRM(mod=01, reg=RDX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
@@ -6602,6 +6593,150 @@ impl Compiler {
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
         self.bounds_check_stubs.push(patch_offset);
+    }
+
+    /// Emit a JVMS-compliant signed integer division or remainder.
+    ///
+    /// Assumes the dividend is in RAX and the divisor in RCX. Leaves the
+    /// result in RAX (sign-extended to 64 bits for the 32-bit forms so that
+    /// the value is safe to push as a long-width stack slot).
+    ///
+    /// Guards required by JVMS §6.5.{idiv,irem,ldiv,lrem}:
+    ///   * divisor == 0 → throw `ArithmeticException` (routed through the
+    ///     uncommon-trap deopt stub with `DEOPT_REASON_DIV_BY_ZERO = 3`; the
+    ///     interpreter materialises the exception from the i64::MIN sentinel).
+    ///   * `INT_MIN / -1` (or `LONG_MIN / -1`) — the raw x86 IDIV faults with
+    ///     #DE on this overflow. The Java spec says no exception is raised:
+    ///     `idiv`/`ldiv` must return the dividend unchanged, and `irem`/`lrem`
+    ///     must return 0. We special-case this with a CMP/CMP/branch pair and
+    ///     synthesise the result without executing IDIV.
+    ///
+    /// `bci` is the bytecode pc used for the deopt-stub bookkeeping.
+    fn emit_safe_idiv(&mut self, bci: usize, is_64bit: bool, is_rem: bool) {
+        // -------- Guard 1: divide-by-zero --------
+        if is_64bit {
+            // TEST RCX, RCX  (48 85 C9)
+            self.buf.emit(&[0x48, 0x85, 0xC9]);
+        } else {
+            // TEST ECX, ECX  (85 C9)
+            self.buf.emit(&[0x85, 0xC9]);
+        }
+        // JZ rel32 → deopt stub (DEOPT_REASON_DIV_BY_ZERO = 3)
+        self.buf.emit(&[0x0F, 0x84]);
+        let dz_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.deopt_stubs.push((dz_patch, bci, 3));
+
+        // -------- Guard 2: INT_MIN / -1  (or LONG_MIN / -1) --------
+        // If dividend == MIN and divisor == -1, IDIV would raise #DE.
+        // Materialise the JVMS-mandated result and skip the IDIV.
+        //
+        //     CMP   dividend, MIN
+        //     JNE   :do_div
+        //     CMP   divisor, -1
+        //     JNE   :do_div
+        //     <materialise result>      ; idiv → dividend (RAX already holds MIN)
+        //                               ; irem → 0
+        //     JMP   :after_div
+        //   :do_div
+        //     CDQ / CQO
+        //     IDIV  ECX / RCX
+        //     <move result into RAX, sign-extending for 32-bit>
+        //   :after_div
+
+        // CMP dividend, MIN
+        if is_64bit {
+            // CMP RAX, imm32 sign-extended — we need full i64::MIN which doesn't
+            // fit in imm32. Load i64::MIN into R10 and CMP RAX, R10.
+            // MOV R10, i64::MIN  (49 BA <imm64>)
+            self.buf.emit(&[0x49, 0xBA]);
+            self.buf.emit(&(i64::MIN as u64).to_le_bytes());
+            // CMP RAX, R10  (4C 39 D0)
+            self.buf.emit(&[0x4C, 0x39, 0xD0]);
+        } else {
+            // CMP EAX, imm32  (3D <imm32>)
+            self.buf.emit_byte(0x3D);
+            self.buf.emit(&(i32::MIN as u32).to_le_bytes());
+        }
+        // JNE rel8 → :do_div (we'll patch after we know the size)
+        self.buf.emit(&[0x75, 0x00]); // placeholder rel8
+        let jne1_patch = self.buf.pos() - 1;
+
+        // CMP divisor, -1
+        if is_64bit {
+            // CMP RCX, -1  (48 83 F9 FF)  — imm8 sign-extended to 64
+            self.buf.emit(&[0x48, 0x83, 0xF9, 0xFF]);
+        } else {
+            // CMP ECX, -1  (83 F9 FF)     — imm8 sign-extended to 32
+            self.buf.emit(&[0x83, 0xF9, 0xFF]);
+        }
+        // JNE rel8 → :do_div
+        self.buf.emit(&[0x75, 0x00]);
+        let jne2_patch = self.buf.pos() - 1;
+
+        // Materialise the overflow result.
+        if is_rem {
+            // result = 0
+            if is_64bit {
+                // XOR EAX, EAX (zeros full RAX)
+                self.buf.emit(&[0x31, 0xC0]);
+            } else {
+                self.buf.emit(&[0x31, 0xC0]);
+            }
+        } else {
+            // result = dividend (RAX/EAX already holds MIN). For 32-bit, ensure
+            // RAX is sign-extended like the IDIV path does.
+            if !is_64bit {
+                // MOVSXD RAX, EAX  (48 63 C0)
+                self.buf.emit(&[0x48, 0x63, 0xC0]);
+            }
+        }
+        // JMP rel8 → :after_div
+        self.buf.emit(&[0xEB, 0x00]);
+        let jmp_after_patch = self.buf.pos() - 1;
+
+        // :do_div — patch JNE targets to here
+        let do_div_off = self.buf.pos();
+        let rel1 = (do_div_off as i64) - (jne1_patch as i64 + 1);
+        let rel2 = (do_div_off as i64) - (jne2_patch as i64 + 1);
+        debug_assert!((-128..=127).contains(&rel1));
+        debug_assert!((-128..=127).contains(&rel2));
+        self.buf.patch_byte(jne1_patch, rel1 as u8);
+        self.buf.patch_byte(jne2_patch, rel2 as u8);
+
+        // Sign-extend RAX → RDX:RAX (or EAX → EDX:EAX), then IDIV.
+        if is_64bit {
+            // CQO  (48 99)
+            self.buf.emit(&[0x48, 0x99]);
+            // IDIV RCX  (48 F7 F9)
+            self.buf.emit(&[0x48, 0xF7, 0xF9]);
+        } else {
+            // CDQ  (99)
+            self.buf.emit_byte(0x99);
+            // IDIV ECX  (F7 F9)
+            self.buf.emit(&[0xF7, 0xF9]);
+        }
+
+        // Move the result (quotient in RAX/EAX, remainder in RDX/EDX) into RAX,
+        // sign-extending 32-bit results so callers can treat RAX as i64.
+        if is_rem {
+            if is_64bit {
+                // MOV RAX, RDX  (48 89 D0)
+                self.buf.emit(&[0x48, 0x89, 0xD0]);
+            } else {
+                // MOVSXD RAX, EDX  (48 63 C2)
+                self.buf.emit(&[0x48, 0x63, 0xC2]);
+            }
+        } else if !is_64bit {
+            // MOVSXD RAX, EAX  (48 63 C0)
+            self.buf.emit(&[0x48, 0x63, 0xC0]);
+        }
+
+        // :after_div — patch the JMP from the overflow path.
+        let after_off = self.buf.pos();
+        let rel_jmp = (after_off as i64) - (jmp_after_patch as i64 + 1);
+        debug_assert!((-128..=127).contains(&rel_jmp));
+        self.buf.patch_byte(jmp_after_patch, rel_jmp as u8);
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
@@ -7856,7 +7991,20 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // aastore — store reference to Object[] array via helper + write barrier
+                // aastore — store reference to Object[] array (inline store + barrier-only call)
+                //
+                // R20 / HIGH-5 (see docs/PRESENTATION.md): replace the full `jit_aastore`
+                // helper call with an inline `MOV QWORD [array + index*8 + HEADER_SIZE], val`
+                // followed by a CALL to the much-cheaper `write_barrier` helper. The barrier
+                // helper short-circuits when `val == 0` (null), so we don't need an inline
+                // null check. Array layout is compact 8-byte pointers (matches the already-
+                // inlined `aaload` path).
+                //
+                // ArrayStoreException note: the current `jit_aastore` helper does NOT enforce
+                // the ASE check (the interpreter does it via `set_array_element`). This inline
+                // path matches the helper's behavior exactly — no regression. Wiring an inline
+                // ASE check is a follow-up that needs type-narrowing infrastructure (not yet
+                // tracked in this JIT).
                 0x53 => {
                     self.flush_scratch_registers();
                     let val_slot = self.pop_stack();
@@ -7865,12 +8013,20 @@ impl Compiler {
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
                     self.emit_bounds_check(pc);
-                    // jit_aastore(vm_ptr, array_ptr, index, val)
+                    self.load_slot_to_reg(RDX, val_slot);
+                    // Inline store: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
+                    self.emit_ref_astore_regs();
+                    // Post-store write barrier: jit_write_barrier(vm_ptr, array_ptr, val_ptr).
+                    // The helper itself bails out when val_ptr == 0, so storing null
+                    // skips the card-mark cost (no extra inline branch needed).
+                    // TODO: inline the card-mark (`SHR addr, 9; MOV BYTE [card_table+addr], 0`)
+                    // when `card_table_base` is exposed in JitRuntimeHelpers — would eliminate
+                    // this call entirely. Per task constraint, do not add a new helper field
+                    // unilaterally; leave the call-only barrier as the partial win.
                     self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                     self.load_slot_to_reg(ARG_REGS[1], array_slot);
-                    self.load_slot_to_reg(ARG_REGS[2], index_slot);
-                    self.load_slot_to_reg(ARG_REGS[3], val_slot);
-                    self.emit_call_absolute(self.helpers.aastore);
+                    self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                    self.emit_call_absolute(self.helpers.write_barrier);
                     pc += 1;
                 }
 
@@ -8201,30 +8357,22 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // idiv
+                // idiv — JVMS-compliant: guards divide-by-zero (→ deopt to
+                // throw ArithmeticException) and INT_MIN / -1 (→ INT_MIN).
+                // See `emit_safe_idiv` for the guard sequence.
                 0x6c => {
                     self.pop_to_rcx(); // divisor
                     self.pop_to_rax(); // dividend
-                                       // CDQ — sign-extend eax into edx:eax
-                    self.buf.emit_byte(0x99);
-                    // IDIV ecx — eax = edx:eax / ecx
-                    self.buf.emit(&[0xF7, 0xF9]);
-                    self.rex_w();
-                    self.buf.emit(&[0x63, 0xC0]); // movsxd rax, eax
+                    self.emit_safe_idiv(pc, /*is_64bit*/ false, /*is_rem*/ false);
                     self.push_from_rax();
                     pc += 1;
                 }
 
-                // ldiv
+                // ldiv — JVMS-compliant guards; LONG_MIN / -1 returns LONG_MIN.
                 0x6d => {
                     self.pop_to_rcx();
                     self.pop_to_rax();
-                    // CQO — sign-extend rax into rdx:rax
-                    self.rex_w();
-                    self.buf.emit_byte(0x99);
-                    // IDIV rcx — rax = rdx:rax / rcx
-                    self.rex_w();
-                    self.buf.emit(&[0xF7, 0xF9]);
+                    self.emit_safe_idiv(pc, /*is_64bit*/ true, /*is_rem*/ false);
                     self.push_from_rax();
                     pc += 1;
                 }
@@ -8241,30 +8389,20 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // irem
+                // irem — JVMS-compliant guards; INT_MIN % -1 returns 0.
                 0x70 => {
                     self.pop_to_rcx();
                     self.pop_to_rax();
-                    self.buf.emit_byte(0x99); // CDQ
-                    self.buf.emit(&[0xF7, 0xF9]); // IDIV ecx
-                                                  // Remainder in edx
-                    self.rex_w();
-                    self.buf.emit(&[0x63, 0xC2]); // movsxd rax, edx
+                    self.emit_safe_idiv(pc, /*is_64bit*/ false, /*is_rem*/ true);
                     self.push_from_rax();
                     pc += 1;
                 }
 
-                // lrem
+                // lrem — JVMS-compliant guards; LONG_MIN % -1 returns 0.
                 0x71 => {
                     self.pop_to_rcx();
                     self.pop_to_rax();
-                    self.rex_w();
-                    self.buf.emit_byte(0x99); // CQO
-                    self.rex_w();
-                    self.buf.emit(&[0xF7, 0xF9]); // IDIV rcx
-                                                  // Remainder in rdx → move to rax
-                    self.rex_w();
-                    self.buf.emit(&[0x89, 0xD0]); // mov rax, rdx
+                    self.emit_safe_idiv(pc, /*is_64bit*/ true, /*is_rem*/ true);
                     self.push_from_rax();
                     pc += 1;
                 }
@@ -9219,6 +9357,19 @@ impl Compiler {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
                         if type_tag == b'L' || type_tag == b'[' {
+                            // TODO (R20 follow-up): inline this store. Blocked on the
+                            // field-storage layout — Java object fields are stored as
+                            // the 16-byte Rust enum `Value` (tag + payload, repr is
+                            // implementation-defined), not a compact 8-byte pointer like
+                            // the Object[] array layout used by aastore. A safe inline
+                            // store would need either:
+                            //   (a) a `#[repr(C, u8)]` or stable-layout commitment on
+                            //       `Value`, plus emitting both halves (tag byte + ptr
+                            //       qword) at the field offset; or
+                            //   (b) migrating reference fields to a compact pointer
+                            //       layout (parallel to the array compact layout).
+                            // Neither is in scope here, so keep the helper call. This is
+                            // the higher-value half of HIGH-5 and remains a known gap.
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
