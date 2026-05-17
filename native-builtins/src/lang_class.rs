@@ -3297,7 +3297,16 @@ pub(crate) fn native_field_get_boolean(ctx: &mut dyn NativeContext, args: &[Valu
     }
     let val = field_get_raw(ctx, args)?;
     match val {
-        Value::Int(v) => Ok(Some(Value::Int(if v != 0 { 1 } else { 0 }))),
+        // Round-7 MED-11 fix: validate the underlying int is strictly 0 or 1.
+        // Previously any non-zero int was silently coerced to `true`, which
+        // masks heap-corruption bugs and diverges from the JDK contract —
+        // `Field.getBoolean` on a non-boolean storage value throws IAE with
+        // exactly this message ("Argument is not of type Boolean").
+        Value::Int(0) => Ok(Some(Value::Int(0))),
+        Value::Int(1) => Ok(Some(Value::Int(1))),
+        Value::Int(_) => Err(illegal_arg_exc(
+            "Argument is not of type Boolean".to_string(),
+        )),
         _ => Err(illegal_arg_exc(
             "Field.getBoolean: field type is not boolean".to_string(),
         )),

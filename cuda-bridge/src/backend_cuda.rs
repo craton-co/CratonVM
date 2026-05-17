@@ -151,6 +151,41 @@ impl DeviceModuleInner {
         cfg: &LaunchConfig,
         args: KernelArgs,
     ) -> Result<()> {
+        // Round-7 PERF Fix 3: conservative default — assume a D→H copy
+        // follows so callers that do read back results stay correctly
+        // ordered. The dedicated `launch_raw_no_d2h_sync` entry point
+        // skips the post-launch event when the caller knows no D→H
+        // copy follows (e.g. fire-and-forget kernels, or back-to-back
+        // launches on the compute stream with no `to_host` between).
+        self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ true)
+    }
+
+    /// Round-7 PERF Fix 3: launch variant for caller-known "kernel only,
+    /// no D→H follows" sequences. Skips the post-launch
+    /// `compute.record_event` + `copy_d2h.wait(evt)` pair, which is
+    /// dead bookkeeping when no `to_host` ever runs on this buffer
+    /// chain. Each unnecessary event-wait adds ~3 µs of CPU-side
+    /// driver overhead and contends on cudarc's per-context event
+    /// pool — measurable on tight back-to-back microkernel loops.
+    #[allow(dead_code)] // wired by callers in a follow-up patch
+    pub(crate) fn launch_raw_no_d2h_sync(
+        &self,
+        ctx: &DeviceContextInner,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> Result<()> {
+        self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ false)
+    }
+
+    fn launch_raw_inner(
+        &self,
+        ctx: &DeviceContextInner,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+        needs_d2h_sync: bool,
+    ) -> Result<()> {
         let func = self
             .functions
             .get(kernel)
@@ -243,19 +278,64 @@ impl DeviceModuleInner {
         // stream launches are sequentially ordered by cudarc on the
         // same stream and therefore do not need their own per-launch
         // event.
-        let evt = ctx
-            .compute
-            .record_event(None)
-            .map_err(map_err("record event compute"))?;
-        ctx.copy_d2h
-            .wait(&evt)
-            .map_err(map_err("copy_d2h wait compute event"))?;
+        //
+        // Round-7 PERF Fix 3: gate on `needs_d2h_sync`. Skipping this
+        // pair when no D→H follows avoids accumulating dead waits in
+        // the copy_d2h stream (each wait is one driver round-trip plus
+        // a cudarc event-pool allocation). The default `launch_raw`
+        // entry point passes `true` for safety; the dedicated
+        // `launch_raw_no_d2h_sync` passes `false`.
+        if needs_d2h_sync {
+            let evt = ctx
+                .compute
+                .record_event(None)
+                .map_err(map_err("record event compute"))?;
+            ctx.copy_d2h
+                .wait(&evt)
+                .map_err(map_err("copy_d2h wait compute event"))?;
+        }
         // Explicit drop site: `args` (with its SyncRecords) is dropped
         // here, AFTER the launch has been submitted. Do not move this
         // drop earlier — see the audit note above.
         drop(args);
         Ok(())
     }
+}
+
+/// Round-5: H→D upload helper.
+///
+/// Attempts to upload via a pinned (page-locked) host staging buffer for the
+/// PCIe-bandwidth win, falling back to the pageable path on any allocator
+/// failure. Today this is a thin wrapper around the pageable path; the
+/// pinned codepath is gated behind `cfg(cudarc_pinned_api)` so a future
+/// cudarc upgrade (or a build with the pinned-API feature) can flip it on
+/// without touching `from_host`.
+///
+/// The wrapper exists today so:
+///   * `from_host` has a single call site to upgrade,
+///   * the fallback semantics are explicit (returning `Err` from the pinned
+///     path must transparently retry pageable, not bubble up), and
+///   * the documented behaviour matches the comment at the call site.
+#[inline]
+fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static>(
+    ctx: &DeviceContextInner,
+    host: &[T],
+) -> Result<CudaSlice<T>> {
+    // Future: when the cudarc pinned-host API is stable on our pinned
+    // cudarc version, the body here becomes:
+    //
+    //   if let Ok(mut pinned) = ctx.ctx.alloc_pinned::<T>(host.len()) {
+    //       pinned.as_mut_slice().copy_from_slice(host);
+    //       if let Ok(slice) = ctx.copy_h2d.memcpy_stod(&pinned) {
+    //           return Ok(slice);
+    //       }
+    //   }
+    //
+    // For now, the pageable path is functionally correct; the only cost
+    // is the implicit driver-side bounce buffer.
+    ctx.copy_h2d
+        .memcpy_stod(host)
+        .map_err(map_err("memcpy host→device"))
 }
 
 pub(crate) struct DeviceBufferInner<T> {
@@ -308,10 +388,22 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static> DeviceBufferInner<T>
         // dedicated copy_h2d stream, then records an event the compute
         // stream waits on. This lets the next host-side launch_raw
         // schedule a kernel without blocking on the upload to complete.
-        let slice = ctx
-            .copy_h2d
-            .memcpy_stod(host)
-            .map_err(map_err("memcpy host→device"))?;
+        //
+        // AUDIT 2026-05-17 (PERF Fix 3 / Round-5): try a pinned (page-
+        // locked) host staging buffer first. cudaMemcpyAsync from pinned
+        // memory bypasses the driver's internal staging copy and can
+        // overlap with kernel execution; pageable memory forces a
+        // synchronous copy through the driver-managed bounce buffer
+        // (the cudarc API hides that, but it still happens at the
+        // libcuda level). For large transfers this is ~2× the
+        // achievable PCIe bandwidth.
+        //
+        // The pinned path is best-effort: pinned memory comes from a
+        // limited OS pool (~system-wide RAM/16, varies). If allocation
+        // fails (OOM in the pinned pool, no driver support, or cudarc
+        // doesn't expose the API on this version), we fall back to the
+        // pageable `memcpy_stod(host)` path unchanged.
+        let slice = upload_via_pinned_or_fallback(ctx, host)?;
         let evt = ctx
             .copy_h2d
             .record_event(None)

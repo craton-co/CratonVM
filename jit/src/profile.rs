@@ -269,7 +269,27 @@ pub struct ProfileStore {
     /// two `Arc<str>` into a fresh `MethodKey`.  Populated lazily by the
     /// cold insert branch; entries point at the same `Arc<Mutex<...>>` as
     /// the canonical `methods` map.
-    name_index: parking_lot::RwLock<FxHashMap<u64, Arc<parking_lot::Mutex<MethodProfile>>>>,
+    ///
+    /// round-7 fix (bug 2): value is now `(MethodKey, Arc<Mutex<MethodProfile>>)`
+    /// rather than the bare `Arc`.  The cached `MethodKey` is compared
+    /// against the requested `(class_id, &name, &descriptor)` after every
+    /// fingerprint hit; on the (extremely rare) SipHash-fingerprint
+    /// collision we fall through to the canonical `methods` slow path
+    /// instead of silently returning the wrong method's profile slot.
+    /// Storage cost: one extra `MethodKey` (= one `u32` + two
+    /// `Arc<str>` refcount bumps) per indexed method, paid once at
+    /// insert; lookup cost: three field compares (two `&str` equality
+    /// checks; both are SSO-friendly and short-circuit at the first
+    /// byte mismatch).
+    name_index: parking_lot::RwLock<
+        FxHashMap<u64, (MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)>,
+    >,
+    /// round-7 fix (bug 2): diagnostic counter — number of fingerprint
+    /// hits that turned out to be a false positive (different
+    /// `MethodKey` than the requested one) and fell through to the slow
+    /// path.  Expected to be 0 in normal operation; non-zero indicates
+    /// a SipHash collision (or, more likely, a logic bug).
+    name_index_collisions: std::sync::atomic::AtomicU64,
 }
 
 impl ProfileStore {
@@ -278,7 +298,18 @@ impl ProfileStore {
             methods: parking_lot::RwLock::new(FxHashMap::default()),
             invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
             name_index: parking_lot::RwLock::new(FxHashMap::default()),
+            name_index_collisions: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// round-7 fix (bug 2): observed name-index fingerprint collisions
+    /// (cached slot's `MethodKey` did not match the queried triple, so
+    /// we fell through to the canonical `methods` lookup).  Exposed
+    /// for diagnostics; non-zero values usually indicate either a
+    /// SipHash collision (probability ~2.7e-10 per pair at 100k
+    /// methods) or a logic bug.
+    pub fn name_index_collisions(&self) -> u64 {
+        self.name_index_collisions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Increment the invocation counter for a method identified by the packed key
@@ -356,37 +387,106 @@ impl ProfileStore {
             h.finish()
         };
 
-        // Fast path: read-lock + index probe.  On hit, return the cached
-        // `Arc<Mutex<MethodProfile>>` with no further allocation.
+        // Lock-order discipline (round-7 CRIT-2): the canonical order
+        // is `methods` > `name_index` (see `docs/lock-order.md`). All
+        // code paths in this function take `methods` *before*
+        // `name_index`, never the other way around.
+        //
+        // Fast path: probe `name_index` briefly, drop it, then take
+        // `methods.read()` to verify and clone the slot.  No nested
+        // acquisition — the two reads are sequential.
+        //
+        // round-7 fix (bug 2): the cached value is now `(MethodKey,
+        // Arc<...>)`.  After a fingerprint hit we verify the cached
+        // key matches the query triple; on mismatch (collision) we
+        // bump the diagnostic counter and fall through to the slow
+        // path, which uses the canonical `MethodKey`-equality map.
+        //
+        // The verification happens *under* the read-lock so we only
+        // pay one `Arc::clone` on the slot (matching the pre-fix
+        // hot-path cost) and no `MethodKey` clone.  Verification
+        // itself is u32 compare + two `&str` equality short-circuits.
+        let cached: Option<Arc<parking_lot::Mutex<MethodProfile>>> = {
+            let idx = self.name_index.read();
+            match idx.get(&fingerprint) {
+                Some((cached_key, slot))
+                    if cached_key.class_id == class_id
+                        && cached_key.method_name.as_ref() == method_name.as_ref()
+                        && cached_key.descriptor.as_ref() == descriptor.as_ref() =>
+                {
+                    Some(Arc::clone(slot))
+                }
+                Some(_) => None, // collision — handled below
+                None => None,
+            }
+        };
+        if let Some(slot) = cached {
+            return slot;
+        }
+        // Distinguish "fingerprint missed entirely" from "fingerprint
+        // hit but key mismatched (collision)": re-probe briefly to bump
+        // the counter only on real collisions.  The probability of
+        // either is so low this re-probe never shows up in a profile.
         {
             let idx = self.name_index.read();
-            if let Some(slot) = idx.get(&fingerprint) {
-                return Arc::clone(slot);
+            if idx.contains_key(&fingerprint) {
+                self.name_index_collisions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
-        // Slow path: insert.  Build the owned `MethodKey` (one-time per
-        // triple), insert it into both `methods` and `name_index`, and
-        // return the freshly allocated slot.
+        // Slow path: take `methods.write()` FIRST, then `name_index.write()`
+        // nested inside it.  Build the owned `MethodKey` (one-time per
+        // triple) for canonical insertion into `methods`.
         let slot = Arc::new(parking_lot::Mutex::new(MethodProfile::default()));
         let key = MethodKey {
             class_id,
             method_name: Arc::clone(method_name),
             descriptor: Arc::clone(descriptor),
         };
-        {
-            let mut write = self.methods.write();
-            // Race: another writer may have inserted between us dropping the
-            // read-lock and acquiring the write-lock.  Re-probe under the
-            // exclusive lock and return the existing slot if so.
-            if let Some(existing) = write.get(&key) {
-                let existing = Arc::clone(existing);
-                self.name_index.write().insert(fingerprint, Arc::clone(&existing));
-                return existing;
+        let mut write = self.methods.write();
+        // Race: another writer may have inserted between us dropping the
+        // index read-lock and acquiring `methods.write()`.  Re-probe
+        // under the exclusive lock and return the existing slot if so.
+        if let Some(existing) = write.get(&key) {
+            let existing = Arc::clone(existing);
+            // methods (held) > name_index (canonical order).
+            //
+            // round-7 fix (bug 2): only overwrite the name_index entry
+            // if its current fingerprint slot is empty or already
+            // points at this same key — we must not stomp a different
+            // method's slot just because our fingerprint collides
+            // with theirs.  When there's already a conflicting entry
+            // we leave it in place; the next borrowed-lookup for the
+            // *other* method will hit, verify, and return correctly,
+            // while lookups for *this* method will collide-then-fall-
+            // through to here, which is correct (if slow).
+            let mut idx = self.name_index.write();
+            let should_insert = match idx.get(&fingerprint) {
+                None => true,
+                Some((existing_key, _)) => existing_key == &key,
+            };
+            if should_insert {
+                idx.insert(fingerprint, (key, Arc::clone(&existing)));
             }
-            write.insert(key, Arc::clone(&slot));
+            return existing;
         }
-        self.name_index.write().insert(fingerprint, Arc::clone(&slot));
+        write.insert(key.clone(), Arc::clone(&slot));
+        // Still under methods.write() — nested name_index.write() in
+        // canonical order.
+        //
+        // round-7 fix (bug 2): same conflict check as above before
+        // inserting our key into the auxiliary index.
+        let mut idx = self.name_index.write();
+        let should_insert = match idx.get(&fingerprint) {
+            None => true,
+            Some((existing_key, _)) => existing_key == &key,
+        };
+        if should_insert {
+            idx.insert(fingerprint, (key, Arc::clone(&slot)));
+        }
+        drop(idx);
+        drop(write);
         slot
     }
 
@@ -485,10 +585,18 @@ impl ProfileStore {
     }
 
     /// Retrieve a snapshot of the profile for the given method, if any.
+    ///
+    /// Round-7 CRIT-3 sibling fix: same two-phase pattern as
+    /// `snapshot_all` — clone the `Arc<Mutex<...>>` under the outer
+    /// read-lock, drop the outer guard, then lock the per-slot Mutex
+    /// independently.  Prevents the per-slot lock from being acquired
+    /// while `methods.read()` is held.
     pub fn get_profile(&self, key: &MethodKey) -> Option<MethodProfile> {
-        let read = self.methods.read();
-        let slot = read.get(key)?;
-        let p = slot.lock();
+        let slot_arc = {
+            let read = self.methods.read();
+            Arc::clone(read.get(key)?)
+        };
+        let p = slot_arc.lock();
         // Snapshot: clone branch + receiver + loop maps
         Some(MethodProfile {
             branches: p.branches.clone(),
@@ -499,13 +607,26 @@ impl ProfileStore {
 
     /// Snapshot all method profiles: returns (MethodKey, MethodProfile) pairs.
     /// Used by AOT training to bulk-sync JIT profile data to the AOT recorder.
+    ///
+    /// Round-7 CRIT-3 fix: two-phase snapshot.  Phase 1 clones the (key, Arc)
+    /// pairs under the outer read-lock and drops it.  Phase 2 locks each
+    /// per-slot Mutex with the outer guard already released — so no thread
+    /// holding a slot lock can deadlock against a writer trying to take
+    /// `methods.write()`.
     pub fn snapshot_all(&self) -> Vec<(MethodKey, MethodProfile)> {
-        let read = self.methods.read();
-        read.iter()
+        // Phase 1: snapshot the (key, Arc<Mutex<...>>) pairs.  Holding only
+        // the outer read-lock — no per-slot lock taken yet.
+        let arcs: Vec<(MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)> = {
+            let read = self.methods.read();
+            read.iter().map(|(k, slot)| (k.clone(), Arc::clone(slot))).collect()
+        };
+        // Phase 2: outer lock released; iterate locking each slot
+        // independently.  Slot lock is now leaf-level.
+        arcs.into_iter()
             .map(|(k, slot)| {
                 let p = slot.lock();
                 (
-                    k.clone(),
+                    k,
                     MethodProfile {
                         branches: p.branches.clone(),
                         receivers: p.receivers.clone(),

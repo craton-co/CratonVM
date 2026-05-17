@@ -1194,6 +1194,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // documented contract — callers fall back to the per-element path.
 
     fn write_byte_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u8]) -> bool {
+        // invariant: returns true iff every src byte landed inside the
+        // destination array (kind/element-type/bounds all OK). The default
+        // impl in `native-api/src/registry.rs` now performs the same
+        // bounds check up front; callers may rely on `true` meaning the
+        // full slice was written and `false` meaning nothing was written.
         // Verify destination is a byte/boolean array (both store 1 byte per element).
         if self.shared.heap.kind_of(arr) != ObjectKind::Array {
             return false;

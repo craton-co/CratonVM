@@ -10,7 +10,7 @@
 //! Gray objects (live but unscanned) are tracked in the mark queue, not in
 //! the bitmap itself.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 
 /// Granularity of the mark bitmap: one bit per 8 bytes of heap.
 /// This matches the minimum object alignment (8-byte aligned headers).
@@ -112,10 +112,27 @@ impl MarkBitmap {
     }
 
     /// Clear all bits (prepare for next GC cycle).
+    ///
+    /// **Ordering contract** (Round-7 audit §4): the per-word `Release`
+    /// store pairs with `try_mark`'s `AcqRel` `fetch_or` and `is_marked`'s
+    /// `Acquire` load on the *same word* — so a reader touching a word
+    /// whose store has already happened-before sees the cleared bits.
+    /// However, the per-word `Release` provides no inter-word ordering:
+    /// a marker that wakes on word B can still observe word A's stale
+    /// bits from the previous cycle if the clear loop hasn't reached A
+    /// yet. Today this is invisible because `clear()` is always called
+    /// from `start_concurrent_mark` (`g1.rs:1211`) inside `brief_stw(...)`
+    /// with every mutator parked at `gc_barrier`, and the barrier's
+    /// release on STW exit provides the global fence the per-word stores
+    /// lack. The single `SeqCst` fence below makes that invariant
+    /// explicit and survives any future move of `clear()` out of the
+    /// initial-mark STW pause (e.g. background pre-clear), at the cost
+    /// of one fence per cycle.
     pub fn clear(&self) {
         for word in &self.words {
             word.store(0, Ordering::Release);
         }
+        fence(Ordering::SeqCst);
     }
 
     /// Count the total number of marked bits (for statistics).

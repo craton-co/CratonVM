@@ -25,6 +25,11 @@ default = []
 # GC-delay logic that pauses collection while a token is held. With this
 # feature off the crate compiles to identical bytes as before the GPU work.
 gpu-offload = []
+# Round-7 cross-cutting Fix 4: the `zgc` module is a 1884-LOC stub of the
+# Z Garbage Collector with no consumers in the workspace. Off-by-default
+# saves compile time + binary size; flip on with `--features zgc` once a
+# concrete in-tree user appears.
+zgc = []
 
 [lints]
 workspace = true

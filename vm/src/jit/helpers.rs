@@ -440,6 +440,36 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 }
 
 // ---------------------------------------------------------------------------
+// JIT safepoint SATB flush — Round-7 fix (CRIT, audit §3)
+// ---------------------------------------------------------------------------
+//
+// The interpreter drains its per-thread SATB buffer at every safepoint
+// arrival (`runtime/interpreter.rs::safepoint_check`, line 899). JIT-
+// running threads have no such poll — they only return through one of
+// the runtime helpers below. If any of those helpers participates in an
+// STW pause (directly via `collect_garbage` or transitively via the
+// shared barrier on a concurrent GC trigger) without first draining the
+// per-thread SATB buffer, up to `DEFAULT_SATB_CAPACITY` (256) overwritten
+// references stay invisible to the marker. The next mixed evacuation
+// then turns the classic SATB lost-object scenario into a use-after-
+// free (audit: docs/round7-gc.md §3).
+//
+// `flush_thread_satb` itself is a cheap inline call when `is_active() ==
+// false`: a single Acquire load and an early return. We invoke it
+// unconditionally at the top of every GC-triggering JIT helper so the
+// invariant holds without a separate JIT-emitted safepoint stub.
+#[inline]
+unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
+    if vm_ptr == 0 {
+        return;
+    }
+    // SAFETY: caller contract for every JIT helper — vm_ptr is a live
+    // SharedVm pointer.
+    let vm = &*(vm_ptr as *const SharedVm);
+    vm.heap.flush_thread_satb();
+}
+
+// ---------------------------------------------------------------------------
 // Array allocation helpers
 // ---------------------------------------------------------------------------
 
@@ -448,6 +478,10 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
 // length is the requested array size. The returned i64 is a raw heap pointer to the new array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i64 {
+    // Round-7 fix (CRIT, audit §3): drain THIS thread's per-thread SATB
+    // buffer before any path that may park at the GC barrier or trigger
+    // collection. Mirrors interpreter::safepoint_check (line 899).
+    jit_safepoint_flush_satb(vm_ptr);
     let elem_type = match atype as u8 {
         4 => ArrayElementType::Boolean,
         5 => ArrayElementType::Char,
@@ -578,6 +612,8 @@ pub unsafe extern "C" fn jit_post_tlab_init(
 // The returned i64 is a raw heap pointer to the newly allocated object.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
+    // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
+    jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let heap = &vm.heap;
@@ -638,6 +674,8 @@ pub unsafe extern "C" fn jit_anewarray_object(
     component_class_id_raw: i64,
     length: i64,
 ) -> i64 {
+    // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
+    jit_safepoint_flush_satb(vm_ptr);
     // BUGFIX: see `jit_newarray` — narrow length to int payload and sign-extend.
     // JLS only allows `int` array lengths; defensive against JIT slot patterns
     // that carry stale upper bits (e.g. NaN-boxed CompactValue raw bits).
@@ -686,16 +724,29 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to a byte/boolean array object. Null sets the pending-NPE flag (the
-// interpreter post-JIT path throws on resume); out-of-bounds is handled gracefully.
+// pointer to a byte/boolean array object. Null aborts the process — see comment.
+// Out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §bastore: throw NullPointerException on null array reference.
-        // Previously silently no-op'd, dropping the user's intended write and
-        // hiding the bug. Stores have no return slot, so we only flag the
-        // pending NPE — the interpreter resumes at the deopt PC and throws.
-        set_jit_pending_npe();
-        return;
+        //
+        // CORRECTNESS NOTE: store helpers return `()`, so there is no return-value
+        // slot in which to pass the `i64::MIN` deopt sentinel back to the JIT-compiled
+        // caller (compare `jit_iaload`/`jit_aaload`/`jit_arraylength`, which return
+        // i64 and signal via that channel). If we merely set the thread-local
+        // `JIT_PENDING_NPE` flag and returned, the JIT method continues executing
+        // (the inline store path doesn't check the flag) and the stale NPE bit
+        // leaks to the *next* JIT helper call that does deopt — surfacing the NPE
+        // at the wrong PC/method.
+        //
+        // The production JIT codegen never CALLs this helper (stores are inlined
+        // in `jit/src/x64.rs` and rely on the hardware page-fault NPE path through
+        // the array-length load in `emit_bounds_check`). This helper is registered
+        // in `JitRuntimeHelpers` but currently unreachable. Aborting here makes
+        // any future regression (someone wiring this helper into codegen without
+        // also adding a deopt-sentinel return path) fail loudly and locally
+        // instead of leaking a stale NPE flag to an unrelated downstream site.
+        std::process::abort();
     }
     // SAFETY: array_ptr is non-null and points to a live array object on the GC heap.
     let ptr = array_ptr as *mut u8;
@@ -730,14 +781,17 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
 }
 
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
-// pointer to an int array object. Null sets the pending-NPE flag (the interpreter
-// post-JIT path throws on resume); out-of-bounds is handled gracefully.
+// pointer to an int array object. Null aborts the process — see `jit_bastore` for
+// the rationale. Out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §iastore: throw NullPointerException on null array reference.
-        // Previously silently no-op'd, dropping the write and masking the bug.
-        set_jit_pending_npe();
-        return;
+        // Void return means no deopt-sentinel channel; setting the pending-NPE
+        // flag here would leak across to the next JIT helper call that does
+        // deopt. See `jit_bastore` for the full reasoning. The production JIT
+        // inlines this opcode and never CALLs this helper; abort if anything
+        // ever does so we fail loudly instead of mis-attributing a future NPE.
+        std::process::abort();
     }
     // SAFETY: array_ptr is non-null and points to a live int[] on the GC heap.
     let ptr = array_ptr as *mut u8;
@@ -777,9 +831,13 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
 pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §aastore: throw NullPointerException on null array reference.
-        // Previously silently no-op'd, dropping the write and masking the bug.
-        set_jit_pending_npe();
-        return;
+        // Void return means no deopt-sentinel channel; setting the pending-NPE
+        // flag here would leak across to the next JIT helper call that does
+        // deopt. See `jit_bastore` for the full reasoning. The production JIT
+        // inlines this opcode (see `jit/src/x64.rs` opcode 0x53 — inline store
+        // plus barrier-only call) and never CALLs this helper; abort if anything
+        // ever does so we fail loudly instead of mis-attributing a future NPE.
+        std::process::abort();
     }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
     let ptr = array_ptr as *mut u8;
@@ -788,6 +846,17 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *mut u64;
+    // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier. Read the
+    // OLD reference *before* the store so concurrent marking still sees a
+    // path to the about-to-be-overwritten target. Mirrors the interpreter
+    // call at runtime/interpreter.rs:4093 (aastore) and 5164 (aastore via
+    // set_array_element).
+    let old_raw = std::ptr::read(elem_ptr);
+    if old_raw != 0 {
+        let heap = heap_from_vm(vm_ptr);
+        let old_obj = ObjectRef::from_raw(old_raw as usize as *mut u8);
+        heap.satb_barrier(Value::Object(Some(old_obj)));
+    }
     std::ptr::write(elem_ptr, val as u64);
 
     if val != 0 {
@@ -808,6 +877,8 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     dim1: i64,
     dim2: i64,
 ) -> i64 {
+    // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
+    jit_safepoint_flush_satb(vm_ptr);
     let heap = heap_from_vm(vm_ptr);
     let elem_type = match leaf_et as u8 {
         4 => ArrayElementType::Boolean,
@@ -937,6 +1008,14 @@ pub unsafe extern "C" fn jit_putfield_object(
     let ptr = obj_ref
         .as_ptr()
         .add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
+    // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier — read the
+    // OLD reference before overwriting it. Mirrors interpreter putfield
+    // at runtime/interpreter.rs:6206.
+    let old_value: Value = std::ptr::read(ptr as *const Value);
+    if let Value::Object(Some(_)) = old_value {
+        let heap = heap_from_vm(vm_ptr);
+        heap.satb_barrier(old_value);
+    }
     std::ptr::write(ptr as *mut Value, value);
     if val != 0 {
         let heap = heap_from_vm(vm_ptr);
@@ -957,6 +1036,39 @@ pub unsafe extern "C" fn jit_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i
     let val_ref = ObjectRef::from_raw(val_ptr as usize as *mut u8);
     let value = Value::Object(Some(val_ref));
     heap.write_barrier(obj_ref, value);
+}
+
+// Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier helper.
+//
+// Logs the OLD reference value to the per-thread SATB buffer before the
+// JIT-compiled aastore / putfield / putstatic actually overwrites the
+// reference slot. This preserves the snapshot-at-the-beginning invariant
+// the concurrent marker relies on; without it, JIT-overwritten still-live
+// references silently disappear from the mark closure and become UAF on
+// the next mixed evacuation.
+//
+// The interpreter calls `shared.heap.satb_barrier(old_value)` at every
+// ref-store site (interpreter.rs lines 4093, 5164, 5961, 6206). This
+// helper is the JIT-callable equivalent.
+//
+// Fast path: when concurrent marking is idle (`SatbQueue::is_active() ==
+// false`), the helper performs a single Acquire load and returns — no
+// lock taken, no buffer touched. In steady state the cost is two
+// register operations and a not-taken branch.
+//
+// SAFETY: Called from JIT-compiled code. `vm_ptr` must be a valid
+// SharedVm pointer. `old_ref` is 0 (null) or the raw address of the
+// reference value that was about to be overwritten; null is filtered out
+// inside `satb_barrier` and `satb_thread_local_log`, so passing it is
+// safe but wasteful.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
+    if vm_ptr == 0 || old_ref == 0 {
+        return;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    let old_obj = ObjectRef::from_raw(old_ref as usize as *mut u8);
+    vm.heap.satb_barrier(Value::Object(Some(old_obj)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1145,13 @@ pub unsafe extern "C" fn jit_putstatic_object(vm_ptr: i64, class_id_raw: i64, fi
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
+    // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier — log the
+    // OLD static value before overwriting. Mirrors interpreter putstatic
+    // at runtime/interpreter.rs:5961.
+    let old_static = crate::vm::get_static_shared(vm, class_id, field_index as usize);
+    if let Value::Object(Some(_)) = old_static {
+        vm.heap.satb_barrier(old_static);
+    }
     let value = if val == 0 {
         Value::Object(None)
     } else {
@@ -1336,6 +1455,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     args_ptr: i64,
     num_args: i64,
 ) -> i64 {
+    // Round-7 fix (CRIT, audit §3): SATB safepoint flush. A dispatched
+    // call may transitively enter the GC barrier through callee
+    // allocations or `Object.wait` paths.
+    jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: vm_ptr and info_ptr originate from JIT code; both point to valid, live objects.
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
@@ -1624,6 +1747,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     mic_ptr: i64,
     pic_ptr: i64,
 ) -> i64 {
+    // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
+    jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
     if num_args < 0 || (num_args > 0 && (args_ptr as *const i64).is_null()) {
@@ -2394,6 +2519,10 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         invoke_dispatch: jit_invoke_dispatch as *const () as usize,
         invoke_virtual_mic: jit_invoke_virtual_mic as *const () as usize,
         write_barrier: jit_write_barrier as *const () as usize,
+        // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier so JIT-
+        // overwritten references are logged before the concurrent marker
+        // loses the only path to them.
+        satb_pre_write_barrier: jit_satb_pre_write_barrier as *const () as usize,
         uncommon_trap: jit_uncommon_trap as *const () as usize,
         math_fma_double: jit_math_fma_double as *const () as usize,
         math_fma_float: jit_math_fma_float as *const () as usize,

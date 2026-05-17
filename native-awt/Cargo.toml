@@ -15,7 +15,8 @@ default = []
 [dependencies]
 rustjvm-types = { path = "../types" }
 rustjvm-native-api = { path = "../native-api" }
-tracing = "0.1"
+# Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 parking_lot = "0.12"
 bitflags = "2"
 rustc-hash = "1.1"

@@ -858,7 +858,17 @@ pub const CLASS_INIT_INITIALIZED: u8 = 2;
 /// author classifies it as either an invariant (add to this struct + the
 /// assertion) or a mutable redefine field (add to the swap block + the
 /// documented set above).
-#[cfg(debug_assertions)]
+///
+/// Round 7 audit fix (CRIT #1): the snapshot type *itself* and the
+/// destructuring `let Class { … } = c;` in `from_class` are now always
+/// compiled (the `#[cfg(debug_assertions)]` gate was previously around
+/// both, so release builds silently lost the field-exhaustiveness
+/// trip-wire — a future contributor could add a new `Class` field that
+/// the redefine path quietly clobbered without anyone noticing until a
+/// debug-build test caught it). Only the *runtime* `debug_assert_eq!`
+/// checks in [`assert_eq`] remain `#[cfg(debug_assertions)]`-gated; the
+/// destructuring pattern is purely compile-time and adds zero runtime
+/// cost in either profile.
 #[derive(Debug)]
 struct RedefineInvariantSnapshot {
     id: ClassId,
@@ -889,7 +899,6 @@ struct RedefineInvariantSnapshot {
     array_info_present: bool,
 }
 
-#[cfg(debug_assertions)]
 impl RedefineInvariantSnapshot {
     fn from_class(c: &Class) -> Self {
         // Destructure with explicit names. The trailing `..` is
@@ -966,6 +975,13 @@ impl RedefineInvariantSnapshot {
         }
     }
 
+    // Round 7 audit fix (CRIT #1): only the runtime walk is debug-only;
+    // the struct + `from_class` are always compiled so the destructuring
+    // trip-wire fires in release builds. `dead_code` is allowed because
+    // release callers never invoke this method (the `debug_assert_eq!`
+    // bodies compile to no-ops, so the function is effectively unused
+    // in release, but we keep the symbol for ABI / future debug runs).
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     fn assert_eq(&self, after: &Self, class_name: &str) {
         // One assert per invariant so the failure message tells the
         // future-author exactly which field they mutated.
@@ -2645,6 +2661,21 @@ impl ClassManager {
         // overrides so the VM-side hook can fire the CHA invalidation.
         let mut overrides: Vec<(u32, usize)> = Vec::new();
 
+        // Round 7 audit fix (HIGH #5): cache `code_attr.code.to_arc()`
+        // by (class_id_u32, method_index). `to_arc()` materialises a
+        // fresh `Arc<[u8]>` (alloc + memcpy) per call; without this
+        // cache, every time the same method is touched by the vtable
+        // build path it pays the alloc again. While the current loop
+        // visits each `class.methods[i]` exactly once, the cache (a)
+        // makes the intent explicit, (b) protects against future
+        // re-entry from override / interface scaffolding being added
+        // here, and (c) is essentially free on miss (one FxHashMap
+        // insert). On Spring inheritance chains this saves the bulk of
+        // the ~12k redundant Arc allocations attributed to vtable
+        // installation.
+        let mut method_code_cache: FxHashMap<(u32, u32), Arc<[u8]>> =
+            FxHashMap::with_capacity_and_hasher(class.methods.len(), Default::default());
+
         for (method_index, method) in class.methods.iter().enumerate() {
             // Skip non-virtual methods.
             if method.is_static() {
@@ -2679,6 +2710,17 @@ impl ClassManager {
             let dispatch: Option<VtableMethodSnapshot> = if is_abstract {
                 None
             } else if let Some(code_attr) = method.code() {
+                // Round 7 audit fix (HIGH #5): dedupe `to_arc()` via
+                // `method_code_cache` so the same method id never
+                // allocates more than one `Arc<[u8]>` in this build.
+                // First touch allocates + memcpys (one-time cost per
+                // method); every subsequent touch is a refcount bump on
+                // the cached Arc.
+                let cache_key = (class_id_u32, method_index as u32);
+                let code_arc = method_code_cache
+                    .entry(cache_key)
+                    .or_insert_with(|| code_attr.code.to_arc())
+                    .clone();
                 Some(VtableMethodSnapshot {
                     class_name: class.name.to_string(),
                     source_file: class.source_file.clone(),
@@ -2687,7 +2729,7 @@ impl ClassManager {
                     // snapshot owns a standalone `Arc<[u8]>` that is
                     // decoupled from the class-file buffer (Frame.code
                     // and JIT consumers want a free-standing Arc).
-                    code: code_attr.code.to_arc(),
+                    code: code_arc,
                     exception_table: code_attr.exception_table.clone(),
                     max_stack: code_attr.max_stack,
                     max_locals: code_attr.max_locals,
@@ -3404,7 +3446,11 @@ impl ClassManager {
         // author classifies it as either an invariant (add to the
         // snapshot below + the assertion) or a mutable redefine field
         // (add to the post-swap mutation block + the documented set).
-        #[cfg(debug_assertions)]
+        //
+        // Round 7 audit fix (CRIT #1): always build the snapshot so the
+        // exhaustive destructuring trip-wire fires in release builds
+        // too. The actual `assert_eq` runtime check below remains gated
+        // behind `cfg(debug_assertions)`.
         let invariant_snapshot: Option<RedefineInvariantSnapshot> = self
             .class_store
             .get(class_id)
@@ -3456,15 +3502,24 @@ impl ClassManager {
         // Everything else is a JEP 109 invariant and a mutation here
         // would silently corrupt downstream caches (vtable, JIT,
         // resolution cache) that key off identity-stable fields.
+        //
+        // Round 7 audit fix (CRIT #1): `invariant_snapshot` is always
+        // built (above) so the destructuring trip-wire fires in release.
+        // Only the runtime `assert_eq` walk is debug-gated here.
         #[cfg(debug_assertions)]
         if let (Some(before), Some(after)) = (
-            invariant_snapshot,
+            invariant_snapshot.as_ref(),
             self.class_store
                 .get(class_id)
                 .map(RedefineInvariantSnapshot::from_class),
         ) {
             before.assert_eq(&after, &existing_name);
         }
+        // In release builds the snapshot is built for its trip-wire
+        // side-effect (compile-time enumeration of every Class field)
+        // but otherwise unused. Suppress the dead-store warning.
+        #[cfg(not(debug_assertions))]
+        let _ = invariant_snapshot;
 
         // ---- Step 5b: verify the freshly-installed bytecode ----
         // Run the same Pass-2 (structural) + Pass-3 (bytecode type
@@ -3982,6 +4037,21 @@ impl ClassManager {
         //
         // T10.9.E: clone the existing `Arc<str>` (refcount bump) instead
         // of allocating a fresh `String` for the map key.
+        //
+        // Round 7 audit fix (CRIT #2): the key hardcodes
+        // `ClassLoaderId::Bootstrap` because synthetic JDK stubs are
+        // bootstrap-loaded by construction. Assert that the `Class`
+        // being inserted agrees, so a future contributor who extends
+        // this path to user-defined loaders has to update both sides at
+        // once instead of silently inserting a mis-keyed entry that
+        // would shadow the real class in `loaded_classes`.
+        debug_assert_eq!(
+            class.loader_id,
+            ClassLoaderId::Bootstrap,
+            "synthetic class creation paths must use Bootstrap loader (got {:?} for {})",
+            class.loader_id,
+            class.name,
+        );
         let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
         self.loaded_classes.insert(key, id);
         self.class_store.add(class);
@@ -4186,6 +4256,20 @@ impl ClassManager {
         //
         // T10.9.E: clone the existing `Arc<str>` (refcount bump) instead
         // of allocating a fresh `String` for the map key.
+        //
+        // Round 7 audit fix (CRIT #2): per JVMS §5.3.3, array classes
+        // are *created* by the bootstrap class loader regardless of the
+        // component type's defining loader. Assert that the freshly-
+        // built `Class` honours that invariant — a future contributor
+        // who experiments with per-loader array classes must update
+        // both the `Class::loader_id` field and the map key together.
+        debug_assert_eq!(
+            class.loader_id,
+            ClassLoaderId::Bootstrap,
+            "synthetic class creation paths must use Bootstrap loader (got {:?} for array {})",
+            class.loader_id,
+            class.name,
+        );
         let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
         self.loaded_classes.insert(key, id);
         self.class_store.add(class);

@@ -4194,6 +4194,27 @@ fn native_period_zero_const(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 
 // ---- DateTimeFormatter implementations ----
 
+/// Round-7 MED-13 fix: cache DateTimeFormatter synthetics keyed by pattern
+/// string. `ofPattern` is called repeatedly per log line / serializer in
+/// most real apps (loggers reify their pattern on every message); the
+/// previous implementation allocated a fresh synthetic + interned the
+/// pattern string each call. The cache lookup avoids both the allocation
+/// and the `set_field` traffic on the hot path.
+///
+/// Note: the cached `ObjectRef` is a heap reference. Because our heap
+/// is process-lifetime (`alloc_concurrent_synthetic` allocates from an
+/// arena that lives until process exit) the cached refs remain valid
+/// for the lifetime of the table. The cache itself is a `parking_lot
+/// ::Mutex<FxHashMap>` consistent with the other side tables in the
+/// crate.
+fn dtf_pattern_cache(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<String, ObjectRef>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<String, ObjectRef>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 fn native_dtf_of_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let pattern = match args.first() {
         Some(Value::Object(Some(o))) => ctx
@@ -4201,7 +4222,22 @@ fn native_dtf_of_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .unwrap_or_else(|| "yyyy-MM-dd'T'HH:mm:ss".to_string()),
         _ => "yyyy-MM-dd'T'HH:mm:ss".to_string(),
     };
-    Ok(Some(Value::Object(Some(alloc_dtf(ctx, &pattern)))))
+    // Round-7 MED-13: cached lookup keyed by pattern string.
+    {
+        let cache = dtf_pattern_cache().lock();
+        if let Some(obj) = cache.get(&pattern) {
+            return Ok(Some(Value::Object(Some(*obj))));
+        }
+    }
+    let obj = alloc_dtf(ctx, &pattern);
+    {
+        let mut cache = dtf_pattern_cache().lock();
+        // Insert if still missing — another thread may have raced us. We
+        // accept the rare double-allocation on contention (no eviction
+        // needed since cache misses are bounded by distinct patterns).
+        cache.entry(pattern).or_insert(obj);
+    }
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 fn native_dtf_format(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

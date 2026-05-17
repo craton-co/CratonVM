@@ -143,21 +143,37 @@ impl EventRepository {
         self.base_index = self.total_recorded;
     }
 
-    /// Return references to events matching the given type id.
+    /// Return an iterator over events matching the given type id.
     /// Uses the type_index for O(1) lookup of matching indices.
+    ///
+    /// Round-5: this is the allocation-free primary API. Use `events_by_type`
+    /// only when a `Vec` is genuinely required (e.g. by `.len()` from older
+    /// test code). Callers that just iterate should call this directly.
+    pub fn iter_by_type(
+        &self,
+        type_id: EventTypeId,
+    ) -> impl Iterator<Item = &EventInstance> {
+        // `into_iter` of `Option<&VecDeque<usize>>` -> flatten yields the
+        // empty iterator when no indices exist for this type, avoiding the
+        // allocation that the old `Vec::new()` branch required.
+        let base = self.base_index as usize;
+        self.type_index
+            .get(&type_id)
+            .into_iter()
+            .flat_map(|abs_indices| abs_indices.iter())
+            .filter_map(move |&abs_idx| {
+                let rel = abs_idx.checked_sub(base)?;
+                self.events.get(rel)
+            })
+    }
+
+    /// Return references to events matching the given type id.
+    ///
+    /// Prefer [`iter_by_type`](Self::iter_by_type) for iteration — this
+    /// allocator-eager wrapper exists only for callers that need to take
+    /// `.len()` or pass a slice elsewhere.
     pub fn events_by_type(&self, type_id: EventTypeId) -> Vec<&EventInstance> {
-        match self.type_index.get(&type_id) {
-            Some(abs_indices) => {
-                abs_indices
-                    .iter()
-                    .filter_map(|&abs_idx| {
-                        let rel = abs_idx.checked_sub(self.base_index as usize)?;
-                        self.events.get(rel)
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
-        }
+        self.iter_by_type(type_id).collect()
     }
 
     /// Return references to events whose start_time falls within [start, end].

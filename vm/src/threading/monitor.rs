@@ -278,6 +278,29 @@ struct MonitorState {
     /// Re-entry count. Incremented on each `monitorenter`, decremented on
     /// `monitorexit`. The monitor is released when this reaches 0.
     entry_count: u32,
+    /// Round-7 HIGH (vm #5): JFR enter/exit event-pair consistency.
+    ///
+    /// JFR can be enabled or disabled at any moment (`rustjvm_jfr::is_enabled()`
+    /// flips via a global AtomicBool). The interpreter's `Monitorenter` path
+    /// snapshots `is_enabled()` *before* acquiring the lock and only emits the
+    /// JFR monitor-enter event if that snapshot was true. The corresponding
+    /// `Monitorexit` path would naturally re-check `is_enabled()` — but if JFR
+    /// *enabled* between the enter snapshot and the exit, the exit-side check
+    /// would emit an exit event for which no matching enter event was ever
+    /// recorded (orphan exit), and downstream JFR consumers correlate enter
+    /// and exit events by `(thread_id, monitor_addr)` so an orphan exit
+    /// corrupts their per-monitor wait-time aggregation.
+    ///
+    /// To keep the enter/exit pair atomic with respect to JFR state, we stash
+    /// the enter-time decision on the monitor itself: the interpreter sets
+    /// this flag via [`Monitor::set_jfr_enter_recorded`] right after it emits
+    /// the enter event, and the exit path consults
+    /// [`Monitor::take_jfr_enter_recorded`] to decide whether to emit the
+    /// matching exit event. Only the outermost reentrant enter records (so a
+    /// nested re-acquire of the same monitor by the same thread doesn't
+    /// produce a spurious paired event); when `entry_count` returns to 0 the
+    /// flag is cleared so the next acquisition starts fresh.
+    jfr_enter_recorded: bool,
 }
 
 impl Monitor {
@@ -287,6 +310,7 @@ impl Monitor {
             state: Mutex::new(MonitorState {
                 owner: None,
                 entry_count: 0,
+                jfr_enter_recorded: false,
             }),
             entry_condvar: Condvar::new(),
             wait_condvar: Condvar::new(),
@@ -355,6 +379,13 @@ impl Monitor {
                 state.entry_count -= 1;
                 if state.entry_count == 0 {
                     state.owner = None;
+                    // Round-7 HIGH (vm #5): clear the JFR enter-event flag at
+                    // the same instant the monitor becomes unowned. The next
+                    // acquirer (potentially a different thread) starts with
+                    // a fresh `jfr_enter_recorded = false` and the
+                    // interpreter's enter-time snapshot governs whether
+                    // the next enter/exit pair is JFR-tracked.
+                    state.jfr_enter_recorded = false;
                     // Wake one thread waiting to enter this monitor
                     self.entry_condvar.notify_one();
                 }
@@ -362,6 +393,32 @@ impl Monitor {
             }
             _ => Err(MonitorError::NotOwner),
         }
+    }
+
+    /// Round-7 HIGH (vm #5): record that the interpreter emitted a JFR
+    /// `monitor_enter` event for the current outermost acquisition of this
+    /// monitor. Called from the `Monitorenter` opcode handler right after the
+    /// event is pushed to the flight recorder, so the matching `Monitorexit`
+    /// can decide whether to emit an exit event without re-checking the
+    /// (potentially-flipped-since) global JFR enable flag.
+    ///
+    /// No-op unless the caller currently owns the monitor — defensive against
+    /// a stale snapshot in a racing interpreter thread.
+    pub(crate) fn set_jfr_enter_recorded(&self, thread_id: ThreadId) {
+        let mut state = self.state.lock();
+        if state.owner == Some(thread_id) {
+            state.jfr_enter_recorded = true;
+        }
+    }
+
+    /// Round-7 HIGH (vm #5): peek the JFR enter-recorded flag for the current
+    /// owner. Returns `true` only if the interpreter actually emitted a
+    /// matching `monitor_enter` event for the live acquisition — the natural
+    /// gate for emitting a paired `monitor_exit` event without producing an
+    /// orphan one when JFR turned on between the two opcodes.
+    pub(crate) fn jfr_enter_recorded(&self) -> bool {
+        let state = self.state.lock();
+        state.jfr_enter_recorded
     }
 
     /// Object.wait() — release the monitor and block until notified.
@@ -819,6 +876,33 @@ impl MonitorTable {
                     },
                 )))
             }
+        }
+    }
+
+    /// Round-7 HIGH (vm #5): record on the monitor for `obj_ref` that the
+    /// interpreter has emitted a JFR `monitor_enter` event for the current
+    /// outermost acquisition by `thread_id`. The exit-side companion is
+    /// [`jfr_enter_recorded`].
+    ///
+    /// If the monitor has not been inflated yet (the uncontended fast path
+    /// served the enter via the mark-word thin lock), this forces inflation
+    /// so the flag has a stable home. Inflation is the expected price for a
+    /// monitor that the JFR consumer is interested in — the JFR-enabled gate
+    /// means we're already on the cold path.
+    pub fn set_jfr_enter_recorded(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
+        let monitor = self.ensure_inflated(obj_ref, thread_id);
+        monitor.set_jfr_enter_recorded(thread_id);
+    }
+
+    /// Round-7 HIGH (vm #5): query whether a JFR `monitor_enter` event was
+    /// emitted for the current outermost acquisition of the monitor for
+    /// `obj_ref`. Returns `false` if the monitor has not been inflated (in
+    /// which case the enter event could not have been recorded — the flag
+    /// lives on the heavyweight `Monitor`, never on the thin lock).
+    pub fn jfr_enter_recorded(&self, obj_ref: ObjectRef) -> bool {
+        match self.lookup_inflated(obj_ref) {
+            Some(m) => m.jfr_enter_recorded(),
+            None => false,
         }
     }
 

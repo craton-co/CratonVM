@@ -890,10 +890,6 @@ unsafe fn emit_osr_trampoline(
             tramp.emit(&src_disp.to_le_bytes());
         }
 
-        let frame_neg_off = -((i as i32 + 1) * 8);
-        tramp.emit(&[0x48, 0x89, 0x85]);
-        tramp.emit(&frame_neg_off.to_le_bytes());
-
         let dst_reg_opt = if let Some(assignments) = local_assignments {
             assignments.get(i).copied().flatten()
         } else if i < num_reg_locals {
@@ -901,6 +897,26 @@ unsafe fn emit_osr_trampoline(
         } else {
             None
         };
+
+        // round-8 perf (round-4 #11 / round-5 #8): elide the frame-slot
+        // store when the local has a canonical register home. The compiled
+        // method body reads from `dst_reg` (or `xmm` below) directly; the
+        // frame slot is only used as a spill backing store, which the JIT
+        // re-establishes lazily before any operation that needs a memory
+        // operand. Skipping this MOV saves 7 bytes + one L1d store per
+        // register-resident local on each OSR entry.
+        let xmm_opt = if let Some(xmm_asgn) = xmm_assignments {
+            xmm_asgn.get(i).copied().flatten()
+        } else {
+            None
+        };
+        let has_register_home = dst_reg_opt.is_some() || xmm_opt.is_some();
+        if !has_register_home {
+            let frame_neg_off = -((i as i32 + 1) * 8);
+            tramp.emit(&[0x48, 0x89, 0x85]);
+            tramp.emit(&frame_neg_off.to_le_bytes());
+        }
+
         if let Some(dst_reg) = dst_reg_opt {
             let rex = 0x48 | if dst_reg >= 8 { 0x04 } else { 0x00 };
             tramp.emit_byte(rex);
@@ -911,11 +927,6 @@ unsafe fn emit_osr_trampoline(
         // If this local has an XMM assignment, load the value into the XMM register.
         // RAX already contains the local's value (from the MOV above).
         // Emit: MOVQ XMMn, RAX  (66 48|4C 0F 6E /r)
-        let xmm_opt = if let Some(xmm_asgn) = xmm_assignments {
-            xmm_asgn.get(i).copied().flatten()
-        } else {
-            None
-        };
         if let Some(xmm) = xmm_opt {
             let rex_r = if xmm >= 8 { 0x04u8 } else { 0u8 };
             tramp.emit_byte(0x66);
@@ -1672,6 +1683,49 @@ fn compute_jit_key_hash(class: &str, method: &str, desc: &str) -> u64 {
 /// after a hash hit — this protects against (rare) hash collisions
 /// while eliminating the three `Arc<str>` clones the prior keyed-map
 /// implementation required on every lookup (PERF-P2).
+///
+/// TODO(round-8, HIGH from round-7 jit #6): no pooling / LRU / coalescing
+/// of `ExecutableBuffer`s.  On Windows each compiled method calls
+/// `VirtualAlloc` with a typical code size of ~5 KB but allocation
+/// granularity is 64 KB, wasting ~59 KB of address space per method.
+/// For a JDK workload with ~3000 hot methods that's ~177 MB of
+/// reserved-but-unused VA.  A per-VM code arena (single large
+/// `VirtualAlloc` carved into slabs, with LRU eviction keyed by
+/// invocation count) would close the gap.
+///
+/// Concrete plan for round-8:
+///   1. Add `code_arena: Mutex<JitCodeArena>` to `JitCache`. The arena
+///      owns one or more 16 MiB executable regions (each is a single
+///      `VirtualAlloc(MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE)` followed
+///      by a `VirtualProtect(PAGE_EXECUTE_READ)` after each method
+///      finalize — but at *page* granularity, not allocation
+///      granularity, so the 64 KB tax is paid once per arena instead
+///      of once per method).
+///   2. `ExecutableBuffer::new(size)` becomes
+///      `ExecutableBuffer::new_in(arena, size)`. On success it returns
+///      a buffer that points into the arena and carries a back-pointer
+///      to the arena for free-on-drop. The arena maintains a free-list
+///      keyed by 256-byte-rounded size buckets so deopt-invalidated
+///      methods (see `JitCache::remove` / `invalidate_for_class`)
+///      return space for reuse.
+///   3. The JIT-code-region tracker (`jit_code_regions`) registers
+///      whole *arenas* instead of individual buffers — the validator
+///      uses a single range check per arena, which also speeds up the
+///      conservative scan's `is_code_address` query.
+///   4. W^X transitions (`make_executable` / `make_writable`) must be
+///      page-aligned. The arena rounds each buffer up to 4 KB to allow
+///      independent protection toggling, OR (preferred) batches all
+///      protect-RX transitions until JIT-quiesce time so a single
+///      `VirtualProtect` covers many buffers at once.
+///   5. OSR trampolines (allocated via `ExecutableBuffer::new` in
+///      `emit_osr_trampoline`) need their own small-buckets arena to
+///      avoid heap fragmentation. Trampolines are typically <1 KB.
+///
+/// Deferred from this wave because it requires reworking
+/// `ExecutableBuffer` ownership, the Drop impl, the OSR-trampoline
+/// cache (`osr_trampoline_cache`), relocation patches, and the
+/// JIT-code-region tracker (`jit_code_regions`) — all touching
+/// concurrency invariants that need their own test battery.
 pub struct JitCache {
     methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
     string_arena: Vec<Pin<Box<str>>>,
@@ -2050,10 +2104,86 @@ fn apply_ea_to_ir(
 // Compilation entry point
 // ---------------------------------------------------------------------------
 
+// round-7 fix (bug 1, CRIT, permanent recompile waste):
+//
+// `try_compile` returns `None` for two distinct reasons:
+//   1. Transient failure (resolver returned None, executable-buffer alloc
+//      failed, profile not yet present, etc.) — these are worth re-trying
+//      later once the missing state is populated.
+//   2. Permanent bail — the x64 backend hit an unsupported pattern
+//      (e.g. >ARG_REGS direct-call args at x64.rs:10380/10422/10583/10665)
+//      and returned `false` from `compile_bytecode`.  These will *always*
+//      fail until the JIT grows the missing feature, but the interpreter
+//      keeps polling `try_compile` every 2000 invocations forever — each
+//      attempt burns ~50µs walking the same scan/IR pipeline only to bail
+//      at the same site.
+//
+// We can't trivially distinguish (1) from (2) without plumbing a richer
+// return type through the entire compilation pipeline.  As a pragmatic
+// approximation, we treat the *most expensive* failure mode — the one
+// where x64::compile() runs the full scan/IR/optimization pipeline and
+// then returns None because of a backend bail — as permanent.  All the
+// "transient" None paths (resolver-fail, allocator-fail) short-circuit
+// *before* x64::compile and therefore don't pollute the bail-list.
+//
+// Implementation: a process-wide `FxHashSet<u64>` (keyed by the same
+// XOR-folded FxHash we already use for the JIT cache, see
+// `compute_jit_key_hash`).  Membership is checked at the top of
+// `try_compile`; entries are added when the heavy backend path returns
+// None.  The set is never pruned — bail-listed methods stay bail-listed
+// for the JVM's lifetime (matches the "wave them off" intent).
+//
+// Hash collisions between two methods are benign here: the worst case
+// is a non-bail-listed method that shares a hash with a bail-listed
+// one gets falsely skipped (and stays in the interpreter).  Probability
+// is the same ~2.7e-10 / 100k methods as the JIT cache.
+
+static JIT_BAIL_LIST: std::sync::OnceLock<parking_lot::RwLock<rustc_hash::FxHashSet<u64>>> =
+    std::sync::OnceLock::new();
+static JIT_BAIL_SHORTCIRCUITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn jit_bail_list() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
+    JIT_BAIL_LIST.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Whether the given method has been added to the JIT bail-list by a
+/// prior permanent-bail compilation attempt.  Checked at the top of
+/// `try_compile` to short-circuit re-attempts.
+fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    let h = compute_jit_key_hash(class_name, method_name, descriptor);
+    jit_bail_list().read().contains(&h)
+}
+
+/// Mark the method as permanently bail-listed.  Called when the heavy
+/// `x64::compile` path returns None (typically because of an unsupported
+/// backend pattern that won't change on retry).
+fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
+    let h = compute_jit_key_hash(class_name, method_name, descriptor);
+    jit_bail_list().write().insert(h);
+}
+
+/// Diagnostic: number of methods currently bail-listed.
+pub fn jit_bail_list_size() -> usize {
+    jit_bail_list().read().len()
+}
+
+/// Diagnostic: number of `try_compile` calls short-circuited because
+/// the method was already bail-listed.  Each short-circuit saves the
+/// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
+/// re-hit the same backend bail.
+pub fn jit_bail_shortcircuits() -> u64 {
+    JIT_BAIL_SHORTCIRCUITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Try to JIT-compile a cached bytecode method.
 ///
 /// The `helpers` parameter provides function pointer addresses for runtime callbacks
 /// that will be embedded into the generated machine code.
+///
+/// round-7 fix (bug 1): wraps the inner pipeline so we can record a
+/// permanent bail when the backend returns None.  See the bail-list
+/// notes above.
 #[allow(clippy::type_complexity)]
 pub fn try_compile(
     cached: &CachedBytecodeMethod,
@@ -2068,6 +2198,71 @@ pub fn try_compile(
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+) -> Option<CompiledMethod> {
+    // round-7 fix (bug 1): short-circuit re-attempts on methods the
+    // backend already permanently bailed on.  Avoids ~50µs of wasted
+    // scan/IR/lowering work per re-attempt (every 2000 invocations
+    // under the default interpreter warmup gate).
+    if is_jit_bail_listed(&cached.class_name, &cached.method_name, &cached.method_descriptor) {
+        JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+
+    // Inner pipeline: returns None on either a transient resolver miss
+    // OR a permanent backend bail.  Only the latter pollutes the bail-
+    // list, so we use a sentinel `bailed` ref-mut that the inner fn
+    // sets when it traverses past the cheap resolver checks into
+    // `x64::compile`.
+    let mut backend_attempted = false;
+    let result = try_compile_inner(
+        cached,
+        cp_class_name_resolver,
+        cp_field_resolver,
+        cp_static_field_resolver,
+        cp_invoke_resolver,
+        callee_compiler,
+        cp_new_resolver,
+        cp_ldc_resolver,
+        cp_ldc2w_resolver,
+        profile,
+        helpers,
+        inline_resolver,
+        &mut backend_attempted,
+    );
+
+    if result.is_none() && backend_attempted {
+        // The heavy backend path ran and returned None — treat as
+        // permanent.  Future try_compile calls for this method
+        // short-circuit immediately at the check above.
+        mark_jit_bail_listed(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+        );
+    }
+    result
+}
+
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn try_compile_inner(
+    cached: &CachedBytecodeMethod,
+    cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8)>>,
+    cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize)>>,
+    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
+    profile: Option<&profile::MethodProfile>,
+    helpers: &JitRuntimeHelpers,
+    inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    // round-7 fix (bug 1): set to `true` immediately before invoking
+    // the heavy `x64::compile` path so the outer wrapper can tell a
+    // permanent backend bail (worth bail-listing) from an early
+    // transient miss (e.g. resolver returned None, profile not yet
+    // present — worth retrying later).
+    backend_attempted: &mut bool,
 ) -> Option<CompiledMethod> {
     // Architecture-specific backend selection.
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
@@ -2097,6 +2292,12 @@ pub fn try_compile(
                 }
             }
         }
+
+        // round-7 fix (bug 1): aarch64 backend is also a "heavy"
+        // pipeline — a `result.success == false` is a permanent bail
+        // for the same reason as the x64 backend bails.  Set the
+        // flag before invoking so the outer wrapper records it.
+        *backend_attempted = true;
 
         let mut backend = aarch64_backend::Arm64Backend::new();
         let result = backend.compile_method_with_info(
@@ -2494,6 +2695,13 @@ pub fn try_compile(
                 .collect()
         })
         .unwrap_or_default();
+
+    // round-7 fix (bug 1): from this point on, any `None` return is a
+    // permanent backend bail — the resolver pre-checks all completed
+    // successfully and we're about to walk the full
+    // scan/IR/lowering pipeline.  Flag it so the outer wrapper adds
+    // this method to the bail-list.
+    *backend_attempted = true;
 
     let mut compiled = x64::compile(
         code,

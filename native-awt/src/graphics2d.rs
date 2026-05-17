@@ -571,19 +571,75 @@ impl Graphics2DState {
     }
 
     /// Fill a rectangle with a linear gradient, computing the colour per-pixel.
+    ///
+    /// Round-5: write directly into the pixel buffer row-by-row instead of
+    /// looping through `set_color` + `draw_pixel` (each of which re-applied
+    /// the affine transform and re-checked clip/bounds). We pre-clip the
+    /// rectangle to the buffer + active clip once, then walk the visible
+    /// rows touching `renderer.pixels_mut()` directly. The inner row loop
+    /// computes one gradient color per pixel and writes it; gradient cost
+    /// dominates per-pixel set_color overhead now.
     fn fill_rect_gradient(
         &mut self,
         x: i32, y: i32, w: u32, h: u32,
         gx1: f64, gy1: f64, gx2: f64, gy2: f64,
         color1: u32, color2: u32, cyclic: bool,
     ) {
-        for py in 0..h as i32 {
-            for px in 0..w as i32 {
-                let fx = (x + px) as f64;
-                let fy = (y + py) as f64;
+        let buf_w = self.renderer.width() as i32;
+        let buf_h = self.renderer.height() as i32;
+
+        // Visible-rect intersection: rect ∩ buffer ∩ clip.
+        let mut x0 = x.max(0);
+        let mut y0 = y.max(0);
+        let mut x1 = (x.saturating_add(w as i32)).min(buf_w);
+        let mut y1 = (y.saturating_add(h as i32)).min(buf_h);
+        if let Some(clip) = self.renderer.clip() {
+            x0 = x0.max(clip.x);
+            y0 = y0.max(clip.y);
+            x1 = x1.min(clip.x.saturating_add(clip.width as i32));
+            y1 = y1.min(clip.y.saturating_add(clip.height as i32));
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        // Round-7: detect the "vertical only" gradient (colour varies with y
+        // only, not x). For such gradients every pixel in a scanline has the
+        // same colour, so we can splat the row via `slice::fill` instead of
+        // computing the gradient once per pixel. Common case: button-bar
+        // top-to-bottom gradients in Swing L&Fs.
+        let dx_g = gx2 - gx1;
+        let dy_g = gy2 - gy1;
+        let len_sq = dx_g * dx_g + dy_g * dy_g;
+        let vertical_only = len_sq >= 1e-12 && (dx_g * dx_g) / len_sq < 1e-18;
+
+        let buf_w_usize = self.renderer.width() as usize;
+        let pixels = self.renderer.pixels_mut();
+        let row_w = (x1 - x0) as usize;
+
+        if vertical_only {
+            for py in y0..y1 {
+                let c = gradient_color_at(
+                    gx1, gy1, gx2, gy2, color1, color2, cyclic,
+                    x0 as f64, py as f64,
+                );
+                let start = py as usize * buf_w_usize + x0 as usize;
+                pixels[start..start + row_w].fill(c);
+            }
+            return;
+        }
+
+        for py in y0..y1 {
+            let fy = py as f64;
+            let row_base = (py as usize) * buf_w_usize;
+            // Precompute color per pixel within the row. The hot work is the
+            // gradient math (a dot product and a lerp) — the row-direct write
+            // eliminates per-pixel transform/clip/bounds re-checks.
+            let row = &mut pixels[row_base + x0 as usize..row_base + x1 as usize];
+            for (i, dst) in row.iter_mut().enumerate() {
+                let fx = (x0 + i as i32) as f64;
                 let c = gradient_color_at(gx1, gy1, gx2, gy2, color1, color2, cyclic, fx, fy);
-                self.renderer.set_color(c);
-                self.renderer.draw_pixel(x + px, y + py);
+                *dst = c;
             }
         }
     }

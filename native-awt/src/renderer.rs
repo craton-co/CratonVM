@@ -107,7 +107,45 @@ impl AffineTransform {
     }
 
     /// `self * other` — applies `other` first, then `self`.
+    ///
+    /// Round-7 fast paths:
+    /// - If `other` is the identity, return `self` unchanged (no multiply).
+    /// - If `other` is a pure translation (linear part = identity), the
+    ///   resulting linear part is `self`'s linear part; only the translation
+    ///   column needs the partial multiply `self.linear * other.trans + self.trans`.
+    ///
+    /// These cases are extremely common: every `Graphics2D::translate(dx, dy)`
+    /// call enters the second path, and many Swing repaints compose a
+    /// translation onto an identity current transform (first path).
     pub fn concatenate(&self, other: &AffineTransform) -> AffineTransform {
+        // Identity short-circuit. Tight tolerance — true identities come from
+        // `AffineTransform::identity()` and compare exactly. The comparisons
+        // are bitwise-equivalent on the constants 1.0 / 0.0.
+        if other.m00 == 1.0
+            && other.m01 == 0.0
+            && other.m10 == 0.0
+            && other.m11 == 1.0
+            && other.m02 == 0.0
+            && other.m12 == 0.0
+        {
+            return *self;
+        }
+
+        // Translation-only short-circuit: `other` has identity linear part
+        // (a=1, b=0, c=0, d=1) but non-zero translation. Skip the four
+        // linear multiplies; only fold `other`'s translation through `self`'s
+        // linear part into the new translation column.
+        if other.m00 == 1.0 && other.m01 == 0.0 && other.m10 == 0.0 && other.m11 == 1.0 {
+            return AffineTransform {
+                m00: self.m00,
+                m01: self.m01,
+                m02: self.m00 * other.m02 + self.m01 * other.m12 + self.m02,
+                m10: self.m10,
+                m11: self.m11,
+                m12: self.m10 * other.m02 + self.m11 * other.m12 + self.m12,
+            };
+        }
+
         AffineTransform {
             m00: self.m00 * other.m00 + self.m01 * other.m10,
             m01: self.m00 * other.m01 + self.m01 * other.m11,
@@ -1120,6 +1158,19 @@ impl SoftwareRenderer {
     }
 
     /// Scaled blit with optional bilinear interpolation.
+    ///
+    /// When `bilinear` is `false`, sampling is nearest-neighbour: each output
+    /// pixel reads exactly one source pixel (chosen by rounding). When
+    /// `bilinear` is `true`, the four surrounding source pixels are linearly
+    /// interpolated — smoother for arbitrary scale factors, but more
+    /// expensive. Callers select the mode via Graphics2D's
+    /// `RenderingHints.VALUE_INTERPOLATION_{NEAREST_NEIGHBOR,BILINEAR}`.
+    ///
+    /// Round-7 fast path: when the requested destination size matches the
+    /// source size and the transform is identity, dispatch to the unscaled
+    /// `blit_image` path. This sidesteps the per-pixel interpolation /
+    /// rounding / put_pixel work for the very common "scale factor of 1"
+    /// case (e.g. icon sheets, sprite atlases, double-buffered repaints).
     pub fn blit_image_scaled(
         &mut self,
         src: &[u32], src_w: u32, src_h: u32,
@@ -1127,6 +1178,14 @@ impl SoftwareRenderer {
         bilinear: bool,
     ) {
         if dw == 0 || dh == 0 || src_w == 0 || src_h == 0 {
+            return;
+        }
+
+        // Round-7: identity-scale fast path. If the caller asked for a 1:1
+        // copy (no actual scaling) and the active transform is identity, fall
+        // back to the unscaled blit which has the SSE2/SRC_OVER row paths.
+        if dw == src_w && dh == src_h && self.transform.is_identity() {
+            self.blit_image(src, src_w, src_h, dx, dy);
             return;
         }
 

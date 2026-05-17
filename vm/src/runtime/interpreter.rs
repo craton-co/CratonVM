@@ -2056,14 +2056,25 @@ pub fn execute(
                 cm._jit_strings = owned_jit_strings;
                 cm._jit_invoke_infos = owned_jit_invoke_infos;
                 let code_size = 0usize; // TODO: expose compiled code size
-                let mut jit_cache = shared.jit_cache.write();
-                jit_cache.put(
-                    class_name_arc.clone(),
-                    method_name_arc.clone(),
-                    descriptor_arc.clone(),
-                    cm,
-                );
-                // Record JFR compilation event
+                // Round-7 HIGH-2 fix: do NOT hold `jit_cache.write()` across
+                // `flight_recorder.lock()`.  The global JIT cache writer
+                // would otherwise serialise JFR formatting for every
+                // sibling compiler thread.  Two-phase: (1) put + get under
+                // the JIT cache write, drop it; (2) JFR event emitted with
+                // only the flight_recorder lock held.
+                let cached_result = {
+                    let mut jit_cache = shared.jit_cache.write();
+                    jit_cache.put(
+                        class_name_arc.clone(),
+                        method_name_arc.clone(),
+                        descriptor_arc.clone(),
+                        cm,
+                    );
+                    jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+                    // `jit_cache` write-lock dropped here at end of scope.
+                };
+                // Record JFR compilation event — flight_recorder lock taken
+                // *after* the JIT cache write has been released.
                 {
                     let now_ns = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -2081,7 +2092,7 @@ pub fn execute(
                         now_ns, 0, // start_time, duration (not tracked)
                     );
                 }
-                jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+                cached_result
             });
 
             if let Some(compiled) = compiled {
@@ -2484,6 +2495,102 @@ pub fn pop_and_recycle_frame_with_reason(
 }
 
 // ---------------------------------------------------------------------------
+// OSR back-edge orchestration helper
+// ---------------------------------------------------------------------------
+
+/// Outcome of a back-edge OSR attempt. Returned by [`try_osr_with_backoff`]
+/// so callers can dispatch cleanly between the three possible outcomes
+/// (return-from-execute_frame, continue-the-dispatch-loop, fall-through-to-
+/// safepoint).
+///
+/// Round-7 HIGH #1: the surrounding OSR-rejection orchestration used to be
+/// duplicated 14 times at each back-edge site (goto/if_icmp{eq,ne,lt,le,gt,
+/// ge}/if{eq,ne,lt,le,gt,ge}/super-instruction iload-iload-if_icmplt). All
+/// 14 callsites shared the identical sequence:
+///
+///   1. `should_try_osr(entry_pc, OSR_THRESHOLD)` — backoff schedule check.
+///   2. `try_osr(...)` — JIT compile + entry trampoline.
+///   3. On `Some(value)`: pop child frame if any, push return value, then
+///      either `continue` the dispatch loop (nested call) or `return Ok(v)`
+///      (root-frame return).
+///   4. On `None`: `record_osr_rejection(entry_pc)` to schedule the next
+///      retry exponentially further out.
+///
+/// This helper folds 1–4 into a single call so each callsite shrinks to
+/// the dispatch-match on `OsrBackoffOutcome` plus the natural
+/// `safepoint_check`/`continue` tail.
+pub(crate) enum OsrBackoffOutcome {
+    /// OSR didn't fire (either backoff not yet, or `try_osr` rejected and
+    /// the rejection has been recorded). Caller falls through to its
+    /// post-back-edge work (typically `safepoint_check` then `continue`).
+    Skip,
+    /// OSR completed and we're back at the root frame of this
+    /// `execute_frame` invocation — bubble the return value up to the
+    /// outer caller via `return Ok(value)`.
+    ReturnOuter(Option<Value>),
+    /// OSR completed an inner (stackless) call frame; the helper has
+    /// already popped the recycled frame and pushed the return value
+    /// onto the now-current frame's stack. Caller should `continue` the
+    /// dispatch loop so it picks up at the parent's next instruction.
+    /// The new current frame index is communicated back via the
+    /// `frame_idx` out-parameter (which the helper mutates).
+    ContinueDispatch,
+}
+
+/// Run the standard back-edge OSR orchestration: backoff check → try_osr →
+/// rejection bookkeeping. See [`OsrBackoffOutcome`] for the meaning of
+/// each return variant.
+///
+/// **Borrow contract:** callers MUST drop any outstanding `&mut Frame`
+/// borrow before calling this — the helper re-borrows `thread.frames`
+/// internally (both for the should-try check and for the rejection
+/// record). The standard sequence at each callsite is:
+///
+/// ```ignore
+/// frame.backward_count += 1;
+/// let entry_pc = frame.pc;
+/// let _ = frame; // drop &mut borrow
+/// match try_osr_with_backoff(shared, thread, &mut frame_idx,
+///                             initial_frame_idx, entry_pc) {
+///     OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+///     OsrBackoffOutcome::ContinueDispatch => continue,
+///     OsrBackoffOutcome::Skip => {}
+/// }
+/// safepoint_check(shared, thread);
+/// ```
+#[inline]
+pub(crate) fn try_osr_with_backoff(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: &mut usize,
+    initial_frame_idx: usize,
+    entry_pc: usize,
+) -> OsrBackoffOutcome {
+    if !thread.frames[*frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
+        return OsrBackoffOutcome::Skip;
+    }
+    let osr_class_id = thread.frames[*frame_idx].class_id;
+    match try_osr(shared, thread, *frame_idx, osr_class_id, entry_pc) {
+        Some(osr_val) => {
+            if *frame_idx > initial_frame_idx {
+                pop_and_recycle_frame(shared, thread);
+                *frame_idx -= 1;
+                if let Some(value) = osr_val {
+                    thread.frames[*frame_idx].stack.push_unchecked(value);
+                }
+                OsrBackoffOutcome::ContinueDispatch
+            } else {
+                OsrBackoffOutcome::ReturnOuter(osr_val)
+            }
+        }
+        None => {
+            thread.frames[*frame_idx].record_osr_rejection(entry_pc);
+            OsrBackoffOutcome::Skip
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main execution loop
 // ---------------------------------------------------------------------------
 
@@ -2715,22 +2822,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     if offset < 0 {
                                         if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc + 2); }
                                         frame.backward_count += 1;
-                                       
+
                                         let entry_pc = frame.pc;
                                         let _ = frame;
-                                        if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
-                                            let osr_class_id = thread.frames[frame_idx].class_id;
-                                            if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
-                                                if frame_idx > initial_frame_idx {
-                                                    pop_and_recycle_frame(shared, thread);
-                                                    frame_idx -= 1;
-                                                    if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
-                                                    continue;
-                                                }
-                                                return Ok(osr_val);
-                                            } else {
-                                                thread.frames[frame_idx].record_osr_rejection(entry_pc);
-                                            }
+                                        match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                            OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                            OsrBackoffOutcome::ContinueDispatch => continue,
+                                            OsrBackoffOutcome::Skip => {}
                                         }
                                         safepoint_check(shared, thread);
                                     }
@@ -3046,28 +3144,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
                         // Backward branch — increment OSR counter
                         frame.backward_count += 1;
-                       
+
                         let entry_pc = frame.pc;
                         let _ = frame; // drop borrow before try_osr
-                        if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
-                            // Try OSR: compile and enter JIT at loop header
-                            let osr_class_id = thread.frames[frame_idx].class_id;
-                            if let Some(osr_val) =
-                                try_osr(shared, thread, frame_idx, osr_class_id, entry_pc)
-                            {
-                                // OSR completed the method — handle return
-                                if frame_idx > initial_frame_idx {
-                                    pop_and_recycle_frame(shared, thread);
-                                    frame_idx -= 1;
-                                    if let Some(value) = osr_val {
-                                        thread.frames[frame_idx].stack.push_unchecked(value);
-                                    }
-                                    continue;
-                                }
-                                return Ok(osr_val);
-                            } else {
-                                thread.frames[frame_idx].record_osr_rejection(entry_pc);
-                            }
+                        match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                            OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                            OsrBackoffOutcome::ContinueDispatch => continue,
+                            OsrBackoffOutcome::Skip => {}
                         }
                         safepoint_check(shared, thread);
                     }
@@ -3085,22 +3168,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if offset < 0 {
                             if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
                             frame.backward_count += 1;
-                           
+
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
-                                let osr_class_id = thread.frames[frame_idx].class_id;
-                                if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
-                                    if frame_idx > initial_frame_idx {
-                                        pop_and_recycle_frame(shared, thread);
-                                        frame_idx -= 1;
-                                        if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
-                                        continue;
-                                    }
-                                    return Ok(osr_val);
-                                } else {
-                                    thread.frames[frame_idx].record_osr_rejection(entry_pc);
-                                }
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
                         }
@@ -3121,22 +3195,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if offset < 0 {
                             if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
                             frame.backward_count += 1;
-                           
+
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) {
-                                let osr_class_id = thread.frames[frame_idx].class_id;
-                                if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
-                                    if frame_idx > initial_frame_idx {
-                                        pop_and_recycle_frame(shared, thread);
-                                        frame_idx -= 1;
-                                        if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); }
-                                        continue;
-                                    }
-                                    return Ok(osr_val);
-                                } else {
-                                    thread.frames[frame_idx].record_osr_rejection(entry_pc);
-                                }
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
                         }
@@ -3154,7 +3219,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3169,7 +3245,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3184,7 +3271,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3199,7 +3297,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3297,7 +3406,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3311,7 +3431,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3325,7 +3456,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3339,7 +3481,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3353,7 +3506,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3367,7 +3531,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); } frame.backward_count += 1; let entry_pc = frame.pc; let _ = frame; if thread.frames[frame_idx].should_try_osr(entry_pc, OSR_THRESHOLD) { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } else { thread.frames[frame_idx].record_osr_rejection(entry_pc); } } safepoint_check(shared, thread); }
+                        if offset < 0 {
+                            if pgo_enabled { let (cid, mn, md) = method_key_parts(frame); shared.profile_store.record_backedge_borrowed(cid, mn, md, saved_pc); }
+                            frame.backward_count += 1;
+                            let entry_pc = frame.pc;
+                            let _ = frame;
+                            match try_osr_with_backoff(shared, thread, &mut frame_idx, initial_frame_idx, entry_pc) {
+                                OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
+                                OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::Skip => {}
+                            }
+                            safepoint_check(shared, thread);
+                        }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -4972,14 +5147,16 @@ fn route_jit_exception_through_method(
     // (execute_invokestatic_cached / execute_invokevirtual_cached) popped
     // them before calling execute_jit_call — so nothing to undo here.
 
-    // Build args vector sized to the method's locals. The JIT already
-    // consumed the arguments, so we have no live values to pass. Use
-    // `Uninitialized` — these locals are unreachable once PC jumps to the
-    // catch block (Java verifier guarantees catch-block locals are
-    // re-initialized before use).
-    let args: Vec<Value> = (0..cached.num_params as usize)
-        .map(|_| Value::Uninitialized)
-        .collect();
+    // Pass an empty args slice — these locals are unreachable once PC jumps
+    // to the catch block (Java verifier guarantees catch-block locals are
+    // re-initialized before use). `Frame::new_pooled` already fills `locals`
+    // with `CompactValue::uninitialized()` slots; the historical
+    // `Vec<Value::Uninitialized>` of length `num_params` was a per-throw
+    // heap allocation that got immediately re-set by `init_locals_pooled`'s
+    // `resize(n, uninitialized())`. The `cached.max_locals` parameter still
+    // sizes the local slot vec correctly via `effective_max_locals`.
+    // (round-7 vm #6 perf fix.)
+    const NO_ARGS: &[Value] = &[];
 
     // T10.7 — if the per-thread pool has run dry, replenish it from the
     // shared VM-wide VecPool before building the frame.
@@ -5000,7 +5177,7 @@ fn route_jit_exception_through_method(
         cached.exception_table.clone(),
         cached.max_stack,
         cached.max_locals,
-        &args,
+        NO_ARGS,
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
@@ -6786,6 +6963,10 @@ fn execute_instruction(
                     format!("monitorenter in {cls}.{mth} pc={pc_snap}")
                 })?
             };
+            // Snapshot the JFR-enabled flag *before* the acquire so the
+            // matching exit can decide whether to emit a paired event
+            // without re-reading the global flag (which may have flipped
+            // mid-critical-section — round-7 vm #5).
             let jfr_on = rustjvm_jfr::is_enabled();
             let mon_start = if jfr_on {
                 Some(std::time::Instant::now())
@@ -6810,6 +6991,16 @@ fn execute_instruction(
                         now_ns.saturating_sub(mon_dur.as_nanos() as u64), // Cast: duration to u64 nanoseconds
                         mon_dur.as_nanos() as u64, // Cast: duration to u64 nanoseconds
                     );
+                    // Drop the recorder lock before reaching into MonitorTable
+                    // to avoid a lock-acquisition-order inversion with the
+                    // monitor's own state mutex.
+                    drop(jfr);
+                    // Stash the per-monitor flag so a future paired exit-side
+                    // emission knows the enter event was recorded. Today no
+                    // exit event is emitted, but the gate is in place so the
+                    // exit handler below can safely consult it without
+                    // re-checking the (potentially flipped) global flag.
+                    shared.monitors.set_jfr_enter_recorded(obj_ref, thread.thread_id);
                 }
             }
         }
@@ -6828,6 +7019,19 @@ fn execute_instruction(
                     format!("monitorexit in {cls}.{mth} pc={pc_snap}")
                 })?
             };
+            // Round-7 HIGH (vm #5): when JFR is currently enabled, consult
+            // the per-monitor JFR-enter-recorded flag *before* releasing
+            // the monitor — the release zeroes the flag atomically with the
+            // entry_count → 0 transition. The result is intentionally
+            // ignored today (no paired exit event is emitted yet), but the
+            // gate forces any future `emit_monitor_exit_event` to consult
+            // the enter-time snapshot rather than re-reading the global JFR
+            // flag, which may have flipped on mid-critical-section and
+            // would otherwise produce an orphan exit event without a
+            // matching enter event in the flight recorder.
+            if rustjvm_jfr::is_enabled() {
+                let _ = shared.monitors.jfr_enter_recorded(obj_ref);
+            }
             shared.monitors.exit(obj_ref, thread.thread_id)?;
         }
 

@@ -200,10 +200,114 @@ impl Tlab {
     /// Retire this TLAB (mark it as exhausted).
     /// The unused tail space is wasted but will be reclaimed at GC time
     /// when the arena is reset.
+    ///
+    /// Round-5 #9 / round-7 #9: callers that retire a live TLAB during a
+    /// GC cycle (i.e. the backing arena will be heap-walked before reset)
+    /// should call [`Self::install_tail_filler`] **before** retiring so the
+    /// heap iterator can skip the unused tail as a single synthetic
+    /// `int[]` filler object instead of stopping at the first byte of
+    /// garbage. The plain `retire` path here remains the right choice
+    /// when the arena is immediately reset (no walk needed).
     pub fn retire(&mut self) {
         self.start = std::ptr::null_mut();
         self.cursor = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
+    }
+
+    /// Round-5 #9 / round-7 #9 — Install a synthetic `int[]` filler object
+    /// at the TLAB cursor before retiring, so a subsequent heap iterator
+    /// can skip the entire unused tail in O(1).
+    ///
+    /// Before this fix, when a thread reached a safepoint with a partially
+    /// used TLAB and the GC walked the backing arena, the iterator stopped
+    /// at the first byte past `cursor` (where bytes are zero / garbage),
+    /// losing up to `MAX_TLAB_SIZE` (1 MiB) bytes per thread per cycle to
+    /// invisible tail waste.
+    ///
+    /// # How the filler is laid out
+    ///
+    /// The filler is an `Array<i32>` header whose `array_length` is chosen
+    /// so that `HEADER_SIZE + array_data_size(len, Int) == tail_bytes`.
+    /// Element size is 4 bytes; the data area is rounded up to 8-byte
+    /// alignment by `array_data_size`, which matches the TLAB's natural
+    /// 8-byte alignment for cursor/end.
+    ///
+    /// If the cursor is not 8-aligned (rare — most allocations use 8-byte
+    /// align), it is bumped up to the next 8-byte boundary; the skipped
+    /// padding bytes are zeroed.
+    ///
+    /// If fewer than `HEADER_SIZE` bytes remain after alignment, the tail
+    /// is simply zeroed — there is no room for a header. A zero header
+    /// terminates the heap iterator naturally (class_id = 0 / num_slots = 0
+    /// → size = HEADER_SIZE; iterator either stops or skips a tiny
+    /// well-formed empty record).
+    ///
+    /// # Safety
+    /// The caller must guarantee that the TLAB backing memory is still
+    /// valid (the arena has not been reset yet) and that no other thread
+    /// will read or write the tail concurrently — both conditions hold at
+    /// a safepoint when the owning thread is parked.
+    ///
+    /// `class_id` must be a class id that the heap walker will treat as a
+    /// well-formed `int[]`. Use [`tlab_filler_class_id`] to pick one.
+    pub unsafe fn install_tail_filler(&mut self, class_id: rustjvm_types::ClassId) {
+        if self.cursor.is_null() || self.end.is_null() {
+            return;
+        }
+
+        // Align cursor up to 8 so the synthetic header lives at an
+        // 8-byte-aligned address (ObjectHeader requires it).
+        let cursor_addr = self.cursor as usize;
+        let aligned = (cursor_addr + 7) & !7;
+        let end_addr = self.end as usize;
+        if aligned >= end_addr {
+            return;
+        }
+
+        // Zero any pre-alignment padding so the iterator sees clean bytes
+        // up to the synthetic header.
+        if aligned > cursor_addr {
+            let pad = aligned - cursor_addr;
+            // SAFETY: cursor..aligned lies within [cursor, end), still owned by this TLAB.
+            unsafe { std::ptr::write_bytes(self.cursor, 0, pad); }
+        }
+
+        let tail = end_addr - aligned;
+        use crate::heap::{HEADER_SIZE, ArrayElementType, ObjectKind, ObjectHeader};
+        if tail < HEADER_SIZE {
+            // Not enough room for a synthetic header; zero the residual.
+            // SAFETY: aligned..end is within the TLAB.
+            unsafe { std::ptr::write_bytes(aligned as *mut u8, 0, tail); }
+            self.cursor = self.end;
+            return;
+        }
+
+        // tail >= HEADER_SIZE; compute array length so the filler exactly
+        // consumes `tail` bytes. (tail - HEADER_SIZE) is a multiple of 8
+        // because both `aligned` and `end_addr` are 8-aligned.
+        let data_bytes = tail - HEADER_SIZE;
+        // data_bytes is a multiple of 8; (n*4 + 7) & !7 == n*4 iff n is even.
+        // data_bytes/4 is even because data_bytes is a multiple of 8 → length fits exactly.
+        let length = (data_bytes / 4) as u32;
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Array,
+            ArrayElementType::Int,
+            0,
+            length,
+            0,
+        );
+        // SAFETY: aligned..aligned+HEADER_SIZE lies within [cursor, end)
+        // and is properly aligned for ObjectHeader.
+        unsafe {
+            std::ptr::write(aligned as *mut ObjectHeader, header);
+            // Zero the data area so any stale bytes don't trip header
+            // sanity checks on the next walk.
+            std::ptr::write_bytes((aligned + HEADER_SIZE) as *mut u8, 0, data_bytes);
+        }
+        // Bump cursor past the filler so subsequent `remaining()` calls
+        // report zero. The TLAB is now fully consumed (by the filler).
+        self.cursor = self.end;
     }
 
     /// T5.5.1 — Recommended byte size for the next refill. Delegates to
@@ -259,6 +363,25 @@ pub fn min_tlab_size() -> usize {
 /// T19.3.G1 — cap on TLAB refill sizes (bytes).
 pub fn max_tlab_size() -> usize {
     MAX_TLAB_SIZE
+}
+
+/// Round-5 #9 / round-7 #9 — synthetic class id used for `int[]` TLAB
+/// fillers installed at TLAB retire time. Picked from the high-bit
+/// "synthetic VM" class-id range (matches the convention used by
+/// `AUTOBOX_CLASS_ID` = 0xAB00_0000) so it cannot collide with a
+/// classloader-issued id.
+pub const TLAB_FILLER_CLASS_ID: rustjvm_types::ClassId =
+    rustjvm_types::ClassId::new(0xF111_E700);
+
+/// Round-5 #9 / round-7 #9 — class id every TLAB tail filler should use.
+///
+/// Heap walkers that see an array with this class id can treat the bytes
+/// as dead-on-arrival filler, but the layout is a perfectly valid
+/// `int[]` so even walkers that do not recognise the sentinel will skip
+/// past it correctly using the normal array-size formula.
+#[inline]
+pub fn tlab_filler_class_id() -> rustjvm_types::ClassId {
+    TLAB_FILLER_CLASS_ID
 }
 
 // ---------------------------------------------------------------------------
@@ -718,6 +841,70 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let next = t.next_refill_size();
         assert_eq!(next, MIN_TLAB_SIZE);
+    }
+
+    // ---------------------------------------------------------------
+    // Round-5 #9 / round-7 #9 — TLAB tail-filler tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn tlab_filler_consumes_remaining_tail() {
+        use crate::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        // Use a buffer well above HEADER_SIZE so the filler has room.
+        let mut buf = vec![0u8; 4096];
+        // Align buffer pointer up to 8.
+        let raw = buf.as_mut_ptr();
+        let aligned = ((raw as usize + 7) & !7) as *mut u8;
+        let usable = 4096 - (aligned as usize - raw as usize);
+        let usable = usable & !7;
+        let mut tlab = unsafe { Tlab::new(aligned, usable) };
+        // Use part of the TLAB so a meaningful tail remains.
+        let _ = tlab.alloc(64, 8).unwrap();
+        let tail_before = tlab.remaining();
+        assert!(tail_before > HEADER_SIZE);
+
+        let cursor_before = tlab.cursor;
+        unsafe {
+            tlab.install_tail_filler(TLAB_FILLER_CLASS_ID);
+        }
+        // After install, cursor is at end (TLAB consumed).
+        assert_eq!(tlab.remaining(), 0);
+
+        // The synthetic header at the old cursor describes an int[] that
+        // covers the remaining tail exactly.
+        let hdr = unsafe { &*(cursor_before as *const ObjectHeader) };
+        assert_eq!(hdr.kind, ObjectKind::Array);
+        assert_eq!(hdr.element_type, ArrayElementType::Int);
+        assert_eq!(hdr.class_id, TLAB_FILLER_CLASS_ID);
+        let total = HEADER_SIZE + (hdr.array_length as usize) * 4;
+        // total should equal tail_before (no padding waste because both ends 8-aligned).
+        assert_eq!(total, tail_before);
+    }
+
+    #[test]
+    fn tlab_filler_handles_tiny_tail() {
+        // Fewer than HEADER_SIZE bytes left → filler routine zeroes the
+        // tail and bumps the cursor without writing a header.
+        let mut buf = vec![0u8; 64];
+        let raw = buf.as_mut_ptr();
+        let aligned = ((raw as usize + 7) & !7) as *mut u8;
+        let usable = 64 - (aligned as usize - raw as usize);
+        let usable = usable & !7;
+        let mut tlab = unsafe { Tlab::new(aligned, usable) };
+        // Allocate enough that less than HEADER_SIZE remains.
+        let alloc_size = usable.saturating_sub(8);
+        let _ = tlab.alloc(alloc_size, 8).unwrap();
+        assert!(tlab.remaining() < crate::heap::HEADER_SIZE);
+        unsafe { tlab.install_tail_filler(TLAB_FILLER_CLASS_ID); }
+        assert_eq!(tlab.remaining(), 0);
+    }
+
+    #[test]
+    fn tlab_filler_noop_on_empty_tlab() {
+        let mut tlab = Tlab::empty();
+        // Must not panic on null cursor/end.
+        unsafe { tlab.install_tail_filler(TLAB_FILLER_CLASS_ID); }
+        assert!(tlab.is_empty());
     }
 
     #[test]

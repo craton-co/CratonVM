@@ -435,9 +435,34 @@ fn native_jarfile_entries(
             Some(s) => s,
             None => return Ok(Some(Value::Object(None))),
         };
-        let mut v = Vec::with_capacity(state.archive.len());
-        for i in 0..state.archive.len() {
-            if let Ok(f) = state.archive.by_index(i) {
+        // Perf fix (audit MED, round-5/7 carryover): the old code called
+        // `by_index(i)` for every entry. `by_index` does **two** expensive
+        // things per entry: (1) `find_content` seeks to the local file
+        // header and parses it, and (2) it builds a `make_reader` chain
+        // (Inflate / Bzip / …) just so we can call `name()`/`size()` —
+        // which both live in the central-directory record and never need
+        // any of that machinery.
+        //
+        // Optimisation strategy:
+        //   * Names come from `file_names()` — a pure central-directory
+        //     walk, zero I/O, zero allocation beyond the returned `&str`s.
+        //   * For size/csize/crc/method we still need a per-entry handle
+        //     because the `zip` crate doesn't expose the central-directory
+        //     `ZipFileData` publicly. We use `by_index_raw` instead of
+        //     `by_index`, which skips the decompressor chain (saves the
+        //     Inflate state setup — material for jars with many entries).
+        //     `find_content`'s local-header seek is still paid on the
+        //     first call, but `data_start` is memoised in a `OnceCell`,
+        //     so any subsequent `by_index_raw`/`by_index` for the same
+        //     entry is a single seek + take.
+        //
+        // Future work: if the `zip` crate exposes central-directory
+        // accessors (`size_for_index`, `crc_for_index`, etc.), drop the
+        // `by_index_raw` call entirely.
+        let n = state.archive.len();
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Ok(f) = state.archive.by_index_raw(i) {
                 let method: i64 = match f.compression() {
                     zip::CompressionMethod::Stored => 0,
                     _ => 8,

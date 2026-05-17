@@ -64,6 +64,23 @@ pub struct LaunchConfig {
 impl LaunchConfig {
     /// One-dimensional launch sized to cover `n` elements with the
     /// default block size of 256 threads.
+    ///
+    /// TODO(round-8, PERF): the 256-thread block size is a portable
+    /// "good enough" pick — it divides cleanly into the warp size
+    /// (32) on every CUDA arch and fits in shared-memory budgets up
+    /// to Hopper. But it leaves occupancy on the table for kernels
+    /// that are bound by register pressure or shared-memory use.
+    /// The proper autotune path is:
+    ///   let mut block: i32 = 0;
+    ///   let mut min_grid: i32 = 0;
+    ///   // cuOccupancyMaxPotentialBlockSize(
+    ///   //   &mut min_grid, &mut block, kernel_fn, /*smem*/ 0,
+    ///   //   /*max_block*/ 0)
+    ///   let block = if block > 0 { block as u32 } else { 256 };
+    /// cudarc exposes this as `CudaFunction::occupancy_max_potential_block_size`
+    /// in 0.13+; the elementwise helper would need the resolved kernel
+    /// handle as input. Falling back to 256 on any query failure keeps
+    /// behaviour deterministic.
     pub fn elementwise(n: u32) -> Self {
         let block = 256u32;
         let grid = n.div_ceil(block).max(1);

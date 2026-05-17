@@ -482,8 +482,19 @@ impl Heap {
 
     /// Get the value of a volatile field at the given index.
     ///
-    /// Uses `SeqCst` memory fences to ensure cross-thread visibility.
+    /// JLS §17.7 requires volatile long/double (and any volatile-declared
+    /// field) reads to be atomic. The on-heap `Value` slot is 16 bytes,
+    /// wider than any stable Rust atomic on x86-64, so SeqCst fences alone
+    /// give the JMM ordering edge but not 16-byte slot atomicity — a
+    /// concurrent writer mid-store would expose a torn (tag, payload)
+    /// pair to this read.
+    ///
+    /// We acquire the per-slot stripe lock from
+    /// [`crate::collector::volatile_stripe_lock`] so paired
+    /// `set_field_volatile` writers serialize against this read; the
+    /// 16-byte `Value` therefore appears either fully old or fully new.
     pub fn get_field_volatile(&self, obj_ref: ObjectRef, index: usize) -> Value {
+        let _guard = crate::collector::volatile_stripe_lock(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let val = self.get_field(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -492,8 +503,12 @@ impl Heap {
 
     /// Set the value of a volatile field at the given index.
     ///
-    /// Uses `SeqCst` memory fences to ensure cross-thread visibility.
+    /// Acquires the per-slot stripe lock so concurrent volatile readers
+    /// observe a fully-old or fully-new 16-byte `Value`. SeqCst fences
+    /// provide the JMM happens-before edge. See [`Self::get_field_volatile`]
+    /// for the full rationale.
     pub fn set_field_volatile(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        let _guard = crate::collector::volatile_stripe_lock(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         self.set_field(obj_ref, index, value);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);

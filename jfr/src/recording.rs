@@ -335,13 +335,22 @@ impl FlightRecorder {
             std::io::Error::new(std::io::ErrorKind::NotFound, "recording not found"),
         ))?;
 
-        let events = rec.repository_mut().events();
-        let start_time = events.iter().map(|e| e.start_time).min().unwrap_or(0);
-        let end_time = events.iter().map(|e| e.end_time).max().unwrap_or(0);
+        // Round-5: collapse three linear passes (min start_time, max end_time,
+        // and the `make_contiguous` slice materialization that the old
+        // `repository_mut().events()` call performed) into one fold over the
+        // iterator. The downstream dumper consumes events via
+        // `EventRepository::iter`, so a contiguous slice is not required.
+        let (start_time, end_time) = rec.repository().iter().fold(
+            (u64::MAX, 0u64),
+            |(min_s, max_e), e| (min_s.min(e.start_time), max_e.max(e.end_time)),
+        );
+        let start_time = if start_time == u64::MAX { 0 } else { start_time };
         let duration = end_time.saturating_sub(start_time);
 
         // `extra_events = Vec::new()` — the recording's repository already
         // contains every event it should see. See Bug 1 fix in dump.rs.
+        // `durable: true` — user-initiated dumps fsync the file before
+        // rename for crash durability. Periodic snapshot paths pass `false`.
         dump::dump_to_file(
             path,
             rec.repository(),
@@ -349,6 +358,7 @@ impl FlightRecorder {
             start_time,
             duration,
             Vec::new(),
+            true,
         )
     }
 }

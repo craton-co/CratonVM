@@ -140,6 +140,89 @@ fn tcp_remove(id: i32) {
 }
 
 // ---------------------------------------------------------------------------
+// Connect pool (round-7 HIGH-5)
+// ---------------------------------------------------------------------------
+//
+// `socket_channel::connect` previously fell through to `std::thread::spawn`
+// for the async-connect path, paying one OS-thread creation per call. A
+// microservice with bursty connect traffic (~1k connects/s) saw the
+// per-op overhead dominate. We now route async-connect jobs to a small
+// fixed-size pool whose worker count is `min(available_parallelism, 32)`.
+// Excess jobs queue in the mpsc channel.
+//
+// The pool is lazy-initialised on first use via `OnceLock`, so VMs that
+// never exercise non-blocking connect never pay the pool's startup cost.
+
+struct ConnectJob {
+    id: i32,
+    target: String,
+}
+
+const CONNECT_POOL_MAX_WORKERS: usize = 32;
+
+fn connect_pool_sender() -> &'static std::sync::mpsc::Sender<ConnectJob> {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<ConnectJob>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        // Bounded by available parallelism but capped — for connect-
+        // storms a moderate worker count is enough; extra threads just
+        // add scheduler pressure.
+        let workers = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(CONNECT_POOL_MAX_WORKERS)
+            .max(2);
+        let (tx, rx) = std::sync::mpsc::channel::<ConnectJob>();
+        // Multi-consumer over a std mpsc receiver requires a shared
+        // Mutex; jobs are small and rare relative to socket IO, so a
+        // parking_lot Mutex on the receiver is fine.
+        let rx = std::sync::Arc::new(parking_lot::Mutex::new(rx));
+        for w in 0..workers {
+            let rx = std::sync::Arc::clone(&rx);
+            let _ = std::thread::Builder::new()
+                .name(format!("rustjvm-connect-pool-{w}"))
+                .spawn(move || connect_pool_worker(rx));
+        }
+        tx
+    })
+}
+
+fn connect_pool_worker(
+    rx: std::sync::Arc<parking_lot::Mutex<std::sync::mpsc::Receiver<ConnectJob>>>,
+) {
+    loop {
+        let job = {
+            // Hold the receiver lock only across `recv()` — when a job
+            // arrives we drop the lock immediately so a sibling worker
+            // can pick up the next one in parallel with our connect.
+            let guard = rx.lock();
+            match guard.recv() {
+                Ok(j) => j,
+                Err(_) => return, // channel closed → process shutdown
+            }
+        };
+        // Brief 5-second timeout so a stuck DNS lookup doesn't pin a worker.
+        let res = match job.target.parse::<SocketAddr>() {
+            Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_secs(5)),
+            Err(_) => TcpStream::connect(&job.target),
+        };
+        let map = tcp_registry().read();
+        if let Some(TcpHandle::Connecting(prog)) = map.get(&job.id) {
+            *prog.result.lock() = Some(res);
+            prog.done
+                .store(true, std::sync::atomic::Ordering::Release);
+            ipc_dbg(format!("connect worker completed id={}", job.id));
+        }
+    }
+}
+
+fn connect_pool_submit(job: ConnectJob) {
+    let id = job.id;
+    if let Err(e) = connect_pool_sender().send(job) {
+        ipc_dbg(format!("connect pool send failed id={id}: {e}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -644,7 +727,11 @@ fn sc_connect_inner(
         return Ok(true);
     }
 
-    // Fallback: spawn a worker thread that performs the connect.
+    // Round-7 HIGH-5 fix: fallback uses a small fixed-size connect
+    // pool instead of `std::thread::spawn` per call.  A microservice
+    // connect-storm previously paid one OS-thread creation per pending
+    // connect; the pool caps that at `CONNECT_POOL_WORKERS` workers
+    // total.  Excess jobs queue in the channel.
     let progress = ConnectInProgress {
         result: parking_lot::Mutex::new(None),
         done: std::sync::atomic::AtomicBool::new(false),
@@ -652,23 +739,7 @@ fn sc_connect_inner(
     let id = tcp_register(TcpHandle::Connecting(progress));
     tcp_blocking_state().write().insert(id, false);
 
-    let target_clone = target.clone();
-    let id_clone = id;
-    std::thread::spawn(move || {
-        // Brief 5-second timeout so a stuck DNS lookup doesn't pin a worker.
-        let res = match target_clone.parse::<SocketAddr>() {
-            Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_secs(5)),
-            Err(_) => TcpStream::connect(&target_clone),
-        };
-        // Mark done.
-        let map = tcp_registry().read();
-        if let Some(TcpHandle::Connecting(prog)) = map.get(&id_clone) {
-            *prog.result.lock() = Some(res);
-            prog.done
-                .store(true, std::sync::atomic::Ordering::Release);
-            ipc_dbg(format!("connect worker completed id={id_clone}"));
-        }
-    });
+    connect_pool_submit(ConnectJob { id, target: target.clone() });
 
     if ctx.object_num_fields(this) >= N_FIELDS {
         ctx.set_field(this, F_REG_ID, Value::Int(id));

@@ -19,6 +19,14 @@ tracing.workspace = true
 parking_lot = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rustc-hash = "1.1"
+# Round 7 audit fix (MED #12): memory-mapped JAR / .class file reads.
+# Replaces 8 `fs::read` slurp sites in class_path.rs. On Spring-Boot
+# fat-JARs (~80 MB) this avoids a per-load full-into-memory copy that
+# sits in heap-allocated RSS, in favour of a page-cache-backed mmap
+# the kernel can drop under pressure. The `zip` crate accepts `&[u8]`
+# directly, so the mmap deref is a drop-in replacement everywhere the
+# bytes feed straight into `ZipArchive::new(Cursor::new(bytes))`.
+memmap2 = "0.9"
 
 [lints]
 workspace = true

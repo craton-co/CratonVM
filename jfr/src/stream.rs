@@ -765,7 +765,7 @@ mod tests {
         let dir = std::env::temp_dir().join("jfr_stream_openrepo");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("stream_roundtrip.jfr");
-        dump_to_file(&path, &repo, &reg, 1_000, 2_000, Vec::new()).unwrap();
+        dump_to_file(&path, &repo, &reg, 1_000, 2_000, Vec::new(), false).unwrap();
 
         let (disk_repo, mut stream) = EventStream::open_repository(&path, &reg).unwrap();
         assert_eq!(disk_repo.len(), 2);
@@ -839,7 +839,7 @@ mod tests {
         let dir = std::env::temp_dir().join("jfr_stream_unknown");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("unknown.jfr");
-        dump_to_file(&path, &repo, &writer_reg, 0, 0, Vec::new()).unwrap();
+        dump_to_file(&path, &repo, &writer_reg, 0, 0, Vec::new(), false).unwrap();
 
         // Reader with a different registry can't resolve the type.
         let reader_reg = EventTypeRegistry::new();

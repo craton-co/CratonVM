@@ -2263,11 +2263,34 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> ru
 }
 
 
+// Per-OS-thread cache of boxed `Integer` instances for the JLS-mandated
+// small-value range (-128..=127). Mirrors the round-6 ThreadLocal pattern:
+// `ObjectRef` is `!Send` so we cannot share globally without locks, but
+// since GC roots are walked per-thread the cached refs stay live and
+// identity equality holds within a thread (which is all `Integer.valueOf`
+// must guarantee — see JLS 5.1.7).
+std::thread_local! {
+    static INTEGER_CACHE: std::cell::RefCell<[Option<rustjvm_types::ObjectRef>; 256]> =
+        const { std::cell::RefCell::new([None; 256]) };
+    static BOOLEAN_CACHE: std::cell::Cell<[Option<rustjvm_types::ObjectRef>; 2]> =
+        const { std::cell::Cell::new([None; 2]) };
+}
+
 pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = match args.first() {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if (-128..=127).contains(&val) {
+        let idx = (val + 128) as usize;
+        if let Some(cached) = INTEGER_CACHE.with(|c| c.borrow()[idx]) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+        let obj = alloc_wrapper(ctx, "java/lang/Integer");
+        ctx.set_field(obj, 0, Value::Int(val));
+        INTEGER_CACHE.with(|c| c.borrow_mut()[idx] = Some(obj));
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Integer");
     ctx.set_field(obj, 0, Value::Int(val));
     Ok(Some(Value::Object(Some(obj))))
@@ -2564,8 +2587,21 @@ pub(crate) fn native_boolean_value_of(ctx: &mut dyn NativeContext, args: &[Value
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // `Boolean.valueOf(z)` returns one of two cached instances (TRUE/FALSE)
+    // per JLS contract. Cache per OS thread (ObjectRef is !Send); identity
+    // equality holds for the only two values that exist.
+    let idx = if val != 0 { 1 } else { 0 };
+    let cached = BOOLEAN_CACHE.with(|c| c.get()[idx]);
+    if let Some(o) = cached {
+        return Ok(Some(Value::Object(Some(o))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Boolean");
-    ctx.set_field(obj, 0, Value::Int(val));
+    ctx.set_field(obj, 0, Value::Int(if val != 0 { 1 } else { 0 }));
+    BOOLEAN_CACHE.with(|c| {
+        let mut arr = c.get();
+        arr[idx] = Some(obj);
+        c.set(arr);
+    });
     Ok(Some(Value::Object(Some(obj))))
 }
 

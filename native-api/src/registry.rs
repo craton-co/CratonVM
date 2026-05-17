@@ -224,6 +224,15 @@ pub trait NativeContext {
     /// VM override uses `ptr::copy_nonoverlapping` against the array's raw
     /// payload, which is ~50-100x faster for multi-KB copies.
     fn write_byte_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u8]) -> bool {
+        // CRIT fix: previously the per-element fallback wrote unconditionally,
+        // so a too-large `src` would silently overflow past the array end
+        // (or panic on the underlying `set_array_element`, depending on impl)
+        // while the function reported `true` to the caller. Guard the entry
+        // with the same bounds check the VM override performs.
+        let dst_len = self.array_length(arr);
+        if dst_off.checked_add(src.len()).map_or(true, |end| end > dst_len) {
+            return false;
+        }
         for (i, b) in src.iter().enumerate() {
             self.set_array_element(arr, dst_off + i, Value::Int(*b as i8 as i32));
         }
@@ -236,13 +245,23 @@ pub trait NativeContext {
     /// The default impl loops via `get_array_element`; the VM override
     /// `memcpy`s from the array's raw payload.
     fn read_byte_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u8]) -> usize {
-        for i in 0..dst.len() {
+        // CRIT fix: clamp to the array length up front so we never call
+        // `get_array_element` out of bounds (which can panic in real
+        // contexts) and so the return value honours the documented
+        // "0 on bounds error" contract when `src_off` itself is past end.
+        let src_len = self.array_length(arr);
+        if src_off > src_len {
+            return 0;
+        }
+        let available = src_len - src_off;
+        let n = available.min(dst.len());
+        for i in 0..n {
             match self.get_array_element(arr, src_off + i) {
                 Value::Int(v) => dst[i] = v as u8,
                 _ => return i,
             }
         }
-        dst.len()
+        n
     }
 
     /// Bulk read from a Java `char[]` array into a host `u16` buffer.
@@ -252,13 +271,20 @@ pub trait NativeContext {
     /// stored as little-endian `u16` matching host order on supported
     /// targets — same convention `read_char_array_bulk` in `vm_heap`).
     fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
-        for i in 0..dst.len() {
+        // CRIT fix: same out-of-bounds guard as `read_byte_array_into`.
+        let src_len = self.array_length(arr);
+        if src_off > src_len {
+            return 0;
+        }
+        let available = src_len - src_off;
+        let n = available.min(dst.len());
+        for i in 0..n {
             match self.get_array_element(arr, src_off + i) {
                 Value::Int(v) => dst[i] = v as u16,
                 _ => return i,
             }
         }
-        dst.len()
+        n
     }
 
     /// Bulk write from a host `u16` buffer into a Java `char[]` array at
@@ -270,6 +296,12 @@ pub trait NativeContext {
     /// in one shot instead of N `set_array_element` round-trips. The
     /// VM override `memcpy`s into the compact char-array payload.
     fn write_char_array_from(&mut self, arr: ObjectRef, dst_off: usize, src: &[u16]) -> bool {
+        // CRIT fix: bounds-check the destination before any writes so we
+        // never silently overflow past the array end while reporting `true`.
+        let dst_len = self.array_length(arr);
+        if dst_off.checked_add(src.len()).map_or(true, |end| end > dst_len) {
+            return false;
+        }
         for (i, c) in src.iter().enumerate() {
             self.set_array_element(arr, dst_off + i, Value::Int(*c as i32));
         }

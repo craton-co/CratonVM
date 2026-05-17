@@ -66,6 +66,12 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
 ///
 /// If any step fails (e.g. class not found), falls back to `InternalError`
 /// to prevent infinite recursion.
+///
+/// Round-7 Fix 7: `#[cold]` — exception construction is always off the hot
+/// path; marking cold lets LLVM lay this function out away from callers
+/// (better I-cache for the success path) and tags every callsite as
+/// unlikely so branch hints point at the success arm.
+#[cold]
 pub fn create_exception_object(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -185,6 +191,10 @@ pub fn create_exception_object(
 /// Creates a real Java exception object on the heap corresponding to the
 /// `RuntimeError` variant. If creating the Java exception object fails,
 /// falls back to `MethodCallFailed::InternalError`.
+///
+/// Round-7 Fix 7: `#[cold]` — the whole throw machinery (allocation, init
+/// call, fillInStackTrace) is rare relative to non-throwing opcodes.
+#[cold]
 pub fn throw_runtime_error(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -410,6 +420,9 @@ pub fn throw_runtime_error(
 /// If constructing the Java exception itself fails (e.g. rt.jar absent), we
 /// fall back to the original internal-error form so callers still see *some*
 /// failure rather than a silent success.
+///
+/// Round-7 Fix 7: `#[cold]` — class-resolution misses are rare in steady state.
+#[cold]
 pub fn raise_no_class_def_found(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -436,6 +449,10 @@ pub fn raise_no_class_def_found(
 ///
 /// Use via `.map_err(|e| convert_class_not_found(shared, thread, &name, e))`
 /// at opcode boundaries that resolve a class from the constant pool.
+///
+/// Round-7 Fix 7: `#[cold]` — this is the error branch of opcode
+/// resolution; marking cold preserves the hot-path layout.
+#[cold]
 pub fn convert_class_not_found(
     shared: &SharedVm,
     thread: &mut JvmThread,

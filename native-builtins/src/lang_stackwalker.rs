@@ -632,6 +632,85 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // Round-7 HIGH-10 fix: StackFrame.getMethodType() previously returned
+    // null, breaking ReflectionFactory / MethodHandle.asType reflection that
+    // walks the stack and asks each frame for its method type (Spring
+    // `AnnotationUtils.getDefaultValue` and Guice both do this).
+    //
+    // Strategy: read the declaring class + method name from the populated
+    // SFI, find the first matching `declared_methods` entry, parse its JVM
+    // descriptor, and delegate to `MethodType.fromMethodDescriptorString`
+    // for the actual MethodType allocation. The JDK factory does the
+    // descriptor → (Class returnType, Class[] paramTypes) decode for us
+    // and applies caching downstream.
+    //
+    // Overload disambiguation: when multiple methods share a name, we pick
+    // the first declared overload. The stack-trace entry does not carry the
+    // descriptor, and computing the exact one would require pairing with the
+    // call site's `invoke*` instruction, which is more than the JDK contract
+    // requires for `StackFrame.getMethodType()` (the javadoc allows returning
+    // any valid MethodType for the method).
+    registry.register(
+        sfi,
+        "getMethodType",
+        "()Ljava/lang/invoke/MethodType;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Prefer the internal-name slot we populate at SFI-construct
+            // time so we avoid the dotted-class-name round-trip through
+            // class_id_by_name (which would NPE on synthetic frames).
+            let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if internal.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let method_name = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => match ctx.get_field(this, SF_METHODNAME) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                },
+            };
+            if method_name.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let class_id = match ctx.class_id_by_name(&internal) {
+                Some(c) => c,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // Pick the first declared overload that matches the method name.
+            // See the comment above on overload disambiguation.
+            let descriptor = ctx
+                .declared_methods(class_id)
+                .into_iter()
+                .find(|m| m.name == method_name)
+                .map(|m| m.descriptor);
+            let Some(desc) = descriptor else {
+                return Ok(Some(Value::Object(None)));
+            };
+            // Delegate to MethodType.fromMethodDescriptorString — the JDK
+            // factory parses (paramTypes)returnType and allocates a real
+            // MethodType. We pass `null` for the ClassLoader to use the
+            // system loader (matches what the JDK's own StackFrameInfo
+            // wiring does in expandStackFrameInfo).
+            let desc_str = ctx.create_string(&desc);
+            ctx.invoke(
+                "java/lang/invoke/MethodType",
+                "fromMethodDescriptorString",
+                "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;",
+                &[
+                    Value::Object(Some(desc_str)),
+                    Value::Object(None),
+                ],
+            )
+        },
+    );
+
     // SB3 deduceMainApplicationClass path: real-JDK
     // `StackFrameBuffer.at(int)` calls the package-private virtual
     // `ClassFrameInfo.declaringClass()` (overridden by `StackFrameInfo`)

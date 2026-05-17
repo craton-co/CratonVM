@@ -32,6 +32,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# Round-7 cross-cutting Fix 2: mimalloc as the global allocator. The default
+# system allocator on Windows is HeapAlloc, which is dramatically slower than
+# mimalloc on the VM's tiny-object workload (Value, ObjectRef, frame locals,
+# Strings, parking_lot internal nodes). Opt-in via the `mimalloc` feature so
+# platforms without working mimalloc support (musl, exotic targets) can
+# fall back to the system allocator.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # GPU offload is an opt-in feature. Without `--features gpu` the
 # entire crate compiles to byte-identical output as before the GPU
@@ -42,7 +49,12 @@ path = "../cuda-bridge"
 optional = true
 
 [features]
-default = []
+default = ["mimalloc"]
+# Round-7 cross-cutting Fix 2: opt-in global allocator. Enabled by default
+# because the gains on Windows are large and there is no downside on Linux
+# or macOS, but kept as a feature so musl / exotic targets can disable it
+# with `--no-default-features`.
+mimalloc = ["dep:mimalloc"]
 # Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
 synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]
 # Expose --gpu* flags and link cuda-bridge in stub mode. Probing the

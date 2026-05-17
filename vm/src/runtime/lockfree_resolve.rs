@@ -16,7 +16,12 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+
+// Round-7 HIGH-1 fix: migrated `SharedResolutionState`'s four RwLocks
+// from `std::sync::RwLock` to `parking_lot::RwLock` to drop the
+// pthread_rwlock + poisoning overhead — every other workspace lock is
+// already `parking_lot`.
+use parking_lot::RwLock;
 
 use super::fx_collections::{fx_hashmap, FxBuildHasher, FxHashMap, FxHasher};
 use crate::classloading::resolution::CachedInvokeTarget;
@@ -141,6 +146,10 @@ impl ThreadLocalResolveCache {
     /// double-probe into a single `match self.methods.get(...)`. SipHash on
     /// a `ResolutionKey` is not free; doing it twice on every hit doubled
     /// the cost of the resolution fast path.
+    ///
+    /// Round-7 Fix 6: `#[inline]` so the resolution fast path (called on
+    /// every Invoke* opcode) inlines into the dispatch loop under LTO.
+    #[inline]
     pub fn get_method(&mut self, key: &ResolutionKey) -> Option<&ResolvedTarget> {
         match self.methods.get(key) {
             Some(t) => {
@@ -179,6 +188,9 @@ impl ThreadLocalResolveCache {
     /// Updates hit/miss counters.
     ///
     /// PERF (round-5 vm #5): single-probe lookup, see `get_method`.
+    ///
+    /// Round-7 Fix 6: `#[inline]` for the Get/Putfield/static fast path.
+    #[inline]
     pub fn get_field(&mut self, key: &ResolutionKey) -> Option<&ResolvedField> {
         match self.fields.get(key) {
             Some(t) => {
@@ -320,13 +332,13 @@ impl SharedResolutionState {
     /// Attempt to resolve a method from the shared cache.  Acquires a read
     /// lock; concurrent callers do not block each other.
     pub fn resolve_method(&self, key: &ResolutionKey) -> Option<ResolvedTarget> {
-        let guard = self.global_methods.read().unwrap();
+        let guard = self.global_methods.read();
         guard.get(key).cloned()
     }
 
     /// Store a method resolution in the shared cache.  Acquires a write lock.
     pub fn cache_method(&self, key: ResolutionKey, target: ResolvedTarget) {
-        let mut guard = self.global_methods.write().unwrap();
+        let mut guard = self.global_methods.write();
         guard.insert(key, target);
     }
 
@@ -334,13 +346,13 @@ impl SharedResolutionState {
 
     /// Attempt to resolve a field from the shared cache.  Acquires a read lock.
     pub fn resolve_field(&self, key: &ResolutionKey) -> Option<ResolvedField> {
-        let guard = self.global_fields.read().unwrap();
+        let guard = self.global_fields.read();
         guard.get(key).cloned()
     }
 
     /// Store a field resolution in the shared cache.  Acquires a write lock.
     pub fn cache_field(&self, key: ResolutionKey, field: ResolvedField) {
-        let mut guard = self.global_fields.write().unwrap();
+        let mut guard = self.global_fields.write();
         guard.insert(key, field);
     }
 
@@ -360,7 +372,7 @@ impl SharedResolutionState {
         &self,
         key: &PromotedInvokeKey,
     ) -> Option<CachedInvokeTarget> {
-        let guard = self.promoted_invokes.read().unwrap();
+        let guard = self.promoted_invokes.read();
         let hit = guard.get(key).cloned();
         drop(guard);
         match hit {
@@ -371,7 +383,7 @@ impl SharedResolutionState {
             Some(_stale) => {
                 // Evict on detection — sibling threads would otherwise keep
                 // re-promoting the same stale entry until somebody noticed.
-                let mut guard = self.promoted_invokes.write().unwrap();
+                let mut guard = self.promoted_invokes.write();
                 if let Some(existing) = guard.get(key) {
                     if existing.is_stale() {
                         guard.remove(key);
@@ -391,7 +403,7 @@ impl SharedResolutionState {
         key: PromotedInvokeKey,
         target: CachedInvokeTarget,
     ) {
-        let mut guard = self.promoted_invokes.write().unwrap();
+        let mut guard = self.promoted_invokes.write();
         guard.insert(key, target);
         self.promoted_inserts.fetch_add(1, Ordering::Relaxed);
     }
@@ -409,22 +421,22 @@ impl SharedResolutionState {
     /// Number of distinct call sites currently cached in the promoted-invoke
     /// map (tests / diagnostics).  Acquires a read-lock.
     pub fn promoted_invoke_count(&self) -> usize {
-        self.promoted_invokes.read().unwrap().len()
+        self.promoted_invokes.read().len()
     }
 
     // -- housekeeping -----------------------------------------------------
 
     /// Clear both method and field caches (e.g. after class redefinition).
     pub fn invalidate_all(&self) {
-        self.global_methods.write().unwrap().clear();
-        self.global_fields.write().unwrap().clear();
-        self.promoted_invokes.write().unwrap().clear();
+        self.global_methods.write().clear();
+        self.global_fields.write().clear();
+        self.promoted_invokes.write().clear();
     }
 
     /// Clear promoted invoke entries whose caller class or receiver class
     /// matches `class_id` — used by CHA invalidation / class redefinition.
     pub fn invalidate_promoted_for_class(&self, class_id: ClassId) {
-        let mut guard = self.promoted_invokes.write().unwrap();
+        let mut guard = self.promoted_invokes.write();
         guard.retain(|(caller, _, _, rcv), _| {
             *caller != class_id && *rcv != Some(class_id)
         });
@@ -432,12 +444,12 @@ impl SharedResolutionState {
 
     /// Number of cached method resolutions.
     pub fn method_count(&self) -> usize {
-        self.global_methods.read().unwrap().len()
+        self.global_methods.read().len()
     }
 
     /// Number of cached field resolutions.
     pub fn field_count(&self) -> usize {
-        self.global_fields.read().unwrap().len()
+        self.global_fields.read().len()
     }
 }
 

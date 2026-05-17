@@ -95,8 +95,29 @@ impl std::fmt::Debug for FrameInner {
 /// parallel `Vec<u64> + Vec<u8>` SoA pair into a single cache-line-friendly
 /// buffer: every `iload_N` / `istore_N` / `iinc` opcode now touches one
 /// allocation instead of two (HIGH-8 audit fix, 2026-05-16).
+///
+/// ## Field ordering (round-7 HIGH #4)
+///
+/// Fields are deliberately grouped by access frequency so the hot footprint
+/// fits in the first ~128 bytes (~2 cache lines on x86-64) and cold metadata
+/// trails after them. Per-opcode hot reads/writes hit `class_id`, `pc`,
+/// `last_instr_pc`, `locals`, `stack`, `code`, `max_stack`, `max_locals`,
+/// `is_jdk_class`, and `backward_count`. Cold-only state (the
+/// `FrameInner` metadata enum, the OSR backoff vector, the synchronized
+/// monitor-on-exit slot) is placed *after* the hot region so the dispatch
+/// loop's frame load doesn't drag those bytes into L1.
+///
+/// Round-6 left `backward_count` *between* `inner` (cold) and
+/// `osr_attempt_counts` (cold), which interleaved a per-back-edge mutated
+/// field with two cold-only fields and forced a second cache line to be
+/// touched on every backward branch. This struct layout is intentionally
+/// non-`#[repr(C)]` — Rust may reorder for natural alignment, but the
+/// declaration order already provides a hot-then-cold partition that the
+/// compiler's auto-layout preserves.
 #[derive(Debug)]
 pub struct Frame {
+    // ── Hot fields (touched on every opcode) ────────────────────────────
+
     /// The class that declares this method.
     pub class_id: ClassId,
 
@@ -125,12 +146,21 @@ pub struct Frame {
     /// invocation arguments (defensive clamp; see `effective_max_locals`).
     pub max_locals: u16,
 
-    /// Cold-path metadata (method name, descriptor, exception table, etc.).
-    inner: FrameInner,
-
     /// Backward branch counter for OSR (On-Stack Replacement).
     /// Incremented on each backward branch; triggers JIT when exceeding threshold.
+    /// Hot — bumped on every back-edge of every loop in the interpreter.
     pub backward_count: u32,
+
+    /// T14: Set to true for methods from real JDK classes (java/*, jdk/*, sun/*).
+    /// Used to skip the fast-path interpreter which uses pop_unchecked and may
+    /// panic on bytecode patterns not handled by the fast path.
+    /// Hot — checked once per `execute_frame` entry.
+    pub is_jdk_class: bool,
+
+    // ── Cold fields (metadata, rarely-mutated state) ────────────────────
+
+    /// Cold-path metadata (method name, descriptor, exception table, etc.).
+    inner: FrameInner,
 
     /// CRIT-PERF (audit 2026-05-17): per-loop OSR attempt counter with
     /// exponential backoff.
@@ -166,11 +196,6 @@ pub struct Frame {
     /// object that must be released when this frame returns or is unwound by
     /// an exception.  `None` for non-synchronized methods.
     pub monitor_on_exit: Option<ObjectRef>,
-
-    /// T14: Set to true for methods from real JDK classes (java/*, jdk/*, sun/*).
-    /// Used to skip the fast-path interpreter which uses pop_unchecked and may
-    /// panic on bytecode patterns not handled by the fast path.
-    pub is_jdk_class: bool,
 }
 
 fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, u16) {
@@ -352,7 +377,14 @@ pub(crate) fn class_disables_interp_fast_path(class_name: &str) -> bool {
         || class_name.starts_with("jdk/")
         || class_name.starts_with("sun/")
         || class_name.starts_with("com/sun/")
-        || class_name.contains("springframework")
+        // round-7 HIGH: `contains("springframework")` was O(name-len) per
+        // Frame::new (every method call). Real Spring class names are always
+        // rooted at `org/springframework/...` (or `org/springframework$Cglib...`
+        // proxy variants — both share the package prefix), so a prefix test
+        // is O(20) regardless of class-name length and matches the same set
+        // in practice.
+        || class_name.starts_with("org/springframework/")
+        || class_name.starts_with("org/springframework$")
 }
 
 /// CRIT-PERF cap: after this many failed OSR attempts for a single entry
@@ -449,6 +481,26 @@ impl Frame {
     }
 
     /// Create a new frame from pre-built Arc data (zero-copy for code and strings).
+    ///
+    /// # Bytecode padding precondition (SAFETY)
+    ///
+    /// The hot interpreter dispatch loop unconditionally reads `code[pc+1]` and
+    /// `code[pc+2]` for multi-byte opcodes without per-read bounds checks (see
+    /// e.g. `interpreter.rs` opcode decoding for `bipush`, `sipush`, `getfield`,
+    /// jump targets, etc.). The decode relies on **at least 2 trailing zero
+    /// bytes** of padding at the end of `code` so the speculative reads never
+    /// fall off the end of the allocation.
+    ///
+    /// Callers **must** pass an already-padded `Arc<[u8]>` — typically the
+    /// result of [`padded_bytecode`]. This zero-copy constructor exists
+    /// precisely to avoid an extra allocation when the caller already holds a
+    /// padded Arc (e.g. cached from a prior load); validating/re-padding here
+    /// would defeat that goal. The `debug_assert!` below catches violations
+    /// in debug builds; in release builds an unpadded input leads to an
+    /// out-of-bounds read in the hot loop, which is UB.
+    ///
+    /// If the caller cannot guarantee padding, use [`Frame::new_pooled`] or
+    /// `Frame::new` (which both run their input through `padded_bytecode`).
     #[allow(clippy::too_many_arguments)]
     pub fn new_from_arcs(
         class_id: ClassId,
@@ -462,6 +514,16 @@ impl Frame {
         max_locals: u16,
         args: &[Value],
     ) -> Self {
+        // SAFETY/precondition check: the dispatch loop reads up to 2 bytes past
+        // the last opcode. Empty `code` is permissible only if no instruction is
+        // ever decoded (defensive: still require the 2-byte tail). If `code` is
+        // non-empty it must have at least 2 trailing zero bytes.
+        debug_assert!(
+            code.len() >= 2 && code[code.len() - 1] == 0 && code[code.len() - 2] == 0,
+            "Frame::new_from_arcs: bytecode Arc must be padded with >=2 trailing zero \
+             bytes (use `padded_bytecode()` on raw classfile bytes). len={}",
+            code.len(),
+        );
         let (locals, eff_max_locals) = init_locals(max_locals, args);
         let is_jdk = class_disables_interp_fast_path(&*class_name);
         Self {

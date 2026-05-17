@@ -437,7 +437,13 @@ fn build_declared_frames(
     method_name: &str,
 ) -> Result<FxHashMap<u16, VerificationFrame>, LinkageError> {
     let mut frames = FxHashMap::with_capacity_and_hasher(32, Default::default());
-    let offsets = table.absolute_offsets();
+    // Round 7 audit fix (MED #8): u32-internal accumulation with
+    // `absolute > u16::MAX` rejection surfaces here as a verify error.
+    let offsets = table.absolute_offsets().map_err(|e| LinkageError::VerifyError {
+        class_name: class_name.to_string(),
+        method_name: method_name.to_string(),
+        message: format!("StackMapTable absolute_offsets: {e}"),
+    })?;
 
     let mut prev_frame = initial_frame.clone();
 

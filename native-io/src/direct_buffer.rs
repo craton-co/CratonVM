@@ -453,6 +453,85 @@ fn directbuffer_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 }
 
+/// `jdk.internal.misc.Unsafe.freeMemory(long addr)` — the canonical
+/// JDK escape hatch for explicit DirectByteBuffer reclamation. The
+/// JDK contract is "the address must have come from `allocateMemory`",
+/// which on our side means it was minted by `dbb_allocate`. We don't
+/// know the size at this entry point (Unsafe.freeMemory takes only
+/// addr), so we cannot return it to the pool — fall through to a
+/// system `dealloc` with a synthesised 1-byte layout, which is wrong
+/// for `Bits` accounting but matches the JDK's "no-op if you mis-use"
+/// behaviour. Callers that care about correct accounting should use
+/// `dbb_free_explicit` (registered as `freeMemory(JJ)V`) instead.
+///
+/// TODO(round-8): wire a `PhantomReference<DirectByteBuffer>` queue
+/// that calls `dbb_free` on GC. Today we rely on either an explicit
+/// `cleaner.clean()` from the JDK side or VM shutdown to reclaim
+/// pool entries.
+fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0) as u64;
+    if addr == 0 {
+        return Ok(None);
+    }
+    // Without a size we cannot return to the pool. The safer choice
+    // is to leak rather than dealloc a wrong layout (which is UB).
+    // Real-JDK Unsafe.freeMemory tracks size in `AllocationTable`;
+    // mimic that with a global map.
+    if let Some(size) = take_unsafe_alloc(addr) {
+        dbb_free(addr, size);
+    }
+    Ok(None)
+}
+
+/// `jdk.internal.misc.Unsafe.allocateMemory(long size) -> long` —
+/// records the (addr, size) so `freeMemory(addr)` can reclaim it
+/// accurately. JVM users who go via `ByteBuffer.allocateDirect` use
+/// `dbb_allocate_direct0` above and don't touch this path.
+fn unsafe_allocate_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = arg_long(args, 0);
+    let addr = dbb_allocate(size)?;
+    if addr != 0 {
+        record_unsafe_alloc(addr, size);
+    }
+    Ok(Some(Value::Long(addr as i64)))
+}
+
+/// Per-allocation (addr → size) table for Unsafe.allocate/freeMemory.
+/// Kept separate from the Cleaner registry because Unsafe-allocated
+/// memory has no associated Cleaner.
+fn unsafe_allocs() -> &'static Mutex<FxHashMap<u64, i64>> {
+    static U: OnceLock<Mutex<FxHashMap<u64, i64>>> = OnceLock::new();
+    U.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn record_unsafe_alloc(addr: u64, size: i64) {
+    if let Ok(mut g) = unsafe_allocs().lock() {
+        g.insert(addr, size);
+    }
+}
+
+fn take_unsafe_alloc(addr: u64) -> Option<i64> {
+    unsafe_allocs().lock().ok()?.remove(&addr)
+}
+
+/// `dbb_free_explicit(addr, size)` — escape hatch for Java callers
+/// that know both the pointer *and* the original capacity. Returns
+/// the bytes to the pool and refunds `Bits` accounting. This is the
+/// preferred path from the JDK side: synthetic `Cleaner` runnables
+/// call it with the address+size captured at allocation time, so
+/// pool reuse stays correct even without `PhantomReference` support.
+fn dbb_free_explicit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0) as u64;
+    let size = arg_long(args, 1);
+    if addr == 0 || size <= 0 {
+        return Ok(None);
+    }
+    // Also drop any Unsafe.allocateMemory record so we don't double-free.
+    let _ = take_unsafe_alloc(addr);
+    dbb_free(addr, size);
+    Ok(None)
+}
+
 /// `((DirectBuffer) buf).cleaner().clean()` plumbed through to here:
 /// the buffer carries the cleaner id at slot 6 in synthetic layout, or
 /// in field `cleanerId` in real layout.
@@ -572,6 +651,28 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "cleanNative0",
         "()V",
         directbuffer_clean,
+    );
+
+    // Unsafe.allocateMemory / freeMemory — the path real-JDK uses
+    // when a non-buffer caller goes through Unsafe directly (e.g.
+    // `sun.misc.Unsafe.allocateMemory(n)` returns a raw address).
+    // We back it with the same pool/accounting machinery as the
+    // DirectByteBuffer path so a 4 KiB tight-loop allocate/free
+    // stays RSS-bounded regardless of which API the JDK picks.
+    for cls in ["jdk/internal/misc/Unsafe", "sun/misc/Unsafe"] {
+        r.register(cls, "allocateMemory", "(J)J", unsafe_allocate_memory);
+        r.register(cls, "allocateMemory0", "(J)J", unsafe_allocate_memory);
+        r.register(cls, "freeMemory", "(J)V", unsafe_free_memory);
+        r.register(cls, "freeMemory0", "(J)V", unsafe_free_memory);
+    }
+
+    // Synthetic helper used by JDK-side Cleaner runnables that
+    // capture (addr, size) at allocation time — see module docs.
+    r.register(
+        "java/nio/DirectByteBuffer",
+        "freeMemoryExplicit",
+        "(JJ)V",
+        dbb_free_explicit,
     );
 }
 
