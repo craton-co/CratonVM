@@ -2,7 +2,7 @@
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -263,10 +263,17 @@ impl ThreadEventRing {
 //   * The owning producer thread is the *only* writer. It is the unique caller
 //     of `SpscEventRing::push` for this shard (enforced by the thread-local
 //     `THREAD_REGISTERED_RING`).
-//   * The consumer is `ThreadRingRegistry::drain_all`, which is serialized
-//     across calls by the registry-level mutex that snapshots the shard list.
-//     Inside `drain_all`, each shard is popped to exhaustion by exactly one
-//     thread, so it sees a consistent SPSC discipline.
+//   * Consumers are *serialized* per ring (round-5 CRIT-fix, 2026-05-17): a
+//     `consumer_busy: AtomicBool` on each `SpscEventRing` is CAS-acquired by
+//     the would-be consumer in `try_pop`. If the CAS fails, `try_pop` returns
+//     `None` and the contending consumer simply leaves the events for the
+//     next drain pass. This preserves SPSC semantics (still exactly one
+//     consumer touching the slot array at any instant) while allowing
+//     multiple unsynchronized call sites of `drain_all` (`recording.rs`,
+//     `dump.rs`, test fixtures) to be safe under `RwLock::read()` sharing.
+//     Producer-becomes-consumer is also safe: a producer that enters
+//     `drain_all` for its own shard will lose the CAS to any concurrent
+//     drainer and skip the shard, rather than racing on `assume_init_read`.
 //
 // Memory ordering follows the standard Lamport/Vyukov SPSC pattern:
 //   producer: load tail (Acquire) → write slot → store head (Release)
@@ -296,16 +303,23 @@ fn next_power_of_two(n: usize) -> usize {
     if n.is_power_of_two() { n } else { n.next_power_of_two() }
 }
 
-/// A single-producer / single-consumer bounded ring of `EventInstance`s.
+/// A single-producer / serialized-consumer bounded ring of `EventInstance`s.
 ///
 /// Lock-free in the steady state: producer and consumer touch disjoint atomic
 /// counters (`head` / `tail`) and disjoint slots. The slot array is a `Vec`
 /// of `UnsafeCell<MaybeUninit<EventInstance>>` — the producer initializes
 /// slots in `[tail, head)`, the consumer takes ownership when it pops.
 ///
-/// Safety contract: this type is `Sync` because it is only ever used with a
-/// strict SPSC discipline (one producer thread + one consumer thread at any
-/// given time). Violating that discipline is undefined behaviour.
+/// Safety contract: this type is `Sync` because (a) the producer is unique
+/// per ring (enforced by the thread-local `THREAD_REGISTERED_RING`) and
+/// (b) consumers are *serialized* by the `consumer_busy` CAS gate inside
+/// `try_pop` — at any instant exactly one thread holds the consumer role
+/// for a given ring. Round-5 CRIT-fix (2026-05-17): the previous single-
+/// declared-consumer contract was not enforceable because `drain_all` is
+/// invoked from 5+ unsynchronized sites in `recording.rs` and `dump.rs`
+/// under `RwLock::read()`, which allows concurrent readers. The CAS gate
+/// converts those would-be races into a clean "skip this shard, the other
+/// drainer is consuming it" return path.
 pub struct SpscEventRing {
     /// Backing storage; length = capacity, all slots logically uninitialised
     /// outside `[tail, head)` (mod capacity).
@@ -316,12 +330,31 @@ pub struct SpscEventRing {
     tail: AtomicUsize,
     /// `capacity - 1`. Capacity is a power of two so `idx & mask` indexes.
     mask: usize,
+    /// Producer-private cache of the last-observed `tail`. Used to skip the
+    /// Acquire load of the consumer counter on every `push`: the producer
+    /// only reloads when `head - cached_tail >= capacity` (i.e. the ring
+    /// *might* be full according to a stale snapshot). On x86 the cost is
+    /// nominal, but on ARM64 this elides an LDAR per emit. Accessed only
+    /// from the (unique) producer thread, so `UnsafeCell<usize>` is sound.
+    /// (Round-5 perf finding 6, 2026-05-17.)
+    cached_tail: UnsafeCell<usize>,
+    /// Consumer-side serialization gate. `try_pop` CAS-acquires this before
+    /// touching the slot array; on contention it returns `None` and leaves
+    /// the events for the holder of the gate to drain. Round-5 CRIT-fix
+    /// (2026-05-17) for the multi-consumer UB hazard.
+    consumer_busy: AtomicBool,
 }
 
-// SAFETY: `SpscEventRing` is only ever used with a single producer and a
-// single consumer (see module-level invariants). The `UnsafeCell` interior
-// is partitioned by the atomic head/tail counters so producer and consumer
-// never touch the same slot at the same time. `EventInstance` is `Send`.
+// SAFETY: `SpscEventRing` enforces the SPSC discipline at runtime:
+//   * The producer is unique by construction (one Arc<SpscEventRing> per
+//     producing thread, kept in `THREAD_REGISTERED_RING`).
+//   * Consumers are serialized by the `consumer_busy` AtomicBool CAS in
+//     `try_pop`, so only one thread at a time reads the slot array.
+// The `UnsafeCell<MaybeUninit<EventInstance>>` slots are partitioned by
+// the atomic head/tail counters so producer and (the single active)
+// consumer never touch the same slot at the same time. The producer-only
+// `UnsafeCell<usize>` cached_tail is never touched by consumers.
+// `EventInstance` is `Send`.
 unsafe impl Sync for SpscEventRing {}
 unsafe impl Send for SpscEventRing {}
 
@@ -339,6 +372,8 @@ impl SpscEventRing {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             mask: capacity - 1,
+            cached_tail: UnsafeCell::new(0),
+            consumer_busy: AtomicBool::new(false),
         }
     }
 
@@ -357,10 +392,32 @@ impl SpscEventRing {
         // The producer is the only writer to `head`, so a Relaxed self-load
         // is fine — we already observe our own prior stores.
         let head = self.head.load(Ordering::Relaxed);
-        // Acquire to synchronize with consumer's tail-Release in `try_pop`,
-        // so we observe the consumer's freed slots.
-        let tail = self.tail.load(Ordering::Acquire);
         let capacity = self.mask + 1;
+        // Cached-tail fast path (round-5 perf finding 6, 2026-05-17). The
+        // producer keeps a private snapshot of the last `tail` it observed.
+        // Tail only ever advances, so if `head - cached_tail < capacity`
+        // there is *definitely* free space and we can skip the Acquire load
+        // of the consumer's counter. We only pay the Acquire when the
+        // cached snapshot says the ring is full — at that point we must
+        // re-check the real tail before dropping the event.
+        //
+        // SAFETY: `cached_tail` is producer-owned (only this thread reads
+        // or writes it). The single-producer invariant is enforced by the
+        // thread-local `THREAD_REGISTERED_RING` (see module header).
+        let cached_tail = unsafe { *self.cached_tail.get() };
+        let in_flight = head.wrapping_sub(cached_tail);
+        let tail = if in_flight >= capacity {
+            // Slow path: cached snapshot says we're full — reload the real
+            // tail and refresh the cache. Acquire to synchronize with the
+            // consumer's tail-Release in `try_pop`, so we observe the
+            // consumer's freed slots.
+            let real_tail = self.tail.load(Ordering::Acquire);
+            // SAFETY: producer-only field (see above).
+            unsafe { *self.cached_tail.get() = real_tail; }
+            real_tail
+        } else {
+            cached_tail
+        };
         // head/tail are unbounded monotonically-increasing counters; the
         // number of in-flight events is `head - tail` (wrapping). Full when
         // this equals capacity (every slot occupied). `wrapping_sub` keeps
@@ -383,35 +440,93 @@ impl SpscEventRing {
         Ok(())
     }
 
-    /// Consumer-side pop. Returns `None` if the ring is empty.
+    /// Consumer-side pop. Returns `None` if the ring is empty *or* if
+    /// another consumer currently holds the serialization gate.
     ///
-    /// SAFETY contract (caller-upheld): must be called from a single consumer
-    /// thread per ring.
+    /// Round-5 CRIT-fix (2026-05-17): consumers are serialized by a
+    /// `consumer_busy` AtomicBool CAS. `drain_all` is invoked from many
+    /// unsynchronized sites in `recording.rs` and `dump.rs` under
+    /// `RwLock::read()`, which would otherwise let two threads enter
+    /// `try_pop` for the same shard simultaneously and race on
+    /// `assume_init_read` (undefined behaviour). On CAS failure we simply
+    /// return `None` — the holder of the gate will drain the events, and
+    /// the next call to `drain_all` will pick up anything pushed after.
     pub fn try_pop(&self) -> Option<EventInstance> {
-        // Consumer owns `tail` — Relaxed self-load is fine.
+        // Acquire the consumer gate. Acquire ordering pairs with the
+        // Release store on the unlock side below, so the moment we observe
+        // `consumer_busy == false` we also observe every slot read and
+        // `tail` advance performed by the previous consumer.
+        if self
+            .consumer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another consumer is mid-drain on this shard. Skip — they will
+            // drain what's there; we will catch up on the next pass.
+            return None;
+        }
+        // From here until the Release store below, we are the unique
+        // consumer of this ring (SPSC invariant holds).
+        // Consumer owns `tail` while the gate is held — Relaxed self-load is fine.
         let tail = self.tail.load(Ordering::Relaxed);
         // Acquire to synchronize with producer's head-Release in `push`, so
         // we see the slot writes that preceded it.
         let head = self.head.load(Ordering::Acquire);
         if head == tail {
+            // Empty — release the gate and report empty.
+            self.consumer_busy.store(false, Ordering::Release);
             return None;
         }
         let idx = tail & self.mask;
         // SAFETY: producer published an initialised value at slot `idx` via
         // its head-Release; our head-Acquire above synchronises that write.
-        // No other consumer races us (SPSC).
+        // No other consumer races us — `consumer_busy` is held above.
         let ev = unsafe { (*self.slots[idx].get()).assume_init_read() };
         // Release so the producer's Acquire-load of tail in `push` sees the
         // slot as freed before observing the new tail value.
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        // Release the consumer gate. Release ordering publishes the slot
+        // read + tail advance to the next consumer.
+        self.consumer_busy.store(false, Ordering::Release);
         Some(ev)
     }
 
     /// Consumer-side drain into a Vec.
+    ///
+    /// Acquires the consumer-serialization gate once and pops events under
+    /// that single CAS critical section, rather than CAS-acquiring per
+    /// event as repeated `try_pop` calls would. If another consumer
+    /// currently holds the gate this is a no-op (events will be drained
+    /// by the holder, or on the next pass).
     pub fn drain_into(&self, out: &mut Vec<EventInstance>) {
-        while let Some(ev) = self.try_pop() {
-            out.push(ev);
+        // Acquire the consumer gate (see `try_pop` for the full reasoning).
+        if self
+            .consumer_busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
         }
+        // Now the unique consumer. Pop in a tight loop without re-CAS.
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        loop {
+            let head = self.head.load(Ordering::Acquire);
+            if head == tail {
+                break;
+            }
+            let idx = tail & self.mask;
+            // SAFETY: producer published this slot via head-Release; our
+            // head-Acquire synchronises that write. No other consumer
+            // races — `consumer_busy` is held.
+            let ev = unsafe { (*self.slots[idx].get()).assume_init_read() };
+            out.push(ev);
+            tail = tail.wrapping_add(1);
+            // Publish each tail advance so the producer (which may be
+            // running in parallel) sees freed slots promptly.
+            self.tail.store(tail, Ordering::Release);
+        }
+        // Release the consumer gate.
+        self.consumer_busy.store(false, Ordering::Release);
     }
 
     /// Approximate count (non-atomic snapshot — useful for tests/diagnostics).
@@ -484,9 +599,12 @@ thread_local! {
 ///     itself is now read-shared safely.
 ///
 /// The dumper consumer-side races are addressed at the shard level: each
-/// `SpscEventRing` has a single declared consumer (the dump thread that owns
-/// the drain pass). Inside `drain_all`, every shard is popped to exhaustion
-/// by exactly one caller within the closure, preserving the SPSC contract.
+/// `SpscEventRing` carries a `consumer_busy` AtomicBool CAS gate that
+/// serializes any number of would-be drainers down to at most one active
+/// consumer per shard at any instant (round-5 CRIT-fix, 2026-05-17). Losing
+/// drainers simply skip the shard; the winner drains to empty. This is what
+/// makes it safe for the many unsynchronized `drain_all` call sites to share
+/// a `RwLock::read()` snapshot of the shard list without violating SPSC.
 pub struct ThreadRingRegistry {
     rings: RwLock<Vec<Arc<SpscEventRing>>>,
     /// Bounded capacity propagated to each newly-registered thread shard.
@@ -537,11 +655,14 @@ impl ThreadRingRegistry {
     /// that need a time-ordered stream (e.g. the dumper) should sort by
     /// `start_time`.
     ///
-    /// SPSC invariant: this method must not be called concurrently by two
-    /// threads on the *same shard*. The registry-level RwLock snapshots the
-    /// shard list under a read lock, but does not prevent two callers from
-    /// racing on shard drain. In practice there is exactly one dump thread per
-    /// `ThreadRingRegistry` instance, so this is fine.
+    /// SPSC invariant: round-5 CRIT-fix (2026-05-17). `drain_all` is called
+    /// from many unsynchronized sites (`recording.rs` ~268/696/718,
+    /// `dump.rs` ~1309/1571/1602/1651/1674), so the registry-level
+    /// `RwLock::read()` does NOT serialize concurrent drainers. The
+    /// per-shard `SpscEventRing::consumer_busy` CAS gate (inside
+    /// `try_pop` / `drain_into`) enforces single-consumer-at-a-time on
+    /// each shard: a losing drainer simply skips the shard and the
+    /// winning drainer takes its events. No UB on `assume_init_read`.
     pub fn drain_all(&self) -> Vec<EventInstance> {
         // Snapshot the Arc list under a read lock so we don't hold it while
         // draining each shard. The Arc clones make the list cheap to copy.

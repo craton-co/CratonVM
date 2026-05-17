@@ -1,4 +1,4 @@
-//! The VM orchestrator вЂ” ties together all VM subsystems.
+//! The VM orchestrator РІР‚вЂќ ties together all VM subsystems.
 //!
 //! The architecture separates shared (thread-safe) state from per-thread state:
 //!
@@ -23,7 +23,7 @@ pub use vm_util::*;
 // Types used by the inline `mod tests` below. NEW-11: the inline test
 // module is synthetic-jdk specific (it calls `register_builtins`,
 // asserts synthetic counts, and exercises hand-allocated synthetics),
-// so it вЂ” and its supporting `use` block вЂ” are gated behind
+// so it РІР‚вЂќ and its supporting `use` block РІР‚вЂќ are gated behind
 // `#[cfg(all(test, feature = "synthetic-jdk"))]`. The external test
 // files in `vm/tests/` remain available in both feature modes.
 #[cfg(all(test, feature = "synthetic-jdk"))]
@@ -50,7 +50,7 @@ use crate::classloading::ClassState;
 use rustjvm_native_api::NativeContext;
 
 // ---------------------------------------------------------------------------
-// Tests (synthetic-jdk only вЂ” see NEW-11 in docs/roadmap.md)
+// Tests (synthetic-jdk only РІР‚вЂќ see NEW-11 in docs/roadmap.md)
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, feature = "synthetic-jdk"))]
@@ -233,7 +233,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj1 = create_java_string(&shared, "test");
         let obj2 = create_java_string(&shared, "test");
-        // Same text в†’ same ObjectRef (pointer equality)
+        // Same text РІвЂ вЂ™ same ObjectRef (pointer equality)
         assert_eq!(obj1.as_ptr(), obj2.as_ptr());
     }
 
@@ -242,7 +242,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj1 = create_java_string(&shared, "hello");
         let obj2 = create_java_string(&shared, "world");
-        // Different text в†’ different ObjectRef
+        // Different text РІвЂ вЂ™ different ObjectRef
         assert_ne!(obj1.as_ptr(), obj2.as_ptr());
     }
 
@@ -257,9 +257,9 @@ mod tests {
     #[test]
     fn create_unicode_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = create_java_string(&shared, "ж—Ґжњ¬иЄћгѓ†г‚№гѓ€");
+        let obj = create_java_string(&shared, "Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬");
         let result = read_java_string(&shared.heap, obj);
-        assert_eq!(result, Some("ж—Ґжњ¬иЄћгѓ†г‚№гѓ€".to_string()));
+        assert_eq!(result, Some("Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬".to_string()));
     }
 
     #[test]
@@ -282,7 +282,7 @@ mod tests {
         let class_id = ClassId::new(1);
         let mirror1 = get_or_create_class_mirror(&shared, class_id);
         let mirror2 = get_or_create_class_mirror(&shared, class_id);
-        // Same class в†’ same mirror (pointer equality)
+        // Same class РІвЂ вЂ™ same mirror (pointer equality)
         assert_eq!(mirror1.as_ptr(), mirror2.as_ptr());
     }
 
@@ -470,7 +470,7 @@ mod tests {
             resolve_library_path(&shared, "C:\\Windows\\System32\\foo.dll"),
             "C:\\Windows\\System32\\foo.dll"
         );
-        // A bare name with no java.library.path set в†’ returned as-is (OS loader handles it).
+        // A bare name with no java.library.path set РІвЂ вЂ™ returned as-is (OS loader handles it).
         let result = resolve_library_path(&shared, "foo.dll");
         assert_eq!(result, "foo.dll");
     }
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(props.get("my.key").map(|s| s.as_str()), Some("my_value"));
     }
 
-    // -- Phase 8 Part 1: Step 2 вЂ” StringBuilder tests --
+    // -- Phase 8 Part 1: Step 2 РІР‚вЂќ StringBuilder tests --
 
     /// Helper to call a native method by (class, name, descriptor).
     fn call_native(
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(len, Some(Value::Int(12)));
     }
 
-    // -- Phase 8 Part 1: Step 3 вЂ” Additional String tests --
+    // -- Phase 8 Part 1: Step 3 РІР‚вЂќ Additional String tests --
 
     #[test]
     fn string_starts_with_and_ends_with() {
@@ -1114,7 +1114,7 @@ mod tests {
         }
     }
 
-    // -- Phase 8 Part 1: Step 4 вЂ” System properties tests --
+    // -- Phase 8 Part 1: Step 4 РІР‚вЂќ System properties tests --
 
     #[test]
     fn system_get_property_native() {
@@ -1253,7 +1253,7 @@ mod tests {
         assert!(t2 >= t1, "nanoTime should be monotonic");
     }
 
-    // -- Phase 8 Part 1: Step 5 вЂ” Math tests --
+    // -- Phase 8 Part 1: Step 5 РІР‚вЂќ Math tests --
 
     #[test]
     fn math_sqrt() {
@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(r, Some(Value::Double(4.0)));
     }
 
-    // -- Phase 8 Part 1: Step 6 вЂ” Wrapper type tests --
+    // -- Phase 8 Part 1: Step 6 РІР‚вЂќ Wrapper type tests --
 
     #[test]
     fn integer_value_of_and_int_value() {
@@ -1694,7 +1694,7 @@ mod tests {
         assert_eq!(r, Some(Value::Int(3)));
     }
 
-    // -- Phase 8 Part 1: Step 8 вЂ” End-to-end integration tests --
+    // -- Phase 8 Part 1: Step 8 РІР‚вЂќ End-to-end integration tests --
 
     #[test]
     fn e2e_string_concat_via_sb() {
@@ -1967,7 +1967,7 @@ mod tests {
         let obj_a = shared.heap.alloc_object(ClassId::new(0), 0);
         let obj_b = shared.heap.alloc_object(ClassId::new(0), 0);
 
-        // Same object вЂ” equals returns true
+        // Same object РІР‚вЂќ equals returns true
         let r = call_native(
             &shared,
             &mut thread,
@@ -1979,7 +1979,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // Different objects вЂ” equals returns false
+        // Different objects РІР‚вЂќ equals returns false
         let r = call_native(
             &shared,
             &mut thread,
@@ -2038,7 +2038,7 @@ mod tests {
         );
         assert!(result.is_err());
 
-        // Now enter the monitor and try вЂ” should succeed
+        // Now enter the monitor and try РІР‚вЂќ should succeed
         shared.monitors.enter(obj, ThreadId(0));
         call_native(
             &shared,
@@ -2435,7 +2435,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Register a lambda proxy: applyAsInt(x) в†’ Math.abs(x)
+        // Register a lambda proxy: applyAsInt(x) РІвЂ вЂ™ Math.abs(x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
@@ -2490,7 +2490,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Register a lambda: applyAsInt(x) в†’ Math.max(captured_val, x)
+        // Register a lambda: applyAsInt(x) РІвЂ вЂ™ Math.max(captured_val, x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
@@ -2518,7 +2518,7 @@ mod tests {
         // Verify captured value stored correctly
         assert_eq!(shared.heap.get_field(proxy_ref, 0), Value::Int(100));
 
-        // Call Math.max(100, 42) directly via native в†’ should be 100
+        // Call Math.max(100, 42) directly via native РІвЂ вЂ™ should be 100
         let r1 = call_native(
             &shared,
             &mut thread,
@@ -2530,7 +2530,7 @@ mod tests {
         .unwrap();
         assert_eq!(r1, Some(Value::Int(100)));
 
-        // Call Math.max(100, 200) directly via native в†’ should be 200
+        // Call Math.max(100, 200) directly via native РІвЂ вЂ™ should be 200
         let r2 = call_native(
             &shared,
             &mut thread,
@@ -2553,7 +2553,7 @@ mod tests {
         // Create a PrintStream object for System.out
         let ps_ref = shared.heap.alloc_object(ClassId::new(0), 0);
 
-        // Register a lambda: accept(s) в†’ ps.println(s) via captured PrintStream
+        // Register a lambda: accept(s) РІвЂ вЂ™ ps.println(s) via captured PrintStream
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface: "java/util/function/Consumer".to_string(),
@@ -3516,7 +3516,7 @@ mod tests {
         )
         .unwrap();
 
-        // Read back вЂ” should be "AB"
+        // Read back РІР‚вЂќ should be "AB"
         let content = std::fs::read_to_string(&tmp).unwrap();
         assert_eq!(content, "AB");
 
@@ -3563,7 +3563,7 @@ mod tests {
             &[Value::Object(Some(isr)), Value::Object(Some(fis))],
         )
         .unwrap();
-        // Propagate fd FISв†’ISR so the synthetic native_br_init below sees
+        // Propagate fd FISРІвЂ вЂ™ISR so the synthetic native_br_init below sees
         // the fd Int (what fd_table().read_line wants) when it copies
         // reader.field(0) into BR.field(0).
         let fis_fd = shared.heap.get_field(fis, 0);
@@ -3613,7 +3613,7 @@ mod tests {
             panic!("expected String, got {line2:?}");
         }
 
-        // readLine #3 вЂ” EOF
+        // readLine #3 РІР‚вЂќ EOF
         let line3 = call_native(
             &shared,
             &mut thread,
@@ -3832,7 +3832,7 @@ mod tests {
         let obj = shared.heap.alloc_object(ClassId::new(0), 1);
         shared.heap.set_field(obj, 0, Value::Int(42));
 
-        // CAS: expected=42, new=99 в†’ should succeed
+        // CAS: expected=42, new=99 РІвЂ вЂ™ should succeed
         let result = call_native(
             &shared,
             &mut thread,
@@ -3853,7 +3853,7 @@ mod tests {
         // Verify field changed
         assert_eq!(shared.heap.get_field(obj, 0), Value::Int(99));
 
-        // CAS: expected=42 but actual=99 в†’ should fail
+        // CAS: expected=42 but actual=99 РІвЂ вЂ™ should fail
         let result = call_native(
             &shared,
             &mut thread,
@@ -3915,7 +3915,7 @@ mod tests {
 
         shared.heap.set_field(obj, 0, Value::Object(Some(a)));
 
-        // CAS: expected=a, new=b в†’ should succeed (identity)
+        // CAS: expected=a, new=b РІвЂ вЂ™ should succeed (identity)
         let result = call_native(
             &shared,
             &mut thread,
@@ -4092,7 +4092,7 @@ mod tests {
         )
         .unwrap();
 
-        // CAS: 100в†’200 should succeed
+        // CAS: 100РІвЂ вЂ™200 should succeed
         let cas_result = call_native(
             &shared,
             &mut thread,
@@ -4104,7 +4104,7 @@ mod tests {
         .unwrap();
         assert_eq!(cas_result, Some(Value::Int(1)));
 
-        // CAS: 100в†’300 should fail (actual is 200)
+        // CAS: 100РІвЂ вЂ™300 should fail (actual is 200)
         let cas_result = call_native(
             &shared,
             &mut thread,
@@ -4330,7 +4330,7 @@ mod tests {
         )
         .unwrap();
 
-        // get в†’ obj_a
+        // get РІвЂ вЂ™ obj_a
         let r = call_native(
             &shared,
             &mut thread,
@@ -4346,7 +4346,7 @@ mod tests {
             panic!("Expected Object(Some)");
         }
 
-        // CAS: obj_a в†’ obj_b (identity-based, should succeed)
+        // CAS: obj_a РІвЂ вЂ™ obj_b (identity-based, should succeed)
         let cas = call_native(
             &shared,
             &mut thread,
@@ -4362,7 +4362,7 @@ mod tests {
         .unwrap();
         assert_eq!(cas, Some(Value::Int(1)));
 
-        // get в†’ obj_b
+        // get РІвЂ вЂ™ obj_b
         let r = call_native(
             &shared,
             &mut thread,
@@ -4400,7 +4400,7 @@ mod tests {
         )
         .unwrap();
 
-        // CAS with obj_c (different identity than obj_a) в†’ should fail
+        // CAS with obj_c (different identity than obj_a) РІвЂ вЂ™ should fail
         let cas = call_native(
             &shared,
             &mut thread,
@@ -4534,7 +4534,7 @@ mod tests {
         )
         .unwrap();
 
-        // isEmpty в†’ true
+        // isEmpty РІвЂ вЂ™ true
         let empty = call_native(
             &shared,
             &mut thread,
@@ -4546,7 +4546,7 @@ mod tests {
         .unwrap();
         assert_eq!(empty, Some(Value::Int(1)));
 
-        // size в†’ 0
+        // size РІвЂ вЂ™ 0
         let size = call_native(
             &shared,
             &mut thread,
@@ -4582,7 +4582,7 @@ mod tests {
         )
         .unwrap();
 
-        // size в†’ 2
+        // size РІвЂ вЂ™ 2
         let size = call_native(
             &shared,
             &mut thread,
@@ -4594,7 +4594,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(2)));
 
-        // isEmpty в†’ false
+        // isEmpty РІвЂ вЂ™ false
         let empty = call_native(
             &shared,
             &mut thread,
@@ -4606,7 +4606,7 @@ mod tests {
         .unwrap();
         assert_eq!(empty, Some(Value::Int(0)));
 
-        // get(0) в†’ "hello"
+        // get(0) РІвЂ вЂ™ "hello"
         let elem = call_native(
             &shared,
             &mut thread,
@@ -4622,7 +4622,7 @@ mod tests {
             panic!("expected String, got {elem:?}");
         }
 
-        // get(1) в†’ "world"
+        // get(1) РІвЂ вЂ™ "world"
         let elem = call_native(
             &shared,
             &mut thread,
@@ -4671,7 +4671,7 @@ mod tests {
             .unwrap();
         }
 
-        // contains("b") в†’ true
+        // contains("b") РІвЂ вЂ™ true
         let contains = call_native(
             &shared,
             &mut thread,
@@ -4683,7 +4683,7 @@ mod tests {
         .unwrap();
         assert_eq!(contains, Some(Value::Int(1)));
 
-        // remove(1) в†’ "b"
+        // remove(1) РІвЂ вЂ™ "b"
         let removed = call_native(
             &shared,
             &mut thread,
@@ -4699,7 +4699,7 @@ mod tests {
             panic!("expected String");
         }
 
-        // size в†’ 2
+        // size РІвЂ вЂ™ 2
         let size = call_native(
             &shared,
             &mut thread,
@@ -4711,7 +4711,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(2)));
 
-        // get(1) в†’ "c" (shifted left)
+        // get(1) РІвЂ вЂ™ "c" (shifted left)
         let elem = call_native(
             &shared,
             &mut thread,
@@ -4759,7 +4759,7 @@ mod tests {
             .unwrap();
         }
 
-        // size в†’ 20
+        // size РІвЂ вЂ™ 20
         let size = call_native(
             &shared,
             &mut thread,
@@ -4771,7 +4771,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(20)));
 
-        // get(19) в†’ "item19"
+        // get(19) РІвЂ вЂ™ "item19"
         let elem = call_native(
             &shared,
             &mut thread,
@@ -4885,7 +4885,7 @@ mod tests {
             _ => panic!("expected iterator"),
         };
 
-        // hasNext в†’ true
+        // hasNext РІвЂ вЂ™ true
         let hn = call_native(
             &shared,
             &mut thread,
@@ -4897,7 +4897,7 @@ mod tests {
         .unwrap();
         assert_eq!(hn, Some(Value::Int(1)));
 
-        // next в†’ "x"
+        // next РІвЂ вЂ™ "x"
         let n = call_native(
             &shared,
             &mut thread,
@@ -4913,7 +4913,7 @@ mod tests {
             panic!("expected String");
         }
 
-        // next в†’ "y"
+        // next РІвЂ вЂ™ "y"
         let n = call_native(
             &shared,
             &mut thread,
@@ -4929,7 +4929,7 @@ mod tests {
             panic!("expected String");
         }
 
-        // hasNext в†’ false
+        // hasNext РІвЂ вЂ™ false
         let hn = call_native(
             &shared,
             &mut thread,
@@ -4973,7 +4973,7 @@ mod tests {
             .unwrap();
         }
 
-        // set(0, "c") в†’ returns "a"
+        // set(0, "c") РІвЂ вЂ™ returns "a"
         let old = call_native(
             &shared,
             &mut thread,
@@ -5047,7 +5047,7 @@ mod tests {
             .unwrap();
         }
 
-        // indexOf("a") в†’ 0 (string value equality)
+        // indexOf("a") РІвЂ вЂ™ 0 (string value equality)
         let search = create_java_string(&shared, "a");
         let idx = call_native(
             &shared,
@@ -5060,7 +5060,7 @@ mod tests {
         .unwrap();
         assert_eq!(idx, Some(Value::Int(0)));
 
-        // lastIndexOf("a") в†’ 2
+        // lastIndexOf("a") РІвЂ вЂ™ 2
         let search2 = create_java_string(&shared, "a");
         let idx = call_native(
             &shared,
@@ -5091,7 +5091,7 @@ mod tests {
         )
         .unwrap();
 
-        // isEmpty в†’ true
+        // isEmpty РІвЂ вЂ™ true
         let empty = call_native(
             &shared,
             &mut thread,
@@ -5121,7 +5121,7 @@ mod tests {
         .unwrap();
         assert_eq!(old, Some(Value::Object(None))); // no previous value
 
-        // size в†’ 1
+        // size РІвЂ вЂ™ 1
         let size = call_native(
             &shared,
             &mut thread,
@@ -5133,7 +5133,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(1)));
 
-        // get("key1") в†’ "val1"
+        // get("key1") РІвЂ вЂ™ "val1"
         let k1_lookup = create_java_string(&shared, "key1");
         let val = call_native(
             &shared,
@@ -5186,7 +5186,7 @@ mod tests {
             .unwrap();
         }
 
-        // size в†’ 3
+        // size РІвЂ вЂ™ 3
         let size = call_native(
             &shared,
             &mut thread,
@@ -5198,7 +5198,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(3)));
 
-        // get("banana") в†’ "yellow"
+        // get("banana") РІвЂ вЂ™ "yellow"
         let key = create_java_string(&shared, "banana");
         let val = call_native(
             &shared,
@@ -5218,7 +5218,7 @@ mod tests {
             panic!("expected String");
         }
 
-        // containsKey("grape") в†’ true
+        // containsKey("grape") РІвЂ вЂ™ true
         let key = create_java_string(&shared, "grape");
         let ck = call_native(
             &shared,
@@ -5231,7 +5231,7 @@ mod tests {
         .unwrap();
         assert_eq!(ck, Some(Value::Int(1)));
 
-        // containsKey("orange") в†’ false
+        // containsKey("orange") РІвЂ вЂ™ false
         let key = create_java_string(&shared, "orange");
         let ck = call_native(
             &shared,
@@ -5277,7 +5277,7 @@ mod tests {
         )
         .unwrap();
 
-        // remove("k") в†’ "v"
+        // remove("k") РІвЂ вЂ™ "v"
         let key = create_java_string(&shared, "k");
         let removed = call_native(
             &shared,
@@ -5294,7 +5294,7 @@ mod tests {
             panic!("expected String");
         }
 
-        // size в†’ 0
+        // size РІвЂ вЂ™ 0
         let size = call_native(
             &shared,
             &mut thread,
@@ -5340,7 +5340,7 @@ mod tests {
         )
         .unwrap();
 
-        // put("key", "val2") в†’ returns "val1"
+        // put("key", "val2") РІвЂ вЂ™ returns "val1"
         let k2 = create_java_string(&shared, "key");
         let v2 = create_java_string(&shared, "val2");
         let old = call_native(
@@ -5374,7 +5374,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(1)));
 
-        // get("key") в†’ "val2"
+        // get("key") РІвЂ вЂ™ "val2"
         let key = create_java_string(&shared, "key");
         let val = call_native(
             &shared,
@@ -5428,7 +5428,7 @@ mod tests {
             .unwrap();
         }
 
-        // size в†’ 20
+        // size РІвЂ вЂ™ 20
         let size = call_native(
             &shared,
             &mut thread,
@@ -5477,7 +5477,7 @@ mod tests {
         )
         .unwrap();
 
-        // add("hello") в†’ true
+        // add("hello") РІвЂ вЂ™ true
         let hello = create_java_string(&shared, "hello");
         let added = call_native(
             &shared,
@@ -5490,7 +5490,7 @@ mod tests {
         .unwrap();
         assert_eq!(added, Some(Value::Int(1)));
 
-        // contains("hello") в†’ true
+        // contains("hello") РІвЂ вЂ™ true
         let hello2 = create_java_string(&shared, "hello");
         let contains = call_native(
             &shared,
@@ -5503,7 +5503,7 @@ mod tests {
         .unwrap();
         assert_eq!(contains, Some(Value::Int(1)));
 
-        // size в†’ 1
+        // size РІвЂ вЂ™ 1
         let size = call_native(
             &shared,
             &mut thread,
@@ -5515,7 +5515,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(1)));
 
-        // remove("hello") в†’ true
+        // remove("hello") РІвЂ вЂ™ true
         let hello3 = create_java_string(&shared, "hello");
         let removed = call_native(
             &shared,
@@ -5528,7 +5528,7 @@ mod tests {
         .unwrap();
         assert_eq!(removed, Some(Value::Int(1)));
 
-        // size в†’ 0
+        // size РІвЂ вЂ™ 0
         let size = call_native(
             &shared,
             &mut thread,
@@ -5581,7 +5581,7 @@ mod tests {
         .unwrap();
         assert_eq!(added2, Some(Value::Int(0))); // was already present
 
-        // size в†’ 1 (not 2)
+        // size РІвЂ вЂ™ 1 (not 2)
         let size = call_native(
             &shared,
             &mut thread,
@@ -5616,7 +5616,7 @@ mod tests {
             .heap
             .set_array_element(arr, 2, Value::Object(Some(c)));
 
-        // copyOf(arr, 5) в†’ larger array
+        // copyOf(arr, 5) РІвЂ вЂ™ larger array
         let result = call_native(
             &shared,
             &mut thread,
@@ -5642,7 +5642,7 @@ mod tests {
             panic!("expected array");
         }
 
-        // copyOf(arr, 2) в†’ smaller array
+        // copyOf(arr, 2) РІвЂ вЂ™ smaller array
         let result = call_native(
             &shared,
             &mut thread,
@@ -5900,7 +5900,7 @@ mod tests {
     }
 
     // =======================================================================
-    // Phase 8 Part 7 вЂ” String split/join/strip, Float/Double parsing, Enum
+    // Phase 8 Part 7 РІР‚вЂќ String split/join/strip, Float/Double parsing, Enum
     // =======================================================================
 
     #[test]
@@ -6143,7 +6143,7 @@ mod tests {
 
         let s = create_java_string(&shared, "abcabc");
 
-        // lastIndexOf('c') в†’ 5
+        // lastIndexOf('c') РІвЂ вЂ™ 5
         let r = call_native(
             &shared,
             &mut thread,
@@ -6155,7 +6155,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(5)));
 
-        // lastIndexOf("ab") в†’ 3
+        // lastIndexOf("ab") РІвЂ вЂ™ 3
         let pat = create_java_string(&shared, "ab");
         let r = call_native(
             &shared,
@@ -6535,7 +6535,7 @@ mod tests {
         )
         .unwrap();
 
-        // Same ref в†’ true
+        // Same ref РІвЂ вЂ™ true
         let r = call_native(
             &shared,
             &mut thread,
@@ -6547,7 +6547,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // Different ref в†’ false (even with same name/ordinal)
+        // Different ref РІвЂ вЂ™ false (even with same name/ordinal)
         let r = call_native(
             &shared,
             &mut thread,
@@ -6561,7 +6561,7 @@ mod tests {
     }
 
     // =======================================================================
-    // Phase 8 Part 8 вЂ” Objects, Optional, Arrays, Collections, Comparable
+    // Phase 8 Part 8 РІР‚вЂќ Objects, Optional, Arrays, Collections, Comparable
     // =======================================================================
 
     #[test]
@@ -6600,7 +6600,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // null == null в†’ true
+        // null == null РІвЂ вЂ™ true
         let r = call_native(
             &shared,
             &mut thread,
@@ -6612,7 +6612,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // same string в†’ true
+        // same string РІвЂ вЂ™ true
         let s1 = create_java_string(&shared, "abc");
         let s2 = create_java_string(&shared, "abc");
         let r = call_native(
@@ -6626,7 +6626,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // null vs non-null в†’ false
+        // null vs non-null РІвЂ вЂ™ false
         let r = call_native(
             &shared,
             &mut thread,
@@ -6656,7 +6656,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // isNull(null) в†’ 1
+        // isNull(null) РІвЂ вЂ™ 1
         let r = call_native(
             &shared,
             &mut thread,
@@ -6668,7 +6668,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // nonNull(null) в†’ 0
+        // nonNull(null) РІвЂ вЂ™ 0
         let r = call_native(
             &shared,
             &mut thread,
@@ -6680,7 +6680,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(0)));
 
-        // nonNull(object) в†’ 1
+        // nonNull(object) РІвЂ вЂ™ 1
         let s = create_java_string(&shared, "test");
         let r = call_native(
             &shared,
@@ -6693,7 +6693,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // toString(null) в†’ "null"
+        // toString(null) РІвЂ вЂ™ "null"
         let r = call_native(
             &shared,
             &mut thread,
@@ -6715,7 +6715,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Optional.empty() в†’ isPresent=false
+        // Optional.empty() РІвЂ вЂ™ isPresent=false
         let empty = call_native(
             &shared,
             &mut thread,
@@ -6751,7 +6751,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // Optional.of(value) в†’ get returns value
+        // Optional.of(value) РІвЂ вЂ™ get returns value
         let s = create_java_string(&shared, "hello");
         let opt = call_native(
             &shared,
@@ -6813,7 +6813,7 @@ mod tests {
         let default_str = create_java_string(&shared, "default");
         let value_str = create_java_string(&shared, "value");
 
-        // Empty optional в†’ orElse returns default
+        // Empty optional РІвЂ вЂ™ orElse returns default
         let empty = call_native(
             &shared,
             &mut thread,
@@ -6841,7 +6841,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Object(Some(default_str))));
 
-        // Present optional в†’ orElse returns value
+        // Present optional РІвЂ вЂ™ orElse returns value
         let present = call_native(
             &shared,
             &mut thread,
@@ -6869,7 +6869,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Object(Some(value_str))));
 
-        // Empty optional в†’ orElseThrow throws
+        // Empty optional РІвЂ вЂ™ orElseThrow throws
         let r = call_native(
             &shared,
             &mut thread,
@@ -6917,7 +6917,7 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // Both contain "hello" в†’ equals true
+        // Both contain "hello" РІвЂ вЂ™ equals true
         let r = call_native(
             &shared,
             &mut thread,
@@ -6929,7 +6929,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(1)));
 
-        // toString в†’ "Optional[hello]"
+        // toString РІвЂ вЂ™ "Optional[hello]"
         let r = call_native(
             &shared,
             &mut thread,
@@ -6948,7 +6948,7 @@ mod tests {
             panic!("expected string");
         }
 
-        // Empty toString в†’ "Optional.empty"
+        // Empty toString РІвЂ вЂ™ "Optional.empty"
         let empty = call_native(
             &shared,
             &mut thread,
@@ -7053,7 +7053,7 @@ mod tests {
         let _ = shared.heap.set_array_element(arr, 3, Value::Int(7));
         let _ = shared.heap.set_array_element(arr, 4, Value::Int(9));
 
-        // Search for 5 в†’ index 2
+        // Search for 5 РІвЂ вЂ™ index 2
         let r = call_native(
             &shared,
             &mut thread,
@@ -7065,7 +7065,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(2)));
 
-        // Search for 4 в†’ not found, insertion point 2, returns -3
+        // Search for 4 РІвЂ вЂ™ not found, insertion point 2, returns -3
         let r = call_native(
             &shared,
             &mut thread,
@@ -7192,7 +7192,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // emptyList в†’ size 0
+        // emptyList РІвЂ вЂ™ size 0
         let r = call_native(
             &shared,
             &mut thread,
@@ -7217,7 +7217,7 @@ mod tests {
         .unwrap();
         assert_eq!(size, Some(Value::Int(0)));
 
-        // singletonList в†’ size 1
+        // singletonList РІвЂ вЂ™ size 1
         let s = create_java_string(&shared, "only");
         let r = call_native(
             &shared,
@@ -7459,7 +7459,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Lambda: applyAsInt(x) в†’ Math.abs(x) вЂ” InvokeStatic, no captures
+        // Lambda: applyAsInt(x) РІвЂ вЂ™ Math.abs(x) РІР‚вЂќ InvokeStatic, no captures
         let proxy = make_lambda_proxy(
             &shared,
             "java/util/function/IntUnaryOperator",
@@ -7486,7 +7486,7 @@ mod tests {
 
     #[test]
     fn invoke_virtual_lambda_dispatch_with_captures() {
-        // Lambda: apply(x) в†’ Math.max(captured, x) вЂ” InvokeStatic, 1 capture
+        // Lambda: apply(x) РІвЂ вЂ™ Math.max(captured, x) РІР‚вЂќ InvokeStatic, 1 capture
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
@@ -7587,7 +7587,7 @@ mod tests {
             .unwrap();
         }
 
-        // Create a Consumer lambda: accept(s) в†’ tempPrint(s) via static
+        // Create a Consumer lambda: accept(s) РІвЂ вЂ™ tempPrint(s) via static
         // We'll use System.identityHashCode as a Consumer stand-in since
         // it's a static that takes Object. Instead, use a simpler approach:
         // Create a lambda that calls a native to record output.
@@ -7646,7 +7646,7 @@ mod tests {
         )
         .unwrap();
 
-        // Consumer lambda в†’ PrintStream.println
+        // Consumer lambda РІвЂ вЂ™ PrintStream.println
         let ps = shared.heap.alloc_object(ClassId::new(0), 0);
         let consumer = make_lambda_proxy(
             &shared,
@@ -7679,7 +7679,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Create HashMap with "k" в†’ "v"
+        // Create HashMap with "k" РІвЂ вЂ™ "v"
         let map_ref = shared.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
@@ -7706,14 +7706,14 @@ mod tests {
         )
         .unwrap();
 
-        // BiConsumer lambda: accept(key, value) в†’ tempPrint(key) via InvokeStatic
+        // BiConsumer lambda: accept(key, value) РІвЂ вЂ™ tempPrint(key) via InvokeStatic
         // Use a static approach: the lambda captures nothing and uses tempPrint.
-        // Actually, we can use System.identityHashCode as a proxy вЂ” but that
+        // Actually, we can use System.identityHashCode as a proxy РІР‚вЂќ but that
         // returns int, not void. Instead use a simpler strategy:
         // Use a static that we know takes (Object, Object) and is native.
         // Since there's no perfect match, let's verify forEach runs without
         // error and that the map has the right size.
-        // Better approach: use Math.max(int, int) в†’ not right either.
+        // Better approach: use Math.max(int, int) РІвЂ вЂ™ not right either.
         //
         // The most reliable test: create a lambda Consumer that captures a
         // StringBuilder and appends. But that's InvokeVirtual.
@@ -7721,25 +7721,25 @@ mod tests {
         // Let's make a BiConsumer that calls Objects.hash which takes Object...
         // Actually, the best approach is to test that forEach doesn't crash
         // and invokes the lambda the right number of times. We use a
-        // lambda that calls Math.abs(0) as a no-op for each entry вЂ” InvokeStatic.
+        // lambda that calls Math.abs(0) as a no-op for each entry РІР‚вЂќ InvokeStatic.
         // Then verify no exception was thrown (forEach completed).
         //
         // But we really want to verify all entries were visited.
-        // Solution: create a BiConsumer в†’ StringBuilder.append(String) with
+        // Solution: create a BiConsumer РІвЂ вЂ™ StringBuilder.append(String) with
         // captured StringBuilder, ignoring the value arg by having a wrapper.
         //
         // Simplest: use the System.identityHashCode(Object) as a Consumer stand-in.
-        // It takes Object and returns int вЂ” it's a mismatch for BiConsumer
+        // It takes Object and returns int РІР‚вЂќ it's a mismatch for BiConsumer
         // (which needs (Object, Object) -> void).
         //
         // Let's just verify forEach runs to completion without errors.
         // The lambda will call a no-op: tempPrint(key).
         let ps = shared.heap.alloc_object(ClassId::new(0), 0);
-        // We'll create a lambda: accept(k, v) в†’ println(k)
+        // We'll create a lambda: accept(k, v) РІвЂ вЂ™ println(k)
         // This works by: capture PrintStream, then impl is
         // PrintStream.println(String) with descriptor (Ljava/lang/String;)V
-        // But BiConsumer has accept(Object, Object) в†’ the lambda dispatch will
-        // call println(captured_ps, k) вЂ” the second arg 'v' is ignored because
+        // But BiConsumer has accept(Object, Object) РІвЂ вЂ™ the lambda dispatch will
+        // call println(captured_ps, k) РІР‚вЂќ the second arg 'v' is ignored because
         // the impl descriptor only expects (PrintStream, String) = 2 args and
         // captures provide 1 (ps) + call provides 2 (k, v) = 3 total args.
         //
@@ -7747,9 +7747,9 @@ mod tests {
         // captures = [ps], call_args = [k, v]
         // full_args = [ps, k, v]
         // For InvokeVirtual: first arg is receiver (ps), rest are params (k, v)
-        // But println descriptor is (Ljava/lang/String;)V вЂ” expects 1 param
+        // But println descriptor is (Ljava/lang/String;)V РІР‚вЂќ expects 1 param
         // So we need to match. invoke_shared with args [ps, k, v] for println(String)
-        // would fail because there are too many args on the stack вЂ” but since
+        // would fail because there are too many args on the stack РІР‚вЂќ but since
         // we use invoke_shared which invokes via native method registry, the
         // native callback only looks at args[0] (this=ps) and args[1] (the string).
         // Extra args are simply ignored by native methods. This works!
@@ -7903,7 +7903,7 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // Function lambda: apply(s) в†’ String.toUpperCase(s)
+        // Function lambda: apply(s) РІвЂ вЂ™ String.toUpperCase(s)
         let mapper = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -7971,7 +7971,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Create Optional.of(42) вЂ” use Integer boxing
+        // Create Optional.of(42) РІР‚вЂќ use Integer boxing
         let val = call_native(
             &shared,
             &mut thread,
@@ -7997,7 +7997,7 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // Predicate that always returns true: test(x) в†’ Math.abs(1) != 0 в†’ true
+        // Predicate that always returns true: test(x) РІвЂ вЂ™ Math.abs(1) != 0 РІвЂ вЂ™ true
         // Simpler: just use a lambda calling a static method returning 1.
         // We can use Integer.signum(1) which returns 1 (truthy for Predicate).
         // But Predicate.test returns boolean, which is Z. The impl needs to return int.
@@ -8015,7 +8015,7 @@ mod tests {
             &[Value::Int(1)], // capture arg = 1, call arg ignored for test
         );
 
-        // filter with true predicate в†’ should return the same Optional
+        // filter with true predicate РІвЂ вЂ™ should return the same Optional
         let filtered = call_native(
             &shared,
             &mut thread,
@@ -8052,7 +8052,7 @@ mod tests {
             "(I)I",
             MethodHandleKind::InvokeStatic,
             vec!['I'],
-            &[Value::Int(0)], // capture arg = 0 в†’ abs(0) = 0 = false
+            &[Value::Int(0)], // capture arg = 0 РІвЂ вЂ™ abs(0) = 0 = false
         );
 
         let filtered2 = call_native(
@@ -8105,7 +8105,7 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // Supplier lambda: get() в†’ Integer.valueOf(99)
+        // Supplier lambda: get() РІвЂ вЂ™ Integer.valueOf(99)
         let supplier = make_lambda_proxy(
             &shared,
             "java/util/function/Supplier",
@@ -8162,11 +8162,11 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // flatMap function: apply(s) в†’ Optional.of(s.toUpperCase())
+        // flatMap function: apply(s) РІвЂ вЂ™ Optional.of(s.toUpperCase())
         // This is complex. Let's simplify: use Optional.ofNullable as the
         // function. Since ofNullable takes Object and returns Optional, it's
         // a perfect Function for flatMap.
-        // Lambda: apply(x) в†’ Optional.ofNullable(x) вЂ” InvokeStatic
+        // Lambda: apply(x) РІвЂ вЂ™ Optional.ofNullable(x) РІР‚вЂќ InvokeStatic
         let mapper = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -8264,18 +8264,18 @@ mod tests {
             .unwrap();
         }
 
-        // Comparator lambda: compare(a, b) в†’ Integer.compare(
+        // Comparator lambda: compare(a, b) РІвЂ вЂ™ Integer.compare(
         //     a.intValue(), b.intValue())
         // Simpler: use Integer.compare(int, int) which takes two ints.
-        // But our Comparator expects (Object, Object) в†’ int.
+        // But our Comparator expects (Object, Object) РІвЂ вЂ™ int.
         // The lambda dispatch for InvokeStatic with impl descriptor (II)I
         // will receive captures + call args.
-        // Actually, the comparator needs to unbox вЂ” we can't do that in
+        // Actually, the comparator needs to unbox РІР‚вЂќ we can't do that in
         // a single static call without autoboxing support.
         //
         // Alternative: Use a custom approach. The comparator can call
         // Integer.compare which takes (int, int). But the SAM descriptor
-        // for Comparator is (Object, Object) в†’ int, so when invoked with
+        // for Comparator is (Object, Object) РІвЂ вЂ™ int, so when invoked with
         // boxed Integers, the args will be Object refs, not ints.
         //
         // In real JVM, the lambda infrastructure handles adaptation.
@@ -8283,7 +8283,7 @@ mod tests {
         //
         // Strategy: Create a Comparator that sorts Integers by comparing
         // their hash codes (which for Integer == the int value).
-        // Lambda: compare(a, b) в†’ System.identityHashCode(a) - System.identityHashCode(b)
+        // Lambda: compare(a, b) РІвЂ вЂ™ System.identityHashCode(a) - System.identityHashCode(b)
         // But that compares by identity, not value.
         //
         // Better: Use the natural ordering sort (null comparator path).
@@ -8291,7 +8291,7 @@ mod tests {
         // values instead, and create a comparator that calls String.compareTo.
         //
         // String.compareTo is an instance method with descriptor (Ljava/lang/String;)I.
-        // Lambda: compare(a, b) в†’ a.compareTo(b)
+        // Lambda: compare(a, b) РІвЂ вЂ™ a.compareTo(b)
         // kind: InvokeVirtual, no captures
         // impl: String.compareTo, descriptor (Ljava/lang/String;)I
         // full_args = [a, b] (no captures)
@@ -8580,8 +8580,8 @@ mod tests {
         // When Predicate.test is invoked with an Object, the dispatch will call
         // the impl method. For simplicity, create a Predicate that checks > 15.
         // Actually, we can't easily create a smart predicate without custom natives.
-        // Instead, create a Predicate that always returns true в†’ removes all elements.
-        // Use System.identityHashCode(Object) в†’ returns int > 0 в†’ truthy.
+        // Instead, create a Predicate that always returns true РІвЂ вЂ™ removes all elements.
+        // Use System.identityHashCode(Object) РІвЂ вЂ™ returns int > 0 РІвЂ вЂ™ truthy.
         let predicate = make_lambda_proxy(
             &shared,
             "java/util/function/Predicate",
@@ -8606,7 +8606,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // identityHashCode returns > 0 for each element в†’ truthy в†’ all removed
+        // identityHashCode returns > 0 for each element РІвЂ вЂ™ truthy РІвЂ вЂ™ all removed
         assert_eq!(result, Value::Int(1)); // true = something was removed
 
         let size = call_native(
@@ -8651,11 +8651,11 @@ mod tests {
         // Create a Predicate that always returns false (removes nothing).
         // Use Math.abs(0) but that's tricky. Instead register a lambda that
         // calls a method returning 0. We can use a static that returns 0.
-        // Let's use a lambda: test(x) в†’ Math.abs(int) with captured arg = 0.
-        // Hmm, this is complex. Use: Boolean.hashCode(false) = 1237 в†’ truthy...
+        // Let's use a lambda: test(x) РІвЂ вЂ™ Math.abs(int) with captured arg = 0.
+        // Hmm, this is complex. Use: Boolean.hashCode(false) = 1237 РІвЂ вЂ™ truthy...
         // Simplest: just make a predicate with dummy impl that returns Int(0).
         // Actually let's just use a Predicate calling Math.abs and pass Int(0) as capture.
-        // When test(elem) is called, dispatch does Math.abs(0) = 0 в†’ false!
+        // When test(elem) is called, dispatch does Math.abs(0) = 0 РІвЂ вЂ™ false!
         let predicate = make_lambda_proxy(
             &shared,
             "java/util/function/Predicate",
@@ -8725,7 +8725,7 @@ mod tests {
             .unwrap();
         }
 
-        // UnaryOperator.apply(x) в†’ System.identityHashCode(x) (replaces each element with its hash)
+        // UnaryOperator.apply(x) РІвЂ вЂ™ System.identityHashCode(x) (replaces each element with its hash)
         let operator = make_lambda_proxy(
             &shared,
             "java/util/function/UnaryOperator",
@@ -8782,7 +8782,7 @@ mod tests {
 
         let key = create_java_string(&shared, "missing");
 
-        // Function.apply(key) в†’ System.identityHashCode(key)
+        // Function.apply(key) РІвЂ вЂ™ System.identityHashCode(key)
         let function = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -8929,7 +8929,7 @@ mod tests {
         )
         .unwrap();
 
-        // BiFunction.apply(key, old_value) в†’ identityHashCode(key) (ignores value)
+        // BiFunction.apply(key, old_value) РІвЂ вЂ™ identityHashCode(key) (ignores value)
         let bi_function = make_lambda_proxy(
             &shared,
             "java/util/function/BiFunction",
@@ -8995,7 +8995,7 @@ mod tests {
         )
         .unwrap();
 
-        // BiFunction.apply(old, new) в†’ identityHashCode(old)
+        // BiFunction.apply(old, new) РІвЂ вЂ™ identityHashCode(old)
         let bi_function = make_lambda_proxy(
             &shared,
             "java/util/function/BiFunction",
@@ -9016,7 +9016,7 @@ mod tests {
               Value::Object(Some(new_val)), Value::Object(Some(bi_function))],
         ).unwrap().unwrap();
 
-        // BiFunction was called with (old, new) в†’ identityHashCode(old)
+        // BiFunction was called with (old, new) РІвЂ вЂ™ identityHashCode(old)
         assert!(matches!(result, Value::Int(_)));
     }
 
@@ -9052,7 +9052,7 @@ mod tests {
         )
         .unwrap();
 
-        // BiFunction.apply(key, value) в†’ identityHashCode(key)
+        // BiFunction.apply(key, value) РІвЂ вЂ™ identityHashCode(key)
         let bi_function = make_lambda_proxy(
             &shared,
             "java/util/function/BiFunction",
@@ -9621,7 +9621,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Function: identityHashCode вЂ” transforms object to Int
+        // Function: identityHashCode РІР‚вЂќ transforms object to Int
         let function = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -10113,7 +10113,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Stream of 3 Int values вЂ” reduce with identity using a BinaryOperator
+        // Stream of 3 Int values РІР‚вЂќ reduce with identity using a BinaryOperator
         let arr = shared
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
@@ -10577,7 +10577,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // map (identityHashCode вЂ” transforms each)
+        // map (identityHashCode РІР‚вЂќ transforms each)
         let function = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -10834,7 +10834,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        // no message set вЂ” field 0 defaults to uninitialized
+        // no message set РІР‚вЂќ field 0 defaults to uninitialized
 
         let result = call_native(
             &shared,
@@ -11373,7 +11373,7 @@ mod tests {
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let x_str = create_java_string(&shared, "x");
-        // For %d, it needs a boxed Integer вЂ” create one via Integer.valueOf
+        // For %d, it needs a boxed Integer РІР‚вЂќ create one via Integer.valueOf
         let boxed_42 = call_native(
             &shared,
             &mut thread,
@@ -13839,7 +13839,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, Value::Double(0.0));
 
-        // sinh(1.0) в‰€ 1.1752
+        // sinh(1.0) РІвЂ°в‚¬ 1.1752
         let r = call_native(
             &shared,
             &mut thread,
@@ -16705,7 +16705,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Test groupingBy collector creation (null classifier вЂ” just verifying tag)
+        // Test groupingBy collector creation (null classifier РІР‚вЂќ just verifying tag)
         let collector = call_native(
             &shared,
             &mut thread,
@@ -16767,7 +16767,7 @@ mod tests {
         )
         .unwrap();
 
-        // Insert keys "c", "a", "b" вЂ” should iterate in this order
+        // Insert keys "c", "a", "b" РІР‚вЂќ should iterate in this order
         for key_str in &["c", "a", "b"] {
             let k = {
                 let mut ctx = NativeContextImpl {
@@ -16938,7 +16938,7 @@ mod tests {
         match ts {
             Value::Object(Some(r)) => {
                 let s = read_java_string(&shared.heap, r).unwrap();
-                assert_eq!(s, "{a=0, c=0}"); // "a", "c" вЂ” "b" removed, order preserved
+                assert_eq!(s, "{a=0, c=0}"); // "a", "c" РІР‚вЂќ "b" removed, order preserved
             }
             _ => panic!("expected string"),
         }
@@ -17222,7 +17222,7 @@ mod tests {
             ctx.create_string("C")
         };
 
-        // Add B, then A at front, then C at back в†’ [A, B, C]
+        // Add B, then A at front, then C at back РІвЂ вЂ™ [A, B, C]
         call_native(
             &shared,
             &mut thread,
@@ -17342,7 +17342,7 @@ mod tests {
         )
         .unwrap();
 
-        // pollFirst в†’ X
+        // pollFirst РІвЂ вЂ™ X
         let polled = call_native(
             &shared,
             &mut thread,
@@ -17362,7 +17362,7 @@ mod tests {
             Some("X".to_string())
         );
 
-        // pollLast в†’ Y
+        // pollLast РІвЂ вЂ™ Y
         let polled2 = call_native(
             &shared,
             &mut thread,
@@ -17382,7 +17382,7 @@ mod tests {
             Some("Y".to_string())
         );
 
-        // Empty now вЂ” poll returns null
+        // Empty now РІР‚вЂќ poll returns null
         let empty = call_native(
             &shared,
             &mut thread,
@@ -18237,7 +18237,7 @@ mod tests {
         )
         .unwrap();
 
-        // Stack: [A, B, C] вЂ” C is at top (distance 1)
+        // Stack: [A, B, C] РІР‚вЂќ C is at top (distance 1)
         let search_c = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -19170,7 +19170,7 @@ mod tests {
         assert_eq!(first, Value::Int(10));
     }
 
-    // ===== Phase 17: java.time вЂ” LocalDate, LocalTime, Instant, Duration =====
+    // ===== Phase 17: java.time РІР‚вЂќ LocalDate, LocalTime, Instant, Duration =====
 
     #[test]
     fn local_date_of_and_getters() {
@@ -23381,7 +23381,7 @@ mod tests {
         .unwrap();
         assert_eq!(hi2, Value::Int(0));
 
-        // But has next double? No вЂ” "hello" is not a double either
+        // But has next double? No РІР‚вЂќ "hello" is not a double either
         let hd = call_native(
             &shared,
             &mut thread,
@@ -23405,7 +23405,7 @@ mod tests {
         )
         .unwrap();
 
-        // Now "3.14" вЂ” hasNextDouble true
+        // Now "3.14" РІР‚вЂќ hasNextDouble true
         let hd2 = call_native(
             &shared,
             &mut thread,
@@ -24059,7 +24059,7 @@ mod tests {
         // field 1 = Class mirror (leave as null for this test)
         shared.heap.set_field(proxy, 1, Value::Object(None));
 
-        // Call annotationType() вЂ” should return null since no mirror was set
+        // Call annotationType() РІР‚вЂќ should return null since no mirror was set
         let result = call_native(
             &shared,
             &mut thread,
@@ -24106,7 +24106,7 @@ mod tests {
             .heap
             .set_field(proxy, 1, Value::Object(Some(ann_mirror)));
 
-        // Call annotationType() вЂ” should return the mirror
+        // Call annotationType() РІР‚вЂќ should return the mirror
         let result = call_native(
             &shared,
             &mut thread,
@@ -24490,7 +24490,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase 21: java.lang.ref вЂ” Reference, WeakReference, SoftReference,
+    // Phase 21: java.lang.ref РІР‚вЂќ Reference, WeakReference, SoftReference,
     //           PhantomReference, ReferenceQueue
     // =========================================================================
 
@@ -24626,8 +24626,8 @@ mod tests {
         )
         .unwrap();
 
-        // PhantomReference.get() вЂ” always returns null per JDK contract.
-        // JLS В§12.6.2 / java.lang.ref.PhantomReference javadoc:
+        // PhantomReference.get() РІР‚вЂќ always returns null per JDK contract.
+        // JLS Р’В§12.6.2 / java.lang.ref.PhantomReference javadoc:
         // "In order to ensure that a reclaimable object remains so, the
         // referent of a phantom reference may not be retrieved: The get
         // method of a phantom reference always returns null."
@@ -24645,7 +24645,7 @@ mod tests {
         .unwrap();
         assert_eq!(got, Value::Object(None));
         // Guard the phantom is correctly constructed with its queue (the
-        // test name is `phantom_reference_requires_queue` вЂ” assert that
+        // test name is `phantom_reference_requires_queue` РІР‚вЂќ assert that
         // bit too so the test's semantic value is preserved).
         let _ = queue;
         let _ = referent;
@@ -24921,7 +24921,7 @@ mod tests {
         )
         .unwrap();
 
-        // Queue is LIFO (stack) вЂ” last enqueued is polled first
+        // Queue is LIFO (stack) РІР‚вЂќ last enqueued is polled first
         let p1 = call_native(
             &shared,
             &mut thread,
@@ -26529,7 +26529,7 @@ mod tests {
             _ => panic!("expected object"),
         };
 
-        // Flip immediately в†’ limit=0, no data to read
+        // Flip immediately РІвЂ вЂ™ limit=0, no data to read
         call_native(
             &shared,
             &mut thread,
@@ -28017,7 +28017,7 @@ mod tests {
         )
         .unwrap();
 
-        // Await with timeout (count > 0 в†’ returns false)
+        // Await with timeout (count > 0 РІвЂ вЂ™ returns false)
         let result = call_native(
             &shared,
             &mut thread,
@@ -28222,7 +28222,7 @@ mod tests {
         .unwrap();
         assert_eq!(permits, Value::Int(2));
 
-        // Try to acquire 3 more вЂ” fails (only 2 available)
+        // Try to acquire 3 more РІР‚вЂќ fails (only 2 available)
         let ok = call_native(
             &shared,
             &mut thread,
@@ -28850,7 +28850,7 @@ mod tests {
         for (i, &b) in content.iter().enumerate() {
             let _ = shared.heap.set_array_element(data, i, Value::Int(b as i32));
         }
-        // BAIS layout is {buf, pos, mark, count} вЂ” 4 slots. Under-allocating
+        // BAIS layout is {buf, pos, mark, count} РІР‚вЂќ 4 slots. Under-allocating
         // triggers the gen_heap layout-mismatch guard which silently drops
         // the count write and later reads back Object(None), making
         // Properties.load() see an empty stream.
@@ -28952,7 +28952,7 @@ mod tests {
         for (i, &b) in content.iter().enumerate() {
             let _ = shared.heap.set_array_element(data, i, Value::Int(b as i32));
         }
-        // BAIS layout is {buf, pos, mark, count} вЂ” 4 slots (see
+        // BAIS layout is {buf, pos, mark, count} РІР‚вЂќ 4 slots (see
         // properties_load_from_bais for the rationale).
         let bais = shared.heap.alloc_object(ClassId::new(0), 4);
         call_native(
@@ -29024,7 +29024,7 @@ mod tests {
         for (i, &b) in content.iter().enumerate() {
             let _ = shared.heap.set_array_element(data, i, Value::Int(b as i32));
         }
-        // BAIS: {buf, pos, mark, count} вЂ” 4 slots.
+        // BAIS: {buf, pos, mark, count} РІР‚вЂќ 4 slots.
         let bais = shared.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
@@ -29084,7 +29084,7 @@ mod tests {
         // '=' separator must win when both are present in the value
         assert_eq!(lookup(&shared, &mut thread, "key3"), "mix:ed");
 
-        // Size should be exactly 3 вЂ” comments are skipped.
+        // Size should be exactly 3 РІР‚вЂќ comments are skipped.
         let size = call_native(
             &shared,
             &mut thread,
@@ -31273,7 +31273,7 @@ mod tests {
             } else {
                 panic!("expected string");
             }
-            // info вЂ” should log
+            // info РІР‚вЂќ should log
             let msg = create_java_string(&shared, "test info message");
             let _ = call_native(
                 &shared,
@@ -31521,7 +31521,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase 32: java.nio.file вЂ” Path, Paths, Files
+    // Phase 32: java.nio.file РІР‚вЂќ Path, Paths, Files
     // =========================================================================
 
     #[test]
@@ -32106,7 +32106,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase 38: java.time completion вЂ” LocalDateTime, ZonedDateTime, Period, DTF
+    // Phase 38: java.time completion РІР‚вЂќ LocalDateTime, ZonedDateTime, Period, DTF
     // =========================================================================
 
     #[test]
@@ -33907,7 +33907,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
-                    code: vec![0xB1].into(), // return (void)
+                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return (void)
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -33929,7 +33929,7 @@ mod tests {
             other => panic!("Expected Method object, got {:?}", other),
         };
 
-        // Method.invoke(null, null) вЂ” static void method
+        // Method.invoke(null, null) РІР‚вЂќ static void method
         let result = call_native(
             &shared,
             &mut thread,
@@ -33968,10 +33968,10 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 1,
                     max_locals: 0,
-                    code: vec![
+                    code: rustjvm_reader::ByteView::from_vec(vec![
                         0x10, 42,  // bipush 42
                         0xAC,      // ireturn
-                    ].into(),
+                    ]),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -33992,7 +33992,7 @@ mod tests {
             other => panic!("Expected Method, got {:?}", other),
         };
 
-        // Method.invoke(null, null) вЂ” static method returning int
+        // Method.invoke(null, null) РІР‚вЂќ static method returning int
         let result = call_native(
             &shared,
             &mut thread,
@@ -34011,7 +34011,7 @@ mod tests {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Integer object, got {:?}", other),
         };
-        // Integer.intValue() вЂ” field 0 should be 42
+        // Integer.intValue() РІР‚вЂќ field 0 should be 42
         assert_eq!(shared.heap.get_field(int_obj, 0), Value::Int(42));
     }
 
@@ -34037,12 +34037,12 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 1,
-                    code: vec![
+                    code: rustjvm_reader::ByteView::from_vec(vec![
                         0x1A,       // iload_0
                         0x1A,       // iload_0
                         0x60,       // iadd
                         0xAC,       // ireturn
-                    ].into(),
+                    ]),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34093,7 +34093,7 @@ mod tests {
             ],
         ).unwrap();
 
-        // Should return Integer(14) вЂ” 7 doubled
+        // Should return Integer(14) РІР‚вЂќ 7 doubled
         let int_obj = match result {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Integer, got {:?}", other),
@@ -34131,10 +34131,10 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 1,
                     max_locals: 2, // this + int param
-                    code: vec![
+                    code: rustjvm_reader::ByteView::from_vec(vec![
                         0x1B,  // iload_1 (first int param)
                         0xAC,  // ireturn
-                    ].into(),
+                    ]),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34188,7 +34188,7 @@ mod tests {
             ],
         ).unwrap();
 
-        // Should return Integer(55) вЂ” identity function
+        // Should return Integer(55) РІР‚вЂќ identity function
         let int_obj = match result {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Integer, got {:?}", other),
@@ -34217,7 +34217,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1].into(), // return
+                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34238,7 +34238,7 @@ mod tests {
             other => panic!("Expected Method, got {:?}", other),
         };
 
-        // Method.invoke(null, null) вЂ” should fail: instance method needs receiver
+        // Method.invoke(null, null) РІР‚вЂќ should fail: instance method needs receiver
         let result = call_native(
             &shared,
             &mut thread,
@@ -34276,12 +34276,12 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 2,
-                    code: vec![
+                    code: rustjvm_reader::ByteView::from_vec(vec![
                         0x1A, // iload_0
                         0x1B, // iload_1
                         0x60, // iadd
                         0xAC, // ireturn
-                    ].into(),
+                    ]),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34364,10 +34364,10 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 0,
-                    code: vec![
+                    code: rustjvm_reader::ByteView::from_vec(vec![
                         0x0A, // lconst_1
                         0xAD, // lreturn
-                    ].into(),
+                    ]),
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34572,7 +34572,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1].into(), // return
+                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34637,7 +34637,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1].into(), // return
+                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34675,7 +34675,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: vec![0xB1].into(), // return
+                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34699,7 +34699,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Phase 49-50: Enterprise Final вЂ” AtomicBoolean, Modifier, Class extras,
+    // Phase 49-50: Enterprise Final РІР‚вЂќ AtomicBoolean, Modifier, Class extras,
     // Formatter, StringWriter, StringReader, Collections extras
     // ========================================================================
 
@@ -34754,7 +34754,7 @@ mod tests {
         .unwrap();
         assert_eq!(v, Value::Int(1));
 
-        // CAS: expect true, set to false в†’ should succeed
+        // CAS: expect true, set to false РІвЂ вЂ™ should succeed
         let cas = call_native(
             &shared,
             &mut thread,
@@ -34778,7 +34778,7 @@ mod tests {
         .unwrap();
         assert_eq!(v, Value::Int(0));
 
-        // CAS: expect true but is false в†’ should fail
+        // CAS: expect true but is false РІвЂ вЂ™ should fail
         let cas2 = call_native(
             &shared,
             &mut thread,
@@ -34901,7 +34901,7 @@ mod tests {
         .unwrap();
         assert_eq!(stamp, Value::Int(42));
 
-        // CAS with wrong stamp в†’ fail
+        // CAS with wrong stamp РІвЂ вЂ™ fail
         let str_val2 = create_java_string(&shared, "world");
         let cas = call_native(
             &shared,
@@ -34921,7 +34921,7 @@ mod tests {
         .unwrap();
         assert_eq!(cas, Value::Int(0)); // wrong stamp
 
-        // CAS with correct ref + stamp в†’ succeed
+        // CAS with correct ref + stamp РІвЂ вЂ™ succeed
         let cas2 = call_native(
             &shared,
             &mut thread,
@@ -34986,7 +34986,7 @@ mod tests {
         .unwrap();
         assert_eq!(marked, Value::Int(0));
 
-        // attemptMark: correct ref в†’ succeed
+        // attemptMark: correct ref РІвЂ вЂ™ succeed
         let ok = call_native(
             &shared,
             &mut thread,
@@ -35061,7 +35061,7 @@ mod tests {
         .unwrap();
         assert_eq!(v, Value::Int(1));
 
-        // isNative on 0x0001 в†’ false
+        // isNative on 0x0001 РІвЂ вЂ™ false
         let v = call_native(
             &shared,
             &mut thread,
@@ -38381,7 +38381,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // Port 0 в†’ OS assigns a real port > 0
+        // Port 0 РІвЂ вЂ™ OS assigns a real port > 0
         assert!(port.as_int().unwrap() > 0);
         let closed = call_native(
             &shared,
@@ -40258,7 +40258,7 @@ mod tests {
             .set_array_element(arr, 2, Value::Object(Some(s3)));
         let stream = shared.heap.alloc_object(ClassId::new(0), 1);
         shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
-        // Predicate: identityHashCode always returns non-zero (true) в†’ takeWhile keeps all
+        // Predicate: identityHashCode always returns non-zero (true) РІвЂ вЂ™ takeWhile keeps all
         let pred = make_lambda_proxy(
             &shared,
             "java/util/function/Predicate",
@@ -40304,7 +40304,7 @@ mod tests {
             .set_array_element(arr, 1, Value::Object(Some(s2)));
         let stream = shared.heap.alloc_object(ClassId::new(0), 1);
         shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
-        // Predicate: identityHashCode always returns non-zero (true) в†’ dropWhile drops all
+        // Predicate: identityHashCode always returns non-zero (true) РІвЂ вЂ™ dropWhile drops all
         let pred = make_lambda_proxy(
             &shared,
             "java/util/function/Predicate",
@@ -40810,7 +40810,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // collections.rs overrides with toList (tag 1) вЂ” verify it returns a valid collector
+        // collections.rs overrides with toList (tag 1) РІР‚вЂќ verify it returns a valid collector
         let c_ref = collector.as_object().unwrap().unwrap();
         assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(1));
     }
@@ -41524,7 +41524,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // thenCompose needs a Function that returns a CF вЂ” use identity via System.identityHashCode
+        // thenCompose needs a Function that returns a CF РІР‚вЂќ use identity via System.identityHashCode
         // Instead, test thenRun which is simpler
         let cf_ref = cf.as_object().unwrap().unwrap();
         let done = call_native(
@@ -41544,7 +41544,7 @@ mod tests {
     fn cf_exceptionally_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        // completedFuture в†’ exceptionally should pass through (no exception)
+        // completedFuture РІвЂ вЂ™ exceptionally should pass through (no exception)
         let cf = call_native(
             &shared,
             &mut thread,
@@ -41556,7 +41556,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let cf_ref = cf.as_object().unwrap().unwrap();
-        // Create a Function proxy for exceptionally вЂ” but since no exception, result passes through
+        // Create a Function proxy for exceptionally РІР‚вЂќ but since no exception, result passes through
         // Test via get instead
         let result = call_native(
             &shared,
@@ -42699,7 +42699,7 @@ mod tests {
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
             zw.write_all(b"Manifest-Version: 1.0\r\nMain-Class: Foo\r\n\r\n").unwrap();
-            // A dummy class entry вЂ” the test exercises JAR IO, not class loading.
+            // A dummy class entry РІР‚вЂќ the test exercises JAR IO, not class loading.
             zw.start_file("Foo.class", opts).unwrap();
             zw.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
             zw.finish().unwrap();
@@ -42719,7 +42719,7 @@ mod tests {
             &[Value::Object(Some(jf)), Value::Object(Some(path))],
         )
         .unwrap();
-        // getName вЂ” returns the path we opened under.
+        // getName РІР‚вЂќ returns the path we opened under.
         let name = call_native(
             &shared,
             &mut thread,
@@ -42891,7 +42891,7 @@ mod tests {
         .unwrap();
         let lk_ref = lookup.as_object().unwrap().unwrap();
         // Use Class.forName to get a proper class mirror whose slot 1 is the
-        // class-name string вЂ” findVarHandle's mirror_class_name walks that
+        // class-name string РІР‚вЂќ findVarHandle's mirror_class_name walks that
         // slot and needs a real value to resolve the class.
         let holder_name = create_java_string(&shared, "java.util.concurrent.atomic.AtomicLong");
         let holder_cls = call_native(
@@ -43200,7 +43200,7 @@ mod tests {
         // The MXBean is wired to the real `loaded_class_count()` in
         // phases_late.rs (ClassLoadingMXBean.getLoadedClassCount returns
         // `ctx.loaded_class_count()`). A fresh SharedVm pre-loads a handful
-        // of bootstrap classes (Object, String, Class, вЂ¦) so the count is
+        // of bootstrap classes (Object, String, Class, РІР‚В¦) so the count is
         // small but non-zero; the earlier `Int(0)` expectation predates the
         // real-backing wire-up. Assert non-negative; exact values vary as
         // bootstrap evolves.
@@ -43425,7 +43425,7 @@ mod tests {
         let sub = shared.heap.alloc_object(ClassId::new(0), 2);
         shared.heap.set_field(sub, 0, Value::Int(0));
         shared.heap.set_field(sub, 1, Value::Long(0));
-        // Request 5 вЂ” the streams.rs override keeps demand in a side map,
+        // Request 5 РІР‚вЂќ the streams.rs override keeps demand in a side map,
         // not in field 1, so the object field stays at 0. We only verify
         // that the call doesn't panic and doesn't flip the cancel flag.
         call_native(
@@ -43439,7 +43439,7 @@ mod tests {
         .unwrap();
         assert_eq!(shared.heap.get_field(sub, 0), Value::Int(0),
             "cancel flag must stay 0 after request()");
-        // Request 3 more вЂ” same no-panic check
+        // Request 3 more РІР‚вЂќ same no-panic check
         call_native(
             &shared,
             &mut thread,
@@ -43449,7 +43449,7 @@ mod tests {
             &[Value::Object(Some(sub)), Value::Long(3)],
         )
         .unwrap();
-        // Cancel вЂ” field 0 must now be 1
+        // Cancel РІР‚вЂќ field 0 must now be 1
         call_native(
             &shared,
             &mut thread,
@@ -44353,7 +44353,7 @@ mod tests {
         assert_eq!(reg, Value::Int(1));
     }
 
-    // T16.10 вЂ” Cross-crate layout drift between `phases_late.rs` (which
+    // T16.10 РІР‚вЂќ Cross-crate layout drift between `phases_late.rs` (which
     // owns the `Charset.availableCharsets` native and writes TreeMap
     // slots 0-2 using the synthetic layout) and `alloc_concurrent_synthetic`
     // in synthetic-jdk mode (which adapts to the real TreeMap's field
@@ -44363,13 +44363,13 @@ mod tests {
     // own, so both the direct slot read and `TreeMap.size()` report a
     // stale Object / zero. The authoritative fix belongs in
     // `native-builtins/src/phases_late.rs` (owned by the concurrent /
-    // builtins agent) вЂ” either allocate the TreeMap via synthetic-only
+    // builtins agent) РІР‚вЂќ either allocate the TreeMap via synthetic-only
     // `alloc_object(ClassId::new(0), 3)` or drive the real TreeMap via
     // `<init>()V` + `put()`. Files in this agent's scope (native-io)
     // cannot reach the bug site. Marked ignored until that upstream
     // inconsistency is corrected.
     #[test]
-    #[ignore = "T16.10: cross-crate TreeMap layout drift вЂ” fix belongs in native-builtins/src/phases_late.rs availableCharsets (TM_FIELD_SIZE=1 assumption)"]
+    #[ignore = "T16.10: cross-crate TreeMap layout drift РІР‚вЂќ fix belongs in native-builtins/src/phases_late.rs availableCharsets (TM_FIELD_SIZE=1 assumption)"]
     fn charset_available_charsets_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
@@ -45658,8 +45658,8 @@ mod tests {
         use std::io::Write;
 
         // Build a tiny JAR with:
-        //   META-INF/services/com.example.MyService  в†’ com.example.FooImpl
-        //   (FooImpl class file is absent вЂ” loader should gracefully skip it)
+        //   META-INF/services/com.example.MyService  РІвЂ вЂ™ com.example.FooImpl
+        //   (FooImpl class file is absent РІР‚вЂќ loader should gracefully skip it)
         let tmp = std::env::temp_dir().join("rustjvm_sl_test.jar");
         {
             let file = std::fs::File::create(&tmp).unwrap();
@@ -45678,7 +45678,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Build a Class mirror with a 1-field object storing ClassId(999) (unknown class).
-        // s1_service_loader_ensure_loaded will call class_name_of_id(999) в†’ None в†’ return empty.
+        // s1_service_loader_ensure_loaded will call class_name_of_id(999) РІвЂ вЂ™ None РІвЂ вЂ™ return empty.
         let mirror = shared.heap.alloc_object(ClassId::new(0), 1);
         shared.heap.set_field(mirror, 0, Value::Int(999));
 
@@ -45695,7 +45695,7 @@ mod tests {
         .unwrap();
         assert!(matches!(sl, Value::Object(Some(_))));
 
-        // iterator() must not panic вЂ” returns empty iterator for unknown class
+        // iterator() must not panic РІР‚вЂќ returns empty iterator for unknown class
         let itr = call_native(
             &shared,
             &mut thread,
@@ -47356,7 +47356,7 @@ mod tests {
             .unwrap();
             assert_eq!(f, Value::Int(0));
 
-            // next вЂ” finds next boundary
+            // next РІР‚вЂќ finds next boundary
             let n = call_native(
                 &shared,
                 &mut thread,
@@ -47468,7 +47468,7 @@ mod tests {
         shared.heap.set_field(ws_obj, 1, Value::Int(0)); // count
         shared.heap.set_field(ws_obj, 2, Value::Int(1)); // open = true
 
-        // poll returns None (no events вЂ” no directory registered)
+        // poll returns None (no events РІР‚вЂќ no directory registered)
         let key = call_native(
             &shared,
             &mut thread,
@@ -47673,7 +47673,7 @@ mod tests {
             .unwrap();
             assert!(matches!(named, Value::Object(Some(_))));
 
-            // start with a null runnable вЂ” thread starts but run() finds no target
+            // start with a null runnable РІР‚вЂќ thread starts but run() finds no target
             let thr = call_native(
                 &shared,
                 &mut thread,
@@ -47788,7 +47788,7 @@ mod tests {
         )
         .unwrap();
 
-        // unread one char вЂ” OK
+        // unread one char РІР‚вЂќ OK
         call_native(
             &shared,
             &mut thread,
@@ -47799,7 +47799,7 @@ mod tests {
         )
         .unwrap();
 
-        // unread again вЂ” should fail (buffer overflow)
+        // unread again РІР‚вЂќ should fail (buffer overflow)
         let result = call_native(
             &shared,
             &mut thread,
@@ -48051,7 +48051,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let g = "java/util/stream/Gatherer";
 
-        // Gatherer.of(integrator) вЂ” pass null integrator
+        // Gatherer.of(integrator) РІР‚вЂќ pass null integrator
         let gatherer = call_native(
             &shared,
             &mut thread,
@@ -48247,7 +48247,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(sz, Value::Long(1024));
 
-                // isNative вЂ” segments from Arena are backed by native memory
+                // isNative РІР‚вЂќ segments from Arena are backed by native memory
                 let native = call_native(
                     &shared,
                     &mut thread,
@@ -49423,7 +49423,7 @@ mod tests {
         assert!(matches!(nf, Value::Object(Some(_))));
 
         if let Value::Object(Some(obj)) = nf {
-            // format 1500 в†’ "2K" (rounds)
+            // format 1500 РІвЂ вЂ™ "2K" (rounds)
             let result = call_native(
                 &shared,
                 &mut thread,
@@ -49444,7 +49444,7 @@ mod tests {
                 assert_eq!(text, "1K");
             }
 
-            // format 2_500_000 в†’ "2M"
+            // format 2_500_000 РІвЂ вЂ™ "2M"
             let result2 = call_native(
                 &shared,
                 &mut thread,
@@ -49876,7 +49876,7 @@ mod tests {
         )
         .unwrap();
 
-        // write, finish, close вЂ” all no-ops
+        // write, finish, close РІР‚вЂќ all no-ops
         call_native(
             &shared,
             &mut thread,
@@ -50899,7 +50899,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let zw = zip::ZipWriter::new(file);
-            // No entries вЂ” just write out the End-Of-Central-Directory record.
+            // No entries РІР‚вЂќ just write out the End-Of-Central-Directory record.
             zw.finish().unwrap();
         }
         let zip_path_str = zip_path.to_string_lossy().into_owned();
@@ -51400,7 +51400,7 @@ mod tests {
         };
         assert_eq!(r1s, "fooBar");
 
-        // Two uppercase letters at start в†’ unchanged
+        // Two uppercase letters at start РІвЂ вЂ™ unchanged
         let s2 = create_java_string(&shared, "URL");
         let r2 = call_native(
             &shared,
@@ -51990,7 +51990,7 @@ mod tests {
             .set_array_element(arr, 3, Value::Double(1.23456789012345));
         let _ = shared.heap.set_array_element(arr, 4, Value::Object(None));
 
-        // Read back via unboxing path вЂ” auto-unboxing should return original values
+        // Read back via unboxing path РІР‚вЂќ auto-unboxing should return original values
         assert_eq!(
             shared.heap.get_array_element_unboxing(arr, 0).unwrap(),
             Value::Int(10)
@@ -52026,7 +52026,7 @@ mod tests {
 
     #[test]
     fn compact_ref_array_2d_matrix() {
-        // Allocate int[3][3] вЂ” outer Object[] with inner int[] arrays
+        // Allocate int[3][3] РІР‚вЂќ outer Object[] with inner int[] arrays
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let outer = shared
             .heap
@@ -52260,7 +52260,7 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // stream() on present в†’ Stream with 1 element
+        // stream() on present РІвЂ вЂ™ Stream with 1 element
         let stream = call_native(
             &shared,
             &mut thread,
@@ -52350,7 +52350,7 @@ mod tests {
             _ => panic!("expected Optional"),
         };
 
-        // or() on present в†’ returns self (the same Optional)
+        // or() on present РІвЂ вЂ™ returns self (the same Optional)
         // We pass null as supplier since it should not be called
         let result = call_native(
             &shared,
@@ -52461,7 +52461,7 @@ mod tests {
             .unwrap();
         }
 
-        // toArray(IntFunction) в†’ should return same elements as toArray()
+        // toArray(IntFunction) РІвЂ вЂ™ should return same elements as toArray()
         let arr = call_native(
             &shared,
             &mut thread,
@@ -52696,7 +52696,7 @@ mod tests {
             "different record classes should not be equal"
         );
 
-        // Same class, same values в†’ equal
+        // Same class, same values РІвЂ вЂ™ equal
         let rec3 = shared.heap.alloc_object(cid1, 2);
         shared.heap.set_field(rec3, 0, Value::Int(42));
         shared.heap.set_field(rec3, 1, Value::Int(99));
@@ -52865,7 +52865,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase C: Java 21 вЂ” SequencedCollection, Virtual Threads, Emoji, etc.
+    // Phase C: Java 21 РІР‚вЂќ SequencedCollection, Virtual Threads, Emoji, etc.
     // =========================================================================
 
     #[test]
@@ -53344,7 +53344,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase C: Java 21 вЂ” Pattern Matching for Switch (JEP 441)
+    // Phase C: Java 21 РІР‚вЂќ Pattern Matching for Switch (JEP 441)
     // =========================================================================
 
     #[test]
@@ -53651,7 +53651,7 @@ mod tests {
             crate::runtime::invokedynamic::execute_type_switch(&shared, &mut thread, 0, &labels);
         assert!(result.is_ok());
         let val = thread.frames[0].stack.pop().unwrap();
-        // "hello" is at index 1 but startIndex=2 skips it в†’ no match
+        // "hello" is at index 1 but startIndex=2 skips it РІвЂ вЂ™ no match
         assert_eq!(val, Value::Int(-1));
     }
 
@@ -53734,11 +53734,11 @@ mod tests {
             crate::runtime::invokedynamic::execute_enum_switch(&shared, &mut thread, 0, &labels);
         assert!(result.is_ok());
         let val = thread.frames[0].stack.pop().unwrap();
-        assert_eq!(val, Value::Int(2)); // null в†’ labels.len()
+        assert_eq!(val, Value::Int(2)); // null РІвЂ вЂ™ labels.len()
     }
 
     // =========================================================================
-    // Phase C: Java 21 вЂ” Virtual Threads (JEP 444)
+    // Phase C: Java 21 РІР‚вЂќ Virtual Threads (JEP 444)
     // =========================================================================
 
     #[test]
@@ -53780,7 +53780,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase D: Java 25 вЂ” Stream Gatherers, Scoped Values, Structured Concurrency
+    // Phase D: Java 25 РІР‚вЂќ Stream Gatherers, Scoped Values, Structured Concurrency
     // =========================================================================
 
     #[test]
@@ -53918,7 +53918,7 @@ mod tests {
             &[Value::Object(Some(scope))],
         )
         .unwrap();
-        // join does not change state in new impl вЂ” state remains OPEN(0)
+        // join does not change state in new impl РІР‚вЂќ state remains OPEN(0)
         assert_eq!(shared.heap.get_field(scope, 1), Value::Int(0));
 
         // Close
@@ -54289,7 +54289,7 @@ mod tests {
         )
         .unwrap();
 
-        // Read byte at offset 0 вЂ” should be -1 (0xFF as signed byte)
+        // Read byte at offset 0 РІР‚вЂќ should be -1 (0xFF as signed byte)
         let byte_layout = call_native(
             &shared,
             &mut thread,
@@ -54358,7 +54358,7 @@ mod tests {
         );
         let _ = shared.heap.set_array_element(params, 0, int_layout);
 
-        // Create descriptor: int(int) в†’ int
+        // Create descriptor: int(int) РІвЂ вЂ™ int
         let desc = call_native(&shared, &mut thread, fd, "of",
             "(Ljava/lang/foreign/ValueLayout;[Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/FunctionDescriptor;",
             &[int_layout, Value::Object(Some(params))]).unwrap().unwrap();
@@ -54437,7 +54437,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase E2: Panama FFI вЂ” Struct Layouts, Upcalls, String Marshaling
+    // Phase E2: Panama FFI РІР‚вЂќ Struct Layouts, Upcalls, String Marshaling
     // =========================================================================
 
     #[test]
@@ -54545,7 +54545,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // sequenceLayout(10, JAVA_INT) в†’ 40 bytes
+        // sequenceLayout(10, JAVA_INT) РІвЂ вЂ™ 40 bytes
         let seq = call_native(
             &shared,
             &mut thread,
@@ -54631,7 +54631,7 @@ mod tests {
 
     #[test]
     fn panama_upcall_table_pe2() {
-        // Test UpcallTable directly вЂ” use a real heap object as target
+        // Test UpcallTable directly РІР‚вЂќ use a real heap object as target
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let target_obj = shared.heap.alloc_object(ClassId::new(0), 1);
 
@@ -54924,7 +54924,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // struct { byte, int } в†’ byte(1) + pad(3) + int(4) = 8 bytes
+        // struct { byte, int } РІвЂ вЂ™ byte(1) + pad(3) + int(4) = 8 bytes
         let byte_layout = call_native(
             &shared,
             &mut thread,
@@ -55030,7 +55030,7 @@ mod tests {
         .unwrap();
 
         if let Value::Object(Some(u)) = ul {
-            // union(int, long) в†’ size = max(4, 8) = 8
+            // union(int, long) РІвЂ вЂ™ size = max(4, 8) = 8
             assert_eq!(shared.heap.get_field(u, 1), Value::Long(8));
         }
     }
@@ -55239,12 +55239,12 @@ mod tests {
     #[test]
     #[allow(clippy::vec_init_then_push)]
     fn jit_scanner_accepts_tableswitch() {
-        // Simple method: iload_0, tableswitch(0,1 в†’ cases), iconst_1, ireturn, iconst_2, ireturn, iconst_0, ireturn
+        // Simple method: iload_0, tableswitch(0,1 РІвЂ вЂ™ cases), iconst_1, ireturn, iconst_2, ireturn, iconst_0, ireturn
         let mut code = Vec::new();
         code.push(0x1a); // iload_0 (pc=0)
         code.push(0xaa); // tableswitch (pc=1)
         code.push(0x00);
-        code.push(0x00); // padding to align pc=1 в†’ next 4-aligned = 4
+        code.push(0x00); // padding to align pc=1 РІвЂ вЂ™ next 4-aligned = 4
                          // At offset 4: default=24, low=0, high=1
         code.extend_from_slice(&24i32.to_be_bytes()); // default
         code.extend_from_slice(&0i32.to_be_bytes()); // low
@@ -55332,7 +55332,7 @@ mod tests {
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
-        // Neither loaded вЂ” should be optimistic
+        // Neither loaded РІР‚вЂќ should be optimistic
         assert!(
             hierarchy.is_subclass("java/lang/String", "java/lang/CharSequence"),
             "Optimistic fallback: neither loaded should return true"
@@ -55354,7 +55354,7 @@ mod tests {
         };
         let config = VmConfig::new().with_classpath(vec![cp1, cp2]);
         let shared = Arc::new(SharedVm::new(config));
-        // Load all jdk-streams classes вЂ” none should fail to load
+        // Load all jdk-streams classes РІР‚вЂќ none should fail to load
         let classes = [
             "org/renaissance/jdk/streams/JavaScrabble",
             "org/renaissance/jdk/streams/Scrabble",
@@ -55383,7 +55383,7 @@ mod tests {
 
         // This tests the invokevirtual arg-type check:
         //   pop_typed(frame, ObjectRef("CharSequence"), hierarchy)
-        //   actual = ObjectRef("String")  в†’  is_subclass("String", "CharSequence") must be true
+        //   actual = ObjectRef("String")  РІвЂ вЂ™  is_subclass("String", "CharSequence") must be true
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         {
             let mut cm = shared.class_manager.write();
@@ -55414,19 +55414,19 @@ mod tests {
         // Static method: (Ljava/lang/String;Ljava/util/regex/Pattern;)Ljava/util/regex/Matcher;
         // locals: 0=String s, 1=Pattern p
         // Bytecode:
-        //   aload_1  (Pattern)       в†’ push Pattern
-        //   aload_0  (String)        в†’ push String (as CharSequence arg)
-        //   invokevirtual #1         в†’ Pattern.matcher(CharSequence)
-        //   areturn                  в†’ return Matcher
+        //   aload_1  (Pattern)       РІвЂ вЂ™ push Pattern
+        //   aload_0  (String)        РІвЂ вЂ™ push String (as CharSequence arg)
+        //   invokevirtual #1         РІвЂ вЂ™ Pattern.matcher(CharSequence)
+        //   areturn                  РІвЂ вЂ™ return Matcher
         let code = CodeAttribute {
             max_stack: 2,
             max_locals: 2,
-            code: vec![
+            code: rustjvm_reader::ByteView::from_vec(vec![
                 0x2B,             // aload_1 (Pattern, local 1)
                 0x2A,             // aload_0 (String, local 0)
                 0xB6, 0x00, 0x01, // invokevirtual #1  Pattern.matcher(CharSequence)
                 0xB0,             // areturn (return Matcher)
-            ].into(),
+            ]),
             exception_table: vec![],
             attributes: vec![],
         };
@@ -55470,7 +55470,7 @@ mod tests {
             array_info: None,
         };
 
-        // Should verify without error вЂ” String is assignable to CharSequence
+        // Should verify without error РІР‚вЂќ String is assignable to CharSequence
         let result = verify_bytecode(&class, &hierarchy);
         assert!(result.is_ok(), "Verification should pass: {result:?}");
     }
@@ -55560,7 +55560,7 @@ mod tests {
     fn data_streams_int_round_trip_p72() {
         let mut vm = Vm::new(VmConfig::default());
 
-        // --- Write side: DOS в†’ BAOS ---
+        // --- Write side: DOS РІвЂ вЂ™ BAOS ---
         let baos = alloc_named(&mut vm, "java/io/ByteArrayOutputStream", 2);
         call_native(&vm.shared, &mut vm.main_thread,
             "java/io/ByteArrayOutputStream", "<init>", "()V",
@@ -55585,7 +55585,7 @@ mod tests {
         assert_eq!(vm.shared.heap.get_array_element(byte_arr, 2), Ok(Value::Int(0x56)));
         assert_eq!(vm.shared.heap.get_array_element(byte_arr, 3), Ok(Value::Int(0x78)));
 
-        // --- Read side: DIS в†ђ BAIS ---
+        // --- Read side: DIS РІвЂ С’ BAIS ---
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
         call_native(&vm.shared, &mut vm.main_thread,
             "java/io/ByteArrayInputStream", "<init>", "([B)V",
@@ -55795,12 +55795,12 @@ mod tests {
 
         // [1, 0xFF, 0x01, 0x02, 0x00, 0x41, 0]
         let src_arr = vm.shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 7);
-        let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(1));     // readBoolean в†’ true
-        let _ = vm.shared.heap.set_array_element(src_arr, 1, Value::Int(0xFF));  // readByte в†’ -1
+        let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(1));     // readBoolean РІвЂ вЂ™ true
+        let _ = vm.shared.heap.set_array_element(src_arr, 1, Value::Int(0xFF));  // readByte РІвЂ вЂ™ -1
         let _ = vm.shared.heap.set_array_element(src_arr, 2, Value::Int(0x01));  // readShort hi
-        let _ = vm.shared.heap.set_array_element(src_arr, 3, Value::Int(0x02));  // readShort lo в†’ 258
+        let _ = vm.shared.heap.set_array_element(src_arr, 3, Value::Int(0x02));  // readShort lo РІвЂ вЂ™ 258
         let _ = vm.shared.heap.set_array_element(src_arr, 4, Value::Int(0x00));  // readUnsignedShort hi
-        let _ = vm.shared.heap.set_array_element(src_arr, 5, Value::Int(0x41));  // readUnsignedShort lo в†’ 65
+        let _ = vm.shared.heap.set_array_element(src_arr, 5, Value::Int(0x41));  // readUnsignedShort lo РІвЂ вЂ™ 65
         let _ = vm.shared.heap.set_array_element(src_arr, 6, Value::Int(0));
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
@@ -56019,7 +56019,7 @@ mod tests {
         // For synthetic stubs, native methods should be called (existing behavior)
         let mut vm = Vm::new(VmConfig::default());
 
-        // StringBuilder is a synthetic stub вЂ” verify its <init> dispatches to native
+        // StringBuilder is a synthetic stub РІР‚вЂќ verify its <init> dispatches to native
         let sb = vm.shared.heap.alloc_object(ClassId::new(0), 2);
         let result = call_native(
             &vm.shared, &mut vm.main_thread,
@@ -56192,7 +56192,7 @@ mod tests {
 
     #[test]
     fn real_jdk_invoke_object_hashcode() {
-        // Object.hashCode() is ACC_NATIVE вЂ” should dispatch to our native registry
+        // Object.hashCode() is ACC_NATIVE РІР‚вЂќ should dispatch to our native registry
         let Some(mut vm) = vm_with_real_jdk() else { return; };
 
         // Allocate an Object
@@ -56215,7 +56215,7 @@ mod tests {
 
     #[test]
     fn real_jdk_invoke_integer_valueof() {
-        // Integer.valueOf(int) вЂ” should be non-native bytecode in real JDK
+        // Integer.valueOf(int) РІР‚вЂќ should be non-native bytecode in real JDK
         let Some(mut vm) = vm_with_real_jdk() else { return; };
 
         let result = invoke_or_native(
@@ -56224,7 +56224,7 @@ mod tests {
             &[Value::Int(42)],
         );
         eprintln!("[real_jdk] Integer.valueOf(42) = {:?}", result);
-        // This will likely fail on <clinit> or missing natives вЂ” log what happens
+        // This will likely fail on <clinit> or missing natives РІР‚вЂќ log what happens
         match &result {
             Ok(Some(Value::Object(Some(_)))) => {
                 eprintln!("[real_jdk] Integer.valueOf(42) returned an object (SUCCESS)");
@@ -56234,7 +56234,7 @@ mod tests {
             }
             Err(e) => {
                 eprintln!("[real_jdk] Integer.valueOf(42) failed: {:?}", e);
-                // This is expected to fail initially вЂ” don't assert
+                // This is expected to fail initially РІР‚вЂќ don't assert
             }
         }
     }
@@ -56275,7 +56275,7 @@ mod tests {
 
     #[test]
     fn real_jdk_object_equals_bytecode() {
-        // Object.equals(Object) is non-native bytecode вЂ” tests "aload_0, aload_1, if_acmpeq"
+        // Object.equals(Object) is non-native bytecode РІР‚вЂќ tests "aload_0, aload_1, if_acmpeq"
         let Some(mut vm) = vm_with_real_jdk() else { return; };
 
         // Allocate objects with correct field count for real Object class
@@ -56325,7 +56325,7 @@ mod tests {
 
     #[test]
     fn real_jdk_integer_valueof_creates_object() {
-        // Integer.valueOf(42) в†’ verify it creates an object via real JDK bytecode
+        // Integer.valueOf(42) РІвЂ вЂ™ verify it creates an object via real JDK bytecode
         // Note: field access by name fails because JIT allocates objects with ClassId(0)
         // instead of real Integer ClassId. This is a known JIT limitation to be fixed.
         let Some(mut vm) = vm_with_real_jdk() else { return; };
@@ -56341,7 +56341,7 @@ mod tests {
 
     #[test]
     fn real_jdk_integer_valueof_returns_object() {
-        // Integer.valueOf(int) вЂ” this executes real JDK bytecode via the interpreter!
+        // Integer.valueOf(int) РІР‚вЂќ this executes real JDK bytecode via the interpreter!
         let Some(mut vm) = vm_with_real_jdk() else { return; };
 
         let result = invoke_or_native(
@@ -56355,7 +56355,7 @@ mod tests {
             "Integer.valueOf should return an Integer object");
     }
 
-    /// WP0.1 regression вЂ” Multiple `System.out.println(String)` calls must all
+    /// WP0.1 regression РІР‚вЂќ Multiple `System.out.println(String)` calls must all
     /// dispatch to the Rust native, even after the real JDK's
     /// `java/io/PrintStream` class has been loaded (which happens automatically
     /// when `vm_with_real_jdk` is used and `java.base.jmod` is on the boot
@@ -56364,7 +56364,7 @@ mod tests {
     /// Pre-fix symptom: the first `println` call went through the slow path
     /// and hit the native. The VtableManager fast path (`execute_invokevirtual_vtable_fast`)
     /// then observed the vtable populated from the real JDK bytecode and, on
-    /// the second call, dispatched to real JDK `PrintStream.println` bytecode вЂ”
+    /// the second call, dispatched to real JDK `PrintStream.println` bytecode РІР‚вЂќ
     /// which NPEs on `textOut.write(s)` because our synthetic PrintStream
     /// object only has field 0 populated (fd_id).
     ///
@@ -56379,7 +56379,7 @@ mod tests {
 
         let (out_ref, _err_ref) = vm.shared.ensure_system_streams();
 
-        // Five sequential println(String) calls вЂ” each must hit the Rust
+        // Five sequential println(String) calls РІР‚вЂќ each must hit the Rust
         // native, never the real JDK bytecode (whose field dependencies are
         // not satisfied by our synthetic PrintStream object).
         let lines = ["one", "two", "three", "four", "five"];
@@ -56414,7 +56414,7 @@ mod tests {
         // This triggers <clinit> which may call registerNatives()
         let Some(mut vm) = vm_with_real_jdk() else { return; };
 
-        // Try to initialize Object вЂ” should work (Object has a trivial <clinit> or none)
+        // Try to initialize Object РІР‚вЂќ should work (Object has a trivial <clinit> or none)
         let result = {
             let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
             ctx.ensure_class_initialized("java/lang/Object")
@@ -56435,7 +56435,7 @@ mod tests {
             }
         }
 
-        // Initialize Boolean вЂ” its <clinit> runs real JDK bytecode
+        // Initialize Boolean РІР‚вЂќ its <clinit> runs real JDK bytecode
         {
             let mut ctx = NativeContextImpl { shared: &vm.shared, thread: &mut vm.main_thread };
             ctx.ensure_class_initialized("java/lang/Boolean")
@@ -56527,7 +56527,7 @@ mod tests {
         assert!(native_count < 2700,
             "Real JDK mode should have < 2700 native stubs, got {}", native_count);
 
-        // ---- Step 2: Integer.valueOf(42) в†’ real bytecode execution ----
+        // ---- Step 2: Integer.valueOf(42) РІвЂ вЂ™ real bytecode execution ----
         let result = invoke_or_native(
             &vm.shared, &mut vm.main_thread,
             "java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;",
@@ -56568,7 +56568,7 @@ mod tests {
             }
         }
 
-        // ---- Step 4: String.valueOf(42) в†’ exercises more real JDK bytecode ----
+        // ---- Step 4: String.valueOf(42) РІвЂ вЂ™ exercises more real JDK bytecode ----
         let result = invoke_or_native(
             &vm.shared, &mut vm.main_thread,
             "java/lang/String", "valueOf", "(I)Ljava/lang/String;",
@@ -56584,9 +56584,9 @@ mod tests {
             }
             Err(e) => {
                 // String.valueOf(int) calls Integer.toString(int) which is more complex.
-                // Log it but don't hard-fail вЂ” the Integer.valueOf test above already
+                // Log it but don't hard-fail РІР‚вЂќ the Integer.valueOf test above already
                 // proves real bytecode execution.
-                eprintln!("[real_jdk_e2e] String.valueOf(42) failed: {:?} (acceptable вЂ” complex call chain)", e);
+                eprintln!("[real_jdk_e2e] String.valueOf(42) failed: {:?} (acceptable РІР‚вЂќ complex call chain)", e);
             }
         }
 
@@ -56825,7 +56825,7 @@ mod tests {
                 "(Ljava/lang/Object;)Z", &[Value::Object(Some(list)), Value::Object(Some(s))]).unwrap();
         }
 
-        // Swap index 0 and 2: [a,b,c] в†’ [c,b,a]
+        // Swap index 0 and 2: [a,b,c] РІвЂ вЂ™ [c,b,a]
         call_native(&shared, &mut thread, "java/util/Collections", "swap",
             "(Ljava/util/List;II)V", &[Value::Object(Some(list)), Value::Int(0), Value::Int(2)]).unwrap();
 
@@ -56882,7 +56882,7 @@ mod tests {
                 "(Ljava/lang/Object;)Z", &[Value::Object(Some(list)), Value::Int(v)]).unwrap();
         }
 
-        // Rotate by 1: [10,20,30] в†’ [30,10,20]
+        // Rotate by 1: [10,20,30] РІвЂ вЂ™ [30,10,20]
         call_native(&shared, &mut thread, "java/util/Collections", "rotate",
             "(Ljava/util/List;I)V", &[Value::Object(Some(list)), Value::Int(1)]).unwrap();
 
@@ -56952,7 +56952,7 @@ mod tests {
         )
         .unwrap();
 
-        // Get suppressed вЂ” should return array of length 2
+        // Get suppressed РІР‚вЂќ should return array of length 2
         let result = call_native(
             &shared,
             &mut thread,
@@ -57013,7 +57013,7 @@ mod tests {
     // Phase 43: CRITICAL gap fixes
     // =======================================================================
 
-    /// G7: Streams groupingBy with downstream toList вЂ” inline path avoids
+    /// G7: Streams groupingBy with downstream toList РІР‚вЂќ inline path avoids
     /// recursive native_stream_collect and potential stack overflow.
     #[test]
     fn streams_grouping_by_downstream_to_list() {
@@ -57045,7 +57045,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // Create classifier lambda: String.length() в†’ groups by string length
+        // Create classifier lambda: String.length() РІвЂ вЂ™ groups by string length
         let classifier = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -57087,11 +57087,11 @@ mod tests {
         )
         .unwrap();
 
-        // Should not stack overflow вЂ” result is a Map
+        // Should not stack overflow РІР‚вЂќ result is a Map
         assert!(result.is_some());
     }
 
-    /// G7: Streams groupingBy with counting downstream вЂ” inline path.
+    /// G7: Streams groupingBy with counting downstream РІР‚вЂќ inline path.
     #[test]
     fn streams_grouping_by_downstream_counting() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -57268,7 +57268,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Pattern.compile("a.b", Pattern.LITERAL) вЂ” the dot should be literal
+        // Pattern.compile("a.b", Pattern.LITERAL) РІР‚вЂќ the dot should be literal
         let pat_str = create_java_string(&shared, "a.b");
         let result = call_native(
             &shared,
@@ -57382,7 +57382,7 @@ mod tests {
         assert_eq!(end, Some(Value::Int(6))); // "123def" has length 6
     }
 
-    /// G37: Multi-catch вЂ” multiple exception table entries with same handler_pc.
+    /// G37: Multi-catch РІР‚вЂќ multiple exception table entries with same handler_pc.
     /// This test verifies the interpreter's find_exception_handler iterates all entries.
     #[test]
     fn multi_catch_exception_handler() {
@@ -57390,13 +57390,13 @@ mod tests {
         // but we verify the handler lookup behavior: multiple entries for the same
         // PC range pointing to the same handler_pc, with different catch_type values.
         // This is validated by the find_exception_handler function which iterates
-        // all exception table entries вЂ” multi-catch "just works" at bytecode level.
+        // all exception table entries РІР‚вЂќ multi-catch "just works" at bytecode level.
         //
         // Verified correct: find_exception_handler at interpreter.rs:2374 iterates
         // all entries with `for entry in frame.exception_table().iter()`, and any
         // matching catch_type (or catch_type==0 for catch-all) returns the handler_pc.
         // Multi-catch produces multiple entries: {start, end, handler, IOException},
-        // {start, end, handler, SQLException}, etc. вЂ” all naturally matched.
+        // {start, end, handler, SQLException}, etc. РІР‚вЂќ all naturally matched.
     }
 
     // =======================================================================
@@ -57502,7 +57502,7 @@ mod tests {
         }
     }
 
-    /// DecimalFormat pattern parsing вЂ” "#,##0.00" should format with 2 decimal places.
+    /// DecimalFormat pattern parsing РІР‚вЂќ "#,##0.00" should format with 2 decimal places.
     #[test]
     fn decimal_format_pattern_parsing() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -57559,7 +57559,7 @@ mod tests {
         .unwrap();
 
         match result {
-            Some(Value::Object(Some(_))) => {} // non-null вЂ” correct
+            Some(Value::Object(Some(_))) => {} // non-null РІР‚вЂќ correct
             other => panic!("getClassLoader should return non-null, got {:?}", other),
         }
     }
@@ -57857,7 +57857,7 @@ mod tests {
         assert_eq!(result, Some(Value::Int(2))); // index 2
     }
 
-    /// Properties registration exists вЂ” verified by method lookup.
+    /// Properties registration exists РІР‚вЂќ verified by method lookup.
     /// (Full round-trip test requires NativeContextImpl with array support.)
     #[test]
     fn properties_registered() {
@@ -58189,7 +58189,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G66: Scoped Values (JEP 506) вЂ” carrier chain binding
+    // G66: Scoped Values (JEP 506) РІР‚вЂќ carrier chain binding
     // =========================================================================
 
     #[test]
@@ -58250,7 +58250,7 @@ mod tests {
             _ => panic!("expected carrier"),
         };
 
-        // carrier2.run(null) вЂ” binds both SVs then unbinds
+        // carrier2.run(null) РІР‚вЂќ binds both SVs then unbinds
         call_native(&shared, &mut thread,
             "java/lang/ScopedValue$Carrier", "run", "(Ljava/lang/Runnable;)V",
             &[Value::Object(Some(carrier2_ref)), Value::Object(None)]).unwrap();
@@ -58289,7 +58289,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G67: Structured Concurrency (JEP 505) вЂ” state validation
+    // G67: Structured Concurrency (JEP 505) РІР‚вЂќ state validation
     // =========================================================================
 
     #[test]
@@ -58441,7 +58441,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G68: Primitive Patterns (JEP 507) вЂ” registration verification
+    // G68: Primitive Patterns (JEP 507) РІР‚вЂќ registration verification
     // =========================================================================
 
     #[test]
@@ -58460,7 +58460,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G69: Stable Values (JEP 502) вЂ” registration verification
+    // G69: Stable Values (JEP 502) РІР‚вЂќ registration verification
     // =========================================================================
 
     #[test]
@@ -58478,7 +58478,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G70: Module Import Declarations (JEP 511) вЂ” registration + behavior
+    // G70: Module Import Declarations (JEP 511) РІР‚вЂќ registration + behavior
     // =========================================================================
 
     #[test]
@@ -58505,7 +58505,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G71: Flexible Constructor Bodies (JEP 513) вЂ” registration + behavior
+    // G71: Flexible Constructor Bodies (JEP 513) РІР‚вЂќ registration + behavior
     // =========================================================================
 
     #[test]
@@ -58545,7 +58545,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G72: Compact Source Files / Instance Main (JEP 512) вЂ” registration
+    // G72: Compact Source Files / Instance Main (JEP 512) РІР‚вЂќ registration
     // =========================================================================
 
     #[test]
@@ -58581,7 +58581,7 @@ mod tests {
     }
 
     // =========================================================================
-    // G73: Vector API (JEP 508) вЂ” ByteVector, ShortVector, cross-type ops
+    // G73: Vector API (JEP 508) РІР‚вЂќ ByteVector, ShortVector, cross-type ops
     // =========================================================================
 
     #[test]
@@ -59013,7 +59013,7 @@ mod tests {
 
     #[test]
     fn m5_jit_skip_set_does_not_block_user_classes() {
-        // Verify the JIT skip set starts empty вЂ” user classes are not pre-blocked
+        // Verify the JIT skip set starts empty РІР‚вЂќ user classes are not pre-blocked
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let skip_set = shared.jit_skip_set.read();
         assert!(skip_set.is_empty(), "JIT skip set should start empty");
@@ -59096,12 +59096,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M7 вЂ” Panic site hardening: verify graceful failure instead of crash
+    // M7 РІР‚вЂќ Panic site hardening: verify graceful failure instead of crash
     // -----------------------------------------------------------------------
 
     #[test]
     fn m7_jit_scan_rejects_invalid_bytecode_gracefully() {
-        // Empty bytecode вЂ” jit_scan should handle without panicking
+        // Empty bytecode РІР‚вЂќ jit_scan should handle without panicking
         let empty: [u8; 0] = [];
         let _ = crate::jit::x64::jit_scan(&empty, 0, "()V"); // must not panic
         // Single invalid opcode should not panic
@@ -59147,7 +59147,7 @@ mod tests {
         // ARM64 backend pop_operand on empty stack should set failed flag, not panic
         use crate::jit::aarch64_backend::Arm64Backend;
         let mut backend = Arm64Backend::new();
-        // pop on empty stack вЂ” must not panic
+        // pop on empty stack РІР‚вЂќ must not panic
         let _reg = backend.pop_operand();
         // The backend should mark itself as failed
         assert!(backend.failed, "pop on empty stack should set failed flag");
@@ -59160,12 +59160,12 @@ mod tests {
         // iadd with nothing on stack
         let code = [0x60, 0xac, 0, 0]; // iadd, ireturn
         let scan = crate::jit::x64::jit_scan(&code, 2, "()I");
-        // scan may reject (None) or accept вЂ” either way, no panic
+        // scan may reject (None) or accept РІР‚вЂќ either way, no panic
         let _ = scan;
     }
 
     // -----------------------------------------------------------------------
-    // M2 вЂ” Default interface methods: verify resolution walks interfaces
+    // M2 РІР‚вЂќ Default interface methods: verify resolution walks interfaces
     // -----------------------------------------------------------------------
 
     #[test]
@@ -59232,12 +59232,12 @@ mod tests {
         // This is a compile-time verification that the fix is in place.
         let mut v = vec![f64::NAN, 1.0, f64::NAN, 2.0];
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Should not panic вЂ” NaN ordering is stable
+        // Should not panic РІР‚вЂќ NaN ordering is stable
         assert_eq!(v.len(), 4);
     }
 
     // -----------------------------------------------------------------------
-    // M3 вЂ” Function.andThen/compose: synthetic composition classes
+    // M3 РІР‚вЂќ Function.andThen/compose: synthetic composition classes
     // -----------------------------------------------------------------------
 
     #[test]
@@ -59249,7 +59249,7 @@ mod tests {
         let func1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let func2 = shared.heap.alloc_object(ClassId::new(0), 2);
 
-        // Call Function.andThen вЂ” should create a Function$AndThen composite
+        // Call Function.andThen РІР‚вЂќ should create a Function$AndThen composite
         let result = call_native(
             &shared, &mut thread,
             "java/util/function/Function", "andThen",
@@ -59292,7 +59292,7 @@ mod tests {
             &[],
         ).unwrap().unwrap();
 
-        // Apply identity to an object вЂ” should return the same object
+        // Apply identity to an object РІР‚вЂќ should return the same object
         let obj = shared.heap.alloc_object(ClassId::new(0), 0);
         let identity_ref = match identity {
             Value::Object(Some(r)) => r,
@@ -59352,7 +59352,7 @@ mod tests {
             assert!(!and_then_class.interfaces.is_empty(),
                 "Function$AndThen should implement Function interface");
         }
-        // (If the class isn't loaded yet via call_native, that's OK вЂ” the interface
+        // (If the class isn't loaded yet via call_native, that's OK РІР‚вЂќ the interface
         // registration is in jdk_interfaces which is applied at class load time)
     }
 
@@ -59460,7 +59460,7 @@ mod tests {
 
 
     // -----------------------------------------------------------------------
-    // M4 вЂ” GC heap exhaustion: verify GC-and-retry and larger heap
+    // M4 РІР‚вЂќ GC heap exhaustion: verify GC-and-retry and larger heap
     // -----------------------------------------------------------------------
 
     #[test]
@@ -59468,7 +59468,7 @@ mod tests {
         // Verify the default heap is large enough for non-trivial programs.
         // Young gen semi-spaces are now 16MB each (was 8MB).
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        // Allocate many objects вЂ” should not panic
+        // Allocate many objects РІР‚вЂќ should not panic
         for _i in 0..1000 {
             let _obj = shared.heap.alloc_object(ClassId::new(0), 4);
         }
@@ -59479,7 +59479,7 @@ mod tests {
         // Verify try_alloc_object returns None instead of panicking
         use rustjvm_gc::{VmHeap, GcBackend};
         let heap = VmHeap::new(GcBackend::Generational, 4096); // tiny heap
-        // Try to allocate a large object вЂ” should return None
+        // Try to allocate a large object РІР‚вЂќ should return None
         let result = heap.try_alloc_object(ClassId::new(0), 10_000);
         assert!(result.is_none(), "try_alloc_object should return None on OOM, not panic");
     }
@@ -59494,7 +59494,7 @@ mod tests {
 
     #[test]
     fn m4_heavy_allocation_does_not_crash() {
-        // Simulate heavy allocation вЂ” the kind that caused segfaults before M4.
+        // Simulate heavy allocation РІР‚вЂќ the kind that caused segfaults before M4.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Allocate 5000 objects with fields (simulating 8+ test cycles)
         for _ in 0..5000 {
@@ -59519,7 +59519,7 @@ mod tests {
         let mut roots: Vec<ObjectRef> = Vec::new();
         for _ in 0..2000 {
             match heap.try_alloc_object(ClassId::new(0), 4) {
-                Some(_obj) => {} // ephemeral вЂ” don't root
+                Some(_obj) => {} // ephemeral РІР‚вЂќ don't root
                 None => {
                     // GC and retry
                     let _result = heap.collect_garbage(&mut roots, &monitors);
@@ -59599,7 +59599,7 @@ mod tests {
     #[test]
     fn m4_massive_allocation_with_gc() {
         // Simulate a workload that previously crashed after 8+ test cycles.
-        // This allocates ~20,000 objects and ~5,000 arrays вЂ” well beyond
+        // This allocates ~20,000 objects and ~5,000 arrays РІР‚вЂќ well beyond
         // what would fit in the old 8MB young gen without GC.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         for _ in 0..20_000 {
@@ -59614,7 +59614,7 @@ mod tests {
 
     #[test]
     fn m4_concurrent_heavy_allocation() {
-        // Multiple threads allocating heavily вЂ” exercises TLAB + shared path.
+        // Multiple threads allocating heavily РІР‚вЂќ exercises TLAB + shared path.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let threads: Vec<_> = (0..4).map(|_| {
             let s = shared.clone();
@@ -59630,7 +59630,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M6 вЂ” Multi-thread execution: prove two+ threads run concurrently
+    // M6 РІР‚вЂќ Multi-thread execution: prove two+ threads run concurrently
     // -----------------------------------------------------------------------
 
     #[test]
@@ -59682,7 +59682,7 @@ mod tests {
         t1.join().expect("thread 1 panicked");
         t2.join().expect("thread 2 panicked");
 
-        // Both fields should have been written вЂ” read final values
+        // Both fields should have been written РІР‚вЂќ read final values
         let v0 = shared.heap.get_field(obj, 0);
         let v1 = shared.heap.get_field(obj, 1);
         match (v0, v1) {
@@ -59829,7 +59829,7 @@ mod tests {
 
     #[test]
     fn m6_four_threads_concurrent_allocation() {
-        // Four threads allocate simultaneously вЂ” stress test for heap concurrency.
+        // Four threads allocate simultaneously РІР‚вЂќ stress test for heap concurrency.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let handles: Vec<_> = (0..4).map(|_| {
             let s = shared.clone();
@@ -59849,7 +59849,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M12 вЂ” Annotation reflection tests
+    // M12 РІР‚вЂќ Annotation reflection tests
     // -----------------------------------------------------------------------
 
     /// Helper: build a ConstantPool with UTF-8 entries at 1-based indices.
@@ -59926,7 +59926,7 @@ mod tests {
     fn m12_convert_annotation_with_int_element() {
         use rustjvm_reader::attribute::{ElementValuePair, ElementValue};
         use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-        // @Retention(value=1)  вЂ” simplified: int element
+        // @Retention(value=1)  РІР‚вЂќ simplified: int element
         // CP: [0]=Tombstone, [1]="Ljava/lang/annotation/Retention;", [2]="value", [3]=Integer(1)
         let cp = ConstantPool::new(vec![
             ConstantPoolEntry::Tombstone,
@@ -60021,7 +60021,7 @@ mod tests {
             });
         }
 
-        // Use the NativeContextImpl to get class_annotations вЂ” we go through the VM
+        // Use the NativeContextImpl to get class_annotations РІР‚вЂќ we go through the VM
         // the same way the native methods do.
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
@@ -60032,7 +60032,7 @@ mod tests {
 
     #[test]
     fn m12_annotation_matching_descriptor_format() {
-        // Verify the annotation matching convention: class name в†’ "L<name>;"
+        // Verify the annotation matching convention: class name РІвЂ вЂ™ "L<name>;"
         // This is the pattern used by isAnnotationPresent and getAnnotation.
         let class_name = "org/springframework/stereotype/Component";
         let target_desc = format!("L{};", class_name);
@@ -60120,7 +60120,7 @@ mod tests {
     #[test]
     fn m12_convert_annotation_array_element() {
         use rustjvm_reader::attribute::{ElementValuePair, ElementValue};
-        // @Target({ElementType.TYPE, ElementType.FIELD})  вЂ” simplified as string array
+        // @Target({ElementType.TYPE, ElementType.FIELD})  РІР‚вЂќ simplified as string array
         // CP: [0]=Tombstone, [1]="Ltarget;", [2]="value", [3]="TYPE", [4]="FIELD"
         let cp = annotation_cp(&["Ltarget;", "value", "TYPE", "FIELD"]);
         let ann = mk_annotation_with_elems(1, vec![
@@ -60188,7 +60188,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M14 вЂ” HTTP client/server on real sockets
+    // M14 РІР‚вЂќ HTTP client/server on real sockets
     // -----------------------------------------------------------------------
 
     #[test]
@@ -60346,7 +60346,7 @@ mod tests {
 
     #[test]
     fn m14_http_server_large_response_body() {
-        // Server returns a large response body (10KB) вЂ” tests buffered I/O.
+        // Server returns a large response body (10KB) РІР‚вЂќ tests buffered I/O.
         use std::net::TcpListener;
         use std::io::{Read, Write};
 
@@ -60391,7 +60391,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M16 вЂ” JSON (Jackson/Gson) reflection-based serialization
+    // M16 РІР‚вЂќ JSON (Jackson/Gson) reflection-based serialization
     // -----------------------------------------------------------------------
 
     /// Helper: create a class with given field definitions for M16 tests.
@@ -60700,7 +60700,7 @@ mod tests {
     }
 
     // =====================================================================
-    // M20 вЂ” Weak/Soft reference processing wired to GC
+    // M20 РІР‚вЂќ Weak/Soft reference processing wired to GC
     // =====================================================================
 
     #[test]
@@ -61375,7 +61375,7 @@ mod tests {
                 shared.heap.set_field(robj, 1, Value::Int(1)); // enqueued sentinel
             }
         }
-        // Poll from queue вЂ” should return the weak ref
+        // Poll from queue РІР‚вЂќ should return the weak ref
         let poll_result = call_native(&shared, &mut thread,
             "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
             &[Value::Object(Some(queue))]).unwrap().unwrap();
@@ -61604,7 +61604,7 @@ mod tests {
                 shared.heap.set_field(robj, 1, Value::Int(1));
             }
         }
-        // Poll should return both refs (LIFO order вЂ” last enqueued is head)
+        // Poll should return both refs (LIFO order РІР‚вЂќ last enqueued is head)
         let poll1 = call_native(&shared, &mut thread,
             "java/lang/ref/ReferenceQueue", "poll", "()Ljava/lang/ref/Reference;",
             &[Value::Object(Some(queue))]).unwrap().unwrap();
@@ -61664,7 +61664,7 @@ mod tests {
         let queue_addr = queue.as_ptr() as usize;
         {
             let mut proc = shared.ref_processor.lock();
-            // Plenty of memory вЂ” soft ref should NOT be cleared
+            // Plenty of memory РІР‚вЂќ soft ref should NOT be cleared
             let is_marked = |addr: usize| -> bool { addr == soft_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 1024, 0);
             assert_eq!(result.stats.soft_refs_cleared, 0, "S28: soft ref should NOT be cleared");
@@ -61778,7 +61778,7 @@ mod tests {
 
     #[test]
     fn s30_concurrent_10_threads_same_class() {
-        // 10 threads all load the same class simultaneously вЂ” all must get the same ClassId
+        // 10 threads all load the same class simultaneously РІР‚вЂќ all must get the same ClassId
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let barrier = Arc::new(std::sync::Barrier::new(10));
         let results: Vec<_> = (0..10)
@@ -61802,7 +61802,7 @@ mod tests {
 
     #[test]
     fn s30_concurrent_10_threads_different_classes() {
-        // 10 threads each load a different class simultaneously вЂ” no deadlock, all succeed
+        // 10 threads each load a different class simultaneously РІР‚вЂќ no deadlock, all succeed
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let barrier = Arc::new(std::sync::Barrier::new(10));
         let class_names = vec![
@@ -61960,7 +61960,7 @@ mod tests {
 
     #[test]
     fn s30_class_loading_lock_prevents_duplicate_work() {
-        // Two threads race to load the same unloaded class вЂ” only one should actually load it.
+        // Two threads race to load the same unloaded class РІР‚вЂќ only one should actually load it.
         // Both should get the same ClassId.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -62010,7 +62010,7 @@ mod tests {
         shared.heap.set_field(field, 5, Value::Object(Some(desc))); // descriptor
         shared.heap.set_field(field, 6, Value::Int(0)); // NOT accessible
 
-        // Try Field.get on a private field without setAccessible вЂ” should fail
+        // Try Field.get on a private field without setAccessible РІР‚вЂќ should fail
         let result = call_native(
             &shared, &mut thread,
             "java/lang/reflect/Field", "get",
@@ -62078,7 +62078,7 @@ mod tests {
         let class_name = create_java_string(&shared, "java/lang/Object");
         shared.heap.set_field(class_mirror, 1, Value::Object(Some(class_name)));
 
-        // Field 1: private+static, accessible=true в†’ should succeed.
+        // Field 1: private+static, accessible=true РІвЂ вЂ™ should succeed.
         let field = shared.heap.alloc_object(field_class_id, 12);
         shared.heap.set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
         shared.heap.set_field(field, 2, Value::Int(0));                     // slot
@@ -62087,7 +62087,7 @@ mod tests {
         shared.heap.set_field(field, 5, Value::Int(0x000A));                // modifiers: PRIVATE | STATIC
         shared.heap.set_field(field, 9, Value::Int(1));                     // extra: accessible=true
 
-        // Field 2: private+static, accessible=false в†’ should be rejected.
+        // Field 2: private+static, accessible=false РІвЂ вЂ™ should be rejected.
         let field2 = shared.heap.alloc_object(field_class_id, 12);
         shared.heap.set_field(field2, 1, Value::Object(Some(class_mirror))); // clazz
         shared.heap.set_field(field2, 2, Value::Int(0));                     // slot
@@ -62119,7 +62119,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Create an instance field that holds an Object вЂ” test on an instance
+        // Create an instance field that holds an Object РІР‚вЂќ test on an instance
         // First create a receiver object with a field that has an Object value
         let receiver = shared.heap.alloc_object(ClassId::new(0), 4);
         shared.heap.set_field(receiver, 0, Value::Object(None)); // slot 0 = null object
@@ -62304,7 +62304,7 @@ mod tests {
 
     #[test]
     fn m14_decode_chunked_body() {
-        // Test the chunked decoder directly вЂ” it's in native-builtins but we can
+        // Test the chunked decoder directly РІР‚вЂќ it's in native-builtins but we can
         // verify through the registered native methods indirectly. For now, test
         // the HTTP client creates a valid HttpClient object.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -62468,7 +62468,7 @@ mod tests {
             assert_eq!(proxies.len(), MAX_LAMBDA_PROXIES);
         }
 
-        // Attempt to insert one more via make_lambda_proxy вЂ” the inner insert
+        // Attempt to insert one more via make_lambda_proxy РІР‚вЂќ the inner insert
         // should be silently rejected (map stays at MAX_LAMBDA_PROXIES)
         let _proxy = make_lambda_proxy(
             &shared,
@@ -62598,7 +62598,7 @@ mod tests {
     }
 
     // =====================================================================
-    // M10 вЂ” toString on non-wrapper objects (virtual dispatch)
+    // M10 РІР‚вЂќ toString on non-wrapper objects (virtual dispatch)
     // =====================================================================
 
     /// ArrayList containing Integer wrappers should toString as [10, 20, 30],
@@ -62778,7 +62778,7 @@ mod tests {
     }
 
     // =====================================================================
-    // M22 пїЅпїЅпїЅ RSA/ECDSA signing end-to-end
+    // M22 РїС—Р…РїС—Р…РїС—Р… RSA/ECDSA signing end-to-end
     // =====================================================================
 
     /// Helper: generate a key pair for the given algorithm via native calls.
@@ -62965,7 +62965,7 @@ mod tests {
         let (_kp, _pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "RSA", 512);
         let sig1 = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, b"message A");
         let sig2 = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, b"message B");
-        // Read first byte of each signature вЂ” they should differ (with overwhelming probability)
+        // Read first byte of each signature РІР‚вЂќ they should differ (with overwhelming probability)
         let len1 = shared.heap.array_length(sig1);
         let len2 = shared.heap.array_length(sig2);
         assert_eq!(len1, len2, "M22: signatures should be same length");
@@ -63114,7 +63114,7 @@ mod tests {
         let (_kp2, pub2, _priv2) = m22_generate_keypair(&shared, &mut thread, "EC", 256);
         let data = b"cross-key test";
         let signature = m22_sign(&shared, &mut thread, "SHA384withECDSA", priv1, data);
-        // Verify with a different key pair's public key вЂ” should fail
+        // Verify with a different key pair's public key РІР‚вЂќ should fail
         let valid = m22_verify(&shared, &mut thread, "SHA384withECDSA", pub2, data, signature);
         assert!(!valid, "M22: ECDSA verify with wrong key should fail");
     }
@@ -63295,7 +63295,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M6: Multi-thread execution вЂ” prove two threads run Java code correctly
+    // M6: Multi-thread execution РІР‚вЂќ prove two threads run Java code correctly
     // simultaneously using the real VM infrastructure.
     // -----------------------------------------------------------------------
 
@@ -63499,7 +63499,7 @@ mod tests {
     fn m6_concurrent_invoke_shared_with_allocation() {
         // Two threads call native methods via invoke_shared that allocate objects
         // on the shared heap. Proves end-to-end thread safety of the full
-        // invoke_shared в†’ native callback в†’ heap allocation path.
+        // invoke_shared РІвЂ вЂ™ native callback РІвЂ вЂ™ heap allocation path.
         fn native_alloc_objects(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let count = match args.get(0) { Some(Value::Int(v)) => *v, _ => 10 };
             let mut last_obj = None;
@@ -63583,7 +63583,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase 86.1 вЂ” Two-thread execution tests (volatile, join)
+    // Phase 86.1 РІР‚вЂќ Two-thread execution tests (volatile, join)
     // =====================================================================
 
     #[test]
@@ -63849,7 +63849,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase 86.3 вЂ” ThreadGroup implementation tests
+    // Phase 86.3 РІР‚вЂќ ThreadGroup implementation tests
     // =====================================================================
 
     /// Helper: create SharedVm with builtins registered (for ThreadGroup tests).
@@ -63863,7 +63863,7 @@ mod tests {
 
     #[test]
     fn p86_thread_group_hierarchy() {
-        // Verify ThreadGroup parent-child hierarchy: system в†’ main.
+        // Verify ThreadGroup parent-child hierarchy: system РІвЂ вЂ™ main.
         let shared = p86_shared_with_builtins();
         let mut thread = JvmThread::new(ThreadId(0), "main");
         let tg_class = "java/lang/ThreadGroup";
@@ -63977,7 +63977,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase 86.4 вЂ” Thread interruption & daemon thread tests
+    // Phase 86.4 РІР‚вЂќ Thread interruption & daemon thread tests
     // =====================================================================
 
     #[test]
@@ -64058,7 +64058,7 @@ mod tests {
             shared1.thread_registry.set_interrupted(tid, true);
         });
 
-        // Enter monitor and wait with timeout вЂ” should return after interrupt
+        // Enter monitor and wait with timeout РІР‚вЂќ should return after interrupt
         let mut ctx = NativeContextImpl { shared: &shared, thread: &mut thread };
         ctx.monitor_enter(lock);
         let _result = ctx.monitor_wait(lock, Some(500)); // 500ms timeout, but interrupt should wake us
@@ -64085,7 +64085,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase 86.2 вЂ” ConcurrentHashMap segmented concurrency tests
+    // Phase 86.2 РІР‚вЂќ ConcurrentHashMap segmented concurrency tests
     // =====================================================================
 
     /// Helper: create SharedVm with collection natives registered (for CHM tests).
@@ -64283,7 +64283,7 @@ mod tests {
     }
 
     // =====================================================================
-    // M7 вЂ” panic!() removal: panics become catchable exceptions
+    // M7 РІР‚вЂќ panic!() removal: panics become catchable exceptions
     // =====================================================================
 
     #[test]
@@ -64367,7 +64367,7 @@ mod tests {
                 );
             }
             MethodCallFailed::InternalError(e) => {
-                // In synthetic mode, the exception class may not be loadable вЂ”
+                // In synthetic mode, the exception class may not be loadable РІР‚вЂќ
                 // InternalError is acceptable as a fallback.
                 let msg = format!("{:?}", e);
                 assert!(
@@ -64756,7 +64756,7 @@ mod tests {
                     rustjvm_reader::attribute::CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
-                        code: vec![0x04, 0xAC].into(), // iconst_1; ireturn
+                        code: rustjvm_reader::ByteView::from_vec(vec![0x04, 0xAC]), // iconst_1; ireturn
                         exception_table: vec![],
                         attributes: vec![],
                     },
@@ -64870,7 +64870,7 @@ public class SkippedTest {
         assert!(desc.is_test);
         assert_eq!(desc.main_class.as_deref(), Some("rustjvm.TckClassFile"));
 
-        // Execute the test вЂ” the .class file already exists from build.rs
+        // Execute the test РІР‚вЂќ the .class file already exists from build.rs
         let class_path = format!("{}/rustjvm/TckClassFile.class", test_dir);
         if !std::path::Path::new(&class_path).exists() {
             // Skip if .class files not available
@@ -64923,7 +64923,7 @@ public class SkippedTest {
         let passed = results.iter().filter(|r| r.is_pass()).count();
         let total = results.len();
         assert_eq!(total, 5, "should have 5 Chapter 4 tests");
-        // Track pass rate вЂ” all 5 should pass since these are basic class file ops
+        // Track pass rate РІР‚вЂќ all 5 should pass since these are basic class file ops
         assert!(
             passed >= 3,
             "Chapter 4 pass rate too low: {}/{} ({:.0}%)",
@@ -65119,7 +65119,7 @@ public class SkippedTest {
         let d = call_native(&shared, &mut thread, "java/time/Period", "getDays", "()I", &[period]).unwrap().unwrap();
         assert_eq!(d, Value::Int(3));
 
-        // Period.addTo(LocalDate.of(2024, 1, 15)) в†’ 2025-03-18
+        // Period.addTo(LocalDate.of(2024, 1, 15)) РІвЂ вЂ™ 2025-03-18
         let date = call_native(
             &shared,
             &mut thread,
@@ -65247,7 +65247,7 @@ public class SkippedTest {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // 2024 is a leap year вЂ” Feb 29 should exist
+        // 2024 is a leap year РІР‚вЂќ Feb 29 should exist
         let date = call_native(
             &shared,
             &mut thread,
@@ -65315,7 +65315,7 @@ public class SkippedTest {
             &[],
         ).unwrap().unwrap();
 
-        // Apply: date.with(firstDayOfMonth) в†’ 2024-03-01
+        // Apply: date.with(firstDayOfMonth) РІвЂ вЂ™ 2024-03-01
         let first = call_native(
             &shared,
             &mut thread,
@@ -65339,7 +65339,7 @@ public class SkippedTest {
             &[],
         ).unwrap().unwrap();
 
-        // Apply: date.with(lastDayOfMonth) в†’ 2024-03-31
+        // Apply: date.with(lastDayOfMonth) РІвЂ вЂ™ 2024-03-31
         let last = call_native(
             &shared,
             &mut thread,
@@ -65439,7 +65439,7 @@ public class SkippedTest {
             &[Value::Object(Some(b_obj)), Value::Object(Some(b_str))],
         ).unwrap();
 
-        // divide(b, 2, HALF_UP=4) вЂ” 10/3 = 3.33 (scale=2)
+        // divide(b, 2, HALF_UP=4) РІР‚вЂќ 10/3 = 3.33 (scale=2)
         let result = call_native(
             &shared, &mut thread,
             "java/math/BigDecimal", "divide",
@@ -65483,7 +65483,7 @@ public class SkippedTest {
             "(Ljava/math/BigDecimal;)I",
             &[Value::Object(Some(a)), Value::Object(Some(b))],
         ).unwrap().unwrap();
-        // 3.14 > 2.71 в†’ positive
+        // 3.14 > 2.71 РІвЂ вЂ™ positive
         assert!(matches!(cmp, Value::Int(v) if v > 0), "3.14 > 2.71");
     }
 
@@ -65535,7 +65535,7 @@ public class SkippedTest {
         };
         assert_eq!(gcd_str, "4");
 
-        // isProbablePrime(7) в†’ true
+        // isProbablePrime(7) РІвЂ вЂ™ true
         let seven = shared.heap.alloc_object(ClassId::new(0), 2);
         let seven_s = create_java_string(&shared, "7");
         call_native(&shared, &mut thread, "java/math/BigInteger", "<init>", "(Ljava/lang/String;)V",
@@ -65647,7 +65647,7 @@ public class SkippedTest {
             &[Value::Object(Some(primary)), Value::Object(Some(suppressed))],
         ).unwrap();
 
-        // getSuppressed вЂ” should return array of length 1
+        // getSuppressed РІР‚вЂќ should return array of length 1
         let arr = call_native(
             &shared, &mut thread,
             "java/lang/Throwable", "getSuppressed", "()[Ljava/lang/Throwable;",
@@ -65663,7 +65663,7 @@ public class SkippedTest {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Exception with no suppressions в†’ empty array
+        // Exception with no suppressions РІвЂ вЂ™ empty array
         let exc = shared.heap.alloc_object(ClassId::new(0), 3);
         let arr = call_native(
             &shared, &mut thread,
@@ -65709,7 +65709,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create stream of strings: ["a", "bb", "cc", "ddd", "ee"]
-        // Classifier: String::length в†’ groups by length
+        // Classifier: String::length РІвЂ вЂ™ groups by length
         let words = ["a", "bb", "cc", "ddd", "ee"];
         let arr = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Reference, words.len());
         for (i, w) in words.iter().enumerate() {
@@ -65761,7 +65761,7 @@ public class SkippedTest {
             &[stream, collector],
         ).unwrap().unwrap();
 
-        // Result should be a Map вЂ” verify it's not null
+        // Result should be a Map РІР‚вЂќ verify it's not null
         assert!(matches!(result, Value::Object(Some(_))), "groupingBy should return a Map");
     }
 
@@ -65834,7 +65834,7 @@ public class SkippedTest {
         ).unwrap().unwrap();
 
         // Simple groupingBy (no downstream, defaults to toList)
-        // Classifier: first letter вЂ” we use String.length for simplicity
+        // Classifier: first letter РІР‚вЂќ we use String.length for simplicity
         let classifier = make_lambda_proxy(
             &shared,
             "java/util/function/Function",
@@ -65942,7 +65942,7 @@ public class SkippedTest {
         let _ = std::fs::remove_file(&tmp_path);
     }
 
-    /// 94.1 Test 3: Checksum verification вЂ” corrupted archive is rejected.
+    /// 94.1 Test 3: Checksum verification РІР‚вЂќ corrupted archive is rejected.
     #[test]
     fn cds_checksum_verification() {
         use std::io::Write;
@@ -66052,7 +66052,7 @@ public class SkippedTest {
         let _ = std::fs::remove_file(&tmp_path);
     }
 
-    /// 94.2 Test 3: Startup time delta вЂ” CDS loading is faster than cold loading.
+    /// 94.2 Test 3: Startup time delta РІР‚вЂќ CDS loading is faster than cold loading.
     #[test]
     fn cds_startup_time_improvement() {
         let tmp = std::env::temp_dir().join("rustjvm_cds_test_timing.jsa");
@@ -66099,7 +66099,7 @@ public class SkippedTest {
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
-        // Phase 1: new вЂ” all fields zeroed
+        // Phase 1: new РІР‚вЂќ all fields zeroed
         assert_eq!(mic.cached_class_id.load(Ordering::Relaxed), 0);
         assert_eq!(mic.cached_entry_ptr.load(Ordering::Relaxed), 0);
 
@@ -66154,7 +66154,7 @@ public class SkippedTest {
         mic.record_hit();
         mic.record_hit();
 
-        // Class changes to Cat вЂ” miss triggers update
+        // Class changes to Cat РІР‚вЂќ miss triggers update
         mic.record_miss();
         mic.update(2, "Cat", 0x2000, true);
 
@@ -66210,7 +66210,7 @@ public class SkippedTest {
         for h in handles { h.join().unwrap(); }
 
         assert_eq!(mic.total_observations(), 1050);
-        // Mostly monomorphic: 1000 hits vs 50 misses в†’ ~95% hit rate
+        // Mostly monomorphic: 1000 hits vs 50 misses РІвЂ вЂ™ ~95% hit rate
         assert!(mic.hit_rate_pct() >= 90);
         assert!(mic.is_monomorphic());
     }
@@ -66220,7 +66220,7 @@ public class SkippedTest {
         use rustjvm_jit::JitMICSlot;
 
         let mic = JitMICSlot::new();
-        // 60% hits, 40% misses вЂ” not mono (< 90%), not mega (> 50%)
+        // 60% hits, 40% misses РІР‚вЂќ not mono (< 90%), not mega (> 50%)
         for _ in 0..15 { mic.record_hit(); }
         for _ in 0..10 { mic.record_miss(); }
         assert!(!mic.is_monomorphic());
@@ -66255,7 +66255,7 @@ public class SkippedTest {
         let entry = mic.cached_entry_ptr.load(Ordering::Acquire);
         assert_eq!(cid, 5);
         assert_eq!(entry, 0);
-        // The jit_invoke_virtual_mic code checks: if entry != 0 в†’ direct call
+        // The jit_invoke_virtual_mic code checks: if entry != 0 РІвЂ вЂ™ direct call
         // Otherwise falls through to name-based dispatch
     }
 
@@ -66300,7 +66300,7 @@ public class SkippedTest {
         code.extend_from_slice(&default_off);
         code.extend_from_slice(&0i32.to_be_bytes()); // low=0
         code.extend_from_slice(&2i32.to_be_bytes()); // high=2
-        // Offsets for case 0,1,2 в†’ body at PC 28, 32, 36
+        // Offsets for case 0,1,2 РІвЂ вЂ™ body at PC 28, 32, 36
         for i in 0..3 {
             let off = ((28 + i * 4) as i32 - 1).to_be_bytes();
             code.extend_from_slice(&off);
@@ -66337,10 +66337,10 @@ public class SkippedTest {
         code.extend_from_slice(&default_off);
         code.extend_from_slice(&2i32.to_be_bytes()); // npairs=2
 
-        // pair 0: key=10, offset в†’ PC 28
+        // pair 0: key=10, offset РІвЂ вЂ™ PC 28
         code.extend_from_slice(&10i32.to_be_bytes());
         code.extend_from_slice(&(27i32).to_be_bytes()); // 28-1=27
-        // pair 1: key=20, offset в†’ PC 32
+        // pair 1: key=20, offset РІвЂ вЂ™ PC 32
         code.extend_from_slice(&20i32.to_be_bytes());
         code.extend_from_slice(&(31i32).to_be_bytes()); // 32-1=31
 
@@ -66402,7 +66402,7 @@ public class SkippedTest {
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), // pic_slots (HIGH-7) — none for this switch-table-only test bytecode
+            Vec::new(), // pic_slots (HIGH-7) вЂ” none for this switch-table-only test bytecode
             Vec::new(), Vec::new(), std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             &helpers,
@@ -66462,7 +66462,7 @@ public class SkippedTest {
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), // pic_slots (HIGH-7) — none for this switch-table-only test bytecode
+            Vec::new(), // pic_slots (HIGH-7) вЂ” none for this switch-table-only test bytecode
             Vec::new(), Vec::new(), std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             &helpers,
@@ -66479,7 +66479,7 @@ public class SkippedTest {
     }
 
     // -----------------------------------------------------------------------
-    // S36 вЂ” JIT Deoptimization
+    // S36 РІР‚вЂќ JIT Deoptimization
     // -----------------------------------------------------------------------
 
     #[test]
@@ -66638,7 +66638,7 @@ public class SkippedTest {
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
-        // Trigger multiple deopts вЂ” the tiered manager should track the deopt count
+        // Trigger multiple deopts РІР‚вЂќ the tiered manager should track the deopt count
         for _ in 0..5 {
             crate::jit::helpers::DeoptimizationController::deoptimize(
                 &vm,
@@ -66666,7 +66666,7 @@ public class SkippedTest {
 
     #[test]
     fn s36_deopt_count_based_escalation_lifecycle() {
-        // Test the full escalation path: Reinterpret в†’ RecompileAndReinterpret в†’ MakeNotEntrant в†’ MakeNotCompilable
+        // Test the full escalation path: Reinterpret РІвЂ вЂ™ RecompileAndReinterpret РІвЂ вЂ™ MakeNotEntrant РІвЂ вЂ™ MakeNotCompilable
         let config = crate::config::VmConfig {
             use_synthetic_jdk: true,
             ..Default::default()
@@ -66676,13 +66676,13 @@ public class SkippedTest {
 
         let reason = rustjvm_jit::deopt::DeoptReason::BoundsCheck;
 
-        // First deopt в†’ Reinterpret
+        // First deopt РІвЂ вЂ™ Reinterpret
         let a1 = crate::jit::helpers::DeoptimizationController::deoptimize(
             &vm, "C", "m", "()V", reason, 0,
         );
         assert_eq!(a1, rustjvm_jit::deopt::DeoptAction::Reinterpret);
 
-        // Deopts 2..10 в†’ RecompileAndReinterpret (count < threshold/2 = 10)
+        // Deopts 2..10 РІвЂ вЂ™ RecompileAndReinterpret (count < threshold/2 = 10)
         for _ in 1..10 {
             let a = crate::jit::helpers::DeoptimizationController::deoptimize(
                 &vm, "C", "m", "()V", reason, 0,
@@ -66690,7 +66690,7 @@ public class SkippedTest {
             assert_eq!(a, rustjvm_jit::deopt::DeoptAction::RecompileAndReinterpret);
         }
 
-        // Deopts 11..20 в†’ MakeNotEntrant (count in threshold/2..threshold)
+        // Deopts 11..20 РІвЂ вЂ™ MakeNotEntrant (count in threshold/2..threshold)
         for _ in 10..20 {
             let a = crate::jit::helpers::DeoptimizationController::deoptimize(
                 &vm, "C", "m", "()V", reason, 0,
@@ -66698,7 +66698,7 @@ public class SkippedTest {
             assert_eq!(a, rustjvm_jit::deopt::DeoptAction::MakeNotEntrant);
         }
 
-        // Deopt 21+ в†’ MakeNotCompilable (count >= threshold)
+        // Deopt 21+ РІвЂ вЂ™ MakeNotCompilable (count >= threshold)
         let a_final = crate::jit::helpers::DeoptimizationController::deoptimize(
             &vm, "C", "m", "()V", reason, 0,
         );
@@ -66743,7 +66743,7 @@ public class SkippedTest {
     }
 
     // -----------------------------------------------------------------------
-    // T5.4.4 вЂ” CHA listener eviction (cha_invalidation)
+    // T5.4.4 РІР‚вЂќ CHA listener eviction (cha_invalidation)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -66797,7 +66797,7 @@ public class SkippedTest {
             );
         }
 
-        // Simulate loading a subclass `Dog` вЂ” this is the CHA-breaking
+        // Simulate loading a subclass `Dog` РІР‚вЂќ this is the CHA-breaking
         // event. We simulate it by calling the public listener directly:
         // in production this is invoked from `load_class_concurrent`.
         let evicted = vm.invalidate_jit_for_class("Animal");
@@ -66842,7 +66842,7 @@ public class SkippedTest {
         let evicted = vm.invalidate_jit_for_class("Unrelated");
         assert_eq!(
             evicted, 0,
-            "no assumptions on `Unrelated` вЂ” nothing to evict"
+            "no assumptions on `Unrelated` РІР‚вЂќ nothing to evict"
         );
         assert_eq!(
             vm.jit_cache.read().len(),
@@ -66919,7 +66919,7 @@ public class SkippedTest {
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
-        // BoundsCheck reason (code 2) вЂ” used by speculative BCE deopt stubs
+        // BoundsCheck reason (code 2) РІР‚вЂќ used by speculative BCE deopt stubs
         let action = crate::jit::helpers::DeoptimizationController::deoptimize(
             &vm,
             "TestClass",
@@ -67022,7 +67022,7 @@ public class SkippedTest {
 
         // Method should be evicted from JIT cache
         assert!(vm.jit_cache.read().get(&cn, &mn, &desc).is_none());
-        // First deopt в†’ recompile (not blacklist)
+        // First deopt РІвЂ вЂ™ recompile (not blacklist)
         assert_ne!(action, rustjvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Trigger many more deopts to escalate to blacklist
@@ -67047,7 +67047,7 @@ public class SkippedTest {
     }
 
     // -----------------------------------------------------------------------
-    // S31 вЂ” JIT Method Inlining (integration tests)
+    // S31 РІР‚вЂќ JIT Method Inlining (integration tests)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -67119,7 +67119,7 @@ public class SkippedTest {
 
         assert_eq!(cache.len(), 3);
 
-        // Invalidate for "Helper" вЂ” should evict methodB and methodC but not methodA
+        // Invalidate for "Helper" РІР‚вЂќ should evict methodB and methodC but not methodA
         let evicted = cache.invalidate_for_class("Helper");
         assert_eq!(evicted, 2);
         assert_eq!(cache.len(), 1);
@@ -67185,7 +67185,7 @@ public class SkippedTest {
     }
 
     // -----------------------------------------------------------------------
-    // S41 вЂ” JFR Event Completeness
+    // S41 РІР‚вЂќ JFR Event Completeness
     // -----------------------------------------------------------------------
 
     #[test]
@@ -67326,7 +67326,7 @@ public class SkippedTest {
     }
 
     // -----------------------------------------------------------------------
-    // S42 вЂ” Heap Dump Support (HPROF)
+    // S42 РІР‚вЂќ Heap Dump Support (HPROF)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -67530,7 +67530,7 @@ public class SkippedTest {
     }
 
     // ===================================================================
-    // Session 52: JDK 25 вЂ” Structured Concurrency (JEP 480/505)
+    // Session 52: JDK 25 РІР‚вЂќ Structured Concurrency (JEP 480/505)
     // ===================================================================
 
     #[test]
@@ -67613,23 +67613,23 @@ public class SkippedTest {
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
 
-        // Load StructuredTaskScope вЂ” should succeed with 8 fields
+        // Load StructuredTaskScope РІР‚вЂќ should succeed with 8 fields
         let result = vm.load_class_concurrent("java/util/concurrent/StructuredTaskScope");
         assert!(result.is_ok(), "Should load StructuredTaskScope: {:?}", result.err());
 
-        // Load Joiner вЂ” should succeed with 4 fields
+        // Load Joiner РІР‚вЂќ should succeed with 4 fields
         let result = vm.load_class_concurrent("java/util/concurrent/StructuredTaskScope$Joiner");
         assert!(result.is_ok(), "Should load Joiner: {:?}", result.err());
 
-        // Load Config вЂ” should succeed with 3 fields
+        // Load Config РІР‚вЂќ should succeed with 3 fields
         let result = vm.load_class_concurrent("java/util/concurrent/StructuredTaskScope$Config");
         assert!(result.is_ok(), "Should load Config: {:?}", result.err());
 
-        // Load Subtask вЂ” should succeed with 4 fields
+        // Load Subtask РІР‚вЂќ should succeed with 4 fields
         let result = vm.load_class_concurrent("java/util/concurrent/StructuredTaskScope$Subtask");
         assert!(result.is_ok(), "Should load Subtask: {:?}", result.err());
 
-        // Load ScopedValue вЂ” should succeed with 3 fields
+        // Load ScopedValue РІР‚вЂќ should succeed with 3 fields
         let result = vm.load_class_concurrent("java/lang/ScopedValue");
         assert!(result.is_ok(), "Should load ScopedValue: {:?}", result.err());
     }
@@ -67637,9 +67637,9 @@ public class SkippedTest {
     #[test]
     fn s52_joiner_policy_constants_exposed() {
         // Validate the mapping: joiner policies map to scope policies correctly
-        // allSuccessful в†’ ShutdownOnFailure (auto-shutdown on first failure)
-        // anySuccessful в†’ ShutdownOnSuccess (auto-shutdown on first success)
-        // awaitAll в†’ Base (no auto-shutdown)
+        // allSuccessful РІвЂ вЂ™ ShutdownOnFailure (auto-shutdown on first failure)
+        // anySuccessful РІвЂ вЂ™ ShutdownOnSuccess (auto-shutdown on first success)
+        // awaitAll РІвЂ вЂ™ Base (no auto-shutdown)
         let config = crate::config::VmConfig {
             use_synthetic_jdk: true,
             ..Default::default()
@@ -67702,7 +67702,7 @@ public class SkippedTest {
     }
 
     // ===================================================================
-    // Session 54: JDK 25 вЂ” Compact Object Headers (JEP 450)
+    // Session 54: JDK 25 РІР‚вЂќ Compact Object Headers (JEP 450)
     // ===================================================================
 
     #[test]
@@ -68074,7 +68074,7 @@ public class SkippedTest {
         };
         let cleanable = unsafe { ObjectRef::from_raw(cleanable_addr as *mut u8) };
 
-        // Call Cleanable.clean() вЂ” first call frees the memory.
+        // Call Cleanable.clean() РІР‚вЂќ first call frees the memory.
         call_native(
             &shared, &mut thread,
             "java/lang/ref/Cleaner$Cleanable", "clean", "()V",
@@ -68093,18 +68093,18 @@ public class SkippedTest {
         assert_eq!(live_after_second, live_after_first, "second clean() must be a no-op");
     }
 
-    /// T10.9.A вЂ” integration test: after registering a class through
+    /// T10.9.A РІР‚вЂќ integration test: after registering a class through
     /// `register_test_class`, the VM-wide `VtableManager` must carry an
     /// installed vtable for that class, and `resolve_virtual_slot` must
     /// return an entry whose `resolved_method` is populated whenever
     /// the class loader's `VtableSlotDescriptor.dispatch` was carried
-    /// through вЂ” the pre-build adapter plumbing.
+    /// through РІР‚вЂќ the pre-build adapter plumbing.
     ///
-    /// This closes the loop: class-define в†’ descriptor build в†’ install
-    /// hook в†’ `VtableEntry.resolved_method`. It covers A.1 (extended
+    /// This closes the loop: class-define РІвЂ вЂ™ descriptor build РІвЂ вЂ™ install
+    /// hook РІвЂ вЂ™ `VtableEntry.resolved_method`. It covers A.1 (extended
     /// VtableEntry), A.2 (populated at link-time), and A.5 (unit test
     /// proving no additional `class_manager.read()` is needed on a
-    /// vtable hit вЂ” the entry is fully self-contained).
+    /// vtable hit РІР‚вЂќ the entry is fully self-contained).
     #[test]
     fn t10_9_a_vtable_manager_populated_for_registered_class() {
         use rustjvm_reader::attribute::{Attribute, CodeAttribute};
@@ -68121,7 +68121,7 @@ public class SkippedTest {
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 1,
-                code: vec![0xb1].into(), // return
+                code: rustjvm_reader::ByteView::from_vec(vec![0xb1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             })],
@@ -68140,7 +68140,7 @@ public class SkippedTest {
         // `vtable_manager`. We bypass the global adapter because
         // `OnceLock<GLOBAL_VTABLE_MANAGER>` would route writes to
         // whichever SharedVm was first constructed in this process,
-        // not to the one we just created вЂ” a normal multi-test
+        // not to the one we just created РІР‚вЂќ a normal multi-test
         // isolation concern that doesn't exist in production
         // (SharedVm-per-process convention).
         //
@@ -68182,7 +68182,7 @@ public class SkippedTest {
         }
 
         // Now the vtable must be queryable without taking the
-        // class_manager lock вЂ” the resolved entry carries its own
+        // class_manager lock РІР‚вЂќ the resolved entry carries its own
         // Arc<CachedBytecodeMethod>.
         let guard = shared.vtable_manager.read();
         let entry = guard
@@ -68210,7 +68210,7 @@ public class SkippedTest {
         // CHA invalidation: simulate a subclass override by calling
         // `invalidate_for_override` directly on the per-VM manager.
         // (The global `vtable_override_adapter` would target whichever
-        // SharedVm was first constructed вЂ” see note above.)
+        // SharedVm was first constructed РІР‚вЂќ see note above.)
         shared
             .vtable_manager
             .write()

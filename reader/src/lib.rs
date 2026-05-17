@@ -19,6 +19,7 @@
 
 pub mod attribute;
 pub mod buffer;
+pub mod byte_view;
 pub mod class_access_flags;
 pub mod class_file;
 pub mod class_file_version;
@@ -35,6 +36,7 @@ pub mod signature;
 pub mod stack_map;
 
 pub use attribute::{LazyAttribute, decode_attribute, force_decode_all};
+pub use byte_view::ByteView;
 pub use class_file::ClassFile;
 pub use class_reader::read_class;
 pub use class_reader_error::ClassReaderError;

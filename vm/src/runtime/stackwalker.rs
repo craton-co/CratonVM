@@ -193,7 +193,7 @@ mod tests {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: vec![0xb1].into(), // return
+            code: rustjvm_reader::ByteView::from_vec(vec![0xb1]), // return
             exception_table: Vec::new(),
             attributes: vec![Attribute::LineNumberTable(entries)],
         };
@@ -249,7 +249,7 @@ mod tests {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: vec![0xb1].into(),
+            code: rustjvm_reader::ByteView::from_vec(vec![0xb1]),
             exception_table: Vec::new(),
             attributes: vec![
                 Attribute::LineNumberTable(vec![LineNumberEntry {

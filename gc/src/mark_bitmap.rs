@@ -68,14 +68,18 @@ impl MarkBitmap {
         }
 
         // Atomic fetch-or: set the bit and check if it was already set.
-        // Round-2 fix (GC §8): `Relaxed` is sufficient — the mark bitmap is
-        // metadata; correctness only requires that two markers don't both
-        // push the same object onto the work queue. The mark queue's mutex
-        // already provides the cross-thread synchronization for the work
-        // transfer. On x86 fetch_or is a single `LOCK BTS`/`LOCK CMPXCHG`
-        // either way (no perf difference); on ARM64 Relaxed is materially
-        // cheaper than AcqRel — ~10-20% throughput on marker threads.
-        let old = self.words[word_index].fetch_or(mask, Ordering::Relaxed);
+        // Round-5 fix (CRIT — ARM cross-cycle race): pair `clear()`'s
+        // `Release` store with `AcqRel` on the mark-side `fetch_or`. The
+        // Acquire half guarantees the marker observes the zero bits
+        // published by the prior cycle's `clear()`; the Release half
+        // publishes the newly-set bit for downstream `is_marked()`
+        // readers (including the next cycle's `clear()` ordering anchor).
+        // Without this, on ARM/AArch64 a marker can observe a stale
+        // black bit from a previous cycle and skip a live object → UAF.
+        // On x86 `fetch_or` is a single `LOCK BTS`/`LOCK CMPXCHG` so the
+        // upgrade is free; on ARM64 the extra LDAXR/STLXR is required
+        // for correctness.
+        let old = self.words[word_index].fetch_or(mask, Ordering::AcqRel);
         old & mask == 0 // true if bit was newly set
     }
 
@@ -99,9 +103,11 @@ impl MarkBitmap {
             return false;
         }
 
-        // Round-2 fix: paired with the Relaxed in try_mark — read-side
-        // also doesn't need Acquire ordering for the mark bitmap.
-        let word = self.words[word_index].load(Ordering::Relaxed);
+        // Round-5 fix (CRIT — ARM cross-cycle race): pair `clear()`'s
+        // `Release` store and `try_mark`'s AcqRel `fetch_or` with an
+        // `Acquire` load here so the reader observes a coherent view of
+        // the bitmap across cycles on weakly-ordered platforms (ARM64).
+        let word = self.words[word_index].load(Ordering::Acquire);
         word & (1u64 << bit_within_word) != 0
     }
 

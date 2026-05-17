@@ -603,16 +603,22 @@ fn pending_array_writes() -> &'static Mutex<Vec<PendingArrayWrite>> {
 }
 
 fn flush_pending_array_writes_inner(ctx: &mut dyn NativeContext) {
+    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic instead
+    // of per-element `set_array_element`. The VM override does a single
+    // `ptr::copy_nonoverlapping` against the compact byte-array payload.
     let parked = std::mem::take(&mut *pending_array_writes().lock());
     for p in parked {
         let arr_len = ctx.array_length(p.arr);
-        for (i, b) in p.bytes.iter().enumerate() {
-            let pos = p.offset as usize + i;
-            if pos >= arr_len {
-                break;
-            }
-            ctx.set_array_element(p.arr, pos, Value::Int(*b as i32));
+        let off = p.offset as usize;
+        if off >= arr_len {
+            continue;
         }
+        let max = arr_len - off;
+        let n = p.bytes.len().min(max);
+        if n == 0 {
+            continue;
+        }
+        ctx.write_byte_array_from(p.arr, off, &p.bytes[..n]);
     }
 }
 
@@ -914,17 +920,19 @@ fn read_buffer_bytes(
         }
         v
     } else if let Some(a) = arr {
+        // AUDIT 2026-05-17: bulk read via NativeContext intrinsic
+        // instead of per-element `get_array_element`. The VM override
+        // does a single memcpy from the byte-array payload.
         let arr_len = ctx.array_length(a);
-        let mut v = Vec::with_capacity(len as usize);
-        for i in 0..len as usize {
-            let pos = off as usize + i;
-            if pos >= arr_len {
-                break;
-            }
-            if let Value::Int(b) = ctx.get_array_element(a, pos) {
-                v.push((b & 0xff) as u8);
-            }
+        let off_us = off as usize;
+        if off_us >= arr_len {
+            return Vec::new();
         }
+        let avail = arr_len - off_us;
+        let take = (len as usize).min(avail);
+        let mut v = vec![0u8; take];
+        let n = ctx.read_byte_array_into(a, off_us, &mut v);
+        v.truncate(n);
         v
     } else {
         Vec::new()

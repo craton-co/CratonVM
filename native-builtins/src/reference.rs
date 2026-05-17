@@ -93,6 +93,19 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
         native_phantom_ref_get,
     );
 
+    // Round-5 fix (HIGH): SoftReference.get() must touch the GC's
+    // soft-ref LRU index so subsequently-cleared soft refs reflect
+    // recency-of-use. The base `native_ref_get` registered for all
+    // four classes above does not call into the LRU; override the
+    // SoftReference slot with a specialized native that performs the
+    // LRU touch after reading the referent.
+    registry.register(
+        "java/lang/ref/SoftReference",
+        "get",
+        "()Ljava/lang/Object;",
+        native_soft_ref_get,
+    );
+
     // Reference base constructors (for subclass dispatch)
     registry.register(
         "java/lang/ref/Reference",
@@ -240,6 +253,35 @@ fn native_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     Ok(Some(ctx.get_field(this, REF_FIELD_REFERENT)))
+}
+
+/// Round-5 fix (HIGH — broken SoftRef LRU): `SoftReference.get()` must
+/// notify the GC's reference processor so the soft-ref LRU timestamp
+/// for this reference is refreshed. The base `native_ref_get` reads the
+/// referent and returns it but never calls into the LRU, leaving every
+/// SoftReference with `last_access_time_ms == 0` — making them all
+/// appear infinitely stale and clearing the entire soft-ref population
+/// on the first low-memory cycle (defeating soft-ref-backed caches like
+/// `WeakHashMap`/`Caffeine` variants and the JDK's own
+/// `sun.nio.ch.Util.BufferCache`).
+///
+/// The `touch_soft_reference` hook on `NativeContext` defaults to a
+/// no-op for test mocks; the VM's `NativeContextImpl` overrides it to
+/// call `ReferenceProcessor::touch_soft_reference` with the current
+/// wall-clock time.
+fn native_soft_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let referent = ctx.get_field(this, REF_FIELD_REFERENT);
+    // Only refresh the LRU when the referent is still live — touching
+    // a cleared soft ref would needlessly churn the index for an
+    // entry that's about to be removed.
+    if matches!(referent, Value::Object(Some(_))) {
+        ctx.touch_soft_reference(this);
+    }
+    Ok(Some(referent))
 }
 
 fn native_ref_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

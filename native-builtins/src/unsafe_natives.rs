@@ -300,13 +300,29 @@ fn native_unsafe_get_byte_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // Probe the cache (used by `cache_lookup`-based hot-loop tests and
-    // by the future raw-ptr fast path).  Even on a cache hit we still
-    // refresh — that's how the window grows forward across the loop.
-    let _hit = cache_lookup(addr, 1).is_some();
-    let v = crate::unsafe_arena_get_byte(addr);
-    refresh_arena_cache(addr, 1);
-    Ok(Some(Value::Int(v as i32)))
+    // audit-round5 fix #3 (HIGH): mirror the round-4 put-side IAE behavior.
+    // The previous get-side called `unsafe_arena_get_byte` which silently
+    // returned 0 on an out-of-arena address — callers reading garbage 0s
+    // tripped downstream NPEs far from the actual bug. Throw IAE when the
+    // cache misses AND the bounds-checked read misses.
+    let cache_hit = cache_lookup(addr, 1).is_some();
+    match crate::unsafe_arena_try_get_byte(addr) {
+        Some(v) => {
+            refresh_arena_cache(addr, 1);
+            Ok(Some(Value::Int(v as i32)))
+        }
+        None if cache_hit => {
+            // Cache says the address is in a known window, but the bytes
+            // are no longer live (arena freed / shrunk). Surface 0 rather
+            // than IAE since the cache covers it — invalidate next time.
+            refresh_arena_cache(addr, 1);
+            Ok(Some(Value::Int(0)))
+        }
+        None => Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.getByte: address 0x{addr:x} is not in any live arena"),
+        }
+        .into()),
+    }
 }
 
 fn native_unsafe_put_byte_at_address(
@@ -350,10 +366,22 @@ fn native_unsafe_get_short_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let _hit = cache_lookup(addr, 2).is_some();
-    let v = crate::unsafe_arena_get_short(addr);
-    refresh_arena_cache(addr, 2);
-    Ok(Some(Value::Int(v as i32)))
+    // audit-round5 fix #3: see `get_byte_at_address`.
+    let cache_hit = cache_lookup(addr, 2).is_some();
+    match crate::unsafe_arena_try_get_short(addr) {
+        Some(v) => {
+            refresh_arena_cache(addr, 2);
+            Ok(Some(Value::Int(v as i32)))
+        }
+        None if cache_hit => {
+            refresh_arena_cache(addr, 2);
+            Ok(Some(Value::Int(0)))
+        }
+        None => Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.getShort: address 0x{addr:x} is not in any live arena"),
+        }
+        .into()),
+    }
 }
 
 fn native_unsafe_put_short_at_address(
@@ -388,10 +416,22 @@ fn native_unsafe_get_int_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let _hit = cache_lookup(addr, 4).is_some();
-    let v = crate::unsafe_arena_get_int(addr);
-    refresh_arena_cache(addr, 4);
-    Ok(Some(Value::Int(v)))
+    // audit-round5 fix #3: see `get_byte_at_address`.
+    let cache_hit = cache_lookup(addr, 4).is_some();
+    match crate::unsafe_arena_try_get_int(addr) {
+        Some(v) => {
+            refresh_arena_cache(addr, 4);
+            Ok(Some(Value::Int(v)))
+        }
+        None if cache_hit => {
+            refresh_arena_cache(addr, 4);
+            Ok(Some(Value::Int(0)))
+        }
+        None => Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.getInt: address 0x{addr:x} is not in any live arena"),
+        }
+        .into()),
+    }
 }
 
 fn native_unsafe_put_int_at_address(
@@ -426,10 +466,22 @@ fn native_unsafe_get_long_at_address(
         Some(Value::Long(a)) => *a,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let _hit = cache_lookup(addr, 8).is_some();
-    let v = crate::unsafe_arena_get_long(addr);
-    refresh_arena_cache(addr, 8);
-    Ok(Some(Value::Long(v)))
+    // audit-round5 fix #3: see `get_byte_at_address`.
+    let cache_hit = cache_lookup(addr, 8).is_some();
+    match crate::unsafe_arena_try_get_long(addr) {
+        Some(v) => {
+            refresh_arena_cache(addr, 8);
+            Ok(Some(Value::Long(v)))
+        }
+        None if cache_hit => {
+            refresh_arena_cache(addr, 8);
+            Ok(Some(Value::Long(0)))
+        }
+        None => Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.getLong: address 0x{addr:x} is not in any live arena"),
+        }
+        .into()),
+    }
 }
 
 fn native_unsafe_put_long_at_address(
@@ -1008,9 +1060,23 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 Some(Value::Long(a)) => *a,
                 _ => return Ok(Some(Value::Float(0.0))),
             };
-            let bits = crate::unsafe_arena_get_int(addr) as u32;
-            refresh_arena_cache(addr, 4);
-            Ok(Some(Value::Float(f32::from_bits(bits))))
+            // audit-round5 fix #3: IAE on out-of-arena address (mirror
+            // of the put-side and `get_byte_at_address` semantics).
+            let cache_hit = cache_lookup(addr, 4).is_some();
+            match crate::unsafe_arena_try_get_int(addr) {
+                Some(v) => {
+                    refresh_arena_cache(addr, 4);
+                    Ok(Some(Value::Float(f32::from_bits(v as u32))))
+                }
+                None if cache_hit => {
+                    refresh_arena_cache(addr, 4);
+                    Ok(Some(Value::Float(0.0)))
+                }
+                None => Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Unsafe.getFloat: address 0x{addr:x} is not in any live arena"),
+                }
+                .into()),
+            }
         });
         registry.register(class, "putFloat", "(JF)V", |_ctx, args| {
             let addr = match args.get(1) {
@@ -1035,9 +1101,22 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
                 Some(Value::Long(a)) => *a,
                 _ => return Ok(Some(Value::Double(0.0))),
             };
-            let bits = crate::unsafe_arena_get_long(addr) as u64;
-            refresh_arena_cache(addr, 8);
-            Ok(Some(Value::Double(f64::from_bits(bits))))
+            // audit-round5 fix #3: IAE on out-of-arena address.
+            let cache_hit = cache_lookup(addr, 8).is_some();
+            match crate::unsafe_arena_try_get_long(addr) {
+                Some(v) => {
+                    refresh_arena_cache(addr, 8);
+                    Ok(Some(Value::Double(f64::from_bits(v as u64))))
+                }
+                None if cache_hit => {
+                    refresh_arena_cache(addr, 8);
+                    Ok(Some(Value::Double(0.0)))
+                }
+                None => Err(RuntimeError::IllegalArgumentException {
+                    message: format!("Unsafe.getDouble: address 0x{addr:x} is not in any live arena"),
+                }
+                .into()),
+            }
         });
         registry.register(class, "putDouble", "(JD)V", |_ctx, args| {
             let addr = match args.get(1) {

@@ -3316,8 +3316,23 @@ impl Compiler {
     /// `local` is non-null at the instruction starting at `pc`. Uses
     /// the forward-dataflow result computed by
     /// [`crate::null_check_elim::analyze`].
-    pub(crate) fn is_local_nonnull(&self, pc: usize, local: usize) -> bool {
-        self.null_check_info.is_nonnull(pc, local)
+    ///
+    /// CRIT (round-5 review): The single forward-pass analysis in
+    /// `null_check_elim::analyze` is unsound — the mask at a forward
+    /// branch target reflects the linearly-prior path, not the actual
+    /// predecessor set (no meet-over-paths). Until a proper
+    /// dataflow/dominator analysis lands we disable the elimination by
+    /// returning `false` unconditionally; this preserves the wiring at
+    /// the call sites (ifnull/ifnonnull, getfield, invokevirtual,
+    /// arraylength) so we can re-enable it with a one-line revert once
+    /// the analysis is fixed.
+    ///
+    /// TODO(round-6-wave-2): implement meet-over-paths null check
+    /// analysis with proper dataflow (worklist + per-BB IN/OUT sets,
+    /// meet = bitwise AND across predecessors), then re-enable by
+    /// delegating to `self.null_check_info.is_nonnull(pc, local)`.
+    pub(crate) fn is_local_nonnull(&self, _pc: usize, _local: usize) -> bool {
+        false
     }
 
     /// Offset for local variable `idx`: [rbp - (idx+1)*8]
@@ -10344,6 +10359,27 @@ impl Compiler {
                                 && callee_needs_ctx == self.needs_heap;
 
                             if is_sibling_tail {
+                                // CRIT (round-5 review): the `if i+1 <
+                                // ARG_REGS.len()` / `if i < ARG_REGS.len()`
+                                // guards below silently drop arguments
+                                // past the register file, corrupting the
+                                // callee's locals. Until stack-arg setup
+                                // lands, bail the entire method back to
+                                // the interpreter when a direct call would
+                                // need stack args.
+                                //
+                                // TODO(round-6-wave-2): emit stack-arg
+                                // setup for >ARG_REGS direct calls (Win64:
+                                // 4 home slots + stack push; SysV: 16-byte
+                                // alignment + stack push).
+                                let reg_limit = if callee_needs_ctx {
+                                    ARG_REGS.len() - 1
+                                } else {
+                                    ARG_REGS.len()
+                                };
+                                if arg_slots.len() > reg_limit {
+                                    return false;
+                                }
                                 // Load args into ABI registers, tear
                                 // down our frame, then JMP.
                                 if callee_needs_ctx {
@@ -10373,6 +10409,23 @@ impl Compiler {
                                 continue;
                             }
 
+                            // CRIT (round-5 review): the `if i+1 <
+                            // ARG_REGS.len()` / `if i < ARG_REGS.len()`
+                            // guards below silently drop arguments past
+                            // the register file. Bail the entire method
+                            // to the interpreter when a direct call would
+                            // need stack args.
+                            //
+                            // TODO(round-6-wave-2): emit stack-arg setup
+                            // for >ARG_REGS direct calls.
+                            let reg_limit = if callee_needs_ctx {
+                                ARG_REGS.len() - 1
+                            } else {
+                                ARG_REGS.len()
+                            };
+                            if arg_slots.len() > reg_limit {
+                                return false;
+                            }
                             if callee_needs_ctx {
                                 // Callee needs VM context as hidden first arg
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -10517,6 +10570,22 @@ impl Compiler {
                             continue;
                         }
 
+                        // CRIT (round-5 review): the `if i+1 <
+                        // ARG_REGS.len()` / `if i < ARG_REGS.len()`
+                        // guards below silently drop self-call args
+                        // past the register file. Bail to interpreter
+                        // when the recursive call would need stack args.
+                        //
+                        // TODO(round-6-wave-2): emit stack-arg setup
+                        // for >ARG_REGS self-recursive calls.
+                        let reg_limit = if self.needs_heap {
+                            ARG_REGS.len() - 1
+                        } else {
+                            ARG_REGS.len()
+                        };
+                        if arg_slots.len() > reg_limit {
+                            return false;
+                        }
                         // Normal self-call via CALL
                         if self.needs_heap {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
@@ -10579,6 +10648,24 @@ impl Compiler {
                         }
                         arg_slots.reverse();
 
+                        // CRIT (round-5 review): the `if i+1 <
+                        // ARG_REGS.len()` / `if i < ARG_REGS.len()`
+                        // guards below silently drop invokespecial /
+                        // invokevirtual direct-call args past the
+                        // register file (receiver + params combined).
+                        // Bail the entire method to the interpreter when
+                        // a direct call would need stack args.
+                        //
+                        // TODO(round-6-wave-2): emit stack-arg setup
+                        // for >ARG_REGS direct invokespecial/virtual.
+                        let reg_limit = if callee_needs_ctx {
+                            ARG_REGS.len() - 1
+                        } else {
+                            ARG_REGS.len()
+                        };
+                        if arg_slots.len() > reg_limit {
+                            return false;
+                        }
                         if callee_needs_ctx {
                             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                             for (i, slot) in arg_slots.iter().enumerate() {
@@ -10825,6 +10912,21 @@ impl Compiler {
                                 // depends on whether the receiver reg is
                                 // an extended register (R8+).
                                 let recv_reg = ARG_REGS[1];
+                                // MED (round-5 review): mod=00 encoding
+                                // reuses the low-3 bits of the register as
+                                // r/m, where r/m==4 (RSP/R12) means
+                                // SIB-follows and r/m==5 (RBP/R13) means
+                                // RIP-relative — both would mis-encode this
+                                // displacement-free load. Safe today
+                                // because RCX(.1)/RDX(.2)/RSI(.6) are all
+                                // outside {4,5}, but any future ARG_REGS
+                                // shuffle would silently corrupt this PIC
+                                // slot. Trap brittleness in debug builds.
+                                debug_assert!(
+                                    (recv_reg & 7) != 4 && (recv_reg & 7) != 5,
+                                    "PIC slot-0 mod=00 requires ARG_REGS[1] low3 not in {{4,5}} (got {})",
+                                    recv_reg,
+                                );
                                 if recv_reg >= 8 {
                                     // REX.B + 8B /r, modrm = mod(00) reg(EAX=0) rm(recv&7)
                                     self.buf.emit(&[0x41, 0x8B, recv_reg & 7]);

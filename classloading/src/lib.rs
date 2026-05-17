@@ -42,6 +42,9 @@ pub use class_manager::{
     ClassFileLoadHook, ClassManager, DefineClassOptions, JitInvalidateHook, JvmtiClassHook,
     RedefineOptions, ResolutionInvalidateHook, VtableInstallHook, VtableMethodSnapshot,
     VtableOverrideHook, VtableSlotDescriptor,
+    // Round 5 audit fix (HIGH): AtomicU8 class-init fast-path constants
+    // consumed by `vm_util::ensure_class_initialized_shared`.
+    CLASS_INIT_IN_PROGRESS, CLASS_INIT_INITIALIZED, CLASS_INIT_UNINITIALIZED,
 };
 pub use class_path::{ClassPath, ManifestInfo};
 pub use module::{

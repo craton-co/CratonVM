@@ -983,12 +983,13 @@ pub(crate) fn sb_ensure_capacity(
     let new_cap = std::cmp::max(old_cap * 2 + 2, count + additional);
     let new_buf = ctx.new_array(ArrayElementType::Char, new_cap);
 
-    // Copy old content
+    // audit-round5 fix #6 (HIGH): use the `bulk_array_copy` intrinsic
+    // (single `copy_nonoverlapping` in the VM override) instead of a
+    // per-element `get_array_element` / `set_array_element` loop. This
+    // collapses 2N virtual trait dispatches into one bulk call on the
+    // StringBuilder grow path.
     if let Some(old_buf) = buf {
-        for i in 0..count {
-            let val = ctx.get_array_element(old_buf, i);
-            ctx.set_array_element(new_buf, i, val);
-        }
+        let _ = ctx.bulk_array_copy(old_buf, 0, new_buf, 0, count);
     }
 
     ctx.set_field(this, 0, Value::Object(Some(new_buf)));
@@ -1129,13 +1130,15 @@ pub(crate) fn native_sb_append_char_array_off_len(
     let arr_len = ctx.array_length(arr);
     let end = off.saturating_add(len).min(arr_len);
     let start = off.min(arr_len);
-    let mut chars: Vec<u16> = Vec::with_capacity(end.saturating_sub(start));
-    for i in start..end {
-        if let Value::Int(ch) = ctx.get_array_element(arr, i) {
-            chars.push(ch as u16);
-        }
-    }
-    sb_append_chars(ctx, this, &chars);
+    let copy_len = end.saturating_sub(start);
+    // audit-round5 fix #6 (HIGH): both sides are Java `char[]` — go
+    // through `bulk_array_copy` (single `copy_nonoverlapping` in the VM
+    // override) instead of materialising a per-element Rust `Vec<u16>`.
+    let buf = sb_ensure_capacity(ctx, this, copy_len);
+    let (_, count) = sb_state(ctx, this);
+    let count = count as usize;
+    let _ = ctx.bulk_array_copy(arr, start, buf, count, copy_len);
+    ctx.set_field(this, 1, Value::Int((count + copy_len) as i32));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1153,13 +1156,13 @@ pub(crate) fn native_sb_append_char_array(
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let n = ctx.array_length(arr);
-    let mut chars: Vec<u16> = Vec::with_capacity(n);
-    for i in 0..n {
-        if let Value::Int(ch) = ctx.get_array_element(arr, i) {
-            chars.push(ch as u16);
-        }
-    }
-    sb_append_chars(ctx, this, &chars);
+    // audit-round5 fix #6 (HIGH): bulk-copy directly into the SB buffer
+    // (see `native_sb_append_char_array_off_len` for rationale).
+    let buf = sb_ensure_capacity(ctx, this, n);
+    let (_, count) = sb_state(ctx, this);
+    let count = count as usize;
+    let _ = ctx.bulk_array_copy(arr, 0, buf, count, n);
+    ctx.set_field(this, 1, Value::Int((count + n) as i32));
     Ok(Some(Value::Object(Some(this))))
 }
 

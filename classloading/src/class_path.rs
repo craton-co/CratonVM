@@ -14,6 +14,19 @@ use zip::ZipArchive;
 /// `BOOT-INF/classes/`).
 pub struct ClassPath {
     entries: Vec<ClassPathEntry>,
+    /// Round 5 audit fix (MED): per-`ClassPath` cache of
+    /// [`fs::canonicalize`] results. Each `find_class` probe over a
+    /// `Directory` entry previously canonicalized BOTH the classpath
+    /// root and the resolved file on every call — that's two syscalls
+    /// per probe even when neither path has changed since the last
+    /// lookup. The cache is consulted before falling through to the
+    /// `fs` call; populated lazily on first miss. Cap is implicit by
+    /// the number of distinct paths probed (classpath roots stay
+    /// constant; resolved-file entries are bounded by the loaded class
+    /// count). Use `Mutex` (not `RwLock`) because the populate path
+    /// only writes; reads of an already-cached entry are sub-ms even
+    /// under contention.
+    canonicalize_cache: Mutex<HashMap<PathBuf, PathBuf>>,
 }
 
 enum ClassPathEntry {
@@ -397,6 +410,33 @@ pub(crate) fn is_safe_entry_name(name: &str) -> bool {
 }
 
 impl ClassPath {
+    /// Round 5 audit fix (MED): cached [`fs::canonicalize`] wrapper.
+    ///
+    /// The classpath-traversal symlink check (audit-fix #5) canonicalizes
+    /// both the directory root AND the resolved class file on every probe.
+    /// On a Spring app with 15k classes × 3 directory entries that's
+    /// ~90k canonicalize syscalls per cold start. The cache makes
+    /// repeated lookups of the same `PathBuf` zero-syscall.
+    ///
+    /// Errors are NOT cached — a transient `ENOENT` should not be
+    /// remembered as a fail-closed verdict for the rest of the process.
+    fn canonicalize_cached(&self, path: &Path) -> std::io::Result<PathBuf> {
+        {
+            let guard = self.canonicalize_cache.lock();
+            if let Some(canon) = guard.get(path) {
+                return Ok(canon.clone());
+            }
+        }
+        let canon = fs::canonicalize(path)?;
+        // Insert under the lock; tolerate the race where another thread
+        // inserted the same entry between our read and write — they
+        // produce identical values so either wins.
+        self.canonicalize_cache
+            .lock()
+            .insert(path.to_path_buf(), canon.clone());
+        Ok(canon)
+    }
+
     /// Audit-fix #7: build (once) the set of `META-INF/versions/<N>/`
     /// numbers actually present in `archive`. Subsequent multi-release
     /// lookups iterate only over this set, skipping the per-class
@@ -530,7 +570,10 @@ impl ClassPath {
                 }
             }
         }
-        Self { entries }
+        Self {
+            entries,
+            canonicalize_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Expand a single classpath token, honouring Java's `dir/*` wildcard.
@@ -987,7 +1030,14 @@ impl ClassPath {
                         // refuse to read — silently proceeding allowed
                         // a symlinked `Object.class -> /etc/passwd` to
                         // be served as classfile bytes.
-                        let canon_dir = fs::canonicalize(dir).map_err(|e| {
+                        //
+                        // Round 5 audit fix (MED): routed through
+                        // `canonicalize_cached` so repeat probes of the
+                        // same paths skip the per-call syscall — the
+                        // classpath root is identical across every
+                        // probe and resolved-file paths repeat once a
+                        // class is reloaded by JVMTI / instrumentation.
+                        let canon_dir = self.canonicalize_cached(dir).map_err(|e| {
                             debug!(
                                 "Refusing to load {class_name}: cannot canonicalize \
                                  classpath root {}: {e}",
@@ -998,7 +1048,7 @@ impl ClassPath {
                                 source: e,
                             }
                         })?;
-                        let canon_path = fs::canonicalize(&full_path).map_err(|e| {
+                        let canon_path = self.canonicalize_cached(&full_path).map_err(|e| {
                             debug!(
                                 "Refusing to load {class_name}: cannot canonicalize \
                                  resolved path {}: {e}",

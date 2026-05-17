@@ -1252,23 +1252,32 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let new_buckets = alloc_ref_array(ctx, new_cap as usize);
 
     // Re-hash all entries. When `new_cap == 2 * old_cap` (the common
-    // doubling case) we can use JDK's split semantics: each entry whose
+    // doubling case) we use JDK's split semantics: each entry whose
     // `hash & old_cap == 0` stays at bucket `i`, and the rest move to
-    // bucket `i + old_cap`. That lets us bulk-copy the old bucket array
-    // head pointers into `new_buckets[0..old_cap]` first (a single memcpy
-    // when the VM's `bulk_array_copy` override supports reference arrays)
-    // and then only walk chains to split off the high-bit nodes, instead
-    // of rebuilding every chain head-by-head with virtual array writes.
+    // bucket `i + old_cap`. This walks each chain exactly once and
+    // writes the two head slots — strictly better than the legacy
+    // head-prepend path which performs N `set_array_element` calls per
+    // bucket.
     //
-    // The bulk pre-seed is only valid when `bulk_array_copy` succeeds —
-    // today it returns `false` for reference arrays (write-barrier /
-    // ArrayStoreException reasons), so we fall back to the legacy
-    // per-bucket rebuild walk that does not depend on the pre-seed.
+    // AUDIT 2026-05-17: previously this branch was gated on a
+    // successful `bulk_array_copy` of the reference bucket array as a
+    // "pre-seed" optimization. `vm_exec::bulk_array_copy` refuses
+    // reference arrays (write-barrier reasons), so the gate always
+    // failed and we always took the slow legacy path. The split is a
+    // perf win even without the pre-seed — overwriting the two head
+    // slots is what the JDK does itself — so we always take it.
+    // `bulk_array_copy` is still attempted as an optional fast path so
+    // that if a future VM override does support reference arrays, we
+    // skip the per-bucket head reads.
     if let Some(old_b) = old_buckets {
         let doubled = (new_cap as i64) == (old_cap as i64) * 2;
-        let preseeded = doubled
-            && ctx.bulk_array_copy(old_b, 0, new_buckets, 0, old_cap as usize);
-        if preseeded {
+        if doubled {
+            // Optional fast path: if the VM's bulk_array_copy supports
+            // reference arrays, pre-seed `new_buckets[0..old_cap]` from
+            // `old_b[0..old_cap]`. If not, the split loop below still
+            // writes every head slot, so correctness is unaffected.
+            let _preseeded =
+                ctx.bulk_array_copy(old_b, 0, new_buckets, 0, old_cap as usize);
             // JDK-style split: walk each old bucket, partition its chain
             // into "low" (stays at i) and "high" (moves to i+old_cap)
             // lists, then overwrite the two head slots.

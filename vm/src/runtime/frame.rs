@@ -132,26 +132,35 @@ pub struct Frame {
     /// Incremented on each backward branch; triggers JIT when exceeding threshold.
     pub backward_count: u32,
 
-    /// CRIT-PERF (audit 2026-05-17): per-loop "OSR already attempted" set.
+    /// CRIT-PERF (audit 2026-05-17): per-loop OSR attempt counter with
+    /// exponential backoff.
     ///
     /// The trigger condition used to be `bc == OSR_THRESHOLD` (exact
     /// equality), which meant that if the OSR compile was queued but the
     /// JIT entry trampoline wasn't ready yet, `try_osr` rejected the
     /// attempt and **the counter immediately moved past the threshold**
     /// — so the loop kept iterating in the interpreter forever without
-    /// ever retrying OSR.  The fix changes the trigger to `bc >=
-    /// OSR_THRESHOLD` (so we retry on every subsequent back-edge of the
-    /// same loop) and uses this Vec to suppress the case where OSR for a
-    /// given entry PC has already been attempted and failed for a
-    /// permanent reason (skip-list ban, native shadow, compile failure
-    /// returning `None` after recording the attempt). The Vec is kept
-    /// over `Option<usize>` because a method may contain multiple loops
-    /// that each hit the threshold and we want each loop's OSR attempt
-    /// to be tracked independently. Capacity stays at zero unless OSR
-    /// actually fires, so the steady-state per-frame cost is one extra
-    /// 24-byte `Vec` header — negligible next to the ~hundreds of bytes
-    /// per `Frame`.
-    pub osr_attempted_entry_pcs: Vec<usize>,
+    /// ever retrying OSR.
+    ///
+    /// Round-4 wave-1 first replaced this with a permanent-ban `Vec<usize>`
+    /// — but that swung too far the other way: a *single* transient reject
+    /// (e.g. compile queued but trampoline not yet installed) blocked any
+    /// future OSR attempt for that loop forever, even though the next
+    /// back-edge ~µs later might well have succeeded.
+    ///
+    /// Round-5 fix (audit `docs/round5-vm.md`): track an attempt counter
+    /// per entry PC and use **exponential backoff** — first retry after
+    /// `OSR_THRESHOLD` back-edges, second after `2 * OSR_THRESHOLD`,
+    /// third after `4 * OSR_THRESHOLD`, etc.  After
+    /// `OSR_MAX_ATTEMPTS` (=5) rejections we give up permanently
+    /// (equivalent to the old permanent ban for truly hot loops the
+    /// compiler can't handle).
+    ///
+    /// Stored as a small `Vec<(entry_pc, attempts)>` rather than a hashmap
+    /// because a method has only a handful of loops and the per-frame
+    /// allocation cost (24-byte Vec header) dwarfs hashmap overhead.
+    /// Capacity stays at zero unless OSR actually fires.
+    pub osr_attempt_counts: Vec<(usize, u32)>,
 
     /// For synchronized methods dispatched via the stackless path: the monitor
     /// object that must be released when this frame returns or is unwound by
@@ -346,7 +355,58 @@ pub(crate) fn class_disables_interp_fast_path(class_name: &str) -> bool {
         || class_name.contains("springframework")
 }
 
+/// CRIT-PERF cap: after this many failed OSR attempts for a single entry
+/// PC we stop retrying — the loop is presumably uncompilable.  Matches the
+/// effective behaviour of the round-4 wave-1 permanent-ban Vec for hot
+/// loops whose IR the JIT genuinely can't lower.
+pub const OSR_MAX_ATTEMPTS: u32 = 5;
+
 impl Frame {
+    /// Return `true` if a fresh OSR attempt should be made for `entry_pc`
+    /// given the current `backward_count` and the per-loop exponential
+    /// backoff schedule.  See `osr_attempt_counts` for the rationale.
+    ///
+    /// `osr_threshold` is the base back-edge count required for the first
+    /// attempt (typically `OSR_THRESHOLD`).  The k-th retry fires at
+    /// `osr_threshold << k` back-edges; once `OSR_MAX_ATTEMPTS` is reached
+    /// the loop is permanently shadowed.
+    #[inline]
+    pub fn should_try_osr(&self, entry_pc: usize, osr_threshold: u32) -> bool {
+        let bc = self.backward_count;
+        // Linear scan: a method has only a handful of loops in practice.
+        let attempts = self
+            .osr_attempt_counts
+            .iter()
+            .find(|(pc, _)| *pc == entry_pc)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        if attempts >= OSR_MAX_ATTEMPTS {
+            return false;
+        }
+        // Exponential backoff: 1×, 2×, 4×, 8×, 16× the base threshold.
+        // `checked_shl` defends against overflow if `OSR_MAX_ATTEMPTS` is
+        // ever bumped large enough to push past u32::MAX.
+        let shift = attempts;
+        let backoff = osr_threshold
+            .checked_shl(shift)
+            .unwrap_or(u32::MAX);
+        bc >= backoff
+    }
+
+    /// Record that an OSR attempt for `entry_pc` failed (returned `None`
+    /// from `try_osr`).  Bumps the per-loop attempt counter so that the
+    /// next attempt waits exponentially longer.
+    #[inline]
+    pub fn record_osr_rejection(&mut self, entry_pc: usize) {
+        for (pc, n) in &mut self.osr_attempt_counts {
+            if *pc == entry_pc {
+                *n = n.saturating_add(1);
+                return;
+            }
+        }
+        self.osr_attempt_counts.push((entry_pc, 1));
+    }
+
     /// Create a new frame for a method (converts owned String/Vec to Arc).
     ///
     /// `args` are copied into the first local variable slots.
@@ -382,7 +442,7 @@ impl Frame {
                 exception_table: Arc::from(exception_table.into_boxed_slice()),
             },
             backward_count: 0,
-            osr_attempted_entry_pcs: Vec::new(),
+            osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -421,7 +481,7 @@ impl Frame {
                 exception_table,
             },
             backward_count: 0,
-            osr_attempted_entry_pcs: Vec::new(),
+            osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -469,7 +529,7 @@ impl Frame {
                 exception_table,
             },
             backward_count: 0,
-            osr_attempted_entry_pcs: Vec::new(),
+            osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -507,7 +567,7 @@ impl Frame {
             max_locals: eff_max_locals,
             inner: FrameInner::Cached(cached),
             backward_count: 0,
-            osr_attempted_entry_pcs: Vec::new(),
+            osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
         }
@@ -532,7 +592,7 @@ impl Frame {
         self.pc = 0;
         self.last_instr_pc = 0;
         self.backward_count = 0;
-        self.osr_attempted_entry_pcs.clear();
+        self.osr_attempt_counts.clear();
         self.code = code;
         self.max_stack = max_stack;
         let eff_max_locals = effective_max_locals(max_locals, args);
@@ -920,7 +980,7 @@ impl Frame {
                 exception_table,
             },
             backward_count: 0,
-            osr_attempted_entry_pcs: Vec::new(),
+            osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: false,
         }

@@ -136,13 +136,21 @@ impl ThreadLocalResolveCache {
 
     /// Look up a cached method.  Returns `Some` on hit, `None` on miss.
     /// Updates hit/miss counters.
+    ///
+    /// PERF (round-5 vm #5): collapse the previous `contains_key` + `get`
+    /// double-probe into a single `match self.methods.get(...)`. SipHash on
+    /// a `ResolutionKey` is not free; doing it twice on every hit doubled
+    /// the cost of the resolution fast path.
     pub fn get_method(&mut self, key: &ResolutionKey) -> Option<&ResolvedTarget> {
-        if self.methods.contains_key(key) {
-            self.hits += 1;
-            self.methods.get(key)
-        } else {
-            self.misses += 1;
-            None
+        match self.methods.get(key) {
+            Some(t) => {
+                self.hits += 1;
+                Some(t)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
         }
     }
 
@@ -169,13 +177,18 @@ impl ThreadLocalResolveCache {
 
     /// Look up a cached field.  Returns `Some` on hit, `None` on miss.
     /// Updates hit/miss counters.
+    ///
+    /// PERF (round-5 vm #5): single-probe lookup, see `get_method`.
     pub fn get_field(&mut self, key: &ResolutionKey) -> Option<&ResolvedField> {
-        if self.fields.contains_key(key) {
-            self.hits += 1;
-            self.fields.get(key)
-        } else {
-            self.misses += 1;
-            None
+        match self.fields.get(key) {
+            Some(t) => {
+                self.hits += 1;
+                Some(t)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
         }
     }
 

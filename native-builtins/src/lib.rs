@@ -13442,12 +13442,23 @@ mod unsafe_arena {
             self.read::<1>(addr).map(|b| b[0]).unwrap_or(0)
         }
 
+        // audit-round5 fix #3 (HIGH): bounds-checked getters used by the
+        // get-side natives to throw IAE on out-of-arena addresses
+        // (mirror of the put-side IAE behavior fixed in round-4 wave-1).
+        pub(super) fn try_get_byte(&self, addr: i64) -> Option<u8> {
+            self.read::<1>(addr).map(|b| b[0])
+        }
+
         pub(super) fn put_byte(&self, addr: i64, v: u8) -> bool {
             self.write::<1>(addr, &[v])
         }
 
         pub(super) fn get_short(&self, addr: i64) -> i16 {
             i16::from_le_bytes(self.read::<2>(addr).unwrap_or([0; 2]))
+        }
+
+        pub(super) fn try_get_short(&self, addr: i64) -> Option<i16> {
+            self.read::<2>(addr).map(i16::from_le_bytes)
         }
 
         pub(super) fn put_short(&self, addr: i64, v: i16) -> bool {
@@ -13458,12 +13469,20 @@ mod unsafe_arena {
             i32::from_le_bytes(self.read::<4>(addr).unwrap_or([0; 4]))
         }
 
+        pub(super) fn try_get_int(&self, addr: i64) -> Option<i32> {
+            self.read::<4>(addr).map(i32::from_le_bytes)
+        }
+
         pub(super) fn put_int(&self, addr: i64, v: i32) -> bool {
             self.write::<4>(addr, &v.to_le_bytes())
         }
 
         pub(super) fn get_long(&self, addr: i64) -> i64 {
             i64::from_le_bytes(self.read::<8>(addr).unwrap_or([0; 8]))
+        }
+
+        pub(super) fn try_get_long(&self, addr: i64) -> Option<i64> {
+            self.read::<8>(addr).map(i64::from_le_bytes)
         }
 
         pub(super) fn put_long(&self, addr: i64, v: i64) -> bool {
@@ -13571,6 +13590,14 @@ pub(crate) fn unsafe_arena_get_byte(addr: i64) -> u8 {
     unsafe_arena::store().get_byte(addr)
 }
 
+// audit-round5 fix #3 (HIGH): bounds-checked get* shims. Return `Some(v)`
+// when the address falls inside a live arena, `None` otherwise. The
+// get-at-address natives map `None` to IllegalArgumentException to match
+// the put-side behavior fixed in round-4 wave-1.
+pub(crate) fn unsafe_arena_try_get_byte(addr: i64) -> Option<u8> {
+    unsafe_arena::store().try_get_byte(addr)
+}
+
 /// audit-2026-05-16: returns `true` on success, `false` when the write
 /// would extend the arena past its original size. Java natives map `false`
 /// to `IllegalArgumentException`.
@@ -13582,6 +13609,10 @@ pub(crate) fn unsafe_arena_get_short(addr: i64) -> i16 {
     unsafe_arena::store().get_short(addr)
 }
 
+pub(crate) fn unsafe_arena_try_get_short(addr: i64) -> Option<i16> {
+    unsafe_arena::store().try_get_short(addr)
+}
+
 pub(crate) fn unsafe_arena_put_short(addr: i64, v: i16) -> bool {
     unsafe_arena::store().put_short(addr, v)
 }
@@ -13590,12 +13621,20 @@ pub(crate) fn unsafe_arena_get_int(addr: i64) -> i32 {
     unsafe_arena::store().get_int(addr)
 }
 
+pub(crate) fn unsafe_arena_try_get_int(addr: i64) -> Option<i32> {
+    unsafe_arena::store().try_get_int(addr)
+}
+
 pub(crate) fn unsafe_arena_put_int(addr: i64, v: i32) -> bool {
     unsafe_arena::store().put_int(addr, v)
 }
 
 pub(crate) fn unsafe_arena_get_long(addr: i64) -> i64 {
     unsafe_arena::store().get_long(addr)
+}
+
+pub(crate) fn unsafe_arena_try_get_long(addr: i64) -> Option<i64> {
+    unsafe_arena::store().try_get_long(addr)
 }
 
 pub(crate) fn unsafe_arena_put_long(addr: i64, v: i64) -> bool {
@@ -14035,22 +14074,18 @@ fn native_atomic_int_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+// audit-round5 fix #9 (HIGH): replace per-iteration CAS loops with the
+// `atomic_fetch_add_int` intrinsic. The default trait impl preserves CAS
+// behavior for non-VM contexts (mocks); the VM override can collapse this
+// into a single `LOCK XADD`. One trait dispatch per call instead of two
+// per loop iteration.
 fn native_atomic_int_get_and_increment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Int(old) = current {
-            let new_val = Value::Int(old.wrapping_add(1));
-            if ctx.compare_and_swap_field(this, 0, current, new_val) {
-                return Ok(Some(Value::Int(old)));
-            }
-        } else {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_int(this, 0, 1);
+    Ok(Some(Value::Int(old)))
 }
 
 fn native_atomic_int_get_and_decrement(
@@ -14058,17 +14093,8 @@ fn native_atomic_int_get_and_decrement(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Int(old) = current {
-            let new_val = Value::Int(old.wrapping_sub(1));
-            if ctx.compare_and_swap_field(this, 0, current, new_val) {
-                return Ok(Some(Value::Int(old)));
-            }
-        } else {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_int(this, 0, -1);
+    Ok(Some(Value::Int(old)))
 }
 
 fn native_atomic_int_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14077,17 +14103,8 @@ fn native_atomic_int_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(d)) => *d,
         _ => 0,
     };
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Int(old) = current {
-            let new_val = Value::Int(old.wrapping_add(delta));
-            if ctx.compare_and_swap_field(this, 0, current, new_val) {
-                return Ok(Some(Value::Int(old)));
-            }
-        } else {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_int(this, 0, delta);
+    Ok(Some(Value::Int(old)))
 }
 
 fn native_atomic_int_increment_and_get(
@@ -14095,17 +14112,8 @@ fn native_atomic_int_increment_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Int(old) = current {
-            let new_val = old.wrapping_add(1);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Int(new_val)) {
-                return Ok(Some(Value::Int(new_val)));
-            }
-        } else {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_int(this, 0, 1);
+    Ok(Some(Value::Int(old.wrapping_add(1))))
 }
 
 fn native_atomic_int_decrement_and_get(
@@ -14113,17 +14121,8 @@ fn native_atomic_int_decrement_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Int(old) = current {
-            let new_val = old.wrapping_sub(1);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Int(new_val)) {
-                return Ok(Some(Value::Int(new_val)));
-            }
-        } else {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_int(this, 0, -1);
+    Ok(Some(Value::Int(old.wrapping_sub(1))))
 }
 
 fn native_atomic_int_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14132,17 +14131,8 @@ fn native_atomic_int_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(d)) => *d,
         _ => 0,
     };
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Int(old) = current {
-            let new_val = old.wrapping_add(delta);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Int(new_val)) {
-                return Ok(Some(Value::Int(new_val)));
-            }
-        } else {
-            return Ok(Some(Value::Int(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_int(this, 0, delta);
+    Ok(Some(Value::Int(old.wrapping_add(delta))))
 }
 
 fn native_atomic_int_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14282,22 +14272,16 @@ fn native_atomic_long_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+// audit-round5 fix #9 (HIGH): AtomicLong analogue of the AtomicInteger
+// fetch_add migration — single trait dispatch per call, VM override can
+// emit a single `LOCK XADDQ`.
 fn native_atomic_long_get_and_increment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Long(old) = current {
-            let new_val = Value::Long(old.wrapping_add(1));
-            if ctx.compare_and_swap_field(this, 0, current, new_val) {
-                return Ok(Some(Value::Long(old)));
-            }
-        } else {
-            return Ok(Some(Value::Long(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_long(this, 0, 1);
+    Ok(Some(Value::Long(old)))
 }
 
 fn native_atomic_long_get_and_decrement(
@@ -14305,17 +14289,8 @@ fn native_atomic_long_get_and_decrement(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Long(old) = current {
-            let new_val = Value::Long(old.wrapping_sub(1));
-            if ctx.compare_and_swap_field(this, 0, current, new_val) {
-                return Ok(Some(Value::Long(old)));
-            }
-        } else {
-            return Ok(Some(Value::Long(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_long(this, 0, -1);
+    Ok(Some(Value::Long(old)))
 }
 
 fn native_atomic_long_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14324,17 +14299,8 @@ fn native_atomic_long_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Long(d)) => *d,
         _ => 0,
     };
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Long(old) = current {
-            let new_val = Value::Long(old.wrapping_add(delta));
-            if ctx.compare_and_swap_field(this, 0, current, new_val) {
-                return Ok(Some(Value::Long(old)));
-            }
-        } else {
-            return Ok(Some(Value::Long(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_long(this, 0, delta);
+    Ok(Some(Value::Long(old)))
 }
 
 fn native_atomic_long_increment_and_get(
@@ -14342,17 +14308,8 @@ fn native_atomic_long_increment_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Long(old) = current {
-            let new_val = old.wrapping_add(1);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Long(new_val)) {
-                return Ok(Some(Value::Long(new_val)));
-            }
-        } else {
-            return Ok(Some(Value::Long(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_long(this, 0, 1);
+    Ok(Some(Value::Long(old.wrapping_add(1))))
 }
 
 fn native_atomic_long_decrement_and_get(
@@ -14360,17 +14317,8 @@ fn native_atomic_long_decrement_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Long(old) = current {
-            let new_val = old.wrapping_sub(1);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Long(new_val)) {
-                return Ok(Some(Value::Long(new_val)));
-            }
-        } else {
-            return Ok(Some(Value::Long(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_long(this, 0, -1);
+    Ok(Some(Value::Long(old.wrapping_sub(1))))
 }
 
 fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14379,17 +14327,8 @@ fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Long(d)) => *d,
         _ => 0,
     };
-    loop {
-        let current = ctx.get_field_volatile(this, 0);
-        if let Value::Long(old) = current {
-            let new_val = old.wrapping_add(delta);
-            if ctx.compare_and_swap_field(this, 0, current, Value::Long(new_val)) {
-                return Ok(Some(Value::Long(new_val)));
-            }
-        } else {
-            return Ok(Some(Value::Long(0)));
-        }
-    }
+    let old = ctx.atomic_fetch_add_long(this, 0, delta);
+    Ok(Some(Value::Long(old.wrapping_add(delta))))
 }
 
 fn native_atomic_long_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29049,6 +28988,13 @@ fn native_long_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(None)
 }
 
+// audit-round5 fix #2 (CRIT): LongAdder.add / increment / decrement must be
+// atomic. The previous non-CAS read-modify-write lost updates under any
+// concurrent contention — defeating LongAdder's entire purpose as a
+// striped, contention-tolerant counter. Mirror the AtomicLong.getAndAdd
+// CAS-loop pattern (`get_field_volatile` + `compare_and_swap_field`).
+// LongAdder semantics permit the "approximate sum" relaxation across
+// cells, but each cell's update must be atomic.
 fn native_long_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -29058,12 +29004,22 @@ fn native_long_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let cur = match ctx.get_field(this, 0) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, 0, Value::Long(cur.wrapping_add(x)));
-    Ok(None)
+    loop {
+        let current = ctx.get_field_volatile(this, 0);
+        if let Value::Long(old) = current {
+            let new_val = Value::Long(old.wrapping_add(x));
+            if ctx.compare_and_swap_field(this, 0, current, new_val) {
+                return Ok(None);
+            }
+        } else {
+            // Field uninitialized (Value::Object(None) or similar) — seed
+            // it to `x` via CAS and return.
+            let new_val = Value::Long(x);
+            if ctx.compare_and_swap_field(this, 0, current, new_val) {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 fn native_long_adder_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29071,12 +29027,20 @@ fn native_long_adder_increment(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let cur = match ctx.get_field(this, 0) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, 0, Value::Long(cur.wrapping_add(1)));
-    Ok(None)
+    loop {
+        let current = ctx.get_field_volatile(this, 0);
+        if let Value::Long(old) = current {
+            let new_val = Value::Long(old.wrapping_add(1));
+            if ctx.compare_and_swap_field(this, 0, current, new_val) {
+                return Ok(None);
+            }
+        } else {
+            let new_val = Value::Long(1);
+            if ctx.compare_and_swap_field(this, 0, current, new_val) {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 fn native_long_adder_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29084,12 +29048,20 @@ fn native_long_adder_decrement(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let cur = match ctx.get_field(this, 0) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, 0, Value::Long(cur.wrapping_sub(1)));
-    Ok(None)
+    loop {
+        let current = ctx.get_field_volatile(this, 0);
+        if let Value::Long(old) = current {
+            let new_val = Value::Long(old.wrapping_sub(1));
+            if ctx.compare_and_swap_field(this, 0, current, new_val) {
+                return Ok(None);
+            }
+        } else {
+            let new_val = Value::Long(-1);
+            if ctx.compare_and_swap_field(this, 0, current, new_val) {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 fn native_long_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29097,7 +29069,9 @@ fn native_long_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    // audit-round5 fix #2: use volatile read so callers see the most
+    // recently published value from another thread's `add`/CAS.
+    Ok(Some(ctx.get_field_volatile(this, 0)))
 }
 
 fn native_long_adder_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29117,7 +29091,9 @@ fn native_long_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, 0, Value::Long(0));
+    // audit-round5 fix #2: volatile store so other threads observing via
+    // `sum`/`get_field_volatile` immediately see the cleared cell.
+    ctx.set_field_volatile(this, 0, Value::Long(0));
     Ok(None)
 }
 
@@ -29129,9 +29105,14 @@ fn native_long_adder_sum_then_reset(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let v = ctx.get_field(this, 0);
-    ctx.set_field(this, 0, Value::Long(0));
-    Ok(Some(v))
+    // audit-round5 fix #2: atomic swap via CAS-loop so we cannot lose a
+    // concurrent `add` that races between the read and the clear.
+    loop {
+        let current = ctx.get_field_volatile(this, 0);
+        if ctx.compare_and_swap_field(this, 0, current, Value::Long(0)) {
+            return Ok(Some(current));
+        }
+    }
 }
 
 fn native_long_adder_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29157,6 +29138,10 @@ fn native_double_adder_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
+// audit-round5 fix #2 (CRIT, mirror): DoubleAdder.add must be atomic for
+// the same reasons as LongAdder.add. CAS uses bit-pattern equality on
+// Value::Double (see vm_exec::values_equal_for_cas) so NaN does not cause
+// a livelock — `Double(NaN).to_bits() == Double(NaN).to_bits()` holds.
 fn native_double_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -29166,12 +29151,17 @@ fn native_double_adder_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let cur = match ctx.get_field(this, 0) {
-        Value::Double(v) => v,
-        _ => 0.0,
-    };
-    ctx.set_field(this, 0, Value::Double(cur + x));
-    Ok(None)
+    loop {
+        let current = ctx.get_field_volatile(this, 0);
+        let old = match current {
+            Value::Double(v) => v,
+            _ => 0.0,
+        };
+        let new_val = Value::Double(old + x);
+        if ctx.compare_and_swap_field(this, 0, current, new_val) {
+            return Ok(None);
+        }
+    }
 }
 
 fn native_double_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29179,7 +29169,8 @@ fn native_double_adder_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Double(0.0))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    // audit-round5 fix #2: volatile read so concurrent `add`s are observed.
+    Ok(Some(ctx.get_field_volatile(this, 0)))
 }
 
 fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29187,7 +29178,9 @@ fn native_double_adder_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, 0, Value::Double(0.0));
+    // audit-round5 fix #2: volatile store so other threads' `sum`
+    // reads the cleared value immediately.
+    ctx.set_field_volatile(this, 0, Value::Double(0.0));
     Ok(None)
 }
 

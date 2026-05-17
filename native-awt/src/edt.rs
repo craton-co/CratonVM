@@ -149,10 +149,27 @@ impl EventDispatchThread {
     /// `invokeLater` / `invokeAndWait` natives BEFORE posting the
     /// corresponding `AwtEvent::invocation` so that the dispatch site
     /// can always find the Runnable.
+    ///
+    /// RACE FIX (round-5 audit): `runnables` and `runnables_order` MUST be
+    /// updated atomically.  Before this fix the two locks were taken
+    /// separately in both `register_runnable` and `take_runnable`, so an
+    /// eviction in `register_runnable` could `pop_front` from `order` an
+    /// id whose `runnables` entry the dispatcher had just removed (line
+    /// 171, between the two lock-acquisitions in `take_runnable`).  The
+    /// eviction's `map.remove(&old)` then silently no-op'd while still
+    /// having consumed `old` from the order deque — leaving subsequent
+    /// dispatchers unable to detect that the slot they thought was theirs
+    /// had been re-allocated to a different runnable.
+    ///
+    /// We now take both locks atomically (consistent ordering: runnables
+    /// before runnables_order, the same as `take_runnable` and `stop`) so
+    /// the eviction loop sees an internally-consistent view of the table.
     pub fn register_runnable(&self, callback_id: u64, runnable: ObjectRef) {
         let mut map = self.runnables.lock();
         let mut order = self.runnables_order.lock();
-        // Evict oldest entries if at capacity.
+        // Evict oldest entries if at capacity.  Both locks held: the
+        // dispatcher in `take_runnable` is blocked behind `map` here, so
+        // we know `map.len()` and `order` cannot diverge mid-eviction.
         while map.len() >= Self::MAX_RUNNABLES {
             if let Some(old) = order.pop_front() {
                 map.remove(&old);
@@ -167,13 +184,21 @@ impl EventDispatchThread {
 
     /// Remove and return the Runnable registered for `callback_id`, if
     /// any.  Called by `InvocationEvent.dispatch()V`.
+    ///
+    /// RACE FIX (round-5 audit): hold both `runnables` and
+    /// `runnables_order` for the full remove+order-cleanup so that a
+    /// concurrent `register_runnable` cannot pop the head of `order`
+    /// while we have already removed the corresponding `map` entry but
+    /// not yet swept the order tracker.  See `register_runnable` for the
+    /// full hazard description.
     pub fn take_runnable(&self, callback_id: u64) -> Option<ObjectRef> {
-        let removed = self.runnables.lock().remove(&callback_id);
+        let mut map = self.runnables.lock();
+        let mut order = self.runnables_order.lock();
+        let removed = map.remove(&callback_id);
         if removed.is_some() {
             // Remove from order tracker. Linear scan is fine: the order
             // deque is bounded by `MAX_RUNNABLES`, and successful dispatches
             // typically take the head (cheap).
-            let mut order = self.runnables_order.lock();
             if let Some(pos) = order.iter().position(|&id| id == callback_id) {
                 order.remove(pos);
             }

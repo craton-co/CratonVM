@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::buffer::ClassFileBuffer;
+use crate::byte_view::ByteView;
 use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::ConstantPool;
 
@@ -48,12 +49,12 @@ pub enum Attribute {
 
     /// The `StackMapTable` attribute (4.7.4): verification type info for each basic block.
     ///
-    /// `entries` is stored as `Arc<[u8]>` so producing the attribute from
-    /// the class-reader hot path is a refcount-bump on the shared class
-    /// file buffer (`Arc::from(&source[range])` → `Arc<[u8]>`) rather than
-    /// a per-attribute `.to_vec()` memcpy. The verifier reads it via
-    /// deref coercion (`Arc<[u8]>` → `&[u8]`).
-    StackMapTable { entries: Arc<[u8]> },
+    /// `entries` is stored as a [`ByteView`] — a zero-copy slice of the
+    /// shared class-file `Arc<[u8]>`. Producing this attribute on the
+    /// hot path is a single `Arc::clone` refcount bump plus two `usize`
+    /// copies, no memcpy. The verifier reads it via deref coercion
+    /// (`ByteView` → `&[u8]`).
+    StackMapTable { entries: ByteView },
 
     /// The `BootstrapMethods` attribute (4.7.23): bootstrap methods for invokedynamic.
     BootstrapMethods(Vec<BootstrapMethod>),
@@ -142,30 +143,33 @@ pub enum Attribute {
     /// An attribute we don't yet parse. Stores the raw bytes.
     ///
     /// `name` is an `Arc<str>` (refcount-bump clone of the constant-pool
-    /// interned attribute name) and `data` is an `Arc<[u8]>` slicing into
-    /// the shared class file buffer — both avoid per-attribute allocations
-    /// on the parse hot path. Most class files have several
-    /// `Unknown`-tagged attributes (older annotation extensions, vendor
-    /// attributes), so this is a measurable bootstrap win.
-    Unknown { name: Arc<str>, data: Arc<[u8]> },
+    /// interned attribute name) and `data` is a [`ByteView`] slicing
+    /// directly into the shared class-file `Arc<[u8]>` — both avoid
+    /// per-attribute allocations on the parse hot path. Most class
+    /// files have several `Unknown`-tagged attributes (older annotation
+    /// extensions, vendor attributes), so this is a measurable
+    /// bootstrap win.
+    Unknown { name: Arc<str>, data: ByteView },
 }
 
 /// The Code attribute structure (JVM spec 4.7.3).
 ///
-/// `code` is stored as `Arc<[u8]>` so the body bytes are *not* memcpy'd
-/// out of the class file buffer on parse. The decoder slices the shared
-/// `Arc<[u8]>` that wraps the whole class file and refcount-bumps it; the
-/// per-method cost is one Arc bump, not a `Vec<u8>` allocation +
-/// `MemCopy(code_length)`. On java.base bootstrap this saves on the order
-/// of one allocation + memcpy per method × ~24 k methods. Consumers that
-/// previously took `&Vec<u8>` work unchanged thanks to deref coercion
-/// (`Arc<[u8]>` → `&[u8]`); consumers that previously moved or cloned the
-/// `Vec` now move/clone an `Arc` (still a refcount bump).
+/// `code` is stored as a [`ByteView`] so the body bytes are *not*
+/// memcpy'd out of the class file buffer on parse. The decoder builds
+/// the view over the shared class-file `Arc<[u8]>`; the per-method
+/// cost is one `Arc::clone` refcount bump plus two `usize` copies, not
+/// a `Vec<u8>` allocation + `MemCopy(code_length)`. On java.base
+/// bootstrap this saves on the order of one allocation + memcpy per
+/// method × ~24 k methods. Consumers that previously took `&[u8]` work
+/// unchanged thanks to deref coercion (`ByteView` → `&[u8]`); consumers
+/// that need an owned `Arc<[u8]>` (e.g. `VtableMethodSnapshot.code`,
+/// `Frame.code`) call [`ByteView::to_arc`] which materializes a fresh
+/// standalone allocation exactly once.
 #[derive(Debug, Clone)]
 pub struct CodeAttribute {
     pub max_stack: u16,
     pub max_locals: u16,
-    pub code: Arc<[u8]>,
+    pub code: ByteView,
     pub exception_table: Vec<ExceptionTableEntry>,
     pub attributes: Vec<Attribute>,
 }
@@ -598,12 +602,12 @@ pub fn decode_attribute(
 /// `source` is the shared class file buffer; `range` is the inclusive-
 /// exclusive byte range of *this attribute's body* inside `source`. Any
 /// raw-byte payloads (`Code.code`, `StackMapTable.entries`,
-/// `Unknown.data`) are produced as `Arc::from(&source[sub_range])` —
-/// a single fresh `Arc<[u8]>` allocation per payload that *would have
-/// been* a `Vec<u8>` before. The benefit vs. the pre-T11 reader is that
-/// each payload Arc is its own slice rather than the full attribute body,
-/// and the parent attribute header bytes (name index, length) are not
-/// duplicated.
+/// `Unknown.data`) are produced as
+/// `ByteView::new(Arc::clone(source), sub_range)` — a single atomic
+/// refcount bump and two `usize` copies per payload, with no memcpy.
+/// (Round-4 wave-2 used `Arc::from(&source[range])` here, which
+/// silently allocated a fresh `ArcInner<[u8]>` and memcpy'd the slice;
+/// see `docs/round5-reader.md` CRIT-1.)
 pub fn decode_attribute_with_source(
     name: &str,
     source: &Arc<[u8]>,
@@ -642,9 +646,10 @@ pub fn decode_attribute_with_source(
 /// `source` + `body_offset` describe the location of *this attribute's
 /// body* inside the shared class file buffer. Sub-attributes that store
 /// raw bytes use `body_offset + buf.position()` to compute the absolute
-/// offset of their payload start inside `source` and slice it as
-/// `Arc::from(&source[start..end])` — one shared-buffer-backed allocation
-/// instead of a fresh `Vec<u8>` per payload.
+/// offset of their payload start inside `source` and wrap it as
+/// `ByteView::new(Arc::clone(source), start..end)` — a refcount-only
+/// view on the shared buffer instead of a fresh `Vec<u8>` (or, post-
+/// round-4-wave-2, a fresh `Arc<[u8]>`) per payload.
 fn decode_attribute_body(
     name: &str,
     length: usize,
@@ -721,14 +726,20 @@ fn decode_attribute_body(
             // The StackMapTable body is stored verbatim — verifier-time
             // parsing happens later in the `stack_map` module.
             //
-            // Zero-copy: slice the shared class-file buffer rather than
-            // copying the body into a fresh `Vec<u8>`. The slice's start
-            // is `body_offset + current buffer position`; we still call
-            // `read_bytes` to advance the buffer and surface any EOF
-            // exactly the way the previous code did.
+            // True zero-copy: build a `ByteView` over the shared
+            // class-file `Arc<[u8]>`. This is a single `Arc::clone`
+            // refcount bump plus two `usize` copies — no memcpy. The
+            // slice's start is `body_offset + current buffer position`;
+            // we still call `read_bytes` to advance the buffer and
+            // surface any EOF exactly the way the previous code did.
+            //
+            // (Round-4 wave-2 used `Arc::from(&source[range])` here,
+            // which silently allocated a fresh `ArcInner<[u8]>` and
+            // memcpy'd the slice — the parent Arc was *not* shared.
+            // See round5-reader.md CRIT-1.)
             let start = body_offset + buf.position();
             let _ = buf.read_bytes(length)?;
-            let entries: Arc<[u8]> = Arc::from(&source[start..start + length]);
+            let entries = ByteView::new(Arc::clone(source), start..start + length);
             Attribute::StackMapTable { entries }
         }
         "BootstrapMethods" => {
@@ -988,15 +999,19 @@ fn decode_attribute_body(
             // because the post-parse check in `decode_attribute_with_source`
             // would catch a mismatch anyway.
             //
-            // Zero-copy: slice the shared class-file buffer for the data
-            // payload, and re-use the pool-interned attribute name (a
-            // refcount bump on the same `Arc<str>` the LazyAttribute
-            // header carries). On bootstrap, hundreds of distinct vendor /
-            // legacy attribute names recur many times across classes — the
-            // intern path makes each name a single allocation.
+            // True zero-copy: build a `ByteView` over the shared
+            // class-file `Arc<[u8]>` for the data payload, and re-use
+            // the pool-interned attribute name (a refcount bump on the
+            // same `Arc<str>` the LazyAttribute header carries). On
+            // bootstrap, hundreds of distinct vendor / legacy attribute
+            // names recur many times across classes — the intern path
+            // makes each name a single allocation. (Round-4 wave-2
+            // used `Arc::from(&source[range])` here, which allocated a
+            // fresh `ArcInner<[u8]>` + memcpy'd the slice; the parent
+            // Arc was *not* shared. See round5-reader.md CRIT-1.)
             let start = body_offset + buf.position();
             let _ = buf.read_bytes(length)?;
-            let data: Arc<[u8]> = Arc::from(&source[start..start + length]);
+            let data = ByteView::new(Arc::clone(source), start..start + length);
             Attribute::Unknown {
                 name: rustjvm_types::intern_arc(name),
                 data,
@@ -1016,7 +1031,8 @@ fn decode_attribute_body(
 /// `source` + `outer_body_offset` thread the shared class file buffer + the
 /// outer attribute body's start through to the per-nested decoder so its
 /// raw-byte payloads (`StackMapTable.entries`, `Unknown.data`) can be
-/// `Arc::from(&source[..])` slices instead of fresh `Vec<u8>` allocations.
+/// `ByteView::new(Arc::clone(source), ..)` views instead of fresh
+/// `Vec<u8>` (or fresh `Arc<[u8]>`) allocations per payload.
 fn decode_attributes_vec(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
@@ -1067,10 +1083,13 @@ fn decode_attributes_vec(
 ///
 /// `source` + `body_offset` describe the byte range of the Code
 /// attribute's body inside the shared class file buffer. The bytecode
-/// payload is produced as `Arc::from(&source[code_start..code_end])` —
-/// a refcount-style slice on the shared buffer rather than a fresh
-/// `Vec<u8>` per method. On bootstrap (~24 k methods × ~50 B average)
-/// this eliminates roughly one allocation + memcpy per method.
+/// payload is produced as `ByteView::new(Arc::clone(source),
+/// code_start..code_end)` — a true refcount-only view on the shared
+/// buffer (single atomic increment, no memcpy) rather than the fresh
+/// `Vec<u8>` (pre-round-4) or fresh `Arc<[u8]>` (round-4 wave-2, which
+/// turned out to also allocate; see round5-reader.md CRIT-1) that
+/// preceded it. On bootstrap (~24 k methods × ~50 B average) this
+/// eliminates roughly one allocation + memcpy per method.
 fn decode_code_body(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
@@ -1090,13 +1109,17 @@ fn decode_code_body(
             ),
         });
     }
-    // Zero-copy bytecode: snapshot the absolute offset of the bytecode
-    // payload inside `source`, then advance the buffer past it (we still
-    // call `read_bytes` for the EOF check). The bytecode `Arc<[u8]>` is
-    // a direct slice of the shared class file buffer.
+    // True zero-copy bytecode: snapshot the absolute offset of the
+    // bytecode payload inside `source`, then advance the buffer past
+    // it (we still call `read_bytes` for the EOF check). The bytecode
+    // [`ByteView`] is a refcount-bumped clone of the shared class-file
+    // `Arc<[u8]>` plus a `Range<usize>` — no memcpy. (Round-4 wave-2
+    // used `Arc::from(&source[range])` here, which silently allocated
+    // a fresh `ArcInner<[u8]>` + memcpy; the parent Arc was *not*
+    // shared. See round5-reader.md CRIT-1.)
     let code_start = body_offset + buf.position();
     let _ = buf.read_bytes(code_length)?;
-    let code: Arc<[u8]> = Arc::from(&source[code_start..code_start + code_length]);
+    let code = ByteView::new(Arc::clone(source), code_start..code_start + code_length);
 
     let exception_table_length = buf.read_u16()?;
     let mut exception_table =
@@ -1444,7 +1467,7 @@ mod tests {
     #[test]
     fn attribute_stack_map_table_raw_bytes() {
         let attr = Attribute::StackMapTable {
-            entries: Arc::from([0x01u8, 0x02, 0xFF].as_slice()),
+            entries: ByteView::from_slice(&[0x01u8, 0x02, 0xFF]),
         };
         match &attr {
             Attribute::StackMapTable { entries } => {
@@ -1457,7 +1480,7 @@ mod tests {
     #[test]
     fn attribute_stack_map_table_empty() {
         let attr = Attribute::StackMapTable {
-            entries: Arc::from([].as_slice()),
+            entries: ByteView::empty(),
         };
         match &attr {
             Attribute::StackMapTable { entries } => assert!(entries.is_empty()),
@@ -1571,7 +1594,7 @@ mod tests {
     fn attribute_unknown() {
         let attr = Attribute::Unknown {
             name: Arc::from("CustomAttr"),
-            data: Arc::from([0xDEu8, 0xAD].as_slice()),
+            data: ByteView::from_slice(&[0xDEu8, 0xAD]),
         };
         match &attr {
             Attribute::Unknown { name, data } => {
@@ -1586,7 +1609,7 @@ mod tests {
     fn attribute_unknown_empty_data() {
         let attr = Attribute::Unknown {
             name: Arc::from("Empty"),
-            data: Arc::from([].as_slice()),
+            data: ByteView::empty(),
         };
         match &attr {
             Attribute::Unknown { name, data } => {
@@ -1604,7 +1627,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: 4,
             max_locals: 2,
-            code: Arc::from([0xB1u8].as_slice()), // return
+            code: ByteView::from_slice(&[0xB1u8]), // return
             exception_table: vec![],
             attributes: vec![],
         };
@@ -1626,7 +1649,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: 2,
             max_locals: 1,
-            code: Arc::from([].as_slice()),
+            code: ByteView::empty(),
             exception_table: vec![entry],
             attributes: vec![],
         };
@@ -1654,7 +1677,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: u16::MAX,
             max_locals: u16::MAX,
-            code: Arc::from([].as_slice()),
+            code: ByteView::empty(),
             exception_table: vec![],
             attributes: vec![],
         };
@@ -1671,7 +1694,7 @@ mod tests {
         let code_attr = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: Arc::from([0xB1u8].as_slice()),
+            code: ByteView::from_slice(&[0xB1u8]),
             exception_table: vec![],
             attributes: vec![inner],
         };
@@ -2239,7 +2262,7 @@ mod tests {
         let original = Attribute::Code(CodeAttribute {
             max_stack: 3,
             max_locals: 2,
-            code: Arc::from([0x2Au8, 0xB7, 0x00, 0x01, 0xB1].as_slice()),
+            code: ByteView::from_slice(&[0x2Au8, 0xB7, 0x00, 0x01, 0xB1]),
             exception_table: vec![ExceptionTableEntry {
                 start_pc: 0,
                 end_pc: 5,
@@ -2311,7 +2334,7 @@ mod tests {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: Arc::from([0xB1u8].as_slice()),
+            code: ByteView::from_slice(&[0xB1u8]),
             exception_table: vec![],
             attributes: vec![],
         };

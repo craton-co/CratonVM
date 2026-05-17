@@ -60,6 +60,33 @@ pub fn ensure_class_initialized_shared(
     thread: &mut JvmThread,
     class_id: ClassId,
 ) -> Result<(), MethodCallFailed> {
+    // Round 5 audit fix (HIGH): AtomicU8 fast path. After warmup the
+    // overwhelming majority of `ensure_class_initialized_shared` calls
+    // are for classes that are already fully initialized — the previous
+    // implementation paid for a `class_manager.read()` RwLock + a
+    // `get_class` + a `ClassState` match on every single call (interpreter
+    // dispatch, JIT entry, reflection). A single relaxed atomic load
+    // returns immediately on the steady-state hot path.
+    //
+    // The handle is obtained inside `class_manager.read()` once; the
+    // resulting `Arc<AtomicU8>` lives long enough that the read lock
+    // can be dropped before the load is performed. Subsequent loads
+    // need no lock at all — but we re-obtain the handle each call here
+    // because the caller doesn't currently cache it. Callers that want
+    // to amortize the handle lookup (e.g. JIT entry stubs) should hold
+    // onto the `Arc<AtomicU8>` returned by
+    // `ClassManager::class_init_state_handle` directly.
+    {
+        let cm = shared.class_manager.read();
+        let handle = cm.class_init_state_handle(class_id);
+        drop(cm);
+        if handle.load(std::sync::atomic::Ordering::Acquire)
+            == rustjvm_classloading::CLASS_INIT_INITIALIZED
+        {
+            return Ok(());
+        }
+    }
+
     let current_thread_id = thread.thread_id.0;
 
     loop {
@@ -417,6 +444,17 @@ fn initialize_class_shared(
             if let Some(class) = cm.get_class_mut(class_id) {
                 class.state = new_state;
                 class.initializing_thread = None;
+            }
+            // Round 5 audit fix (HIGH): keep the AtomicU8 fast-path
+            // cache in sync. Only `Initialized` flips the cache to the
+            // fast-return state — `InitializationError` stays
+            // UNINITIALIZED so the fast path always falls through to
+            // the slow path which converts it to `NoClassDefFoundError`.
+            if matches!(new_state, ClassState::Initialized) {
+                cm.set_class_init_state(
+                    class_id,
+                    rustjvm_classloading::CLASS_INIT_INITIALIZED,
+                );
             }
         }
         // Remove waiter and notify all blocked threads

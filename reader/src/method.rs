@@ -143,7 +143,7 @@ mod tests {
         let code_attr = crate::attribute::CodeAttribute {
             max_stack: 2,
             max_locals: 1,
-            code: vec![0xb1], // return
+            code: crate::byte_view::ByteView::from_vec(vec![0xb1]), // return
             exception_table: Vec::new(),
             attributes: Vec::new(),
         };
