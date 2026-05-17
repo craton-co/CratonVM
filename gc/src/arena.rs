@@ -48,6 +48,34 @@ impl Arena {
 
     /// Reset the arena, logically freeing all allocations.
     /// The backing memory is zeroed for safety.
+    ///
+    /// # When is it safe to use [`Self::reset_no_zero`] instead?
+    ///
+    /// The unsafe `reset_no_zero` variant is only sound when **both** of the
+    /// following hold:
+    ///
+    /// 1. The allocator path zero-initialises every byte before handing the
+    ///    pointer to the caller (e.g. `try_alloc_young` calls
+    ///    `ptr::write_bytes(ptr, 0, size)`), OR the immediate caller fully
+    ///    overwrites the region (e.g. Cheney `copy_nonoverlapping` writing
+    ///    `total_size` bytes into the to-space slot). This guarantees no
+    ///    legitimate read ever observes a stale byte.
+    /// 2. No external code can read bytes past the cursor between the reset
+    ///    and the next allocation. In CratonVM this is **not** true for
+    ///    young-gen arenas: `GenerationalHeap::is_object_address`
+    ///    (gen_heap.rs:465) performs conservative pointer validation that
+    ///    accepts any 8-byte-aligned address within `[base, base+capacity)`
+    ///    of either young space and then dereferences it as an
+    ///    `ObjectHeader`. The VM's conservative root scanner
+    ///    (vm/src/vm/vm_exec.rs:679) feeds ambiguous JVM long values through
+    ///    this check, so leftover bytes in a reset young arena can be
+    ///    misidentified as live objects and forwarded as garbage.
+    ///
+    /// Therefore: do **not** swap `reset` for `reset_no_zero` on the young
+    /// from-space hot path until `is_object_address` is bounded by the live
+    /// cursor (or the conservative root scanner is replaced with a precise
+    /// stack map). The audit-flagged "perf bug" is a real cost, but the
+    /// correctness hazard outweighs it.
     pub fn reset(&mut self) {
         // Zero out used region for safety (prevents stale data reads)
         self.data[..self.cursor].fill(0);
@@ -58,8 +86,18 @@ impl Arena {
     ///
     /// # Safety
     /// Callers must ensure all subsequent allocations are fully
-    /// initialized before any reads. Used by GC when copying live
-    /// objects will overwrite all returned memory anyway.
+    /// initialized before any reads, AND that no external scanner can
+    /// observe bytes past the (now-zero) cursor before they are
+    /// re-allocated. See the doc comment on [`Self::reset`] for the
+    /// full safety contract.
+    ///
+    /// Currently unused: the young-gen reset path in `gen_heap.rs` cannot
+    /// satisfy condition (2) because conservative root scanning may
+    /// dereference any 8-byte-aligned address in an arena's capacity
+    /// range. Retained for future use when the GC switches to precise
+    /// stack maps or when `is_object_address` is tightened to honour the
+    /// cursor bound.
+    #[allow(dead_code)]
     pub unsafe fn reset_no_zero(&mut self) {
         self.cursor = 0;
     }

@@ -145,6 +145,15 @@ pub fn read_class(data: &[u8]) -> Result<ClassFile, ClassReaderError> {
 
 fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassReaderError> {
     let count = buf.read_u16()?;
+    // JVMS §4.1: constant_pool_count must be >= 1. The 0-th slot is a
+    // reserved sentinel; valid entries live at indices 1..count. HotSpot
+    // rejects count == 0 with java.lang.ClassFormatError.
+    if count == 0 {
+        return Err(ClassReaderError::InvalidConstantPool {
+            index: 0,
+            message: "constant_pool_count must be >= 1".to_string(),
+        });
+    }
     validate_count("constant_pool", count, MAX_CP_SIZE)?;
     let mut entries: Vec<ConstantPoolEntry> = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
     entries.push(ConstantPoolEntry::Tombstone); // Index 0
@@ -390,6 +399,13 @@ fn read_attributes(
                 ),
             });
         }
+
+        // Snapshot position before dispatching to the sub-parser so we can
+        // verify post-parse that exactly `length` bytes were consumed.
+        // A malicious attribute can declare e.g. `length = 4` while its
+        // structured body actually walks the parser past the declared end,
+        // mis-aligning every subsequent attribute (including Code bodies).
+        let start_pos = buf.position();
 
         let attr = match name {
             "Code" => read_code_attribute(buf, constant_pool)?,
@@ -713,6 +729,18 @@ fn read_attributes(
                 }
             }
         };
+
+        // Enforce that the sub-parser consumed exactly `length` bytes.
+        // Any over- or under-read indicates a malformed (or malicious)
+        // attribute body that would mis-align all subsequent attributes.
+        let consumed = buf.position() - start_pos;
+        if consumed != length {
+            return Err(ClassReaderError::InvalidClassData {
+                message: format!(
+                    "attribute '{name}' declared length {length} but sub-parser consumed {consumed} bytes"
+                ),
+            });
+        }
 
         attributes.push(attr);
     }

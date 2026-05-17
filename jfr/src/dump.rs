@@ -262,12 +262,22 @@ fn build_metadata_section(registry: &EventTypeRegistry, start_time_ns: u64) -> V
         body.push(if event_type.has_stacktrace { 1 } else { 0 });
     }
 
-    // Wrap in a size-prefixed record
-    let mut record = Vec::new();
-    let total = encode_compressed_int((body.len() + 1) as u64).len() + body.len();
-    record.extend_from_slice(&encode_compressed_int(total as u64));
-    record.extend_from_slice(&body);
-    record
+    // Wrap in a size-prefixed record.  Because the size prefix is itself a
+    // variable-length compressed int, we iterate until the prefix length is
+    // stable (same pattern as `serialize_event`).
+    let body_len = body.len();
+    let mut size_prefix_len = 1usize;
+    loop {
+        let total = size_prefix_len + body_len;
+        let actual_prefix_len = encode_compressed_int(total as u64).len();
+        if actual_prefix_len == size_prefix_len {
+            let mut record = Vec::with_capacity(total);
+            record.extend_from_slice(&encode_compressed_int(total as u64));
+            record.extend_from_slice(&body);
+            return record;
+        }
+        size_prefix_len = actual_prefix_len;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,12 +304,21 @@ fn build_checkpoint_section(start_time_ns: u64) -> Vec<u8> {
     // Number of constant pools: 0
     body.extend_from_slice(&encode_compressed_int(0));
 
-    // Wrap in size-prefixed record
-    let mut record = Vec::new();
-    let total = encode_compressed_int((body.len() + 1) as u64).len() + body.len();
-    record.extend_from_slice(&encode_compressed_int(total as u64));
-    record.extend_from_slice(&body);
-    record
+    // Wrap in size-prefixed record.  Iterate until the size-prefix length is
+    // stable (same pattern as `serialize_event`).
+    let body_len = body.len();
+    let mut size_prefix_len = 1usize;
+    loop {
+        let total = size_prefix_len + body_len;
+        let actual_prefix_len = encode_compressed_int(total as u64).len();
+        if actual_prefix_len == size_prefix_len {
+            let mut record = Vec::with_capacity(total);
+            record.extend_from_slice(&encode_compressed_int(total as u64));
+            record.extend_from_slice(&body);
+            return record;
+        }
+        size_prefix_len = actual_prefix_len;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,50 +368,86 @@ pub fn dump_to_file(
     start_time_ns: u64,
     duration_ns: u64,
 ) -> Result<u64, JfrDumpError> {
-    let file = std::fs::File::create(path)?;
-    let mut writer = io::BufWriter::new(file);
+    // Write to a sibling `<name>.jfr.part` file and atomically rename on
+    // success.  If anything fails partway through, the prior `.jfr` file is
+    // left intact and the `.part` scratch file is best-effort removed by the
+    // RAII guard below.
+    let part_path = path.with_extension("jfr.part");
 
-    // Write placeholder header (will be updated at the end)
-    write_header(&mut writer, 0, 0, 0, start_time_ns, duration_ns, FILE_STATE_WRITING)?;
-
-    // Write events
-    for event in repository.iter() {
-        let record = serialize_event(
-            event.type_id,
-            event.start_time,
-            event.end_time,
-            event.thread_id,
-            &event.fields,
-        );
-        writer.write_all(&record)?;
+    /// Best-effort cleanup of the in-progress `.part` file. `disarm()` is
+    /// called once the rename succeeds; otherwise `drop` removes the file.
+    struct PartGuard<'a> {
+        path: &'a Path,
+        armed: bool,
     }
+    impl<'a> PartGuard<'a> {
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+    impl<'a> Drop for PartGuard<'a> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = std::fs::remove_file(self.path);
+            }
+        }
+    }
+    let mut guard = PartGuard { path: &part_path, armed: true };
 
-    // Write checkpoint
-    let checkpoint_offset = writer.seek(SeekFrom::Current(0))?;
-    let checkpoint = build_checkpoint_section(start_time_ns);
-    writer.write_all(&checkpoint)?;
+    let file_size = {
+        let file = std::fs::File::create(&part_path)?;
+        let mut writer = io::BufWriter::new(file);
 
-    // Write metadata
-    let metadata_offset = writer.seek(SeekFrom::Current(0))?;
-    let metadata = build_metadata_section(registry, start_time_ns);
-    writer.write_all(&metadata)?;
+        // Write placeholder header (will be updated at the end)
+        write_header(&mut writer, 0, 0, 0, start_time_ns, duration_ns, FILE_STATE_WRITING)?;
 
-    // Compute final file size
-    let file_size = writer.seek(SeekFrom::Current(0))?;
+        // Write events
+        for event in repository.iter() {
+            let record = serialize_event(
+                event.type_id,
+                event.start_time,
+                event.end_time,
+                event.thread_id,
+                &event.fields,
+            );
+            writer.write_all(&record)?;
+        }
 
-    // Rewrite header with correct offsets and file state
-    writer.seek(SeekFrom::Start(0))?;
-    write_header(
-        &mut writer,
-        file_size,
-        checkpoint_offset,
-        metadata_offset,
-        start_time_ns,
-        duration_ns,
-        FILE_STATE_COMPLETE,
-    )?;
+        // Write checkpoint
+        let checkpoint_offset = writer.seek(SeekFrom::Current(0))?;
+        let checkpoint = build_checkpoint_section(start_time_ns);
+        writer.write_all(&checkpoint)?;
 
-    writer.flush()?;
+        // Write metadata
+        let metadata_offset = writer.seek(SeekFrom::Current(0))?;
+        let metadata = build_metadata_section(registry, start_time_ns);
+        writer.write_all(&metadata)?;
+
+        // Compute final file size
+        let file_size = writer.seek(SeekFrom::Current(0))?;
+
+        // Rewrite header with correct offsets and file state
+        writer.seek(SeekFrom::Start(0))?;
+        write_header(
+            &mut writer,
+            file_size,
+            checkpoint_offset,
+            metadata_offset,
+            start_time_ns,
+            duration_ns,
+            FILE_STATE_COMPLETE,
+        )?;
+
+        // Flush buffered writer into the OS file, then fsync to ensure the
+        // bytes (including the rewritten header) are durable before rename.
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        file_size
+    };
+
+    // Atomically swap the completed `.part` file into the final path.
+    std::fs::rename(&part_path, path)?;
+    guard.disarm();
     Ok(file_size)
 }
 

@@ -5,9 +5,27 @@
 //! inherits from its parent and overrides/appends entries for its own methods.
 
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
+
+use crate::runtime::fx_collections::{FxHashMap, FxHasher};
+
+/// HIGH-6 — fast-path key derived from `(name, descriptor)` without
+/// allocating. Two independent FxHash streams XOR-mixed; the canonical
+/// `FxHashMap<(Arc<str>, Arc<str>), usize>` index disambiguates the
+/// vanishingly-rare collisions.
+#[inline]
+fn fast_lookup_key(name: &str, descriptor: &str) -> u64 {
+    let mut h1 = FxHasher::default();
+    h1.write(name.as_bytes());
+    let mut h2 = FxHasher::default();
+    h2.write(descriptor.as_bytes());
+    // Rotate one half so `(a, b)` and `(b, a)` don't collide on the
+    // (admittedly rare) case where name == descriptor reversed.
+    h1.finish() ^ h2.finish().rotate_left(17)
+}
 
 /// A method slot in the vtable.
 ///
@@ -25,9 +43,18 @@ pub struct VtableEntry {
     /// Method identifier (index into class method table).
     pub method_index: u32,
     /// Fully qualified method name for debugging.
-    pub method_name: String,
+    ///
+    /// HIGH-5 — held as `Arc<str>` so `VtableEntry::clone()` is an
+    /// atomic refcount bump rather than a deep string copy. The source
+    /// of method names (`ClassFileMethod.name`) is already interned as
+    /// `Arc<str>` per perf-gaps.md T10.9.C, so install-time inserts
+    /// reuse those handles without allocating.
+    pub method_name: Arc<str>,
     /// Method descriptor.
-    pub descriptor: String,
+    ///
+    /// HIGH-5 — see `method_name` rationale; held as `Arc<str>` for
+    /// O(1) clone.
+    pub descriptor: Arc<str>,
     /// Whether this entry has been resolved.
     pub resolved: bool,
     /// T10.9.A — fully-built dispatch snapshot. Present for every
@@ -78,8 +105,8 @@ impl Default for VtableEntry {
         VtableEntry {
             declaring_class_id: 0,
             method_index: 0,
-            method_name: String::new(),
-            descriptor: String::new(),
+            method_name: Arc::<str>::from(""),
+            descriptor: Arc::<str>::from(""),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -97,7 +124,19 @@ pub struct Vtable {
     /// Entries indexed by slot number.
     entries: Vec<Option<VtableEntry>>,
     /// Quick lookup: method (name, descriptor) -> slot index.
-    name_to_slot: HashMap<(String, String), usize>,
+    ///
+    /// HIGH-6 — keyed by `(Arc<str>, Arc<str>)` so insertion at link
+    /// time reuses the interned method-name handles instead of
+    /// allocating fresh `String`s. This map is the authoritative
+    /// fallback when the `fast_lookup` u64-hash map collides; routine
+    /// `lookup_slot(&str, &str)` calls never touch it.
+    name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize>,
+    /// HIGH-6 — zero-allocation fast path for `lookup_slot(&str, &str)`.
+    /// Keyed by `fast_lookup_key(name, descriptor)`. Stores a `Vec<usize>`
+    /// to handle the (vanishingly rare) FxHash collisions without
+    /// allocating on probe; on hit, the caller verifies that each
+    /// candidate entry's stored `(name, descriptor)` matches the args.
+    fast_lookup: FxHashMap<u64, Vec<usize>>,
 }
 
 impl Vtable {
@@ -106,7 +145,8 @@ impl Vtable {
         Vtable {
             class_id,
             entries: Vec::new(),
-            name_to_slot: HashMap::new(),
+            name_to_slot: FxHashMap::default(),
+            fast_lookup: FxHashMap::default(),
         }
     }
 
@@ -116,6 +156,7 @@ impl Vtable {
             class_id,
             entries: parent.entries.clone(),
             name_to_slot: parent.name_to_slot.clone(),
+            fast_lookup: parent.fast_lookup.clone(),
         }
     }
 
@@ -129,15 +170,20 @@ impl Vtable {
         declaring_class_id: u64,
         method_index: u32,
     ) -> usize {
-        let key = (name.to_string(), descriptor.to_string());
+        // Materialise Arc<str> handles once for both the entry payload
+        // and the index key — two refcount bumps total instead of two
+        // String allocs per insert.
+        let name_arc: Arc<str> = Arc::<str>::from(name);
+        let desc_arc: Arc<str> = Arc::<str>::from(descriptor);
+        let key = (Arc::clone(&name_arc), Arc::clone(&desc_arc));
 
         // If this method signature already has a slot, override it.
         if let Some(&slot) = self.name_to_slot.get(&key) {
             self.entries[slot] = Some(VtableEntry {
                 declaring_class_id,
                 method_index,
-                method_name: name.to_string(),
-                descriptor: descriptor.to_string(),
+                method_name: name_arc,
+                descriptor: desc_arc,
                 resolved: true,
                 resolved_method: None,
                 is_native: false,
@@ -150,13 +196,18 @@ impl Vtable {
         self.entries.push(Some(VtableEntry {
             declaring_class_id,
             method_index,
-            method_name: name.to_string(),
-            descriptor: descriptor.to_string(),
+            method_name: name_arc,
+            descriptor: desc_arc,
             resolved: true,
             resolved_method: None,
             is_native: false,
         }));
         self.name_to_slot.insert(key, slot);
+        // HIGH-6 — keep the u64 fast-lookup map in sync.
+        self.fast_lookup
+            .entry(fast_lookup_key(name, descriptor))
+            .or_insert_with(Vec::new)
+            .push(slot);
         slot
     }
 
@@ -175,9 +226,24 @@ impl Vtable {
     }
 
     /// Find the slot index for a method by name and descriptor.
+    ///
+    /// HIGH-6 — zero allocation on the hot path. The `fast_lookup` map
+    /// is keyed by `fxhash(name) ^ fxhash(descriptor)`, so the probe
+    /// only borrows the input `&str` slices. On a single-slot bucket
+    /// (the overwhelmingly common case) we verify the candidate entry's
+    /// stored `(method_name, descriptor)` matches before returning;
+    /// on a multi-candidate bucket (FxHash collision) we scan all
+    /// candidates with the same verification.
     pub fn lookup_slot(&self, name: &str, descriptor: &str) -> Option<usize> {
-        let key = (name.to_string(), descriptor.to_string());
-        self.name_to_slot.get(&key).copied()
+        let key = fast_lookup_key(name, descriptor);
+        let candidates = self.fast_lookup.get(&key)?;
+        for &slot in candidates {
+            let entry = self.entries.get(slot)?.as_ref()?;
+            if &*entry.method_name == name && &*entry.descriptor == descriptor {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     /// Get the vtable entry at the given slot index.
@@ -268,7 +334,11 @@ impl Default for Itable {
 /// Manages vtables and itables for all loaded classes.
 pub struct VtableManager {
     /// Vtable per class ID.
-    tables: HashMap<u64, Vtable>,
+    ///
+    /// MED-15 — FxHashMap (rather than SipHash-default `HashMap`)
+    /// because the key is a 64-bit class id and we don't need
+    /// DoS resistance for an internal cache.
+    tables: FxHashMap<u64, Vtable>,
     /// Itable per class ID.
     itables: HashMap<u64, Itable>,
 }
@@ -277,7 +347,7 @@ impl VtableManager {
     /// Create a new empty manager.
     pub fn new() -> Self {
         VtableManager {
-            tables: HashMap::new(),
+            tables: FxHashMap::default(),
             itables: HashMap::new(),
         }
     }
@@ -297,15 +367,21 @@ impl VtableManager {
                     .get(&pid)
                     .map(|p| p.entries.clone())
                     .unwrap_or_default();
-                let parent_name_to_slot: HashMap<(String, String), usize> = self
+                let parent_name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize> = self
                     .tables
                     .get(&pid)
                     .map(|p| p.name_to_slot.clone())
+                    .unwrap_or_default();
+                let parent_fast_lookup: FxHashMap<u64, Vec<usize>> = self
+                    .tables
+                    .get(&pid)
+                    .map(|p| p.fast_lookup.clone())
                     .unwrap_or_default();
                 Vtable {
                     class_id,
                     entries: parent_entries,
                     name_to_slot: parent_name_to_slot,
+                    fast_lookup: parent_fast_lookup,
                 }
             }
             None => Vtable::new(class_id),
@@ -372,17 +448,28 @@ impl VtableManager {
     /// hasn't been overridden yet). The vec is moved — no clone.
     pub fn install_vtable(&mut self, class_id: u64, entries: Vec<Option<VtableEntry>>) {
         // Rebuild the name_to_slot index from the entries so downstream
-        // callers that use `lookup_slot` still work.
-        let mut name_to_slot = HashMap::with_capacity(entries.len());
+        // callers that use `lookup_slot` still work. HIGH-6 — the
+        // entries already own `Arc<str>` for the name and descriptor,
+        // so the keys are O(1) refcount clones rather than fresh allocs.
+        let mut name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize> =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        let mut fast_lookup: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
         for (slot, entry) in entries.iter().enumerate() {
             if let Some(e) = entry {
-                name_to_slot.insert((e.method_name.clone(), e.descriptor.clone()), slot);
+                let key = fast_lookup_key(&e.method_name, &e.descriptor);
+                fast_lookup.entry(key).or_insert_with(Vec::new).push(slot);
+                name_to_slot.insert(
+                    (Arc::clone(&e.method_name), Arc::clone(&e.descriptor)),
+                    slot,
+                );
             }
         }
         let vtable = Vtable {
             class_id,
             entries,
             name_to_slot,
+            fast_lookup,
         };
         self.tables.insert(class_id, vtable);
     }
@@ -594,8 +681,12 @@ pub fn vtable_install_adapter(
                 VtableEntry {
                     declaring_class_id: d.declaring_class_id as u64,
                     method_index: d.method_index,
-                    method_name: d.method_name,
-                    descriptor: d.descriptor,
+                    // HIGH-5 — promote the owned `String` from the
+                    // descriptor into an `Arc<str>` once here so the
+                    // hot-path `VtableEntry::clone()` (called on every
+                    // virtual dispatch) only bumps a refcount.
+                    method_name: Arc::<str>::from(d.method_name),
+                    descriptor: Arc::<str>::from(d.descriptor),
                     resolved: true,
                     resolved_method,
                     is_native,
@@ -652,7 +743,7 @@ mod tests {
         let entry = vt.get(0).unwrap();
         assert_eq!(entry.declaring_class_id, 10);
         assert_eq!(entry.method_index, 5);
-        assert_eq!(entry.method_name, "run");
+        assert_eq!(&*entry.method_name, "run");
         assert!(entry.resolved);
     }
 
@@ -872,7 +963,7 @@ mod tests {
         assert_eq!(vt.lookup_slot("method_149", "()V"), Some(149));
         let entry = vt.get(75).unwrap();
         assert_eq!(entry.method_index, 75);
-        assert_eq!(entry.method_name, "method_75");
+        assert_eq!(&*entry.method_name, "method_75");
     }
 
     #[test]
@@ -958,8 +1049,8 @@ mod tests {
             Some(VtableEntry {
                 declaring_class_id: 42,
                 method_index: 0,
-                method_name: "toString".to_string(),
-                descriptor: "()Ljava/lang/String;".to_string(),
+                method_name: Arc::<str>::from("toString"),
+                descriptor: Arc::<str>::from("()Ljava/lang/String;"),
                 resolved: true,
                 resolved_method: None,
                 is_native: false,
@@ -967,8 +1058,8 @@ mod tests {
             Some(VtableEntry {
                 declaring_class_id: 42,
                 method_index: 1,
-                method_name: "hashCode".to_string(),
-                descriptor: "()I".to_string(),
+                method_name: Arc::<str>::from("hashCode"),
+                descriptor: Arc::<str>::from("()I"),
                 resolved: true,
                 resolved_method: None,
                 is_native: false,
@@ -979,7 +1070,7 @@ mod tests {
         let e0 = mgr.resolve_virtual_slot(42, 0).unwrap();
         assert_eq!(e0.declaring_class_id, 42);
         assert_eq!(e0.method_index, 0);
-        assert_eq!(e0.method_name, "toString");
+        assert_eq!(&*e0.method_name, "toString");
 
         let e1 = mgr.resolve_virtual_slot(42, 1).unwrap();
         assert_eq!(e1.method_index, 1);
@@ -1000,8 +1091,8 @@ mod tests {
         let first = vec![Some(VtableEntry {
             declaring_class_id: 1,
             method_index: 0,
-            method_name: "foo".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("foo"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1011,8 +1102,8 @@ mod tests {
         let second = vec![Some(VtableEntry {
             declaring_class_id: 1,
             method_index: 7,
-            method_name: "bar".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("bar"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1023,7 +1114,7 @@ mod tests {
         assert!(mgr.resolve_virtual(1, "foo", "()V").is_none());
         let e = mgr.resolve_virtual_slot(1, 0).unwrap();
         assert_eq!(e.method_index, 7);
-        assert_eq!(e.method_name, "bar");
+        assert_eq!(&*e.method_name, "bar");
     }
 
     #[test]
@@ -1033,8 +1124,8 @@ mod tests {
             Some(VtableEntry {
                 declaring_class_id: 1,
                 method_index: 0,
-                method_name: "foo".to_string(),
-                descriptor: "()V".to_string(),
+                method_name: Arc::<str>::from("foo"),
+                descriptor: Arc::<str>::from("()V"),
                 resolved: true,
                 resolved_method: None,
                 is_native: false,
@@ -1042,8 +1133,8 @@ mod tests {
             Some(VtableEntry {
                 declaring_class_id: 1,
                 method_index: 1,
-                method_name: "bar".to_string(),
-                descriptor: "()V".to_string(),
+                method_name: Arc::<str>::from("bar"),
+                descriptor: Arc::<str>::from("()V"),
                 resolved: true,
                 resolved_method: None,
                 is_native: false,
@@ -1069,8 +1160,8 @@ mod tests {
         let entries = vec![Some(VtableEntry {
             declaring_class_id: 5,
             method_index: 3,
-            method_name: "run".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("run"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1098,8 +1189,8 @@ mod tests {
         let entries = vec![Some(VtableEntry {
             declaring_class_id: 7,
             method_index: 2,
-            method_name: "foo".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("foo"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1120,8 +1211,8 @@ mod tests {
         let super_entry = VtableEntry {
             declaring_class_id: 1,
             method_index: 0,
-            method_name: "greet".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("greet"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1141,7 +1232,7 @@ mod tests {
             "subclass slot must still point at super's declaring class",
         );
         assert_eq!(inherited.method_index, 0);
-        assert_eq!(inherited.method_name, "greet");
+        assert_eq!(&*inherited.method_name, "greet");
     }
 
     /// When the subclass overrides a method, its own entry occupies the
@@ -1151,8 +1242,8 @@ mod tests {
         let super_entries = vec![Some(VtableEntry {
             declaring_class_id: 1,
             method_index: 0,
-            method_name: "greet".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("greet"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1161,8 +1252,8 @@ mod tests {
         let subclass_entries = vec![Some(VtableEntry {
             declaring_class_id: 2,
             method_index: 5,
-            method_name: "greet".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("greet"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: None,
             is_native: false,
@@ -1194,8 +1285,8 @@ mod tests {
                 Some(VtableEntry {
                     declaring_class_id: 10,
                     method_index: 0,
-                    method_name: "a".to_string(),
-                    descriptor: "()V".to_string(),
+                    method_name: Arc::<str>::from("a"),
+                    descriptor: Arc::<str>::from("()V"),
                     resolved: true,
                     resolved_method: None,
                     is_native: false,
@@ -1203,8 +1294,8 @@ mod tests {
                 Some(VtableEntry {
                     declaring_class_id: 10,
                     method_index: 1,
-                    method_name: "b".to_string(),
-                    descriptor: "()V".to_string(),
+                    method_name: Arc::<str>::from("b"),
+                    descriptor: Arc::<str>::from("()V"),
                     resolved: true,
                     resolved_method: None,
                     is_native: false,
@@ -1212,8 +1303,8 @@ mod tests {
                 Some(VtableEntry {
                     declaring_class_id: 10,
                     method_index: 2,
-                    method_name: "c".to_string(),
-                    descriptor: "()V".to_string(),
+                    method_name: Arc::<str>::from("c"),
+                    descriptor: Arc::<str>::from("()V"),
                     resolved: true,
                     resolved_method: None,
                     is_native: false,
@@ -1290,8 +1381,8 @@ mod tests {
         let entries = vec![Some(VtableEntry {
             declaring_class_id: 100,
             method_index: 0,
-            method_name: "run".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("run"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: Some(make_dispatch_stub(100, "run", "()V")),
             is_native: false,
@@ -1323,8 +1414,8 @@ mod tests {
         let super_entries = vec![Some(VtableEntry {
             declaring_class_id: 1,
             method_index: 0,
-            method_name: "speak".to_string(),
-            descriptor: "()V".to_string(),
+            method_name: Arc::<str>::from("speak"),
+            descriptor: Arc::<str>::from("()V"),
             resolved: true,
             resolved_method: Some(make_dispatch_stub(1, "speak", "()V")),
             is_native: false,
@@ -1369,8 +1460,8 @@ mod tests {
             Some(VtableEntry {
                 declaring_class_id: 51,
                 method_index: 0,
-                method_name: "foo".to_string(),
-                descriptor: "()V".to_string(),
+                method_name: Arc::<str>::from("foo"),
+                descriptor: Arc::<str>::from("()V"),
                 resolved: true,
                 resolved_method: None,
                 is_native: false,
@@ -1399,8 +1490,8 @@ mod tests {
         let desc = rustjvm_classloading::VtableSlotDescriptor {
             declaring_class_id: 77,
             method_index: 3,
-            method_name: "abstr".to_string(),
-            descriptor: "()I".to_string(),
+            method_name: Arc::<str>::from("abstr"),
+            descriptor: Arc::<str>::from("()I"),
             dispatch: None, // abstract method — no snapshot
         };
         // Sanity — field is accessible and defaults to None.
@@ -1418,8 +1509,8 @@ mod tests {
         let entries = vec![Some(VtableEntry {
             declaring_class_id: 88,
             method_index: 0,
-            method_name: "getClass".to_string(),
-            descriptor: "()Ljava/lang/Class;".to_string(),
+            method_name: Arc::<str>::from("getClass"),
+            descriptor: Arc::<str>::from("()Ljava/lang/Class;"),
             resolved: true,
             resolved_method: None,
             is_native: true,
@@ -1449,8 +1540,8 @@ mod tests {
             vec![Some(VtableEntry {
                 declaring_class_id: 10,
                 method_index: 0,
-                method_name: "foo".to_string(),
-                descriptor: "()V".to_string(),
+                method_name: Arc::<str>::from("foo"),
+                descriptor: Arc::<str>::from("()V"),
                 resolved: true,
                 resolved_method: Some(first_arc),
                 is_native: false,
@@ -1462,8 +1553,8 @@ mod tests {
             vec![Some(VtableEntry {
                 declaring_class_id: 10,
                 method_index: 0,
-                method_name: "foo".to_string(),
-                descriptor: "()V".to_string(),
+                method_name: Arc::<str>::from("foo"),
+                descriptor: Arc::<str>::from("()V"),
                 resolved: true,
                 resolved_method: Some(second_arc),
                 is_native: false,

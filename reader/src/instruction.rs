@@ -1,3 +1,12 @@
+/// Upper bound on the number of entries in a `tableswitch.offsets` or
+/// `lookupswitch.pairs` table. JVMS bounds bytecode at 65,535 bytes, so even
+/// the largest legal switch table can only contain a few thousand entries —
+/// 16,384 (64 KB of i32 offsets, or 128 KB of (i32, i32) pairs) is a safe
+/// upper bound that rejects malicious headers like
+/// `low = i32::MIN+1, high = i32::MAX` (which would otherwise pre-allocate
+/// ~8.6 GB) while accepting any switch that can fit in a real method body.
+pub const MAX_SWITCH_ENTRIES: usize = 16_384;
+
 /// A JVM bytecode instruction (JVM spec 6.5).
 ///
 /// Each variant represents a single JVM instruction with its operands already decoded.
@@ -480,7 +489,17 @@ impl Instruction {
                         },
                     );
                 }
-                let count = (high as i64 - low as i64 + 1) as usize;
+                let count_i64 = high as i64 - low as i64 + 1;
+                if count_i64 > MAX_SWITCH_ENTRIES as i64 {
+                    return Err(
+                        crate::class_reader_error::ClassReaderError::InvalidClassData {
+                            message: format!(
+                                "tableswitch entry count {count_i64} exceeds maximum {MAX_SWITCH_ENTRIES}"
+                            ),
+                        },
+                    );
+                }
+                let count = count_i64 as usize;
                 let mut offsets = Vec::with_capacity(count);
                 for _ in 0..count {
                     offsets.push(Self::read_i32(code, &mut next)?);
@@ -505,6 +524,15 @@ impl Instruction {
                         crate::class_reader_error::ClassReaderError::InvalidClassData {
                             message: format!(
                                 "lookupswitch npairs is negative: {npairs_raw}"
+                            ),
+                        },
+                    );
+                }
+                if npairs_raw as i64 > MAX_SWITCH_ENTRIES as i64 {
+                    return Err(
+                        crate::class_reader_error::ClassReaderError::InvalidClassData {
+                            message: format!(
+                                "lookupswitch npairs {npairs_raw} exceeds maximum {MAX_SWITCH_ENTRIES}"
                             ),
                         },
                     );

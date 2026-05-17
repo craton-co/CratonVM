@@ -1942,6 +1942,8 @@ dependencies = [
 name = "rustjvm-types"
 version = "0.2.0"
 dependencies = [
+ "parking_lot",
+ "rustc-hash",
  "thiserror",
 ]
 

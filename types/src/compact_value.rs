@@ -319,16 +319,27 @@ impl CompactValue {
     /// Extract an i64.
     ///
     /// Returns `Some` for untagged values (Long or Double stored raw) as well
-    /// as for NaN-tagged long pairs.  The caller must know from context that
-    /// the slot actually holds a Long.  For tagged non-long values, returns
-    /// `None`.
+    /// as for NaN-tagged long pairs (`SUB_LONG_LO` / `SUB_LONG_HI`) that arise
+    /// when a long's bit pattern collides with our NaN-tag space (e.g. `-1`,
+    /// `i64::MIN`).  The caller must know from context that the slot actually
+    /// holds a Long.  For tagged non-long values, returns `None`.
+    ///
+    /// This mirrors the discrimination logic in [`to_value`](Self::to_value):
+    /// every bit pattern that `to_value` would resolve to `Value::Long(_)`
+    /// here returns `Some(self.0 as i64)`.
     #[inline]
     pub fn as_long(&self) -> Option<i64> {
         if !is_nan_tagged(self.0) {
             // Untagged: raw i64 bits (Long or Double — caller decides).
             return Some(self.0 as i64);
         }
-        None
+        // NaN-tagged: long bit-pattern collisions land in SUB_LONG_LO/HI and
+        // are decoded as Long by `to_value`.  Mirror that here so `as_long`
+        // doesn't lose `i64::MIN`, `-1`, or any other collision value.
+        match (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK {
+            SUB_LONG_LO | SUB_LONG_HI => Some(self.0 as i64),
+            _ => None,
+        }
     }
 
     /// Reinterpret the raw bits as i64 without checking the tag.
@@ -794,6 +805,79 @@ mod tests {
         assert_eq!(cv_min.as_long_unchecked(), i64::MIN);
         let cv_max = CompactValue::long(i64::MAX);
         assert_eq!(cv_max.as_long_unchecked(), i64::MAX);
+    }
+
+    // -- CRIT-1: `as_long()` must return `Some(_)` for every value that
+    // `to_value()` resolves to `Value::Long(_)`, including longs whose
+    // bit pattern collides with the NaN-tag space (e.g. `-1`, `i64::MIN`).
+    // Prior behavior returned `None` for those collisions because
+    // `as_long()` only handled the untagged path.
+
+    #[test]
+    fn as_long_handles_nan_tag_collisions() {
+        // i64::MIN — high bit set, looks NaN-tagged.
+        assert_eq!(CompactValue::long(i64::MIN).as_long(), Some(i64::MIN));
+        // -1 — all-ones, the canonical collision case.
+        assert_eq!(CompactValue::long(-1).as_long(), Some(-1));
+        // 0 — untagged path; the baseline that always worked.
+        assert_eq!(CompactValue::long(0).as_long(), Some(0));
+    }
+
+    #[test]
+    fn as_long_handles_positive_longs() {
+        for v in [1_i64, 42, 1_000_000, 123_456_789_012_345, i64::MAX] {
+            assert_eq!(
+                CompactValue::long(v).as_long(),
+                Some(v),
+                "as_long() failed for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn as_long_handles_negative_longs() {
+        for v in [-2_i64, -1000, -999_999_999_999, i64::MIN + 1] {
+            assert_eq!(
+                CompactValue::long(v).as_long(),
+                Some(v),
+                "as_long() failed for {v}"
+            );
+        }
+    }
+
+    /// `as_long()` and `to_value()` must agree: every bit pattern that
+    /// decodes to `Value::Long(x)` must also yield `Some(x)` from
+    /// `as_long()`.
+    #[test]
+    fn as_long_agrees_with_to_value_for_long_collisions() {
+        for v in [i64::MIN, -1, 0, 1, i64::MAX, -42, i64::MIN + 1, i64::MAX - 1] {
+            let cv = CompactValue::long(v);
+            match cv.to_value() {
+                Value::Long(x) => assert_eq!(
+                    cv.as_long(),
+                    Some(x),
+                    "as_long()/to_value() disagree for {v}"
+                ),
+                Value::Double(_) => assert_eq!(
+                    cv.as_long(),
+                    Some(v),
+                    "untagged long decoded as Double should still expose i64 via as_long()"
+                ),
+                other => panic!("unexpected Value variant for long {v}: {other:?}"),
+            }
+        }
+    }
+
+    /// `as_long()` must still return `None` for genuinely non-long tagged
+    /// values (Int, Float, Object, Null, Uninitialized, ReturnAddress).
+    #[test]
+    fn as_long_returns_none_for_non_longs() {
+        assert_eq!(CompactValue::int(42).as_long(), None);
+        assert_eq!(CompactValue::float(1.5).as_long(), None);
+        assert_eq!(CompactValue::object(0x1000).as_long(), None);
+        assert_eq!(CompactValue::null().as_long(), None);
+        assert_eq!(CompactValue::uninitialized().as_long(), None);
+        assert_eq!(CompactValue::return_address(7).as_long(), None);
     }
 
     // -- Float round-trips ---------------------------------------------------

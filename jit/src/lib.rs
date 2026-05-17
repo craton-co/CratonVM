@@ -34,7 +34,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+use std::hash::Hasher;
 
 // ---------------------------------------------------------------------------
 // JIT code region tracking — validates pointers before transmute to fn ptrs
@@ -444,6 +445,26 @@ pub struct CompiledMethod {
 unsafe impl Send for CompiledMethod {}
 unsafe impl Sync for CompiledMethod {}
 
+impl Drop for CompiledMethod {
+    fn drop(&mut self) {
+        // Purge any cached OSR trampolines that point into this method's code
+        // range. After Drop, `self._buffer` releases its executable mapping, so
+        // any stale `target_addr` in the global cache would be a use-after-free
+        // hazard if a future compile reused the same address.
+        //
+        // `target_addr` for an OSR entry is `self.entry + native_offset`, where
+        // `native_offset < self._buffer.pos()` (the emitted code length). Pruning
+        // by half-open range `[entry, entry + pos)` covers every such address.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let start = self.entry as usize;
+            let end = start.saturating_add(self._buffer.pos());
+            let mut cache = osr_trampoline_cache().lock();
+            cache.retain(|&target, _| !(target >= start && target < end));
+        }
+    }
+}
+
 impl CompiledMethod {
     /// Create from a completed executable buffer (pure method, no context needed).
     ///
@@ -734,13 +755,41 @@ impl CompiledMethod {
 // OSR (On-Stack Replacement) trampoline
 // ---------------------------------------------------------------------------
 
+/// Global cache of emitted OSR trampolines, keyed by `target_addr`.
+///
+/// Each `target_addr` (= `CompiledMethod.entry + native_offset` for an OSR PC) is
+/// stable for the lifetime of the compiled method. The trampoline body depends
+/// only on the method's frame layout and the destination JIT address — all of
+/// which are constant per `target_addr`. Runtime values (`vm_ptr`, `locals_ptr`)
+/// are now passed via argument registers instead of being baked in as immediates,
+/// so a single emitted trampoline can be reused across every OSR entry at that PC.
+///
+/// Buffers are held behind `Arc<ExecutableBuffer>` so they outlive any concurrent
+/// re-entry. Entries are never evicted during a VM run; they're released when the
+/// process exits (or, if the cache is ever cleared, after no thread can hold a
+/// transient `Arc` clone).
+fn osr_trampoline_cache()
+    -> &'static parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>>
+{
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<FxHashMap<usize, Arc<ExecutableBuffer>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
+}
+
+/// Emit a fresh OSR trampoline body for the given destination + frame layout.
+///
+/// The emitted code expects two arguments via the platform C ABI:
+///   * arg0 (RCX on Windows / RDI on SysV) = `locals_ptr: *const i64`
+///   * arg1 (RDX on Windows / RSI on SysV) = `vm_ptr: i64` (only read when `needs_context`)
+///
+/// It saves callee-saved registers used for locals, optionally stores `vm_ptr`
+/// into the heap-local slot, copies each incoming local into its register/XMM/
+/// frame slot, then jumps to `target_addr`.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
-#[inline(never)]
-unsafe fn osr_trampoline(
+unsafe fn emit_osr_trampoline(
     target_addr: usize,
-    vm_ptr: i64,
-    locals_ptr: *const i64,
     num_locals: usize,
     num_reg_locals: usize,
     local_assignments: Option<&[Option<u8>]>,
@@ -749,10 +798,22 @@ unsafe fn osr_trampoline(
     callee_saved_base: i32,
     heap_local_offset: i32,
     needs_context: bool,
-) -> Option<i64> {
+) -> Option<ExecutableBuffer> {
     use crate::x64::LOCAL_REGS;
 
-    let frame_locals: Vec<i64> = (0..num_locals).map(|i| *locals_ptr.add(i)).collect();
+    // Platform C-ABI argument register numbers.
+    // arg0 carries `locals_ptr`, arg1 carries `vm_ptr`. Both are caller-saved on
+    // both ABIs, and neither overlaps any register in `LOCAL_REGS`, so saving
+    // arg0 into R10 first cannot clobber a callee-saved local target before
+    // we've spilled it.
+    #[cfg(target_os = "windows")]
+    let arg0_reg: u8 = 1; // RCX
+    #[cfg(target_os = "windows")]
+    let arg1_reg: u8 = 2; // RDX
+    #[cfg(not(target_os = "windows"))]
+    let arg0_reg: u8 = 7; // RDI
+    #[cfg(not(target_os = "windows"))]
+    let arg1_reg: u8 = 6; // RSI
 
     let trampoline_size = 1024 + num_locals * 32;
     let mut tramp = ExecutableBuffer::new(trampoline_size)?;
@@ -762,6 +823,15 @@ unsafe fn osr_trampoline(
     tramp.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
     tramp.emit(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
     tramp.emit(&frame_size.to_le_bytes());
+
+    // Stash arg0 (locals_ptr) into R10 immediately, before any subsequent emission
+    // could clobber the caller-saved arg register. R10 is itself caller-saved and
+    // not part of LOCAL_REGS on either platform, so it remains live through the
+    // local-copy loop below.
+    // Encoding: MOV r10, arg0_reg  =>  REX.W|REX.B 89 (mod=11 reg=arg0 rm=R10&7=2)
+    tramp.emit_byte(0x49); // REX.W + REX.B (dest extended)
+    tramp.emit_byte(0x89);
+    tramp.emit_byte(0xC0 | ((arg0_reg & 7) << 3) | 2);
 
     let used_regs: Vec<u8> = if let Some(assignments) = local_assignments {
         let mut regs = Vec::new();
@@ -787,16 +857,14 @@ unsafe fn osr_trampoline(
     }
 
     if needs_context {
+        // Spill vm_ptr (already in arg1_reg, both arg1 candidates are low regs)
+        // directly to the heap-local slot. No immediate, no scratch needed.
         let neg_off = -heap_local_offset;
-        tramp.emit(&[0x48, 0xB8]);
-        tramp.emit(&vm_ptr.to_le_bytes());
-        tramp.emit(&[0x48, 0x89, 0x85]);
+        tramp.emit_byte(0x48); // REX.W
+        tramp.emit_byte(0x89); // MOV r/m64, r64
+        tramp.emit_byte(0x85 | ((arg1_reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
     }
-
-    let locals_addr = frame_locals.as_ptr() as i64;
-    tramp.emit(&[0x49, 0xBA]);
-    tramp.emit(&locals_addr.to_le_bytes());
 
     #[allow(clippy::needless_range_loop)]
     for i in 0..num_locals {
@@ -851,23 +919,81 @@ unsafe fn osr_trampoline(
     // Transition trampoline buffer from writable to executable.
     tramp.finalize();
 
-    validate_code_ptr(tramp.as_ptr()).expect("JIT: invalid trampoline code pointer");
-    let tramp_fn: unsafe extern "C" fn() -> i64 = std::mem::transmute(tramp.as_ptr());
-    // SAFETY: frame_locals and tramp must remain alive during tramp_fn() execution.
-    // The generated trampoline reads from frame_locals.as_ptr() and executes from tramp.
-    // Use compiler_fence + black_box to prevent the optimizer from reordering or dropping.
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    let result = tramp_fn();
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    // Keep frame_locals and tramp alive past the call
-    std::hint::black_box(&frame_locals);
-    std::hint::black_box(tramp.as_ptr());
+    Some(tramp)
+}
 
-    // frame_locals and tramp are dropped here normally — the trampoline JMPs into JIT code
-    // which eventually RETs back to the CALL instruction above, so both buffers are no
-    // longer referenced once tramp_fn() returns.
-    drop(frame_locals);
-    drop(tramp);
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn osr_trampoline(
+    target_addr: usize,
+    vm_ptr: i64,
+    locals_ptr: *const i64,
+    num_locals: usize,
+    num_reg_locals: usize,
+    local_assignments: Option<&[Option<u8>]>,
+    xmm_assignments: Option<&[Option<u8>]>,
+    frame_size: i32,
+    callee_saved_base: i32,
+    heap_local_offset: i32,
+    needs_context: bool,
+) -> Option<i64> {
+    // Look up (or emit and insert) the cached trampoline body for this target.
+    // `target_addr` already encodes (compiled-method, OSR PC): it is
+    // `CompiledMethod.entry + native_offset`, both stable for the method's life.
+    // All other parameters except `vm_ptr` and `locals_ptr` are functions of
+    // `target_addr` (frame layout, register assignments, etc.), so the same
+    // emitted body is correct for every call at this PC.
+    let tramp_arc: Arc<ExecutableBuffer> = {
+        let cache = osr_trampoline_cache();
+        // Fast path: read-only lookup.
+        if let Some(existing) = cache.lock().get(&target_addr).cloned() {
+            existing
+        } else {
+            // Slow path: emit outside the lock, then insert under it. If another
+            // thread raced us, prefer their entry and let our buffer drop.
+            let fresh = emit_osr_trampoline(
+                target_addr,
+                num_locals,
+                num_reg_locals,
+                local_assignments,
+                xmm_assignments,
+                frame_size,
+                callee_saved_base,
+                heap_local_offset,
+                needs_context,
+            )?;
+            let fresh_arc = Arc::new(fresh);
+            let mut guard = cache.lock();
+            guard
+                .entry(target_addr)
+                .or_insert_with(|| fresh_arc.clone())
+                .clone()
+        }
+    };
+
+    let code_ptr = tramp_arc.as_ptr();
+    validate_code_ptr(code_ptr).expect("JIT: invalid trampoline code pointer");
+
+    // The cached trampoline now takes (locals_ptr, vm_ptr) via the platform C ABI.
+    // `vm_ptr` is only read when `needs_context`, but passing it unconditionally
+    // is harmless (caller-saved register, ignored if unused).
+    let tramp_fn: unsafe extern "C" fn(*const i64, i64) -> i64 =
+        std::mem::transmute(code_ptr);
+
+    // SAFETY: `tramp_arc` holds an Arc clone of the cached buffer, keeping the
+    // executable memory alive for the duration of the call. `locals_ptr` is
+    // borrowed from the caller's `jit_locals: &[i64]` slice, which is live
+    // across `osr_enter` (and therefore across this call). The fences and
+    // black_box prevent the optimizer from reordering the Arc drop above the
+    // call or otherwise invalidating the live region.
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    let result = tramp_fn(locals_ptr, vm_ptr);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    std::hint::black_box(code_ptr);
+    std::hint::black_box(&tramp_arc);
+
+    drop(tramp_arc);
 
     Some(result)
 }
@@ -1420,9 +1546,37 @@ struct JitKey {
     descriptor: Arc<str>,
 }
 
+/// Compute a u64 hash key for a JIT cache entry by XOR-folding three
+/// independent FxHashes (class, method, descriptor). Using separate
+/// hashers per component (rather than chained writes) keeps each call
+/// branch-free and avoids the per-call Arc clones the previous keyed
+/// lookup required.
+///
+/// Hash collisions are tolerated by the cache: `JitCache::get` always
+/// verifies the full string key match after the hash hit (see PERF-P2
+/// fix). A collision degrades to a cache miss, which is correct but
+/// slightly suboptimal (triggers a re-compile via the slow path).
+#[inline]
+fn compute_jit_key_hash(class: &str, method: &str, desc: &str) -> u64 {
+    let mut hc = FxHasher::default();
+    hc.write(class.as_bytes());
+    let mut hm = FxHasher::default();
+    hm.write(method.as_bytes());
+    let mut hd = FxHasher::default();
+    hd.write(desc.as_bytes());
+    hc.finish() ^ hm.finish() ^ hd.finish()
+}
+
 /// Per-VM JIT cache: maps method identity to compiled native code.
+///
+/// Storage uses a precomputed u64 hash as the map key (see
+/// [`compute_jit_key_hash`]). The full [`JitKey`] is stored alongside
+/// the compiled method so lookups can verify the key fully matches
+/// after a hash hit — this protects against (rare) hash collisions
+/// while eliminating the three `Arc<str>` clones the prior keyed-map
+/// implementation required on every lookup (PERF-P2).
 pub struct JitCache {
-    methods: FxHashMap<JitKey, Arc<CompiledMethod>>,
+    methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
     string_arena: Vec<Pin<Box<str>>>,
     invoke_info_arena: Vec<Pin<Box<JitInvokeInfo>>>,
 }
