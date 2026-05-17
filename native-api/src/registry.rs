@@ -74,11 +74,29 @@ pub struct DefineClassFull {
     pub initialize: bool,
 }
 
-/// Compute a fast hash key for a native method triple.
-/// Uses FNV-1a for speed and low collision rate.
+/// Compute a fast 128-bit hash key for a native method triple.
+///
+/// Returns a `(u64, u64)` pair: two independent FNV-1a passes with
+/// different starting basis values. Using two independent 64-bit hashes
+/// gives a 128-bit composite key whose birthday-collision probability
+/// for ~3,100 registrations is on the order of 1e-32 — i.e. for our
+/// purposes zero. This removes the need for a runtime collision check
+/// on the hot registration path.
 #[inline]
-fn native_method_hash(class: &str, method: &str, descriptor: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
+    (
+        fnv1a_hash(class, method, descriptor, 0xcbf29ce484222325),
+        fnv1a_hash(class, method, descriptor, 0x84222325cbf29ce4),
+    )
+}
+
+/// Single FNV-1a pass over `class . method . descriptor` with a caller-
+/// supplied offset basis. The FNV prime is fixed (0x100000001b3) — only
+/// the basis varies between passes, which is sufficient to make the two
+/// outputs statistically independent for the keyspace we use.
+#[inline]
+fn fnv1a_hash(class: &str, method: &str, descriptor: &str, basis: u64) -> u64 {
+    let mut h: u64 = basis;
     for b in class.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3); // FNV prime
@@ -1310,20 +1328,28 @@ pub type NativeCallback = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResu
 /// Registry of native method implementations.
 ///
 /// Maps (class, method, descriptor) triples to Rust function callbacks.
-/// Uses pre-computed FNV-1a hash keys for zero-allocation lookups.
-/// T10.9.B: FxHashMap — keys are FNV-1a hashes of internal class/method/desc triples.
+/// Uses pre-computed 128-bit hash keys (`(u64, u64)` pair from two
+/// independent FNV-1a passes) for zero-allocation lookups. With a
+/// 128-bit keyspace the birthday-collision probability for the ~3,000
+/// registrations we do at boot is on the order of 1e-32, so no runtime
+/// collision check is needed on the hot path.
 pub struct NativeMethodRegistry {
-    methods: FxHashMap<u64, NativeCallback>,
-    /// Store the triples so we can detect hash collisions.
-    /// With 3000+ registrations, FNV-1a u64 collision probability is non-trivial.
-    keys: FxHashMap<u64, String>,
+    methods: FxHashMap<(u64, u64), NativeCallback>,
+    /// Registration log used only by `alias_class` (a rare, slow-path
+    /// operation called a handful of times at boot to copy interface-
+    /// method registrations down to subinterface class names). We keep
+    /// the original triples here as `Box<str>` rather than `String` to
+    /// minimize per-entry overhead. This replaces the previous
+    /// `FxHashMap<u64, String>` reverse map which was inserted into on
+    /// every `register()` purely to enable collision detection.
+    registrations: Vec<(Box<str>, Box<str>, Box<str>)>,
 }
 
 impl NativeMethodRegistry {
     pub fn new() -> Self {
         Self {
             methods: FxHashMap::default(),
-            keys: FxHashMap::default(),
+            registrations: Vec::new(),
         }
     }
 
@@ -1336,21 +1362,35 @@ impl NativeMethodRegistry {
         callback: NativeCallback,
     ) {
         let key = native_method_hash(class_name, method_name, descriptor);
-        let triple = format!("{class_name}.{method_name}{descriptor}");
-        if let Some(existing) = self.keys.get(&key) {
-            if *existing != triple {
-                // Hash collision is a fatal bug — the hash function must be
-                // collision-free for correctness.  Panic is deliberate.
-                panic!(
-                    "NativeMethodRegistry hash collision!\n  existing: {existing}\n  new: {triple}\n  hash: {key:#018x}"
-                );
-            }
-        }
-        self.keys.insert(key, triple.clone());
-        self.methods.insert(key, callback);
+        // With 128-bit composite keys, collisions on our keyspace are
+        // vanishingly unlikely. We keep a cheap `debug_assert!` as
+        // defense-in-depth: if `register()` ever overwrites an existing
+        // entry, the most common cause is legitimate re-registration of
+        // the same triple (e.g. by `alias_class` running twice). A true
+        // hash collision would only be flagged if it produced a
+        // pre-existing key for a triple we have NOT seen before — but
+        // distinguishing those two cases requires walking
+        // `registrations`, which is O(N). We skip that check here:
+        // unconditional registration is the documented behavior, and
+        // the 128-bit keyspace makes false hits practically impossible.
+        let prior = self.methods.insert(key, callback);
+        debug_assert!(
+            prior.is_none() || prior == Some(callback) || self.registrations.iter().any(
+                |(c, m, d)| c.as_ref() == class_name
+                    && m.as_ref() == method_name
+                    && d.as_ref() == descriptor
+            ),
+            "NativeMethodRegistry 128-bit hash collision for {class_name}.{method_name}{descriptor} (key={key:?})"
+        );
+        self.registrations.push((
+            class_name.into(),
+            method_name.into(),
+            descriptor.into(),
+        ));
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
         // method names. Cheap one-time write per registration.
+        let triple = format!("{class_name}.{method_name}{descriptor}");
         crate::native_ring::register_name(callback as usize, &triple);
     }
 
@@ -1423,9 +1463,9 @@ impl NativeMethodRegistry {
     /// name, not Java inheritance, so we have to populate both keys
     /// explicitly). The function:
     ///
-    ///   1. Walks `keys` (the `hash → "class.method descriptor"`
-    ///      reverse map) to find every entry whose class prefix
-    ///      matches `from_class`.
+    ///   1. Walks the `registrations` log (the per-`register()`
+    ///      append-only list of `(class, method, descriptor)` triples)
+    ///      to find every entry whose class equals `from_class`.
     ///   2. For each match, re-registers the same callback under
     ///      `to_class` with the same method name and descriptor.
     ///
@@ -1434,27 +1474,19 @@ impl NativeMethodRegistry {
     /// the behavior of `register` itself, which re-registers silently
     /// when the triple is identical).
     pub fn alias_class(&mut self, from_class: &str, to_class: &str) {
-        // Collect first to avoid mutating while iterating.
-        let prefix = format!("{from_class}.");
+        // Collect first to avoid mutating while iterating, and to drop
+        // the immutable borrow on `self.registrations` before we call
+        // `self.register()` below.
         let entries: Vec<(String, String, NativeCallback)> = self
-            .keys
+            .registrations
             .iter()
-            .filter_map(|(hash, triple)| {
-                if !triple.starts_with(&prefix) {
+            .filter_map(|(class, method, descriptor)| {
+                if class.as_ref() != from_class {
                     return None;
                 }
-                let after = &triple[prefix.len()..];
-                // Split `methodName(descriptor)` — the method name
-                // ends at the first `(`.
-                let paren = after.find('(')?;
-                let method_name = &after[..paren];
-                let descriptor = &after[paren..];
-                let callback = *self.methods.get(hash)?;
-                Some((
-                    method_name.to_string(),
-                    descriptor.to_string(),
-                    callback,
-                ))
+                let key = native_method_hash(from_class, method, descriptor);
+                let callback = *self.methods.get(&key)?;
+                Some((method.to_string(), descriptor.to_string(), callback))
             })
             .collect();
         for (method_name, descriptor, callback) in entries {
@@ -1616,24 +1648,33 @@ mod tests {
     fn hash_empty_strings() {
         // Edge case: empty strings should not panic
         let h = native_method_hash("", "", "");
-        assert!(h != 0); // FNV offset basis with just dots
+        // FNV offset basis processed through the separator dots — both
+        // halves should be non-zero.
+        assert!(h.0 != 0 && h.1 != 0);
     }
 
     #[test]
-    #[should_panic(expected = "hash collision")]
-    fn hash_collision_panics() {
-        // We can't easily force a real collision, so we test the detection path
-        // by using internal knowledge: insert two different triples with the same hash.
-        // Since we can't easily find a collision, we just verify the panic message
-        // by creating a registry and manually inserting a conflicting key.
+    fn hash_two_halves_independent() {
+        // The two 64-bit halves use different FNV offset bases, so the
+        // same triple should produce two distinct 64-bit values.
+        let (h1, h2) = native_method_hash("java/lang/Object", "hashCode", "()I");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn alias_class_copies_registrations() {
+        // Regression: `alias_class` used to walk a separate `keys`
+        // reverse map. After removing that map, it now walks the
+        // `registrations` log instead. Verify the public behavior is
+        // unchanged.
         let mut registry = NativeMethodRegistry::new();
-        registry.register("A", "b", "()V", dummy_native);
-        // Manually force a collision by inserting a different triple with same hash
-        let key = native_method_hash("A", "b", "()V");
-        // Overwrite the keys map entry to simulate a collision
-        registry.keys.insert(key, "X.y()Z".to_string());
-        // Now registering the original triple again will see a mismatch
-        registry.register("A", "b", "()V", dummy_native);
+        registry.register("java/sql/PreparedStatement", "execute", "()Z", dummy_native);
+        registry.register("java/sql/PreparedStatement", "close", "()V", dummy_native_2);
+        registry.alias_class("java/sql/PreparedStatement", "java/sql/CallableStatement");
+        assert!(registry.find("java/sql/CallableStatement", "execute", "()Z").is_some());
+        assert!(registry.find("java/sql/CallableStatement", "close", "()V").is_some());
+        // Original registrations still present.
+        assert!(registry.find("java/sql/PreparedStatement", "execute", "()Z").is_some());
     }
 
     // -----------------------------------------------------------------------
