@@ -956,6 +956,13 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // Phase 6 #1: spin-yield until every live `SafepointToken` has
+        // dropped. While a kernel is reading a JVM array on the GPU, we
+        // must not move that array — a single token held anywhere on
+        // any thread defers this collection until it is released.
+        // No-op when the `gpu-offload` feature is off.
+        crate::vm_heap::wait_for_gpu_critical_drain();
+
         // NEW-1.5: If any thread is currently inside a JIT call, warn but
         // proceed with GC anyway. The conservative root scanner may treat
         // a coincidental integer as a heap pointer (keeping an extra object
