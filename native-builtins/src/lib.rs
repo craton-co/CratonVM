@@ -12008,12 +12008,13 @@ pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<rustjvm_types::Ob
 // CRIT perf — sharded side-store globals for the Unsafe / Class$Atomic
 // hot path.
 //
-// All four globals below were `std::sync::Mutex<HashMap<...>>` (with
-// SipHash + per-call .lock().unwrap_or_else handshake) and a single
-// process-wide mutex.  Under heavy concurrent CAS / static-field
-// traffic (ChmStress, AQS bursts, JDK lazy-init guards on Class
-// mirrors) they collapsed onto one lock and one SipHash chain per
-// operation.
+// Three of the original globals (`static_long_store`, `static_int_store`,
+// `static_obj_store`) plus the offset-interning map were
+// `std::sync::Mutex<HashMap<...>>` (SipHash + per-call
+// `.lock().unwrap_or_else` handshake on a single process-wide mutex).
+// Under heavy concurrent CAS / static-field traffic (ChmStress, AQS
+// bursts, JDK lazy-init guards on Class mirrors) they collapsed onto one
+// lock and one SipHash chain per operation.
 //
 // Fix: shard each map into `UNSAFE_SHARDS = 32` parking_lot mutexes
 // indexed by FxHash of the key.  parking_lot::Mutex avoids the
@@ -12021,6 +12022,15 @@ pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<rustjvm_types::Ob
 // removes the SipHash overhead — neither global is exposed to
 // untrusted user-input keys (they are derived from JIT/class-loader
 // state), so DoS-resistance is not required here.
+//
+// Round-8 Bug 4 follow-up: `synthetic_field_store` and
+// `class_atomic_side_store` were missed in the original sweep and were
+// still `std::sync::Mutex<std::collections::HashMap<...>>`. They have
+// now been migrated to `parking_lot::Mutex<FxHashMap<...>>` for the same
+// reasons (poisoning + SipHash overhead). They are NOT yet sharded —
+// contention has been low in the workloads we measure (per-receiver
+// keys spread naturally), but if profiling shows otherwise the pattern
+// from `static_*_store` can be lifted in.
 // =====================================================================
 
 const UNSAFE_SHARDS: usize = 32;
@@ -12149,13 +12159,18 @@ fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
 /// Per-object side store for fields stored at a synthetic offset.  Keyed
 /// by `(ObjectRef-as-usize, offset)` so each receiver has its own slot and
 /// CAS sees a consistent value across the load and the compare-and-store.
+///
+/// Round-8 Bug 4: migrated from `std::sync::Mutex<HashMap<...>>` (poisoning
+/// + SipHash overhead) to `parking_lot::Mutex<FxHashMap<...>>`. Keys are
+/// derived from VM-internal pointers and synthetic offsets, never from
+/// untrusted user input, so DoS-resistance via SipHash is not required.
 fn synthetic_field_store()
-    -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), Value>>
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(usize, usize), Value>>
 {
     static T: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(usize, usize), Value>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<(usize, usize), Value>>,
     > = std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 #[inline]
@@ -12165,14 +12180,14 @@ fn obj_key(obj: rustjvm_types::ObjectRef) -> usize {
 }
 
 pub(crate) fn synthetic_get(obj: rustjvm_types::ObjectRef, offset: usize) -> Value {
-    let map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    let map = synthetic_field_store().lock();
     map.get(&(obj_key(obj), offset))
         .copied()
         .unwrap_or(Value::Object(None))
 }
 
 pub(crate) fn synthetic_put(obj: rustjvm_types::ObjectRef, offset: usize, val: Value) {
-    let mut map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = synthetic_field_store().lock();
     map.insert((obj_key(obj), offset), val);
 }
 
@@ -12185,7 +12200,7 @@ pub(crate) fn synthetic_cas(
     expected: Value,
     new_val: Value,
 ) -> bool {
-    let mut map = synthetic_field_store().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = synthetic_field_store().lock();
     let cur = map
         .get(&(obj_key(obj), offset))
         .copied()
@@ -12216,15 +12231,20 @@ pub(crate) fn synthetic_cas(
 // table keyed by mirror pointer.
 // =====================================================================
 
+// Round-8 Bug 4: migrated from `std::sync::Mutex<HashMap<...>>` (poisoning
+// + SipHash) to `parking_lot::Mutex<FxHashMap<...>>`. Keys are
+// VM-internal (Class mirror ptr + slot tag) so SipHash DoS-resistance is
+// not required. See the cluster-comment above `static_long_store` for
+// the wider rationale.
 fn class_atomic_side_store()
-    -> &'static std::sync::Mutex<std::collections::HashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>
 {
     // Key: (Class mirror ptr, slot tag). Tag distinguishes the three
     // slots (reflectionData=0, annotationType=1, annotationData=2).
     static T: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<(usize, u8), Option<rustjvm_types::ObjectRef>>>,
     > = std::sync::OnceLock::new();
-    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 #[inline]
@@ -12243,7 +12263,7 @@ fn class_atomic_cas_impl(args: &[Value], slot_tag: u8) -> MethodCallResult {
         _ => None,
     };
     let key = (class_ref.as_ptr() as usize, slot_tag);
-    let mut map = class_atomic_side_store().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = class_atomic_side_store().lock();
     let cur = map.get(&key).copied().unwrap_or(None);
     if cur == expected {
         map.insert(key, new_val);
@@ -12367,7 +12387,7 @@ fn native_class_new_reflection_data(
     //    calls observe the current value.
     {
         let key = (this.as_ptr() as usize, 0u8);
-        let mut map = class_atomic_side_store().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = class_atomic_side_store().lock();
         map.insert(key, Some(soft_ref));
     }
 

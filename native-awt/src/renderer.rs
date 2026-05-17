@@ -1166,6 +1166,17 @@ impl SoftwareRenderer {
     /// expensive. Callers select the mode via Graphics2D's
     /// `RenderingHints.VALUE_INTERPOLATION_{NEAREST_NEIGHBOR,BILINEAR}`.
     ///
+    /// **TODO(round-8, MED): real bicubic for `VALUE_INTERPOLATION_BICUBIC`.**
+    /// Java's `RenderingHints.VALUE_INTERPOLATION_BICUBIC` (the third
+    /// option) is currently rendered with the bilinear branch — visibly
+    /// softer than a real 4×4 cubic-convolution kernel (Mitchell / Catmull-
+    /// Rom). The full bicubic path needs a 4×4 sample grid with the Keys
+    /// cubic-convolution coefficients (b=0, c=0.5) plus edge clamping, so
+    /// it's tracked separately rather than bolted onto this branch. The
+    /// public Graphics2D plumbing should grow a tri-state
+    /// `InterpolationHint::{Nearest, Bilinear, Bicubic}` rather than the
+    /// current bool so the call site can request the third tier.
+    ///
     /// Round-7 fast path: when the requested destination size matches the
     /// source size and the transform is identity, dispatch to the unscaled
     /// `blit_image` path. This sidesteps the per-pixel interpolation /

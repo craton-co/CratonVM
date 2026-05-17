@@ -65,30 +65,48 @@ impl LaunchConfig {
     /// One-dimensional launch sized to cover `n` elements with the
     /// default block size of 256 threads.
     ///
-    /// TODO(round-8, PERF): the 256-thread block size is a portable
-    /// "good enough" pick — it divides cleanly into the warp size
-    /// (32) on every CUDA arch and fits in shared-memory budgets up
-    /// to Hopper. But it leaves occupancy on the table for kernels
-    /// that are bound by register pressure or shared-memory use.
-    /// The proper autotune path is:
-    ///   let mut block: i32 = 0;
-    ///   let mut min_grid: i32 = 0;
-    ///   // cuOccupancyMaxPotentialBlockSize(
-    ///   //   &mut min_grid, &mut block, kernel_fn, /*smem*/ 0,
-    ///   //   /*max_block*/ 0)
-    ///   let block = if block > 0 { block as u32 } else { 256 };
-    /// cudarc exposes this as `CudaFunction::occupancy_max_potential_block_size`
-    /// in 0.13+; the elementwise helper would need the resolved kernel
-    /// handle as input. Falling back to 256 on any query failure keeps
-    /// behaviour deterministic.
+    /// 256 is a portable "good enough" pick — it divides cleanly into the
+    /// warp size (32) on every CUDA arch and fits in shared-memory budgets
+    /// up to Hopper. For per-kernel autotune (which can beat 256 on
+    /// register-pressure or smem-bound kernels) call
+    /// [`LaunchConfig::elementwise_for_kernel`] with the resolved
+    /// `DeviceModule` and kernel name.
     pub fn elementwise(n: u32) -> Self {
-        let block = 256u32;
+        Self::elementwise_with_block(n, 256)
+    }
+
+    /// One-dimensional launch sized to cover `n` elements with the given
+    /// `block` size (rounded down to a positive value if zero is passed).
+    ///
+    /// Shared between [`Self::elementwise`] and the kernel-aware
+    /// [`Self::elementwise_for_kernel`] path so they agree on grid sizing.
+    pub fn elementwise_with_block(n: u32, block: u32) -> Self {
+        let block = block.max(1);
         let grid = n.div_ceil(block).max(1);
         Self {
             grid: (grid, 1, 1),
             block: (block, 1, 1),
             shared_bytes: 0,
         }
+    }
+
+    /// Like [`Self::elementwise`] but queries the driver's
+    /// `cuOccupancyMaxPotentialBlockSize` (via cudarc) for the named
+    /// kernel and uses the returned block size. Falls back to 256 if the
+    /// query fails or the bridge was built without the `cuda` feature.
+    ///
+    /// Round-8 fix for the "hardcoded block=256" TODO. The autotune cost
+    /// is a single driver call at launch site; for kernels launched in
+    /// tight loops, hoist this above the loop and reuse the returned
+    /// `LaunchConfig`.
+    pub fn elementwise_for_kernel(
+        module: &DeviceModule,
+        ctx: &DeviceContext,
+        kernel: &str,
+        n: u32,
+    ) -> Self {
+        let block = module.0.optimal_block_size(&ctx.0, kernel).unwrap_or(256);
+        Self::elementwise_with_block(n, block)
     }
 }
 
@@ -130,6 +148,15 @@ impl DeviceModule {
     /// layout must match the kernel's PTX parameter declarations
     /// exactly — the bridge does no type checking; the
     /// [`KernelArgs`] helper builds correct buffers from Rust types.
+    ///
+    /// **Sync default.** This entry point records a post-launch event on
+    /// the compute stream and makes the D→H copy stream wait on it, so a
+    /// subsequent [`DeviceBuffer::to_host`] is correctly stream-ordered
+    /// behind the kernel. Callers that know no `to_host` follows (e.g.
+    /// fire-and-forget kernels, or back-to-back launches on the compute
+    /// stream where the next launch already orders behind this one) should
+    /// prefer [`Self::launch_raw_no_sync`] to skip the event-pool
+    /// bookkeeping (~3µs of CPU-side driver overhead per launch).
     pub fn launch_raw(
         &self,
         ctx: &DeviceContext,
@@ -138,6 +165,30 @@ impl DeviceModule {
         args: KernelArgs,
     ) -> Result<()> {
         self.0.launch_raw(&ctx.0, kernel, cfg, args)
+    }
+
+    /// Launch a kernel without recording the post-launch D→H sync event.
+    ///
+    /// Use this when the caller knows no [`DeviceBuffer::to_host`] reads
+    /// the result of this launch. Skipping the event-record/wait pair
+    /// saves a cudarc per-context event-pool allocation per launch
+    /// (~3µs CPU-side), which is measurable on tight back-to-back
+    /// microkernel loops.
+    ///
+    /// **Safety contract (logical, not memory).** If a `to_host` call on
+    /// any buffer this kernel wrote runs after a launch made through
+    /// this entry point — without an intervening [`Self::launch_raw`] or
+    /// [`DeviceContext::synchronize`] — the host may read stale bytes.
+    /// The compute stream still serialises back-to-back launches on
+    /// itself, so the only failure mode is host read-back.
+    pub fn launch_raw_no_sync(
+        &self,
+        ctx: &DeviceContext,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> Result<()> {
+        self.0.launch_raw_no_d2h_sync(&ctx.0, kernel, cfg, args)
     }
 }
 

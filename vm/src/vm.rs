@@ -2784,6 +2784,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         id
     }
@@ -2835,6 +2836,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         // Also register in the loaded_classes map so find_class_by_name works
         cm.register_class_name(ClassLoaderId::Application, &class_name, id);
@@ -52544,6 +52546,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             cm.register_class_name(ClassLoaderId::Application, "com/example/Point", id);
             id
@@ -52624,6 +52627,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             let id2 = cm.class_store.next_id();
             cm.class_store.add(Class {
@@ -52667,6 +52671,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             (id1, id2)
         };
@@ -52765,6 +52770,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
             let sid = cm.class_store.next_id();
@@ -52800,6 +52806,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
             let pid = cm.class_store.next_id();
@@ -52835,6 +52842,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
 
             (rid, sid, pid)
@@ -55468,6 +55476,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
 
         // Should verify without error РІР‚вЂќ String is assignable to CharSequence
@@ -59196,6 +59205,7 @@ mod tests {
                 is_synthetic_stub: false, has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             }
         };
 
@@ -60018,6 +60028,7 @@ mod tests {
                 is_synthetic_stub: false, has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
         }
 
@@ -60081,6 +60092,7 @@ mod tests {
                 is_synthetic_stub: false, has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
         }
 
@@ -60178,6 +60190,7 @@ mod tests {
                 is_synthetic_stub: false, has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
         }
 

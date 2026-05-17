@@ -143,13 +143,33 @@ impl Tlab {
     /// The caller must ensure `ptr..ptr+size` is valid, zeroed, writable
     /// memory that will not be accessed by any other thread until this
     /// TLAB is retired.
+    ///
+    /// Round-5 HIGH #5: the TLAB tail-filler installer assumes the `end`
+    /// pointer is 8-aligned so the synthetic `int[]` filler exactly
+    /// covers `[aligned_cursor, end)` without trailing padding. Caller
+    /// must therefore supply an `end = ptr.add(size)` that is 8-aligned.
+    /// In debug builds we assert that; in release we silently round the
+    /// effective end down to 8 (giving up at most 7 bytes of tail) so a
+    /// non-aligned caller does not corrupt the heap walker.
     pub unsafe fn new(ptr: *mut u8, size: usize) -> Self {
+        let raw_end = ptr.add(size);
+        debug_assert!(
+            (raw_end as usize) & 7 == 0,
+            "Tlab::new: end pointer must be 8-aligned for tail-filler safety \
+             (ptr={:p}, size={}, end={:p})",
+            ptr, size, raw_end
+        );
+        // Release-mode safety net: if the caller violates the alignment
+        // contract, trim the TLAB by up to 7 bytes so install_tail_filler
+        // can rely on (end - aligned_cursor) being a multiple of 8.
+        let aligned_end_addr = (raw_end as usize) & !7usize;
+        let effective_size = aligned_end_addr - (ptr as usize);
         let mut pressure = TlabPressureTracker::new();
-        pressure.begin_refill(size);
+        pressure.begin_refill(effective_size);
         Self {
             start: ptr,
             cursor: ptr,
-            end: ptr.add(size),
+            end: aligned_end_addr as *mut u8,
             pressure,
         }
     }

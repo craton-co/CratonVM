@@ -427,9 +427,32 @@ impl ProfileStore {
         // hit but key mismatched (collision)": re-probe briefly to bump
         // the counter only on real collisions.  The probability of
         // either is so low this re-probe never shows up in a profile.
+        //
+        // LOAD-BEARING: this re-probe assumes the index is INSERT-ONLY
+        // (no eviction).  Between the first read at line 410 and this
+        // second read, the only legal transition is "absent -> present"
+        // (handled by the slow path below).  If a future change adds
+        // eviction or fingerprint-slot replacement, an entry that
+        // mismatched on the first probe could become an unrelated entry
+        // by the second probe — same fingerprint, different real key —
+        // and we'd under-count collisions.  If eviction is introduced,
+        // swap this counter for an atomic increment INSIDE the first
+        // read's `Some(_)` collision arm above.
         {
             let idx = self.name_index.read();
-            if idx.contains_key(&fingerprint) {
+            if let Some((cached_key, _)) = idx.get(&fingerprint) {
+                // Sanity: confirm we're still looking at a real collision
+                // (i.e. the entry has not silently been replaced by an
+                // equal-key entry, which would not be a collision at all).
+                debug_assert!(
+                    !(cached_key.class_id == class_id
+                        && cached_key.method_name.as_ref() == method_name.as_ref()
+                        && cached_key.descriptor.as_ref() == descriptor.as_ref()),
+                    "ProfileStore re-probe saw a matching entry that the \
+                     first probe missed: name_index is no longer insert-only. \
+                     Move the collision-counter increment into the first \
+                     probe's collision arm before adding eviction.",
+                );
                 self.name_index_collisions
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

@@ -2218,6 +2218,18 @@ pub fn execute(
                             return Err(jit_panic_to_exception(shared, thread, panic_payload));
                         }
                     };
+                    // Round-8 CRIT fix (NPE leak): drain the pending-NPE flag on
+                    // EVERY JIT return path, not only the `i64::MIN` deopt arm.
+                    // A void-return store helper (`jit_iastore`/`jit_bastore`/
+                    // `jit_aastore`) that hits a null array sets the flag and
+                    // returns; without this hoist, the flag would leak to the
+                    // next unrelated JIT helper call. The drain runs before any
+                    // normal-return path so the NPE surfaces at the right method.
+                    if crate::jit::helpers::take_jit_pending_npe() {
+                        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                            RuntimeError::NullPointerException { message: None },
+                        )));
+                    }
                     // Deopt sentinel: i64::MIN means the JIT method was deoptimized
                     // via jit_uncommon_trap.  Fall through to the interpreter to
                     // re-execute the method from scratch.
@@ -2241,17 +2253,9 @@ pub fn execute(
                         _ => Ok(None),
                     };
                     }
-                    // Deoptimized — check for pending NPE from a JIT array helper
-                    // (`jit_iaload` / `jit_aaload` / `jit_arraylength` on a null
-                    // array reference) before falling through to interpreter
-                    // re-execution. Previously these helpers swallowed the null
-                    // silently, masking real null-deref bugs.
-                    if crate::jit::helpers::take_jit_pending_npe() {
-                        return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                            RuntimeError::NullPointerException { message: None },
-                        )));
-                    }
-                    // Otherwise fall through to interpreter execution.
+                    // Deoptimized — pending-NPE drain was hoisted above the
+                    // i64::MIN branch (round-8 CRIT fix); fall through to
+                    // interpreter execution.
                     }
                 }
             } // end else (jit_early_exception.is_none())
@@ -6703,6 +6707,67 @@ fn execute_instruction(
                             eprintln!("  ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                         }
                     }
+                    // Round-5 MED-fix (Bug 6, 2026-05-17): emit
+                    // `jdk.JavaErrorThrow` for `java.lang.Error` subclasses.
+                    // The emit fn was previously dead code. Gated by
+                    // `rustjvm_jfr::is_enabled()` so the disabled path is
+                    // ~3 ns (one Acquire load + branch). We only fire for a
+                    // small whitelist of well-known `Error` types so the
+                    // `class_name` argument can stay `&'static str` (per
+                    // the emit-fn API contract — Errors are a fixed
+                    // taxonomy).
+                    if rustjvm_jfr::is_enabled() {
+                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(exc_class_id)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        let static_name: Option<&'static str> = match &*exc_class_name {
+                            "java/lang/OutOfMemoryError" => Some("java.lang.OutOfMemoryError"),
+                            "java/lang/StackOverflowError" => Some("java.lang.StackOverflowError"),
+                            "java/lang/AssertionError" => Some("java.lang.AssertionError"),
+                            "java/lang/NoClassDefFoundError" => Some("java.lang.NoClassDefFoundError"),
+                            "java/lang/NoSuchFieldError" => Some("java.lang.NoSuchFieldError"),
+                            "java/lang/NoSuchMethodError" => Some("java.lang.NoSuchMethodError"),
+                            "java/lang/AbstractMethodError" => Some("java.lang.AbstractMethodError"),
+                            "java/lang/IncompatibleClassChangeError" => Some("java.lang.IncompatibleClassChangeError"),
+                            "java/lang/LinkageError" => Some("java.lang.LinkageError"),
+                            "java/lang/VerifyError" => Some("java.lang.VerifyError"),
+                            "java/lang/ClassFormatError" => Some("java.lang.ClassFormatError"),
+                            "java/lang/UnsatisfiedLinkError" => Some("java.lang.UnsatisfiedLinkError"),
+                            "java/lang/ExceptionInInitializerError" => Some("java.lang.ExceptionInInitializerError"),
+                            "java/lang/InternalError" => Some("java.lang.InternalError"),
+                            _ => None,
+                        };
+                        if let Some(class_name) = static_name {
+                            // Best-effort detailMessage extraction (slot 1
+                            // per Throwable layout). Use an empty
+                            // Arc<str> on miss to avoid extra work.
+                            let message: Arc<str> = match shared.heap.get_field(obj_ref, 1) {
+                                Value::Object(Some(msg_ref)) => {
+                                    Arc::from(
+                                        read_java_string(&shared.heap, msg_ref)
+                                            .unwrap_or_default(),
+                                    )
+                                }
+                                _ => Arc::from(""),
+                            };
+                            let now_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos() as u64;
+                            let mut jfr = shared.flight_recorder.lock();
+                            rustjvm_jfr::builtin::emit_java_error_throw_event(
+                                &mut jfr,
+                                class_name,
+                                message,
+                                now_ns,
+                                thread.thread_id.0 as u64,
+                            );
+                        }
+                    }
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
                 }
                 Value::Object(None) => {
@@ -6982,9 +7047,15 @@ fn execute_instruction(
                         .unwrap_or_default()
                         .as_nanos() as u64; // Cast: duration to u64 nanoseconds
                     let mut jfr = shared.flight_recorder.lock();
-                    rustjvm_jfr::builtin::emit_monitor_enter_event(
+                    // Round-5 HIGH-fix (Bug 4, 2026-05-17): use the `_arc`
+                    // variant so the monitor class name avoids a per-event
+                    // `Arc::from(&str)` allocation inside `emit_*`. The
+                    // frame already holds an `Arc<str>` for the class name
+                    // (`frame.class_name_arc()`), so this is a refcount
+                    // bump instead of a `memcpy + alloc`.
+                    rustjvm_jfr::builtin::emit_monitor_enter_event_arc(
                         &mut jfr,
-                        thread.frames[frame_idx].class_name(),
+                        thread.frames[frame_idx].class_name_arc(),
                         "unknown",
                         obj_ref.as_ptr() as i64, // Cast: JIT ABI -- pointer to i64 register
                         thread.thread_id.0 as u64, // Widening: unsigned conversion
@@ -12596,6 +12667,22 @@ fn execute_jit_call(
         }
     };
 
+    // Round-8 CRIT fix (NPE leak): drain the pending-NPE flag on EVERY
+    // JIT return path, not only the `i64::MIN` deopt sentinel arm. A
+    // JIT-compiled method whose inner dispatch (a nested `jit_invoke_*`
+    // helper or a `jit_iastore`/`jit_aastore`/`jit_bastore` on a null
+    // array — the void-return store helpers cannot signal via the
+    // i64::MIN sentinel) sets the flag and then returns normally would
+    // otherwise leak the flag to the *next* unrelated JIT helper call,
+    // surfacing the NPE at the wrong PC / wrong method. The drain must
+    // happen before *any* normal-return early-return. If a void-return
+    // store helper set the flag, we surface the NPE here.
+    if crate::jit::helpers::take_jit_pending_npe() {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NullPointerException { message: None },
+        )));
+    }
+
     // Deopt sentinel: i64::MIN means the method was deoptimized — fall through
     // to the interpreter slow path to re-execute.
     if result == i64::MIN {
@@ -12607,19 +12694,12 @@ fn execute_jit_call(
                 },
             )));
         }
-        // Check for pending NPE from a JIT array helper. Same shape as the
-        // AIOOBE branch above — without this, `jit_iaload` / `jit_aaload` /
-        // `jit_arraylength` on null silently fall back to interpreter
-        // re-execution, which then re-issues the null deref (caught
-        // correctly there) — but in the meantime any side effects from the
-        // JIT-compiled prologue have already happened. Surfacing the NPE
-        // here matches the AIOOBE protocol and keeps the JIT/interpreter
-        // boundary observably JLS-correct.
-        if crate::jit::helpers::take_jit_pending_npe() {
-            return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::NullPointerException { message: None },
-            )));
-        }
+        // Note: pending-NPE drain was hoisted above the i64::MIN branch
+        // (round-8 CRIT fix) so a void-return store helper that set the
+        // flag but did not produce the sentinel value still surfaces the
+        // NPE. The previous in-arm drain is intentionally removed —
+        // moving it above means the i64::MIN arm runs with NPE already
+        // taken, so we just fall through to deopt re-execution.
         return Ok(CachedCallResult::CacheMiss);
     }
 

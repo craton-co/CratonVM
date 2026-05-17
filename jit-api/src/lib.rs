@@ -180,6 +180,24 @@ impl JitRuntimeHelpers {
     }
 
     /// Collect all pointer values into an array for bulk validation.
+    ///
+    /// **Maintenance contract.** If you add a new function-pointer field
+    /// above, you MUST:
+    ///   1. Add it to the array literal below.
+    ///   2. Add its name to the parallel array in [`Self::field_names`].
+    ///   3. Bump [`Self::NUM_FIELDS`] by one.
+    ///
+    /// The return type `[usize; NUM_FIELDS]` enforces parts (1) and (3)
+    /// at compile time — adding a field to the struct without extending
+    /// the array would produce a `[usize; N]` value where `N != NUM_FIELDS`
+    /// and the type mismatch refuses to compile. Part (2) (the parallel
+    /// `field_names` array) is similarly type-pinned. No runtime assert
+    /// can express this constraint without becoming tautological, so we
+    /// rely on the type system instead.
+    ///
+    /// TODO(round-9): macro this so the field list lives in exactly one
+    /// place — both arrays would then be generated from a single
+    /// declarative source of truth.
     fn all_pointers(&self) -> [usize; Self::NUM_FIELDS] {
         let arr = [
             self.newarray,
@@ -216,12 +234,11 @@ impl JitRuntimeHelpers {
             self.math_fma_double,
             self.math_fma_float,
         ];
-        // Round-7 parallel-array guard: if `NUM_FIELDS` is updated but
-        // this literal isn't (or vice versa), the array-size mismatch
-        // is a compile error — `[usize; NUM_FIELDS]` won't accept a
-        // literal of the wrong length. The redundant `debug_assert_eq!`
-        // below documents intent for callers reading the source.
-        debug_assert_eq!(arr.len(), Self::NUM_FIELDS);
+        // Parallel-array length is type-pinned by the return signature
+        // `[usize; NUM_FIELDS]` — see the maintenance-contract docstring
+        // above. A runtime `debug_assert_eq!(arr.len(), NUM_FIELDS)` here
+        // would be tautological since `arr.len() == NUM_FIELDS` is true
+        // by construction at compile time.
         arr
     }
 
@@ -261,7 +278,8 @@ impl JitRuntimeHelpers {
             "math_fma_double",
             "math_fma_float",
         ];
-        debug_assert_eq!(arr.len(), Self::NUM_FIELDS);
+        // Length type-pinned by `[&'static str; NUM_FIELDS]`. See
+        // `all_pointers` for the maintenance contract.
         arr
     }
 }

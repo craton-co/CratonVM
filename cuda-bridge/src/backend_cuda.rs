@@ -167,7 +167,8 @@ impl DeviceModuleInner {
     /// chain. Each unnecessary event-wait adds ~3 µs of CPU-side
     /// driver overhead and contends on cudarc's per-context event
     /// pool — measurable on tight back-to-back microkernel loops.
-    #[allow(dead_code)] // wired by callers in a follow-up patch
+    ///
+    /// Public surface: routed through `DeviceModule::launch_raw_no_sync`.
     pub(crate) fn launch_raw_no_d2h_sync(
         &self,
         ctx: &DeviceContextInner,
@@ -176,6 +177,41 @@ impl DeviceModuleInner {
         args: KernelArgs,
     ) -> Result<()> {
         self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ false)
+    }
+
+    /// Query the driver for the kernel's occupancy-optimal block size.
+    ///
+    /// Round-8 fix for the `LaunchConfig::elementwise` hardcoded-256
+    /// TODO. Wraps cudarc's
+    /// `CudaFunction::occupancy_max_potential_block_size` (which fans
+    /// out to `cuOccupancyMaxPotentialBlockSize` in the driver). The
+    /// returned size assumes zero dynamic shared memory and no block-
+    /// size ceiling, which matches every kernel the bridge currently
+    /// launches; the caller (`LaunchConfig::elementwise_for_kernel`)
+    /// falls back to 256 if this returns `None`.
+    ///
+    /// `ctx` is accepted but unused today — cudarc 0.13 reads the
+    /// context from `CudaFunction` directly. Kept on the signature so
+    /// adding context-sensitive autotune later (e.g. binding the
+    /// driver query to a non-primary context) does not break callers.
+    pub(crate) fn optimal_block_size(
+        &self,
+        _ctx: &DeviceContextInner,
+        kernel: &str,
+    ) -> Option<u32> {
+        // cudarc's `occupancy_max_potential_block_size` wants an
+        // `extern "C" fn(block_size) -> usize` for dynamic-smem sizing.
+        // We have no dynamic smem, so the callback always returns 0.
+        extern "C" fn zero_smem(_block_size: std::ffi::c_int) -> usize {
+            0
+        }
+        let func = self.functions.get(kernel)?;
+        // Pass `0` as block_size_limit to let the driver pick freely;
+        // `None` flags use CU_OCCUPANCY_DEFAULT.
+        match func.occupancy_max_potential_block_size(zero_smem, 0, 0, None) {
+            Ok((_min_grid, block_size)) if block_size > 0 => Some(block_size),
+            _ => None,
+        }
     }
 
     fn launch_raw_inner(

@@ -795,6 +795,19 @@ impl VirtualThreadManager {
 
     /// Schedule a timed wakeup for a parked virtual thread (used by Thread.sleep
     /// on virtual threads). Spawns a timer thread that unparks after `duration`.
+    ///
+    /// TODO(round-8 Bug 6): this spawns a brand-new OS thread per
+    /// `Thread.sleep` on a virtual thread, which defeats the entire
+    /// premise of virtual threads (millions of cheap lightweight tasks
+    /// multiplexed onto a small carrier pool). A `Thread.sleep(100ms)`
+    /// inside a hot VT loop currently costs an OS-thread spawn + stack
+    /// allocation per call. The correct fix is a single process-wide
+    /// timer wheel / min-heap of `(deadline, vt_id)` driven by ONE
+    /// dedicated timer thread that `park_timeout`s on the head of the
+    /// queue and resubmits expired VTs to the scheduler; cancellation
+    /// becomes a flag flip rather than a `Condvar::notify_one`. Until
+    /// that lands, sleep-heavy VT workloads see the same OS-thread cost
+    /// as platform threads — investing in VTs gains nothing for them.
     pub fn schedule_wakeup(&self, vt_id: u64, duration: std::time::Duration) {
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         self.wakeup_signals.lock().insert(vt_id, signal.clone());

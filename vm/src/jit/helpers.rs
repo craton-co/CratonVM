@@ -730,23 +730,24 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §bastore: throw NullPointerException on null array reference.
         //
-        // CORRECTNESS NOTE: store helpers return `()`, so there is no return-value
-        // slot in which to pass the `i64::MIN` deopt sentinel back to the JIT-compiled
-        // caller (compare `jit_iaload`/`jit_aaload`/`jit_arraylength`, which return
-        // i64 and signal via that channel). If we merely set the thread-local
-        // `JIT_PENDING_NPE` flag and returned, the JIT method continues executing
-        // (the inline store path doesn't check the flag) and the stale NPE bit
-        // leaks to the *next* JIT helper call that does deopt — surfacing the NPE
-        // at the wrong PC/method.
-        //
-        // The production JIT codegen never CALLs this helper (stores are inlined
-        // in `jit/src/x64.rs` and rely on the hardware page-fault NPE path through
-        // the array-length load in `emit_bounds_check`). This helper is registered
-        // in `JitRuntimeHelpers` but currently unreachable. Aborting here makes
-        // any future regression (someone wiring this helper into codegen without
-        // also adding a deopt-sentinel return path) fail loudly and locally
-        // instead of leaking a stale NPE flag to an unrelated downstream site.
-        std::process::abort();
+        // Round-8 CRIT fix (audit `round8-jit.md`, "false promise" item):
+        // previously this called `std::process::abort()` with a comment
+        // claiming the helper was unreachable from inlined codegen, but
+        // (a) the helper is still registered in `JitRuntimeHelpers` and
+        // therefore reachable from any future codegen path that uses it,
+        // and (b) the hardware-page-fault NPE path through
+        // `emit_bounds_check` is *also* a false promise — the signal
+        // handler dumps an hs_err and re-raises, killing the VM. We now
+        // set the pending-NPE flag and return; the void return cannot
+        // carry a sentinel, but the interpreter's post-JIT path drains
+        // `JIT_PENDING_NPE` on EVERY return (not just the i64::MIN
+        // sentinel arm — fixed in the same round) so the NPE surfaces
+        // at the right method instead of leaking across calls. The
+        // inline-store codegen also emits an explicit `TEST receiver,
+        // receiver; JZ deopt_npe` guard before the bounds check, so
+        // this helper is the second line of defense.
+        set_jit_pending_npe();
+        return;
     }
     // SAFETY: array_ptr is non-null and points to a live array object on the GC heap.
     let ptr = array_ptr as *mut u8;
@@ -786,12 +787,12 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §iastore: throw NullPointerException on null array reference.
-        // Void return means no deopt-sentinel channel; setting the pending-NPE
-        // flag here would leak across to the next JIT helper call that does
-        // deopt. See `jit_bastore` for the full reasoning. The production JIT
-        // inlines this opcode and never CALLs this helper; abort if anything
-        // ever does so we fail loudly instead of mis-attributing a future NPE.
-        std::process::abort();
+        // Round-8 CRIT fix: see `jit_bastore` for full rationale. Set the
+        // pending-NPE flag; the interpreter's post-JIT path now drains it
+        // on every return, so the void-return sentinel-less channel is
+        // no longer a correctness blocker.
+        set_jit_pending_npe();
+        return;
     }
     // SAFETY: array_ptr is non-null and points to a live int[] on the GC heap.
     let ptr = array_ptr as *mut u8;
@@ -831,13 +832,12 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
 pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
     if array_ptr == 0 {
         // JVMS §aastore: throw NullPointerException on null array reference.
-        // Void return means no deopt-sentinel channel; setting the pending-NPE
-        // flag here would leak across to the next JIT helper call that does
-        // deopt. See `jit_bastore` for the full reasoning. The production JIT
-        // inlines this opcode (see `jit/src/x64.rs` opcode 0x53 — inline store
-        // plus barrier-only call) and never CALLs this helper; abort if anything
-        // ever does so we fail loudly instead of mis-attributing a future NPE.
-        std::process::abort();
+        // Round-8 CRIT fix: see `jit_bastore` for full rationale. Set the
+        // pending-NPE flag; the interpreter's post-JIT path now drains it
+        // on every return, so the void-return sentinel-less channel is
+        // no longer a correctness blocker.
+        set_jit_pending_npe();
+        return;
     }
     // SAFETY: array_ptr is non-null and points to a live Object[] on the GC heap.
     let ptr = array_ptr as *mut u8;
@@ -2394,6 +2394,41 @@ mod tests {
         let result = unsafe { jit_arraylength(0) };
         assert_eq!(result, i64::MIN);
         assert!(take_jit_pending_npe(), "arraylength(null) must set pending NPE flag");
+    }
+
+    /// Round-8 CRIT fix: store helpers (`jit_iastore` / `jit_bastore` /
+    /// `jit_aastore`) on a null array previously called
+    /// `std::process::abort()` with a comment claiming the helper was
+    /// unreachable; in reality the helpers were registered in
+    /// `JitRuntimeHelpers` and reachable. They now set the pending-NPE
+    /// flag (drained on every JIT return by the interpreter) so the NPE
+    /// surfaces at the right method.
+    #[test]
+    fn jit_iastore_null_sets_pending_npe() {
+        let _ = take_jit_pending_npe();
+        // SAFETY: array_ptr is 0 (null); the function takes the null-guard
+        // early-return path and never dereferences.
+        unsafe { jit_iastore(0, 0, 0) };
+        assert!(take_jit_pending_npe(), "iastore(null) must set pending NPE flag");
+    }
+
+    #[test]
+    fn jit_bastore_null_sets_pending_npe() {
+        let _ = take_jit_pending_npe();
+        // SAFETY: array_ptr is 0 (null); the function takes the null-guard
+        // early-return path and never dereferences.
+        unsafe { jit_bastore(0, 0, 0) };
+        assert!(take_jit_pending_npe(), "bastore(null) must set pending NPE flag");
+    }
+
+    #[test]
+    fn jit_aastore_null_sets_pending_npe() {
+        let _ = take_jit_pending_npe();
+        // SAFETY: array_ptr is 0 (null); the function takes the null-guard
+        // early-return path and never dereferences either array_ptr or
+        // vm_ptr / val (the null path returns before touching them).
+        unsafe { jit_aastore(0, 0, 0, 0) };
+        assert!(take_jit_pending_npe(), "aastore(null) must set pending NPE flag");
     }
 
     #[test]

@@ -478,6 +478,15 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Real-JDK Unsafe.freeMemory tracks size in `AllocationTable`;
     // mimic that with a global map.
     if let Some(size) = take_unsafe_alloc(addr) {
+        // Bug 2 (CRIT): refuse to double-free the same address. Pair
+        // with `dbb_free_explicit` which checks the same set.
+        if mark_freed_or_check(addr) {
+            eprintln!(
+                "[direct_buffer] Unsafe.freeMemory({:#x}) called on already-freed address — skipping",
+                addr
+            );
+            return Ok(None);
+        }
         dbb_free(addr, size);
     }
     Ok(None)
@@ -514,6 +523,48 @@ fn take_unsafe_alloc(addr: u64) -> Option<i64> {
     unsafe_allocs().lock().ok()?.remove(&addr)
 }
 
+/// Bug 2 (CRIT): `Unsafe.freeMemory(addr)` + `freeMemoryExplicit(addr, size)`
+/// on the same address previously double-pool_put'd the buffer (the first
+/// went through `take_unsafe_alloc` → `dbb_free`; the second went straight
+/// to `dbb_free` via the supplied size). A double pool_put corrupts the
+/// free-list — the same address ends up in two pool slots and is later
+/// handed to two distinct Java allocations simultaneously.
+///
+/// We track recently-freed addresses in a set and refuse to double-free.
+/// The set is bounded (capped at ~4096 entries — old entries are dropped
+/// FIFO via a small Vec) to keep memory bounded even for long-lived VMs
+/// that churn millions of Unsafe allocations.
+const FREED_SET_CAP: usize = 4096;
+
+fn freed_addrs() -> &'static Mutex<(FxHashMap<u64, ()>, std::collections::VecDeque<u64>)> {
+    static F: OnceLock<Mutex<(FxHashMap<u64, ()>, std::collections::VecDeque<u64>)>> =
+        OnceLock::new();
+    F.get_or_init(|| {
+        Mutex::new((FxHashMap::default(), std::collections::VecDeque::new()))
+    })
+}
+
+/// Returns `true` if this addr was already freed (caller should skip).
+/// Otherwise records the addr and returns `false`.
+fn mark_freed_or_check(addr: u64) -> bool {
+    let mut g = match freed_addrs().lock() {
+        Ok(g) => g,
+        Err(_) => return false, // poisoned — best-effort: allow the free
+    };
+    if g.0.contains_key(&addr) {
+        return true;
+    }
+    g.0.insert(addr, ());
+    g.1.push_back(addr);
+    // Bound the set: evict oldest entries past the cap.
+    while g.1.len() > FREED_SET_CAP {
+        if let Some(old) = g.1.pop_front() {
+            g.0.remove(&old);
+        }
+    }
+    false
+}
+
 /// `dbb_free_explicit(addr, size)` — escape hatch for Java callers
 /// that know both the pointer *and* the original capacity. Returns
 /// the bytes to the pool and refunds `Bits` accounting. This is the
@@ -528,6 +579,18 @@ fn dbb_free_explicit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     // Also drop any Unsafe.allocateMemory record so we don't double-free.
     let _ = take_unsafe_alloc(addr);
+    // Bug 2 (CRIT): refuse to double-free if a prior `Unsafe.freeMemory`
+    // (or another `dbb_free_explicit`) already pool-put this address.
+    // Without this check, both `freeMemory(addr)` and
+    // `freeMemoryExplicit(addr, size)` on the same address would call
+    // `dbb_free` twice, corrupting the bucketed pool free-list.
+    if mark_freed_or_check(addr) {
+        eprintln!(
+            "[direct_buffer] dbb_free_explicit({:#x}, {}) called on already-freed address — skipping",
+            addr, size
+        );
+        return Ok(None);
+    }
     dbb_free(addr, size);
     Ok(None)
 }

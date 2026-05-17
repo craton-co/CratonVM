@@ -835,7 +835,15 @@ pub struct ClassManager {
     ///
     /// Entries are created lazily by `class_init_state_handle` so classes
     /// that are never initialized cost nothing.
-    init_states: RwLock<FxHashMap<ClassId, Arc<std::sync::atomic::AtomicU8>>>,
+    ///
+    /// Round 8 (CRIT, audit `round8-classloading-reader.md` §3):
+    /// `parking_lot::RwLock` replaces `std::sync::RwLock` here so the
+    /// ensure_class_initialized fast path is no longer paying for std's
+    /// poisoning-aware `Result`-wrapped lock + futex-style park. The
+    /// parking_lot lock is a single CAS on the uncontended fast path,
+    /// which matches the steady-state shape of this map (overwhelming
+    /// majority of accesses are reads of already-INITIALIZED entries).
+    init_states: parking_lot::RwLock<FxHashMap<ClassId, Arc<std::sync::atomic::AtomicU8>>>,
 }
 
 /// Initialization-state values stored in [`ClassManager::init_states`].
@@ -941,6 +949,12 @@ impl RedefineInvariantSnapshot {
             has_finalizer,
             code_source,
             array_info,
+            // Round 8 audit fix (CRIT #4): init_state is the per-class
+            // initialization AtomicU8 (`UNINITIALIZED → IN_PROGRESS →
+            // INITIALIZED`). Mutating during `<clinit>` is normal,
+            // expected behavior — NOT a redefine invariant. Excluded
+            // from the snapshot.
+            init_state: _,
         } = c;
         Self {
             id: *id,
@@ -1090,7 +1104,7 @@ impl ClassManager {
             hidden_name_counter: 0,
             redefine_generations: RwLock::new(FxHashMap::with_capacity_and_hasher(8, Default::default())),
             user_loaders: FxHashSet::with_capacity_and_hasher(4, Default::default()),
-            init_states: RwLock::new(FxHashMap::with_capacity_and_hasher(256, Default::default())),
+            init_states: parking_lot::RwLock::new(FxHashMap::with_capacity_and_hasher(256, Default::default())),
         }
     }
 
@@ -1249,6 +1263,7 @@ impl ClassManager {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
@@ -2374,6 +2389,7 @@ impl ClassManager {
             has_finalizer: false, // computed below
             code_source,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
 
         // Compute has_finalizer: true if this class or any ancestor
@@ -2966,16 +2982,34 @@ impl ClassManager {
         &self,
         class_id: ClassId,
     ) -> Arc<std::sync::atomic::AtomicU8> {
-        // Fast path: read lock + clone existing Arc if present.
+        // Fast path: read lock + clone existing Arc if present. Round-8
+        // CRIT fix: this lock is `parking_lot::RwLock`, so the uncontended
+        // shared-read acquire is a single CAS (no poison check, no futex
+        // syscall, no `Result` unwrap). The overwhelming majority of
+        // dispatches hit this branch because every class an app actually
+        // touches gets a handle entry created the first time
+        // `ensure_class_initialized` runs against it, and the entry is
+        // never removed.
+        //
+        // Round 8 audit fix (CRIT #4): side-table is consulted first
+        // for back-compat (any handle minted before the Class was
+        // registered into the store must remain the canonical one).
+        // If no side-table entry exists, return the per-`Class`
+        // embedded `init_state: Arc<AtomicU8>` — this is the new
+        // canonical fast-path home and avoids the RwLock + FxHashMap
+        // probe entirely for the common case.
         {
-            let guard = self.init_states.read().expect("init_states poisoned");
+            let guard = self.init_states.read();
             if let Some(handle) = guard.get(&class_id) {
                 return Arc::clone(handle);
             }
         }
+        if let Some(class) = self.class_store.get(class_id) {
+            return Arc::clone(&class.init_state);
+        }
         // Slow path: upgrade to write lock and insert. Re-check inside
         // the lock to handle a sibling thread racing the same insert.
-        let mut guard = self.init_states.write().expect("init_states poisoned");
+        let mut guard = self.init_states.write();
         Arc::clone(
             guard
                 .entry(class_id)
@@ -3441,11 +3475,15 @@ impl ClassManager {
         // and aborts, preventing silent type-confusion bugs from
         // shipping to release builds.
         //
-        // The destructuring pattern below uses `..` so that adding a
-        // new field to `Class` is a hard compile error here until the
-        // author classifies it as either an invariant (add to the
-        // snapshot below + the assertion) or a mutable redefine field
-        // (add to the post-swap mutation block + the documented set).
+        // The destructuring pattern in `RedefineInvariantSnapshot::from_class`
+        // explicitly OMITS the trailing `..` so adding a new field to
+        // `Class` is a hard compile error there until the author
+        // classifies it as either an invariant (add to the snapshot
+        // struct + the `assert_eq` walk) or a mutable redefine field
+        // (add to the rollback tuple + the documented set + the
+        // post-swap mutation block).  This trip-wire fires in release
+        // builds because `from_class` is always compiled (only the
+        // runtime `assert_eq` walk is debug-gated below).
         //
         // Round 7 audit fix (CRIT #1): always build the snapshot so the
         // exhaustive destructuring trip-wire fires in release builds
@@ -3782,10 +3820,15 @@ impl ClassManager {
         ];
 
         for key in &keys {
-            // T10.9.E: one `Arc::from(&str)` per (key, loader-triple) probe
-            // hoisted outside the loader loop so we don't allocate three
-            // times. Same allocation cost as the prior `key.clone()`.
-            let arc_key: Arc<str> = Arc::from(key.as_str());
+            // Round 8 audit fix (HIGH #6): route through `intern_arc` so
+            // we share the global pool's Arc with the original class
+            // registration — the `loaded_classes` keys were inserted as
+            // `intern_arc(...)` results, so `Arc::ptr_eq` hits before
+            // any byte comparison. The previous `Arc::from(&str)` minted
+            // a *fresh* Arc per probe, forcing the HashMap to fall
+            // through to a full `str` comparison on every loader-tuple
+            // lookup.
+            let arc_key: Arc<str> = rustjvm_types::intern_arc(key.as_str());
             for loader_id in BUILTIN_LOADERS {
                 if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
                     if let Some(class) = self.get_class(id) {
@@ -3811,7 +3854,9 @@ impl ClassManager {
         // the set is empty and we skip the inner loop entirely.
         if !self.user_loaders.is_empty() {
             for key in &keys {
-                let arc_key: Arc<str> = Arc::from(key.as_str());
+                // Round 8 audit fix (HIGH #6): same intern_arc routing as
+                // the builtin loaders loop above.
+                let arc_key: Arc<str> = rustjvm_types::intern_arc(key.as_str());
                 for loader_id in &self.user_loaders {
                     if let Some(&id) =
                         self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key)))
@@ -3833,9 +3878,11 @@ impl ClassManager {
     /// fallback to the standard loader chain (Bootstrap → Extension → Application).
     pub fn find_class_by_name_in_loader(&self, name: &str, loader_id: ClassLoaderId) -> Option<ClassId> {
         // Check the specific loader first.
-        // T10.9.E: one `Arc::from(&str)` per probe — no worse than the
-        // prior `name.to_string()`.
-        if let Some(&id) = self.loaded_classes.get(&(loader_id, Arc::<str>::from(name))) {
+        // Round 8 audit fix (HIGH #6): use `intern_arc` so the key
+        // shares the global pool Arc with the original registration —
+        // `Arc::ptr_eq` hits before any byte comparison. Previously
+        // `Arc::<str>::from(name)` minted a fresh Arc per probe.
+        if let Some(&id) = self.loaded_classes.get(&(loader_id, rustjvm_types::intern_arc(name))) {
             return Some(id);
         }
         // Delegate to parent chain
@@ -4016,6 +4063,7 @@ impl ClassManager {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
 
         debug!(
@@ -4241,6 +4289,7 @@ impl ClassManager {
             // benches, tests). Wire up real `ArrayInfo` once a consumer
             // (e.g. `Class.getComponentType` fast-path) actually reads it.
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
 
         debug!(
@@ -6674,6 +6723,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
 
         let child_fields = vec![make_field("a", false), make_field("b", false)];
@@ -6899,6 +6949,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_record());
@@ -6957,6 +7008,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_sealed());
@@ -7001,6 +7053,7 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.is_record());
@@ -7046,6 +7099,7 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         assert!(store.get(parent_id).unwrap().is_sealed());
 
@@ -7107,6 +7161,7 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let cls = store.get(id).unwrap();
         // java/lang/Object itself should NOT be considered as "declares_finalize"
@@ -7156,6 +7211,7 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.declares_finalize());
@@ -7196,6 +7252,7 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.declares_finalize());
@@ -7481,6 +7538,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let entries = mgr.build_vtable_descriptors(id, superclass);
         mgr.vtable_descriptors.insert(id, entries);
@@ -7741,6 +7799,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
 
         let (entries, overrides) = mgr.build_vtable_descriptors_with_overrides(id, None);
@@ -7808,6 +7867,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let (_entries, overrides) =
             mgr.build_vtable_descriptors_with_overrides(sub_id, Some(super_id));
@@ -7884,6 +7944,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         let entries = mgr.build_vtable_descriptors(id, None);
         assert_eq!(entries.len(), 1);

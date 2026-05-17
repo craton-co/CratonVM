@@ -124,6 +124,28 @@ pub struct MarkQueue {
 /// Number of shards for the mark queue. Must be a power of two for fast modulo.
 const MARK_QUEUE_SHARDS: usize = 8;
 
+/// Round-5 HIGH #6 — defensive cap on a single mark-queue shard.
+///
+/// The original `MarkQueue::push` was an unbounded `Vec` (well, `VecDeque`)
+/// growth. A pathological mutator graph (e.g. a malicious or buggy
+/// classloader that produces a deeply circular object graph during a
+/// concurrent-mark cycle) could OOM the marker thread by pushing
+/// hundreds of millions of pointers before any are drained. The cap
+/// below converts that silent OOM into a deterministic panic, which is
+/// strictly better than crashing the entire VM with an allocator
+/// failure deep in `VecDeque::push_back`.
+///
+/// 1 million entries per shard * 8 shards * 8 bytes = 64 MiB — chosen
+/// large enough that any realistic mark cycle stays well below it, but
+/// small enough that the panic is reproducible in tests.
+///
+/// TODO(round-5+): the real fix is an overflow-handling strategy —
+/// either spill the queue to a backing region, or drop the explicit
+/// queue entirely and fall back to a "mark-everything-dirty" sweep
+/// pass guided by the card table. Both are too invasive for this
+/// hotfix; the cap below is the defensive interim.
+const MARK_QUEUE_SHARD_CAP: usize = 1 << 20;
+
 thread_local! {
     /// Per-thread round-robin cursor used by [`MarkQueue::pop`] to choose
     /// the shard probe order. Bumping this on every `pop` distributes
@@ -155,9 +177,23 @@ impl MarkQueue {
     }
 
     /// Push an object onto the mark queue (it becomes gray).
+    ///
+    /// Round-5 HIGH #6: enforce a per-shard cap to convert silent
+    /// allocator-OOM into a deterministic panic.  See
+    /// `MARK_QUEUE_SHARD_CAP` for the long-form rationale and the
+    /// TODO note on the eventual real fix.
     pub fn push(&self, obj_ptr: *mut u8) {
         let idx = Self::shard_for(obj_ptr);
-        self.shards[idx].lock().push_back(obj_ptr);
+        let mut shard = self.shards[idx].lock();
+        if shard.len() >= MARK_QUEUE_SHARD_CAP {
+            panic!(
+                "concurrent_mark: MarkQueue shard {} exceeded cap of {} entries — \
+                 object graph pathology or marker starvation suspected. \
+                 TODO(round-5+): implement spill/fallback strategy.",
+                idx, MARK_QUEUE_SHARD_CAP
+            );
+        }
+        shard.push_back(obj_ptr);
     }
 
     /// Pop an object from the mark queue for scanning.
@@ -298,7 +334,15 @@ impl ConcurrentMarker {
         // Process SATB entries: these are old reference values that were
         // overwritten during concurrent marking. We must mark them to
         // prevent live objects from being collected.
-        let satb_entries = self.satb_queue.drain();
+        //
+        // Round-5 CRIT #4: use `deactivate_and_drain` so the barrier
+        // gate transition is atomic with respect to mutator log pushes.
+        // The previous `drain()` + later `deactivate()` left a window
+        // where a mutator could observe "active", be preempted, and
+        // push its old-reference into a shard after the drain returned
+        // — its entry would never be marked and the live object would
+        // be reaped by `concurrent_sweep` despite still being reachable.
+        let satb_entries = self.satb_queue.deactivate_and_drain();
         for addr in satb_entries {
             if addr != 0 && old_gen.contains(addr as *const u8) {
                 if self.bitmap.try_mark(addr) {
@@ -324,8 +368,8 @@ impl ConcurrentMarker {
             discovered += 1;
         }
 
-        // Deactivate SATB barrier — no more logging needed.
-        self.satb_queue.deactivate();
+        // Round-5 CRIT #4: SATB barrier was already deactivated atomically
+        // by `deactivate_and_drain` above. No further `deactivate()` needed.
         self.state.set_phase(ConcurrentGcPhase::ConcurrentSweep);
 
         discovered

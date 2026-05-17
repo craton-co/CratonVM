@@ -724,6 +724,21 @@ fn decode_attribute_body(
     canon!(CANON_RUNTIME_INVISIBLE_ANNOTATIONS, "RuntimeInvisibleAnnotations");
     canon!(CANON_METHOD_PARAMETERS, "MethodParameters");
     canon!(CANON_ENCLOSING_METHOD, "EnclosingMethod");
+    // Round 8 audit fix (HIGH #5): the previous `Arc::ptr_eq` dispatch
+    // omitted these names, so any class carrying them paid the `&**name`
+    // string-compare slow path on the dispatch — measurable on
+    // method-annotation-heavy code (Spring, Jakarta EE, JUnit) where
+    // every parameter-annotated method hits the parameter-annotations
+    // dispatch and every annotation-default method hits AnnotationDefault.
+    canon!(CANON_RUNTIME_VISIBLE_PARAMETER_ANNOTATIONS, "RuntimeVisibleParameterAnnotations");
+    canon!(CANON_RUNTIME_INVISIBLE_PARAMETER_ANNOTATIONS, "RuntimeInvisibleParameterAnnotations");
+    canon!(CANON_RUNTIME_VISIBLE_TYPE_ANNOTATIONS, "RuntimeVisibleTypeAnnotations");
+    canon!(CANON_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS, "RuntimeInvisibleTypeAnnotations");
+    canon!(CANON_ANNOTATION_DEFAULT, "AnnotationDefault");
+    canon!(CANON_MODULE, "Module");
+    canon!(CANON_RECORD, "Record");
+    canon!(CANON_PERMITTED_SUBCLASSES, "PermittedSubclasses");
+    canon!(CANON_SOURCE_DEBUG_EXTENSION, "SourceDebugExtension");
 
     // Pick a string discriminant by Arc-ptr-eq first; fall through to
     // the `&**name` deref for the slow path. The selected string is
@@ -767,6 +782,24 @@ fn decode_attribute_body(
         "MethodParameters"
     } else if Arc::ptr_eq(name, &CANON_ENCLOSING_METHOD) {
         "EnclosingMethod"
+    } else if Arc::ptr_eq(name, &CANON_RUNTIME_VISIBLE_PARAMETER_ANNOTATIONS) {
+        "RuntimeVisibleParameterAnnotations"
+    } else if Arc::ptr_eq(name, &CANON_RUNTIME_INVISIBLE_PARAMETER_ANNOTATIONS) {
+        "RuntimeInvisibleParameterAnnotations"
+    } else if Arc::ptr_eq(name, &CANON_RUNTIME_VISIBLE_TYPE_ANNOTATIONS) {
+        "RuntimeVisibleTypeAnnotations"
+    } else if Arc::ptr_eq(name, &CANON_RUNTIME_INVISIBLE_TYPE_ANNOTATIONS) {
+        "RuntimeInvisibleTypeAnnotations"
+    } else if Arc::ptr_eq(name, &CANON_ANNOTATION_DEFAULT) {
+        "AnnotationDefault"
+    } else if Arc::ptr_eq(name, &CANON_MODULE) {
+        "Module"
+    } else if Arc::ptr_eq(name, &CANON_RECORD) {
+        "Record"
+    } else if Arc::ptr_eq(name, &CANON_PERMITTED_SUBCLASSES) {
+        "PermittedSubclasses"
+    } else if Arc::ptr_eq(name, &CANON_SOURCE_DEBUG_EXTENSION) {
+        "SourceDebugExtension"
     } else {
         &**name
     };
