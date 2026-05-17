@@ -43,10 +43,12 @@ use std::sync::Arc;
 
 use crate::classloading::ClassId;
 use crate::config::VmConfig;
+use rustjvm_reader::constant_pool::ConstantPool;
 use rustjvm_reader::method::ClassFileMethod;
 
 use cuda_bridge::{DeviceContext, DeviceModule};
-use jit_cuda::{analyze, OffloadVerdict, ParamKind};
+use jit_cuda::annotations::read_method_annotations;
+use jit_cuda::{analyzer, OffloadVerdict, ParamKind};
 use jit_cuda::lowering::lower_method;
 use jit_cuda::signature::KernelSignature;
 use jit_cuda::emitter::PtxModule;
@@ -159,17 +161,20 @@ impl OffloadCache {
     /// [`LookupOutcome::Blacklisted`] for previously rejected methods
     /// (same dispatch consequence as `Skip`, but observable).
     ///
-    /// The split into `(class_id, class_name, method)` rather than
+    /// The split into `(class_id, class_name, method, cp)` rather than
     /// taking a `&Class` lets unit tests bypass the full
     /// `rustjvm_classloading::Class` construction (which has ~30
     /// fields of unrelated bookkeeping) and exercise the cache against
-    /// real bytecode loaded directly from disk.
+    /// real bytecode loaded directly from disk. The constant pool is
+    /// threaded through explicitly because annotation parsing
+    /// dereferences UTF-8 entries by index.
     pub fn lookup_or_compile(
         &self,
         class_id: ClassId,
         class_name: &str,
         method_index: u16,
         method: &ClassFileMethod,
+        constant_pool: &ConstantPool,
     ) -> LookupOutcome {
         let key = (class_id, method_index);
 
@@ -187,10 +192,34 @@ impl OffloadCache {
             return LookupOutcome::Hit(Arc::clone(k));
         }
 
+        // Read method annotations once and reuse them for both the
+        // exclude short-circuit and the analyzer hint feed. The
+        // annotations module is pure data and feature-gated alongside
+        // this cache, so there's no driver dependency on this path.
+        let method_annotations = read_method_annotations(&method.attributes, constant_pool);
+
+        // Short-circuit on @GpuExclude. A method tagged exclude is a
+        // permanent blacklist entry: the developer has explicitly
+        // opted out, so we record the verdict and don't even hand the
+        // method to the analyzer.
+        if let Some(exclude) = &method_annotations.gpu_exclude {
+            tracing::debug!(
+                target: "gpu.offload",
+                class = %class_name,
+                method = method_index,
+                reason = %exclude.reason,
+                "blacklisted by @GpuExclude",
+            );
+            self.blacklist.write().insert(key);
+            return LookupOutcome::Blacklisted;
+        }
+
         // Slow path: analyze + lower + load. We do this without
         // holding any lock so concurrent dispatchers for different
-        // methods make progress in parallel.
-        let verdict = analyze(method);
+        // methods make progress in parallel. Annotations are passed
+        // through so the analyzer can use hints (e.g. `@GpuKernel`
+        // attrs) when deciding eligibility.
+        let verdict = analyzer::analyze_with_annotations(method, &method_annotations);
         if self.print_decisions {
             tracing::info!(
                 "gpu offload: {}.{}{} -> {:?}",
@@ -335,13 +364,23 @@ pub fn try_dispatch(
         Some(i) => i as u16,
         None => return Ok(DispatchOutcome::FallThrough),
     };
-    let method = class.methods[method_index as usize].clone();
+    // Hold the class-manager read lock for the full lookup_or_compile
+    // call so we can pass the class's constant pool by reference rather
+    // than cloning ~hundreds of entries. The cache itself takes no
+    // class-manager locks, so this is not a re-entrancy risk; the
+    // tradeoff is that the very first compile of a given method holds
+    // the manager's read lock for the duration of analyze+lower+load.
+    // Concurrent dispatchers reading the manager are unaffected.
+    let outcome = shared.offload_cache.lookup_or_compile(
+        class_id,
+        class_name,
+        method_index,
+        &class.methods[method_index as usize],
+        &class.constant_pool,
+    );
     drop(cm);
 
-    match shared
-        .offload_cache
-        .lookup_or_compile(class_id, class_name, method_index, &method)
-    {
+    match outcome {
         LookupOutcome::Hit(_kernel) => {
             // Launch glue follow-up. Today: fall through to CPU.
             tracing::debug!(
@@ -377,18 +416,19 @@ mod tests {
             .join(format!("{class_name}.class"))
     }
 
-    /// Load a real `.class` file and return its parsed methods plus
-    /// its `this_class` name. We avoid constructing the heavy
-    /// `rustjvm_classloading::Class` — the cache API only needs
-    /// `(class_id, class_name, method_index, &ClassFileMethod)`.
-    fn load_methods(class_name: &str) -> (Vec<ClassFileMethod>, String) {
+    /// Load a real `.class` file and return its parsed methods, its
+    /// `this_class` name, and its constant pool. We avoid constructing
+    /// the heavy `rustjvm_classloading::Class` — the cache API only
+    /// needs `(class_id, class_name, method_index, &ClassFileMethod,
+    /// &ConstantPool)`.
+    fn load_methods(class_name: &str) -> (Vec<ClassFileMethod>, String, ConstantPool) {
         let path = fixture_path(class_name);
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
         let cf = read_class(&bytes)
             .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
         // `this_class` is already resolved to a String by the reader.
-        (cf.methods, cf.this_class)
+        (cf.methods, cf.this_class, cf.constant_pool)
     }
 
     fn find_method_index(methods: &[ClassFileMethod], name: &str, descriptor: &str) -> u16 {
@@ -424,9 +464,9 @@ mod tests {
         let mut config = VmConfig::default();
         config.gpu_offload_enabled = true;
         let cache = OffloadCache::new(&config);
-        let (methods, name) = load_methods("EligibleVectorAdd");
+        let (methods, name, cp) = load_methods("EligibleVectorAdd");
         let idx = find_method_index(&methods, "vectorAdd", "([I[I[I)V");
-        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize]) {
+        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
             LookupOutcome::Skip => {}
             LookupOutcome::Blacklisted => {
                 panic!("expected Skip on no-device path, got Blacklisted")
@@ -448,9 +488,9 @@ mod tests {
         let mut config = VmConfig::default();
         config.gpu_offload_enabled = true;
         let cache = OffloadCache::new(&config);
-        let (methods, name) = load_methods("RejectAllocation");
+        let (methods, name, cp) = load_methods("RejectAllocation");
         let idx = find_method_index(&methods, "build", "(I)[I");
-        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize]) {
+        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
             LookupOutcome::Skip => {
                 // No device → skip. Correct.
             }
@@ -472,9 +512,9 @@ mod tests {
         let config = VmConfig::default();
         let cache = OffloadCache::new(&config);
         assert!(!cache.has_device());
-        let (methods, name) = load_methods("EligibleVectorAdd");
+        let (methods, name, cp) = load_methods("EligibleVectorAdd");
         let idx = find_method_index(&methods, "vectorAdd", "([I[I[I)V");
-        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize]) {
+        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
             LookupOutcome::Skip => {}
             _ => panic!("expected Skip when gpu_offload_enabled=false"),
         }
@@ -496,5 +536,135 @@ mod tests {
     fn output_array_index_handles_all_scalars() {
         let kinds = vec![ParamKind::I32, ParamKind::F32];
         assert_eq!(output_array_index(&kinds), None);
+    }
+
+    /// `@GpuExclude` is a permanent opt-out: the cache must record the
+    /// method in the blacklist and return `Blacklisted` *without*
+    /// invoking the analyzer.
+    ///
+    /// Requires a fixture compiled with `@GpuExclude` on the kernel
+    /// method (Items 7/8). The fixture is expected at
+    /// `test_classes/gpu/annotations/ExcludedKernel.class`. We also
+    /// need a real device context — on the no-GPU CI machine the
+    /// `ctx.is_none()` fast path beats annotation reading, so the
+    /// short-circuit cannot be exercised. Marked `#[ignore]` for that
+    /// reason; run on a GPU host with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "requires @GpuExclude fixture (Items 7/8) and a real CUDA device"]
+    fn excluded_method_returns_blacklisted() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir)
+            .parent()
+            .expect("workspace root is vm/..")
+            .join("test_classes")
+            .join("gpu")
+            .join("annotations")
+            .join("ExcludedKernel.class");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
+        let cf = read_class(&bytes)
+            .unwrap_or_else(|e| panic!("failed to parse fixture: {e:?}"));
+        let methods = cf.methods;
+        let name = cf.this_class;
+        let cp = cf.constant_pool;
+
+        // The fixture's excluded entry point — Items 7/8 will document
+        // the canonical name & descriptor. We probe both common
+        // candidates so the test is robust to minor fixture-naming
+        // tweaks.
+        let idx = methods
+            .iter()
+            .position(|m| {
+                let n = &*m.name;
+                n == "run" || n == "kernel" || n == "compute" || n == "main"
+            })
+            .map(|i| i as u16)
+            .expect("ExcludedKernel fixture must have an entry-point method");
+
+        let mut config = VmConfig::default();
+        config.gpu_offload_enabled = true;
+        let cache = OffloadCache::new(&config);
+        if !cache.has_device() {
+            // Skip silently rather than failing: the test only makes
+            // sense on a GPU host. The `#[ignore]` attribute already
+            // gates the CI default, but a developer running `--ignored`
+            // on a laptop without CUDA should not see a spurious
+            // failure.
+            eprintln!(
+                "excluded_method_returns_blacklisted: no CUDA device; skipping body"
+            );
+            return;
+        }
+
+        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
+            LookupOutcome::Blacklisted => {}
+            LookupOutcome::Skip => panic!("expected Blacklisted for @GpuExclude, got Skip"),
+            LookupOutcome::Hit(_) => {
+                panic!("expected Blacklisted for @GpuExclude, got Hit (analyzer ran?!)")
+            }
+        }
+    }
+
+    /// Even a method whose body would be eligible (e.g. a vector-add
+    /// loop) must be blacklisted when `@GpuExclude` is present — the
+    /// annotation has to short-circuit the analyzer entirely. The
+    /// observable signal here is identical to
+    /// `excluded_method_returns_blacklisted`, but the fixture is built
+    /// from an eligible kernel with the exclude annotation pasted on
+    /// top, proving the opt-out wins over eligibility.
+    ///
+    /// Same `#[ignore]` rationale as above: needs Items 7/8's fixture
+    /// plus a real device for the annotation read to actually fire.
+    #[test]
+    #[ignore = "requires @GpuExclude-on-eligible fixture (Items 7/8) and a real CUDA device"]
+    fn excluded_short_circuits_analyzer() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir)
+            .parent()
+            .expect("workspace root is vm/..")
+            .join("test_classes")
+            .join("gpu")
+            .join("annotations")
+            .join("ExcludedEligibleKernel.class");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("missing fixture {}: {e}", path.display()));
+        let cf = read_class(&bytes)
+            .unwrap_or_else(|e| panic!("failed to parse fixture: {e:?}"));
+        let methods = cf.methods;
+        let name = cf.this_class;
+        let cp = cf.constant_pool;
+
+        // Find any kernel-shaped method (returns void, takes arrays).
+        // Item 7/8 will pin the exact name; "vectorAdd" matches the
+        // existing eligible fixture's convention.
+        let idx = methods
+            .iter()
+            .position(|m| {
+                let n = &*m.name;
+                n == "vectorAdd" || n == "saxpy" || n == "run" || n == "kernel"
+            })
+            .map(|i| i as u16)
+            .expect("ExcludedEligibleKernel fixture must have a kernel-shaped method");
+
+        let mut config = VmConfig::default();
+        config.gpu_offload_enabled = true;
+        let cache = OffloadCache::new(&config);
+        if !cache.has_device() {
+            eprintln!(
+                "excluded_short_circuits_analyzer: no CUDA device; skipping body"
+            );
+            return;
+        }
+
+        // The verdict must be Blacklisted: the exclude annotation
+        // wins, even though analyzer-with-annotations would have
+        // returned Eligible for this body.
+        match cache.lookup_or_compile(TEST_CLASS_ID, &name, idx, &methods[idx as usize], &cp) {
+            LookupOutcome::Blacklisted => {}
+            LookupOutcome::Skip => panic!("expected Blacklisted, got Skip"),
+            LookupOutcome::Hit(_) => panic!(
+                "expected Blacklisted (exclude beats eligibility), got Hit — analyzer ran?!"
+            ),
+        }
     }
 }
