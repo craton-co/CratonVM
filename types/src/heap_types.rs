@@ -9,6 +9,15 @@ use std::sync::atomic::AtomicU64;
 /// code that hardcoded `32` must be updated.
 pub const HEADER_SIZE: usize = 40;
 
+// JIT x64 emits array element offsets as signed disp8 = HEADER_SIZE as u8.
+// If HEADER_SIZE exceeds 127, disp8 wraps to negative and produces wrong
+// addresses. Bump to disp32 emission in jit/src/x64.rs:6690-6813 before
+// allowing HEADER_SIZE to grow beyond this limit.
+const _: () = assert!(
+    HEADER_SIZE <= 127,
+    "HEADER_SIZE must fit in signed disp8 for JIT array access"
+);
+
 // --- Mark word (thin-lock / monitor inflation) -----------------------------
 //
 // The mark word is a single `AtomicU64` appended to `ObjectHeader`. It encodes

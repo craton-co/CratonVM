@@ -2216,13 +2216,34 @@ pub fn try_compile(
         }
     }
 
-    let mut new_info: Vec<(usize, u32, usize)> = Vec::new();
+    // CRIT-2 — new_info tuple shape:
+    //   (pc, class_id_raw, num_fields,
+    //    has_primitive_init,    // class has primitive-typed fields that
+    //                           // need typed-zero defaults applied by
+    //                           // `jit_init_primitive_fields`
+    //    has_finalizer)         // class overrides `finalize()` and must
+    //                           // be registered with the finalizer queue
+    //
+    // When both flags are `false` the inline TLAB fast path can skip the
+    // `jit_post_tlab_init` helper entirely (it just writes the
+    // identity-hash and num_slots fields, which the JIT inlines). The
+    // current `cp_new_resolver` signature returns only
+    // `(class_id, num_fields)` — extending it would touch the resolver
+    // callers in `vm/src/runtime/interpreter.rs`, which is out of scope
+    // for this fix. The defaults below (`true, true`) keep the helper
+    // call mandatory, preserving correctness. Future work: extend the
+    // resolver to return the real flags so JDK micro-objects
+    // (HashMap.Node, ArrayList$Itr) elide the helper.
+    let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() {
         let resolver = cp_new_resolver?;
         for &(pc, cp_idx) in &scan.new_ops {
             let (class_id_raw, num_fields) = resolver(cp_idx)?;
-            new_info.push((pc, class_id_raw, num_fields));
+            // Conservative: assume both flags set until the resolver
+            // is extended to return them. See CRIT-2 follow-up note
+            // above.
+            new_info.push((pc, class_id_raw, num_fields, true, true));
         }
         for &(pc, cp_idx) in &scan.anewarray_ops {
             let (class_id_raw, _) = resolver(cp_idx)?;

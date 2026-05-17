@@ -105,20 +105,38 @@ pub struct G1Region {
     pub pinned: bool,
     /// Survivor age (number of young GCs survived).
     pub age: u8,
+    /// Per-region mark bitmap for concurrent marking.
+    ///
+    /// Round-2 fix (HIGH — GC #5): the bitmap is keyed off the region's
+    /// own heap-allocated `data.as_ptr()` base, so `try_mark`/`is_marked`
+    /// accept real object addresses living inside this region. The
+    /// previous design used a single global bitmap rooted at address 0,
+    /// which silently rejected every real region address and produced
+    /// `live_bytes = 0` for every region (breaking mixed-GC region
+    /// selection). The Vec backing the region is never reallocated
+    /// (only zero-filled by `reset`), so the bitmap base remains stable
+    /// for the entire collector lifetime.
+    pub mark_bitmap: MarkBitmap,
 }
 
 impl G1Region {
     /// Create a new free region of the given size.
     fn new(region_size: usize) -> Self {
+        let data = vec![0u8; region_size];
+        // Round-2 fix (HIGH — GC #5): bitmap covers exactly this region's
+        // heap-allocated buffer. Base = data.as_ptr(), span = region_size.
+        let base = data.as_ptr() as usize;
+        let mark_bitmap = MarkBitmap::new(base, region_size);
         Self {
             region_type: RegionType::Free,
-            data: vec![0u8; region_size],
+            data,
             cursor: 0,
             live_bytes: 0,
             gc_efficiency: 0.0,
             rset: RememberedSet::default(),
             pinned: false,
             age: 0,
+            mark_bitmap,
         }
     }
 
@@ -136,6 +154,11 @@ impl G1Region {
         self.rset.clear();
         self.pinned = false;
         self.age = 0;
+        // Round-2 fix (HIGH — GC #5): clear stale mark bits so they don't
+        // pollute the next concurrent-mark cycle. The Vec is never
+        // reallocated (only `fill(0)`'d) so the bitmap's base address
+        // remains valid.
+        self.mark_bitmap.clear();
         // Zero the backing storage
         self.data.fill(0);
     }
@@ -204,9 +227,12 @@ pub struct G1Collector {
     /// Next identity hash code to assign.
     next_hash_code: AtomicI32,
 
-    /// Mark bitmap for concurrent marking.
-    mark_bitmap: MarkBitmap,
     /// Concurrent GC phase state.
+    ///
+    /// Round-2 fix (HIGH — GC #5): the previously-global `mark_bitmap`
+    /// has moved to `G1Region::mark_bitmap` so each region's bitmap is
+    /// keyed off that region's actual data pointer (not address 0).
+    /// Callers route bitmap operations through the region lookup.
     pub gc_state: Arc<ConcurrentGcState>,
     /// Global SATB queue.
     satb_queue: Arc<SatbQueue>,
@@ -285,10 +311,11 @@ impl G1Collector {
             .collect();
         region_lookup.sort_unstable_by_key(|(base, _)| *base);
 
-        // Compute a dummy base address for the bitmap. Since regions have
-        // independent Vec<u8> backing, we use 0 as base and a large range.
-        // In practice the bitmap tracks addresses within region data vecs.
-        let bitmap = MarkBitmap::new(0, config.heap_size);
+        // Round-2 fix (HIGH — GC #5): no global mark bitmap any more —
+        // bitmaps live per-region (see `G1Region::mark_bitmap`) so they
+        // correctly cover the real heap addresses of each region's data
+        // buffer. The previous global `MarkBitmap::new(0, heap_size)`
+        // silently rejected every real address.
 
         let ihop_threshold =
             (config.heap_size as u64 * config.ihop_percent as u64 / 100) as usize;
@@ -298,7 +325,6 @@ impl G1Collector {
             regions: Mutex::new(regions),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
-            mark_bitmap: bitmap,
             gc_state: Arc::new(ConcurrentGcState::new()),
             satb_queue: Arc::new(SatbQueue::new()),
             collection_count: AtomicU64::new(0),
@@ -834,6 +860,28 @@ impl G1Collector {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, obj_size);
         }
 
+        // Round-2 fix (T2-4): explicit atomic load+store for the mark_word
+        // field. The bulk memcpy above is technically UB for `AtomicU64`:
+        // even under STW the memory model requires atomic ops on atomic
+        // locations. Replicate the mark word atomically so subsequent CAS
+        // operations (monitor inflation, etc.) on the new copy observe a
+        // properly synchronized initial value.
+        //
+        // NOTE: a future concurrent G1 collector needs a different
+        // forwarding protocol — CAS-install the forwarding pointer and
+        // re-read the mark word if a mutator raced the evacuation.
+        // SAFETY: both pointers reference a fully written ObjectHeader.
+        unsafe {
+            let old_header_ptr = old_ptr as *const ObjectHeader;
+            let new_header_ptr = new_ptr as *mut ObjectHeader;
+            let mark = (*old_header_ptr)
+                .mark_word
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (*new_header_ptr)
+                .mark_word
+                .store(mark, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Increment GC age on the new copy
         let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
         if !promote {
@@ -984,7 +1032,14 @@ impl G1Collector {
         self.gc_state
             .set_phase(ConcurrentGcPhase::InitialMark);
         self.satb_queue.activate();
-        self.mark_bitmap.clear();
+        // Round-2 fix (HIGH — GC #5): clear every per-region bitmap so a
+        // previous cycle's mark bits don't leak into this one.
+        {
+            let regions = self.regions.lock();
+            for r in regions.iter() {
+                r.mark_bitmap.clear();
+            }
+        }
         self.mark_worklist.lock().clear();
         self.gc_state
             .set_phase(ConcurrentGcPhase::ConcurrentMark);
@@ -1030,12 +1085,16 @@ impl G1Collector {
             // (Stale roots from before a heap rearrangement would otherwise
             // dereference garbage.)
             let obj_ptr = obj_addr as *mut u8;
-            if self.region_for_ptr(&regions, obj_ptr).is_none() {
-                continue;
-            }
+            let region_idx = match self.region_for_ptr(&regions, obj_ptr) {
+                Some(idx) => idx,
+                None => continue,
+            };
 
+            // Round-2 fix (HIGH — GC #5): bitmaps now live per-region, so
+            // route the mark through the owning region's bitmap (which is
+            // keyed off that region's actual data pointer).
             // Already black? Skip — nothing new to discover from it.
-            if !self.mark_bitmap.try_mark(obj_addr) {
+            if !regions[region_idx].mark_bitmap.try_mark(obj_addr) {
                 continue;
             }
 
@@ -1045,7 +1104,7 @@ impl G1Collector {
             // readable for the duration of the GC cycle (regions are
             // pinned by the lock guard).
             let header = unsafe { &*(obj_addr as *const ObjectHeader) };
-            Self::scan_object_refs(obj_ptr, header, &regions, &self.mark_bitmap, &mut worklist);
+            Self::scan_object_refs(obj_ptr, header, &regions, &mut worklist);
         }
 
         // Ran out of budget but still have work — caller should call again.
@@ -1056,26 +1115,34 @@ impl G1Collector {
     /// target push the target onto `worklist`. This mirrors
     /// `ConcurrentMarker::scan_object` in `concurrent_mark.rs` but uses
     /// G1's per-region addressing (objects live inside `G1Region::data`).
+    ///
+    /// Round-2 fix (HIGH — GC #5): bitmaps are per-region. Instead of
+    /// receiving a single global bitmap, this helper looks up the owning
+    /// region for each reference and consults that region's bitmap to
+    /// avoid pushing already-marked targets back onto the worklist. The
+    /// `try_mark` in `concurrent_mark_step` is still the authoritative
+    /// marker; the `is_marked` check here is only an optimization to
+    /// reduce worklist churn.
     fn scan_object_refs(
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         regions: &[G1Region],
-        bitmap: &MarkBitmap,
         worklist: &mut Vec<usize>,
     ) {
-        // Helper: does this raw pointer fall inside any non-free region?
-        let in_heap = |p: *mut u8| -> bool {
+        // Helper: locate the region (if any) that owns this raw pointer.
+        // Returns the region index, only considering non-free regions.
+        let region_for = |p: *mut u8| -> Option<usize> {
             let addr = p as usize;
-            for r in regions.iter() {
+            for (i, r) in regions.iter().enumerate() {
                 if r.region_type == RegionType::Free {
                     continue;
                 }
                 let base = r.data.as_ptr() as usize;
                 if addr >= base && addr < base + r.data.len() {
-                    return true;
+                    return Some(i);
                 }
             }
-            false
+            None
         };
 
         if header.kind == ObjectKind::Array {
@@ -1090,8 +1157,10 @@ impl G1Collector {
                         continue;
                     }
                     let ref_ptr = raw as usize as *mut u8;
-                    if in_heap(ref_ptr) && !bitmap.is_marked(ref_ptr as usize) {
-                        worklist.push(ref_ptr as usize);
+                    if let Some(idx) = region_for(ref_ptr) {
+                        if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                            worklist.push(ref_ptr as usize);
+                        }
                     }
                 }
             }
@@ -1105,8 +1174,10 @@ impl G1Collector {
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
-                    if in_heap(ref_ptr) && !bitmap.is_marked(ref_ptr as usize) {
-                        worklist.push(ref_ptr as usize);
+                    if let Some(idx) = region_for(ref_ptr) {
+                        if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                            worklist.push(ref_ptr as usize);
+                        }
                     }
                 }
             }
@@ -1142,18 +1213,20 @@ impl G1Collector {
         let regions = self.regions.lock();
         let mut worklist = self.mark_worklist.lock();
 
-        // Helper closure: is `addr` inside any allocated (non-free) region?
-        let in_heap = |addr: usize| -> bool {
-            for r in regions.iter() {
+        // Round-2 fix (HIGH — GC #5): bitmaps are per-region. Helper
+        // returns the owning region index (if any) so we can consult
+        // *that* region's bitmap for the already-marked check.
+        let region_for = |addr: usize| -> Option<usize> {
+            for (i, r) in regions.iter().enumerate() {
                 if r.region_type == RegionType::Free {
                     continue;
                 }
                 let base = r.data.as_ptr() as usize;
                 if addr >= base && addr < base + r.data.len() {
-                    return true;
+                    return Some(i);
                 }
             }
-            false
+            None
         };
 
         // 1) Roots — push every non-null in-heap root onto the gray set.
@@ -1164,10 +1237,10 @@ impl G1Collector {
                 continue;
             }
             let addr = p as usize;
-            if self.mark_bitmap.is_marked(addr) {
-                continue; // already black
-            }
-            if in_heap(addr) {
+            if let Some(idx) = region_for(addr) {
+                if regions[idx].mark_bitmap.is_marked(addr) {
+                    continue; // already black
+                }
                 worklist.push(addr);
             }
         }
@@ -1175,10 +1248,13 @@ impl G1Collector {
         // 2) SATB — every overwritten reference becomes a root.
         let satb_entries = self.satb_queue.drain();
         for addr in satb_entries {
-            if addr == 0 || self.mark_bitmap.is_marked(addr) {
+            if addr == 0 {
                 continue;
             }
-            if in_heap(addr) {
+            if let Some(idx) = region_for(addr) {
+                if regions[idx].mark_bitmap.is_marked(addr) {
+                    continue;
+                }
                 worklist.push(addr);
             }
         }
@@ -1200,7 +1276,9 @@ impl G1Collector {
                 continue;
             }
 
-            // Compute live bytes by walking objects and checking the bitmap
+            // Compute live bytes by walking objects and checking the bitmap.
+            // Round-2 fix (HIGH — GC #5): consult this region's own
+            // bitmap (keyed off `data.as_ptr()`), not a global one.
             let base = region.data.as_ptr() as usize;
             let mut live_bytes = 0usize;
             let mut offset = 0usize;
@@ -1214,7 +1292,7 @@ impl G1Collector {
                     break;
                 }
 
-                if self.mark_bitmap.is_marked(obj_addr) {
+                if region.mark_bitmap.is_marked(obj_addr) {
                     live_bytes += obj_size;
                 }
                 offset += obj_size;
@@ -2689,19 +2767,35 @@ mod tests {
 
     #[test]
     fn cleanup_computes_live_bytes() {
-        // Use a custom collector where we can control the bitmap range.
-        // The mark bitmap in the standard G1Collector covers [0, heap_size),
-        // but region data lives in heap-allocated Vecs at arbitrary addresses.
-        // Instead, we test cleanup's gc_efficiency and live_bytes computation
-        // by verifying that cleanup runs without panic and sets gc_efficiency
-        // on old regions (even when no objects are marked, live_bytes = 0
-        // and empty old regions get freed).
+        // Round-2 fix (HIGH — GC #5): bitmaps now live per-region and
+        // are keyed off each region's heap-allocated `data.as_ptr()`,
+        // so `try_mark`/`is_marked` accept the real addresses of
+        // objects living inside the region. This means `cleanup` can
+        // now correctly attribute live bytes to a marked object.
+        //
+        // The previous version of this test documented the BUG —
+        // marking a real address against a `[0, heap_size)` bitmap
+        // always silently failed, so `live_bytes` was always 0. After
+        // the per-region-bitmap fix, marking succeeds and `cleanup`
+        // reports a non-zero `live_bytes` for the region holding the
+        // marked object.
         let gc = make_collector();
-        let _obj = gc.alloc_object(ClassId::new(1), 2);
+        let obj = gc.alloc_object(ClassId::new(1), 2);
+        let obj_addr = obj.as_ptr() as usize;
 
-        // Promote the Eden region to Old manually
+        // Locate the region the allocator placed the object in, mark
+        // the object in *that* region's bitmap, then promote every
+        // Eden region (including ours) to Old so `cleanup` walks them.
         {
             let mut regions = gc.regions.lock();
+            let region_idx = gc
+                .region_for_ptr(&regions, obj.as_ptr())
+                .expect("freshly-allocated object must live in some region");
+            let marked = regions[region_idx].mark_bitmap.try_mark(obj_addr);
+            assert!(
+                marked,
+                "per-region bitmap must accept real heap addresses post-fix"
+            );
             for r in regions.iter_mut() {
                 if r.region_type == RegionType::Eden {
                     r.region_type = RegionType::Old;
@@ -2711,12 +2805,41 @@ mod tests {
 
         gc.cleanup();
 
-        // Since no objects were marked in the bitmap (bitmap covers [0, heap_size)
-        // but data is at heap-allocated addresses), live_bytes should be 0 and
-        // the empty old region should have been freed.
+        // The region containing our marked object must report non-zero
+        // live_bytes (was always 0 under the buggy global bitmap). The
+        // exact byte count equals one ObjectHeader + 2 SLOT_SIZE
+        // fields = HEADER_SIZE + 2*SLOT_SIZE. We assert >0 to keep the
+        // test resilient to header-size tuning.
         let regions = gc.regions.lock();
-        let old_count = regions.iter().filter(|r| r.region_type == RegionType::Old).count();
-        assert_eq!(old_count, 0, "empty old region should be freed by cleanup");
+        let holding_region = regions
+            .iter()
+            .find(|r| {
+                let base = r.data.as_ptr() as usize;
+                obj_addr >= base && obj_addr < base + r.data.len()
+            })
+            .expect("holding region must still exist");
+        assert!(
+            holding_region.live_bytes > 0,
+            "per-region bitmap fix: cleanup must report >0 live_bytes for the marked region (got {})",
+            holding_region.live_bytes,
+        );
+        assert_eq!(
+            holding_region.region_type,
+            RegionType::Old,
+            "non-empty old region must not be freed by cleanup"
+        );
+
+        // Other old regions had no marked objects, so they should have
+        // been freed (live_bytes == 0, type went back to Free).
+        let old_count = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Old)
+            .count();
+        assert_eq!(
+            old_count, 1,
+            "only the region containing the marked object should remain Old; \
+             empty old regions must be freed"
+        );
     }
 
     // -- Needs GC --
