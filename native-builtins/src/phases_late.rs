@@ -30958,13 +30958,70 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         sps,
         "spliteratorUnknownSize",
         "(Ljava/util/Iterator;I)Ljava/util/Spliterator;",
-        |ctx, _args| {
-            // Return empty spliterator (simplified)
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        |ctx, args| {
+            // The previous implementation always returned an empty
+            // spliterator, ignoring the supplied Iterator. That broke the
+            // entire `Iterable.spliterator()` default-method chain — the
+            // JDK's default `Iterable.spliterator()` calls
+            // `Spliterators.spliteratorUnknownSize(iterator(), 0)`, so any
+            // caller that drove `ServiceLoader` (or any other Iterable) via
+            // `spliterator()` saw zero elements regardless of what
+            // `iterator()` returned. Elasticsearch's CliToolProvider lookup
+            // is the canonical example: `ServiceLoader.load(...).spliterator()
+            // .stream().filter(name=="server")` returned `[]` despite our
+            // `ServiceLoader.iterator()` producing 13 providers.
+            //
+            // Fix: drain the iterator eagerly into an Object[] and stuff it
+            // into the synthetic 3-field spliterator that `Spliterator.*`
+            // natives already understand. Bounded by a generous safety cap
+            // to avoid runaway iteration on a pathological infinite source.
+            let iter = match args.first() {
+                Some(Value::Object(Some(it))) => *it,
+                _ => {
+                    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                    let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+                    ctx.set_field(obj, 0, Value::Object(Some(empty)));
+                    ctx.set_field(obj, 1, Value::Int(0));
+                    ctx.set_field(obj, 2, Value::Int(0));
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            };
+            let mut collected: Vec<Value> = Vec::new();
+            const SAFETY_CAP: usize = 1_000_000;
+            loop {
+                let has_next = ctx.invoke_virtual(
+                    iter,
+                    "hasNext",
+                    "()Z",
+                    &[],
+                );
+                let proceed = matches!(has_next, Ok(Some(Value::Int(1))));
+                if !proceed {
+                    break;
+                }
+                let next = ctx.invoke_virtual(
+                    iter,
+                    "next",
+                    "()Ljava/lang/Object;",
+                    &[],
+                );
+                let val = match next {
+                    Ok(Some(v)) => v,
+                    _ => break,
+                };
+                collected.push(val);
+                if collected.len() >= SAFETY_CAP {
+                    break;
+                }
+            }
+            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, collected.len());
+            for (i, v) in collected.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
             let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
-            ctx.set_field(obj, 2, Value::Int(0));
+            ctx.set_field(obj, 2, Value::Int(collected.len() as i32));
             Ok(Some(Value::Object(Some(obj))))
         },
     );

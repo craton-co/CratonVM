@@ -7130,6 +7130,74 @@ fn invoke_on_class_shared_inner(
                                 | "checkAccess"
                                 | "checkSecurityAccess"
                             ))
+                        // SPARK-LOG4J-CORE: Spark 3.5.x's
+                        // `Logging$.initializeLogging` invokes
+                        // `LoggerContext.reconfigure()` on the core.LoggerContext
+                        // returned by our `LogManager.getContext` shim. Real
+                        // log4j-core bytecode for `reconfigure` (and friends)
+                        // dereferences `this.configuration` at pc=11
+                        // (`getfield configuration / invokeinterface get(...)`)
+                        // and NPEs because the synthetic LoggerContext was
+                        // allocated via `alloc_concurrent_synthetic` and never
+                        // ran the real `<init>` that would populate that field.
+                        //
+                        //   [WF-NPE-STK 4] org/apache/logging/log4j/core/LoggerContext
+                        //                  .reconfigure pc=11
+                        //   [WF-NPE-STK 3] org/apache/spark/internal/Logging
+                        //                  .initializeLogging pc=100
+                        //
+                        // Force the no-op natives registered in
+                        // `native-builtins/src/log4j_extras.rs` (via
+                        // `register_log4j_stubs`) to win for every
+                        // Configuration-touching surface on
+                        // `org/apache/logging/log4j/core/LoggerContext` so the
+                        // null `configuration` field is never dereferenced.
+                        // Same shape as the existing `core.Logger.getAppenders`
+                        // and `DefaultLogbackConfiguration.apply` overrides.
+                        || (class_name == "org/apache/logging/log4j/core/LoggerContext"
+                            && matches!(
+                                method_name,
+                                "reconfigure"
+                                | "getConfiguration"
+                                | "setConfiguration"
+                                | "start"
+                                | "stop"
+                                | "terminate"
+                                | "close"
+                                | "isStarted"
+                                | "isStopped"
+                                | "setConfigLocation"
+                                | "getConfigLocation"
+                                | "updateLoggers"
+                                | "hasLogger"
+                                | "getLoggers"
+                                | "getName"
+                                | "getExternalContext"
+                                // The ctor/clinit overrides are also
+                                // registered as no-ops in log4j_extras —
+                                // allowlist them so the native wins if the
+                                // synthetic-alloc path falls through to
+                                // <clinit> for the concrete class.
+                                | "<init>"
+                                | "<clinit>"
+                            ))
+                        // Same family of overrides on `core.Logger` (the
+                        // concrete log4j-core Logger class our `getLogger`
+                        // shim hands back). These are registered in
+                        // log4j_extras and the existing inline-in-lib.rs
+                        // log4j surface; allowlist so the natives win over
+                        // bytecode for the accessor surface that callers
+                        // touch immediately after `getLogger`.
+                        || (class_name == "org/apache/logging/log4j/core/Logger"
+                            && matches!(
+                                method_name,
+                                "getAppenders"
+                                | "getContext"
+                                | "getParent"
+                                | "getName"
+                                | "getLevel"
+                                | "getMessageFactory"
+                            ))
                         // SB3-LOGBACK: Spring Boot's
                         // DefaultLogbackConfiguration.apply(LoggerContext) sets
                         // up the default logback configuration (root logger

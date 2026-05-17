@@ -449,6 +449,73 @@ fn _unused_aet() -> ArrayElementType {
 }
 
 // ---------------------------------------------------------------------------
+// CRC32 natives (real-JDK mode)
+// ---------------------------------------------------------------------------
+//
+// The pure-Java `java.util.zip.CRC32` in JDK 25 delegates its hot loop to
+// `private static native int updateBytes0(int crc, byte[] b, int off, int len)`
+// (and `updateByteBuffer0` for direct buffers, plus `update(int crc, int b)`).
+// Without intercepts, JAR-loading code that verifies entry CRCs trips an
+// UnsatisfiedLinkError. We implement these in software using the classical
+// IEEE 802.3 (reflected) polynomial 0xEDB88320 — the same polynomial used by
+// the JDK and zlib. The Java side passes `~crc` to the native and complements
+// the return value, so on entry/exit we operate on the *running* CRC value
+// rather than the externally-visible "value" (which is the bit-complement).
+//
+// Reference: java.util.zip.CRC32.updateBytes (JDK 25) — calls
+// `updateBytes0(crc, b, off, len)` with `crc` already complemented; returns
+// `~updated`.
+
+/// CRC-32/IEEE update (reflected poly 0xEDB88320). The `crc` argument is the
+/// "running" (uncomplemented) state — the JDK Java wrapper has already
+/// inverted the public value before handing it to the native.
+fn crc32_step(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc
+}
+
+fn crc32_update(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // static native int update(int crc, int b)
+    let crc = arg_int(args, 0) as u32;
+    let b = (arg_int(args, 1) & 0xFF) as u8;
+    Ok(Some(Value::Int(crc32_step(crc, &[b]) as i32)))
+}
+
+fn crc32_update_bytes_0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // private static native int updateBytes0(int crc, byte[] b, int off, int len)
+    let crc = arg_int(args, 0) as u32;
+    let arr = arg_obj(args, 1);
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let bytes = match arr {
+        Some(a) => read_byte_array(ctx, a, off, len),
+        None => Vec::new(),
+    };
+    let new_crc = crc32_step(crc, &bytes);
+    Ok(Some(Value::Int(new_crc as i32)))
+}
+
+fn crc32_update_byte_buffer_0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // private static native int updateByteBuffer0(int crc, long addr, int off, int len)
+    //
+    // Direct ByteBuffers carry a raw memory address that our VM does not back
+    // with addressable bytes — we have no way to load the payload. Return the
+    // CRC unchanged so callers see a stable (but technically wrong) checksum
+    // rather than an UnsatisfiedLinkError. JAR loading uses the byte[] path,
+    // so this branch is exercised only by user code that explicitly hands a
+    // direct buffer to CRC32.update(ByteBuffer).
+    let crc = arg_int(args, 0);
+    let _ = args;
+    Ok(Some(Value::Int(crc)))
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -494,6 +561,16 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // Note: java.util.zip.ZipFile and ZipFile$Source have NO native methods in
     // JDK 25 — the central-directory parser is pure Java backed by
     // RandomAccessFile. Nothing to register here.
+
+    // CRC32 — covers the JDK 25 `java.util.zip.CRC32` natives. The
+    // phases_early synthetic registers Java-level `update`/`getValue` against
+    // a synthetic 1-field layout; here we additionally cover the *real-JDK*
+    // private natives that the actual JDK class file delegates to. Mindustry
+    // and any app reading JARs trips `updateBytes0` during entry verification.
+    let crc = "java/util/zip/CRC32";
+    r.register(crc, "update", "(II)I", crc32_update);
+    r.register(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0);
+    r.register(crc, "updateByteBuffer0", "(IJII)I", crc32_update_byte_buffer_0);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +601,24 @@ mod tests {
         let produced = decomp.total_out() as usize;
         assert_eq!(&out[..produced], original);
         assert!(matches!(status, flate2::Status::StreamEnd));
+    }
+
+    #[test]
+    fn crc32_matches_known_vectors() {
+        // Empty input — running state starts at 0xFFFFFFFF (the JDK passes
+        // ~crc=0xFFFFFFFF in for a fresh CRC32), no bytes processed, result
+        // equals the input.
+        assert_eq!(crc32_step(0xFFFF_FFFF, b""), 0xFFFF_FFFF);
+
+        // "123456789" — classic CRC-32/IEEE check vector is 0xCBF43926
+        // (final, complemented). Internally the running state at the end is
+        // !0xCBF43926 = 0x340BC6D9.
+        let running = crc32_step(0xFFFF_FFFF, b"123456789");
+        assert_eq!(!running, 0xCBF4_3926);
+
+        // "abc" — CRC-32/IEEE = 0x352441C2.
+        let running = crc32_step(0xFFFF_FFFF, b"abc");
+        assert_eq!(!running, 0x3524_41C2);
     }
 
     #[test]

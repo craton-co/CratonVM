@@ -1525,10 +1525,20 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
-        let needle_suffix = format!(".{method_name}{descriptor}");
-        for (hash, triple) in self.keys.iter() {
-            if triple.ends_with(&needle_suffix) {
-                if let Some(cb) = self.methods.get(hash).copied() {
+        // Walk `registrations` (the canonical record of every
+        // `register()` call) instead of a phantom `keys` map: the latter
+        // was removed when the registry was migrated to 128-bit hash
+        // keys, but a previous fix attempt to `find_by_method_descriptor`
+        // still referenced it — which meant the helper failed to
+        // compile and the fix was never actually built into a binary.
+        //
+        // The triples are stored as `Box<str>` for memory efficiency;
+        // we re-hash each candidate to look up the callback rather
+        // than allocating a comparison string per entry.
+        for (class_name, m, d) in self.registrations.iter() {
+            if m.as_ref() == method_name && d.as_ref() == descriptor {
+                let key = native_method_hash(class_name.as_ref(), method_name, descriptor);
+                if let Some(cb) = self.methods.get(&key).copied() {
                     return Some(cb);
                 }
             }

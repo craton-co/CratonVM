@@ -15447,7 +15447,19 @@ fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let source = ctx.read_string(source_obj).unwrap_or_default();
     let _ = compile_java_regex(&source, 0)?;
 
-    let pat = ctx.alloc_object(rustjvm_types::ClassId::new(0), PAT_NUM_FIELDS);
+    // Allocate with the real `java/util/regex/Pattern` class_id so the
+    // interpreter dispatcher knows the receiver's class — otherwise
+    // invokevirtual on the returned object lands in `java/lang/Object`
+    // and methods like `matcher()` are NoSuchMethodError. Prefer the
+    // already-loaded id (no clinit side-effects); only force loading if
+    // Pattern hasn't been touched yet; fall back to ClassId(0) on
+    // failure.
+    let pat_cid = ctx
+        .class_id_by_name("java/util/regex/Pattern")
+        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
+    let pat = ctx.alloc_object(pat_cid, n);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
     ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(0));
     Ok(Some(Value::Object(Some(pat))))
@@ -15465,7 +15477,13 @@ fn native_pattern_compile_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let source = ctx.read_string(source_obj).unwrap_or_default();
     let _ = compile_java_regex(&source, flags)?;
 
-    let pat = ctx.alloc_object(rustjvm_types::ClassId::new(0), PAT_NUM_FIELDS);
+    // See `native_pattern_compile` for why we use the real Pattern class_id.
+    let pat_cid = ctx
+        .class_id_by_name("java/util/regex/Pattern")
+        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
+    let pat = ctx.alloc_object(pat_cid, n);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
     ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(flags));
     Ok(Some(Value::Object(Some(pat))))
@@ -15480,7 +15498,16 @@ fn native_pattern_matcher(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mat = ctx.alloc_object(rustjvm_types::ClassId::new(0), MAT_NUM_FIELDS);
+    // Allocate with the real `java/util/regex/Matcher` class_id so the
+    // interpreter dispatcher resolves invokevirtual against Matcher
+    // (find/matches/group/etc.) rather than against java/lang/Object.
+    // Prefer the already-loaded id to avoid clinit side-effects.
+    let mat_cid = ctx
+        .class_id_by_name("java/util/regex/Matcher")
+        .or_else(|| ctx.ensure_class_initialized("java/util/regex/Matcher").ok())
+        .unwrap_or(rustjvm_types::ClassId::new(0));
+    let n = ctx.class_num_total_fields(mat_cid).max(MAT_NUM_FIELDS);
+    let mat = ctx.alloc_object(mat_cid, n);
     ctx.set_field(mat, MAT_FIELD_PATTERN, Value::Object(Some(this)));
     ctx.set_field(mat, MAT_FIELD_INPUT, Value::Object(Some(input_obj)));
     ctx.set_field(mat, MAT_FIELD_OFFSET, Value::Int(0));

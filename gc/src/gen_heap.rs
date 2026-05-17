@@ -1173,6 +1173,7 @@ impl GenerationalHeap {
                 old_ptr,
                 &mut objects_copied,
                 &mut pointer_map,
+                &mut promoted_worklist,
             );
             // SAFETY: `new_ptr` was returned by `forward_object`, which allocated
             // space in young_to or old_gen and copied a valid object there.
@@ -1209,6 +1210,7 @@ impl GenerationalHeap {
                             ref_ptr,
                             &mut objects_copied,
                             &mut pointer_map,
+                            &mut promoted_worklist,
                         );
                         // SAFETY: Writing the forwarded pointer back to the same valid slot.
                         unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
@@ -1230,6 +1232,7 @@ impl GenerationalHeap {
                             ref_ptr,
                             &mut objects_copied,
                             &mut pointer_map,
+                            &mut promoted_worklist,
                         );
                         // SAFETY: `new_ptr` is a valid forwarded allocation.
                         let new_value =
@@ -1294,6 +1297,7 @@ impl GenerationalHeap {
                                         ref_ptr,
                                         &mut objects_copied,
                                         &mut pointer_map,
+                                        &mut promoted_worklist,
                                     );
                                     // SAFETY: Writing forwarded pointer back to the same valid slot.
                                     unsafe {
@@ -1320,6 +1324,7 @@ impl GenerationalHeap {
                                     ref_ptr,
                                     &mut objects_copied,
                                     &mut pointer_map,
+                                    &mut promoted_worklist,
                                 );
                                 // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                 let new_value = Value::Object(Some(unsafe {
@@ -1369,6 +1374,7 @@ impl GenerationalHeap {
                                         ref_ptr,
                                         &mut objects_copied,
                                         &mut pointer_map,
+                                        &mut promoted_worklist,
                                     );
                                     // SAFETY: Writing forwarded pointer back to the same valid slot.
                                     unsafe {
@@ -1399,6 +1405,7 @@ impl GenerationalHeap {
                                     ref_ptr,
                                     &mut objects_copied,
                                     &mut pointer_map,
+                                    &mut promoted_worklist,
                                 );
                                 // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                 let new_value = Value::Object(Some(unsafe {
@@ -1441,6 +1448,7 @@ impl GenerationalHeap {
                 old_ptr,
                 &mut objects_copied,
                 &mut pointer_map,
+                &mut promoted_worklist,
             );
             dead_finalizers.push(new_ptr as usize);
         }
@@ -1484,7 +1492,7 @@ impl GenerationalHeap {
                                 if young_from.contains(ref_ptr) {
                                     let new_ref_ptr = Self::forward_object(
                                         &young_from, &mut young_to, &mut old_gen,
-                                        ref_ptr, &mut objects_copied, &mut pointer_map,
+                                        ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
                                     );
                                     // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                     let new_value = Value::Object(Some(unsafe {
@@ -1542,7 +1550,7 @@ impl GenerationalHeap {
                                 if young_from.contains(ref_ptr) {
                                     let new_ref_ptr = Self::forward_object(
                                         &young_from, &mut young_to, &mut old_gen,
-                                        ref_ptr, &mut objects_copied, &mut pointer_map,
+                                        ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
                                     );
                                     // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                     let new_value = Value::Object(Some(unsafe {
@@ -1605,8 +1613,14 @@ impl GenerationalHeap {
         }
         young_from.reset();
 
-        // Phase 4: Remap monitors and swap young spaces
-        monitors.remap_after_gc(&pointer_map);
+        // Phase 4: Remap monitors and swap young spaces. The
+        // `remap_after_gc` trait signature uses `std::collections::HashMap`,
+        // while our internal `pointer_map` is an `FxHashMap` for speed —
+        // bridge by materialising a std map for the call (and for the
+        // public `GcResult.pointer_map` return value below).
+        let pointer_map_std: HashMap<usize, usize> =
+            pointer_map.iter().map(|(&k, &v)| (k, v)).collect();
+        monitors.remap_after_gc(&pointer_map_std);
         std::mem::swap(&mut *young_from, &mut *young_to);
 
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
@@ -1690,7 +1704,10 @@ impl GenerationalHeap {
                     bytes_copied,
                     bytes_freed,
                 },
-                pointer_map,
+                // `GcResult.pointer_map` is `std::collections::HashMap`
+                // (the public-API type); convert from our internal
+                // `FxHashMap` (used for perf-sensitive intra-GC lookups).
+                pointer_map: pointer_map.into_iter().collect(),
             },
             dead_finalizers,
         )

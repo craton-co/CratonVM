@@ -5139,7 +5139,24 @@ fn read_constructor_accessible(
     ctor_obj: rustjvm_types::ObjectRef,
 ) -> bool {
     if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
-        return m.accessible;
+        if m.accessible {
+            return true;
+        }
+    }
+    // Also consult the JDK-standard `override` field — that's what
+    // `AccessibleObject.setAccessible(boolean)` writes (registered in
+    // `lib.rs::native_set_accessible_write_override`). Apache Ignite's
+    // `GridUnsafe.<clinit>` calls `ctor.setAccessible(true)` on a
+    // `java.nio.DirectByteBuffer` constructor and then
+    // `ctor.newInstance(...)` — without this read the extra slot stays at
+    // 0, the deep-reflection check denies the access, and Ignite throws
+    // `IllegalAccessException: module java.base does not "opens java.nio"`
+    // even though setAccessible already paid the check. (`read_method_accessible`
+    // above uses the same pattern.)
+    if let Value::Int(v) = ctx.get_field_by_name(ctor_obj, "override") {
+        if v != 0 {
+            return true;
+        }
     }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);

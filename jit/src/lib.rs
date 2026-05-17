@@ -1611,12 +1611,19 @@ impl JitCache {
         method_name: &Arc<str>,
         descriptor: &Arc<str>,
     ) -> Option<Arc<CompiledMethod>> {
-        let key = JitKey {
-            class_name: class_name.clone(),
-            method_name: method_name.clone(),
-            descriptor: descriptor.clone(),
-        };
-        self.methods.get(&key).cloned()
+        let key = compute_jit_key_hash(class_name, method_name, descriptor);
+        self.methods.get(&key).and_then(|(jk, cm)| {
+            // Verify full key match (defend against rare hash collisions).
+            if Arc::ptr_eq(&jk.class_name, class_name)
+                || (jk.class_name.as_ref() == class_name.as_ref()
+                    && jk.method_name.as_ref() == method_name.as_ref()
+                    && jk.descriptor.as_ref() == descriptor.as_ref())
+            {
+                Some(cm.clone())
+            } else {
+                None
+            }
+        })
     }
 
     pub fn put(
@@ -1626,12 +1633,13 @@ impl JitCache {
         descriptor: Arc<str>,
         compiled: CompiledMethod,
     ) {
-        let key = JitKey {
+        let key = compute_jit_key_hash(&class_name, &method_name, &descriptor);
+        let jk = JitKey {
             class_name,
             method_name,
             descriptor,
         };
-        self.methods.insert(key, Arc::new(compiled));
+        self.methods.insert(key, (jk, Arc::new(compiled)));
     }
 
     pub fn len(&self) -> usize {
@@ -1649,11 +1657,7 @@ impl JitCache {
         method_name: &str,
         descriptor: &str,
     ) {
-        let key = JitKey {
-            class_name: Arc::from(class_name),
-            method_name: Arc::from(method_name),
-            descriptor: Arc::from(descriptor),
-        };
+        let key = compute_jit_key_hash(class_name, method_name, descriptor);
         self.methods.remove(&key);
     }
 
@@ -1668,7 +1672,7 @@ impl JitCache {
     /// Returns the number of evicted entries.
     pub fn invalidate_for_class_change(&mut self, changed_class: &str) -> usize {
         let before = self.methods.len();
-        self.methods.retain(|_key, cm| {
+        self.methods.retain(|_key, (_jk, cm)| {
             // Keep the entry iff it does NOT inline from the changed class.
             !cm.inlined_methods
                 .iter()
@@ -1680,16 +1684,16 @@ impl JitCache {
     /// Invalidate all compiled methods that inlined code from `class_name`.
     /// Returns the number of methods evicted.
     pub fn invalidate_for_class(&mut self, class_name: &str) -> usize {
-        let keys_to_remove: Vec<JitKey> = self
+        let keys_to_remove: Vec<u64> = self
             .methods
             .iter()
-            .filter(|(_, compiled)| {
+            .filter(|(_, (_jk, compiled))| {
                 compiled
                     .inlined_methods
                     .iter()
                     .any(|(cn, _, _)| cn == class_name)
             })
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
             .collect();
         let count = keys_to_remove.len();
         for key in keys_to_remove {
