@@ -310,6 +310,59 @@ fn fire_jit_invalidate_hook(class_id: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Round 4 audit fix (CRIT) — ResolutionCache invalidation hook
+// ---------------------------------------------------------------------------
+//
+// Mirror of the JIT-invalidate hook above, fired at the same point in
+// `redefine_class`. The VM-owned `SharedVm::resolution_cache` caches
+// resolved field/method/call-site lookups keyed by (referring-class,
+// cp-index). After a JVMTI redefine swaps the bytecode + constant pool
+// of `class_id`, those cached entries are stale — the same cp-index in
+// the new pool may refer to a different field/method, and entries that
+// resolved INTO the redefined class hold pointers (declaring_class_id,
+// field_index) that are no longer valid against the new layout.
+//
+// Previously only `InvokeCache` had a per-class invalidation path
+// (via `RedefineGate`); `ResolutionCache` had no gate and no hook, so
+// every `getfield`/`getstatic`/`invokestatic`/`invokevirtual` slow path
+// returned the cached old resolution after a redefine.
+
+/// Signature of the resolution-cache invalidation hook fired by
+/// `redefine_class`.
+///
+/// Parameter: the `ClassId` (as `u32`) whose cached resolutions must be
+/// evicted. The VM-side adapter takes the `resolution_cache` write
+/// lock and calls `invalidate_class` (see
+/// `crate::resolution::ResolutionCache::invalidate_class`), which
+/// drops every entry whose key refers to this class AND every entry
+/// whose resolved declaring class IS this class.
+pub type ResolutionInvalidateHook = fn(u32);
+
+static RESOLUTION_INVALIDATE_HOOK: OnceLock<ResolutionInvalidateHook> = OnceLock::new();
+static RESOLUTION_INVALIDATE_HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Install the resolution-cache invalidate hook. Called once by the VM
+/// during `SharedVm::new`. Idempotent.
+pub fn install_resolution_invalidate_hook(hook: ResolutionInvalidateHook) {
+    if RESOLUTION_INVALIDATE_HOOK.set(hook).is_ok() {
+        RESOLUTION_INVALIDATE_HOOK_ACTIVE.store(true, Ordering::Release);
+    }
+}
+
+/// Invoke the resolution-cache invalidate hook for `class_id`. Hot path
+/// is a single relaxed atomic load + branch when no hook is attached
+/// (e.g. during classloading-only unit tests).
+#[inline]
+fn fire_resolution_invalidate_hook(class_id: u32) {
+    if !RESOLUTION_INVALIDATE_HOOK_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(hook) = RESOLUTION_INVALIDATE_HOOK.get() {
+        hook(class_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T10.5 — vtable install hook registry
 // ---------------------------------------------------------------------------
 //
@@ -607,11 +660,17 @@ pub struct ClassManager {
     /// construct a one-off `Arc::from(s)` — no worse than the prior
     /// `name.to_string()`. Eliminates ~60+ String allocations per class
     /// define on the hot load_class / define_class path.
+    ///
+    /// **Round 4 audit fix (CRIT):** this is now the single authoritative
+    /// name→id index. The former `name_to_id: FxHashMap<u64, ClassId>`
+    /// shadow map was keyed by the raw FNV-1a digest of the class name,
+    /// with no name verification and no `ClassLoaderId` component — so any
+    /// FNV-1a collision returned the wrong `ClassId` (silent type
+    /// confusion downstream) and two loaders that defined the same name
+    /// could not coexist through that map. `get_loaded_class_id` now
+    /// walks this `(ClassLoaderId, Arc<str>)`-keyed map directly, which
+    /// is collision-free (full name comparison) and loader-aware.
     loaded_classes: FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
-
-    /// Fast name→ClassId lookup (hash-keyed, zero-allocation on lookup).
-    /// Populated alongside loaded_classes.
-    name_to_id: FxHashMap<u64, ClassId>,
 
     /// JPMS module registry: descriptors, package map, readability graph.
     pub module_registry: ModuleRegistry,
@@ -705,17 +764,6 @@ pub struct ClassManager {
     redefine_generations: RwLock<FxHashMap<ClassId, Arc<AtomicU32>>>,
 }
 
-/// FNV-1a hash of a class name.
-#[inline]
-fn class_name_hash(name: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in name.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 impl ClassManager {
     /// Create a new class manager with the three built-in class loaders.
     ///
@@ -759,7 +807,6 @@ impl ClassManager {
             extension,
             application,
             loaded_classes: FxHashMap::with_capacity_and_hasher(256, Default::default()),
-            name_to_id: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             module_registry,
             class_bytes_cache: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             cds_class_cache: FxHashMap::with_capacity_and_hasher(64, Default::default()),
@@ -828,10 +875,43 @@ impl ClassManager {
         registry.register(desc, packages);
     }
 
-    /// Fast zero-allocation class lookup by name hash.
-    #[inline]
+    /// Loader-aware class lookup by internal name.
+    ///
+    /// **Round 4 audit fix (CRIT):** previously this consulted a separate
+    /// `name_to_id: FxHashMap<u64, ClassId>` keyed only by the raw FNV-1a
+    /// digest of `name`. Two distinct class names that collide under
+    /// FNV-1a (rare but realistic on adversarial input) returned the
+    /// wrong `ClassId`, and the shadow map had no `ClassLoaderId`
+    /// component so different loaders defining the same name silently
+    /// stomped each other. The fix routes lookups through the
+    /// authoritative `loaded_classes` map (keyed by
+    /// `(ClassLoaderId, Arc<str>)`), which performs full name equality
+    /// and is loader-aware. The three built-in loaders are probed in
+    /// delegation order (Bootstrap → Extension → Application); custom
+    /// loaders are then linearly scanned (rare path — only relevant once
+    /// `URLClassLoader`-style user loaders are wired up).
     pub fn get_loaded_class_id(&self, name: &str) -> Option<ClassId> {
-        self.name_to_id.get(&class_name_hash(name)).copied()
+        // Probe the three built-in loaders first with a single Arc
+        // allocation (refcount-shared across all three lookups).
+        let probe: Arc<str> = Arc::from(name);
+        for loader_id in &[
+            ClassLoaderId::Bootstrap,
+            ClassLoaderId::Extension,
+            ClassLoaderId::Application,
+        ] {
+            if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
+                return Some(id);
+            }
+        }
+        // Custom-loader fallback: linear scan. Cheap in practice
+        // (built-in loaders cover the entire JDK + classpath) and the
+        // outer caller cache typically short-circuits the second hit.
+        for ((_, class_name), &id) in self.loaded_classes.iter() {
+            if &**class_name == name {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Register a minimal synthetic class with the given name and field count.
@@ -1352,7 +1432,7 @@ impl ClassManager {
         if name.starts_with('[') {
             return self.synthesize_array_class(name);
         }
-        // Fast path: zero-allocation hash lookup via name_to_id
+        // Fast path: loader-aware lookup via loaded_classes
         if let Some(id) = self.get_loaded_class_id(name) {
             // If the class is a synthetic stub (no methods, no bytecode), try
             // to upgrade it to a real class from the classpath. This handles
@@ -2121,8 +2201,13 @@ impl ClassManager {
         // rejected duplicate-defines unless `allow_redefine` is set; if
         // the existing class is here, it's because we are doing an
         // in-place redefinition (WP2.4). In that case we drop the old
-        // class_id from both maps before inserting the new one.
-        let name_hash = class_name_hash(&class.name);
+        // class_id before inserting the new one.
+        //
+        // Round 4 audit fix: the redundant `name_to_id` shadow map (keyed
+        // by raw FNV-1a digest, loader-unaware, collision-unsafe) has
+        // been removed — `loaded_classes` is now the single authoritative
+        // index.
+        //
         // T10.9.E: `class.name` is already `Arc<str>` — clone the arc
         // (refcount bump, no allocation) instead of `.to_string()`-ing it
         // into a fresh `String`. This is THE hot insert site — every class
@@ -2130,7 +2215,6 @@ impl ClassManager {
         let key = (loader_id, Arc::clone(&class.name));
         if options.allow_redefine {
             if let Some(old_id) = self.loaded_classes.remove(&key) {
-                self.name_to_id.remove(&class_name_hash(&class.name));
                 debug!(
                     class = %class.name,
                     old_id = %old_id,
@@ -2140,7 +2224,6 @@ impl ClassManager {
             }
         }
         self.loaded_classes.insert(key, id);
-        self.name_to_id.insert(name_hash, id);
         self.class_bytes_cache.insert(name.to_string(), bytes.to_vec());
         // WP2.3: persist the per-class skip-verification flag in the side
         // table. The verifier consults `class_skip_bytecode_verification`
@@ -2921,13 +3004,73 @@ impl ClassManager {
         // inner_classes, enclosing_method, version, state, and
         // initializing_thread are all PRESERVED — JEP 109 forbids
         // changing any of them.
-        {
+        //
+        // Round 4 audit fix (CRIT): the swap is now performed as
+        // snapshot-mutate-verify-rollback. Previously the redefine path
+        // wrote `new_methods`/`new_constant_pool` straight onto the
+        // live `Class` with **no call to `verifier::verify_class` or
+        // `bytecode_verifier::verify_bytecode`** — so any malformed
+        // bytecode delivered via JVMTI `RedefineClasses` /
+        // `Instrumentation.redefineClasses` bypassed the verifier
+        // entirely and crashed the interpreter mid-method. We now:
+        //   1. snapshot the prior `methods` / `constant_pool` /
+        //      `bootstrap_methods` / `annotations` / `source_file`,
+        //   2. install the new ones in place,
+        //   3. invoke `verifier::verify_class` (same Pass-2 + Pass-3
+        //      entry point as `define_class_with_options`), and
+        //   4. on failure, restore the snapshot and return the
+        //      existing `UnsupportedClassRedefinitionError` variant.
+        //
+        // The structural-equivalence check above already guarantees
+        // identical fields/methods/super/interfaces, so the verifier
+        // never sees a mismatch between the live `Class`'s shape and
+        // the bytecode it is verifying — only the bodies + CP have
+        // changed, which is exactly what we want to verify.
+        //
+        // Skip cases mirror `define_class_with_options`:
+        //   - synthetic stubs have no bytecode to verify (and the
+        //     redefine path shouldn't hit them in practice, but be safe);
+        //   - hidden classes flagged `skip_bytecode_verification` at
+        //     define time keep the bypass on redefine (JVMTI agents
+        //     transforming a hidden class shouldn't suddenly trip the
+        //     verifier the original define skipped).
+        let verify_skip = self
+            .class_store
+            .get(class_id)
+            .map(|c| c.is_synthetic_stub)
+            .unwrap_or(false)
+            || self.skip_bytecode_verification.contains(&class_id);
+
+        // Snapshot + swap. The snapshot is only retained for rollback
+        // when we're going to run the verifier; otherwise we drop the
+        // old vecs immediately.
+        let rollback_snapshot = {
             let cls = self.class_store.get_mut(class_id).ok_or_else(|| {
                 LinkageError::UnsupportedClassRedefinitionError {
                     class_name: existing_name.clone(),
                     message: "class id vanished during redefine (race)".to_string(),
                 }
             })?;
+            // Using `std::mem::take` for the vecs (cheap; leaves an
+            // empty Vec behind that we immediately overwrite) and
+            // `clone` for source_file (Option<String>, allocation-light).
+            let snapshot = if verify_skip {
+                None
+            } else {
+                Some((
+                    std::mem::take(&mut cls.methods),
+                    std::mem::replace(
+                        &mut cls.constant_pool,
+                        ConstantPool::new(vec![ConstantPoolEntry::Tombstone]),
+                    ),
+                    std::mem::take(&mut cls.bootstrap_methods),
+                    std::mem::take(&mut cls.annotations),
+                    cls.source_file.clone(),
+                ))
+            };
+            // Install the new bodies / CP / metadata. The Class's shape
+            // (super, interfaces, fields, declared methods sigs) is
+            // unchanged thanks to the structural-equivalence check above.
             cls.methods = new_methods;
             cls.constant_pool = new_constant_pool;
             cls.bootstrap_methods = new_bootstrap_methods;
@@ -2935,7 +3078,76 @@ impl ClassManager {
             if new_source_file.is_some() {
                 cls.source_file = new_source_file;
             }
+            snapshot
+        };
+
+        // ---- Step 5b: verify the freshly-installed bytecode ----
+        // Run the same Pass-2 (structural) + Pass-3 (bytecode type
+        // checking) verifier that `define_class_with_options` runs at
+        // class-define time. The verifier consults the live class store
+        // through `ClassStoreHierarchy` so super/interface lookups walk
+        // the already-loaded class graph (which is unchanged by this
+        // redefine).
+        if let Some((old_methods, old_constant_pool, old_bootstrap_methods,
+                     old_annotations, old_source_file)) = rollback_snapshot
+        {
+            // Run the verifier in an inner scope so the immutable
+            // borrows it takes on `self.class_store` and
+            // `self.loaded_classes` drop before we reach the rollback
+            // path that needs `self.class_store.get_mut(...)`.
+            let verify_result: Result<(), LinkageError> = {
+                let hierarchy = ClassStoreHierarchy {
+                    class_store: &self.class_store,
+                    loaded_classes: &self.loaded_classes,
+                };
+                // SAFETY-shape: the class we just mutated is at
+                // `class_id` in `self.class_store`. `get` returns `Some`
+                // here because the mutate block above succeeded and the
+                // store is not concurrently modified (we hold
+                // `&mut self`).
+                match self.class_store.get(class_id) {
+                    Some(cls) => crate::verifier::verify_class(
+                        cls,
+                        &self.class_store,
+                        &hierarchy,
+                    ),
+                    None => Err(LinkageError::VerifyError {
+                        class_name: existing_name.clone(),
+                        method_name: String::new(),
+                        message: "class id vanished during redefine verification".to_string(),
+                    }),
+                }
+            };
+            if let Err(verify_err) = verify_result {
+                // Roll back: restore the snapshot so the live Class
+                // returns to its pre-redefine state. The vtable
+                // re-install, generation bump, JIT invalidation, and
+                // resolution-cache invalidation all happen below this
+                // point, so no observable side effect needs to be
+                // unwound here.
+                if let Some(cls) = self.class_store.get_mut(class_id) {
+                    cls.methods = old_methods;
+                    cls.constant_pool = old_constant_pool;
+                    cls.bootstrap_methods = old_bootstrap_methods;
+                    cls.annotations = old_annotations;
+                    cls.source_file = old_source_file;
+                }
+                debug!(
+                    class = %existing_name,
+                    error = ?verify_err,
+                    "WP2.4-B redefine: bytecode verification failed; rolled back",
+                );
+                return Err(LinkageError::UnsupportedClassRedefinitionError {
+                    class_name: existing_name.clone(),
+                    message: format!(
+                        "new bytes failed bytecode verification: {verify_err}",
+                    ),
+                });
+            }
         }
+        // Verification succeeded (or was legitimately skipped). The
+        // snapshot vecs (if any) are dropped here; the new ones remain
+        // installed.
         // Forget the borrow — the rest of this function is hooks +
         // bookkeeping that may re-enter the manager.
         let _ = existing_loader; // silence unused warning if no read below
@@ -2980,6 +3192,20 @@ impl ClassManager {
 
         // ---- Step 8: invalidate JIT caches keyed on class_id ----
         fire_jit_invalidate_hook(class_id_u32);
+
+        // ---- Step 9: invalidate the shared ResolutionCache ----
+        // Round 4 audit fix (CRIT): the per-VM `ResolutionCache` caches
+        // resolved fields/methods/call-sites/condy values keyed by
+        // (referring-class, cp-index). The InvokeCache already auto-
+        // evicts via the RedefineGate generation bumped in step 7, but
+        // ResolutionCache has no gate — so without this hook every
+        // cached cp-index from the redefined class continues returning
+        // the resolution made against the OLD constant pool. The
+        // VM-side adapter (installed at SharedVm::new) takes the
+        // resolution_cache write lock and drops every entry whose key
+        // refers to this class OR whose resolved declaring class IS
+        // this class. See `ResolutionCache::invalidate_class`.
+        fire_resolution_invalidate_hook(class_id_u32);
 
         debug!(
             class = %existing_name,
@@ -3106,10 +3332,12 @@ impl ClassManager {
         // hot insert) share the same `Arc<str>` allocation — keeping the
         // key dedup story identical regardless of whether the class is
         // registered via this side-door or via `define_class_with_options`.
+        //
+        // Round 4 audit fix: previously also wrote into the redundant
+        // collision-unsafe `name_to_id` shadow map; that map is gone now
+        // and `loaded_classes` is the only index.
         let name_arc = rustjvm_types::intern_arc(name);
-        self.loaded_classes
-            .insert((loader_id, name_arc), id);
-        self.name_to_id.insert(class_name_hash(name), id);
+        self.loaded_classes.insert((loader_id, name_arc), id);
     }
 
     /// Create a synthetic stub class for a JDK class that has no .class file.
@@ -3255,12 +3483,14 @@ impl ClassManager {
             "Synthetic stub class created",
         );
 
-        let name_hash = class_name_hash(&class.name);
+        // Round 4 audit fix: `name_to_id` shadow map removed
+        // (loader-unaware + FNV-1a collision-unsafe). `loaded_classes`
+        // is now the single name→id index.
+        //
         // T10.9.E: clone the existing `Arc<str>` (refcount bump) instead
         // of allocating a fresh `String` for the map key.
         let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
         self.loaded_classes.insert(key, id);
-        self.name_to_id.insert(name_hash, id);
         self.class_store.add(class);
 
         // Deferred interface resolution: now that this class is registered,
@@ -3298,9 +3528,9 @@ impl ClassManager {
     ///   so that `[[Ljava/util/HashMap;` triggers loading of
     ///   `[Ljava/util/HashMap;` and `java/util/HashMap`.
     ///
-    /// The result is cached in the standard `loaded_classes` / `name_to_id`
-    /// maps under the bootstrap loader, so two calls with the same name
-    /// return the same `ClassId`.
+    /// The result is cached in the standard `loaded_classes` map under the
+    /// bootstrap loader, so two calls with the same name return the same
+    /// `ClassId`.
     fn synthesize_array_class(&mut self, name: &str) -> Result<ClassId, VmError> {
         debug_assert!(name.starts_with('['), "synthesize_array_class called with non-array name {name}");
 
@@ -3457,12 +3687,14 @@ impl ClassManager {
             "Synthesised array class (RKC16N.3)",
         );
 
-        let name_hash = class_name_hash(&class.name);
+        // Round 4 audit fix: `name_to_id` shadow map removed (loader-
+        // unaware + FNV-1a collision-unsafe). `loaded_classes` is now
+        // the single name→id index.
+        //
         // T10.9.E: clone the existing `Arc<str>` (refcount bump) instead
         // of allocating a fresh `String` for the map key.
         let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
         self.loaded_classes.insert(key, id);
-        self.name_to_id.insert(name_hash, id);
         self.class_store.add(class);
 
         Ok(id)

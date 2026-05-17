@@ -1269,12 +1269,12 @@ pub fn execute(
             method_descriptor,
         );
     }
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && method_name == "intValue" {
+    if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
         eprintln!("[interpreter::execute] class_id={:?} method={} desc={} args.len={}",
                   class_id, method_name, method_descriptor, args.len());
     }
     // RUSTJVM_IAE_TRACE: log args when executing AnnotationScopeMetadataResolver.<init>
-    if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+    if crate::runtime::env_cache::iae_trace_os() {
         let class_name_for_trace = shared.class_manager.read()
             .get_class(class_id)
             .map(|c| c.name.to_string())
@@ -1566,7 +1566,7 @@ pub fn execute(
                             }
                             _ => Some(Value::Object(None)),
                         };
-                        if std::env::var_os("RUSTJVM_DBG_NOCODE").is_some() {
+                        if crate::runtime::env_cache::nocode_dbg() {
                             eprintln!(
                                 "[DBG_NOCODE_SYNTH] cp={class_name_owned}.{method_name}{method_descriptor} -> synth={synth:?}"
                             );
@@ -1579,7 +1579,7 @@ pub fn execute(
             let msg = format!(
                 "method {class_name_owned}.{method_name}{method_descriptor} has no Code attribute"
             );
-            if std::env::var_os("RUSTJVM_DBG_NOCODE").is_some() {
+            if crate::runtime::env_cache::nocode_dbg() {
                 eprintln!("[DBG_NOCODE] {msg}");
             }
             match super::exceptions::create_exception_object(
@@ -1672,7 +1672,7 @@ pub fn execute(
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing RUSTJVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
-        let env_disable_jit = std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        let env_disable_jit = crate::runtime::env_cache::disable_jit();
         if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip || native_skip {
             // Method has known JIT issues — skip JIT.
         } else {
@@ -2049,7 +2049,7 @@ pub fn execute(
             });
 
             if let Some(compiled) = compiled {
-                if std::env::var_os("RUSTJVM_DBG_JIT_ENTRY").is_some() {
+                if crate::runtime::env_cache::jit_entry_dbg() {
                     eprintln!("[JIT_ENTRY] {}.{}{}", class_name_arc, method_name_arc, descriptor_arc);
                 }
                 // Ensure all classes referenced by static field ops are initialized.
@@ -2236,7 +2236,7 @@ pub fn execute(
     );
 
     // Push frame onto thread
-    if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+    if crate::runtime::env_cache::frame_trace() {
         eprintln!("[FRAME_PUSH/invoke_method_shared] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
     }
     push_frame_and_fire_entry(thread, frame);
@@ -2319,12 +2319,20 @@ pub fn execute(
 /// only executes during active warmup; allowing inlining lets LLVM CSE
 /// the two `Arc<str>` clones across adjacent record_branch/record_backedge
 /// pairs (e.g. `if_icmp*` + back-edge `record_backedge`).
+///
+/// LOW — takes the frame by ref and uses the ref-returning
+/// `method_name_arc_ref` / `method_descriptor_arc_ref` accessors to
+/// hold off on the `Arc::clone` refcount bumps until the `MethodKey`
+/// is actually being constructed (the call site can elide the call
+/// entirely when profiling is disabled). Previously each call did 2
+/// `Arc::clone` atomic ops up-front in the accessor, plus 2 more
+/// implicit clones into the MethodKey fields.
 #[inline]
 fn make_method_key(frame: &crate::runtime::frame::Frame) -> MethodKey {
     MethodKey {
         class_id: frame.class_id.as_u32(),
-        method_name: frame.method_name_arc(),
-        descriptor: frame.method_descriptor_arc(),
+        method_name: Arc::clone(frame.method_name_arc_ref()),
+        descriptor: Arc::clone(frame.method_descriptor_arc_ref()),
     }
 }
 
@@ -2376,7 +2384,7 @@ pub fn pop_and_recycle_frame_with_reason(
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
     fire_jvmti_frame_pop_if_requested(thread, was_popped_by_exception);
     if let Some(f) = thread.frames.pop() {
-        if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+        if crate::runtime::env_cache::frame_trace() {
             eprintln!("[FRAME_POP] depth={} {}.{}{}", thread.frames.len(), f.class_name(), f.method_name(), f.method_descriptor());
         }
         if let Some(obj) = f.monitor_on_exit {
@@ -2622,7 +2630,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                         let bc = frame.backward_count;
                                         let entry_pc = frame.pc;
                                         let _ = frame;
-                                        if bc == OSR_THRESHOLD {
+                                        if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) {
+                                            thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc);
                                             let osr_class_id = thread.frames[frame_idx].class_id;
                                             if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
                                                 if frame_idx > initial_frame_idx {
@@ -2951,7 +2960,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         let bc = frame.backward_count;
                         let entry_pc = frame.pc;
                         let _ = frame; // drop borrow before try_osr
-                        if bc == OSR_THRESHOLD {
+                        if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) {
+                            thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc);
                             // Try OSR: compile and enter JIT at loop header
                             let osr_class_id = thread.frames[frame_idx].class_id;
                             if let Some(osr_val) =
@@ -2988,7 +2998,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             let bc = frame.backward_count;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            if bc == OSR_THRESHOLD {
+                            if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) {
+                                thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc);
                                 let osr_class_id = thread.frames[frame_idx].class_id;
                                 if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
                                     if frame_idx > initial_frame_idx {
@@ -3022,7 +3033,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             let bc = frame.backward_count;
                             let entry_pc = frame.pc;
                             let _ = frame;
-                            if bc == OSR_THRESHOLD {
+                            if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) {
+                                thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc);
                                 let osr_class_id = thread.frames[frame_idx].class_id;
                                 if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) {
                                     if frame_idx > initial_frame_idx {
@@ -3050,7 +3062,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3065,7 +3077,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3080,7 +3092,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3095,7 +3107,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3114,7 +3126,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     } else {
                         value
                     };
-                    if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
+                    if crate::runtime::env_cache::trace_sb_filter() {
                         let cn = frame.class_name();
                         let mn = frame.method_name();
                         let interesting = (cn.contains("FilteringSpringBootCondition") && mn == "match")
@@ -3193,7 +3205,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3207,7 +3219,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3221,7 +3233,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3235,7 +3247,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3249,7 +3261,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -3263,7 +3275,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if taken {
                         let offset = ((b1 as i16) << 8) | (b2 as i16); // Cast: bytecode operand decoding
                         frame.pc = (saved_pc as isize + offset as isize) as usize; // Cast: signed branch offset arithmetic
-                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc == OSR_THRESHOLD { let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
+                        if offset < 0 { if pgo_enabled { shared.profile_store.record_backedge(&make_method_key(frame), saved_pc); } frame.backward_count += 1; let bc = frame.backward_count; let entry_pc = frame.pc; let _ = frame; if bc >= OSR_THRESHOLD && !thread.frames[frame_idx].osr_attempted_entry_pcs.contains(&entry_pc) { thread.frames[frame_idx].osr_attempted_entry_pcs.push(entry_pc); let osr_class_id = thread.frames[frame_idx].class_id; if let Some(osr_val) = try_osr(shared, thread, frame_idx, osr_class_id, entry_pc) { if frame_idx > initial_frame_idx { pop_and_recycle_frame(shared, thread); frame_idx -= 1; if let Some(value) = osr_val { thread.frames[frame_idx].stack.push_unchecked(value); } continue; } return Ok(osr_val); } } safepoint_check(shared, thread); }
                     } else {
                         frame.pc = saved_pc + 3;
                     }
@@ -4603,7 +4615,7 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
         let tid = thread.thread_id.0;
         crate::runtime::jvmti::fire_method_entry(tid, method_id);
     }
-    if std::env::var("RUSTJVM_TRACE_SB_FILTER").is_ok() {
+    if crate::runtime::env_cache::trace_sb_filter() {
         let last = thread.frames.len() - 1;
         let frame_ref = &thread.frames[last];
         let cn = frame_ref.class_name();
@@ -4656,47 +4668,63 @@ fn find_exception_handler(
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
 
+    // HIGH — take the class_manager read lock ONCE for the whole search.
+    // The previous implementation acquired up to three read locks per
+    // catch entry and cloned each catch-type class name into an owned
+    // String. Both are hot on the exception fast-path. We resolve the
+    // catch-type name as `&str` from the constant pool and compare via
+    // `find_class_by_name(&str)` without allocating.
+    //
+    // We drop the lock only if a lazy class-load is required (since
+    // `load_class_concurrent` takes the write lock internally), then
+    // reacquire it.
+    let mut cm_guard = shared.class_manager.read();
+    // Verify the owning class exists once — hoist this invariant out
+    // of the per-entry loop. We re-fetch the (shared-borrowed) class
+    // inside the loop to get the constant pool; that's a cheap
+    // `HashMap` get against the held read guard.
+    cm_guard.get_class(frame.class_id)?;
+
     for entry in frame.exception_table().iter() {
         // Widening: index conversion
-        if pc >= entry.start_pc as usize && pc < entry.end_pc as usize {
-            // catch_type == 0 means catch-all (finally block) — always matches
-            if entry.catch_type == 0 {
-                return Some((entry.handler_pc as usize, exc)); // Widening: index conversion
-            }
+        if pc < entry.start_pc as usize || pc >= entry.end_pc as usize {
+            continue;
+        }
+        // catch_type == 0 means catch-all (finally block) — always matches
+        if entry.catch_type == 0 {
+            return Some((entry.handler_pc as usize, exc));
+        }
 
-            // Resolve the catch type class name from the constant pool
-            let catch_class_name = {
-                let cm = shared.class_manager.read();
-                let class = cm.get_class(frame.class_id)?;
-                class
-                    .constant_pool
-                    .get_class_name(entry.catch_type)
-                    .map(|s| s.to_string())
-            };
-            let Some(catch_class_name) = catch_class_name else {
-                continue;
-            };
+        // Resolve catch-type class name as a borrowed `&str` from
+        // the constant pool — no allocation.
+        let owning_class = cm_guard.get_class(frame.class_id)?;
+        let Some(catch_class_name) = owning_class.constant_pool.get_class_name(entry.catch_type)
+        else {
+            continue;
+        };
 
-            // Try to find the catch type class. If not loaded yet, attempt lazy load.
-            let catch_class_id = {
-                let cm = shared.class_manager.read();
-                cm.find_class_by_name(&catch_class_name)
-            };
-            let catch_class_id = match catch_class_id {
-                Some(id) => id,
-                None => {
-                    // Lazy load: the catch type might not be resolved yet
-                    match shared.load_class_concurrent(&catch_class_name) {
-                        Ok(id) => id,
-                        Err(_) => continue, // Can't load catch type — skip handler
-                    }
+        // Try to find the catch type class on the held lock — `&str`,
+        // no allocation.
+        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
+            Some(id) => id,
+            None => {
+                // Lazy load: must drop the read lock since
+                // `load_class_concurrent` acquires the write lock.
+                // Copy the name into an owned String only on this
+                // (rare) slow path.
+                let owned = catch_class_name.to_string();
+                drop(cm_guard);
+                let loaded = shared.load_class_concurrent(&owned);
+                cm_guard = shared.class_manager.read();
+                match loaded {
+                    Ok(id) => id,
+                    Err(_) => continue, // Can't load catch type — skip handler
                 }
-            };
-
-            let cm = shared.class_manager.read();
-            if cm.is_subclass_of(exc_class_id, catch_class_id) {
-                return Some((entry.handler_pc as usize, exc)); // Widening: index conversion
             }
+        };
+
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+            return Some((entry.handler_pc as usize, exc));
         }
     }
 
@@ -4725,6 +4753,12 @@ fn find_exception_handler_any_pc(
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
 
+    // HIGH — same treatment as `find_exception_handler`: hold the
+    // class_manager read lock across the loop body and resolve
+    // catch-type class names as borrowed `&str` (no per-entry alloc).
+    let mut cm_guard = shared.class_manager.read();
+    cm_guard.get_class(frame.class_id)?;
+
     for entry in frame.exception_table().iter() {
         // Widening: index conversion
         if pc < entry.start_pc as usize || pc >= entry.end_pc as usize {
@@ -4736,32 +4770,27 @@ fn find_exception_handler_any_pc(
             return Some((entry.handler_pc as usize, exc));
         }
 
-        let catch_class_name = {
-            let cm = shared.class_manager.read();
-            let class = cm.get_class(frame.class_id)?;
-            class
-                .constant_pool
-                .get_class_name(entry.catch_type)
-                .map(|s| s.to_string())
-        };
-        let Some(catch_class_name) = catch_class_name else {
+        let owning_class = cm_guard.get_class(frame.class_id)?;
+        let Some(catch_class_name) = owning_class.constant_pool.get_class_name(entry.catch_type)
+        else {
             continue;
         };
 
-        let catch_class_id = {
-            let cm = shared.class_manager.read();
-            cm.find_class_by_name(&catch_class_name)
-        };
-        let catch_class_id = match catch_class_id {
+        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
             Some(id) => id,
-            None => match shared.load_class_concurrent(&catch_class_name) {
-                Ok(id) => id,
-                Err(_) => continue,
-            },
+            None => {
+                let owned = catch_class_name.to_string();
+                drop(cm_guard);
+                let loaded = shared.load_class_concurrent(&owned);
+                cm_guard = shared.class_manager.read();
+                match loaded {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                }
+            }
         };
 
-        let cm = shared.class_manager.read();
-        if cm.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
             return Some((entry.handler_pc as usize, exc));
         }
     }
@@ -4807,6 +4836,10 @@ fn route_jit_exception_through_method(
     let pc_unknown = throw_pc == usize::MAX;
     let exc_class_id = shared.heap.class_id_of(exc);
     let mut handler_pc: Option<usize> = None;
+    // HIGH — same fast-path treatment as `find_exception_handler`:
+    // hold the class_manager read lock for the duration of the search
+    // and avoid `to_string()` on catch-type names.
+    let mut cm_guard = shared.class_manager.read();
     for entry in cached.exception_table.iter() {
         // Mirror the PC-range check used by `find_exception_handler_any_pc`:
         // a handler only applies when the throw site is inside its
@@ -4833,37 +4866,32 @@ fn route_jit_exception_through_method(
             handler_pc = Some(entry.handler_pc as usize);
             break;
         }
-        let catch_class_name = {
-            let cm = shared.class_manager.read();
-            let class = match cm.get_class(cached.declaring_class_id) {
-                Some(c) => c,
-                None => continue,
-            };
-            class
-                .constant_pool
-                .get_class_name(entry.catch_type)
-                .map(|s| s.to_string())
+        let class = match cm_guard.get_class(cached.declaring_class_id) {
+            Some(c) => c,
+            None => continue,
         };
-        let Some(catch_class_name) = catch_class_name else {
+        let Some(catch_class_name) = class.constant_pool.get_class_name(entry.catch_type) else {
             continue;
         };
-        let catch_class_id = match shared
-            .class_manager
-            .read()
-            .find_class_by_name(&catch_class_name)
-        {
+        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
             Some(id) => id,
-            None => match shared.load_class_concurrent(&catch_class_name) {
-                Ok(id) => id,
-                Err(_) => continue,
-            },
+            None => {
+                let owned = catch_class_name.to_string();
+                drop(cm_guard);
+                let loaded = shared.load_class_concurrent(&owned);
+                cm_guard = shared.class_manager.read();
+                match loaded {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                }
+            }
         };
-        let cm = shared.class_manager.read();
-        if cm.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
             handler_pc = Some(entry.handler_pc as usize);
             break;
         }
     }
+    drop(cm_guard);
 
     let Some(handler_pc) = handler_pc else {
         // No matching handler — propagate to caller.
@@ -4908,7 +4936,7 @@ fn route_jit_exception_through_method(
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
-    if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+    if crate::runtime::env_cache::frame_trace() {
         eprintln!("[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
     }
     push_frame_and_fire_entry(thread, frame);
@@ -5007,7 +5035,7 @@ fn execute_instruction(
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let array_ref = pop_object_ref_ctx(
                 &mut thread.frames[frame_idx].stack,
-                Some("Cannot load from null array".to_string()),
+                Some("Cannot load from null array"),
             )?;
             let value = shared
                 .heap
@@ -5061,7 +5089,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             // SATB barrier: log old array element before overwriting
             // Widening: index conversion
             if let Ok(old_elem) = shared.heap.get_array_element(array_ref, index as usize) {
@@ -5085,7 +5113,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
@@ -5102,7 +5130,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Long(v))
@@ -5114,7 +5142,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -5875,15 +5903,15 @@ fn execute_instruction(
         Instruction::Getfield(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
             let field_name = resolve_field_name(shared, current_class_id, *index);
-            let obj_ref = pop_object_ref_ctx(
+            let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
-                Some(format!(
+                || format!(
                     "Cannot read field '{}' because the object is null",
                     field_name.as_deref().unwrap_or("?")
-                )),
+                ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
-            if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() {
+            if crate::runtime::env_cache::bd_debug() {
                 let mname = thread.frames[frame_idx].method_name().to_string();
                 let cname = thread.frames[frame_idx].class_name().to_string();
                 if cname.contains("BigDecimal") && mname == "intValue" {
@@ -6086,12 +6114,12 @@ fn execute_instruction(
                 }
             };
             let field_name = resolve_field_name(shared, current_class_id, *index);
-            let obj_ref = pop_object_ref_ctx(
+            let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
-                Some(format!(
+                || format!(
                     "Cannot write field '{}' because the object is null",
                     field_name.as_deref().unwrap_or("?")
-                )),
+                ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
@@ -6185,7 +6213,7 @@ fn execute_instruction(
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
             // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
             if class_name == "java/util/NoSuchElementException"
-                && std::env::var("RUSTJVM_NSEE_TRACE").is_ok()
+                && crate::runtime::env_cache::nsee_trace()
             {
                 eprintln!("[NSEE-TRACE] new java/util/NoSuchElementException at:");
                 let cm = shared.class_manager.read();
@@ -6280,13 +6308,13 @@ fn execute_instruction(
             let mname = thread.frames[frame_idx].method_name().to_string();
             let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
             // S111r14 diag: print full Java stack trace on arraylength failure
-            let arr_ref = match pop_object_ref_ctx(
+            let arr_ref = match pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
-                Some(format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})")),
+                || format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})"),
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+                    if crate::runtime::env_cache::iae_trace_os() {
                         eprintln!("[ARRAYLEN-DIAG] failure in {current_class_name}.{mname}{mdesc} pc={pc}");
                         for (i, f) in thread.frames.iter().enumerate().rev() {
                             eprintln!("  frame[{i}]: {}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc);
@@ -6364,7 +6392,7 @@ fn execute_instruction(
                     // S111r19+: trace IAE thrown from Java bytecode (ATHROW opcode)
                     // This catches IAEs that don't go through throw_runtime_error,
                     // e.g. Spring's Assert.notNull / validateBeanDefinition etc.
-                    if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+                    if crate::runtime::env_cache::iae_trace() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .class_manager
@@ -6400,7 +6428,7 @@ fn execute_instruction(
                     // caught by an outer handler that swallows it and the
                     // app exits silently (Kafka 4.2.0 main()'s catch-all
                     // around buildServer/startup is the canonical case).
-                    if std::env::var("RUSTJVM_DBG_ATHROW").is_ok() {
+                    if crate::runtime::env_cache::athrow_dbg() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .class_manager
@@ -6510,7 +6538,7 @@ fn execute_instruction(
                             .get_class(actual_class_id)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| "?".to_string());
-                        if std::env::var_os("RUSTJVM_DBG_CCE").is_some() {
+                        if crate::runtime::env_cache::cce_dbg() {
                             eprintln!(
                                 "[CCE_DBG] checkcast fail: obj_cid={} obj_class={} target={} caller={}.{}{}",
                                 actual_class_id,
@@ -6656,7 +6684,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let obj_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("monitorenter in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
+            let obj_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("monitorenter in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             let mon_start = std::time::Instant::now();
             shared.monitors.enter(obj_ref, thread.thread_id);
             let mon_dur = mon_start.elapsed();
@@ -6681,7 +6709,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let obj_ref = pop_object_ref_ctx(&mut thread.frames[frame_idx].stack, Some(format!("monitorexit in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)))?;
+            let obj_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("monitorexit in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared.monitors.exit(obj_ref, thread.thread_id)?;
         }
 
@@ -8317,7 +8345,7 @@ fn execute_invoke_kind(
                     // (m.getClassLoader() NPEs). Fix lives in
                     // `native-builtins/src/lib.rs` as a native override that
                     // treats null module as `isSystem=true`.
-                    if std::env::var("RUSTJVM_DBG_NPE_INVOKE").is_ok() {
+                    if crate::runtime::env_cache::npe_invoke_dbg() {
                         eprintln!("[NPE-DBG] invokevirtual null receiver: {}.{}", method_class_name, method_name);
                     }
                     // Round 63 — `org/springframework/core/convert/support/
@@ -8977,7 +9005,7 @@ pub(crate) fn try_lambda_dispatch(
             None => return Ok(None), // Not a lambda proxy
         }
     };
-    if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+    if crate::runtime::env_cache::lambda_dbg() {
         eprintln!(
             "[rustjvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
             obj_class_id,
@@ -9211,7 +9239,7 @@ pub(crate) fn try_lambda_dispatch(
                 false,
                 num_captures,
             )?;
-            if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+            if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
                     "[rustjvm-dbg] lambda static-pre-invoke: {}.{}{} args={}",
                     call_site.impl_handle.class_name,
@@ -9228,7 +9256,7 @@ pub(crate) fn try_lambda_dispatch(
                 &call_site.impl_handle.descriptor,
                 &full_args,
             )?;
-            if std::env::var_os("RUSTJVM_DBG_LAMBDA").is_some() {
+            if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
                     "[rustjvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
                     call_site.impl_handle.class_name,
@@ -9816,7 +9844,7 @@ fn try_stackless_invoke(
                 cid = parent_id;
             }
         });
-    if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() && (method_name == "intValue" || (class_name.contains("BigDecimal") && (method_name == "<init>" || method_name == "intValue"))) {
+    if crate::runtime::env_cache::bd_debug() && (method_name == "intValue" || (class_name.contains("BigDecimal") && (method_name == "<init>" || method_name == "intValue"))) {
         eprintln!("[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
                   class_name, method_name, descriptor, native_cb.is_some(), walk_native_hierarchy);
     }
@@ -9833,7 +9861,7 @@ fn try_stackless_invoke(
             )?;
             native_return_pushed_to_stack(shared, thread);
         }
-        if std::env::var_os("RUSTJVM_DBG_RESUME_PC").is_some() && method_name == "enhance" {
+        if crate::runtime::env_cache::resume_pc_dbg() && method_name == "enhance" {
             let f = &thread.frames[frame_idx];
             let pc = f.pc;
             let b = f.code.get(pc).copied().unwrap_or(0);
@@ -10039,7 +10067,7 @@ fn try_stackless_invoke(
     if is_tail_call && thread.frames[frame_idx].monitor_on_exit.is_none() && !invoke_covered_by_handler {
         // Replace the caller frame in-place with the callee
         let code = padded_bytecode(&code_attr.code);
-        if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+        if crate::runtime::env_cache::frame_trace() {
             let caller = &thread.frames[frame_idx];
             eprintln!("[FRAME_TCO] at frame_idx={} replacing {}.{}{} with {}.{}{}",
                 frame_idx, caller.class_name(), caller.method_name(), caller.method_descriptor(),
@@ -10097,7 +10125,7 @@ fn try_stackless_invoke(
         &mut thread.stacks_pool,
     );
     frame.monitor_on_exit = monitor_obj;
-    if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+    if crate::runtime::env_cache::frame_trace() {
         eprintln!("[FRAME_PUSH/stackless] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
     }
     push_frame_and_fire_entry(thread, frame);
@@ -10592,7 +10620,7 @@ fn execute_invokestatic_cached(
                 &mut thread.stacks_pool,
             );
             frame.monitor_on_exit = monitor_obj;
-            if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+            if crate::runtime::env_cache::frame_trace() {
                 eprintln!("[FRAME_PUSH/stackless_cached] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
             }
             push_frame_and_fire_entry(thread, frame);
@@ -10620,7 +10648,7 @@ fn try_osr(
     // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
     // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
     // RUSTJVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
-    if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+    if crate::runtime::env_cache::disable_jit() {
         return None;
     }
     let frame = &thread.frames[frame_idx];
@@ -11124,7 +11152,7 @@ fn try_jit_upgrade_with_gate(
     // RUSTJVM_DISABLE_JIT flag actually disables BOTH JIT entry points
     // (the caller-method counter path here, and the dispatcher path there).
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
-    if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+    if crate::runtime::env_cache::disable_jit() {
         return None;
     }
     // S111r15 — refuse to JIT a method that has a Rust native shadow.
@@ -11611,7 +11639,7 @@ pub fn try_jit_compile_callee(
 ) -> Option<(usize, bool)> {
     // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
-    if std::env::var("RUSTJVM_DISABLE_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+    if crate::runtime::env_cache::disable_jit() {
         return None;
     }
     // RFJP.1 — never JIT a method whose declaring class transitively extends
@@ -12825,7 +12853,7 @@ fn execute_invokevirtual_cached(
                         &mut thread.stacks_pool,
                     );
                     frame.monitor_on_exit = monitor_obj;
-                    if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+                    if crate::runtime::env_cache::frame_trace() {
                         eprintln!("[FRAME_PUSH/vcached] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
                     }
                     push_frame_and_fire_entry(thread, frame);
@@ -12951,7 +12979,7 @@ fn execute_invokevirtual_cached(
                 &mut thread.locals_pool,
                 &mut thread.stacks_pool,
             );
-            if std::env::var_os("RUSTJVM_FRAME_TRACE").is_some() {
+            if crate::runtime::env_cache::frame_trace() {
                 eprintln!("[FRAME_PUSH/vcached2] depth={} {}.{}{}", thread.frames.len(), frame.class_name(), frame.method_name(), frame.method_descriptor());
             }
             push_frame_and_fire_entry(thread, frame);
@@ -13423,15 +13451,97 @@ fn pop_object_ref(stack: &mut crate::runtime::ValueStack) -> Result<ObjectRef, M
     pop_object_ref_ctx(stack, None)
 }
 
+/// Variant of `pop_object_ref_ctx` that defers the NPE-context message
+/// construction until the NPE actually fires. Use this from call sites
+/// that need a `format!`-built message — previously they paid the
+/// per-pop formatting cost on every reference-touching opcode even
+/// when the pop succeeded.
+fn pop_object_ref_ctx_with<F>(
+    stack: &mut crate::runtime::ValueStack,
+    make_context: F,
+) -> Result<ObjectRef, MethodCallFailed>
+where
+    F: FnOnce() -> String,
+{
+    match stack.pop()? {
+        Value::Object(Some(obj_ref)) => Ok(obj_ref),
+        Value::Object(None) => Err(RuntimeError::NullPointerException {
+            message: Some(make_context()),
+        }
+        .into()),
+        Value::Uninitialized => Err(RuntimeError::NullPointerException {
+            message: Some(make_context()),
+        }
+        .into()),
+        Value::Int(0) | Value::Long(0) => Err(RuntimeError::NullPointerException {
+            message: Some(make_context()),
+        }
+        .into()),
+        Value::Double(d) => {
+            let bits = d.to_bits();
+            if bits == 0 {
+                Err(RuntimeError::NullPointerException {
+                    message: Some(make_context()),
+                }
+                .into())
+            } else if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                Ok(unsafe { ObjectRef::from_raw(bits as usize as *mut u8) })
+            } else {
+                Err(VmError::Internal {
+                    message: format!("expected object reference, got double({d})"),
+                }
+                .into())
+            }
+        }
+        Value::Long(l) => {
+            let bits = l as u64;
+            if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                Ok(unsafe { ObjectRef::from_raw(bits as usize as *mut u8) })
+            } else {
+                Err(VmError::Internal {
+                    message: format!("expected object reference, got long({l})"),
+                }
+                .into())
+            }
+        }
+        other => {
+            let ctx = make_context();
+            if crate::runtime::env_cache::iae_trace_os() {
+                eprintln!(
+                    "[pop_object_ref] ERROR: expected object reference, got {other} ctx={ctx:?}"
+                );
+                let bt = std::backtrace::Backtrace::capture();
+                eprintln!("[pop_object_ref] Rust backtrace:\n{bt}");
+            }
+            Err(VmError::Internal {
+                message: format!("expected object reference, got {other} ctx={ctx:?}"),
+            }
+            .into())
+        }
+    }
+}
+
+/// HIGH — accepts the NPE-context message as `Option<&str>` so the
+/// common case (literal context like `"Cannot load from null array"`)
+/// pays zero allocations: the borrowed slice is only copied into an
+/// owned `String` on the NPE-error path. Previously this took
+/// `Option<String>`, forcing callers to `.to_string()` every pop —
+/// which fires once per `aaload`/`aastore`/`getfield`/`monitorenter`,
+/// i.e. essentially every reference-touching opcode.
+///
+/// Callers with a dynamically-formatted message that needs string
+/// interpolation should use `pop_object_ref_ctx_with`, which defers
+/// the formatting until the NPE actually fires.
 fn pop_object_ref_ctx(
     stack: &mut crate::runtime::ValueStack,
-    context: Option<String>,
+    context: Option<&str>,
 ) -> Result<ObjectRef, MethodCallFailed> {
     match stack.pop()? {
         Value::Object(Some(obj_ref)) => Ok(obj_ref),
-        Value::Object(None) => {
-            Err(RuntimeError::NullPointerException { message: context }.into())
+        Value::Object(None) => Err(RuntimeError::NullPointerException {
+            message: context.map(|s| s.to_string()),
         }
+        .into()),
         // SAFETY: The JVM heap zero-initializes object fields.  When a
         // reference-typed field has never been written, the raw bits are
         // 0x0000…, which our tagged-value representation decodes as
@@ -13452,12 +13562,14 @@ fn pop_object_ref_ctx(
         // null").  Observed crash signature on ActiveMQ boot:
         //   internal error: expected object reference, got <uninitialized>
         //   ctx=Some("Cannot read field 'formatter' because the object is null")
-        Value::Uninitialized => {
-            Err(RuntimeError::NullPointerException { message: context }.into())
+        Value::Uninitialized => Err(RuntimeError::NullPointerException {
+            message: context.map(|s| s.to_string()),
         }
-        Value::Int(0) | Value::Long(0) => {
-            Err(RuntimeError::NullPointerException { message: context }.into())
+        .into()),
+        Value::Int(0) | Value::Long(0) => Err(RuntimeError::NullPointerException {
+            message: context.map(|s| s.to_string()),
         }
+        .into()),
         // K1-family: a `CompactValue` storing a tag-lost ObjectRef pointer
         // (pushed via the long path or via a static-field round-trip that
         // dropped the SUB_OBJECT tag) decodes as `Value::Double` because
@@ -13470,7 +13582,10 @@ fn pop_object_ref_ctx(
         Value::Double(d) => {
             let bits = d.to_bits();
             if bits == 0 {
-                Err(RuntimeError::NullPointerException { message: context }.into())
+                Err(RuntimeError::NullPointerException {
+                    message: context.map(|s| s.to_string()),
+                }
+                .into())
             } else if (bits & 0x7) == 0 && bits < (1u64 << 48) {
                 // 8-byte alignment + 47-bit user-space heap address window.
                 // SAFETY: same untagged pointer pattern used by the array
@@ -13500,7 +13615,7 @@ fn pop_object_ref_ctx(
             }
         }
         other => {
-            if std::env::var_os("RUSTJVM_IAE_TRACE").is_some() {
+            if crate::runtime::env_cache::iae_trace_os() {
                 eprintln!("[pop_object_ref] ERROR: expected object reference, got {other} ctx={context:?}");
                 // Print a Rust backtrace to identify the calling opcode handler
                 let bt = std::backtrace::Backtrace::capture();

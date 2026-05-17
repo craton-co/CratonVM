@@ -333,12 +333,17 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
     }
     let new_buf = alloc_ref_array(ctx, new_cap);
 
-    // Copy old content
+    // Copy old content. Prefer the bulk intrinsic so the VM can use
+    // `copy_nonoverlapping` on the underlying storage; fall back to the
+    // per-element loop only when the override declines (default trait impl
+    // also returns `true`, so the loop is unreachable when bulk succeeds).
     if let Some(old_buf) = data {
         let copy_len = std::cmp::min(old_cap, new_cap);
-        for i in 0..copy_len {
-            let val = ctx.get_array_element(old_buf, i);
-            ctx.set_array_element(new_buf, i, val);
+        if !ctx.bulk_array_copy(old_buf, 0, new_buf, 0, copy_len) {
+            for i in 0..copy_len {
+                let val = ctx.get_array_element(old_buf, i);
+                ctx.set_array_element(new_buf, i, val);
+            }
         }
     }
 
@@ -811,9 +816,11 @@ fn native_al_trim_to_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if size < old_cap {
         let new_buf = alloc_ref_array(ctx, size);
         if let Some(old_buf) = data {
-            for i in 0..size {
-                let val = ctx.get_array_element(old_buf, i);
-                ctx.set_array_element(new_buf, i, val);
+            if !ctx.bulk_array_copy(old_buf, 0, new_buf, 0, size) {
+                for i in 0..size {
+                    let val = ctx.get_array_element(old_buf, i);
+                    ctx.set_array_element(new_buf, i, val);
+                }
             }
         }
         al_set_data(ctx, this, new_buf);
@@ -822,20 +829,28 @@ fn native_al_trim_to_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 pub fn native_al_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use std::fmt::Write as _;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = al_state(ctx, this);
     let size = size as usize;
-    let mut parts = Vec::with_capacity(size);
+    // Pre-size: "[" + N elements averaging ~16 chars each + (N-1) ", " + "]".
+    // Single allocation avoids the intermediate Vec<String> + join() walk.
+    let mut text = String::with_capacity(2 + size.saturating_mul(18));
+    text.push('[');
     if let Some(d) = data {
         for i in 0..size {
+            if i > 0 {
+                text.push_str(", ");
+            }
             let val = ctx.get_array_element(d, i);
-            parts.push(obj_to_display_string(ctx, &val));
+            // `write!` into a String never fails; ignore the Result.
+            let _ = write!(text, "{}", obj_to_display_string(ctx, &val));
         }
     }
-    let text = format!("[{}]", parts.join(", "));
+    text.push(']');
     let s = ctx.create_string(&text);
     Ok(Some(Value::Object(Some(s))))
 }
@@ -862,9 +877,11 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
     let buf = al_ensure_capacity(ctx, this, my_size + other_size);
-    for i in 0..other_size {
-        let val = ctx.get_array_element(other_data, i);
-        ctx.set_array_element(buf, my_size + i, val);
+    if !ctx.bulk_array_copy(other_data, 0, buf, my_size, other_size) {
+        for i in 0..other_size {
+            let val = ctx.get_array_element(other_data, i);
+            ctx.set_array_element(buf, my_size + i, val);
+        }
     }
     al_set_size(ctx, this, (my_size + other_size) as i32);
     Ok(Some(Value::Int(1)))
@@ -889,9 +906,11 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let new_buf = alloc_ref_array(ctx, std::cmp::max(sub_size, AL_DEFAULT_CAPACITY));
     if let Some(d) = data {
-        for i in 0..sub_size {
-            let val = ctx.get_array_element(d, from + i);
-            ctx.set_array_element(new_buf, i, val);
+        if !ctx.bulk_array_copy(d, from, new_buf, 0, sub_size) {
+            for i in 0..sub_size {
+                let val = ctx.get_array_element(d, from + i);
+                ctx.set_array_element(new_buf, i, val);
+            }
         }
     }
     al_set_data(ctx, new_list, new_buf);
@@ -1084,11 +1103,14 @@ fn try_set_jdk_map_field(
 
 /// Compute hash for a key.
 fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
-    // Try to read as string for better distribution
+    // Try to read as string for better distribution.
+    // Must match Java's String.hashCode (UTF-16 code units, i32 wrapping mul+add),
+    // otherwise non-ASCII keys hash differently from bytecode-computed hashes and
+    // HashMap.containsKey silently returns false. See vm::vm_exec::java_string_hash.
     if let Some(s) = ctx.read_string(key) {
         let mut h: i32 = 0;
-        for ch in s.bytes() {
-            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        for cu in s.encode_utf16() {
+            h = h.wrapping_mul(31).wrapping_add(cu as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
         return h ^ (h >> 16);
@@ -1229,48 +1251,132 @@ fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
     let new_buckets = alloc_ref_array(ctx, new_cap as usize);
 
-    // Re-hash all entries
+    // Re-hash all entries. When `new_cap == 2 * old_cap` (the common
+    // doubling case) we can use JDK's split semantics: each entry whose
+    // `hash & old_cap == 0` stays at bucket `i`, and the rest move to
+    // bucket `i + old_cap`. That lets us bulk-copy the old bucket array
+    // head pointers into `new_buckets[0..old_cap]` first (a single memcpy
+    // when the VM's `bulk_array_copy` override supports reference arrays)
+    // and then only walk chains to split off the high-bit nodes, instead
+    // of rebuilding every chain head-by-head with virtual array writes.
+    //
+    // The bulk pre-seed is only valid when `bulk_array_copy` succeeds —
+    // today it returns `false` for reference arrays (write-barrier /
+    // ArrayStoreException reasons), so we fall back to the legacy
+    // per-bucket rebuild walk that does not depend on the pre-seed.
     if let Some(old_b) = old_buckets {
-        for i in 0..(old_cap as usize) {
-            let mut node_val = ctx.get_array_element(old_b, i);
-            let mut steps: usize = 0;
-            while let Value::Object(Some(node)) = node_val {
-                steps += 1;
-                if steps > 1_000_000 {
-                    eprintln!(
-                        "[HM-RESIZE-GUARD] aborting old-chain walk at {} nodes (suspected cycle); bucket={}",
-                        steps, i
-                    );
-                    break;
-                }
-                let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
-                    Value::Int(h) => h,
-                    _ => 0,
-                };
-                let next = ctx.get_field(node, NODE_FIELD_NEXT);
-                // Self-cycle guard before we splice into the new bucket
-                if let Value::Object(Some(nx)) = next {
-                    if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
+        let doubled = (new_cap as i64) == (old_cap as i64) * 2;
+        let preseeded = doubled
+            && ctx.bulk_array_copy(old_b, 0, new_buckets, 0, old_cap as usize);
+        if preseeded {
+            // JDK-style split: walk each old bucket, partition its chain
+            // into "low" (stays at i) and "high" (moves to i+old_cap)
+            // lists, then overwrite the two head slots.
+            let split_mask = old_cap; // power-of-two: the new high bit
+            for i in 0..(old_cap as usize) {
+                let mut node_val = ctx.get_array_element(old_b, i);
+                // Track lo/hi head + tail so we preserve original chain order.
+                let mut lo_head: Option<ObjectRef> = None;
+                let mut lo_tail: Option<ObjectRef> = None;
+                let mut hi_head: Option<ObjectRef> = None;
+                let mut hi_tail: Option<ObjectRef> = None;
+                let mut steps: usize = 0;
+                let step_cap = (size as usize).saturating_add(8);
+                while let Value::Object(Some(node)) = node_val {
+                    steps += 1;
+                    if steps > step_cap {
+                        // Total live entries bound the chain length;
+                        // exceeding it indicates a cycle.
                         eprintln!(
-                            "[HM-RESIZE-GUARD] self-cycle in old bucket {} step {}",
-                            i, steps
+                            "[HM-RESIZE-GUARD] aborting old-chain walk at {} nodes (suspected cycle); bucket={}",
+                            steps, i
                         );
-                        // Truncate: splice node alone, do not continue
-                        let new_idx = map_bucket_index(key_hash, new_cap);
-                        let existing = ctx.get_array_element(new_buckets, new_idx);
-                        ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                        ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
                         break;
                     }
+                    let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h,
+                        _ => 0,
+                    };
+                    let next = ctx.get_field(node, NODE_FIELD_NEXT);
+                    if (key_hash & split_mask) == 0 {
+                        if lo_head.is_none() {
+                            lo_head = Some(node);
+                        } else if let Some(t) = lo_tail {
+                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(node)));
+                        }
+                        lo_tail = Some(node);
+                    } else {
+                        if hi_head.is_none() {
+                            hi_head = Some(node);
+                        } else if let Some(t) = hi_tail {
+                            ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(node)));
+                        }
+                        hi_tail = Some(node);
+                    }
+                    node_val = next;
                 }
+                // Terminate both partitioned chains.
+                if let Some(t) = lo_tail {
+                    ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(None));
+                }
+                if let Some(t) = hi_tail {
+                    ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(None));
+                }
+                // Overwrite the two slots (low keeps `i`, high goes to i+old_cap).
+                ctx.set_array_element(
+                    new_buckets,
+                    i,
+                    Value::Object(lo_head),
+                );
+                ctx.set_array_element(
+                    new_buckets,
+                    i + old_cap as usize,
+                    Value::Object(hi_head),
+                );
+            }
+        } else {
+            // Legacy rebuild path: per-bucket re-insert (head-prepend).
+            for i in 0..(old_cap as usize) {
+                let mut node_val = ctx.get_array_element(old_b, i);
+                let mut steps: usize = 0;
+                while let Value::Object(Some(node)) = node_val {
+                    steps += 1;
+                    if steps > 1_000_000 {
+                        eprintln!(
+                            "[HM-RESIZE-GUARD] aborting old-chain walk at {} nodes (suspected cycle); bucket={}",
+                            steps, i
+                        );
+                        break;
+                    }
+                    let key_hash = match ctx.get_field(node, NODE_FIELD_HASH) {
+                        Value::Int(h) => h,
+                        _ => 0,
+                    };
+                    let next = ctx.get_field(node, NODE_FIELD_NEXT);
+                    // Self-cycle guard before we splice into the new bucket
+                    if let Value::Object(Some(nx)) = next {
+                        if std::ptr::eq(nx.as_ptr(), node.as_ptr()) {
+                            eprintln!(
+                                "[HM-RESIZE-GUARD] self-cycle in old bucket {} step {}",
+                                i, steps
+                            );
+                            // Truncate: splice node alone, do not continue
+                            let new_idx = map_bucket_index(key_hash, new_cap);
+                            let existing = ctx.get_array_element(new_buckets, new_idx);
+                            ctx.set_field(node, NODE_FIELD_NEXT, existing);
+                            ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+                            break;
+                        }
+                    }
 
-                // Insert into new bucket
-                let new_idx = map_bucket_index(key_hash, new_cap);
-                let existing = ctx.get_array_element(new_buckets, new_idx);
-                ctx.set_field(node, NODE_FIELD_NEXT, existing);
-                ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
+                    // Insert into new bucket
+                    let new_idx = map_bucket_index(key_hash, new_cap);
+                    let existing = ctx.get_array_element(new_buckets, new_idx);
+                    ctx.set_field(node, NODE_FIELD_NEXT, existing);
+                    ctx.set_array_element(new_buckets, new_idx, Value::Object(Some(node)));
 
-                node_val = next;
+                    node_val = next;
+                }
             }
         }
     }

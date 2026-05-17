@@ -15,6 +15,27 @@ use crate::lang_math::alloc_wrapper;
 use crate::alloc_concurrent_synthetic;
 
 // ---------------------------------------------------------------------------
+// Cached `RUSTJVM_DBG_BB` env-var lookup
+//
+// Env-var lookups go through the process-wide environ lock on Unix and a
+// kernel32 call on Windows; both are surprisingly expensive when hammered.
+// `Class.getName`, `Class.getSuperclass`, `Class.getInterfaces`, and the
+// generic-superclass / generic-interfaces helpers below each read
+// `RUSTJVM_DBG_BB` on every invocation to decide whether to emit ByteBuddy
+// debug traces. These natives sit on the hot reflection path (ByteBuddy
+// agents call them tens of thousands of times during JDK boot), so we
+// cache the boolean in a `OnceLock<bool>` — same pattern as
+// `vm::runtime::exceptions::iae_trace_enabled`. The env var is a debug
+// switch that must be set at process start; changing it after the first
+// reflection native runs intentionally has no effect.
+static DBG_BB: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+pub(crate) fn dbg_bb_enabled() -> bool {
+    *DBG_BB.get_or_init(|| std::env::var("RUSTJVM_DBG_BB").is_ok())
+}
+
+// ---------------------------------------------------------------------------
 // Class-name derivation caches (perf)
 //
 // Many hot `Class.*` natives derive a string form from the internal slashed
@@ -449,7 +470,7 @@ pub(crate) fn native_class_get_name(ctx: &mut dyn NativeContext, args: &[Value])
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    let dbg_bb = dbg_bb_enabled();
 
     // bytebuddy_probe (agent-bb4) — STRICT-NAME-FIRST.
     //
@@ -1843,7 +1864,7 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            if std::env::var("RUSTJVM_DBG_BB").is_ok() {
+            if dbg_bb_enabled() {
                 eprintln!("[bb-dbg] getSuperclass(<null>) -> null");
             }
             return Ok(Some(Value::Object(None)));
@@ -1873,7 +1894,7 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
     } else {
         mirror_class_name(ctx, this).unwrap_or_default()
     };
-    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
             eprintln!("[bb-dbg] getSuperclass({}) -> null [object-early-strict]", this_name);
@@ -6173,7 +6194,7 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
     } else {
         mirror_class_name(ctx, this).unwrap_or_default()
     };
-    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
             eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early-strict]", this_name);
@@ -7431,7 +7452,7 @@ pub(crate) fn native_class_get_generic_superclass(
     } else {
         mirror_class_name(ctx, this).unwrap_or_default()
     };
-    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
             eprintln!("[bb-dbg] getGenericSuperclass({}) -> null [object-early-strict]", this_name);
@@ -7519,7 +7540,7 @@ pub(crate) fn native_class_get_generic_interfaces(
     } else {
         mirror_class_name(ctx, this).unwrap_or_default()
     };
-    let dbg_bb = std::env::var("RUSTJVM_DBG_BB").is_ok();
+    let dbg_bb = dbg_bb_enabled();
     if strict_name == "java/lang/Object" || strict_name == "java.lang.Object" {
         if dbg_bb {
             eprintln!("[bb-dbg] getGenericInterfaces({}) -> [] [object-early-strict]", this_name);

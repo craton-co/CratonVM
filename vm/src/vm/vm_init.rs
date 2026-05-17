@@ -5,7 +5,7 @@ pub(crate) const MAX_LAMBDA_PROXIES: usize = 100_000;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2014,6 +2014,21 @@ impl SharedVm {
             crate::runtime::vtable::vtable_override_adapter,
         );
 
+        // Round 4 audit fix (CRIT) — register the ResolutionCache
+        // invalidation hook so the JVMTI `RedefineClasses` path
+        // (classloading::ClassManager::redefine_class step 9) drops every
+        // cached field/method/call-site/condy resolution that refers to
+        // (or was resolved into) the redefined class.
+        //
+        // Order: this must be installed BEFORE the `RESOLUTION_INVALIDATE_VM`
+        // weak handle is populated below in `Vm::new` (where `self_arc` is
+        // set), but installing the hook here is fine — the adapter's
+        // `if let Some(vm) = ...upgrade()` falls through to a no-op until
+        // the weak handle is wired.
+        rustjvm_classloading::install_resolution_invalidate_hook(
+            resolution_invalidate_adapter,
+        );
+
         // Catch-up pass: replay every class already in the ClassManager's
         // `vtable_descriptors` through the adapter, so classes loaded
         // during ClassManager bootstrap (before the hook was live) end up
@@ -2044,10 +2059,70 @@ impl SharedVm {
         rustjvm_gc::install_gc_start_hook(gc_start_adapter);
         rustjvm_gc::install_gc_finish_hook(gc_finish_adapter);
 
+        // Round 4 audit fix (CRIT) — publish the global Weak<SharedVm>
+        // handle used by `resolution_invalidate_adapter`. Done at the
+        // very end of `SharedVm::new` so the Arc returned by the caller
+        // wrapping us already exists; if we ran before that, the
+        // upgrade would always fail. The Arc-wrap step happens in
+        // `Vm::new` (vm.rs) when `self_arc` is set — `set_global_shared_vm_for_hooks`
+        // is idempotent, so calling it again from there is harmless and
+        // covers the case where this constructor runs as part of a
+        // larger flow that hasn't yet Arc-wrapped us.
+        //
+        // Until the handle is set, `fire_resolution_invalidate_hook`
+        // still fires the adapter, but the adapter's
+        // `Weak::upgrade()` returns None and the call is a no-op —
+        // perfectly safe for unit tests that construct a SharedVm
+        // outside an Arc.
         crate::runtime::jvmti::fire_vm_init();
 
         vm
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 4 audit fix (CRIT) — ResolutionCache invalidation on redefine
+// ---------------------------------------------------------------------------
+//
+// `rustjvm_classloading::ClassManager::redefine_class` fires a plain
+// `fn(u32)` hook (see `install_resolution_invalidate_hook`) when the
+// bytecode of a class is replaced in place. The hook has no captured
+// state, so we bridge it to the VM-owned `SharedVm::resolution_cache`
+// through this module-private `OnceLock<Weak<SharedVm>>`.
+//
+// The pattern mirrors `crate::runtime::vtable::global_vtable_manager`.
+
+static RESOLUTION_INVALIDATE_VM: OnceLock<Weak<SharedVm>> = OnceLock::new();
+
+/// Publish the `Weak<SharedVm>` handle that `resolution_invalidate_adapter`
+/// upgrades to invalidate the per-VM `ResolutionCache` on redefine.
+///
+/// Called from `Vm::new` right after `self_arc` is populated. Idempotent
+/// (first call wins) — repeated calls from per-test fixtures are silently
+/// ignored.
+pub fn set_global_shared_vm_for_hooks(weak: Weak<SharedVm>) {
+    let _ = RESOLUTION_INVALIDATE_VM.set(weak);
+}
+
+/// The `ResolutionInvalidateHook` adapter handed to
+/// `install_resolution_invalidate_hook`. Plain `fn` pointer (no captures)
+/// so the classloading crate can store it in a `OnceLock`.
+///
+/// Drops every cached resolution that refers to (or was resolved into)
+/// the redefined class. The classloading crate's `RedefineGate` already
+/// auto-evicts the per-thread invoke caches via the generation counter;
+/// this closes the loop for the slower symbolic-reference cache.
+fn resolution_invalidate_adapter(class_id: u32) {
+    let weak = match RESOLUTION_INVALIDATE_VM.get() {
+        Some(w) => w,
+        None => return, // hook fired before VM init wired the handle
+    };
+    let shared = match weak.upgrade() {
+        Some(s) => s,
+        None => return, // VM has been dropped; nothing to invalidate
+    };
+    let cid = crate::classloading::ClassId::new(class_id);
+    shared.resolution_cache.write().invalidate_class(cid);
 }
 
 
@@ -3351,6 +3426,15 @@ impl Vm {
         // Store a weak self-reference so native methods can clone the Arc
         // for spawning new threads.
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
+
+        // Round 4 audit fix (CRIT) — publish the same weak handle to the
+        // module-private slot used by `resolution_invalidate_adapter` so
+        // JVMTI `RedefineClasses` can reach back into
+        // `shared.resolution_cache` and drop stale resolutions.
+        // Idempotent — first writer wins, repeated calls (e.g. test
+        // fixtures that build multiple Vms in-process) are silently
+        // ignored, which matches the global vtable hook pattern.
+        set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
 
         // KC16-watchdog: install the wait-site frame dumper so a thread
         // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit

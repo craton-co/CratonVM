@@ -1042,13 +1042,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // Reaching it means a JIT entry point bypassed the flag (a real bug). Returning
     // 0 here is preferable to UB from a stale compiled callsite; emit a one-shot
     // warning so the bypass is visible during bisection.
-    if std::env::var_os("RUSTJVM_DISABLE_JIT")
-        .map(|v| {
-            let s = v.to_string_lossy().into_owned();
-            !s.is_empty() && s != "0"
-        })
-        .unwrap_or(false)
-    {
+    if crate::runtime::env_cache::disable_jit() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
@@ -1061,7 +1055,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
         return 0;
     }
-    if std::env::var_os("RUSTJVM_DBG_JIT_DISPATCH").is_some() {
+    if crate::runtime::env_cache::jit_dispatch_dbg() {
         let p = args_ptr as *const i64;
         let mut buf = String::new();
         if !p.is_null() && num_args > 0 {
@@ -1459,7 +1453,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         Some(Value::Object(None)) | None => 0,
         _ => 0,
     };
-    if std::env::var_os("RUSTJVM_DBG_JIT_DISPATCH").is_some() {
+    if crate::runtime::env_cache::jit_dispatch_dbg() {
         eprintln!(
             "[JIT_DISPATCH_RET] {}.{}{} ret=0x{:x} ({})",
             info.class_name, info.method_name, info.descriptor, ret, ret,
@@ -1574,7 +1568,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         .cached_class_id
         .load(std::sync::atomic::Ordering::Acquire);
 
-    if std::env::var_os("RUSTJVM_DBG_JIT_MIC").is_some() {
+    if crate::runtime::env_cache::jit_mic_dbg() {
         eprintln!(
             "[JIT_MIC] {}.{}{} cached_cid={} recv_cid={} entry={}",
             info.class_name,

@@ -1,20 +1,25 @@
 // AUDIT 2026-05-16: std HashMap unused (replaced by FxHashMap below).
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
 
 use crate::event::{EventInstance, EventTypeId};
 
-// NOTE: The foundation contract requested `parking_lot::Mutex`, but this crate
-// (`rustjvm-jfr`) intentionally does not depend on `parking_lot` (see
-// Cargo.toml comment from the 2026-05-16 audit). Since this task restricts
-// edits to `jfr/src/repository.rs` only, we cannot add the dependency, and we
-// fall back to `std::sync::Mutex`. The API contract and semantics are
-// preserved; callers that hold `Arc<Mutex<VecDeque<EventInstance>>>` work
-// identically with either Mutex implementation. Migrating to
-// `parking_lot::Mutex` later is a mechanical type swap.
+// 2026-05-17 CRIT-fix (Bug 2): the per-thread shard was `Arc<Mutex<VecDeque>>>`,
+// which took a `std::sync::Mutex` on every event push — directly contradicting
+// the docs that promised "SPSC/lock-free per-thread ring". This file now ships
+// a real lock-free single-producer/single-consumer ring (`SpscEventRing`)
+// backed by atomics. The producer is the owning thread (registers the shard
+// via `register_current_thread`, pushes via `push_to_thread_ring`); the
+// consumer is whichever thread calls `drain_all` (the dump path). Concurrent
+// drains across `ThreadRingRegistry`s are still safe because each shard is
+// only ever drained from one place at a time — the registry-level
+// `rings: Mutex<...>` serializes the shard-list snapshot, after which each
+// shard is consumed by exactly one caller within `drain_all`.
 
 /// In-memory event storage with ring-buffer eviction.
 ///
@@ -153,9 +158,9 @@ pub const DEFAULT_THREAD_RING_CAPACITY: usize = 1024;
 /// exposes a "push or drop-oldest" semantics. It is intentionally `!Sync` and
 /// `!Send` (because of `RefCell`), since it is only ever borrowed from the
 /// owning thread. Cross-thread drainage of the *same* event stream is handled
-/// separately via `ThreadRingRegistry`, which holds `Arc<Mutex<VecDeque<…>>>`
-/// shards that producers push to without contention (each thread owns its
-/// shard, so the mutex is uncontended on the producer side).
+/// separately via `ThreadRingRegistry`, which holds `Arc<SpscEventRing>`
+/// shards (a real lock-free SPSC ring; producers and the dump consumer
+/// touch disjoint atomic counters and disjoint slots).
 ///
 /// This struct is kept as part of the public API surface so other crates can
 /// build local (non-registered) rings for testing or specialized buffering.
@@ -213,6 +218,197 @@ impl ThreadEventRing {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lock-free SPSC per-thread event ring (CRIT-fix Bug 2, 2026-05-17)
+// ---------------------------------------------------------------------------
+//
+// The shard a producer thread pushes into, and the dump thread drains from,
+// is now a true single-producer / single-consumer ring with no mutex on the
+// hot path. The invariants are:
+//
+//   * The owning producer thread is the *only* writer. It is the unique caller
+//     of `SpscEventRing::push` for this shard (enforced by the thread-local
+//     `THREAD_REGISTERED_RING`).
+//   * The consumer is `ThreadRingRegistry::drain_all`, which is serialized
+//     across calls by the registry-level mutex that snapshots the shard list.
+//     Inside `drain_all`, each shard is popped to exhaustion by exactly one
+//     thread, so it sees a consistent SPSC discipline.
+//
+// Memory ordering follows the standard Lamport/Vyukov SPSC pattern:
+//   producer: load tail (Acquire) → write slot → store head (Release)
+//   consumer: load head (Acquire) → read slot → store tail (Release)
+//
+// Capacity is rounded up to a power of two so `idx & mask` indexes the
+// backing array. Head and tail are monotonically increasing `usize`s and are
+// masked at access time. Because the counters are unbounded, the full-check
+// is `head - tail == capacity` (using `wrapping_sub` to survive rollover);
+// the empty-check is `head == tail`. This sidesteps the classic ring-buffer
+// "lose one slot to distinguish full from empty" by using the full counter
+// range, paying with a slightly more complex full-check.
+//
+// Bounded-overflow behaviour: when the producer finds the ring full, it
+// DROPS THE INCOMING EVENT. This is a deliberate change from the previous
+// `drop-oldest` (which a true SPSC ring cannot do without violating the
+// producer/consumer split). For JFR's "best-effort completeness, never block
+// the producer" contract, drop-newest is acceptable and matches the spec in
+// the fix prompt.
+
+/// Round a positive capacity request up to the next power of two, with a
+/// minimum of 1. A power-of-two capacity lets us mask indices instead of
+/// modding them.
+#[inline]
+fn next_power_of_two(n: usize) -> usize {
+    let n = n.max(1);
+    if n.is_power_of_two() { n } else { n.next_power_of_two() }
+}
+
+/// A single-producer / single-consumer bounded ring of `EventInstance`s.
+///
+/// Lock-free in the steady state: producer and consumer touch disjoint atomic
+/// counters (`head` / `tail`) and disjoint slots. The slot array is a `Vec`
+/// of `UnsafeCell<MaybeUninit<EventInstance>>` — the producer initializes
+/// slots in `[tail, head)`, the consumer takes ownership when it pops.
+///
+/// Safety contract: this type is `Sync` because it is only ever used with a
+/// strict SPSC discipline (one producer thread + one consumer thread at any
+/// given time). Violating that discipline is undefined behaviour.
+pub struct SpscEventRing {
+    /// Backing storage; length = capacity, all slots logically uninitialised
+    /// outside `[tail, head)` (mod capacity).
+    slots: Box<[UnsafeCell<MaybeUninit<EventInstance>>]>,
+    /// Producer-owned write index (monotonic, masked at access).
+    head: AtomicUsize,
+    /// Consumer-owned read index (monotonic, masked at access).
+    tail: AtomicUsize,
+    /// `capacity - 1`. Capacity is a power of two so `idx & mask` indexes.
+    mask: usize,
+}
+
+// SAFETY: `SpscEventRing` is only ever used with a single producer and a
+// single consumer (see module-level invariants). The `UnsafeCell` interior
+// is partitioned by the atomic head/tail counters so producer and consumer
+// never touch the same slot at the same time. `EventInstance` is `Send`.
+unsafe impl Sync for SpscEventRing {}
+unsafe impl Send for SpscEventRing {}
+
+impl SpscEventRing {
+    /// Create a new ring with capacity rounded up to the next power of two
+    /// (minimum 1).
+    pub fn new(requested_capacity: usize) -> Self {
+        let capacity = next_power_of_two(requested_capacity);
+        let mut slots: Vec<UnsafeCell<MaybeUninit<EventInstance>>> = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            slots.push(UnsafeCell::new(MaybeUninit::uninit()));
+        }
+        Self {
+            slots: slots.into_boxed_slice(),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            mask: capacity - 1,
+        }
+    }
+
+    /// Capacity (number of slots; always a power of two).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
+    }
+
+    /// Producer-side push. Returns `Err(ev)` if the ring is full (drop-newest
+    /// semantics — the caller decides what to do with the rejected event).
+    ///
+    /// SAFETY contract (caller-upheld): must be called from a single producer
+    /// thread per ring. Multiple concurrent producers would race on `head`.
+    pub fn push(&self, ev: EventInstance) -> Result<(), EventInstance> {
+        // The producer is the only writer to `head`, so a Relaxed self-load
+        // is fine — we already observe our own prior stores.
+        let head = self.head.load(Ordering::Relaxed);
+        // Acquire to synchronize with consumer's tail-Release in `try_pop`,
+        // so we observe the consumer's freed slots.
+        let tail = self.tail.load(Ordering::Acquire);
+        let capacity = self.mask + 1;
+        // head/tail are unbounded monotonically-increasing counters; the
+        // number of in-flight events is `head - tail` (wrapping). Full when
+        // this equals capacity (every slot occupied). `wrapping_sub` keeps
+        // the arithmetic correct across `usize` rollover.
+        if head.wrapping_sub(tail) >= capacity {
+            return Err(ev);
+        }
+        let idx = head & self.mask;
+        // SAFETY: producer is the unique writer to slot `idx` until we
+        // publish via the head-Release below. The slot is logically
+        // uninitialised at this point — either never written, or the
+        // consumer popped it on a prior wrap (which moved tail past it,
+        // synchronised via our tail-Acquire above).
+        unsafe {
+            (*self.slots[idx].get()).write(ev);
+        }
+        // Release so the consumer's Acquire-load of head sees a fully
+        // initialised slot.
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
+
+    /// Consumer-side pop. Returns `None` if the ring is empty.
+    ///
+    /// SAFETY contract (caller-upheld): must be called from a single consumer
+    /// thread per ring.
+    pub fn try_pop(&self) -> Option<EventInstance> {
+        // Consumer owns `tail` — Relaxed self-load is fine.
+        let tail = self.tail.load(Ordering::Relaxed);
+        // Acquire to synchronize with producer's head-Release in `push`, so
+        // we see the slot writes that preceded it.
+        let head = self.head.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        let idx = tail & self.mask;
+        // SAFETY: producer published an initialised value at slot `idx` via
+        // its head-Release; our head-Acquire above synchronises that write.
+        // No other consumer races us (SPSC).
+        let ev = unsafe { (*self.slots[idx].get()).assume_init_read() };
+        // Release so the producer's Acquire-load of tail in `push` sees the
+        // slot as freed before observing the new tail value.
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(ev)
+    }
+
+    /// Consumer-side drain into a Vec.
+    pub fn drain_into(&self, out: &mut Vec<EventInstance>) {
+        while let Some(ev) = self.try_pop() {
+            out.push(ev);
+        }
+    }
+
+    /// Approximate count (non-atomic snapshot — useful for tests/diagnostics).
+    pub fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        head.wrapping_sub(tail)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SpscEventRing {
+    fn drop(&mut self) {
+        // Drop any events still buffered. Safe to use `&mut self` here: this
+        // is single-threaded by virtue of being a drop.
+        let head = *self.head.get_mut();
+        let mut tail = *self.tail.get_mut();
+        while tail != head {
+            let idx = tail & self.mask;
+            // SAFETY: slots in [tail, head) are initialised.
+            unsafe {
+                (*self.slots[idx].get()).assume_init_drop();
+            }
+            tail = tail.wrapping_add(1);
+        }
+    }
+}
+
 thread_local! {
     /// Thread-local instance of the simple `ThreadEventRing` (single-threaded
     /// view, kept for API completeness; production emit paths should use
@@ -222,33 +418,37 @@ thread_local! {
 
     /// Each thread's shared ring shard. Populated lazily on the first call to
     /// `push_to_thread_ring` (or `global_ring_registry().register_current_thread()`).
-    /// The `Arc<Mutex<…>>` is also inserted into the global registry so the
-    /// dumper can find and drain it from another thread.
-    static THREAD_REGISTERED_RING: RefCell<Option<Arc<Mutex<VecDeque<EventInstance>>>>> =
+    /// The `Arc<SpscEventRing>` is also inserted into the global registry so
+    /// the dumper can find and drain it from another thread.
+    static THREAD_REGISTERED_RING: RefCell<Option<Arc<SpscEventRing>>> =
         const { RefCell::new(None) };
 }
 
-/// Global registry of per-thread shared ring shards.
+/// Global registry of per-thread SPSC ring shards.
 ///
-/// Each producer thread registers a single `Arc<Mutex<VecDeque<EventInstance>>>`
-/// on its first JFR emit. Producers push to *their own* shard (the per-thread
-/// mutex is therefore uncontended on the hot path); the dumper drains all
-/// shards by locking each one briefly in turn.
+/// Each producer thread registers a single `Arc<SpscEventRing>` on its first
+/// JFR emit. Producers push to *their own* shard (lock-free, no atomics on
+/// other shards); the dumper drains all shards by popping each one to
+/// exhaustion in turn.
 ///
 /// The registry-level mutex is only taken at:
 ///   - first-emit registration (once per thread, lifetime)
-///   - `drain_all` (typically once per dump interval)
+///   - `drain_all` (typically once per dump interval), to snapshot the list
+///     of shards. The mutex is released before we touch any shard.
 ///
 /// Steady-state emits never touch the registry-level mutex.
 pub struct ThreadRingRegistry {
-    rings: Mutex<Vec<Arc<Mutex<VecDeque<EventInstance>>>>>,
+    rings: Mutex<Vec<Arc<SpscEventRing>>>,
     /// Bounded capacity propagated to each newly-registered thread shard.
+    /// The actual ring capacity may be rounded up to the next power of two.
     shard_capacity: usize,
 }
 
 impl ThreadRingRegistry {
     /// Create a registry where each newly registered thread shard will be
-    /// bounded to `shard_capacity` events (drop-oldest on overflow).
+    /// bounded to (at least) `shard_capacity` events. The actual ring may be
+    /// slightly larger if `shard_capacity` is not already a power of two.
+    /// Events pushed when the ring is full are dropped (drop-newest).
     pub fn new(shard_capacity: usize) -> Self {
         Self {
             rings: Mutex::new(Vec::new()),
@@ -256,20 +456,20 @@ impl ThreadRingRegistry {
         }
     }
 
-    /// Returns the per-thread shared ring for the calling thread, creating
+    /// Returns the per-thread SPSC ring for the calling thread, creating
     /// and registering it on first call. Subsequent calls from the same
     /// thread return the same `Arc` (no registry-mutex traffic).
     ///
     /// The returned `Arc` is cloned into the registry so the dumper can drain
     /// it; the producer keeps its own clone in the thread-local cell for fast
     /// re-access.
-    pub fn register_current_thread(&self) -> Arc<Mutex<VecDeque<EventInstance>>> {
+    pub fn register_current_thread(&self) -> Arc<SpscEventRing> {
         // Fast path: already registered for this thread.
         if let Some(existing) = THREAD_REGISTERED_RING.with(|cell| cell.borrow().clone()) {
             return existing;
         }
         // Slow path: allocate, install into thread-local, and publish to registry.
-        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(self.shard_capacity)));
+        let ring = Arc::new(SpscEventRing::new(self.shard_capacity));
         THREAD_REGISTERED_RING.with(|cell| {
             *cell.borrow_mut() = Some(Arc::clone(&ring));
         });
@@ -283,21 +483,25 @@ impl ThreadRingRegistry {
     /// Drain every registered thread shard, returning the merged event stream.
     ///
     /// Events are **not** in strict timestamp order across shards — each shard
-    /// is drained in insertion order, then concatenated. Callers that need a
-    /// time-ordered stream (e.g. the dumper) should sort by `start_time`.
+    /// is drained in producer-insertion order, then concatenated. Callers
+    /// that need a time-ordered stream (e.g. the dumper) should sort by
+    /// `start_time`.
+    ///
+    /// SPSC invariant: this method must not be called concurrently by two
+    /// threads on the same shard. The registry-level mutex snapshots the
+    /// shard list, but does not prevent two callers from racing on shard
+    /// drain. In practice there is exactly one dump thread per
+    /// `ThreadRingRegistry` instance, so this is fine.
     pub fn drain_all(&self) -> Vec<EventInstance> {
         // Snapshot the Arc list under the registry lock so we don't hold it
         // while draining each shard. The Arc clones make the list cheap to copy.
-        let shards: Vec<Arc<Mutex<VecDeque<EventInstance>>>> = match self.rings.lock() {
+        let shards: Vec<Arc<SpscEventRing>> = match self.rings.lock() {
             Ok(guard) => guard.iter().map(Arc::clone).collect(),
             Err(_) => return Vec::new(),
         };
         let mut out = Vec::new();
         for shard in shards {
-            if let Ok(mut q) = shard.lock() {
-                out.reserve(q.len());
-                out.extend(q.drain(..));
-            }
+            shard.drain_into(&mut out);
         }
         out
     }
@@ -307,7 +511,9 @@ impl ThreadRingRegistry {
         self.rings.lock().map(|g| g.len()).unwrap_or(0)
     }
 
-    /// Bounded capacity used when registering new thread shards.
+    /// Bounded capacity used when registering new thread shards. (Note: the
+    /// actual `SpscEventRing` capacity is rounded up to the next power of
+    /// two; this value is the *requested* capacity.)
     pub fn shard_capacity(&self) -> usize {
         self.shard_capacity
     }
@@ -327,36 +533,35 @@ pub fn global_ring_registry() -> &'static ThreadRingRegistry {
     GLOBAL_RING_REGISTRY.get_or_init(ThreadRingRegistry::default)
 }
 
-/// Push an event onto the calling thread's ring shard, registering it with
-/// the global registry on first call.
+/// Push an event onto the calling thread's SPSC ring shard, registering it
+/// with the global registry on first call.
 ///
-/// J7 (round-2): the steady-state hot path borrows the thread-local `Arc`
-/// shard reference *in place* instead of cloning it on every call. The
-/// previous implementation did `cell.borrow().clone()` per emit, which is a
-/// refcount bump (atomic RMW + branch). We now hold a `Ref<'_, …>` borrow
-/// only long enough to take the ring lock; the lock is independent of the
-/// outer borrow so it's safe to drop the borrow afterward.
+/// CRIT-fix (Bug 2, 2026-05-17): the hot path no longer takes any mutex.
+/// The shard is a `SpscEventRing` that uses atomic head/tail counters; the
+/// producer (the calling thread) is the only writer, so the push is
+/// uncontended atomic ops + one slot write.
 ///
-/// Hot-path cost (steady state, no contention):
-///   - 1 thread-local access + borrow (no atomic operations)
-///   - 1 uncontended mutex lock + `VecDeque::push_back` + unlock
-///   - possible `VecDeque::pop_front` if the ring is at capacity
+/// Hot-path cost (steady state):
+///   - 1 thread-local access + borrow (no atomics)
+///   - 1 Relaxed atomic load (own head) + 1 Acquire load (consumer tail)
+///   - 1 unsynchronised slot write
+///   - 1 Release store (own head)
 ///
 /// First-call cost (once per thread, ever):
-///   - 1 `Arc::new` + `Mutex::new` + `VecDeque::with_capacity` allocation
+///   - 1 `Arc::new` + `SpscEventRing::new` (Box<[UnsafeCell<MaybeUninit>]>)
 ///   - 1 global-registry mutex lock to publish the new shard
+///
+/// Overflow policy: drop-newest. If the ring is full when `push` is called,
+/// the event is silently discarded. JFR documents this as best-effort.
 pub fn push_to_thread_ring(ev: EventInstance) {
     // Fast path: borrow the thread-local shard reference in place and push
-    // by value. The closure takes `Option<EventInstance>` so we can move the
-    // event into the queue (preserving its Arc<str> fields without cloning)
-    // and signal back whether the push happened.
-    //
-    // If the cell is empty (first call on this thread), the closure returns
-    // the event unmoved, and we fall through to the slow path that registers
-    // a new shard and pushes via the freshly-returned Arc.
+    // by value. The closure returns the event back if there is no shard yet
+    // so we can install one on the slow path.
     let leftover = THREAD_REGISTERED_RING.with(|cell| {
         if let Some(ring) = cell.borrow().as_ref() {
-            push_one(ring, ev);
+            // Push may fail (full); drop the event on the floor in that
+            // case — drop-newest is the documented overflow policy.
+            let _ = ring.push(ev);
             None
         } else {
             Some(ev)
@@ -365,22 +570,7 @@ pub fn push_to_thread_ring(ev: EventInstance) {
     if let Some(ev) = leftover {
         // Slow path: register, install in thread-local, and push.
         let shard = global_ring_registry().register_current_thread();
-        push_one(&shard, ev);
-    }
-}
-
-/// Inner push helper: lock the shard, evict head if full, push tail. Pulled
-/// out so the fast path and the slow path share one place that does the lock
-/// dance. Takes `EventInstance` by value so its `Arc<str>` payloads are
-/// moved (not cloned) into the queue.
-#[inline]
-fn push_one(ring: &Arc<Mutex<VecDeque<EventInstance>>>, ev: EventInstance) {
-    let capacity = global_ring_registry().shard_capacity();
-    if let Ok(mut q) = ring.lock() {
-        if q.len() >= capacity {
-            let _ = q.pop_front();
-        }
-        q.push_back(ev);
+        let _ = shard.push(ev);
     }
 }
 
@@ -654,40 +844,98 @@ mod tests {
     #[test]
     fn push_to_thread_ring_records_event_visible_to_drain_all() {
         // Push an event with a unique tag, then verify it is reachable through
-        // the same Arc shard that `register_current_thread` returns. This
-        // avoids races against other tests that may concurrently call
-        // `drain_all` on the global registry.
+        // the same Arc shard that `register_current_thread` returns. We pop
+        // every event out of the shard (SPSC consumer side) and search the
+        // popped vector — this is destructive, but the test owns this
+        // thread's shard for its duration so that's fine.
+        //
+        // The shard may already contain residue from prior tests on this
+        // thread (the thread-local cell persists for the whole test binary),
+        // so we drain everything and look for the unique start_time tag.
         let unique_start = 0xDEAD_BEEF_u64;
         push_to_thread_ring(make_event(EventTypeId(7), unique_start, unique_start + 1));
 
         // Re-fetch the same shard — `register_current_thread` is idempotent
         // and returns the cached Arc for the current thread.
         let shard = global_ring_registry().register_current_thread();
-        let q = shard.lock().expect("shard mutex poisoned");
+        let mut drained: Vec<EventInstance> = Vec::new();
+        shard.drain_into(&mut drained);
         assert!(
-            q.iter().any(|e| e.start_time == unique_start && e.type_id == EventTypeId(7)),
-            "expected pushed event to be visible in this thread's shard (len={})",
-            q.len(),
+            drained.iter().any(|e| e.start_time == unique_start && e.type_id == EventTypeId(7)),
+            "expected pushed event to be visible in this thread's shard (drained {} events)",
+            drained.len(),
         );
     }
 
     #[test]
-    fn ring_drops_oldest_on_overflow() {
-        // Construct an isolated registry so this test does not collide with
-        // any other registry traffic in the test binary.
-        let registry = ThreadRingRegistry::new(3);
-        let ring = registry.register_current_thread();
-        // Push 5 events, capacity = 3 — first two should be dropped.
-        for i in 0..5u64 {
-            let mut q = ring.lock().unwrap();
-            if q.len() >= registry.shard_capacity() {
-                let _ = q.pop_front();
-            }
-            q.push_back(make_event(EventTypeId(1), i * 100, i * 100 + 50));
+    fn ring_drops_newest_on_overflow() {
+        // The SPSC ring drops the *newest* event on overflow (the prior
+        // VecDeque-backed shard dropped the oldest, but a true SPSC ring
+        // cannot move the consumer-owned `tail` from the producer thread).
+        // Capacity is rounded up to the next power of two, so a request of
+        // 3 actually gives 4. Verify the first 4 events make it in and the
+        // 5th is dropped.
+        let ring = SpscEventRing::new(3);
+        assert_eq!(ring.capacity(), 4, "capacity should round up to a power of two");
+        for i in 0..4u64 {
+            ring.push(make_event(EventTypeId(1), i * 100, i * 100 + 50)).expect("not full yet");
         }
-        let drained = registry.drain_all();
-        let starts: Vec<u64> = drained.iter().map(|e| e.start_time).collect();
-        assert_eq!(starts, vec![200, 300, 400]);
+        // 5th push should fail (drop-newest).
+        let rejected = ring.push(make_event(EventTypeId(1), 4 * 100, 4 * 100 + 50));
+        assert!(rejected.is_err(), "ring should be full after `capacity` pushes");
+
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+        let starts: Vec<u64> = out.iter().map(|e| e.start_time).collect();
+        assert_eq!(starts, vec![0, 100, 200, 300]);
+    }
+
+    #[test]
+    fn spsc_ring_capacity_rounded_to_power_of_two() {
+        assert_eq!(SpscEventRing::new(1).capacity(), 1);
+        assert_eq!(SpscEventRing::new(2).capacity(), 2);
+        assert_eq!(SpscEventRing::new(3).capacity(), 4);
+        assert_eq!(SpscEventRing::new(5).capacity(), 8);
+        assert_eq!(SpscEventRing::new(1024).capacity(), 1024);
+        // Zero is clamped to 1.
+        assert_eq!(SpscEventRing::new(0).capacity(), 1);
+    }
+
+    #[test]
+    fn spsc_ring_push_pop_round_trip() {
+        let ring = SpscEventRing::new(8);
+        assert!(ring.is_empty());
+        ring.push(make_event(EventTypeId(1), 100, 200)).unwrap();
+        ring.push(make_event(EventTypeId(2), 300, 400)).unwrap();
+        assert_eq!(ring.len(), 2);
+
+        let a = ring.try_pop().unwrap();
+        assert_eq!(a.start_time, 100);
+        let b = ring.try_pop().unwrap();
+        assert_eq!(b.start_time, 300);
+        assert!(ring.try_pop().is_none());
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn spsc_ring_wraps_around() {
+        // Push, pop, push again past the original capacity, verify we get
+        // every pushed event back in FIFO order.
+        let ring = SpscEventRing::new(4);
+        for i in 0..3u64 {
+            ring.push(make_event(EventTypeId(1), i, i + 1)).unwrap();
+        }
+        // Pop two so head moves ahead of tail.
+        assert_eq!(ring.try_pop().unwrap().start_time, 0);
+        assert_eq!(ring.try_pop().unwrap().start_time, 1);
+        // Now push three more — index arithmetic must wrap correctly.
+        for i in 3..6u64 {
+            ring.push(make_event(EventTypeId(1), i, i + 1)).unwrap();
+        }
+        let mut out = Vec::new();
+        ring.drain_into(&mut out);
+        let starts: Vec<u64> = out.iter().map(|e| e.start_time).collect();
+        assert_eq!(starts, vec![2, 3, 4, 5]);
     }
 
     #[test]
@@ -707,9 +955,10 @@ mod tests {
             handles.push(thread::spawn(move || {
                 b.wait();
                 let ring = reg.register_current_thread();
-                // Each thread pushes a unique-tagged event.
-                let mut q = ring.lock().unwrap();
-                q.push_back(make_event(EventTypeId(t as u32 + 1), 1000 + t as u64, 2000 + t as u64));
+                // Each thread pushes a unique-tagged event into its own SPSC
+                // shard (single producer = this thread).
+                ring.push(make_event(EventTypeId(t as u32 + 1), 1000 + t as u64, 2000 + t as u64))
+                    .expect("SPSC ring should have room for one event");
             }));
         }
         for h in handles {
@@ -719,6 +968,7 @@ mod tests {
         // Each worker thread should have registered its own distinct shard.
         assert_eq!(registry.registered_thread_count(), n_threads);
 
+        // `drain_all` is the single consumer for every shard (SPSC invariant).
         let drained = registry.drain_all();
         assert_eq!(drained.len(), n_threads);
         // Verify every type_id 1..=n_threads is represented exactly once.

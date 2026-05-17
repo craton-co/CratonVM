@@ -44,9 +44,13 @@
 //! See `direct_buffer_register_natives` for the FQNs registered.
 
 use std::alloc::{alloc, dealloc, Layout};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+// Cleaner IDs are internal monotonic AtomicI32 counters — no adversarial
+// keying. FxHashMap avoids SipHash on the hot register/fire path. Matches
+// native-api's T10.9.B migration.
+use rustc_hash::FxHashMap;
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
@@ -288,9 +292,9 @@ struct CleanerEntry {
     cleaned: bool,
 }
 
-fn cleaners() -> &'static Mutex<HashMap<i32, CleanerEntry>> {
-    static C: OnceLock<Mutex<HashMap<i32, CleanerEntry>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+fn cleaners() -> &'static Mutex<FxHashMap<i32, CleanerEntry>> {
+    static C: OnceLock<Mutex<FxHashMap<i32, CleanerEntry>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
 fn next_cleaner_id() -> i32 {

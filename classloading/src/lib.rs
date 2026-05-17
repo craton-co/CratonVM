@@ -36,11 +36,12 @@ pub use class::{
 };
 pub use class_manager::{
     install_class_file_load_hook, install_class_load_hook, install_class_prepare_hook,
-    install_jit_invalidate_hook, install_vtable_install_hook, install_vtable_override_hook,
+    install_jit_invalidate_hook, install_resolution_invalidate_hook,
+    install_vtable_install_hook, install_vtable_override_hook,
     is_builtin_classloader_name, jdk_superclass_lookup, register_builtin_classloaders,
     ClassFileLoadHook, ClassManager, DefineClassOptions, JitInvalidateHook, JvmtiClassHook,
-    RedefineOptions, VtableInstallHook, VtableMethodSnapshot, VtableOverrideHook,
-    VtableSlotDescriptor,
+    RedefineOptions, ResolutionInvalidateHook, VtableInstallHook, VtableMethodSnapshot,
+    VtableOverrideHook, VtableSlotDescriptor,
 };
 pub use class_path::{ClassPath, ManifestInfo};
 pub use module::{

@@ -24,6 +24,22 @@ pub mod x509;
 pub use policy::{Grant, PermissionEntry, Policy, PolicyError};
 
 // ---------------------------------------------------------------------------
+// Cached `RUSTJVM_DBG_DOPRIV` env-var lookup
+//
+// `doPrivileged` is called ~50k times during JDK boot; reading
+// `env::var_os` per call funnels every thread through the platform
+// environ lock and reallocates an `OsString`. Cache the boolean once at
+// first use — same pattern as `vm::runtime::exceptions::iae_trace_enabled`.
+// The env var is a debug switch and must be set before `doPrivileged`
+// is first invoked.
+static DBG_DOPRIV: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn dbg_dopriv_enabled() -> bool {
+    *DBG_DOPRIV.get_or_init(|| std::env::var_os("RUSTJVM_DBG_DOPRIV").is_some())
+}
+
+// ---------------------------------------------------------------------------
 // Global SecurityManager singleton
 // ---------------------------------------------------------------------------
 
@@ -182,6 +198,21 @@ pub fn policy_allows_full(
     code_base: Option<&str>,
     cert_digests: &[String],
 ) -> bool {
+    policy_allows_full_generic(permission_class, target, actions, code_base, cert_digests)
+}
+
+/// Like [`policy_allows_full`] but generic over the digest slice element
+/// type. The hot `checkPermission` path holds `&[Arc<str>]` borrowed
+/// directly from the per-thread privileged-frame stack — going through
+/// this variant skips the per-element `.to_string()` clone the
+/// `&[String]` signature would otherwise force.
+pub fn policy_allows_full_generic<S: AsRef<str>>(
+    permission_class: &str,
+    target: &str,
+    actions: &str,
+    code_base: Option<&str>,
+    cert_digests: &[S],
+) -> bool {
     let g = ACTIVE_POLICY.read().unwrap_or_else(|e| e.into_inner());
     match g.as_ref() {
         None => true, // no policy loaded → allow-all
@@ -246,6 +277,10 @@ fn pop_privileged_frame() -> Option<PrivilegedFrame> {
 }
 
 /// Return the codeBase of the currently-active privileged frame, if any.
+///
+/// This allocates a fresh `String` from the frame's `Arc<str>` — convenient
+/// for tests / debug code. The hot `checkPermission` path should call
+/// [`current_privileged_code_base_arc`] instead to avoid the clone.
 pub fn current_privileged_code_base() -> Option<String> {
     PRIVILEGED_STACK.with(|s| {
         s.borrow()
@@ -254,10 +289,21 @@ pub fn current_privileged_code_base() -> Option<String> {
     })
 }
 
+/// Arc-returning variant of [`current_privileged_code_base`]. Cheap
+/// (refcount bump) — used by the `checkPermission` hot path.
+pub fn current_privileged_code_base_arc() -> Option<Arc<str>> {
+    PRIVILEGED_STACK.with(|s| s.borrow().last().and_then(|frame| frame.code_base.clone()))
+}
+
 /// Return the signer-cert SHA-256 digests of the currently-active
 /// privileged frame, or an empty vector if none.  Exposed so policy
 /// checks can verify a `grant signedBy "..."` clause applies to the
 /// code on the privileged frame.
+///
+/// Allocates a fresh `Vec<String>` per call — kept for tests / debug
+/// callers. The `checkPermission` hot path uses
+/// [`current_privileged_cert_digests_arc`] which returns the
+/// `Arc<[Arc<str>]>` directly (a refcount bump, no element clones).
 pub fn current_privileged_cert_digests() -> Vec<String> {
     PRIVILEGED_STACK
         .with(|s| {
@@ -266,6 +312,19 @@ pub fn current_privileged_cert_digests() -> Vec<String> {
                 .map(|frame| frame.cert_digests.iter().map(|a| a.to_string()).collect())
         })
         .unwrap_or_default()
+}
+
+/// Arc-returning variant of [`current_privileged_cert_digests`]. Returns
+/// the per-thread privileged-frame digest array as a refcount-bumped
+/// `Arc<[Arc<str>]>` — no per-element string allocation. Used by the
+/// `checkPermission` hot path (~50k calls during JDK boot).
+pub fn current_privileged_cert_digests_arc() -> Arc<[Arc<str>]> {
+    PRIVILEGED_STACK.with(|s| {
+        s.borrow()
+            .last()
+            .map(|frame| frame.cert_digests.clone())
+            .unwrap_or_else(|| Arc::from(Vec::<Arc<str>>::new()))
+    })
 }
 
 /// Depth of the privileged-frame stack on the current thread. Exposed for
@@ -306,10 +365,15 @@ fn check_permission_impl(
     let target = read_string_field(ctx, perm, 0);
     let actions = read_string_field(ctx, perm, 1);
 
-    let code_base = current_privileged_code_base();
-    let cert_digests = current_privileged_cert_digests();
+    // Hot path: pull the per-thread privileged frame state as Arcs (a
+    // refcount bump per access) instead of cloning a fresh
+    // `Vec<String>` plus per-element `.to_string()`s on every
+    // `checkPermission`. The Arc-migrated frame storage was added in
+    // round 3 specifically to enable this.
+    let code_base = current_privileged_code_base_arc();
+    let cert_digests = current_privileged_cert_digests_arc();
 
-    let allowed = policy_allows_full(
+    let allowed = policy_allows_full_generic(
         &class_name,
         &target,
         &actions,
@@ -733,7 +797,7 @@ fn register_access_controller(r: &mut NativeMethodRegistry) {
             let cid = ctx.class_id_of_object(action);
             let cb = cached_action_code_base(ctx, cid);
             let digests = cached_signer_tokens(ctx, cid);
-            let dbg = std::env::var_os("RUSTJVM_DBG_DOPRIV").is_some();
+            let dbg = dbg_dopriv_enabled();
             if dbg {
                 let cls = ctx.class_name_of_id(cid).unwrap_or_else(|| "?".to_string());
                 eprintln!("[doPriv] ENTER action class={cls}");

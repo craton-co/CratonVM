@@ -532,6 +532,24 @@ impl G1Collector {
             }
         }
 
+        // CRIT fix (UAF): actually process the collected rset sources.
+        // Dedup source indices so we walk each source region at most once.
+        let unique_sources: std::collections::HashSet<usize> = rset_sources
+            .iter()
+            .flat_map(|(_, srcs)| srcs.iter().copied())
+            .collect();
+        for src_idx in unique_sources {
+            self.scan_source_region_for_cset_refs(
+                &mut regions,
+                src_idx,
+                &cset_set,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &mut work_list,
+            );
+        }
+
         // Phase 3: Cheney-style scan of evacuated objects
         let mut scan_idx = 0;
         while scan_idx < work_list.len() {
@@ -729,6 +747,34 @@ impl G1Collector {
                     }
                 }
             }
+        }
+
+        // CRIT fix (UAF): process remembered-set sources for every CSet
+        // region. Collect sources up front (before mutating regions during
+        // evacuation), dedup, then walk each source region rewriting
+        // CSet-bound slots and seeding the work_list with newly evacuated
+        // targets. Without this, cross-region refs (e.g. old → young)
+        // were silently dropped, leaving stale pointers in non-CSet
+        // regions after CSet reset.
+        let mixed_rset_sources: std::collections::HashSet<usize> = {
+            let mut set = std::collections::HashSet::new();
+            for &cset_idx in &cset {
+                for s in regions[cset_idx].rset.sources() {
+                    set.insert(s);
+                }
+            }
+            set
+        };
+        for src_idx in mixed_rset_sources {
+            self.scan_source_region_for_cset_refs(
+                &mut regions,
+                src_idx,
+                &cset_set,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &mut work_list,
+            );
         }
 
         // Cheney scan
@@ -985,6 +1031,112 @@ impl G1Collector {
         }
     }
 
+    /// CRIT fix (UAF): scan every object in a non-CSet source region and,
+    /// for each reference slot pointing into the CSet, evacuate the target
+    /// (if not already evacuated) and rewrite the slot to the forwarded
+    /// pointer in place. Without this step the RSet sources collected in
+    /// young/mixed Phase 2 were dropped, so cross-region references from
+    /// non-CSet → CSet survived as stale pointers after the CSet regions
+    /// were reset, causing silent use-after-free. Pattern mirrors
+    /// `scan_and_evacuate_refs` but operates on a region's full object
+    /// walk rather than a single evacuated object.
+    fn scan_source_region_for_cset_refs(
+        &self,
+        regions: &mut Vec<G1Region>,
+        source_idx: usize,
+        cset: &std::collections::HashSet<usize>,
+        pointer_map: &mut HashMap<usize, usize>,
+        objects_copied: &mut usize,
+        bytes_copied: &mut usize,
+        work_list: &mut Vec<*mut u8>,
+    ) {
+        // Source must be a live non-CSet region; cset sources from rset can
+        // include indices that have since been reclassified.
+        if cset.contains(&source_idx) {
+            return;
+        }
+        let (cursor, base) = {
+            let r = &mut regions[source_idx];
+            if r.region_type == RegionType::Free {
+                return;
+            }
+            (r.cursor, r.data.as_mut_ptr())
+        };
+
+        let mut offset = 0usize;
+        while offset < cursor {
+            let obj_ptr = unsafe { base.add(offset) };
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let obj_size = object_total_size(header);
+            if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                break;
+            }
+
+            // Walk reference slots; mirror scan_and_evacuate_refs's slot
+            // dispatch but rewrite the slot atomically-by-store (STW: no
+            // concurrent mutator; uses the same plain ptr::write pattern
+            // as evacuate_object's mark-word transfer and the existing
+            // scan_and_evacuate_refs helper).
+            if header.kind == ObjectKind::Array {
+                if header.element_type == ArrayElementType::Reference {
+                    for i in 0..header.array_length as usize {
+                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
+                        let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                        if raw == 0 {
+                            continue;
+                        }
+                        let ref_ptr = raw as usize as *mut u8;
+                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
+                            if cset.contains(&ridx) {
+                                if let Some(new_ptr) = self.evacuate_object(
+                                    regions,
+                                    ref_ptr,
+                                    pointer_map,
+                                    objects_copied,
+                                    bytes_copied,
+                                ) {
+                                    unsafe {
+                                        std::ptr::write(slot_ptr as *mut u64, new_ptr as u64);
+                                    }
+                                    work_list.push(new_ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for slot_idx in 0..header.num_slots as usize {
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        let ref_ptr = ref_obj.as_ptr();
+                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
+                            if cset.contains(&ridx) {
+                                if let Some(new_ptr) = self.evacuate_object(
+                                    regions,
+                                    ref_ptr,
+                                    pointer_map,
+                                    objects_copied,
+                                    bytes_copied,
+                                ) {
+                                    let new_value = Value::Object(Some(unsafe {
+                                        ObjectRef::from_raw(new_ptr)
+                                    }));
+                                    unsafe {
+                                        std::ptr::write(slot_ptr as *mut Value, new_value);
+                                    }
+                                    work_list.push(new_ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            offset += obj_size;
+        }
+    }
+
     /// Update interior references in all non-CSet regions using the pointer map.
     fn update_references_in_regions(
         &self,
@@ -1104,7 +1256,7 @@ impl G1Collector {
             // readable for the duration of the GC cycle (regions are
             // pinned by the lock guard).
             let header = unsafe { &*(obj_addr as *const ObjectHeader) };
-            Self::scan_object_refs(obj_ptr, header, &regions, &mut worklist);
+            self.scan_object_refs(obj_ptr, header, &regions, &mut worklist);
         }
 
         // Ran out of budget but still have work — caller should call again.
@@ -1124,25 +1276,23 @@ impl G1Collector {
     /// marker; the `is_marked` check here is only an optimization to
     /// reduce worklist churn.
     fn scan_object_refs(
+        &self,
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         regions: &[G1Region],
         worklist: &mut Vec<usize>,
     ) {
-        // Helper: locate the region (if any) that owns this raw pointer.
-        // Returns the region index, only considering non-free regions.
+        // CRIT-perf fix: use the O(log R) cached `lookup_region_for_addr`
+        // helper instead of an O(R) linear walk. The wrapper preserves
+        // the "skip Free regions" guard the linear version had by
+        // checking the looked-up region's type.
         let region_for = |p: *mut u8| -> Option<usize> {
-            let addr = p as usize;
-            for (i, r) in regions.iter().enumerate() {
-                if r.region_type == RegionType::Free {
-                    continue;
-                }
-                let base = r.data.as_ptr() as usize;
-                if addr >= base && addr < base + r.data.len() {
-                    return Some(i);
-                }
+            let idx = self.lookup_region_for_addr(p as usize)?;
+            if regions[idx].region_type == RegionType::Free {
+                None
+            } else {
+                Some(idx)
             }
-            None
         };
 
         if header.kind == ObjectKind::Array {
@@ -1216,17 +1366,16 @@ impl G1Collector {
         // Round-2 fix (HIGH — GC #5): bitmaps are per-region. Helper
         // returns the owning region index (if any) so we can consult
         // *that* region's bitmap for the already-marked check.
+        // CRIT-perf fix: use the O(log R) cached `lookup_region_for_addr`
+        // instead of an O(R) linear scan; preserve the Free-region skip
+        // by post-filtering on the looked-up region's type.
         let region_for = |addr: usize| -> Option<usize> {
-            for (i, r) in regions.iter().enumerate() {
-                if r.region_type == RegionType::Free {
-                    continue;
-                }
-                let base = r.data.as_ptr() as usize;
-                if addr >= base && addr < base + r.data.len() {
-                    return Some(i);
-                }
+            let idx = self.lookup_region_for_addr(addr)?;
+            if regions[idx].region_type == RegionType::Free {
+                None
+            } else {
+                Some(idx)
             }
-            None
         };
 
         // 1) Roots — push every non-null in-heap root onto the gray set.
@@ -1658,12 +1807,17 @@ impl G1Collector {
 
     /// Record an old reference value in the SATB queue (for concurrent marking).
     /// Only records when SATB is active (during concurrent mark phase).
+    ///
+    /// Routes through the per-thread SATB buffer
+    /// ([`crate::satb::satb_thread_local_log`]) so the hot write-barrier
+    /// path takes no shared lock in the common case; the buffer auto-flushes
+    /// into the global queue every ~256 entries.
     pub fn satb_pre_barrier(&self, old_ref: usize) {
         if old_ref == 0 {
             return;
         }
         if self.satb_queue.is_active() {
-            self.satb_queue.flush(vec![old_ref]);
+            crate::satb::satb_thread_local_log(&self.satb_queue, old_ref);
         }
     }
 
@@ -3239,11 +3393,17 @@ mod tests {
 
         // SATB inactive — should not log
         gc.satb_pre_barrier(addr);
+        // Flush in case a previous test on this thread left buffered entries.
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        let _ = gc.satb_queue().drain();
         assert!(gc.satb_queue().is_empty());
 
-        // Activate SATB and log
+        // Activate SATB and log. The barrier now writes into the per-thread
+        // buffer; force a safepoint-style flush so the global queue sees it
+        // without waiting for the auto-flush threshold.
         gc.satb_queue().activate();
         gc.satb_pre_barrier(addr);
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
         assert_eq!(gc.satb_queue().len(), 1);
 
         let drained = gc.satb_queue().drain();

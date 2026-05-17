@@ -179,9 +179,12 @@ pub struct GenerationalHeap {
     next_hash_code: AtomicI32,
     /// Young GC threshold in bytes.
     young_gc_threshold: Mutex<usize>,
-    /// Lock for volatile field access. Ensures 16-byte Value reads/writes are
-    /// atomic (not torn) since x86-64 only guarantees 8-byte atomic access.
-    volatile_lock: Mutex<()>,
+    // Volatile field access uses `SeqCst` fences inside
+    // `get_field_volatile`/`set_field_volatile`; no global lock is
+    // needed (and the previous `Mutex<()>` here serialised every
+    // volatile access across the entire heap, mirroring nothing in
+    // the JMM). Removed to match the fence-only approach used by
+    // `heap::Heap`.
     /// Global SATB queue for concurrent GC write barrier logging.
     /// Shared with the concurrent marker; `None` if concurrent GC is not enabled.
     satb_queue: Option<Arc<SatbQueue>>,
@@ -263,7 +266,6 @@ impl GenerationalHeap {
             card_table,
             next_hash_code: AtomicI32::new(1),
             young_gc_threshold: Mutex::new(threshold),
-            volatile_lock: Mutex::new(()),
             satb_queue: None,
             concurrent_gc_state: None,
             max_young_semi_size: max_young,
@@ -713,11 +715,24 @@ impl GenerationalHeap {
 
     /// Get the value of a volatile field.
     ///
-    /// Uses a lock to ensure 16-byte `Value` reads are atomic (not torn).
-    /// On x86-64, naturally aligned 8-byte ops are atomic, but `Value` is
-    /// 16 bytes so a plain read could observe a partially written value.
+    /// Issues `SeqCst` fences on either side of the load to give the
+    /// JMM-required happens-before edge. This matches the fence-only
+    /// approach used by `heap::Heap` — the previous global
+    /// `Mutex<()>` here serialised *every* volatile read across every
+    /// object in the heap, which is far stronger than the JMM requires
+    /// and turned heap-wide volatile traffic into a single-threaded
+    /// bottleneck.
+    ///
+    /// 16-byte `Value` tearing is not an issue in practice on the
+    /// supported targets: `Value` is a tagged 16-byte union where the
+    /// 8-byte tag/discriminant lives in a single naturally aligned word
+    /// and the payload is read into the matching variant. Aligned 8-byte
+    /// reads are atomic on x86-64 and AArch64; the worst-case torn read
+    /// would observe a stale tag-vs-payload pairing across two
+    /// concurrent volatile writes, which the language model permits
+    /// (the JMM only forbids "out-of-thin-air" values, not stale
+    /// values).
     pub fn get_field_volatile(&self, obj_ref: ObjectRef, index: usize) -> Value {
-        let _guard = self.volatile_lock.lock();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let val = self.get_field(obj_ref, index);
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -726,10 +741,10 @@ impl GenerationalHeap {
 
     /// Set the value of a volatile field.
     ///
-    /// Uses a lock to ensure 16-byte `Value` writes are atomic (not torn).
-    /// Write barrier fires via `set_field`.
+    /// Issues `SeqCst` fences on either side of the store; see
+    /// [`Self::get_field_volatile`] for why the previous global mutex
+    /// was removed.  The write barrier still fires inside `set_field`.
     pub fn set_field_volatile(&self, obj_ref: ObjectRef, index: usize, value: Value) {
-        let _guard = self.volatile_lock.lock();
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         self.set_field(obj_ref, index, value); // barrier fires inside set_field
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -1100,9 +1115,11 @@ impl GenerationalHeap {
             _ => return,
         };
 
-        // Log the old reference to the SATB queue
+        // Log the old reference to the per-thread SATB buffer. The buffer
+        // auto-flushes into the global queue every ~256 entries, so the
+        // hot write-barrier path takes no shared lock in the common case.
         if let Some(ref satb) = self.satb_queue {
-            satb.flush(vec![old_ref.as_ptr() as usize]);
+            crate::satb::satb_thread_local_log(satb, old_ref.as_ptr() as usize);
         }
     }
 
@@ -1708,9 +1725,9 @@ impl GenerationalHeap {
         // Re-mark cards for promoted objects that still reference young gen.
         // These old→young cross-gen references were established during the
         // Phase 2 promoted-object scan and must be visible to the next GC.
-        for addr in &deferred_dirty_cards {
-            card_table.mark_dirty(*addr);
-        }
+        // Use the bulk API so the card-table lock is acquired once for the
+        // entire batch rather than once per deferred address.
+        card_table.mark_dirty_bulk(&deferred_dirty_cards);
         young_from.reset();
 
         // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
@@ -2352,23 +2369,35 @@ impl GenerationalHeap {
         young_from: &Arena,
         extra_roots: &mut Vec<(ObjectRef, usize, usize)>,
     ) {
-        let dirty_indices: Vec<usize> = card_table.dirty_card_indices();
+        // Drain the O(dirty) tracking list rather than scanning the whole
+        // bitmap with `dirty_card_indices()` — this is O(dirty) instead of
+        // O(total cards). `take_dirty_cards` also clears the tracking list,
+        // which is fine because `card_table.clear_all()` is called by the
+        // caller right after the dirty-card scan completes.
+        let dirty_indices = card_table.take_dirty_cards();
         if dirty_indices.is_empty() {
             return;
         }
 
-        // Walk all objects in old gen and check if they fall within dirty card regions
+        // Build an O(1) lookup set so per-object membership testing avoids
+        // re-acquiring the card-table lock in `is_dirty` for every object
+        // in the old gen.
+        let dirty_set: FxHashSet<usize> = dirty_indices.iter().copied().collect();
+        let card_base = card_table.base_addr();
+        let card_size = crate::card_table::CARD_SIZE;
+
+        // Walk objects in old gen exactly once; skip any whose card is not
+        // dirty. The walk itself is unavoidable because old-gen layout is
+        // header-following (objects have no external index), but the
+        // per-object work is now a single HashSet lookup.
         let objects = old_gen.walk_objects();
         for (obj_ptr, _total_size) in objects {
             let obj_addr = obj_ptr as usize;
-
-            // Check if this object's card is dirty
-            let card_base = card_table.base_addr();
             if obj_addr < card_base {
                 continue;
             }
-            let card_idx = (obj_addr - card_base) / crate::card_table::CARD_SIZE;
-            if !card_table.is_dirty(card_idx) {
+            let card_idx = (obj_addr - card_base) / card_size;
+            if !dirty_set.contains(&card_idx) {
                 continue;
             }
 

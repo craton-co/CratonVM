@@ -282,22 +282,45 @@ impl Vtable {
     }
 }
 
+/// One concrete itable entry — keeps the `Arc<str>` name + descriptor so
+/// hash collisions can be disambiguated without allocation.
+struct ItableEntry {
+    method_name: Arc<str>,
+    descriptor: Arc<str>,
+    vtable_slot: usize,
+}
+
 /// Interface dispatch table.
 /// Maps interface method signatures to vtable slot numbers.
+///
+/// CRIT — `invokeinterface` is on every interface dispatch. The lookup
+/// must not allocate. The map is keyed by a precomputed
+/// `(interface_class_id, fxhash(name) ^ fxhash(descriptor))` u128, and
+/// the slot bucket carries `Arc<str>` name+descriptor for the (rare)
+/// FxHash-collision disambiguation. Both `register` and `lookup` take
+/// `&str` and never `to_string()`.
 pub struct Itable {
-    /// Maps (interface_class_id, method_name, descriptor) -> vtable slot.
-    entries: HashMap<(u64, String, String), usize>,
+    /// FxHashMap from (interface_class_id, fast_lookup_key) -> candidate
+    /// slot entries. Multiple entries per bucket are only present on
+    /// hash collisions; the common case is a single entry per bucket.
+    entries: FxHashMap<(u64, u64), Vec<ItableEntry>>,
 }
 
 impl Itable {
     /// Create an empty interface table.
     pub fn new() -> Self {
         Itable {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 
     /// Register a mapping from an interface method to a vtable slot.
+    ///
+    /// Takes `&str` for the name/descriptor and interns them as
+    /// `Arc<str>` inside the bucket entry. Callers that already hold
+    /// `Arc<str>` pay a single refcount bump worth of work via
+    /// `Arc::from(name)` rather than a heap copy proportional to the
+    /// method-name length.
     pub fn register(
         &mut self,
         interface_class_id: u64,
@@ -305,26 +328,51 @@ impl Itable {
         descriptor: &str,
         vtable_slot: usize,
     ) {
-        self.entries.insert(
-            (interface_class_id, method_name.to_string(), descriptor.to_string()),
-            vtable_slot,
-        );
+        let key = (interface_class_id, fast_lookup_key(method_name, descriptor));
+        let bucket = self.entries.entry(key).or_default();
+        // Replace if the same name/descriptor already lives in this
+        // bucket (re-register), otherwise append.
+        if let Some(existing) = bucket.iter_mut().find(|e| {
+            &*e.method_name == method_name && &*e.descriptor == descriptor
+        }) {
+            existing.vtable_slot = vtable_slot;
+        } else {
+            bucket.push(ItableEntry {
+                method_name: Arc::from(method_name),
+                descriptor: Arc::from(descriptor),
+                vtable_slot,
+            });
+        }
     }
 
     /// Look up the vtable slot for an interface method.
+    ///
+    /// CRIT — zero allocation. The fast-path key is a 128-bit
+    /// `(class_id, fxhash(name)^fxhash(descriptor))` derived directly
+    /// from the input `&str` slices.
     pub fn lookup(
         &self,
         interface_class_id: u64,
         method_name: &str,
         descriptor: &str,
     ) -> Option<usize> {
-        let key = (interface_class_id, method_name.to_string(), descriptor.to_string());
-        self.entries.get(&key).copied()
+        let key = (interface_class_id, fast_lookup_key(method_name, descriptor));
+        let bucket = self.entries.get(&key)?;
+        for entry in bucket {
+            if &*entry.method_name == method_name && &*entry.descriptor == descriptor {
+                return Some(entry.vtable_slot);
+            }
+        }
+        None
     }
 
     /// Number of registered interface method mappings.
+    ///
+    /// Counts all bucket entries, not just buckets — a multi-candidate
+    /// bucket (FxHash collision) is rare but still has multiple
+    /// distinct registrations.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.values().map(|b| b.len()).sum()
     }
 
     /// Whether the itable is empty.

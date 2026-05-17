@@ -2174,10 +2174,85 @@ pub(crate) fn native_math_get_exponent_double(
 // Step 6: Wrapper type boxing/unboxing
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Cached wrapper ClassIds
+//
+// Every autobox (Integer.valueOf, Boolean.valueOf, Long.valueOf, …) used
+// to call `ctx.ensure_class_initialized("java/lang/Integer")` per
+// invocation. Class init resolution is hashmap-by-name; once initialized,
+// the ClassId never changes for the process lifetime. The 9 wrapper
+// types are looked up tens of millions of times during JDK boot —
+// caching their ClassIds in process-wide atomics removes the per-call
+// name lookup.
+//
+// We store `AtomicU32` (sentinel 0 = "not cached yet") rather than
+// `OnceLock<ClassId>` so a single relaxed-read fast-path replaces the
+// `OnceLock::get` + Mutex check; resolution is idempotent and racing
+// stores both compute the same value.
+struct WrapperClassIdCache {
+    integer: std::sync::atomic::AtomicU32,
+    long: std::sync::atomic::AtomicU32,
+    float: std::sync::atomic::AtomicU32,
+    double: std::sync::atomic::AtomicU32,
+    boolean: std::sync::atomic::AtomicU32,
+    byte: std::sync::atomic::AtomicU32,
+    short: std::sync::atomic::AtomicU32,
+    character: std::sync::atomic::AtomicU32,
+}
+
+static WRAPPER_CIDS: WrapperClassIdCache = WrapperClassIdCache {
+    integer:   std::sync::atomic::AtomicU32::new(0),
+    long:      std::sync::atomic::AtomicU32::new(0),
+    float:     std::sync::atomic::AtomicU32::new(0),
+    double:    std::sync::atomic::AtomicU32::new(0),
+    boolean:   std::sync::atomic::AtomicU32::new(0),
+    byte:      std::sync::atomic::AtomicU32::new(0),
+    short:     std::sync::atomic::AtomicU32::new(0),
+    character: std::sync::atomic::AtomicU32::new(0),
+};
+
+fn wrapper_cid_slot(class_name: &str) -> Option<&'static std::sync::atomic::AtomicU32> {
+    match class_name {
+        "java/lang/Integer"   => Some(&WRAPPER_CIDS.integer),
+        "java/lang/Long"      => Some(&WRAPPER_CIDS.long),
+        "java/lang/Float"     => Some(&WRAPPER_CIDS.float),
+        "java/lang/Double"    => Some(&WRAPPER_CIDS.double),
+        "java/lang/Boolean"   => Some(&WRAPPER_CIDS.boolean),
+        "java/lang/Byte"      => Some(&WRAPPER_CIDS.byte),
+        "java/lang/Short"     => Some(&WRAPPER_CIDS.short),
+        "java/lang/Character" => Some(&WRAPPER_CIDS.character),
+        _ => None,
+    }
+}
+
 /// Helper: allocate a wrapper object with 1 field using a well-known class name.
 /// Falls back to ClassId(0) with 1 field if the class can't be loaded.
+///
+/// For the 8 well-known wrapper classes (Integer, Long, Float, Double,
+/// Boolean, Byte, Short, Character) the resolved ClassId is cached in a
+/// process-wide atomic after the first successful `ensure_class_initialized`,
+/// so subsequent autoboxes skip the name lookup entirely.
 pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> rustjvm_types::ObjectRef {
-    // Try to load the class; if it fails, use a synthetic object
+    // Fast path: hit the wrapper-CID cache for the 8 well-known names.
+    if let Some(slot) = wrapper_cid_slot(class_name) {
+        let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 {
+            return ctx.alloc_object(rustjvm_types::ClassId::new(cached), 1);
+        }
+        // First call: resolve, cache, then allocate.
+        if let Ok(class_id) = ctx.ensure_class_initialized(class_name) {
+            // ClassId::new(0) is the synthetic fallback sentinel — never
+            // cache it (it would defeat the cache miss path).
+            let raw = class_id.as_u32();
+            if raw != 0 {
+                slot.store(raw, std::sync::atomic::Ordering::Relaxed);
+            }
+            return ctx.alloc_object(class_id, 1);
+        }
+        eprintln!("[alloc_wrapper] Failed to init {}", class_name);
+        return ctx.alloc_object(rustjvm_types::ClassId::new(0), 1);
+    }
+    // Non-cached class name (caller used a non-wrapper name).
     match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => ctx.alloc_object(class_id, 1),
         Err(e) => {
@@ -2186,6 +2261,7 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> ru
         }
     }
 }
+
 
 pub(crate) fn native_integer_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = match args.first() {

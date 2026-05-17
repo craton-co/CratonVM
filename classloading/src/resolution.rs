@@ -340,6 +340,47 @@ impl ResolutionCache {
         self.call_sites.clear();
         self.condy.clear();
     }
+
+    /// Round 4 audit fix (CRIT): drop every cached resolution that
+    /// references `class_id`, in any of the four caches.
+    ///
+    /// Called from the JVMTI `RedefineClasses` path (via the
+    /// `ResolutionInvalidateHook` installed at VM init) when the
+    /// bytecode + constant pool of a class are replaced in place. The
+    /// (referring-class, cp-index) keys captured by these caches were
+    /// resolved against the **old** constant pool — after a redefine
+    /// the same cp index in the new pool may refer to a different
+    /// field/method/call-site, and the cached `ResolvedField` /
+    /// `ResolvedMethod` / `ResolvedCallSite` / condy value would
+    /// silently return a stale resolution otherwise.
+    ///
+    /// Two-pronged invalidation:
+    ///   1. drop every entry whose **key** matches `class_id` (the
+    ///      caller side — every cp-index that was looked up from
+    ///      bytecode that just got swapped out);
+    ///   2. drop every entry whose **resolved declaring class** matches
+    ///      `class_id` (the callee side — cached resolutions held by
+    ///      other classes that pointed at a now-redefined method/field
+    ///      body; needed so redefine sees through proxy/intermediate
+    ///      classes that resolved methods *into* the redefined class).
+    ///
+    /// `ResolvedCallSite` and condy values are evicted on the key match
+    /// only — their inner contents don't expose a `declaring_class_id`
+    /// reachable from the cache.
+    pub fn invalidate_class(&mut self, class_id: ClassId) {
+        // Fields: drop by key OR by resolved declaring class.
+        self.fields.retain(|(key_class, _), resolved| {
+            *key_class != class_id && resolved.declaring_class_id != class_id
+        });
+        // Methods: same two-pronged check.
+        self.methods.retain(|(key_class, _), resolved| {
+            *key_class != class_id && resolved.declaring_class_id != class_id
+        });
+        // Call sites + condy: key match only. (Their resolved values
+        // carry no reachable declaring-class link.)
+        self.call_sites.retain(|(key_class, _), _| *key_class != class_id);
+        self.condy.retain(|(key_class, _), _| *key_class != class_id);
+    }
 }
 
 impl Default for ResolutionCache {

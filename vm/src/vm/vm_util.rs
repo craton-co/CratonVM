@@ -672,9 +672,7 @@ fn initialize_class_shared(
                             1,
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        if std::env::var("RUSTJVM_STRICT_SWALLOWS").ok().as_deref()
-                            == Some("1")
-                        {
+                        if crate::runtime::env_cache::strict_swallows() {
                             panic!(
                                 "RUSTJVM_STRICT_SWALLOWS=1: swallow at <clinit> [non-critical-exception]: class={} exc={}",
                                 class_name_for_jfr, exc_detail
