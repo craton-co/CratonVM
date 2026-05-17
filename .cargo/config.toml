@@ -17,10 +17,11 @@
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-feature=+sse4.2,+pclmul"]
 
-# The VM allocates 64 MiB Java thread stacks (vm-cli DEFAULT_JAVA_STACK_SIZE)
-# and recursively interprets deeply nested call chains during class init
-# (HotSpot recursion is well known to require 8+ MiB on Windows). Bump the
-# main-thread stack reservation to 16 MiB to avoid stack overflow inside
-# the launcher before the first JvmThread is even spawned.
+# The launcher spawns the real entry point on a dedicated `main-vm` thread
+# (see `vm-cli/src/main.rs`), but the launcher's OWN thread still runs
+# initialisation (panic-hook install, env parsing) before that spawn — so
+# the link-time stack reservation needs enough headroom for short-lived
+# pre-spawn work plus any panic-unwind handler called on the launcher
+# thread. 16 MiB on Windows is overkill but cheap (reserved, not committed).
 [target.'cfg(target_os = "windows")']
 rustflags = ["-C", "link-arg=/STACK:16777216"]

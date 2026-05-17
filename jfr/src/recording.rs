@@ -86,7 +86,27 @@ impl Recording {
     }
 
     /// Record an event if the recording is running and the event is enabled.
-    /// Accepts `Arc<EventInstance>` to avoid cloning across multiple recordings.
+    /// Accepts `Arc<EventInstance>` so the caller can share the event across
+    /// multiple recordings without re-allocating between callees.
+    ///
+    /// Round-5 HIGH-fix (Bug 3, 2026-05-17): we previously called
+    /// `Arc::try_unwrap` first, falling back to a deep clone on `Err`. In
+    /// the multi-recording fan-out path (`drain_per_thread_into_repository`,
+    /// `M > 1`) the caller deliberately keeps an Arc clone live across the
+    /// loop body so every recording receives a sharing reference — that
+    /// means `try_unwrap` *always* fails. We were paying for an atomic CAS
+    /// (the failed unwrap) on top of the deep clone for every event for
+    /// every recording. The CAS was pure waste.
+    ///
+    /// Now: try `Arc::into_inner` (single atomic, succeeds when this caller
+    /// holds the unique Arc — common in tests and in the final iteration
+    /// after the producer drops its own ref). Fall back to cloning the
+    /// inner directly — strictly necessary because the repository stores
+    /// owned values and other recordings still hold the Arc.
+    ///
+    /// Skip-event fast paths (state, enabled, threshold) happen *before*
+    /// the unwrap/clone, so disabled recordings pay only an Arc deref +
+    /// a refcount decrement on return.
     pub fn record_event_arc(&mut self, event: Arc<EventInstance>) {
         if self.state != RecordingState::Running {
             return;
@@ -101,11 +121,18 @@ impl Recording {
                 return;
             }
         }
-        // Unwrap the Arc — the repository stores owned EventInstance.
-        // Arc::try_unwrap will succeed if this is the last reference; otherwise clone.
-        let owned = match Arc::try_unwrap(event) {
-            Ok(e) => e,
-            Err(arc) => (*arc).clone(),
+        // Clone the inner up front when we are not the unique owner.
+        // `Arc::strong_count` is approximate but a `> 1` answer is reliable
+        // for "must clone": even if another ref drops between the check and
+        // `into_inner`, that races a benign single-Arc fast path. We avoid
+        // the CAS-style probe of `try_unwrap` either way.
+        let owned = if Arc::strong_count(&event) == 1 {
+            // Unique — `into_inner` succeeds without a clone.
+            Arc::into_inner(event).expect("strong_count==1 implies into_inner succeeds")
+        } else {
+            // Shared — clone the inner directly. This is the cost we pay
+            // when M recordings fan out the same event.
+            (*event).clone()
         };
         self.repository.push(owned);
     }
@@ -286,13 +313,28 @@ impl FlightRecorder {
                 }
             }
         } else {
-            // Multiple recordings — share each event via Arc to avoid clones.
+            // Multiple recordings — share each event via Arc. Round-5 HIGH-fix
+            // (Bug 3, 2026-05-17): for the last recipient, drop the
+            // producer's own Arc *before* calling `record_event_arc`, so
+            // the recipient observes `strong_count == 1` and takes ownership
+            // via `Arc::into_inner` without cloning the inner `EventInstance`.
+            // Intermediate recipients must clone (the repository owns by
+            // value, and the next iteration still needs an Arc).
             let ids: Vec<u64> = self.running_ids.clone();
             for ev in drained {
                 let arc_event = Arc::new(ev);
-                for &id in &ids {
-                    if let Some(rec) = self.recordings.get_mut(&id) {
-                        rec.record_event_arc(Arc::clone(&arc_event));
+                if let Some((&last_id, prefix_ids)) = ids.split_last() {
+                    for &id in prefix_ids {
+                        if let Some(rec) = self.recordings.get_mut(&id) {
+                            rec.record_event_arc(Arc::clone(&arc_event));
+                        }
+                    }
+                    // Move the original Arc into the final call — this
+                    // releases the producer's ref before the recipient
+                    // inspects the refcount, enabling the zero-clone
+                    // `Arc::into_inner` fast path.
+                    if let Some(rec) = self.recordings.get_mut(&last_id) {
+                        rec.record_event_arc(arc_event);
                     }
                 }
             }

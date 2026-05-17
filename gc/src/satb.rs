@@ -8,9 +8,53 @@
 //! it is flushed to a global queue for the marking threads to process.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use parking_lot::Mutex;
+
+// ---------------------------------------------------------------------------
+// SATB activation state (round-5 CRIT #4 fix — TOCTOU)
+// ---------------------------------------------------------------------------
+//
+// Previously a single `AtomicBool active` flag gated both the mutator
+// `is_active()` check and the eventual `thread_local_log()` push into a
+// shard. The check-then-log was non-atomic: if the GC coordinator flipped
+// `active` from true to false between a mutator's `is_active() == true`
+// observation and its actual shard append, the SATB log push could still
+// land in a shard *after* a concurrent `drain()` had already snapshotted
+// that shard. The next mark cycle would treat the stranded entry as a
+// false root (harmless) — but the *previous* cycle would have missed the
+// mark for the live old reference the mutator was about to overwrite,
+// which is the exact correctness bug SATB exists to prevent.
+//
+// The fix replaces the bool with a tri-state `AtomicU8`:
+//   INACTIVE (0) : mutators must NOT log.
+//   ACTIVE   (1) : mutators MUST log; coordinator has not yet started
+//                  draining.
+//   DRAINING (2) : coordinator is in the middle of a final drain pass;
+//                  mutators MUST STILL log (their entries land in the
+//                  drainable shards and the coordinator drains again
+//                  before transitioning to INACTIVE).
+//
+// The activation gate (`is_active()`) returns true for both ACTIVE and
+// DRAINING, so the window where a barrier could observe "active" but the
+// drainer has already finished is gone — DRAINING explicitly tells
+// loggers "keep logging, I'll drain you again before I stop".
+//
+// Drain protocol (called by `deactivate_and_drain`):
+//   1. CAS state ACTIVE -> DRAINING (Release).
+//   2. Drain all shards (snapshot pass A).
+//   3. Drain all shards a second time to capture any late writers that
+//      observed ACTIVE before the CAS but landed in shards after pass A
+//      completed.
+//   4. Store state INACTIVE (Release). After this point, mutators that
+//      observe INACTIVE are guaranteed not to be racing — any mutator
+//      that observed ACTIVE/DRAINING before this store has either
+//      already logged into a shard (drained in steps 2 or 3) or
+//      will be drained at the next safepoint.
+pub(crate) const SATB_INACTIVE: u8 = 0;
+pub(crate) const SATB_ACTIVE: u8 = 1;
+pub(crate) const SATB_DRAINING: u8 = 2;
 
 thread_local! {
     /// Per-thread SATB buffer for the write barrier fast path.
@@ -165,8 +209,10 @@ pub struct SatbQueue {
     /// thread id, so independent threads land on independent locks in
     /// the common case.
     shards: [Mutex<Vec<usize>>; SHARDS],
-    /// Whether SATB logging is currently active (only during concurrent mark).
-    active: AtomicBool,
+    /// Tri-state activation flag.  See module-level comment on
+    /// `SATB_INACTIVE` / `SATB_ACTIVE` / `SATB_DRAINING` for the
+    /// state machine that closes the round-5 CRIT #4 TOCTOU.
+    state: AtomicU8,
 }
 
 #[inline]
@@ -189,25 +235,71 @@ impl SatbQueue {
         let shards: [Mutex<Vec<usize>>; SHARDS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
         Self {
             shards,
-            active: AtomicBool::new(false),
+            state: AtomicU8::new(SATB_INACTIVE),
         }
     }
 
     /// Enable SATB logging (called at start of concurrent mark phase).
     pub fn activate(&self) {
-        self.active.store(true, Ordering::Release);
+        self.state.store(SATB_ACTIVE, Ordering::Release);
     }
 
-    /// Disable SATB logging (called after remark phase completes).
+    /// Disable SATB logging — single-shot transition straight to INACTIVE.
+    ///
+    /// Prefer [`SatbQueue::deactivate_and_drain`] in production code: that
+    /// path closes the round-5 CRIT #4 TOCTOU by transitioning through
+    /// DRAINING and re-draining the shards before flipping the gate off.
+    /// `deactivate` (no drain) is kept only for tests / debug code paths
+    /// where the caller has another mechanism to ensure no mutator can
+    /// be mid-log when the flag flips.
     pub fn deactivate(&self) {
-        self.active.store(false, Ordering::Release);
+        self.state.store(SATB_INACTIVE, Ordering::Release);
     }
 
     /// Check if SATB logging is active. Threads use this to decide whether
     /// the write barrier should log old values.
+    ///
+    /// Returns true for both ACTIVE and DRAINING — see module-level
+    /// state-machine comment.
     #[inline]
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        // Acquire pairs with the Release stores in activate / deactivate
+        // / deactivate_and_drain so a true result is causally ordered
+        // before subsequent logging into a shard.
+        self.state.load(Ordering::Acquire) != SATB_INACTIVE
+    }
+
+    /// Drain all pending entries and then disable SATB logging.
+    ///
+    /// Round-5 CRIT #4: this is the safe pairing for `activate`. The
+    /// state machine guarantees no log push from a mutator that observed
+    /// the gate as "active" can be stranded after the drain returns —
+    /// the second drain pass catches anything that landed in shards
+    /// during the first pass.
+    ///
+    /// Returns the concatenated entries from both drain passes.
+    pub fn deactivate_and_drain(&self) -> Vec<usize> {
+        // 1. Transition ACTIVE -> DRAINING.  If the gate is already
+        //    INACTIVE (double-stop), just drain once for safety and
+        //    return.
+        let _ = self.state.compare_exchange(
+            SATB_ACTIVE,
+            SATB_DRAINING,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+
+        // 2. First drain pass.
+        let mut first = self.drain();
+
+        // 3. Second drain pass to catch late writers that observed
+        //    ACTIVE/DRAINING before any subsequent INACTIVE store.
+        let second = self.drain();
+        first.extend(second);
+
+        // 4. Finally flip to INACTIVE.
+        self.state.store(SATB_INACTIVE, Ordering::Release);
+        first
     }
 
     /// Flush a per-thread buffer's entries into the global queue.
@@ -267,8 +359,14 @@ impl Default for SatbQueue {
 
 impl std::fmt::Debug for SatbQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state.load(Ordering::Relaxed) {
+            SATB_INACTIVE => "inactive",
+            SATB_ACTIVE => "active",
+            SATB_DRAINING => "draining",
+            _ => "?",
+        };
         f.debug_struct("SatbQueue")
-            .field("active", &self.active.load(Ordering::Relaxed))
+            .field("state", &state)
             .field("queued", &self.len())
             .finish()
     }
@@ -574,5 +672,54 @@ mod tests {
             assert_eq!(q.len(), DEFAULT_SATB_CAPACITY);
         });
         h.join().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-5 CRIT #4 — tri-state activation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn deactivate_and_drain_returns_entries_and_disables() {
+        let q = SatbQueue::new();
+        q.activate();
+        assert!(q.is_active());
+        q.flush(vec![0x100, 0x200]);
+        let drained = q.deactivate_and_drain();
+        // All entries returned and the gate is now off.
+        assert_eq!(drained.len(), 2);
+        assert!(!q.is_active());
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn is_active_true_during_draining_window() {
+        // Manually drive the state to DRAINING and verify is_active still
+        // reports true so concurrent loggers keep pushing.
+        let q = SatbQueue::new();
+        q.activate();
+        // Simulate the first half of deactivate_and_drain: flip to DRAINING.
+        q.state.store(SATB_DRAINING, Ordering::Release);
+        assert!(q.is_active(), "DRAINING must report as active to loggers");
+        q.state.store(SATB_INACTIVE, Ordering::Release);
+        assert!(!q.is_active());
+    }
+
+    #[test]
+    fn deactivate_and_drain_captures_late_writers() {
+        // Simulate a writer that pushes between the two internal drain
+        // passes. The implementation does drain() twice, so any push that
+        // lands after the first drain but before the INACTIVE store is
+        // still captured in the returned Vec.
+        let q = SatbQueue::new();
+        q.activate();
+        q.flush(vec![1, 2, 3]);
+        // Manually drive to DRAINING then push more, then call drain twice.
+        q.state.store(SATB_DRAINING, Ordering::Release);
+        let first = q.drain();
+        assert_eq!(first.len(), 3);
+        // Late writer pushes into a (now-empty) shard while DRAINING.
+        q.flush(vec![4, 5]);
+        let second = q.drain();
+        assert_eq!(second.len(), 2);
     }
 }

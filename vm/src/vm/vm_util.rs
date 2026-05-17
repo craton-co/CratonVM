@@ -68,6 +68,19 @@ pub fn ensure_class_initialized_shared(
     // dispatch, JIT entry, reflection). A single relaxed atomic load
     // returns immediately on the steady-state hot path.
     //
+    // Round-8 CRIT fix (audit `round8-classloading-reader.md` §3): the
+    // inner `init_states` map was previously a `std::sync::RwLock`,
+    // which meant the "fast path" was really two RwLock acquires
+    // (the outer `class_manager.read()` plus the inner `init_states
+    // .read()`) plus an Arc::clone — not an "atomic load only". The
+    // inner lock is now a `parking_lot::RwLock`, so the uncontended
+    // read is a single CAS with no poison check, no `Result` unwrap,
+    // and no futex syscall. The outer `class_manager.read()` is still
+    // a std `RwLock` (the ClassManager is shared widely and changing
+    // its type would be a much larger churn), but profiling shows
+    // that lock is rarely contended in the steady state — the inner
+    // map lock was the hot one.
+    //
     // The handle is obtained inside `class_manager.read()` once; the
     // resulting `Arc<AtomicU8>` lives long enough that the read lock
     // can be dropped before the load is performed. Subsequent loads
@@ -2730,6 +2743,7 @@ mod tests {
                 has_finalizer: false,
                 code_source: None,
                 array_info: None,
+                init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             });
             id
         };

@@ -50,17 +50,32 @@ static JFR_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Returns whether any flight recording is currently running.
 ///
-/// This is the fast-path check used by every `emit_*` function — a single
-/// relaxed atomic load that the JIT/branch predictor can elide.
+/// This is the fast-path check used by every `emit_*` function.
+///
+/// Round-5 CRIT-fix (Bug 2, 2026-05-17): uses `Acquire` ordering so it
+/// correctly pairs with the `Release` store in `set_enabled`. Previously
+/// this was `Relaxed`, which paired with nothing — on a weakly-ordered
+/// architecture (ARM64, POWER) a producer could observe
+/// `is_enabled() == true` while still seeing stale values for
+/// type-registry slots, `cached_event_id` caches, or `running_ids` snapshots
+/// that the recording-start path wrote *before* flipping the flag. The
+/// observable bug was first-batch events on a fresh recording silently
+/// dropping (or recording with an INVALID `type_id`) until the producer
+/// happened to re-fetch the registry.
+///
+/// On x86/x86_64 (TSO) `Acquire` is identical in cost to `Relaxed` for a
+/// simple load. ARM64 pays one LDAR — still cheap, and the correctness
+/// pairing matters far more than the nanosecond difference per emit.
 #[inline(always)]
 pub fn is_enabled() -> bool {
-    JFR_ENABLED.load(Ordering::Relaxed)
+    JFR_ENABLED.load(Ordering::Acquire)
 }
 
 /// Set the global JFR-enabled flag. Called by `FlightRecorder::start_recording`
 /// and `stop_recording`. Uses `Release` ordering so writes that precede the
 /// store (e.g. registry inserts during recording setup) are visible to readers
-/// that subsequently observe `is_enabled() == true`.
+/// that subsequently observe `is_enabled() == true` via the matching
+/// `Acquire` load in [`is_enabled`].
 pub fn set_enabled(v: bool) {
     JFR_ENABLED.store(v, Ordering::Release);
 }

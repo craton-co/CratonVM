@@ -117,6 +117,51 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
 }
 
+// ---------------------------------------------------------------------------
+// Per-segment resize lock (Bug 1 CRIT correctness fix)
+// ---------------------------------------------------------------------------
+//
+// Lock-free CHM readers walk old bucket chains and follow NEXT pointers via
+// `get_field_volatile`. When `map_resize` mutates a chain's NEXT pointers in
+// place to splice the hi/lo partitions, a concurrent reader can skip past
+// the keys living in the hi partition and return a spurious miss.
+//
+// The proper long-term fix is clone-resize: allocate fresh Node objects for
+// the new hi/lo sub-chains and leave the OLD chain untouched so readers
+// observing the OLD buckets array can still walk it correctly. That requires
+// invasive changes to `map_resize` and the node alloc path.
+//
+// TODO(round-6+): replace the RwLock with a clone-resize implementation that
+// allocates new Node objects via `alloc_node` and links the new sub-chains
+// without mutating the old chain. The old chain is then unreachable from the
+// new buckets array and becomes GC-collectible. That restores fully
+// lock-free reads.
+//
+// Interim correctness fix: a per-segment `RwLock` is acquired in write mode
+// around `map_resize` and in read mode around `chm_seg_get`. Concurrent
+// readers serialize against an in-progress resize but parallel reads still
+// proceed. This is keyed by the segment's heap pointer (segments live for
+// the lifetime of the CHM, so the address is stable).
+fn chm_seg_resize_locks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<usize, std::sync::Arc<std::sync::RwLock<()>>>,
+> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<usize, std::sync::Arc<std::sync::RwLock<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn chm_seg_lock_for(seg: ObjectRef) -> std::sync::Arc<std::sync::RwLock<()>> {
+    let key = seg.as_ptr() as usize;
+    let mut map = chm_seg_resize_locks().lock().unwrap_or_else(|e| e.into_inner());
+    std::sync::Arc::clone(
+        map.entry(key)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(()))),
+    )
+}
+
 /// RAII guard for a native monitor (`ctx.monitor_enter` / `monitor_exit`).
 ///
 /// CRIT fix (round-5): the previous CHM write path performed
@@ -163,7 +208,26 @@ impl Drop for ChmMonitorGuard {
         // by the `&mut dyn NativeContext` borrow used in `acquire`. No
         // other code can drop or invalidate the context while the guard
         // is live.
-        unsafe { (*self.ctx).monitor_exit(self.seg) };
+        //
+        // Bug 4 (HIGH): if `monitor_exit` itself panics while we are
+        // already unwinding from a panic in the protected block, Rust
+        // promotes the second panic to an abort. Catch any panic from
+        // `monitor_exit` here so we degrade to a leaked monitor + log
+        // instead of taking down the whole VM. The closure captures a
+        // raw pointer (`self.ctx`) plus a Copy ObjectRef, neither of
+        // which carries UnwindSafe bounds, so we wrap in
+        // `AssertUnwindSafe` — `monitor_exit` does not maintain
+        // invariants that would be broken by an unwinding caller.
+        let ctx_ptr = self.ctx;
+        let seg = self.seg;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            (*ctx_ptr).monitor_exit(seg);
+        }));
+        if result.is_err() {
+            eprintln!(
+                "[CHM] monitor_exit panicked during ChmMonitorGuard::drop — ignoring to avoid double-panic abort"
+            );
+        }
     }
 }
 
@@ -1294,6 +1358,21 @@ const MAP_MAX_CAPACITY: i32 = 1 << 30;
 
 /// Resize the HashMap when load factor is exceeded.
 fn map_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // Bug 1 (CRIT) interim fix: take the write-lock on this segment's
+    // resize lock to exclude concurrent CHM lock-free readers in
+    // `chm_seg_get`. The in-place NEXT mutations below would otherwise
+    // make readers skip past hi-partition entries (spurious miss).
+    //
+    // This lock is harmless for non-CHM single-threaded HashMap users
+    // (zero contention). For CHM, it serializes resize against
+    // concurrent reads but parallel reads still proceed.
+    //
+    // TODO(round-6+): replace with a clone-resize that allocates fresh
+    // Node objects for the new sub-chains and leaves the old chain
+    // untouched, so reads can stay fully lock-free.
+    let resize_lock = chm_seg_lock_for(this);
+    let _write_guard = resize_lock.write().unwrap_or_else(|e| e.into_inner());
+
     let (old_buckets, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
         return; // cannot grow further
@@ -14502,6 +14581,15 @@ fn chm_seg_get(
         Value::Object(None) => (None, 0, true),
         _ => return None,
     };
+    // Bug 1 (CRIT) interim fix: take a read-lock against any in-progress
+    // `map_resize` on this segment. The resize path mutates old-chain
+    // NEXT pointers in place, which can cause lock-free readers to skip
+    // past keys living in the hi partition. The read-lock serializes
+    // readers against the writer's mutation; parallel reads remain
+    // concurrent. See chm_seg_resize_locks() doc for the long-term
+    // clone-resize TODO.
+    let resize_lock = chm_seg_lock_for(seg);
+    let _read_guard = resize_lock.read().unwrap_or_else(|e| e.into_inner());
     // Acquire-load the buckets array reference. If the writer has
     // begun publishing a new array, we see either the old one (with a
     // fully-linked chain) or the new one (also fully-linked) — never a

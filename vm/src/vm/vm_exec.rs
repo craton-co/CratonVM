@@ -1908,20 +1908,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .set_interrupted_flag(tid, pre_interrupted.clone());
 
         let thread_obj_for_spawn = thread_obj;
-        // RKC16N.30 — child Java threads need the same 64 MB native stack
-        // that the main-vm thread gets in `vm-cli/src/main.rs`. The default
-        // Rust thread stack (2 MB on Windows) overflows during deeply
-        // recursive Java callees (e.g. BouncyCastle provider self-test
-        // chains thousands of `<clinit>` levels deep, JDK Stream pipeline
-        // composition, recursive parser combinators), and the Windows
-        // SEH-converted SIGSEGV is opaque — no Java stack trace, no panic,
-        // just a process exit code 139. Match the main-vm sizing so any
-        // user `Thread.start()` gets the same headroom as the entry point.
-        // Stack size honours `RUST_MIN_STACK` so callers can override.
+        // Child Java threads get the same native stack budget as the main-vm
+        // thread in `vm-cli/src/main.rs`. HotSpot's `-Xss` default is 1-2 MiB
+        // depending on platform; we use 2 MiB. The previous 64 MiB reservation
+        // was 64x HotSpot for no measured benefit and exploded VSZ on workloads
+        // that spawn many threads (web servers, GC workers, etc.). Stack size
+        // honours `RUST_MIN_STACK` so any test or workload that genuinely needs
+        // more (e.g. recursive parser combinators) can override. A future
+        // `-Xss` CLI flag should drive this knob instead of the env var.
         let child_stack_size = std::env::var("RUST_MIN_STACK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(64 * 1024 * 1024);
+            .unwrap_or(2 * 1024 * 1024);
         let thread_name_for_builder = name.clone();
         let handle = std::thread::Builder::new()
             .name(thread_name_for_builder)
@@ -9392,6 +9390,7 @@ mod tests {
             signature: None,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)

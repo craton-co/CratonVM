@@ -23,7 +23,14 @@ env:
   # Microbenchmarks are noisy on shared CI runners; -Copt-level=3 is
   # already implied by --release. Pin the rust toolchain for
   # reproducibility.
-  RUSTFLAGS: -Dwarnings
+  #
+  # IMPORTANT: setting RUSTFLAGS here REPLACES (does not merge with) any
+  # `rustflags = [...]` from `.cargo/config.toml`. The config file enables
+  # `+sse4.2,+pclmul` for x86_64; without these the bench-gate measures a
+  # baseline (x86-64-v1) build that does NOT reflect shipping binaries, and
+  # any regression numbers are meaningless. Include the config-toml flags
+  # explicitly so the gate exercises the same ISA users actually run.
+  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmul -Dwarnings"
 
 jobs:
   bench-gate:

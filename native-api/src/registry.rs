@@ -778,9 +778,22 @@ pub trait NativeContext {
     fn atomic_fetch_add_int(&mut self, obj: ObjectRef, index: usize, delta: i32) -> i32 {
         loop {
             let current = self.get_field_volatile(obj, index);
+            // Bug 3 (CRIT type corruption): the previous default impl
+            // silently fell back to old=0 for non-Int slots, then
+            // CAS-wrote `Value::Int(delta)` over the existing slot —
+            // corrupting both the numeric value and the field's type
+            // tag (a Long field would become Int). Panic on type
+            // mismatch so the caller's mis-dispatch surfaces
+            // immediately. The Long → atomic_fetch_add_long delegation
+            // is intentionally NOT done here because the int-variant's
+            // i32 return type cannot losslessly carry a Long previous
+            // value; callers must route via the correct accessor.
             let old = match current {
                 Value::Int(v) => v,
-                _ => 0,
+                other => panic!(
+                    "atomic_fetch_add_int: field {} on object is not Int: {:?}",
+                    index, other
+                ),
             };
             let new_val = Value::Int(old.wrapping_add(delta));
             if self.compare_and_swap_field(obj, index, current, new_val) {
@@ -795,9 +808,17 @@ pub trait NativeContext {
     fn atomic_fetch_add_long(&mut self, obj: ObjectRef, index: usize, delta: i64) -> i64 {
         loop {
             let current = self.get_field_volatile(obj, index);
+            // Bug 3 (CRIT type corruption): refuse to silently rewrite a
+            // non-Long slot. The previous default impl's `_ => 0` arm
+            // turned a wrong-typed field (Int, Reference, …) into
+            // `Value::Long(delta)`, permanently corrupting the slot's
+            // type tag.
             let old = match current {
                 Value::Long(v) => v,
-                _ => 0,
+                other => panic!(
+                    "atomic_fetch_add_long: field {} on object is not Long: {:?}",
+                    index, other
+                ),
             };
             let new_val = Value::Long(old.wrapping_add(delta));
             if self.compare_and_swap_field(obj, index, current, new_val) {

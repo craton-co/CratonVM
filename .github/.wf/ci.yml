@@ -8,7 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+  # IMPORTANT: setting RUSTFLAGS here REPLACES (does not merge with) any
+  # `rustflags = [...]` from `.cargo/config.toml`. The config file enables
+  # `+sse4.2,+pclmul` for x86_64; if we ship without those features the CI
+  # binary diverges from the released binary. Include the config-toml flags
+  # explicitly so the CI matches what users actually run.
+  RUSTFLAGS: "-C target-feature=+sse4.2,+pclmul -Dwarnings"
 
 jobs:
   build-and-test:

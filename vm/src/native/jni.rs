@@ -1032,18 +1032,54 @@ extern "C" fn jni_get_method_id(
     if clazz == 0 {
         return 0;
     }
+    // Round 8 audit fix (CRIT #2): probe the per-VM `LinkResolver` to
+    // dedupe the `(class, name, descriptor)` hierarchy walk. JNI
+    // `GetMethodID` is hot on any C-extension entry path (Hibernate
+    // ByteBuddy proxies, JNI-heavy libraries like SQLite-JDBC, native
+    // image bridges) and the same triple is queried thousands of times
+    // per cold start. Cache hits avoid the full `find_method_recursive`
+    // walk + the per-class linear `methods` position scan.
     with_shared_vm(|shared| {
+        use rustjvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
-        let cm = shared.class_manager.read();
-        let (_method, declaring_class) =
-            find_method_recursive(class_id, name_str, sig_str, &cm.class_store)?;
-        // Find the method's index in the declaring class's methods vec
-        let decl = cm.class_store.get(declaring_class)?;
-        let idx = decl
-            .methods
-            .iter()
-            .position(|m| &*m.name == name_str && &*m.descriptor == sig_str)?;
-        Some(encode_method_id(declaring_class, idx as u16))
+        let resolved = {
+            let cm = shared.class_manager.read();
+            shared.link_resolver.resolve_or_compute(
+                class_id,
+                name_str,
+                sig_str,
+                || {
+                    let result = find_method_recursive(
+                        class_id, name_str, sig_str, &cm.class_store,
+                    )
+                    .and_then(|(_, declaring)| {
+                        let decl = cm.class_store.get(declaring)?;
+                        let idx = decl.methods.iter().position(|m| {
+                            &*m.name == name_str && &*m.descriptor == sig_str
+                        })?;
+                        Some((declaring, idx as u32))
+                    });
+                    let resolved = match result {
+                        Some((d, i)) => ResolvedMember::Method {
+                            declaring_class_id: d,
+                            index: i,
+                        },
+                        None => ResolvedMember::NotFound,
+                    };
+                    (
+                        rustjvm_types::intern_arc(name_str),
+                        rustjvm_types::intern_arc(sig_str),
+                        resolved,
+                    )
+                },
+            )
+        };
+        match resolved {
+            ResolvedMember::Method { declaring_class_id, index } => {
+                Some(encode_method_id(declaring_class_id, index as u16))
+            }
+            _ => None,
+        }
     })
     .flatten()
     .unwrap_or(0)
@@ -1447,12 +1483,52 @@ extern "C" fn jni_get_field_id(
     if clazz == 0 {
         return 0;
     }
+    // Round 8 audit fix (CRIT #2): probe the per-VM `LinkResolver`.
+    // The signature `_sig` parameter is currently ignored by lookup
+    // (matching the existing impl above), so we pass an empty
+    // descriptor as the cache key's third element — for fields the
+    // (class, name) pair is unique within a class anyway.
     with_shared_vm(|shared| {
+        use rustjvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
-        let cm = shared.class_manager.read();
-        let (field_index, _, declaring_class) =
-            find_field_recursive(class_id, name_str, &cm.class_store)?;
-        Some(encode_field_id(declaring_class, field_index))
+        let resolved = {
+            let cm = shared.class_manager.read();
+            shared.link_resolver.resolve_or_compute(
+                class_id,
+                name_str,
+                "",
+                || {
+                    let result = find_field_recursive(
+                        class_id, name_str, &cm.class_store,
+                    );
+                    let resolved = match result {
+                        Some((field_index, field, declaring)) => {
+                            ResolvedMember::Field {
+                                declaring_class_id: declaring,
+                                absolute_index: field_index as u32,
+                                is_static: field
+                                    .access_flags
+                                    .contains(
+                                        rustjvm_reader::class_access_flags::FieldAccessFlags::STATIC,
+                                    ),
+                            }
+                        }
+                        None => ResolvedMember::NotFound,
+                    };
+                    (
+                        rustjvm_types::intern_arc(name_str),
+                        rustjvm_types::intern_arc(""),
+                        resolved,
+                    )
+                },
+            )
+        };
+        match resolved {
+            ResolvedMember::Field { declaring_class_id, absolute_index, .. } => {
+                Some(encode_field_id(declaring_class_id, absolute_index as usize))
+            }
+            _ => None,
+        }
     })
     .flatten()
     .unwrap_or(0)

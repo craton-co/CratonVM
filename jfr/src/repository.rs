@@ -124,6 +124,19 @@ impl EventRepository {
         self.events.iter()
     }
 
+    /// Random-access read of the `rel`-th currently-buffered event (0-based,
+    /// relative to `base_index`). O(1) — the backing `VecDeque` indexes in
+    /// constant time.
+    ///
+    /// Round-5 HIGH-fix (Bug 5, 2026-05-17): `EventStream::next_event` was
+    /// calling `iter().nth(rel)` for each call, which is O(rel) and made a
+    /// full filtered drain quadratic in the number of events. Callers
+    /// should use this method when they already know the relative index.
+    #[inline]
+    pub fn get(&self, rel: usize) -> Option<&EventInstance> {
+        self.events.get(rel)
+    }
+
     pub fn len(&self) -> usize {
         self.events.len()
     }
@@ -559,8 +572,41 @@ impl SpscEventRing {
 
 impl Drop for SpscEventRing {
     fn drop(&mut self) {
-        // Drop any events still buffered. Safe to use `&mut self` here: this
-        // is single-threaded by virtue of being a drop.
+        // Round-5 CRIT-fix (Bug 1, 2026-05-17): a consumer may still be
+        // mid-`try_pop` / `drain_into` on this ring while `Drop` runs.
+        // Freeing `slots` (the boxed `[UnsafeCell<MaybeUninit<EventInstance>>]`)
+        // under a live consumer would let the consumer's `assume_init_read`
+        // touch deallocated memory — a use-after-free during shutdown.
+        //
+        // The producer side is naturally safe at drop time (the producer
+        // owns the Arc<SpscEventRing> via its thread-local; if we are
+        // dropping, no producer reference survives). The risk is a drainer
+        // that grabbed an `Arc<SpscEventRing>` from the registry via
+        // `drain_all` and is between the `consumer_busy` Acquire-CAS and
+        // its Release store. Spin-then-park on the gate before tearing
+        // down. If a drainer is stuck for an unreasonably long time, emit
+        // a warning and leak the slot storage — slots are tiny (1024 *
+        // sizeof(EventInstance)) and leaking on shutdown is preferable to
+        // UAF.
+        let mut spins = 0u32;
+        while self.consumer_busy.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+            spins += 1;
+            if spins > 10_000 {
+                eprintln!(
+                    "WARN: SpscEventRing dropped with consumer still active; \
+                     leaking slot storage to avoid use-after-free"
+                );
+                // Replace slots with an empty box so `Drop` for the field
+                // frees nothing; the original allocation is forgotten.
+                let leaked =
+                    std::mem::replace(&mut self.slots, Vec::new().into_boxed_slice());
+                std::mem::forget(leaked);
+                return;
+            }
+        }
+        // Consumer gate is clear and `&mut self` guarantees no further
+        // entrance — single-threaded teardown from here.
         let head = *self.head.get_mut();
         let mut tail = *self.tail.get_mut();
         while tail != head {

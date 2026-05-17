@@ -444,6 +444,63 @@ impl EventDispatchThread {
         events
     }
 
+    /// Round-8 EDT throughput fix: coalesce adjacent same-peer paint
+    /// events in the queue AND drain the result in a single lock
+    /// acquisition.
+    ///
+    /// Background: the prior two-step pattern
+    /// `coalesce_paint_events(); drain_events();` took the queue mutex
+    /// twice and let an event-poster slip in between, so a paint event
+    /// landing right after `coalesce_paint_events` returned was not
+    /// coalesced with whatever the EDT was about to process. Under
+    /// contention (mouse-drag generating paint storms) that meant
+    /// queue-tail merges were lost and the EDT did unnecessary repaint
+    /// passes.
+    ///
+    /// This single-lock variant performs coalescing in-place on the
+    /// queue then drains, so a concurrent post during the operation
+    /// either lands before the lock (and gets coalesced) or after
+    /// the drain returns (and is processed on the next EDT cycle) —
+    /// never half-and-half.
+    pub fn coalesce_and_drain(&self) -> Vec<AwtEvent> {
+        let mut q = self.queue.lock();
+
+        if q.len() >= 2 {
+            let mut coalesced: VecDeque<AwtEvent> = VecDeque::with_capacity(q.len());
+            while let Some(evt) = q.pop_front() {
+                if !evt.is_paint() {
+                    coalesced.push_back(evt);
+                    continue;
+                }
+                let merged = if let Some(last) = coalesced.back_mut() {
+                    if last.is_paint() && last.source_peer_id == evt.source_peer_id {
+                        Self::merge_paint_rects(last, &evt);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !merged {
+                    coalesced.push_back(evt);
+                }
+            }
+            *q = coalesced;
+        }
+
+        let events: Vec<AwtEvent> = q.drain(..).collect();
+        // Drop the queue lock before invoking `notify_if_invocation`,
+        // which acquires `runnables` and may itself take other locks —
+        // keeping the queue lock held across that path would re-introduce
+        // the contention this method exists to eliminate.
+        drop(q);
+        for e in &events {
+            self.notify_if_invocation(e);
+        }
+        events
+    }
+
     /// Number of events currently in the queue.
     pub fn queue_length(&self) -> usize {
         self.queue.lock().len()
@@ -867,5 +924,35 @@ mod tests {
         } else {
             panic!("expected Paint");
         }
+    }
+
+    #[test]
+    fn coalesce_and_drain_combines_paints_and_drains_in_one_lock() {
+        // Round-8 EDT throughput fix: the combined entry point must
+        // (a) coalesce adjacent same-peer paints exactly like
+        // `coalesce_paint_events` would, and (b) return every remaining
+        // event in queue order — leaving the queue empty.
+        let edt = make_edt();
+        let peer = PeerId(7);
+        edt.post_event(AwtEvent::paint(event_id::PAINT, peer, 0, 0, 0, 10, 10));
+        edt.post_event(AwtEvent::paint(event_id::PAINT, peer, 1, 5, 5, 10, 10));
+        edt.post_event(AwtEvent::mouse(
+            event_id::MOUSE_CLICKED, peer, 2, 1, 1, 1, 1, 0,
+        ));
+        edt.post_event(AwtEvent::paint(event_id::PAINT, peer, 3, 50, 50, 10, 10));
+
+        let drained = edt.coalesce_and_drain();
+        // Two paints merged + one mouse + one trailing paint = 3 events.
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].id, event_id::PAINT);
+        if let AwtEventData::Paint { x, y, width, height } = &drained[0].data {
+            // Bounding union of (0,0,10,10) and (5,5,10,10) = (0,0,15,15)
+            assert_eq!((*x, *y, *width, *height), (0, 0, 15, 15));
+        } else {
+            panic!("expected Paint");
+        }
+        assert_eq!(drained[1].id, event_id::MOUSE_CLICKED);
+        assert_eq!(drained[2].id, event_id::PAINT);
+        assert_eq!(edt.queue_length(), 0);
     }
 }

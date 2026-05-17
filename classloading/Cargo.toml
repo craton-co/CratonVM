@@ -19,6 +19,11 @@ tracing.workspace = true
 parking_lot = "0.12"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rustc-hash = "1.1"
+# Round 8 audit fix (CRIT): hashbrown provides stable `raw_entry_mut` API used
+# by `LinkResolver::get` to probe the `(ClassId, Arc<str>, Arc<str>)` cache by
+# `(ClassId, &str, &str)` without paying two Arc clones per hit. std's
+# `raw_entry_mut` is still nightly-only.
+hashbrown = "0.14"
 # Round 7 audit fix (MED #12): memory-mapped JAR / .class file reads.
 # Replaces 8 `fs::read` slurp sites in class_path.rs. On Spring-Boot
 # fat-JARs (~80 MB) this avoids a per-load full-into-memory copy that

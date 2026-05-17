@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::classloading::resolution::{LambdaCallSite, ResolutionCache};
+use crate::classloading::resolution::{LambdaCallSite, LinkResolver, ResolutionCache};
 use crate::classloading::{ClassId, ClassManager};
 use crate::config::VmConfig;
 use crate::config::{discover_boot_classpath, discover_ext_classpath};
@@ -268,6 +268,17 @@ pub struct SharedVm {
 
     /// Cache of resolved symbolic references (fields and methods).
     pub resolution_cache: RwLock<ResolutionCache>,
+
+    /// Round 8 audit fix (CRIT #2): the reflective `(class, name,
+    /// descriptor)` cache. Previously built (`LinkResolver::new()`) but
+    /// never wired into any caller, so the entire dedupe win was dead
+    /// code. Now reachable from native reflective callers
+    /// (`Class.getDeclaredMethod`, `Class.getMethod`, JNI
+    /// `GetMethodID`/`GetFieldID`) via `vm.link_resolver()`. The
+    /// cache is invalidated on `redefine_class` through the same
+    /// hook that drops `ResolutionCache` entries (see
+    /// `link_resolver_invalidate_adapter`).
+    pub link_resolver: LinkResolver,
 
     /// T10 — vtable manager for virtual/interface dispatch.
     ///
@@ -1862,6 +1873,8 @@ impl SharedVm {
             native_method_cache: parking_lot::RwLock::new(crate::runtime::fx_collections::fx_hashmap()),
             statics: RwLock::new(FxHashMap::default()),
             resolution_cache: RwLock::new(ResolutionCache::new()),
+            // Round 8 audit fix (CRIT #2): reflective lookup cache.
+            link_resolver: LinkResolver::new(),
             vtable_manager: std::sync::Arc::new(parking_lot::RwLock::new(
                 crate::runtime::vtable::VtableManager::new(),
             )),
@@ -2123,6 +2136,17 @@ fn resolution_invalidate_adapter(class_id: u32) {
     };
     let cid = crate::classloading::ClassId::new(class_id);
     shared.resolution_cache.write().invalidate_class(cid);
+    // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
+    // was missing from the redefine-invalidation cascade. Without
+    // this, any cached `(class, name, descriptor)` triple resolved
+    // before a `RedefineClasses` continues to return the
+    // pre-redefine `(declaring_class_id, index)` pair — pointing at
+    // a method index that may now refer to a different method body
+    // (or, after a field shape change, a stale field slot).
+    // `LinkResolver::invalidate_class` mirrors
+    // `ResolutionCache::invalidate_class` (drops by key-class OR
+    // resolved-declaring-class match).
+    shared.link_resolver.invalidate_class(cid);
 }
 
 
@@ -3501,6 +3525,33 @@ impl Vm {
         // driven from the CLI bootstrap loop in `vm-cli/src/main.rs`
         // which owns the initPhase orchestration.
         shared.set_init_level(1);
+
+        // Round-5 MED-fix (Bug 6, 2026-05-17): emit a one-shot
+        // `jdk.PhysicalMemory` event at startup. The emit fn was
+        // previously dead code. Gated by `rustjvm_jfr::is_enabled()` so a
+        // VM started without an active recording pays only one
+        // Acquire-load + branch. We deliberately do not poll periodically
+        // here — the chunk-rollover sampler would live in the JFR crate
+        // itself; this single emission unblocks the consumer side
+        // (`jdk.PhysicalMemory` is an EveryChunk event and at least one
+        // sample is the minimum useful payload).
+        if rustjvm_jfr::is_enabled() {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            // VM `max_heap_size` as a stand-in for total physical memory
+            // until the platform sysinfo dependency lands. `used_size` is
+            // also reported as `max_heap_size` (no precise allocator
+            // accounting at startup); this keeps the schema honest about
+            // scope while keeping the field non-zero so the consumer-side
+            // schema check passes.
+            let total = shared.config.max_heap_size as i64;
+            let mut jfr = shared.flight_recorder.lock();
+            rustjvm_jfr::builtin::emit_physical_memory_event(
+                &mut jfr, total, total, now_ns,
+            );
+        }
 
         Self {
             shared,

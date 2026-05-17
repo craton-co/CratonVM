@@ -1101,6 +1101,16 @@ pub const MATH_ABS_LONG_INTRINSIC: usize = usize::MAX - 7;
 /// software-correct fused operation.
 pub const MATH_FMA_DOUBLE_INTRINSIC: usize = usize::MAX - 8;
 pub const MATH_FMA_FLOAT_INTRINSIC: usize = usize::MAX - 9;
+// Round-8 Bug 8: branchless `Math.min(int,int)` / `Math.max(int,int)` /
+// long variants via CMOV. Per JLS these are total functions with no NaN /
+// trap edge cases on integral inputs — straight `cmp` + `cmovl`/`cmovg`
+// in two GPRs. Replaces a compare + Jcc + branch with a single CMOV;
+// removes a hard-to-predict branch on sorting / argmin kernels where
+// the input distribution beats the branch predictor.
+pub const MATH_MIN_INT_INTRINSIC: usize = usize::MAX - 10;
+pub const MATH_MAX_INT_INTRINSIC: usize = usize::MAX - 11;
+pub const MATH_MIN_LONG_INTRINSIC: usize = usize::MAX - 12;
+pub const MATH_MAX_LONG_INTRINSIC: usize = usize::MAX - 13;
 
 /// A resolved direct-call target.
 pub struct JitDirectCall {
@@ -2583,6 +2593,11 @@ fn try_compile_inner(
                         // T1.1.28 — Math.fma (fused multiply-add).
                         ("fma", "(DDD)D") => Some((MATH_FMA_DOUBLE_INTRINSIC, 3, b'D')),
                         ("fma", "(FFF)F") => Some((MATH_FMA_FLOAT_INTRINSIC, 3, b'F')),
+                        // Round-8 Bug 8 — branchless integer min/max via CMOV.
+                        ("min", "(II)I") => Some((MATH_MIN_INT_INTRINSIC, 2, b'I')),
+                        ("max", "(II)I") => Some((MATH_MAX_INT_INTRINSIC, 2, b'I')),
+                        ("min", "(JJ)J") => Some((MATH_MIN_LONG_INTRINSIC, 2, b'J')),
+                        ("max", "(JJ)J") => Some((MATH_MAX_LONG_INTRINSIC, 2, b'J')),
                         _ => None,
                     };
                     if let Some((entry, num_params, ret)) = intrinsic {

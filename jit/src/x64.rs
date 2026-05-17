@@ -2923,6 +2923,18 @@ struct Compiler {
     /// Deferred out-of-line bounds-check failure stubs: (branch_patch_offset, bc_pc).
     /// After the main bytecode loop, we emit the slow-path code for each.
     bounds_check_stubs: Vec<usize>,
+    /// Round-8 CRIT fix (audit `round8-jit.md`, "false-promise abort" item):
+    /// deferred null-check failure stubs for inline array-store opcodes
+    /// (iastore / bastore / aastore / lastore / fastore / dastore / castore /
+    /// sastore). The inline bounds check would otherwise dereference the
+    /// null array pointer at `[NULL + ARRAY_LENGTH_OFFSET]`, hitting the
+    /// signal-handler hs_err path that just re-raises and kills the VM.
+    /// Each `TEST RAX, RAX; JZ rel32` is recorded as a patch offset; a
+    /// single shared stub at the end calls `jit_bastore` with `array_ptr=0`
+    /// (which sets `JIT_PENDING_NPE` and returns) and then exits via the
+    /// method epilogue with `RAX = i64::MIN`. The interpreter's post-JIT
+    /// path drains the NPE flag and surfaces the exception.
+    null_check_store_stubs: Vec<usize>,
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
@@ -3189,6 +3201,7 @@ impl Compiler {
             simd_loops: Vec::new(),
             bounds_safe_pcs: FxHashSet::default(),
             bounds_check_stubs: Vec::new(),
+            null_check_store_stubs: Vec::new(),
             speculative_bce_guards: Vec::new(),
             new_info: Vec::new(),
             anewarray_info: Vec::new(),
@@ -3572,8 +3585,15 @@ impl Compiler {
     }
 
     /// ModRM byte for [rbp - disp] addressing.
+    ///
+    /// `disp` is the positive depth-from-RBP (i.e. the actual displacement
+    /// is `-disp`). The byte stores `-disp` as i8/i32, so for disp8 we
+    /// need `-disp` to fit in i8 (-128..=127), i.e. `disp` in `-127..=128`.
+    /// The old check `(-128..=127)` was off-by-one: it wasted 3 bytes on
+    /// the common depth-128 spill and would mis-encode disp=-128 as 0x80
+    /// garbage (round-8 jit #4).
     fn modrm_rbp_disp(&mut self, reg: u8, disp: i32) {
-        if (-128..=127).contains(&disp) {
+        if (-127..=128).contains(&disp) {
             // mod=01, r/m=101 (rbp), disp8
             self.buf.emit_byte(0x45 | ((reg & 7) << 3));
             self.buf.emit_byte((-disp) as u8); // negate because we store as positive offset // Cast: x86-64 immediate encoding
@@ -3912,15 +3932,32 @@ impl Compiler {
     // These helpers are emit-time primitives; the IR/lower passes have
     // not yet been taught to detect the patterns that should use them.
     //
-    // TODO(round-8, HIGH from round-7 jit #7): wire `emit_cmov_*` into
-    // a peephole at bytecode emission time. Candidate patterns:
+    // Round-8 Bug 8: the Math.min(I,I)/Math.max(I,I)/(J,J)/(J,J) intrinsics
+    // now lower directly to `CMP + CMOVL/CMOVG` (see the
+    // `MATH_MIN_INT_INTRINSIC` / `MATH_MAX_INT_INTRINSIC` arms in the
+    // invokestatic dispatch). The bytecode-peephole patterns below are
+    // still TODO — they catch user-written ternaries that the JIT cannot
+    // recognise as Math.min/max:
     //   * `if_icmplt; ldc small; goto K; L: ldc small; K:` → CMOVL
-    //   * Math.min(I,I) / Math.max(I,I) builtins inlined in the JIT
     //   * `if_acmpne L; aconst_null; goto K; L: aload x; K:` → CMOVNE
-    // The current emitter performs all selects via compare+conditional
+    // The current emitter performs those selects via compare+conditional
     // jump+move, which mispredicts on hard-to-predict data (e.g. random
-    // array element comparisons in sorting kernels). A CMOV peephole
-    // would close roughly a 2-3% gap on `sort`-heavy microbenchmarks.
+    // array element comparisons in sorting kernels).
+    //
+    // Round-8 wiring attempt: Math.min/Math.max are NOT yet registered
+    // as JIT intrinsics in `lib.rs` (no MATH_MIN_INTRINSIC sentinel and
+    // no detection in `try_resolve_intrinsic`). Adding the intrinsic
+    // dispatch requires edits to `lib.rs` (sentinel constant + matcher
+    // in `try_resolve_intrinsic`) plus an x64.rs callee_entry arm that
+    // emits the CMOV sequence. That cross-file change is owned by a
+    // separate agent in this wave (lib.rs is in another agent's scope).
+    // When wiring lands, the planned sequence for Math.min(int a,int b):
+    //     MOV   EAX, a            ; result := a (default)
+    //     CMP   EAX, b            ; flags := a - b
+    //     CMOVG EAX, b            ; if a > b, take b instead
+    // and symmetric for Math.max (CMOVL EAX, b). This avoids the
+    // misprediction penalty that a JL/JG + MOV would incur on data
+    // with poor branch entropy.
 
     /// Emit `CMOVcc dst, src` (64-bit) with the given condition opcode byte
     /// (0x40..0x4F). dst/src are encoded register-direct (mod=11).
@@ -7297,6 +7334,30 @@ impl Compiler {
         self.buf.emit(&[0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // Cast: x86-64 register encoding
     }
 
+    /// Round-8 CRIT fix: emit an inline null check on the array receiver
+    /// (assumed already in RAX) for an inline array-store opcode. On null,
+    /// branches to the shared `null_check_store_stub` (emitted at method
+    /// end by [`emit_null_check_store_stubs`]). On non-null, falls through
+    /// to the caller's bounds check + inline store.
+    ///
+    /// Mirrors the structure of [`emit_bounds_check`]. Without this guard,
+    /// the immediately-following `MOV R10D, [RAX + ARRAY_LENGTH_OFFSET]`
+    /// in `emit_bounds_check` would dereference NULL and SIGSEGV — the
+    /// signal handler at `vm/src/runtime/crash_handler.rs` only dumps an
+    /// hs_err then re-raises, killing the VM instead of throwing NPE.
+    /// The previous `process::abort()` in `vm/src/jit/helpers.rs`
+    /// jit_iastore/bastore/aastore was a comment-level "fail loudly"
+    /// theater because the helpers were never reached on the inline path.
+    fn emit_null_check_array_store(&mut self) {
+        // TEST RAX, RAX  (48 85 C0)
+        self.buf.emit(&[0x48, 0x85, 0xC0]);
+        // JZ rel32 → null-store stub (patched later)
+        self.buf.emit(&[0x0F, 0x84]);
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+        self.null_check_store_stubs.push(patch_offset);
+    }
+
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
     ///
     /// Loads array length from header offset 12, compares index (unsigned) against length.
@@ -7519,6 +7580,65 @@ impl Compiler {
 
         // Patch all JAE branches to point to the shared stub
         for &patch_off in &self.bounds_check_stubs {
+            let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
+            self.buf.patch_i32(patch_off, rel32);
+        }
+    }
+
+    /// Round-8 CRIT fix (audit `round8-jit.md`): emit the shared null-check
+    /// failure stub for inline array stores. All `JZ` branches recorded by
+    /// [`emit_null_check_array_store`] are patched to point here.
+    ///
+    /// The stub zeroes the array_ptr argument register, calls
+    /// `helpers.bastore` (which on null sets `JIT_PENDING_NPE` and returns
+    /// without dereferencing), loads `i64::MIN` into RAX, and runs the
+    /// method epilogue. The interpreter's post-JIT path drains the NPE
+    /// flag on every JIT return (round-8 fix in
+    /// `vm/src/runtime/interpreter.rs`) and surfaces the NPE.
+    ///
+    /// We deliberately reuse the existing `helpers.bastore` rather than
+    /// add a dedicated `set_npe_and_return` helper to keep this change
+    /// surface tiny — the `bastore` helper short-circuits on null after
+    /// setting the flag, so the call has no other side effects.
+    fn emit_null_check_store_stubs(&mut self) {
+        if self.null_check_store_stubs.is_empty() {
+            return;
+        }
+
+        let stub_offset = self.buf.pos();
+
+        // Zero the array_ptr argument register so `jit_bastore`'s null
+        // guard fires and sets the pending-NPE flag. The index and val
+        // arguments are ignored on the null path; we don't bother clearing
+        // them.
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: arg1 = RCX
+            // XOR ECX, ECX  (31 C9) — zero-extends to RCX
+            self.buf.emit(&[0x31, 0xC9]);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // SysV: arg1 = RDI
+            // XOR EDI, EDI  (31 FF) — zero-extends to RDI
+            self.buf.emit(&[0x31, 0xFF]);
+        }
+
+        // CALL jit_bastore (absolute). On array_ptr=0 the helper sets
+        // JIT_PENDING_NPE and returns. RAX is now clobbered by the call.
+        self.emit_call_absolute(self.helpers.bastore);
+
+        // MOV RAX, i64::MIN  — deopt sentinel so the interpreter's post-JIT
+        // path treats this as a deopt return and runs the NPE drain.
+        // 48 B8 <imm64>
+        self.buf.emit(&[0x48, 0xB8]);
+        self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+
+        // Standard method epilogue: restore callee-saved regs and return.
+        self.emit_epilogue();
+
+        // Patch every recorded JZ branch to point to the shared stub.
+        for &patch_off in &self.null_check_store_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf.patch_i32(patch_off, rel32);
         }
@@ -8714,6 +8834,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §iastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_int_astore_regs();
@@ -8741,6 +8863,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §aastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier.
                     // Inline-load the OLD reference at the slot and pipe it
@@ -8790,6 +8914,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §lastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_long_astore_regs();
@@ -8803,6 +8929,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §fastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     match val_slot {
                         StackSlot::Xmm(xmm) => {
@@ -8834,6 +8962,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §dastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     // Optimize: if value is in XMM, use MOVSD to store directly to memory
                     match val_slot {
@@ -8866,6 +8996,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §bastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_byte_astore_regs();
@@ -8879,6 +9011,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §castore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
@@ -8892,6 +9026,8 @@ impl Compiler {
                     let array_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, array_slot);
                     self.load_slot_to_reg(RCX, index_slot);
+                    // Round-8 CRIT fix: NPE on null array (JVMS §sastore).
+                    self.emit_null_check_array_store();
                     self.emit_bounds_check(pc);
                     self.load_slot_to_reg(RDX, val_slot);
                     self.emit_short_astore_regs();
@@ -10455,6 +10591,53 @@ impl Compiler {
                             self.emit_call_absolute(self.helpers.math_fma_float);
                             self.emit_movq_rax_from_xmm(0);
                             self.push_from_rax_as_xmm0();
+                        } else if callee_entry == super::MATH_MIN_INT_INTRINSIC
+                            || callee_entry == super::MATH_MAX_INT_INTRINSIC
+                        {
+                            // Round-8 Bug 8 — branchless Math.min(int,int) /
+                            // Math.max(int,int) via CMOV. Pop b then a (a is
+                            // the deeper operand, the leftmost arg in the JLS
+                            // signature). Compare EAX (a) against ECX (b); on
+                            // min we keep b in EAX iff b < a (CMOVL EAX, ECX
+                            // means "if SF≠OF after `cmp eax,ecx`, load ECX
+                            // into EAX" — that fires when ECX < EAX, i.e.
+                            // when b < a, which is exactly the case where
+                            // min(a,b) == b). The max variant uses CMOVG with
+                            // the same operand layout.
+                            let b_slot = self.pop_stack();
+                            let a_slot = self.pop_stack();
+                            self.load_slot_to_reg(RAX, a_slot);
+                            self.load_slot_to_reg(RCX, b_slot);
+                            // CMP EAX, ECX — sets flags for signed compare.
+                            self.emit_cmp_r32_r32(RAX, RCX);
+                            let cc = if callee_entry == super::MATH_MIN_INT_INTRINSIC {
+                                0x4Cu8 // CMOVL — load b iff b < a (min)
+                            } else {
+                                0x4Fu8 // CMOVG — load b iff b > a (max)
+                            };
+                            // CMOVcc EAX, ECX (32-bit, no REX.W): 0F 4c C1
+                            self.buf.emit(&[0x0F, cc, 0xC1]);
+                            self.push_from_rax();
+                        } else if callee_entry == super::MATH_MIN_LONG_INTRINSIC
+                            || callee_entry == super::MATH_MAX_LONG_INTRINSIC
+                        {
+                            // Round-8 Bug 8 — 64-bit Math.min(long,long) /
+                            // Math.max(long,long) via REX.W CMP + CMOV. Same
+                            // semantics as the int variants but 64-bit.
+                            let b_slot = self.pop_stack();
+                            let a_slot = self.pop_stack();
+                            self.load_slot_to_reg(RAX, a_slot);
+                            self.load_slot_to_reg(RCX, b_slot);
+                            // CMP RAX, RCX (REX.W): 48 39 C8
+                            self.buf.emit(&[0x48, 0x39, 0xC8]);
+                            let cc = if callee_entry == super::MATH_MIN_LONG_INTRINSIC {
+                                0x4Cu8 // CMOVL
+                            } else {
+                                0x4Fu8 // CMOVG
+                            };
+                            // CMOVcc RAX, RCX (REX.W): 48 0F 4c C1
+                            self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
+                            self.push_from_rax();
                         } else {
                             // Direct call to a JIT-compiled callee
                             let n = callee_params;
@@ -11880,6 +12063,12 @@ impl Compiler {
 
         // Emit out-of-line bounds check failure stubs (after all bytecode)
         self.emit_bounds_check_stubs();
+        // Round-8 CRIT fix: emit shared null-check-failure stub for inline
+        // array-store opcodes (iastore / bastore / aastore / lastore /
+        // fastore / dastore / castore / sastore). Without this, the inline
+        // bounds-check would deref NULL on a null array and the signal
+        // handler would re-raise instead of throwing NPE.
+        self.emit_null_check_store_stubs();
         self.emit_deopt_stubs();
         true
     }
@@ -12210,7 +12399,8 @@ pub fn compile(
 
     // Build the CompiledMethod with OSR metadata
     let has_dispatch = !compiler.invoke_info.is_empty()
-        || !compiler.bounds_check_stubs.is_empty();
+        || !compiler.bounds_check_stubs.is_empty()
+        || !compiler.null_check_store_stubs.is_empty();
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {

@@ -358,6 +358,29 @@ pub struct Class {
     /// JVMS §5.3.3 forbids any classpath I/O for reference-array types.
     /// `None` for ordinary classes and interfaces.
     pub array_info: Option<ArrayInfo>,
+
+    /// Round 8 audit fix (CRIT #4): per-class initialization-state
+    /// AtomicU8, embedded directly on `Class` (not in a side-table).
+    ///
+    /// Previously the "fast path" for `ensure_class_initialized` went
+    /// through `ClassManager::class_init_state_handle(class_id)` which
+    /// did a `RwLock<FxHashMap<ClassId, Arc<AtomicU8>>>::read()` +
+    /// hash lookup on EVERY dispatch — i.e. the supposed fast path
+    /// was a lock acquisition + hash probe per checkpoint. Embedding
+    /// the atomic on `Class` collapses the fast path to a single
+    /// `Arc<AtomicU8>::load(Acquire)` once the caller already holds
+    /// an `Arc<Class>` (or `&Class`), which the dispatch path
+    /// typically does.
+    ///
+    /// The state values are the same `CLASS_INIT_*` constants used by
+    /// the side-table (defined in `class_manager`). The side-table is
+    /// retained for back-compat during the round-8 transition; both
+    /// stores must be kept in lockstep by `set_class_init_state`.
+    ///
+    /// Wrapped in `Arc` so callers (interpreter dispatch, JIT entry
+    /// stubs, reflection) can cheaply share a handle that outlives
+    /// the borrow of the enclosing `Class`.
+    pub init_state: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// RKC16N.3 — Metadata for a synthesised array class.
@@ -956,6 +979,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 

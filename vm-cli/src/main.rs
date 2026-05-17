@@ -642,10 +642,18 @@ fn run() -> Result<()> {
             let env_forced = std::env::var_os("RUSTJVM_QUARKUS")
                 .map(|v| !v.is_empty() && v != "0")
                 .unwrap_or(false);
+            // Round-8 fix: lowercase the filename once before matching so
+            // `Quarkus-App-1.0-Runner.jar`, `MyApp-RUNNER.jar`, etc. all
+            // trip the heuristic. Filesystems on macOS / Windows are
+            // case-insensitive and Maven-built JARs often capitalise the
+            // application name in the filename.
             let filename_hit = jar_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.contains("quarkus-") || n.ends_with("-runner.jar"))
+                .map(|n| {
+                    let n_lower = n.to_ascii_lowercase();
+                    n_lower.contains("quarkus-") || n_lower.ends_with("-runner.jar")
+                })
                 .unwrap_or(false);
             let manifest_hit = manifest
                 .attributes
@@ -1951,10 +1959,20 @@ fn main() {
 
     // The interpreter uses recursive Rust calls for Java method invocations.
     // Deep Java call stacks (e.g. Quarkus bootstrap) can exceed the default
-    // 8 MB Rust stack.  Spawn the real entry point on a thread with 64 MB.
+    // 8 MB Rust stack.  Spawn the real entry point on a thread with 2 MiB —
+    // matching HotSpot's `-Xss` default. The previous 64 MiB reservation was
+    // 64x what HotSpot ships and a 64x VSZ overhead for no measurable benefit
+    // (deep clinit chains observed in BouncyCastle / WildFly bootstrap fit
+    // comfortably under 2 MiB). Override via `RUST_MIN_STACK` if a test or
+    // workload needs more (mirrors child-thread sizing in
+    // `vm/src/vm/vm_exec.rs`).
+    let main_stack_size = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2 * 1024 * 1024);
     let builder = std::thread::Builder::new()
         .name("main-vm".into())
-        .stack_size(64 * 1024 * 1024);
+        .stack_size(main_stack_size);
     let handler = builder.spawn(|| {
         if let Err(e) = run() {
             eprintln!("{e:#}");

@@ -735,6 +735,7 @@ mod tests {
             has_finalizer: false,
             code_source: None,
             array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 

@@ -163,4 +163,26 @@ mod tests {
         assert_eq!(bytes, &[1, 2, 3]);
         assert_eq!(buf.position(), 3);
     }
+
+    /// Regression: `read_bytes` / `skip` must NOT panic or silently
+    /// succeed when `position + count` overflows `usize`.  This is the
+    /// `usize::MAX - 1` + `count == 2` corner case called out by the
+    /// round-7 audit (MED #7) — `checked_add` returns `None`, which
+    /// we map to `UnexpectedEndOfData` instead of wrapping.
+    #[test]
+    fn read_bytes_overflow_returns_error() {
+        let data = [0u8; 4];
+        let mut buf = ClassFileBuffer::new(&data);
+        // Manually drive position to near-MAX to exercise the overflow
+        // branch.  We can't actually have a buffer this large, so the
+        // bounds check below would also fail — but `checked_add` MUST
+        // fire FIRST so that `pos + count` never wraps to a small `end`.
+        buf.position = usize::MAX - 1;
+        assert!(buf.read_bytes(2).is_err());
+        // `read_bytes` failure leaves position untouched so the next
+        // call observes the same overflow.
+        assert_eq!(buf.position(), usize::MAX - 1);
+        assert!(buf.skip(2).is_err());
+        assert_eq!(buf.position(), usize::MAX - 1);
+    }
 }

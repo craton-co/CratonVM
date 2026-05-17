@@ -489,36 +489,74 @@ pub enum ResolvedMember {
 /// strings (refcount bump, no allocation) instead of copying the bytes
 /// — matches the round-3 `Arc<str>` CP work.
 pub struct LinkResolver {
-    cache: parking_lot::RwLock<FxHashMap<(ClassId, Arc<str>, Arc<str>), ResolvedMember>>,
+    /// hashbrown `HashMap` (not std) so we get stable `raw_entry_mut`
+    /// for borrow-free probes. Round 8 audit fix (CRIT): the old
+    /// `FxHashMap<(ClassId, Arc<str>, Arc<str>), _>` keyed by owned
+    /// `Arc<str>` forced every probe (even a cache **hit**) to bump
+    /// two Arc refcounts to build the lookup tuple — defeating the
+    /// dedupe win on the hot Spring `findMethod` loop.
+    cache: parking_lot::RwLock<
+        hashbrown::HashMap<(ClassId, Arc<str>, Arc<str>), ResolvedMember, crate::fx_hash::FxBuildHasher>,
+    >,
 }
 
 impl LinkResolver {
     /// Build an empty resolver.
     pub fn new() -> Self {
         Self {
-            cache: parking_lot::RwLock::new(fx_hashmap_with_capacity(256)),
+            cache: parking_lot::RwLock::new(
+                hashbrown::HashMap::with_capacity_and_hasher(256, Default::default()),
+            ),
         }
+    }
+
+    /// Compute the hash of a `(ClassId, &str, &str)` triple against the
+    /// cache's `BuildHasher`. The hash MUST agree with the hash of the
+    /// owned `(ClassId, Arc<str>, Arc<str>)` tuple — which it does
+    /// because `Arc<str>` derefs to `str` and `Hash` for `Arc<T>` /
+    /// `str` walks the bytes the same way the tuple impl does.
+    #[inline]
+    fn hash_key(
+        hasher: &crate::fx_hash::FxBuildHasher,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+    ) -> u64 {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let mut h = hasher.build_hasher();
+        // Tuple `Hash` impl walks each field in order; replicate that
+        // here so the borrowed and owned forms produce the same hash.
+        class_id.hash(&mut h);
+        name.hash(&mut h);
+        descriptor.hash(&mut h);
+        h.finish()
     }
 
     /// Probe the cache. Returns `None` on cold miss; callers must then
     /// do the full hierarchy walk and call [`Self::insert`] with the
     /// result (including `ResolvedMember::NotFound` so the next probe
     /// short-circuits).
+    ///
+    /// Round 8 audit fix (CRIT): probes via `(ClassId, &str, &str)` using
+    /// hashbrown's `raw_entry` API so a cache hit costs a hash + a key
+    /// comparison — no Arc clones until we know we'll write into the
+    /// cache.
     pub fn get(
         &self,
         class_id: ClassId,
-        name: &Arc<str>,
-        descriptor: &Arc<str>,
+        name: &str,
+        descriptor: &str,
     ) -> Option<ResolvedMember> {
         let guard = self.cache.read();
-        // The `(ClassId, Arc<str>, Arc<str>)` key requires owned arcs,
-        // but the read path produces `&Arc<str>`; we hash & compare via
-        // refcount-bump clones. This is one branch + two atomic
-        // increments per hit — still orders of magnitude cheaper than
-        // a fresh hierarchy walk.
+        let hash = Self::hash_key(guard.hasher(), class_id, name, descriptor);
         guard
-            .get(&(class_id, Arc::clone(name), Arc::clone(descriptor)))
-            .cloned()
+            .raw_entry()
+            .from_hash(hash, |(k_cid, k_name, k_desc)| {
+                *k_cid == class_id
+                    && k_name.as_ref() == name
+                    && k_desc.as_ref() == descriptor
+            })
+            .map(|(_, v)| v.clone())
     }
 
     /// Populate (or overwrite) a cache entry. Takes the write lock for
@@ -534,6 +572,134 @@ impl LinkResolver {
         self.cache
             .write()
             .insert((class_id, name, descriptor), resolved);
+    }
+
+    /// Round 8 audit fix (CRIT #2): caller-friendly "get-or-compute"
+    /// wrapper. Caller passes `(class_id, &str, &str)` plus a closure
+    /// that performs the hierarchy walk on cold miss. The closure
+    /// returns the `(declaring class, name_arc, descriptor_arc,
+    /// member)` tuple so the cache can store the canonical interned
+    /// strings (the closure typically already has them via the
+    /// reader's constant-pool path).
+    ///
+    /// Bug 2 wiring guide for native reflective callers: replace the
+    /// raw `find_method_recursive(...)` / `find_field_recursive(...)`
+    /// call with `vm.link_resolver().resolve_or_compute(class_id,
+    /// name, descriptor, || { /* existing walk; return
+    /// (name_arc, desc_arc, ResolvedMember::...) */ })`. Subsequent
+    /// hits return immediately with a single hash + key compare and
+    /// zero Arc clones.
+    pub fn resolve_or_compute<F>(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+        compute: F,
+    ) -> ResolvedMember
+    where
+        F: FnOnce() -> (Arc<str>, Arc<str>, ResolvedMember),
+    {
+        if let Some(hit) = self.get(class_id, name, descriptor) {
+            return hit;
+        }
+        let (name_arc, desc_arc, resolved) = compute();
+        self.insert(class_id, name_arc, desc_arc, resolved.clone());
+        resolved
+    }
+
+    /// Round 8 wave-3 (HIGH from round-8 classloading-reader review):
+    /// one-shot reflective resolution helper that takes a `ClassStore`
+    /// and does the cache probe + hierarchy walk + cache insert in a
+    /// single call. Lets non-VM callers (`classloading` unit tests,
+    /// `verifier`, future `classloading`-internal reflective paths)
+    /// participate in the LinkResolver dedupe without re-implementing
+    /// the `find_method_recursive` / `find_field_recursive` orchestration.
+    ///
+    /// The JNI path in `vm::native::jni` still uses `resolve_or_compute`
+    /// directly because it needs to interleave with `with_shared_vm` and
+    /// `find_method_recursive` returns method-index (not in
+    /// `ResolvedMember::Method`'s shape) so the closure does a slightly
+    /// different post-walk to compute the index. This helper covers the
+    /// common case where the caller wants the canonical resolved member.
+    ///
+    /// Returns `ResolvedMember::NotFound` (cached) on miss so a tight
+    /// loop of "does class X declare method Y?" probes doesn't re-walk.
+    pub fn resolve_method_in_store(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+        store: &crate::class::ClassStore,
+    ) -> ResolvedMember {
+        self.resolve_or_compute(class_id, name, descriptor, || {
+            let resolved = match crate::class::find_method_recursive(
+                class_id, name, descriptor, store,
+            ) {
+                Some((_, declaring)) => {
+                    // Locate the position inside the declaring class's
+                    // methods vec so callers can re-fetch the
+                    // `ClassFileMethod` via the store.
+                    match store.get(declaring) {
+                        Some(decl) => match decl
+                            .methods
+                            .iter()
+                            .position(|m| &*m.name == name && &*m.descriptor == descriptor)
+                        {
+                            Some(idx) => ResolvedMember::Method {
+                                declaring_class_id: declaring,
+                                index: idx as u32,
+                            },
+                            // Defensive: walk succeeded but position
+                            // lookup failed (would only happen if the
+                            // store mutated between the two calls,
+                            // which a single `&store` borrow prevents).
+                            // Treat as NotFound so we don't return a
+                            // bogus index.
+                            None => ResolvedMember::NotFound,
+                        },
+                        None => ResolvedMember::NotFound,
+                    }
+                }
+                None => ResolvedMember::NotFound,
+            };
+            (
+                rustjvm_types::intern_arc(name),
+                rustjvm_types::intern_arc(descriptor),
+                resolved,
+            )
+        })
+    }
+
+    /// Field-resolution sibling of [`Self::resolve_method_in_store`].
+    /// The field cache key uses an empty descriptor because JVMS
+    /// `(class, name)` is already unique within a class (multiple
+    /// fields with the same name are illegal).  This matches the JNI
+    /// `GetFieldID` wiring in `vm::native::jni`.
+    pub fn resolve_field_in_store(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        store: &crate::class::ClassStore,
+    ) -> ResolvedMember {
+        self.resolve_or_compute(class_id, name, "", || {
+            let resolved = match crate::class::find_field_recursive(
+                class_id, name, store,
+            ) {
+                Some((field_index, field, declaring)) => ResolvedMember::Field {
+                    declaring_class_id: declaring,
+                    absolute_index: field_index as u32,
+                    is_static: field.access_flags.contains(
+                        rustjvm_reader::class_access_flags::FieldAccessFlags::STATIC,
+                    ),
+                },
+                None => ResolvedMember::NotFound,
+            };
+            (
+                rustjvm_types::intern_arc(name),
+                rustjvm_types::intern_arc(""),
+                resolved,
+            )
+        })
     }
 
     /// Drop every cached entry whose key class matches `class_id`, or

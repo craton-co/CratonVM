@@ -45,6 +45,27 @@ impl DeviceModuleInner {
     ) -> Result<()> {
         Err(DeviceError::NoDriver)
     }
+
+    pub(crate) fn launch_raw_no_d2h_sync(
+        &self,
+        _ctx: &DeviceContextInner,
+        _kernel: &str,
+        _cfg: &LaunchConfig,
+        _args: KernelArgs,
+    ) -> Result<()> {
+        Err(DeviceError::NoDriver)
+    }
+
+    /// Stub-mode counterpart to the cuda backend's autotune helper.
+    /// Always returns `None` — `LaunchConfig::elementwise_for_kernel`
+    /// then falls back to the portable 256-thread default.
+    pub(crate) fn optimal_block_size(
+        &self,
+        _ctx: &DeviceContextInner,
+        _kernel: &str,
+    ) -> Option<u32> {
+        None
+    }
 }
 
 pub(crate) struct DeviceBufferInner<T> {

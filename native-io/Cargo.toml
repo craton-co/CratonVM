@@ -19,7 +19,11 @@ synthetic-jdk = []
 rustjvm-types = { path = "../types" }
 rustjvm-native-api = { path = "../native-api" }
 parking_lot = "0.12"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# Round-8 cross-cutting Bug 3: pin `zip` to the workspace entry so this
+# crate and any future workspace consumer share one resolution. See the
+# workspace-deps comment for the pending `native-builtins` migration off
+# 0.6 — once that lands, the duplicate in Cargo.lock disappears.
+zip.workspace = true
 regex = "1"
 memmap2 = "0.9"
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }

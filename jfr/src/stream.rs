@@ -207,11 +207,15 @@ impl EventStream {
             self.read_index = base_index;
         }
 
+        // Round-5 HIGH-fix (Bug 5, 2026-05-17): previously this loop called
+        // `repo.iter().nth(rel)` per iteration, which walks the VecDeque
+        // from the front every call — quadratic over a full filtered drain.
+        // `EventRepository::get(rel)` is O(1).
         while self.read_index < total {
             let rel = (self.read_index - base_index) as usize;
             self.read_index += 1;
 
-            if let Some(event) = repo.iter().nth(rel) {
+            if let Some(event) = repo.get(rel) {
                 if self.type_filters.is_empty() || self.type_filters.contains(&event.type_id) {
                     for cb in &mut self.callbacks {
                         cb(event);

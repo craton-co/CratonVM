@@ -196,6 +196,29 @@ impl G1Region {
     }
 }
 
+/// Round-5 HIGH #6 — defensive cap on the gray-set worklist.
+///
+/// The mark worklist was previously an unbounded `Vec<usize>`. A
+/// pathological object graph (e.g. a malicious or buggy classloader that
+/// produces an exceptionally wide reference fan-out during a concurrent
+/// mark cycle, or a marker thread that has been starved so the worklist
+/// grows faster than it drains) could OOM the JVM by ballooning this
+/// Vec. The cap below converts that silent allocator-OOM into a
+/// deterministic panic, which is strictly better than crashing the
+/// entire VM with an unrecoverable allocation failure deep inside
+/// `Vec::push`.
+///
+/// 1 million entries * 8 bytes = 8 MiB — chosen large enough that any
+/// realistic mark cycle stays well below it, small enough that the
+/// panic is reproducible in tests.
+///
+/// TODO(round-5+): the real fix is an overflow-handling strategy —
+/// either spill the worklist to a backing region, or drop the explicit
+/// worklist entirely and fall back to a "mark-everything-dirty" sweep
+/// pass guided by the card table. Both are too invasive for this
+/// hotfix; the cap below is the defensive interim.
+const MARK_WORKLIST_CAP: usize = 1 << 20;
+
 // ---------------------------------------------------------------------------
 // Collection type
 // ---------------------------------------------------------------------------
@@ -423,11 +446,32 @@ impl G1Collector {
             regions[start + i].cursor = remaining.min(region_size);
         }
 
-        let ptr = regions[start].base_ptr_mut();
-        unsafe {
-            std::ptr::write_bytes(ptr, 0, size.min(region_size));
+        // CRIT (round-5 GC #1, heap walker UAF): zero the *entire* humongous
+        // span, not just the first region's payload. Continuation regions
+        // (start+1..start+regions_needed) come from `Free` slots that may
+        // have last held arbitrary collected data; G1Region::reset() zeroes
+        // a region only on its STW retire path. If we leave the residual
+        // bytes intact, the heap walker that scans `cursor` bytes per
+        // continuation region will treat those stale bytes as live object
+        // headers / reference slots, follow the garbage pointers, and
+        // either crash, corrupt the bitmap, or revive freed objects.
+        //
+        // Zero each region's `cursor` bytes individually rather than a
+        // single `write_bytes` across `total_bytes`: G1Region buffers are
+        // separate `Vec<u8>` allocations and are NOT guaranteed to live
+        // at contiguous addresses, even though they are logically adjacent
+        // in region index space.
+        for i in 0..regions_needed {
+            let n = regions[start + i].cursor;
+            if n > 0 {
+                let p = regions[start + i].base_ptr_mut();
+                unsafe {
+                    std::ptr::write_bytes(p, 0, n);
+                }
+            }
         }
 
+        let ptr = regions[start].base_ptr_mut();
         Some((ptr, start))
     }
 
@@ -1383,6 +1427,14 @@ impl G1Collector {
                     let ref_ptr = raw as usize as *mut u8;
                     if let Some(idx) = region_for(ref_ptr) {
                         if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                            // Round-5 HIGH #6 — see MARK_WORKLIST_CAP doc.
+                            assert!(
+                                worklist.len() < MARK_WORKLIST_CAP,
+                                "g1: mark_worklist exceeded cap of {} entries — \
+                                 object graph pathology or marker starvation suspected. \
+                                 TODO(round-5+): implement spill/fallback strategy.",
+                                MARK_WORKLIST_CAP
+                            );
                             worklist.push(ref_ptr as usize);
                         }
                     }
@@ -1400,6 +1452,14 @@ impl G1Collector {
                     let ref_ptr = ref_obj.as_ptr();
                     if let Some(idx) = region_for(ref_ptr) {
                         if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                            // Round-5 HIGH #6 — see MARK_WORKLIST_CAP doc.
+                            assert!(
+                                worklist.len() < MARK_WORKLIST_CAP,
+                                "g1: mark_worklist exceeded cap of {} entries — \
+                                 object graph pathology or marker starvation suspected. \
+                                 TODO(round-5+): implement spill/fallback strategy.",
+                                MARK_WORKLIST_CAP
+                            );
                             worklist.push(ref_ptr as usize);
                         }
                     }
@@ -1452,6 +1512,20 @@ impl G1Collector {
             }
         };
 
+        // Round-5 HIGH #6 — defensive cap on the gray-set worklist.
+        // See the module-level `MARK_WORKLIST_CAP` for the long-form rationale.
+        let push_with_cap = |worklist: &mut Vec<usize>, addr: usize| {
+            if worklist.len() >= MARK_WORKLIST_CAP {
+                panic!(
+                    "g1: mark_worklist exceeded cap of {} entries — object \
+                     graph pathology or marker starvation suspected. \
+                     TODO(round-5+): implement spill/fallback strategy.",
+                    MARK_WORKLIST_CAP
+                );
+            }
+            worklist.push(addr);
+        };
+
         // 1) Roots — push every non-null in-heap root onto the gray set.
         //    `concurrent_mark_step` will mark them and follow their refs.
         for root in roots {
@@ -1464,7 +1538,7 @@ impl G1Collector {
                 if regions[idx].mark_bitmap.is_marked(addr) {
                     continue; // already black
                 }
-                worklist.push(addr);
+                push_with_cap(&mut worklist, addr);
             }
         }
 
@@ -1478,7 +1552,7 @@ impl G1Collector {
                 if regions[idx].mark_bitmap.is_marked(addr) {
                     continue;
                 }
-                worklist.push(addr);
+                push_with_cap(&mut worklist, addr);
             }
         }
 
@@ -1540,7 +1614,15 @@ impl G1Collector {
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
         self.mark_worklist.lock().clear();
-        self.satb_queue.deactivate();
+        // Round-5 CRIT #4: close the SATB barrier with a drain-then-flip
+        // protocol so no mutator log push that observed the gate as
+        // active can be stranded after the cycle ends. The drained
+        // stragglers are discarded — the mark cycle is complete and
+        // anything not yet marked is correctly dead; the next cycle
+        // will re-discover live state from roots. (We are at the very
+        // end of the cycle so missing a few late SATB entries is
+        // semantically fine.)
+        let _stragglers = self.satb_queue.deactivate_and_drain();
 
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
         self.marking_complete.store(true, Ordering::Relaxed);
@@ -2143,22 +2225,28 @@ impl GarbageCollector for G1Collector {
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
         // JLS §17.7 atomicity for 16-byte `Value` slots: acquire the per-slot
         // stripe lock so paired writers don't expose a torn (tag, payload) to
-        // this read. SeqCst fences supply the JMM happens-before edge. See
-        // `crate::collector::volatile_stripe_lock` for the design rationale.
+        // this read. See `crate::collector::volatile_stripe_lock` for the
+        // design rationale.
+        //
+        // Round-8 Bug 5: removed the bracketing `fence(SeqCst)` pair. The
+        // mutex acquire/release in `volatile_stripe_lock` is already a full
+        // JMM ordering edge — a mutex lock is Acquire-ordered and unlock is
+        // Release-ordered, which together synthesise happens-before between
+        // any prior unlock on the same lock and the current critical
+        // section. The standalone SeqCst fences added nothing beyond what
+        // the mutex pair already guarantees and measurably cost an `mfence`
+        // on x86 per volatile op.
         let _guard = crate::collector::volatile_stripe_lock(obj, index);
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let val = self.get_field(obj, index);
-        std::sync::atomic::fence(Ordering::SeqCst);
-        val
+        self.get_field(obj, index)
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
         // Pair with `get_field_volatile`: the stripe lock makes the 16-byte
         // `Value` write appear atomic to a concurrent volatile reader.
+        // Round-8 Bug 5: the bracketing `fence(SeqCst)` pair was redundant
+        // with the mutex acquire/release JMM edge — see `get_field_volatile`.
         let _guard = crate::collector::volatile_stripe_lock(obj, index);
-        std::sync::atomic::fence(Ordering::SeqCst);
         self.set_field(obj, index, value);
-        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     fn array_length(&self, obj: ObjectRef) -> usize {

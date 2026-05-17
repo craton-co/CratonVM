@@ -537,6 +537,40 @@ impl RegionHeap {
                                     obj_size - HEADER_SIZE,
                                 );
                             }
+                            // ----------------------------------------------
+                            // CRIT (round-5 GC #3, ARM ordering):
+                            //
+                            // Inject a Release fence between the data-area
+                            // memcpy and the subsequent header-field stores.
+                            //
+                            // The "data-then-header publication" pattern
+                            // relies on a concurrent scanner observing the
+                            // *header* (with Acquire ordering on
+                            // `forwarding_ptr`) only after the *data area*
+                            // is in place. On TSO (x86) the per-byte stores
+                            // from `copy_nonoverlapping` retire in program
+                            // order, so this happens to work without a
+                            // fence. On weakly-ordered architectures (ARM,
+                            // POWER, RISC-V), the CPU and the compiler are
+                            // free to reorder the data-area stores past the
+                            // header writes that publish the destination
+                            // object's `forwarding_ptr`. A concurrent
+                            // scanner that performs an Acquire load of
+                            // `forwarding_ptr`, observes the new value,
+                            // then dereferences fields of the new object
+                            // would race against the still-in-flight
+                            // data-area stores.
+                            //
+                            // The Release fence pairs with the Acquire load
+                            // of `forwarding_ptr` on the scanner side:
+                            //   Writer:  data memcpy ; FENCE(Release) ; store header
+                            //   Reader:  load header (Acquire) ; read data
+                            //
+                            // The Acquire on `forwarding_ptr` is the
+                            // synchronisation point that observes everything
+                            // sequenced before the matching Release here.
+                            // ----------------------------------------------
+                            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                             // 2) Copy the header as the last step so any
                             //    concurrent reader of `dest_ptr` either
                             //    sees zeroed bytes (allocation zero-init

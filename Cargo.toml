@@ -16,6 +16,14 @@ categories = ["compilers", "emulators"]
 
 [workspace.dependencies]
 thiserror = "2"
+# Round-8 cross-cutting Bug 3: workspace-wide pin for `zip` so every crate
+# that opts in via `zip.workspace = true` resolves to the same major
+# version. `native-io` already targets 2.x; `native-builtins` is still on
+# 0.6 because `FileOptions::default()` and the un-generic `ZipWriter` API
+# disappeared in 2.x (every `start_file` / `ZipWriter::new` call site needs
+# the `SimpleFileOptions` migration). Until that migration lands the two
+# crates still pull two distinct `zip` impls — tracked as a follow-up.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Round-7 cross-cutting Fix 3: `release_max_level_info` causes `trace!` and
 # `debug!` macros to expand to no-ops in release builds. The VM has thousands
 # of trace/debug sites in interpreter dispatch, GC scan loops, JIT entry, and

@@ -147,6 +147,18 @@ fn is_nan_tagged(v: u64) -> bool {
     (v & NANBOX_BITS) == NANBOX_BITS
 }
 
+/// Round-8 branch-hint: the SUB_OBJECT degraded path (null or unaligned
+/// pointer arising from a stale slot) returns `Value::Object(None)` and
+/// is taken essentially never in steady-state interpretation. Splitting
+/// it out as a `#[cold]` non-inlined function gives LLVM permission to
+/// place it off the hot path, freeing icache for the well-formed
+/// branch in [`CompactValue::to_value`].
+#[cold]
+#[inline(never)]
+fn cold_degraded_object_ptr() -> Value {
+    Value::Object(None)
+}
+
 impl CompactValue {
     // -- Constructors -------------------------------------------------------
 
@@ -492,11 +504,12 @@ impl CompactValue {
                 let ptr = (self.0 & PAYLOAD_MASK) as *mut u8;
                 // Mirror the safety net in `decode_value` — null or unaligned
                 // pointers arising from stale slots degrade to Object(None)
-                // rather than panicking.
-                if ptr.is_null() {
-                    Value::Object(None)
-                } else if (ptr as usize) % 8 != 0 {
-                    Value::Object(None)
+                // rather than panicking. The degraded paths are off the hot
+                // line: every well-formed object slot satisfies both
+                // predicates, so the branch predictor (and LLVM's basic-
+                // block layout) should treat them as cold.
+                if ptr.is_null() || (ptr as usize) % 8 != 0 {
+                    cold_degraded_object_ptr()
                 } else {
                     Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
                 }

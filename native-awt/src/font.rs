@@ -480,13 +480,20 @@ impl GlyphAtlas {
     ///
     /// The returned `Arc<GlyphBitmap>` is shared with the cache. The hot
     /// path is a single mutex acquire and a hashmap lookup — no allocation.
-    /// On a miss we rasterize outside the lock (the only contention-sensitive
-    /// section is the insert), then re-acquire to insert.
     ///
-    /// Note: in the rare race where two threads miss the same key
-    /// concurrently we may rasterize twice; both bitmaps will be byte-equal
-    /// and the second insert overwrites the first. That's harmless and
-    /// cheaper than holding the mutex across the rasterization call.
+    /// **Identity contract.** Two concurrent calls for the same key return
+    /// `Arc`s that satisfy `Arc::ptr_eq`. Downstream caches (platform
+    /// glyph-atlas textures, GPU upload trackers) key on the bitmap's
+    /// pointer identity; if a second thread received a freshly-rasterized
+    /// `Arc` that overwrote the first, those caches would silently miss
+    /// and re-upload byte-equal bitmaps on every contended lookup.
+    ///
+    /// Implementation: the first thread to acquire the lock through
+    /// `entry(..).or_insert_with(..)` wins and rasterizes; every other
+    /// thread blocks on the same mutex and then sees the cached entry.
+    /// This briefly holds the mutex across rasterization in the
+    /// contended-miss case, but the steady-state hot path stays
+    /// single-lookup-and-clone.
     pub fn get_or_rasterize(
         &self,
         key: GlyphKey,
@@ -497,24 +504,15 @@ impl GlyphAtlas {
             return g;
         }
 
-        // Miss: rasterize outside the lock. `from_u32` is the safe path —
-        // we never want to panic on a surrogate or out-of-range code point
-        // sneaked in by upstream string handling.
-        let ch = std::char::from_u32(key.ch).unwrap_or(' ');
-        let (metrics, alpha_vec) = fontdue_font.rasterize(ch, key.size as f32);
-
-        let bitmap = Arc::new(GlyphBitmap {
-            alpha: alpha_vec.into(),
-            width: metrics.width as u32,
-            height: metrics.height as u32,
-            bearing_x: metrics.xmin,
-            bearing_y: metrics.ymin,
-            advance: metrics.advance_width,
-        });
-
-        // Insert path. Reacquire the lock and bulk-evict if at cap.
+        // Miss: enter the insert path under a single lock acquisition so
+        // racing misses on the same key all observe the SAME Arc — the
+        // first inserter wins, the rest get the cached entry. This
+        // preserves `Arc::ptr_eq` for downstream identity caches.
         let mut cache = self.cache.lock();
-        if cache.len() >= self.cap {
+
+        // Bulk-evict BEFORE the `entry` lookup. If we are about to insert
+        // and we're already at cap, free space first.
+        if cache.len() >= self.cap && !cache.contains_key(&key) {
             // Pseudo-random bulk eviction: drop the first half of whatever
             // the iterator yields. Cheaper than tracking LRU and adequate
             // for the soft-cap role this serves. See `GlyphAtlas` docs.
@@ -525,8 +523,22 @@ impl GlyphAtlas {
                 cache.remove(&k);
             }
         }
-        cache.insert(key, Arc::clone(&bitmap));
-        bitmap
+
+        Arc::clone(cache.entry(key).or_insert_with(|| {
+            // `from_u32` is the safe path — we never want to panic on a
+            // surrogate or out-of-range code point sneaked in by upstream
+            // string handling.
+            let ch = std::char::from_u32(key.ch).unwrap_or(' ');
+            let (metrics, alpha_vec) = fontdue_font.rasterize(ch, key.size as f32);
+            Arc::new(GlyphBitmap {
+                alpha: alpha_vec.into(),
+                width: metrics.width as u32,
+                height: metrics.height as u32,
+                bearing_x: metrics.xmin,
+                bearing_y: metrics.ymin,
+                advance: metrics.advance_width,
+            })
+        }))
     }
 }
 

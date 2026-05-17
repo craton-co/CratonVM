@@ -66,18 +66,31 @@ fn bucket_for(size: usize) -> usize {
     idx.min(NUM_BUCKETS - 1)
 }
 
-/// Pick the smallest bucket index whose blocks are *guaranteed* to be at
-/// least `size` bytes. Allocators start their search here and escalate
-/// upward; this avoids walking buckets that cannot satisfy the request.
+/// Pick the smallest bucket index that *might* contain a block large enough
+/// to satisfy `size`. Allocators start their search here and escalate upward.
+///
+/// CRIT (round-5 GC #2, spurious OOM): the previous implementation rounded
+/// `size` *up* to the next power of two and used that bucket as the search
+/// start — but bucket `k` holds blocks in `[2^(s+k), 2^(s+k+1))`, indexed
+/// by `floor(log2(block_size))`. For a request of 100 bytes, the old code
+/// jumped to bucket 4 (lower bound 128) and skipped bucket 3, which holds
+/// blocks in `[64, 128)`. A 100-byte free block lives in bucket 3; the
+/// allocator would miss it entirely and report OOM despite having a
+/// fitting block on hand.
+///
+/// The correct starting bucket is `floor(log2(size))`: that bucket may
+/// hold blocks ranging from `size` up to `2*size - 1`, which are valid
+/// fits. The per-bucket best-fit scan filters out blocks too small to
+/// satisfy the request (`total_needed <= block.size`), so starting one
+/// bucket lower than the old code costs only an extra cheap scan in the
+/// rare worst case and *cannot* spuriously OOM.
 #[inline]
 fn min_satisfying_bucket(size: usize) -> usize {
     if size <= (1usize << MIN_BUCKET_SHIFT) {
         return 0;
     }
-    // bucket k holds blocks in [2^(s+k), 2^(s+k+1)); we want the first bucket
-    // whose lower bound >= size. Round size up to a power of 2 to find it.
-    let n = size.next_power_of_two();
-    let lg = n.trailing_zeros() as usize;
+    // floor(log2(size)) - MIN_BUCKET_SHIFT — same formula as `bucket_for`.
+    let lg = (usize::BITS - 1 - size.leading_zeros()) as usize;
     lg.saturating_sub(MIN_BUCKET_SHIFT as usize).min(NUM_BUCKETS - 1)
 }
 

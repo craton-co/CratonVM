@@ -9020,11 +9020,36 @@ fn next_lock_token() -> i64 {
 /// Half-open `[a_pos, a_pos + a_size)` overlaps `[b_pos, b_pos + b_size)`.
 /// `i64::MAX` is treated as "rest of file" — any non-empty region that
 /// starts at or beyond it does not overlap.
+///
+/// Bug 5 (HIGH) fix: previously this used `saturating_add` for both end
+/// points which silently widened large regions, producing false-positive
+/// conflicts when callers passed `size = i64::MAX` (e.g. a lock spanning
+/// the rest of the file from a non-zero offset). We now compute the
+/// overlap test directly via `checked_add`: if either size overflows when
+/// added to its position we treat that region's end as "+∞", which is
+/// the precise FileLock semantic for `size == i64::MAX`. This way an
+/// `[a_pos, +∞)` region only conflicts with `[b_pos, b_end)` iff
+/// `b_end > a_pos`, never just because both sizes saturated.
 fn regions_overlap(a_pos: i64, a_size: i64, b_pos: i64, b_size: i64) -> bool {
-    let a_end = a_pos.saturating_add(a_size);
-    let b_end = b_pos.saturating_add(b_size);
-    // Standard half-open interval overlap test.
-    a_pos < b_end && b_pos < a_end
+    // Empty regions never overlap anything.
+    if a_size <= 0 || b_size <= 0 {
+        return false;
+    }
+    // Compute each end as `Option<i64>` where `None` means "+∞"
+    // (the region extends past i64::MAX — treat as unbounded).
+    let a_end = a_pos.checked_add(a_size);
+    let b_end = b_pos.checked_add(b_size);
+    // Half-open overlap: `a_pos < b_end && b_pos < a_end`. With +∞
+    // semantics, any comparison against +∞ on the right of `<` is true.
+    let a_lt_b_end = match b_end {
+        Some(end) => a_pos < end,
+        None => true,
+    };
+    let b_lt_a_end = match a_end {
+        Some(end) => b_pos < end,
+        None => true,
+    };
+    a_lt_b_end && b_lt_a_end
 }
 
 /// Attempt to register an in-process lock. Returns the new token on
