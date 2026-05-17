@@ -612,6 +612,41 @@ fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+
+    // Compatibility: `java.net.URL.openConnection()` (registered in
+    // `net_phase_e::register_re4_url_http` and in `lib.rs::register_net_natives`)
+    // allocates `java/net/HttpURLConnection` synthetics with a DIFFERENT field
+    // layout — field 0 holds the originating URL object, not an i32 conn_id.
+    // For non-http(s) URLs (file:, jar:, classpath:, jrt:, nested:), the right
+    // behaviour is to delegate to `URL.openStream()` so Logback / Spring /
+    // Cassandra can read XML configs through `URLConnection.getInputStream()`.
+    // Without this branch, the HTTP-only `ensure_connected` path below treats
+    // the URL object as a conn_id, fails `parse_url`, and returns a 0-byte
+    // ByteArrayInputStream — which surfaces as `SAXParseException: Premature
+    // end of file` in Logback's Joran parser (Cassandra NodeTool boot).
+    if let Value::Object(Some(maybe_url)) = ctx.get_field(this, HUC_CONN_ID) {
+        // Peek at the external form via the URL's full-URL string field
+        // (field 5 in our URL synthetic), falling back to field 0.
+        let url_str = match ctx.get_field(maybe_url, 5) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => match ctx.get_field(maybe_url, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
+        };
+        if !url_str.is_empty()
+            && !url_str.starts_with("http://")
+            && !url_str.starts_with("https://")
+        {
+            return ctx.invoke_virtual(
+                maybe_url,
+                "openStream",
+                "()Ljava/io/InputStream;",
+                &[],
+            );
+        }
+    }
+
     ensure_connected(ctx, this)?;
     let body_bytes = with_state(ctx, this, |s| s.response_body.clone()).unwrap_or_default();
     let body_arr = new_byte_array(ctx, &body_bytes);

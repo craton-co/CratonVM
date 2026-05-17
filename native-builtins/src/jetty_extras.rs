@@ -104,14 +104,140 @@ fn jetty_start_args_get_classpath(
     Ok(Some(Value::Object(None)))
 }
 
+/// `org.eclipse.jetty.start.Main.processCommandLine([Ljava/lang/String;)Lorg/eclipse/jetty/start/StartArgs;`
+///
+/// Real-mode (`RUSTJVM_JETTY_REAL=1`) intercept that returns a synthetic
+/// non-null `StartArgs` instance. The real bytecode walks the argument
+/// list, parses `start.d/*.ini` files, and constructs a fully-populated
+/// `StartArgs` — but on CratonVM's partial bootstrap several internal
+/// helpers (Props, BaseHome filesystem probing) return null and the
+/// final return value ends up null. Downstream `Main.start(StartArgs)`
+/// then NPEs at line 397 on `aload_1 + invokevirtual getClasspath`.
+///
+/// Returning a synthetic non-null `StartArgs` is paired with no-op
+/// intercepts of the launcher's boolean predicates (`isHelp`,
+/// `isListClasspath`, `isListConfig`, `isDryRun`, `isStopCommand`,
+/// `isTestingModeEnabled`, `isRun`, `isExec`, `isCreateFiles`,
+/// `hasJvmArgs`, `hasSystemProperties`) and getter methods that the
+/// `start(StartArgs)` body invokes before any code path that would
+/// actually run Jetty. The combination unblocks `--list-config` to
+/// progress past the NPE — it won't print Jetty's real configuration
+/// (we return false for `isListConfig`), but it returns cleanly
+/// without aborting the VM.
+fn jetty_main_process_command_line(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    if let Some(cid) = ctx.class_id_by_name(CN_START_ARGS) {
+        let obj = ctx.alloc_object(cid, 0);
+        tracing::warn!(
+            "[jetty-shim] Main.processCommandLine returned synthetic StartArgs (REAL mode)"
+        );
+        return Ok(Some(Value::Object(Some(obj))));
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+/// Generic `()Z` returning `false` (0). Used for the boolean predicates
+/// on a synthetic `StartArgs` so that `Main.start(StartArgs)` falls
+/// through every conditional branch without dereferencing fields that
+/// were never populated.
+fn jetty_return_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// Generic getter returning `null` reference. Used for `StartArgs` getter
+/// methods invoked by `Main.start(StartArgs)` (e.g. `getListModules`,
+/// `getShowModules`, `getModuleGraphFilename`). Each call site downstream
+/// of these checks for null before dereferencing.
+fn jetty_return_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
 /// Install every Jetty boot-test short-circuit this module owns.
 ///
 /// **NOT WIRED YET.** The orchestrator owns `lib.rs` and is responsible
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_jetty_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_JETTY_REAL=1, skip all short-circuits so
-    // the real Jetty launcher runs end-to-end (used for `--list-config` etc).
+    // REAL-mode intercepts: fire even when `RUSTJVM_JETTY_REAL=1` is set.
+    // The launcher's `processCommandLine` returns null on CratonVM's
+    // partial bootstrap (deep inside its Props/BaseHome plumbing), and
+    // the downstream `Main.start(StartArgs)` then NPEs at line 397 on
+    // `aload_1 + invokevirtual getClasspath`. Returning a synthetic
+    // non-null StartArgs + no-op predicates lets the launcher run to
+    // completion without crashing the VM.
+    //
+    // Main.processCommandLine([Ljava/lang/String;)LStartArgs; — synth.
+    registry.register(
+        CN_MAIN,
+        "processCommandLine",
+        "([Ljava/lang/String;)Lorg/eclipse/jetty/start/StartArgs;",
+        jetty_main_process_command_line,
+    );
+    // Also override the List<String> overload, in case some caller path
+    // dispatches through the boxed-list variant.
+    registry.register(
+        CN_MAIN,
+        "processCommandLine",
+        "(Ljava/util/List;)Lorg/eclipse/jetty/start/StartArgs;",
+        jetty_main_process_command_line,
+    );
+    // StartArgs boolean predicates — return false so `Main.start(StartArgs)`
+    // falls through every conditional. Without these, the synthetic
+    // StartArgs would invoke the real `isHelp` etc. bytecode whose field
+    // reads return zero anyway (because the object was alloc'd empty),
+    // but we register explicit natives for clarity and to defend against
+    // any field-layout drift between Jetty versions.
+    for m in [
+        "isHelp",
+        "isListClasspath",
+        "isListConfig",
+        "isDryRun",
+        "isStopCommand",
+        "isTestingModeEnabled",
+        "isRun",
+        "isExec",
+        "isCreateFiles",
+        "hasJvmArgs",
+        "hasSystemProperties",
+    ] {
+        registry.register(CN_START_ARGS, m, "()Z", jetty_return_false);
+    }
+    // StartArgs reference getters used by `Main.start(StartArgs)` — return
+    // null so the null-checks in that method skip the dependent blocks.
+    registry.register(
+        CN_START_ARGS,
+        "getListModules",
+        "()Ljava/util/List;",
+        jetty_return_null,
+    );
+    registry.register(
+        CN_START_ARGS,
+        "getShowModules",
+        "()Ljava/util/List;",
+        jetty_return_null,
+    );
+    registry.register(
+        CN_START_ARGS,
+        "getModuleGraphFilename",
+        "()Ljava/lang/String;",
+        jetty_return_null,
+    );
+    // StartArgs.getClasspath()LClasspath; — synthetic empty Classpath so
+    // any caller that dereferences the result sees non-null. Registered
+    // in REAL mode too (not just the boot-test short-circuit branch).
+    registry.register(
+        CN_START_ARGS,
+        "getClasspath",
+        "()Lorg/eclipse/jetty/start/Classpath;",
+        jetty_start_args_get_classpath,
+    );
+
+    // Diagnostic gate: when RUSTJVM_JETTY_REAL=1, skip the
+    // boot-test-rc=0 short-circuits below so the real Jetty launcher
+    // runs end-to-end (used for `--list-config` etc). The REAL-mode
+    // intercepts above still fire to keep the launcher from NPEing.
     if std::env::var("RUSTJVM_JETTY_REAL").as_deref() == Ok("1") {
         return;
     }
@@ -132,14 +258,8 @@ pub fn register_jetty_stubs(registry: &mut NativeMethodRegistry) {
         jetty_start_noop,
     );
 
-    // StartArgs.getClasspath()LClasspath; — synthetic empty Classpath so
-    // any caller that races past Main.main / Main.start sees non-null.
-    registry.register(
-        CN_START_ARGS,
-        "getClasspath",
-        "()Lorg/eclipse/jetty/start/Classpath;",
-        jetty_start_args_get_classpath,
-    );
+    // (StartArgs.getClasspath is registered unconditionally above in
+    // the REAL-mode block, so no duplicate registration is needed here.)
 
     // Main.<clinit>()V — no-op. The real clinit instantiates a logger and
     // resolves the launcher's filesystem location; both are unnecessary

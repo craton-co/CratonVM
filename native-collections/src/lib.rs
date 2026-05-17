@@ -5055,7 +5055,16 @@ fn native_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this);
+    // Use `stream_elements_mut` (rather than the immutable `stream_elements`)
+    // so we fall through to `Stream.toArray()` for real-JDK Stream
+    // implementations whose field-0 isn't our synthetic backing array. ES's
+    // `CliToolProvider.load` runs `ServiceLoader.load(...).spliterator()
+    // .stream().filter(name=="server")`; the resulting stream is a real JDK
+    // `ReferencePipeline` (not our `java/util/stream/Stream` synthetic) and
+    // the immutable helper would return Vec::new() — producing
+    // `AssertionError: available names are []` even though
+    // `ServiceLoader.iterator()` correctly produced 13 providers.
+    let elements = stream_elements_mut(ctx, this);
     let mut kept = Vec::new();
     for elem in &elements {
         let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[*elem])?;
@@ -5075,7 +5084,10 @@ fn native_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this);
+    // Mirror the `filter` fix: use the `_mut` variant so real-JDK
+    // `ReferencePipeline` instances drain via `Stream.toArray()` rather than
+    // silently producing an empty stream.
+    let elements = stream_elements_mut(ctx, this);
     let mut mapped = Vec::with_capacity(elements.len());
     for elem in &elements {
         let result = ctx.invoke_virtual(
@@ -5098,7 +5110,7 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
-    let elements = stream_elements(ctx, this);
+    let elements = stream_elements_mut(ctx, this);
     let mut flat = Vec::new();
     for elem in &elements {
         let result = ctx.invoke_virtual(
@@ -5108,7 +5120,7 @@ fn native_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             &[*elem],
         )?;
         if let Some(Value::Object(Some(inner_stream))) = result {
-            let inner = stream_elements(ctx, inner_stream);
+            let inner = stream_elements_mut(ctx, inner_stream);
             flat.extend(inner);
         }
     }

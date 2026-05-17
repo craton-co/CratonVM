@@ -2232,6 +2232,35 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let val = match args.first() { Some(Value::Long(v)) => *v, _ => 0 };
         Ok(Some(Value::Object(Some(ctx.create_string(&val.to_string())))))
     });
+    // Double.toString(D) / Float.toString(F) overrides — JDK 25's
+    // `jdk/internal/math/DoubleToDecimal` / `FloatToDecimal` bytecode
+    // mis-renders values in our interpreter (Spark
+    // `SparkSubmitArguments.loadEnvironmentArguments` fails parsing
+    // `spark.driver.memoryOverheadFactor` default 0.1 as
+    // `0.?9999999E-18`). Route through `format_double` / `format_float`
+    // which produce Java-spec strings ("0.1", "Infinity", "NaN").
+    registry.register(
+        "java/lang/Double",
+        "toString",
+        "(D)Ljava/lang/String;",
+        |ctx, args| {
+            let v = match args.first() { Some(Value::Double(d)) => *d, _ => 0.0 };
+            Ok(Some(Value::Object(Some(
+                ctx.create_string(&format_double(v)),
+            ))))
+        },
+    );
+    registry.register(
+        "java/lang/Float",
+        "toString",
+        "(F)Ljava/lang/String;",
+        |ctx, args| {
+            let v = match args.first() { Some(Value::Float(f)) => *f, _ => 0.0 };
+            Ok(Some(Value::Object(Some(
+                ctx.create_string(&format_float(v)),
+            ))))
+        },
+    );
     registry.register("java/lang/Long", "toHexString", "(J)Ljava/lang/String;", |ctx, args| {
         let val = match args.first() { Some(Value::Long(v)) => *v, _ => 0 };
         Ok(Some(Value::Object(Some(ctx.create_string(&format!("{:x}", val as u64))))))

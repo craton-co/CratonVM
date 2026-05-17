@@ -68,6 +68,42 @@ const CN_ABSTRACT_LOGGER: &str = "org/apache/logging/log4j/spi/AbstractLogger";
 /// classpath we must hand out instances of THIS class to avoid CCE.
 const CN_CORE_LOGGER: &str = "org/apache/logging/log4j/core/Logger";
 const CN_CORE_LOGGER_CONTEXT: &str = "org/apache/logging/log4j/core/LoggerContext";
+/// log4j-core's concrete `LoggerContextFactory` impl. We hand out
+/// instances of this from `LogManager.getFactory()` so callers that
+/// invokeinterface `LoggerContextFactory.isClassLoaderDependent()` (e.g.
+/// `Log4jLoggerFactory.getContext` in the slf4j bridge) see a non-null
+/// receiver.
+const CN_CORE_CONTEXT_FACTORY: &str = "org/apache/logging/log4j/core/impl/Log4jContextFactory";
+/// Simple fallback factory when log4j-core isn't on the classpath. The
+/// log4j-api jar ships `simple.SimpleLoggerContextFactory` for the
+/// "no-provider" case.
+const CN_SIMPLE_CONTEXT_FACTORY: &str =
+    "org/apache/logging/log4j/simple/SimpleLoggerContextFactory";
+const CN_LOGGER_CONTEXT_FACTORY: &str = "org/apache/logging/log4j/spi/LoggerContextFactory";
+
+/// Build a synthetic `LoggerContextFactory`. Prefers log4j-core's
+/// `Log4jContextFactory`, falling back to `SimpleLoggerContextFactory`
+/// from log4j-api. Both implement
+/// `org.apache.logging.log4j.spi.LoggerContextFactory`, so callers that
+/// `invokeinterface isClassLoaderDependent()` on the result resolve to
+/// our registered native (which returns false, steering callers down
+/// the `aconst_null` branch and onto our already-shimmed
+/// `LogManager.getContext(Z)` path).
+fn build_logger_context_factory(ctx: &mut dyn NativeContext) -> ObjectRef {
+    if ctx.class_id_by_name(CN_CORE_CONTEXT_FACTORY).is_some()
+        || ctx.ensure_class_initialized(CN_CORE_CONTEXT_FACTORY).is_ok()
+    {
+        return crate::alloc_concurrent_synthetic(ctx, CN_CORE_CONTEXT_FACTORY, 8);
+    }
+    if ctx.class_id_by_name(CN_SIMPLE_CONTEXT_FACTORY).is_some()
+        || ctx.ensure_class_initialized(CN_SIMPLE_CONTEXT_FACTORY).is_ok()
+    {
+        return crate::alloc_concurrent_synthetic(ctx, CN_SIMPLE_CONTEXT_FACTORY, 8);
+    }
+    // Last resort: an instance of the interface itself (synthetic alloc
+    // accepts an interface name and yields a usable mirror).
+    crate::alloc_concurrent_synthetic(ctx, CN_LOGGER_CONTEXT_FACTORY, 8)
+}
 
 /// Build a synthetic `LoggerContext`. Prefers `org.apache.logging.log4j
 /// .core.LoggerContext` (the concrete log4j-core class) so callers that
@@ -394,17 +430,56 @@ pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
         native_get_root_logger,
     );
 
-    // `LogManager.getFactory` — return null. Callers (in real bytecode)
-    // null-check before dereferencing. Returning null is safer than
-    // building a synthetic LoggerContextFactory because we don't have a
-    // stable signature for the various factory implementations across
-    // log4j versions.
+    // `LogManager.getFactory` — return a synthetic
+    // `LoggerContextFactory`. Many callers (notably the
+    // log4j-slf4j2-impl bridge's `Log4jLoggerFactory.getContext`)
+    // do NOT null-check the result; they go straight to
+    // `invokeinterface LoggerContextFactory.isClassLoaderDependent()`.
+    // Returning null there NPEs with "Cannot invoke
+    // isClassLoaderDependent on null" (observed in Apache ActiveMQ 5.18
+    // boot under CratonVM). We hand out a synthetic instance of
+    // `core.impl.Log4jContextFactory` (or the simple fallback) and pair
+    // it with a registered `isClassLoaderDependent` native (below) that
+    // returns false — steering callers down the `aconst_null` branch
+    // and onto `LogManager.getContext(Z)`, which we already shim.
     registry.register(
         CN_LOGMANAGER,
         "getFactory",
         "()Lorg/apache/logging/log4j/spi/LoggerContextFactory;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Ok(Some(Value::Object(Some(build_logger_context_factory(ctx))))),
     );
+
+    // `LoggerContextFactory.isClassLoaderDependent()Z` — return false on
+    // every concrete factory class we hand out from `getFactory`. This
+    // satisfies the `Log4jLoggerFactory.getContext` bytecode path:
+    //   getFactory().isClassLoaderDependent()
+    //     ? StackLocatorUtil.getCallerClass(...) (heavy path)
+    //     : null                                  (light path)
+    // We register on all three so `invokeinterface` dispatch lands on
+    // the native regardless of which class `build_logger_context_factory`
+    // returned at runtime. Note: this method has a default
+    // implementation on the interface; `vm_exec::check_override` has an
+    // allow-list entry pinning the native ahead of the bytecode body.
+    for cls in [
+        CN_CORE_CONTEXT_FACTORY,
+        CN_SIMPLE_CONTEXT_FACTORY,
+        CN_LOGGER_CONTEXT_FACTORY,
+    ] {
+        registry.register(cls, "isClassLoaderDependent", "()Z", native_log_is_enabled);
+        // Defensive: also no-op the ctor + clinit for the synthetic
+        // alloc path so the real heavy-init bytecode never runs on our
+        // synthetic instance.
+        registry.register(cls, "<init>", "()V", native_log_void);
+        registry.register(cls, "<clinit>", "()V", native_log_void);
+        // `hasContext` — return false so the default `shutdown`
+        // implementation skips the `getContext` + `terminate` chain.
+        registry.register(
+            cls,
+            "hasContext",
+            "(Ljava/lang/String;Ljava/lang/ClassLoader;Z)Z",
+            native_log_is_enabled,
+        );
+    }
 
     // `LogManager.exists(String) -> boolean` — return false. Callers
     // use this to gate `getLogger` calls; saying "no" forces them to

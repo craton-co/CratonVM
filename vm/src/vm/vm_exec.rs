@@ -6208,6 +6208,25 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
+                        // of `Log4jLoggerFactory.getContext` calls
+                        // `LogManager.getFactory().isClassLoaderDependent()`
+                        // without a null-check. We patched `getFactory()`
+                        // to return a synthetic Log4jContextFactory and
+                        // registered `isClassLoaderDependent()` natives on
+                        // every concrete factory class (and the interface
+                        // itself). Those methods have default-method
+                        // bytecode in the real jars; pin our natives ahead
+                        // so the synthetic receiver doesn't walk the
+                        // un-initialised `selector` / `shutdownCallbackRegistry`
+                        // fields the real impl reads. Same rationale for
+                        // `hasContext` which the default `shutdown`
+                        // dispatches to.
+                        || ((class_name == "org/apache/logging/log4j/core/impl/Log4jContextFactory"
+                                || class_name == "org/apache/logging/log4j/simple/SimpleLoggerContextFactory"
+                                || class_name == "org/apache/logging/log4j/spi/LoggerContextFactory")
+                            && (method_name == "isClassLoaderDependent"
+                                || method_name == "hasContext"))
                         // Insurance / Spring Boot 3: real-JDK `URL.getHost` resolves
                         // the host through `InetAddress.getByName` /
                         // `getHostName`, which re-enters `Class.initClassName` in a
@@ -7424,7 +7443,45 @@ fn invoke_on_class_shared_inner(
                         // `propertyAccessExceptions` and calls super; our intercept
                         // does the same plus prints diagnostics.
                         || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
-                            && method_name == "<init>");
+                            && method_name == "<init>")
+                        // Jetty 11 launcher (`jetty_extras.rs`): the real
+                        // `Main.processCommandLine` walks Props/BaseHome plumbing
+                        // that on CratonVM's partial bootstrap returns null, so
+                        // the JDK bytecode would surface as a downstream
+                        // `Cannot invoke isHelp/getClasspath on null` in
+                        // `Main.start(StartArgs)`. Force our synthetic
+                        // non-null StartArgs to win — `check_override` is
+                        // normally false because the method is not abstract
+                        // and not ACC_NATIVE in the .class file.
+                        || (class_name == "org/eclipse/jetty/start/Main"
+                            && method_name == "processCommandLine")
+                        // Companion to the `processCommandLine` override:
+                        // the launcher's `start(StartArgs)` invokes a fixed
+                        // set of boolean predicates and reference getters on
+                        // the synthetic StartArgs. Force our null/false-returning
+                        // natives to win so the synthetic object doesn't
+                        // exercise the real JDK bytecode (which would read
+                        // uninitialised fields and either NPE or return
+                        // garbage).
+                        || (class_name == "org/eclipse/jetty/start/StartArgs"
+                            && matches!(
+                                method_name,
+                                "isHelp"
+                                | "isListClasspath"
+                                | "isListConfig"
+                                | "isDryRun"
+                                | "isStopCommand"
+                                | "isTestingModeEnabled"
+                                | "isRun"
+                                | "isExec"
+                                | "isCreateFiles"
+                                | "hasJvmArgs"
+                                | "hasSystemProperties"
+                                | "getListModules"
+                                | "getShowModules"
+                                | "getModuleGraphFilename"
+                                | "getClasspath"
+                            ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
