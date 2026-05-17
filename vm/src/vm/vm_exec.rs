@@ -2611,17 +2611,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let impl_desc = lcs.impl_handle.descriptor.clone();
             let (_, sam_ret) = crate::runtime::interpreter::split_method_descriptor(&sam_desc);
             let (_, impl_ret) = crate::runtime::interpreter::split_method_descriptor(&impl_desc);
-            // `InvokeSpecial` always targets an instance method (private or
-            // super); the lambda capture list begins with the bound `this`,
-            // so `full_args[0]` is the receiver and must be skipped during
-            // SAM/impl arg coercion.  Omitting it slides every parameter by
-            // one index, leaving the final SAM-supplied arg unconverted —
-            // the Flink `getRawValueFromOption` boolean-unbox regression.
             let receiver_present = matches!(
                 lcs.impl_handle.kind,
-                MethodHandleKind::InvokeVirtual
-                    | MethodHandleKind::InvokeInterface
-                    | MethodHandleKind::InvokeSpecial
+                MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface
             );
             crate::runtime::interpreter::coerce_lambda_args(
                 self.shared,
@@ -7146,16 +7138,14 @@ fn invoke_on_class_shared_inner(
                                 | "checkAccess"
                                 | "checkSecurityAccess"
                             ))
-                        // SPARK-LOG4J-CORE: Spark 3.5.x's
-                        // `Logging$.initializeLogging` invokes
-                        // `LoggerContext.reconfigure()` on the core.LoggerContext
-                        // returned by our `LogManager.getContext` shim. Real
-                        // log4j-core bytecode for `reconfigure` (and friends)
-                        // dereferences `this.configuration` at pc=11
-                        // (`getfield configuration / invokeinterface get(...)`)
-                        // and NPEs because the synthetic LoggerContext was
-                        // allocated via `alloc_concurrent_synthetic` and never
-                        // ran the real `<init>` that would populate that field.
+                        // SPARK-LOG4J2: Spark `Logging.initializeLogging`
+                        // calls `core.LoggerContext.reconfigure()` on the
+                        // synthetic LoggerContext returned by our
+                        // `LogManager.getContext` shim. The real bytecode
+                        // derefs `this.configuration` at pc=11 and NPEs
+                        // because the synthetic was allocated via
+                        // `alloc_concurrent_synthetic` and never ran the
+                        // real ctor that would populate that field.
                         //
                         //   [WF-NPE-STK 4] org/apache/logging/log4j/core/LoggerContext
                         //                  .reconfigure pc=11
@@ -7166,10 +7156,11 @@ fn invoke_on_class_shared_inner(
                         // `native-builtins/src/log4j_extras.rs` (via
                         // `register_log4j_stubs`) to win for every
                         // Configuration-touching surface on
-                        // `org/apache/logging/log4j/core/LoggerContext` so the
-                        // null `configuration` field is never dereferenced.
-                        // Same shape as the existing `core.Logger.getAppenders`
-                        // and `DefaultLogbackConfiguration.apply` overrides.
+                        // `org/apache/logging/log4j/core/LoggerContext` so
+                        // the null `configuration` field is never
+                        // dereferenced. Same shape as the existing
+                        // `core.Logger.getAppenders` and
+                        // `DefaultLogbackConfiguration.apply` overrides.
                         || (class_name == "org/apache/logging/log4j/core/LoggerContext"
                             && matches!(
                                 method_name,
@@ -7189,19 +7180,20 @@ fn invoke_on_class_shared_inner(
                                 | "getLoggers"
                                 | "getName"
                                 | "getExternalContext"
+                                | "getLogger"
+                                | "getContext"
                                 // The ctor/clinit overrides are also
                                 // registered as no-ops in log4j_extras —
-                                // allowlist them so the native wins if the
-                                // synthetic-alloc path falls through to
-                                // <clinit> for the concrete class.
+                                // allowlist them so the native wins if
+                                // the synthetic-alloc path falls through
+                                // to <clinit> for the concrete class.
                                 | "<init>"
                                 | "<clinit>"
                             ))
                         // Same family of overrides on `core.Logger` (the
                         // concrete log4j-core Logger class our `getLogger`
                         // shim hands back). These are registered in
-                        // log4j_extras and the existing inline-in-lib.rs
-                        // log4j surface; allowlist so the natives win over
+                        // log4j_extras; allowlist so the natives win over
                         // bytecode for the accessor surface that callers
                         // touch immediately after `getLogger`.
                         || (class_name == "org/apache/logging/log4j/core/Logger"
@@ -7214,6 +7206,45 @@ fn invoke_on_class_shared_inner(
                                 | "getLevel"
                                 | "getMessageFactory"
                             ))
+                        // log4j 2.x LogManager surface: getContext /
+                        // getLogger / getFormatterLogger / getRootLogger /
+                        // getFactory / shutdown overloads. The `<clinit>`
+                        // shim (elsewhere) leaves the static `factory`
+                        // field null, so the real bytecode for these
+                        // statics NPEs on `factory.getContext(...)`.
+                        // Allowlist them so
+                        // `log4j_extras::register_log4j_stubs` wins
+                        // dispatch and returns synthetic LoggerContext /
+                        // Logger instances instead.
+                        || (class_name == "org/apache/logging/log4j/LogManager"
+                            && matches!(method_name,
+                                "getContext"
+                                | "getLogger"
+                                | "getFormatterLogger"
+                                | "getRootLogger"
+                                | "getFactory"
+                                | "exists"
+                                | "shutdown"))
+                        // SimpleLoggerContext / SimpleLogger / core.Logger:
+                        // synthetic pipeline objects handed out by the
+                        // LogManager shims above. The receiver's real
+                        // bytecode (when it loads) would otherwise win
+                        // over our natives on getLogger / isXxxEnabled /
+                        // info / warn / etc.
+                        || (class_name
+                                == "org/apache/logging/log4j/simple/SimpleLoggerContext"
+                            && matches!(method_name,
+                                "getLogger" | "getContext" | "<init>" | "<clinit>"))
+                        || (matches!(class_name,
+                                "org/apache/logging/log4j/simple/SimpleLogger"
+                                | "org/apache/logging/log4j/spi/AbstractLogger")
+                            && matches!(method_name,
+                                "trace" | "debug" | "info" | "warn" | "error" | "fatal"
+                                | "isTraceEnabled" | "isDebugEnabled" | "isInfoEnabled"
+                                | "isWarnEnabled" | "isErrorEnabled" | "isFatalEnabled"
+                                | "isEnabled" | "logIfEnabled" | "logMessage"
+                                | "getName" | "getLevel" | "getMessageFactory"
+                                | "<init>"))
                         // SB3-LOGBACK: Spring Boot's
                         // DefaultLogbackConfiguration.apply(LoggerContext) sets
                         // up the default logback configuration (root logger
@@ -7333,307 +7364,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
                             && method_name == "getBeanClass")
                         // (Assert.notNull shim removed — caused hangs.)
-                        // sportme: AbstractBeanDefinition.hasBeanClass —
-                        // returns true only when beanClass is a Class mirror,
-                        // false for orphan beans whose class isn't loadable.
-                        || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
-                            && method_name == "hasBeanClass")
-                        // (setPropertyValue/setPropertyValues universal no-ops
-                        //  removed: regressed insurance without fixing demo.)
-                        // sportme: BeanDefinitionReaderUtils.registerBeanDefinition
-                        // — filter orphans at the registration entry point.
-                        || (class_name == "org/springframework/beans/factory/support/BeanDefinitionReaderUtils"
-                            && method_name == "registerBeanDefinition")
-                        // demo: ConfigurationClassPostProcessor entry points
-                        // — bean-name-scoped no-op (only this bean reaches them).
-                        || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
-                            && matches!(method_name,
-                                "processConfigBeanDefinitions"
-                                | "postProcessBeanDefinitionRegistry"
-                                | "postProcessBeanFactory"))
-                        // elasticsearch: ES boot-test stubs.
-                        || (class_name == "org/elasticsearch/launcher/CliToolLauncher"
-                            && method_name == "main")
-                        || (class_name == "org/elasticsearch/cli/CliToolProvider"
-                            && method_name == "load")
-                        || (class_name == "org/apache/logging/log4j/util/ServiceLoaderUtil"
-                            && method_name == "loadClassloaderServices")
-                        // elasticsearch (ES5 audit): the `main` intercept never
-                        // fires because `CliToolLauncher.<clinit>` runs BEFORE
-                        // `vm.invoke("main")` is reached by the CLI. The clinit
-                        // chain (Log4j LogManager.<clinit> → ServiceLoaderUtil
-                        // discovery) NPEs and prints AssertionError before our
-                        // shim has a chance. Allowlist the relevant <clinit>s so
-                        // any intercept the orchestrator wires up in
-                        // phases_late.rs can win over the JDK/library bytecode.
-                        //
-                        // FINDING: <clinit> overrides are unusual but valid here.
-                        // The constructor-skip guard at vm_exec.rs:~3983 only
-                        // suppresses the *superclass-hierarchy-walk* native
-                        // lookup for "<init>" (checked literally). It does NOT
-                        // touch "<clinit>", and it does NOT touch the direct
-                        // `native_methods.find(class_name, ...)` path at the top
-                        // of `invoke_or_native`. So adding these entries is
-                        // sufficient on the dispatch side — the missing piece
-                        // (out of scope for this agent: phases_late.rs is owned
-                        // by DE) is the actual intercept registration for these
-                        // <clinit> signatures.
-                        || (class_name == "org/elasticsearch/launcher/CliToolLauncher"
-                            && method_name == "<clinit>")
-                        || (class_name == "org/apache/logging/log4j/LogManager"
-                            && method_name == "<clinit>")
-                        || (class_name == "org/apache/logging/log4j/util/ServiceLoaderUtil"
-                            && method_name == "<clinit>")
-                        // sportme: AbstractBeanDefinition.getBeanClassName —
-                        // returns null for orphan beans with unloadable classes
-                        // so Spring's downstream code skips them.
-                        || (class_name == "org/springframework/beans/factory/support/AbstractBeanDefinition"
-                            && method_name == "getBeanClassName")
-                        // demo: ConfigurationClassPostProcessor setters that
-                        // would otherwise throw Assert.notNull mid-boot.
-                        || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
-                            && matches!(method_name,
-                                "setMetadataReaderFactory"
-                                | "setEnvironment"
-                                | "setResourceLoader"
-                                | "setBeanClassLoader"))
-                        // wildfly: Module/ModuleLoader/ModuleSpec deeper shims.
-                        || (class_name == "org/jboss/modules/Module"
-                            && matches!(method_name,
-                                "getDependencies"
-                                | "getPaths"
-                                | "getExportedPaths"
-                                | "getResourceLoaders"))
-                        || (class_name == "org/jboss/modules/ModuleLoader"
-                            && matches!(method_name,
-                                "preloadModule" | "findLoadedModuleLocal"
-                                | "installMBeanServer" | "installMBeanServerDirect"))
-                        || (class_name == "org/jboss/modules/Module"
-                            && matches!(method_name,
-                                "installMBeanServer" | "setModuleLogger"
-                                | "getCallerModuleLoader" | "forClass"
-                                | "loadClassFromCallerModuleLoader"))
-                        || (class_name == "org/jboss/modules/ModuleSpec"
-                            && method_name == "getDependencies")
-                        // Boot-test stubs for new apps (Jetty, OL, SonarQube,
-                        // cglib_probe, AS-server Main fallbacks). Wave-1
-                        // 2026-05 expansion: <clinit> + additional entry
-                        // classes per group B/C/F reports.
-                        || (matches!(class_name,
-                                "org/eclipse/jetty/start/Main"
-                                | "org/eclipse/jetty/start/StartArgs"
-                                | "org/eclipse/jetty/start/Classpath")
-                            && matches!(method_name,
-                                "main" | "start" | "getClasspath" | "<clinit>"))
-                        || (matches!(class_name,
-                                "com/ibm/ws/kernel/boot/cmdline/EnvCheck"
-                                | "com/ibm/ws/kernel/boot/Launcher"
-                                | "wlp/lib/com/ibm/ws/kernel/boot/cmdline/UtilityMain")
-                            && matches!(method_name,
-                                "main" | "createPlatform" | "<clinit>"))
-                        || (matches!(class_name,
-                                "org/sonar/application/App"
-                                | "org/sonar/application/config/AppSettingsLoaderImpl")
-                            && matches!(method_name,
-                                "main" | "start" | "detectHomeDir" | "<clinit>"))
-                        || (class_name == "org/test/CglibProbe"
-                            && method_name == "main")
-                        || (matches!(class_name,
-                                "org/jboss/as/server/Main"
-                                | "org/jboss/as/Main"
-                                | "org/jboss/as/standalone/Main"
-                                | "org/jboss/as/host/controller/Main"
-                                | "org/jboss/as/process/Main"
-                                | "org/jboss/as/process/ProcessController"
-                                | "org/jboss/as/process/Main$1"
-                                | "org/jboss/as/host/HostController"
-                                | "org/keycloak/Main"
-                                | "org/keycloak/keycloak/Main"
-                                | "org/keycloak/server/Main"
-                                | "org/keycloak/server/KeycloakServer"
-                                | "org/keycloak/Keycloak")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // DE5 demo CCPP defang
-                        || (class_name == "org/springframework/context/annotation/ConfigurationClassPostProcessor"
-                            && matches!(method_name,
-                                "<init>" | "setBeanFactory" | "setBeanClassLoader"
-                                | "setEnvironment" | "setResourceLoader"
-                                | "setMetadataReaderFactory" | "setApplicationStartup"
-                                | "postProcessBeanDefinitionRegistry"
-                                | "postProcessBeanFactory"))
-                        // ES6 boot-test stubs (extended for ES 7 / ES 8
-                        // server-mode entry classes per group C report).
-                        || (matches!(class_name,
-                                "org/elasticsearch/cli/Command"
-                                | "org/elasticsearch/launcher/CliToolLauncher"
-                                | "org/elasticsearch/server/cli/Elasticsearch"
-                                | "org/elasticsearch/bootstrap/Elasticsearch")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        || (matches!(class_name,
-                                "org/apache/logging/log4j/LogManager"
-                                | "org/apache/logging/log4j/util/ServiceLoaderUtil"
-                                | "org/apache/logging/log4j/util/ProviderUtil")
-                            && method_name == "<clinit>")
-                        // log4j 2.x LogManager surface: getContext / getLogger
-                        // / getFormatterLogger / getRootLogger / getFactory /
-                        // shutdown overloads. The `<clinit>` shim (above) leaves
-                        // the static `factory` field null, so the real bytecode
-                        // for these statics NPEs on `factory.getContext(...)`.
-                        // Allowlist them so `log4j_extras::register_log4j_stubs`
-                        // wins dispatch and returns synthetic LoggerContext /
-                        // Logger instances instead.
-                        || (class_name == "org/apache/logging/log4j/LogManager"
-                            && matches!(method_name,
-                                "getContext"
-                                | "getLogger"
-                                | "getFormatterLogger"
-                                | "getRootLogger"
-                                | "getFactory"
-                                | "exists"
-                                | "shutdown"))
-                        // SimpleLoggerContext / SimpleLogger / core.Logger /
-                        // core.LoggerContext: synthetic pipeline objects
-                        // handed out by the LogManager shims above. The
-                        // receiver's real bytecode (when it loads) would
-                        // otherwise win over our natives on getLogger /
-                        // isXxxEnabled / info / warn / etc.
-                        || (matches!(class_name,
-                                "org/apache/logging/log4j/simple/SimpleLoggerContext"
-                                | "org/apache/logging/log4j/core/LoggerContext")
-                            && matches!(method_name, "getLogger" | "getContext" | "<init>" | "<clinit>"))
-                        || (matches!(class_name,
-                                "org/apache/logging/log4j/simple/SimpleLogger"
-                                | "org/apache/logging/log4j/core/Logger"
-                                | "org/apache/logging/log4j/spi/AbstractLogger")
-                            && matches!(method_name,
-                                "<init>"
-                                | "getName" | "getLevel" | "getMessageFactory"
-                                | "getAppenders" | "getContext" | "getParent"
-                                | "isTraceEnabled" | "isDebugEnabled"
-                                | "isInfoEnabled" | "isWarnEnabled"
-                                | "isErrorEnabled" | "isFatalEnabled"
-                                | "isEnabled"
-                                | "trace" | "debug" | "info" | "warn" | "error" | "fatal"
-                                | "logIfEnabled" | "logMessage"))
-                        // CG4 cglib clinit chain
-                        || (matches!(class_name,
-                                "CglibProbe"
-                                | "org/test/CglibProbe"
-                                | "CglibProbe$Greeter"
-                                | "org/test/CglibProbe$Greeter"
-                                | "net/sf/cglib/proxy/Enhancer"
-                                | "net/sf/cglib/core/AbstractClassGenerator"
-                                | "net/sf/cglib/core/ReflectUtils"
-                                | "net/sf/cglib/core/DebuggingClassWriter"
-                                | "net/sf/cglib/core/internal/Function")
-                            && matches!(method_name, "<clinit>" | "main" | "<init>" | "hello"))
-                        // BB5 bytebuddy stubs
-                        || (matches!(class_name,
-                                "ByteBuddyProbe"
-                                | "org/test/ByteBuddyProbe"
-                                | "net/bytebuddy/ByteBuddy"
-                                | "net/bytebuddy/TypePool$Default$Resolution"
-                                | "net/bytebuddy/description/type/TypeDescription$Generic$LazyProjection"
-                                | "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default"
-                                | "net/bytebuddy/utility/dispatcher/JavaDispatcher")
-                            && matches!(method_name, "<clinit>" | "main"))
-                        // DE6 demo stubs
-                        || (matches!(class_name,
-                                "com/example/demo/DemoApplication"
-                                | "Demo"
-                                | "DemoApplication"
-                                | "org/springframework/boot/loader/JarLauncher"
-                                | "org/springframework/boot/loader/launch/JarLauncher"
-                                | "org/springframework/boot/loader/PropertiesLauncher"
-                                | "org/springframework/boot/loader/launch/PropertiesLauncher")
-                            && method_name == "main")
-                        || (class_name == "org/springframework/boot/SpringApplication"
-                            && method_name == "run")
-                        // JN3 jenkins Java-25 bypass
-                        || (class_name == "executable/Main"
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // WF5 wildfly entry-point safety net
-                        || (matches!(class_name,
-                                "org/jboss/as/host/controller/Main"
-                                | "org/jboss/as/process/Main"
-                                | "org/jboss/as/process/ProcessController"
-                                | "org/jboss/as/host/HostController")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // WF9: jboss-modules Main short-circuit
-                        || (class_name == "org/jboss/modules/Main"
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // batch1: activemq, felix, glassfish, gradle
-                        || (matches!(class_name,
-                                "org/apache/activemq/console/Main"
-                                | "org/apache/felix/main/Main"
-                                | "com/sun/enterprise/glassfish/bootstrap/ASMain"
-                                | "org/gradle/launcher/GradleMain"
-                                | "org/gradle/launcher/Main"
-                                | "org/gradle/launcher/bootstrap/EntryPoint")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // batch2: hbase, ignite, hazelcast, spark, flink
-                        || (matches!(class_name,
-                                "org/apache/hadoop/hbase/util/VersionInfo"
-                                | "org/apache/hadoop/hbase/HMaster"
-                                | "org/apache/hadoop/hbase/HBCK2"
-                                | "org/apache/hadoop/hbase/util/HBaseFsck"
-                                | "org/apache/ignite/startup/cmdline/CommandLineStartup"
-                                | "org/apache/ignite/Ignition"
-                                | "com/hazelcast/core/server/HazelcastMemberStarter"
-                                | "org/apache/spark/deploy/SparkSubmit"
-                                | "org/apache/spark/launcher/Main"
-                                | "org/apache/flink/client/cli/CliFrontend"
-                                | "org/apache/flink/runtime/entrypoint/StandaloneSessionClusterEntrypoint")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // batch3: eclipse, netbeans, hadoop, mindustry
-                        || (matches!(class_name,
-                                "org/eclipse/equinox/launcher/Main"
-                                | "org/netbeans/Main"
-                                | "org/netbeans/MainImpl"
-                                | "org/apache/hadoop/util/VersionInfo"
-                                | "org/apache/hadoop/util/RunJar"
-                                | "mindustry/desktop/DesktopLauncher")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // batch4: nexus, cas, grpc, rabbitmq, jdownloader, freemind
-                        || (matches!(class_name,
-                                "org/sonatype/nexus/karaf/NexusMain"
-                                | "org/sonatype/nexus/karaf/NexusFileLock"
-                                | "org/sonatype/nexus/karaf/NonResettableLogManager"
-                                | "org/apereo/cas/CasWebApplication"
-                                | "org/apereo/cas/CasCommandLineShellApplication"
-                                | "org/apereo/cas/CasEmbeddedContainerTomcat"
-                                | "io/grpc/examples/helloworld/HelloWorldServer"
-                                | "io/grpc/examples/helloworld/HelloWorldClient"
-                                | "io/grpc/examples/routeguide/RouteGuideServer"
-                                | "io/grpc/examples/routeguide/RouteGuideClient"
-                                | "com/rabbitmq/perf/PerfTest"
-                                | "com/rabbitmq/perf/PerfTestMulti"
-                                | "com/rabbitmq/tools/Tracer"
-                                | "com/rabbitmq/tools/jsonrpc/JsonRpcServer"
-                                | "org/jdownloader/update/launcher/JDLauncher"
-                                | "jd/Main"
-                                | "jd/controlling/JDController"
-                                | "freemind/main/FreeMindStarter"
-                                | "freemind/main/FreeMind"
-                                | "freemind/main/FreeMindCommon")
-                            && matches!(method_name, "main" | "<clinit>"))
-                        // r36 boot-test stubs (BlueJ, jEdit, Arduino, Cassandra, Neo4j, Solr, cglib)
-                        || (matches!(class_name,
-                                "Installer"
-                                | "bluej/Main"
-                                | "bluej/BlueJ"
-                                | "bluej/Boot"
-                                | "bluej/launcher/Launcher"
-                                | "installer/Install"
-                                | "org/gjt/sp/jedit/jEdit"
-                                | "processing/app/Base"
-                                | "org/apache/cassandra/service/CassandraDaemon"
-                                | "org/neo4j/server/CommunityEntryPoint"
-                                | "org/neo4j/server/startup/NeoBootstrapper"
-                                | "org/apache/solr/cli/SolrCLI"
-                                | "org/apache/solr/core/CoreContainer"
-                                | "org/apache/solr/servlet/SolrDispatchFilter")
-                            && matches!(method_name, "main" | "<clinit>" | "activate"))
                         // sportme: BeanWrapperImpl.getWrappedInstance — returns
                         // synthetic placeholder for null beans so downstream
                         // lifecycle doesn't ISE on "No wrapped object".
@@ -7694,24 +7424,7 @@ fn invoke_on_class_shared_inner(
                         // `propertyAccessExceptions` and calls super; our intercept
                         // does the same plus prints diagnostics.
                         || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
-                            && method_name == "<init>")
-                        // Jenkins boot: `Boolean.getBoolean(String)` is a concrete
-                        // static JDK method whose bytecode does
-                        //   `parseBoolean(System.getProperty(name))`.
-                        // The Jenkins WAR launcher hits a NoSuchMethodError on
-                        // this lookup before our `System.getProperty` override
-                        // can intercept anything — the resolved method-ref points
-                        // at a Boolean.class entry that some bootstrap paths
-                        // (e.g. early launchers that load `java.lang.Boolean`
-                        // before the full JDK module image is materialised) see
-                        // as absent. Force our native (registered in
-                        // `lang_math::register_wrapper_natives` as
-                        // `native_boolean_get_boolean`) to win, which reads the
-                        // system property directly via `ctx.get_system_property`
-                        // and returns the case-insensitive "true" comparison.
-                        || (class_name == "java/lang/Boolean"
-                            && method_name == "getBoolean"
-                            && descriptor == "(Ljava/lang/String;)Z");
+                            && method_name == "<init>");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
@@ -7914,6 +7627,52 @@ fn invoke_on_class_shared_inner(
                 if class_name == "java/lang/Object"
                     && !is_object_member(method_name, descriptor)
                 {
+                    // Synthetic-receiver rescue: when both the dispatch class
+                    // AND the heap receiver are bare `java/lang/Object`, the
+                    // object was allocated by a native with `ClassId::new(0)`
+                    // (Pattern / Matcher / similar synthetic placeholders that
+                    // intentionally avoid running real-JDK `<clinit>`). Probe
+                    // the native registry for the method+descriptor against
+                    // the well-known synthetic types so subsequent
+                    // `Pattern.matcher(CharSequence)` / `Matcher.find()` etc.
+                    // dispatch to our registered natives instead of NSME-ing
+                    // against `Object.matcher` / `Object.find` / `Object.group`.
+                    //
+                    // We probe a fixed set of candidate class names rather
+                    // than scanning the whole registry: keeps the slow-path
+                    // bounded, and the false-positive risk is near zero
+                    // because the candidate list is exactly the synthetic
+                    // types we allocate with ClassId 0.
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        if recv_cid == ClassId::new(0)
+                            || shared
+                                .class_manager
+                                .read()
+                                .get_class(recv_cid)
+                                .map(|c| c.name.as_ref() == "java/lang/Object")
+                                .unwrap_or(false)
+                        {
+                            const SYNTH_RECEIVER_CANDIDATES: &[&str] = &[
+                                "java/util/regex/Pattern",
+                                "java/util/regex/Matcher",
+                            ];
+                            for cand in SYNTH_RECEIVER_CANDIDATES {
+                                if let Some(cb) = shared.native_methods.find(
+                                    cand, method_name, descriptor,
+                                ) {
+                                    tracing::warn!(
+                                        target: "rustjvm_vm::dispatch::synth_rescue",
+                                        rescued_via = %cand,
+                                        method = %format!("{method_name}{descriptor}"),
+                                        "RECEIVER-IS-OBJECT synth rescue fired",
+                                    );
+                                    return safe_native_call(shared, thread, cb, args);
+                                }
+                            }
+                        }
+                    }
+
                     // Try receiver class chain — covers the case where
                     // recv_cid is a valid non-Object class but the CP
                     // dispatch resolved to Object due to a synthetic alloc.
@@ -7965,33 +7724,7 @@ fn invoke_on_class_shared_inner(
                             }
                             drop(cm3);
                         }
-                    }
 
-                    // RECEIVER-IS-OBJECT recovery: when the receiver's class
-                    // is literally `java/lang/Object` (e.g. our `Pattern` /
-                    // `Matcher` synthetic instances allocated via
-                    // `ctx.alloc_object(ClassId::new(0), …)` — Object IS
-                    // class_id 0 in this VM, so `class_id_of` returns Object's
-                    // class metadata), the receiver-chain walk above bails on
-                    // `recv_name == "java/lang/Object"`. The only signal we
-                    // still have is the `(method_name, descriptor)` pair.
-                    // Scan the native registry for any class that registered
-                    // this exact method+descriptor — `Pattern.matcher(...)`,
-                    // `Matcher.find()`, `Matcher.group(I)Ljava/lang/String;`
-                    // etc. are uniquely keyed by their signature because
-                    // `Object` has no such method.
-                    //
-                    // Concrete tripwire: log4j2's `PropertySource$Util.tokenize`
-                    // calls `Pattern.matcher` on a static field whose value
-                    // came from our `native_pattern_compile` — the resulting
-                    // object has `class_id = 0` and dispatches as
-                    // `Object.matcher`, surfacing as `NoSuchMethodError
-                    // java/lang/Object.matcher(...)`.
-                    if let Some(cb) = shared
-                        .native_methods
-                        .find_by_method_descriptor(method_name, descriptor)
-                    {
-                        return safe_native_call(shared, thread, cb, args);
                     }
                 }
 

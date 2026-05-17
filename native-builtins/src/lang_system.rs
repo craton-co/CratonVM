@@ -7,6 +7,39 @@ use rustjvm_types::error::{MethodCallResult, RuntimeError};
 use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 
 // ---------------------------------------------------------------------------
+// System.exit / Runtime.exit pre-termination hook.
+//
+// `native_system_exit` and `native_runtime_exit` both `std::process::exit`
+// after printing the `[rustjvm] System.exit(N) called` line. Once the
+// process exits, downstream observers (dispatch_trace ring, watchdog
+// printers) lose their chance to dump state. Crates higher up the
+// dependency stack (e.g. `rustjvm-vm` / `vm-cli`) can register a pre-exit
+// hook here so they get one last shot at printing diagnostics before
+// we terminate.
+//
+// Wired by `vm-cli::main::run()` so a silent `System.exit(0)` during real
+// app boot (e.g. Cassandra NodeTool's airline NPE catch path) at least
+// dumps the dispatch_trace ring when `RUSTJVM_DBG_EXIT=1` is set.
+// ---------------------------------------------------------------------------
+type PreExitHook = fn(code: i32);
+static PRE_EXIT_HOOK: std::sync::OnceLock<PreExitHook> = std::sync::OnceLock::new();
+
+/// Install a pre-`std::process::exit` callback that fires from
+/// `native_system_exit` / `native_runtime_exit` immediately before the
+/// process is torn down. Intended for diagnostic dumps (dispatch_trace
+/// ring, last-N-bytecodes printout). First-installer wins — subsequent
+/// calls are silent no-ops, matching `OnceLock` semantics.
+pub fn set_pre_exit_hook(hook: PreExitHook) {
+    let _ = PRE_EXIT_HOOK.set(hook);
+}
+
+fn invoke_pre_exit_hook(code: i32) {
+    if let Some(hook) = PRE_EXIT_HOOK.get() {
+        hook(code);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // java.lang.System natives
 // ---------------------------------------------------------------------------
 
@@ -656,6 +689,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
     eprintln!("[rustjvm] System.exit({code}) called — process terminating");
+    invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
 
@@ -882,6 +916,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
     eprintln!("[rustjvm] Runtime.exit({code}) called — process terminating");
+    invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
 

@@ -492,6 +492,26 @@ fn run() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Pre-`std::process::exit` hook: dump the dispatch_trace ring before
+    // `native_system_exit` / `native_runtime_exit` tear the process down.
+    // This restores last-N-bytecodes visibility for "silent System.exit"
+    // bugs (the Cassandra NodeTool airline NPE was completely hidden behind
+    // `exit(0)` with an empty Java caller chain until this hook landed; with
+    // `RUSTJVM_DBG_LETSGO=1` set, the ring now reveals the last Java method
+    // that ran before exit).
+    //
+    // No-op when neither `RUSTJVM_DBG_EXIT` nor `RUSTJVM_DBG_LETSGO` is set,
+    // so clean runs stay quiet.
+    rustjvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
+        if std::env::var_os("RUSTJVM_DBG_EXIT").is_some()
+            || std::env::var_os("RUSTJVM_DBG_LETSGO").is_some()
+        {
+            rustjvm_vm::dispatch_trace::dump_to_stderr_unconditional(&format!(
+                "pre-System.exit({code})"
+            ));
+        }
+    });
+
     // Extract -Dkey=value system properties before clap parsing
     let raw_args: Vec<String> = normalize_java_launcher_argv(std::env::args().collect());
     let (filtered_args, system_properties) = extract_system_properties(raw_args);

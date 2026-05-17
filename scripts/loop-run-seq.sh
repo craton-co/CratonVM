@@ -59,9 +59,21 @@ run_app eclipse 25 --Xmx 512m \
     --jar "$ECLAUNCHER"
 
 NB="$APPS/netbeans"
-NBCP=$(find "$NB/platform/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
-run_app netbeans 25 --Xmx 512m -c "$NBCP" \
+# NetBeans launcher needs platform/lib (boot.jar w/ org.netbeans.Main +
+# MainImpl + BootClassLoader) AND platform/core (core.jar w/ the default
+# `netbeans.mainclass` = org.netbeans.core.startup.Main). Without core/
+# the BootClassLoader.loadClass call throws ClassNotFoundException.
+NBCP_LIB=$(find "$NB/platform/lib" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+NBCP_CORE=$(find "$NB/platform/core" -name "*.jar" | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+mkdir -p "$LOGDIR/nb-userdir"
+# `netbeans.user` must be a writable dir or MainImpl falls back to
+# parsing `--userdir` from argv (we have none, so it would NPE).
+# `netbeans.dirs` is the cluster-dirs list — set it to platform so
+# MainImpl.execute's build_cp picks up platform/core too.
+run_app netbeans 25 --Xmx 512m -c "$NBCP_LIB;$NBCP_CORE" \
     "-Dnetbeans.home=$NB/platform" \
+    "-Dnetbeans.dirs=$NB/platform" \
+    "-Dnetbeans.user=$LOGDIR/nb-userdir" \
     org.netbeans.Main
 
 HD="$APPS/hadoop-3.3.6"
