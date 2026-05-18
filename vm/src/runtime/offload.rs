@@ -1572,6 +1572,97 @@ pub fn finalize_submission(
     }
 }
 
+// ── Phase 7 #2: device-buffer cache for resident GpuArrays ──────────
+//
+// Each `craton.gpu.GpuArray` handle that's been uploaded to the GPU
+// at least once keeps its `DeviceBuffer<T>` here. The next kernel
+// that references the same handle skips the H→D copy and runs
+// directly against the cached buffer. The kernel's writes stay on
+// the device buffer; the writeback updates the host-bytes mirror
+// in native-builtins's synthetic store (so `GpuArray.toHost()`
+// returns current contents).
+//
+// Cache eviction: when Java calls `Native.releaseArray(handle)`,
+// `craton_gpu::array_release` (Phase 7 #2 hook) calls
+// `device_cache::release(handle)` to drop the cached buffer.
+//
+// All four primitive element types get their own slot in the same
+// keyed map; element type is fixed at wrap time on the
+// native-builtins side, so collisions across types for the same
+// handle don't happen.
+
+#[cfg(feature = "gpu-offload")]
+pub(crate) mod device_cache {
+    use cuda_bridge::DeviceBuffer;
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::sync::{Arc, OnceLock};
+
+    pub(crate) enum CachedBuffer {
+        I32(Arc<DeviceBuffer<i32>>),
+        I64(Arc<DeviceBuffer<i64>>),
+        F32(Arc<DeviceBuffer<f32>>),
+        F64(Arc<DeviceBuffer<f64>>),
+    }
+
+    static CACHE: OnceLock<Mutex<FxHashMap<u64, CachedBuffer>>> = OnceLock::new();
+
+    fn map() -> &'static Mutex<FxHashMap<u64, CachedBuffer>> {
+        CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+    }
+
+    pub(crate) fn get_i32(handle: u64) -> Option<Arc<DeviceBuffer<i32>>> {
+        match map().lock().get(&handle) {
+            Some(CachedBuffer::I32(arc)) => Some(arc.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put_i32(handle: u64, buf: Arc<DeviceBuffer<i32>>) {
+        map().lock().insert(handle, CachedBuffer::I32(buf));
+    }
+
+    pub(crate) fn get_i64(handle: u64) -> Option<Arc<DeviceBuffer<i64>>> {
+        match map().lock().get(&handle) {
+            Some(CachedBuffer::I64(arc)) => Some(arc.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put_i64(handle: u64, buf: Arc<DeviceBuffer<i64>>) {
+        map().lock().insert(handle, CachedBuffer::I64(buf));
+    }
+
+    pub(crate) fn get_f32(handle: u64) -> Option<Arc<DeviceBuffer<f32>>> {
+        match map().lock().get(&handle) {
+            Some(CachedBuffer::F32(arc)) => Some(arc.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put_f32(handle: u64, buf: Arc<DeviceBuffer<f32>>) {
+        map().lock().insert(handle, CachedBuffer::F32(buf));
+    }
+
+    pub(crate) fn get_f64(handle: u64) -> Option<Arc<DeviceBuffer<f64>>> {
+        match map().lock().get(&handle) {
+            Some(CachedBuffer::F64(arc)) => Some(arc.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn put_f64(handle: u64, buf: Arc<DeviceBuffer<f64>>) {
+        map().lock().insert(handle, CachedBuffer::F64(buf));
+    }
+
+    /// Drop the cached device buffer for `handle` (if any). Called
+    /// from `Native.releaseArray` so the device memory is freed when
+    /// the Java `GpuArray` is no longer needed.
+    pub fn release(handle: u64) {
+        map().lock().remove(&handle);
+    }
+}
+
 // ── Per-type marshalling helpers ────────────────────────────────────
 
 #[cfg(feature = "gpu-offload")]
@@ -1581,13 +1672,15 @@ pub enum MarshalWriteback {
     I64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
     F32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
     F64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
-    // Phase 6 #3 — GpuArray-backed args. Writeback target is the
-    // resident-store entry keyed by `handle`, not a Java array
-    // object.
-    ResidentI32 { handle: u64, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
-    ResidentI64 { handle: u64, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
-    ResidentF32 { handle: u64, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
-    ResidentF64 { handle: u64, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
+    // Phase 6 #3 / Phase 7 #2 — GpuArray-backed args. The
+    // `DeviceBuffer<T>` is shared with `device_cache` so the next
+    // kernel using the same `handle` reuses it instead of
+    // re-uploading. Writeback target is the resident-store entry
+    // keyed by `handle`, not a Java array object.
+    ResidentI32 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>, len: usize },
+    ResidentI64 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>, len: usize },
+    ResidentF32 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>, len: usize },
+    ResidentF64 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>, len: usize },
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -1719,83 +1812,93 @@ fn marshal_resident_array_arg(
     use crate::runtime::gpu_marshal;
     use rustjvm_types::ArrayElementType;
 
-    match element_type {
-        ArrayElementType::Int => {
-            let host: &[i32] = bytemuck::cast_slice(&host_bytes);
-            let buf = gpu_marshal::upload(ctx, host)
-                .map_err(|e| format!("upload i32 (GpuArray, len={len}): {e}"))?;
-            let wb = MarshalWriteback::ResidentI32 { handle: arr_handle, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::ResidentI32 { buf, .. } => {
-                    let len32 = len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i32>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<i32> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len32)
-                    })
-                }
-                _ => unreachable!(),
+    // Macro to keep the four type-specialized arms readable. Each
+    // arm: (a) consult device_cache, (b) on miss upload + cache,
+    // (c) build a push-closure pinning the DeviceBuffer pointer
+    // via the Arc<DeviceBuffer<T>> stored in the writeback.
+    macro_rules! resident_arm {
+        ($ty:ty, $variant:ident, $cache_get:path, $cache_put:path, $tag:literal) => {{
+            // (a) Cache check.
+            let arc = if let Some(arc) = $cache_get(arr_handle) {
+                arc
+            } else {
+                // (b) Miss — upload and install.
+                let host: &[$ty] = bytemuck::cast_slice(&host_bytes);
+                let buf = gpu_marshal::upload(ctx, host)
+                    .map_err(|e| format!("upload {} (GpuArray, len={len}): {e}", $tag))?;
+                let arc = std::sync::Arc::new(buf);
+                $cache_put(arr_handle, arc.clone());
+                arc
             };
-            Ok((push, wb))
-        }
-        ArrayElementType::Long => {
-            let host: &[i64] = bytemuck::cast_slice(&host_bytes);
-            let buf = gpu_marshal::upload(ctx, host)
-                .map_err(|e| format!("upload i64 (GpuArray, len={len}): {e}"))?;
-            let wb = MarshalWriteback::ResidentI64 { handle: arr_handle, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::ResidentI64 { buf, .. } => {
-                    let len32 = len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i64>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<i64> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len32)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        ArrayElementType::Float => {
-            let host: &[f32] = bytemuck::cast_slice(&host_bytes);
-            let buf = gpu_marshal::upload(ctx, host)
-                .map_err(|e| format!("upload f32 (GpuArray, len={len}): {e}"))?;
-            let wb = MarshalWriteback::ResidentF32 { handle: arr_handle, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::ResidentF32 { buf, .. } => {
-                    let len32 = len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f32>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<f32> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len32)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        ArrayElementType::Double => {
-            let host: &[f64] = bytemuck::cast_slice(&host_bytes);
-            let buf = gpu_marshal::upload(ctx, host)
-                .map_err(|e| format!("upload f64 (GpuArray, len={len}): {e}"))?;
-            let wb = MarshalWriteback::ResidentF64 { handle: arr_handle, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::ResidentF64 { buf, .. } => {
-                    let len32 = len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f64>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<f64> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len32)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        other => Err(format!(
-            "submitMethod: GpuArray element type {other:?} unsupported"
-        )),
+            // (c) Build the push closure + writeback. Both share
+            // ownership of the Arc; the closure pins a raw pointer
+            // to the inner DeviceBuffer for `push_device_ptr` since
+            // KernelArgs takes `&DeviceBuffer<T>`. The pointer
+            // stays valid because the Arc inside the writeback
+            // (returned alongside) keeps the buffer alive.
+            let len32 = len as i32;
+            let wb_arc = arc.clone();
+            let device_ptr =
+                std::sync::Arc::as_ptr(&arc) as *const cuda_bridge::DeviceBuffer<$ty>;
+            let push: Box<dyn FnOnce(_) -> _> =
+                Box::new(move |args: cuda_bridge::KernelArgs| {
+                    // SAFETY: the Arc<DeviceBuffer<T>> we cloned
+                    // for the writeback (wb_arc, returned with the
+                    // writeback below) keeps the buffer alive for
+                    // the duration of `dispatch_method_from_native`,
+                    // which is when this closure fires and is
+                    // immediately consumed.
+                    let _ = &arc; // keep this clone alive past push
+                    let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
+                    args.push_device_ptr(buf_ref).push_i32(len32)
+                });
+            (
+                push,
+                MarshalWriteback::$variant {
+                    handle: arr_handle,
+                    buf: wb_arc,
+                    len,
+                },
+            )
+        }};
     }
+
+    let (push, wb) = match element_type {
+        ArrayElementType::Int => resident_arm!(
+            i32,
+            ResidentI32,
+            device_cache::get_i32,
+            device_cache::put_i32,
+            "i32"
+        ),
+        ArrayElementType::Long => resident_arm!(
+            i64,
+            ResidentI64,
+            device_cache::get_i64,
+            device_cache::put_i64,
+            "i64"
+        ),
+        ArrayElementType::Float => resident_arm!(
+            f32,
+            ResidentF32,
+            device_cache::get_f32,
+            device_cache::put_f32,
+            "f32"
+        ),
+        ArrayElementType::Double => resident_arm!(
+            f64,
+            ResidentF64,
+            device_cache::get_f64,
+            device_cache::put_f64,
+            "f64"
+        ),
+        other => {
+            return Err(format!(
+                "submitMethod: GpuArray element type {other:?} unsupported"
+            ));
+        }
+    };
+    Ok((push, wb))
 }
 
 /// Phase 6 #2: detect Java's autoboxed primitives and unwrap them
