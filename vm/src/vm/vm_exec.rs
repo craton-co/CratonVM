@@ -902,6 +902,40 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    /// Phase 6 #5: resolve a lambda proxy back to its target method
+    /// + captured values for GPU dispatch.
+    fn gpu_resolve_lambda_target(
+        &self,
+        callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::classloading::resolution::MethodHandleKind;
+            let cid = self.shared.heap.class_id_of(callable);
+            let proxies = self.shared.lambda_proxies.read();
+            let lcs = proxies.get(&cid)?;
+            // Only static-method targets are GPU-dispatchable.
+            if !matches!(lcs.impl_handle.kind, MethodHandleKind::InvokeStatic) {
+                return None;
+            }
+            let class_name = lcs.impl_handle.class_name.clone();
+            let member_name = lcs.impl_handle.member_name.clone();
+            let descriptor = lcs.impl_handle.descriptor.clone();
+            let n_captures = lcs.capture_types.len();
+            drop(proxies);
+            let mut captures = Vec::with_capacity(n_captures);
+            for i in 0..n_captures {
+                captures.push(self.shared.heap.get_field(callable, i));
+            }
+            Some((class_name, member_name, descriptor, captures))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = callable;
+            None
+        }
+    }
+
     /// Phase 6 #4: block on the real GPU submission's event.
     fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
         #[cfg(feature = "gpu-offload")]

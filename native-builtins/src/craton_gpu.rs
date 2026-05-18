@@ -428,33 +428,93 @@ fn record_failed_future() -> u64 {
 
 /// `Native.submit(long execHandle, GpuCallable c) -> GpuFuture`
 ///
-/// Records a Failed future in our state (no CUDA device available),
-/// then wraps the handle in a real `GpuFutureImpl` Java object so
-/// `Native.futureSynchronize` + `Native.futureGetErrorMessage` can
-/// drive the round-trip end-to-end.
+/// Phase 6 #5: tries to resolve the GpuCallable lambda's target
+/// method via `ctx.gpu_resolve_lambda_target`. If successful, the
+/// captured values become the kernel args and we dispatch through
+/// the real path (same as if the user had called the explicit
+/// `submit(class, method, descriptor, args)` form). Otherwise we
+/// fall back to recording a synthetic Failed future so the Java
+/// side surfaces a clear error message.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit(
     ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
-    let _callable = arg_object(args, 1);
-    let future_handle = record_failed_future();
-    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", future_handle)
+    let callable = match arg_object(args, 1) {
+        Some(o) => o,
+        None => {
+            let h = record_failed_future_with_message("submit: callable was null");
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+        }
+    };
+    // Phase 6 #5: try to resolve the lambda's target.
+    if let Some((class_name, method_name, descriptor, captures)) =
+        ctx.gpu_resolve_lambda_target(callable)
+    {
+        if let Some(handle) = ctx.gpu_dispatch_method(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+        ) {
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                handle,
+            );
+        }
+    }
+    // Fallback — the callable is not a recognized GPU-dispatchable
+    // lambda (anonymous-class implementation, non-static target,
+    // capture types we don't understand, etc.). Surface a clear
+    // failure rather than silently running on CPU.
+    let h = record_failed_future_with_message(
+        "submit: callable is not a GPU-dispatchable lambda \
+         (expected a static-method reference with capture-only args)",
+    );
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h)
 }
 
 /// `Native.launch(long execHandle, GpuRunnable r) -> GpuFuture`
 ///
-/// Same shape as `submit`.
+/// Same shape as `submit` — Phase 6 #5 resolution applies. The
+/// only difference is the SAM (`run()` returns void), so the
+/// returned future's parametric type is `Void`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_launch(
     ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
-    let _runnable = arg_object(args, 1);
-    let future_handle = record_failed_future();
-    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", future_handle)
+    let runnable = match arg_object(args, 1) {
+        Some(o) => o,
+        None => {
+            let h = record_failed_future_with_message("launch: runnable was null");
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+        }
+    };
+    if let Some((class_name, method_name, descriptor, captures)) =
+        ctx.gpu_resolve_lambda_target(runnable)
+    {
+        if let Some(handle) = ctx.gpu_dispatch_method(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+        ) {
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                handle,
+            );
+        }
+    }
+    let h = record_failed_future_with_message(
+        "launch: runnable is not a GPU-dispatchable lambda \
+         (expected a static-method reference with capture-only args)",
+    );
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h)
 }
 
 /// `Native.submitMethod(long execHandle, String className, String methodName,

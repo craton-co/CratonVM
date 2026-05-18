@@ -152,6 +152,34 @@ pub trait NativeContext {
         None
     }
 
+    /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
+    /// `GpuFunction` lambda's target method.
+    ///
+    /// When the user writes
+    ///
+    /// ```ignore
+    /// executor.submit(() -> Pipeline.vectorAdd(a, b, out));
+    /// ```
+    ///
+    /// the lambda is materialised as a proxy object whose class is
+    /// recorded in `shared.lambda_proxies`. This method looks the
+    /// proxy up and returns
+    /// `Some((target_class, target_method, target_descriptor,
+    ///        captured_values))` so the dispatcher can route through
+    /// `gpu_dispatch_method`.
+    ///
+    /// Returns `None` for any of:
+    ///   * `callable` is not a lambda proxy
+    ///   * the impl method handle is not InvokeStatic (instance
+    ///     methods cannot run on the GPU)
+    ///   * gpu-offload feature is off (default impl)
+    fn gpu_resolve_lambda_target(
+        &self,
+        _callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        None
+    }
+
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
     fn new_object(&mut self, class_name: &str) -> MethodCallResult;
