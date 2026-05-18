@@ -51,6 +51,19 @@ public final class Native {
         Object lambda,
         Object samArg);
 
+    /**
+     * Phase 8 #6: generalised {@link #submitWithArg} for SAMs of
+     * any arity (BiFunction, TriFunction, custom @FunctionalInterface
+     * types with multiple parameters). The lambda's captures
+     * followed by {@code samArgs} (in declaration order) become the
+     * kernel parameters. Returns a {@code Failed} future when the
+     * lambda isn't a GPU-dispatchable static-method reference.
+     */
+    public static native <R> GpuFuture<R> submitWithArgs(
+        long execHandle,
+        Object lambda,
+        Object[] samArgs);
+
     public static native GpuStream newStream(long execHandle);
     public static native void      closeStream(long streamHandle);
 

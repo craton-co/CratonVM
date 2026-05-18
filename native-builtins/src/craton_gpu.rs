@@ -79,6 +79,12 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(JLjava/lang/Object;Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
         builtin_submit_with_arg,
     );
+    registry.register(
+        KLASS,
+        "submitWithArgs",
+        "(JLjava/lang/Object;[Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
+        builtin_submit_with_args,
+    );
     registry.register(KLASS, "newStream",    "(J)Lcraton/gpu/GpuStream;", builtin_new_stream);
     registry.register(KLASS, "closeStream",  "(J)V", builtin_close_stream);
 
@@ -529,6 +535,60 @@ fn builtin_submit_with_arg(
     }
     let h = record_failed_future_with_message(
         "submitWithArg: lambda is not a GPU-dispatchable single-arg SAM",
+    );
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h)
+}
+
+/// Phase 8 #6 — `Native.submitWithArgs(long execHandle, Object
+/// lambda, Object[] samArgs) -> GpuFuture`
+///
+/// Generalised companion to `submitWithArg` (Phase 7 #3) for SAMs
+/// with arity > 1: BiFunction, TriFunction, custom multi-param
+/// @FunctionalInterface types. Captures are followed by every
+/// element of `samArgs` in declaration order; the resulting list
+/// is passed to `gpu_dispatch_method`. `samArgs` is allowed to
+/// be empty (in which case this collapses to the Phase 6 #5
+/// zero-arg behavior of `submit`).
+#[cfg(feature = "gpu-offload")]
+fn builtin_submit_with_args(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let _exec = arg_long(args, 0) as u64;
+    let lambda = match arg_object(args, 1) {
+        Some(o) => o,
+        None => {
+            let h = record_failed_future_with_message("submitWithArgs: lambda was null");
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+        }
+    };
+    // samArgs may be null; we treat that as the empty arg array.
+    let sam_args_obj = arg_object(args, 2);
+
+    if let Some((class_name, method_name, descriptor, mut captures)) =
+        ctx.gpu_resolve_lambda_target(lambda)
+    {
+        if let Some(arr_obj) = sam_args_obj {
+            let n = ctx.array_length(arr_obj);
+            for i in 0..n {
+                captures.push(ctx.get_array_element(arr_obj, i));
+            }
+        }
+        if let Some(handle) = ctx.gpu_dispatch_method(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+        ) {
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                handle,
+            );
+        }
+    }
+    let h = record_failed_future_with_message(
+        "submitWithArgs: lambda is not a GPU-dispatchable static-method reference",
     );
     instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h)
 }
