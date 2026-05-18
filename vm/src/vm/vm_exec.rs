@@ -914,8 +914,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let cid = self.shared.heap.class_id_of(callable);
             let proxies = self.shared.lambda_proxies.read();
             let lcs = proxies.get(&cid)?;
-            // Only static-method targets are GPU-dispatchable.
+            // Phase 7 #4 (partial): only static-method targets are
+            // GPU-dispatchable today. Non-static kinds need:
+            //   - The analyzer to admit non-static methods (Phase 8
+            //     work; currently Reason::NonStatic rejects them).
+            //   - The marshaller to thread the receiver as a kernel
+            //     arg (straightforward extension once admitted).
+            //   - For NewInvokeSpecial / GetField / etc.: no
+            //     GPU semantics — heap construction and field
+            //     access on the device aren't supported.
+            // Log a tracing::debug so `--print-gpu-decisions` shows
+            // why a lambda fell through to CPU.
             if !matches!(lcs.impl_handle.kind, MethodHandleKind::InvokeStatic) {
+                tracing::debug!(
+                    target: "gpu.offload",
+                    handle_kind = ?lcs.impl_handle.kind,
+                    target_class = %lcs.impl_handle.class_name,
+                    target_member = %lcs.impl_handle.member_name,
+                    "lambda target rejected: only static-method references are GPU-dispatchable today (PHASE8-FOLLOWUP)",
+                );
                 return None;
             }
             let class_name = lcs.impl_handle.class_name.clone();
