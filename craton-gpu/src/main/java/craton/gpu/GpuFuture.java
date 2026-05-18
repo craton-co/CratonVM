@@ -49,10 +49,10 @@ public interface GpuFuture<T> {
      * is performed between the two stages.
      *
      * @param fn  the continuation to apply
-     * @param <R> the type produced by the continuation
+     * @param <U> the type produced by the continuation
      * @return a future representing the chained computation
      */
-    <R> GpuFuture<R> thenApplyGpu(GpuFunction<T, R> fn);
+    <U> GpuFuture<U> thenApplyGpu(GpuFunction<? super T, ? extends U> fn);
 
     /**
      * Adapts this {@code GpuFuture} to a standard {@link CompletableFuture}.

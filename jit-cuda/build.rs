@@ -92,6 +92,26 @@ fn compile_top_level_fixtures(sources_dir: &Path) {
 
     let mut cmd = Command::new("javac");
     cmd.arg("-d").arg(sources_dir);
+
+    // Phase 8 #3 — top-level fixtures may import `craton.gpu.*`
+    // (e.g. `BenchmarkExplicit.java` uses GpuExecutor). Add the
+    // craton-gpu annotations classpath if `craton-gpu`'s build.rs
+    // produced one. Same env-var-fallback rules as
+    // `compile_annotation_fixtures`.
+    let cp_dir = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR")
+        .unwrap_or_default();
+    let cp_jar = std::env::var("DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR")
+        .unwrap_or_default();
+    let classpath: Option<String> = match (cp_jar.is_empty(), cp_dir.is_empty()) {
+        (false, false) => Some(format!("{cp_jar}{}{cp_dir}", classpath_separator())),
+        (false, true) => Some(cp_jar),
+        (true, false) => Some(cp_dir),
+        (true, true) => None,
+    };
+    if let Some(cp) = &classpath {
+        cmd.arg("-cp").arg(cp);
+    }
+
     for f in &java_files {
         cmd.arg(f);
     }
