@@ -73,6 +73,12 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
         "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
         builtin_submit_method,
     );
+    registry.register(
+        KLASS,
+        "submitWithArg",
+        "(JLjava/lang/Object;Ljava/lang/Object;)Lcraton/gpu/GpuFuture;",
+        builtin_submit_with_arg,
+    );
     registry.register(KLASS, "newStream",    "(J)Lcraton/gpu/GpuStream;", builtin_new_stream);
     registry.register(KLASS, "closeStream",  "(J)V", builtin_close_stream);
 
@@ -472,6 +478,57 @@ fn builtin_submit(
     let h = record_failed_future_with_message(
         "submit: callable is not a GPU-dispatchable lambda \
          (expected a static-method reference with capture-only args)",
+    );
+    instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h)
+}
+
+/// Phase 7 #3 — `Native.submitWithArg(long execHandle, Object
+/// lambda, Object samArg) -> GpuFuture`
+///
+/// For `GpuFunction<T, R>` (and any other single-arg SAM) lambdas.
+/// Resolves the lambda target like Phase 6 #5, then appends
+/// `samArg` to the captures so the kernel sees
+/// `(capture0, capture1, ..., samArg)` in order. If the lambda
+/// isn't a static-method-reference shape, returns a synthetic
+/// Failed future; the Java caller can fall back to CPU evaluation.
+#[cfg(feature = "gpu-offload")]
+fn builtin_submit_with_arg(
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let _exec = arg_long(args, 0) as u64;
+    let lambda = match arg_object(args, 1) {
+        Some(o) => o,
+        None => {
+            let h = record_failed_future_with_message("submitWithArg: lambda was null");
+            return instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h);
+        }
+    };
+    // samArg may be null (e.g. for a SAM whose input is a reference
+    // type and the caller passed null) — preserve it as
+    // Value::Object(None). The dispatcher will surface "null arg"
+    // if the target descriptor needs an array there.
+    let sam_arg = args.get(2).copied().unwrap_or(Value::Object(None));
+
+    if let Some((class_name, method_name, descriptor, mut captures)) =
+        ctx.gpu_resolve_lambda_target(lambda)
+    {
+        captures.push(sam_arg);
+        if let Some(handle) = ctx.gpu_dispatch_method(
+            &class_name,
+            &method_name,
+            &descriptor,
+            &captures,
+        ) {
+            return instantiate_handle_wrapper(
+                ctx,
+                "craton/gpu/internal/GpuFutureImpl",
+                handle,
+            );
+        }
+    }
+    let h = record_failed_future_with_message(
+        "submitWithArg: lambda is not a GPU-dispatchable single-arg SAM",
     );
     instantiate_handle_wrapper(ctx, "craton/gpu/internal/GpuFutureImpl", h)
 }

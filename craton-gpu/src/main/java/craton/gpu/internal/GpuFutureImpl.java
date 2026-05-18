@@ -60,10 +60,36 @@ final class GpuFutureImpl<T> implements GpuFuture<T> {
     public <U> GpuFuture<U> thenApplyGpu(GpuFunction<? super T, ? extends U> fn) {
         try {
             T value = get();
+            // Phase 7 #3: try GPU dispatch first. If the lambda is
+            // a static-method reference whose target is GPU-eligible,
+            // Native.submitWithArg returns a real submission. If
+            // the lambda can't be resolved or the kernel isn't
+            // eligible, the returned future immediately reports
+            // Failed and we fall back to evaluating `fn` on the CPU
+            // so existing user code keeps working.
+            //
+            // execHandle=0 because dispatch_method_from_native
+            // doesn't actually consult the handle today (it uses
+            // OffloadCacheRegistry with the default device ordinal).
+            @SuppressWarnings("unchecked")
+            GpuFuture<U> gpuResult = (GpuFuture<U>) Native.submitWithArg(0L, fn, value);
+            if (gpuResult != null) {
+                // futureStatus: 0=running, 1=completed, 2=failed.
+                // On Failed at submission time we know the GPU path
+                // didn't take. On Running / Completed we hand the
+                // future back; the user's get() will wait.
+                long h = ((GpuFutureImpl<?>) gpuResult).handle();
+                int status = Native.futureStatus(h);
+                if (status != 2) {
+                    return gpuResult;
+                }
+                // Release the synthetic Failed future since we're
+                // discarding it. (StreamCleaner will GC-release
+                // eventually anyway; explicit is tidier.)
+                Native.releaseFuture(h);
+            }
+            // CPU fallback — original Phase 3.5 behavior.
             U result = fn.apply(value);
-            // Phase 3.5: synchronous chain. Real stream-affine chaining
-            // (where `fn` itself is a @GpuKernel staying on the same
-            // stream) is a follow-up.
             return new CompletedFuture<>(result);
         } catch (Exception e) {
             throw new GpuException("thenApplyGpu failed", e);

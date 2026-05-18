@@ -37,6 +37,20 @@ public final class Native {
         String descriptor,
         Object[] args);
 
+    /**
+     * Phase 7 #3: like {@link #submit} but for {@code GpuFunction<T,R>}
+     * lambdas that take a single SAM arg. The lambda's captures plus
+     * {@code samArg} (appended last) become the kernel parameters.
+     * Returns a {@code Failed} future if the lambda can't be resolved
+     * or the kernel isn't eligible — callers (typically
+     * {@code GpuFuture.thenApplyGpu}) may fall back to CPU evaluation
+     * after observing the failure.
+     */
+    public static native <R> GpuFuture<R> submitWithArg(
+        long execHandle,
+        Object lambda,
+        Object samArg);
+
     public static native GpuStream newStream(long execHandle);
     public static native void      closeStream(long streamHandle);
 
