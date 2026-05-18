@@ -100,6 +100,13 @@ pub enum Reason {
     HasExceptionHandlers,
     /// `aaload` / `aastore` — we don't allow reference arrays.
     RefArrayOp,
+    /// Phase 9 #2 — `aload_0` in a non-static method that is NOT
+    /// immediately followed by `getfield` of a primitive-array
+    /// field. The only supported receiver-access pattern is
+    /// `aload_0; getfield <primitive-array-cp>`; everything else
+    /// (passing `this` to another method, storing `this` to a
+    /// local, etc.) lacks a GPU lowering today.
+    NonStaticReceiverMisuse,
     /// An opcode we haven't enumerated yet — be safe and reject.
     UnknownOpcode(u8),
 }
@@ -140,9 +147,14 @@ pub fn analyze_with_annotations(
     method: &ClassFileMethod,
     annotations: &MethodAnnotations,
 ) -> OffloadVerdict {
-    if !method.is_static() {
-        return OffloadVerdict::Rejected(Reason::NonStatic);
-    }
+    // Phase 9 #2 — non-static methods are now admitted if their body
+    // uses `aload_0` only as the immediate-getfield-receiver
+    // pattern. The receiver's accessed fields become extra kernel
+    // args (see `KernelSignature::this_field_cps`). Other ways of
+    // using `this` (storing it, passing it to another method, etc.)
+    // still reject via `Reason::NonStaticReceiverMisuse` from the
+    // body scan.
+    let is_static = method.is_static();
     if method.is_synchronized() {
         return OffloadVerdict::Rejected(Reason::Synchronized);
     }
@@ -180,27 +192,66 @@ pub fn analyze_with_annotations(
         .map(|k| k.admit)
         .unwrap_or(AdmissionHint::Strict);
 
-    if let Err(reason) = scan_bytecode(code, hint) {
-        return OffloadVerdict::Rejected(reason);
-    }
+    let this_field_cps = match scan_bytecode(code, hint, is_static) {
+        Ok(cps) => cps,
+        Err(reason) => return OffloadVerdict::Rejected(reason),
+    };
 
     let estimated_work = estimate_work(code);
     OffloadVerdict::Eligible(KernelSignature {
         param_kinds,
         return_kind,
         estimated_work,
+        this_field_cps,
     })
 }
 
 /// Walk the bytecode once and reject as soon as we hit a forbidden
 /// opcode. `hint` selectively loosens specific rejections — see
 /// [`AdmissionHint`] for the policy table.
-fn scan_bytecode(code: &CodeAttribute, hint: AdmissionHint) -> Result<(), Reason> {
+fn scan_bytecode(
+    code: &CodeAttribute,
+    hint: AdmissionHint,
+    is_static: bool,
+) -> Result<Vec<u16>, Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
     let mut prev_op: Option<u8> = None;
+    let mut this_field_cps: Vec<u16> = Vec::new();
+
     while pc < bytes.len() {
         let op = bytes[pc];
+
+        // Phase 9 #2 — non-static receiver-access pattern handling.
+        // For non-static methods, `aload_0` (0x2A) loads `this`. The
+        // only supported follow-up is `getfield` (0xB4) of a
+        // primitive-array field; anything else (e.g. invokevirtual
+        // on this, astore_*) lacks a GPU lowering today.
+        //
+        // For static methods, `aload_0` loads the first array
+        // parameter — same as `aload_<n>` for any other slot — and
+        // does not interact with `getfield` because static-context
+        // `getfield` rejects anyway via `classify`.
+        if !is_static && prev_op == Some(0x2A) {
+            if op == 0xB4 {
+                // Read the 2-byte CP index following getfield.
+                if pc + 2 >= bytes.len() {
+                    return Err(Reason::BadDescriptor);
+                }
+                let cp_index = u16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]);
+                this_field_cps.push(cp_index);
+                // Skip the default `classify` rejection of 0xB4 —
+                // it's accepted here as the receiver-access shape.
+                prev_op = Some(op);
+                pc += 3; // getfield is 3 bytes total
+                continue;
+            } else {
+                // `aload_0` followed by something other than
+                // getfield — not the supported pattern.
+                return Err(Reason::NonStaticReceiverMisuse);
+            }
+        }
+
         match classify(op, hint, prev_op) {
             OpClass::Ok => {}
             OpClass::Reject(r) => return Err(r),
@@ -208,7 +259,7 @@ fn scan_bytecode(code: &CodeAttribute, hint: AdmissionHint) -> Result<(), Reason
         prev_op = Some(op);
         pc += instruction_size(bytes, pc)?;
     }
-    Ok(())
+    Ok(this_field_cps)
 }
 
 enum OpClass {
@@ -503,6 +554,62 @@ mod tests {
             analyze(&method),
             OffloadVerdict::Rejected(Reason::FieldAccess)
         );
+    }
+
+    // ─── Phase 9 #2 — non-static receiver-access pattern ────────────
+
+    /// `NonStaticScale.scaleInPlace(I)V` is a non-static method whose
+    /// body reads `this.data` (primitive-array field) via the
+    /// `aload_0; getfield <data-cp>` pattern. Pre-Phase 9 #2 this
+    /// rejected as `NonStatic`; now it's `Eligible` with the
+    /// getfield CP index recorded in `this_field_cps` (the
+    /// marshaller / emitter use it in Phase 9 #2 push 2).
+    #[test]
+    fn accept_non_static_with_this_field_pattern() {
+        let method = load_method("NonStaticScale", "scaleInPlace", "(I)V");
+        match analyze(&method) {
+            OffloadVerdict::Eligible(sig) => {
+                // The body accesses `this.data` multiple times
+                // (length read, indexed load, indexed store) — every
+                // access goes through `aload_0; getfield <data>`, so
+                // we expect ≥ 3 cps. Duplicates are intentional;
+                // the marshaller may de-dup.
+                assert!(
+                    sig.this_field_cps.len() >= 3,
+                    "expected ≥3 this_field_cps entries, got {:?}",
+                    sig.this_field_cps,
+                );
+                // Every cp index should be the same field
+                // (`NonStaticScale.data`).
+                let first = sig.this_field_cps[0];
+                for &cp in &sig.this_field_cps {
+                    assert_eq!(
+                        cp, first,
+                        "expected every this_field_cp entry to point at the same field; got {:?}",
+                        sig.this_field_cps,
+                    );
+                }
+            }
+            v => panic!("expected Eligible for non-static this-access pattern, got {v:?}"),
+        }
+    }
+
+    /// Sanity check: static methods that still use `aload_0` (to
+    /// load their first array parameter) keep working — Phase 9 #2
+    /// must not break the static path.
+    #[test]
+    fn static_methods_still_eligible_after_non_static_relax() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        match analyze(&method) {
+            OffloadVerdict::Eligible(sig) => {
+                assert!(
+                    sig.this_field_cps.is_empty(),
+                    "static methods should have no this_field_cps, got {:?}",
+                    sig.this_field_cps,
+                );
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
     }
 
     #[test]
