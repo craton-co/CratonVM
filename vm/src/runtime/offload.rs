@@ -906,6 +906,58 @@ pub struct StreamSubmission {
     /// Current lifecycle state. `Running` until the host observes
     /// completion or failure.
     pub status: parking_lot::Mutex<SubmissionStatus>,
+    /// Phase 7 #1 — deferred finalization payload. Holds the
+    /// pending writebacks and the GPU-critical SafepointToken
+    /// captured at dispatch time. Set to `None` once finalization
+    /// has run (the first `future.get()` / `futureSynchronize`
+    /// call drains it). Subsequent finalization attempts are no-ops.
+    ///
+    /// This is what unlocks overlap between consecutive `submit()`
+    /// calls on the same stream: `dispatch_async` no longer waits
+    /// on the event, so the second submit can queue while the
+    /// first kernel is still running on the device.
+    pub finalize: parking_lot::Mutex<Option<FinalizeState>>,
+}
+
+/// Phase 7 #1 — payload of work that must run on the first
+/// `future.get()` call.
+#[cfg(feature = "gpu-offload")]
+pub struct FinalizeState {
+    /// Writebacks to drain after the event fires (download device
+    /// buffers into source Java arrays / resident-store entries).
+    pub writebacks: Vec<MarshalWriteback>,
+    /// GC-critical-section bookkeeping. We can't store a real
+    /// `SafepointToken` here because that type is intentionally
+    /// `!Send` (one-thread RAII contract), and finalization may
+    /// run on a different thread from dispatch. Instead we manage
+    /// the increment/decrement manually: dispatch increments
+    /// `vm_heap::GPU_CRITICAL_COUNT`, finalization (or `Drop` of
+    /// this state, if finalize never runs) decrements it.
+    _gc_critical: GcCriticalGuard,
+}
+
+/// Send-able RAII guard for the process-wide GPU_CRITICAL_COUNT.
+/// Manually mirrors `SafepointToken`'s increment/decrement
+/// semantics without the `!Send` marker.
+#[cfg(feature = "gpu-offload")]
+pub struct GcCriticalGuard;
+
+#[cfg(feature = "gpu-offload")]
+impl GcCriticalGuard {
+    /// Increment the GC-critical counter and return the guard.
+    pub fn acquire() -> Self {
+        rustjvm_gc::vm_heap::GPU_CRITICAL_COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(feature = "gpu-offload")]
+impl Drop for GcCriticalGuard {
+    fn drop(&mut self) {
+        rustjvm_gc::vm_heap::GPU_CRITICAL_COUNT
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -982,6 +1034,7 @@ impl OffloadCache {
                     stream: Some(stream.clone()),
                     event,
                     status: parking_lot::Mutex::new(status),
+                    finalize: parking_lot::Mutex::new(None),
                 })
             };
         let make = |status: SubmissionStatus| make_with_event(status, None);
@@ -1040,15 +1093,13 @@ impl OffloadCache {
             });
         }
 
-        // 5. Phase 6 #4 — record a completion event on the stream
-        //    so callers can poll or wait without blocking other
-        //    submissions on the same stream. The event lives on the
-        //    returned StreamSubmission; the immediate
-        //    `event.synchronize()` below is the temporary
-        //    PHASE7-FOLLOWUP synchronous-await — Phase 7 moves
-        //    the wait + writebacks into `gpu_finalize_future` so
-        //    multiple submits on one stream can queue without
-        //    serializing.
+        // 5. Phase 7 #1 — record a completion event and return
+        //    immediately. The caller's worker thread is now free to
+        //    queue another submit on the same stream while this
+        //    kernel runs. The event lives on the StreamSubmission;
+        //    `gpu_finalize_future` (called from
+        //    `Native.futureSynchronize` / `futureGetResult`) will
+        //    `event.synchronize()` and drain the writebacks.
         let event = match cuda_bridge::Event::new(ctx) {
             Ok(e) => std::sync::Arc::new(e),
             Err(e) => {
@@ -1062,21 +1113,13 @@ impl OffloadCache {
                 message: format!("Stream::record_event: {e}"),
             });
         }
-        if let Err(e) = event.synchronize() {
-            return make(SubmissionStatus::Failed {
-                message: format!("event.synchronize after launch: {e}"),
-            });
-        }
 
-        // 6. Success. Today every kernel returns `Void`; output array
-        //    parameters are written in-place on the host side by the
-        //    marshaller, not surfaced through `SerializedResult`.
-        make_with_event(
-            SubmissionStatus::Completed {
-                result: SerializedResult::Void,
-            },
-            Some(event),
-        )
+        // 6. Return a Running submission. The status flips to
+        //    Completed inside `finalize_submission` after the event
+        //    fires and the writebacks complete. Callers attach the
+        //    writebacks + token via `attach_finalize_state` before
+        //    registering the submission.
+        make_with_event(SubmissionStatus::Running, Some(event))
     }
 }
 
@@ -1170,6 +1213,7 @@ fn record_failed_submission(
         stream,
         event: None,
         status: parking_lot::Mutex::new(SubmissionStatus::Failed { message }),
+        finalize: parking_lot::Mutex::new(None),
     });
     register_submission(sub);
     handle
@@ -1287,9 +1331,17 @@ pub fn dispatch_method_from_native(
         }
     };
 
-    // 6. Enter the GC-critical section. Held across upload + launch
-    //    + writeback so the GC cannot move any pinned arrays while
-    //    the device is reading them.
+    // 6. Enter the GC-critical section. The guard lives in the
+    //    StreamSubmission's FinalizeState (Phase 7 #1), bracketing
+    //    the kernel's read of source arrays from dispatch through
+    //    writeback. We also keep a short-lived SafepointToken bound
+    //    to the calling thread for the marshal-time gpu_marshal::*
+    //    calls — they have a `&SafepointToken<'_>` signature, and
+    //    the GcCriticalGuard alone wouldn't satisfy it. Once
+    //    marshalling is done the token is dropped; the guard in
+    //    the FinalizeState keeps the GC paused for the rest of
+    //    the submission's life.
+    let gc_guard = GcCriticalGuard::acquire();
     let token = shared.heap.enter_gpu_critical();
 
     // 7. Marshal Java args into KernelArgs + remember writebacks.
@@ -1378,30 +1430,40 @@ pub fn dispatch_method_from_native(
         }
     }
 
-    // 8. Dispatch on the stream (this synchronizes internally — see
-    //    `dispatch_async`'s PHASE5-FOLLOWUP note).
+    // 8. Phase 7 #1 — dispatch on the stream. `dispatch_async`
+    //    now returns immediately with the kernel queued and the
+    //    completion event recorded; it does NOT wait. The Java
+    //    side's `future.get()` triggers `finalize_submission`
+    //    (event-sync + writebacks).
     let submission = cache.dispatch_async(stream.clone(), class_id, method_index, kernel_args);
 
-    // 9. On success, write every device buffer back into its source
-    //    Java array. Failure submissions skip the writeback entirely
-    //    (the Java side will read the failure via futureGetErrorMessage).
-    let succeeded = {
+    // 9. If the dispatch itself failed (no device, kernel not in
+    //    cache, launch error), there is nothing to finalize — the
+    //    submission is already Failed. Otherwise attach the
+    //    writebacks + the GC-critical token to the submission so
+    //    `finalize_submission` can drain them on the first
+    //    `future.get()` call. The token moves into the
+    //    FinalizeState — its `Drop` runs when finalization completes
+    //    or when the submission is dropped without ever being
+    //    finalized.
+    let needs_finalize = {
         let status = submission.status.lock();
-        matches!(*status, SubmissionStatus::Completed { .. })
+        matches!(*status, SubmissionStatus::Running)
     };
-    if succeeded {
-        for wb in &writebacks {
-            if let Err(msg) = wb.writeback(shared, &token) {
-                // First writeback failure marks the submission as
-                // Failed; subsequent writebacks are skipped.
-                let mut status = submission.status.lock();
-                *status = SubmissionStatus::Failed { message: msg };
-                break;
-            }
-        }
-    }
-
+    // The thread-local SafepointToken's role is over (marshal
+    // is done). The cross-thread GcCriticalGuard takes over.
     drop(token);
+    if needs_finalize {
+        *submission.finalize.lock() = Some(FinalizeState {
+            writebacks,
+            _gc_critical: gc_guard,
+        });
+    } else {
+        // Failed submission — guard drops here, writebacks
+        // discarded (no kernel ran).
+        drop(gc_guard);
+        let _ = writebacks;
+    }
 
     // 10. Register the submission and return its handle. The Java
     //     side wraps this handle in `GpuFutureImpl`.
@@ -1410,10 +1472,110 @@ pub fn dispatch_method_from_native(
     handle
 }
 
+/// Phase 7 #1 — finalize a submission on the first `future.get()`.
+///
+/// Idempotent: subsequent calls return the same terminal status
+/// without re-synchronizing the event.
+///
+/// Returns `Ok(())` on Completed, `Err(message)` on Failed. The
+/// caller (typically the `gpu_future_synchronize` escape hatch)
+/// surfaces the error to Java as `GpuException`.
+#[cfg(feature = "gpu-offload")]
+pub fn finalize_submission(
+    shared: &crate::vm::SharedVm,
+    submission: &std::sync::Arc<StreamSubmission>,
+) -> Result<(), String> {
+    // First, take the FinalizeState. If None, finalization has
+    // already run (or this submission was Failed at dispatch) —
+    // fall through to read the terminal status.
+    let pending = submission.finalize.lock().take();
+
+    if let Some(FinalizeState { writebacks, _gc_critical }) = pending {
+        // 1. Wait for the kernel to complete via the recorded event.
+        if let Some(event) = &submission.event {
+            if let Err(e) = event.synchronize() {
+                let mut status = submission.status.lock();
+                *status = SubmissionStatus::Failed {
+                    message: format!("event.synchronize: {e}"),
+                };
+                // _gc_critical drops here (releases GC gate).
+                drop(writebacks);
+                drop(_gc_critical);
+                return Err(match &*status {
+                    SubmissionStatus::Failed { message } => message.clone(),
+                    _ => unreachable!(),
+                });
+            }
+        }
+        // 2. Synthesize a thread-local SafepointToken to satisfy
+        //    the writeback signature. The token is purely a
+        //    type-system marker (the actual no-GC window is held
+        //    by `_gc_critical` against the shared GPU_CRITICAL_COUNT);
+        //    a local counter satisfies the borrow without affecting
+        //    the real GC gate.
+        let local_counter = std::sync::atomic::AtomicU32::new(0);
+        let local_token = rustjvm_gc::safepoint::SafepointToken::new(&local_counter);
+
+        // 3. Drain writebacks. First failure marks the submission
+        //    Failed and stops further writebacks.
+        let mut first_err: Option<String> = None;
+        for wb in &writebacks {
+            if let Err(msg) = wb.writeback(shared, &local_token) {
+                first_err = Some(msg);
+                break;
+            }
+        }
+        // 4. Drop guard (release real GC gate) BEFORE we touch the
+        //    status mutex so a concurrent reader of status doesn't
+        //    block GC longer than necessary.
+        drop(local_token);
+        drop(writebacks);
+        drop(_gc_critical);
+
+        // 4. Transition status.
+        let mut status = submission.status.lock();
+        match (&*status, first_err) {
+            (SubmissionStatus::Running, None) => {
+                *status = SubmissionStatus::Completed {
+                    result: SerializedResult::Void,
+                };
+                Ok(())
+            }
+            (SubmissionStatus::Running, Some(msg)) => {
+                *status = SubmissionStatus::Failed {
+                    message: msg.clone(),
+                };
+                Err(msg)
+            }
+            // Submission was already terminal — keep whatever status
+            // it had. (Shouldn't happen given we took the FinalizeState
+            // under the same submission, but defensive.)
+            (SubmissionStatus::Completed { .. }, _) => Ok(()),
+            (SubmissionStatus::Failed { message }, _) => Err(message.clone()),
+        }
+    } else {
+        // Already finalized (or never had a FinalizeState — e.g.
+        // a dispatch-time failure). Return the terminal status.
+        let status = submission.status.lock();
+        match &*status {
+            SubmissionStatus::Running => {
+                // No FinalizeState and still Running is a logic
+                // error — treat as failed.
+                Err(format!(
+                    "submission handle={} is Running with no FinalizeState",
+                    submission.handle,
+                ))
+            }
+            SubmissionStatus::Completed { .. } => Ok(()),
+            SubmissionStatus::Failed { message } => Err(message.clone()),
+        }
+    }
+}
+
 // ── Per-type marshalling helpers ────────────────────────────────────
 
 #[cfg(feature = "gpu-offload")]
-enum MarshalWriteback {
+pub enum MarshalWriteback {
     // Plain JVM primitive arrays (Phase 5).
     I32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
     I64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },

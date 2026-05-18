@@ -936,35 +936,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    /// Phase 6 #4: block on the real GPU submission's event.
+    /// Phase 6 #4 + Phase 7 #1: block on the GPU submission and
+    /// run its deferred writebacks. If the submission still carries
+    /// a FinalizeState (the kernel may still be running on the GPU),
+    /// this is the call that:
+    ///   1. waits on the recorded event,
+    ///   2. drains all the device-to-host writebacks,
+    ///   3. drops the SafepointToken (releases GC).
+    /// Idempotent — subsequent calls find FinalizeState already
+    /// taken and return the cached terminal status.
     fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
         #[cfg(feature = "gpu-offload")]
         {
             let sub = crate::runtime::offload::lookup_submission(handle)?;
-            // If we have an event, wait on it. Otherwise the
-            // submission was finalized synchronously at dispatch
-            // time (the Phase 6 #4 transitional behavior) and the
-            // status field already reflects the outcome.
-            if let Some(event) = &sub.event {
-                if let Err(e) = event.synchronize() {
-                    return Some(Err(format!("event.synchronize: {e}")));
-                }
-            }
-            let status = sub.status.lock();
-            match &*status {
-                crate::runtime::offload::SubmissionStatus::Running => {
-                    // No event but still Running — caller can poll
-                    // again. Treat as Ok for now (the synchronous
-                    // dispatch path means this is unreachable).
-                    Some(Ok(()))
-                }
-                crate::runtime::offload::SubmissionStatus::Completed { .. } => {
-                    Some(Ok(()))
-                }
-                crate::runtime::offload::SubmissionStatus::Failed { message } => {
-                    Some(Err(message.clone()))
-                }
-            }
+            Some(crate::runtime::offload::finalize_submission(self.shared, &sub))
         }
         #[cfg(not(feature = "gpu-offload"))]
         {

@@ -39,8 +39,12 @@ pub enum GcBackend {
 // counter for backwards compatibility with the Phase 1 tests — the
 // two paths are independent.
 
+/// Process-wide GPU-critical-section counter. Public so the VM
+/// crate can manage the count manually from `runtime::offload` for
+/// the Phase 7 deferred-finalize path (which crosses thread
+/// boundaries and therefore can't use the `!Send` `SafepointToken`).
 #[cfg(feature = "gpu-offload")]
-pub(crate) static GPU_CRITICAL_COUNT: std::sync::atomic::AtomicU32 =
+pub static GPU_CRITICAL_COUNT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 /// Spin-yield until every live `SafepointToken` has been dropped.
