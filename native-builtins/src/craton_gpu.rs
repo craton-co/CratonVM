@@ -947,12 +947,18 @@ fn builtin_array_is_resident(
 /// `Native.releaseArray(long arrayHandle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_array(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
+    // Phase 8 #1 — drop both the host-side resident entry AND any
+    // cached device buffer keyed by the same handle. Without the
+    // device-cache eviction, a long-running Java program that
+    // wraps + releases many GpuArrays would accumulate device
+    // memory until process exit.
     state::with(|s| {
         s.arrays.remove(&handle);
     });
+    ctx.gpu_release_array_cache(handle);
     Ok(None)
 }

@@ -902,6 +902,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    /// Phase 8 #1: evict the device-buffer cache entry for a
+    /// GpuArray handle. Called from `Native.releaseArray` when Java
+    /// drops the wrapper.
+    fn gpu_release_array_cache(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
     /// Phase 6 #5: resolve a lambda proxy back to its target method
     /// + captured values for GPU dispatch.
     fn gpu_resolve_lambda_target(

@@ -152,6 +152,15 @@ pub trait NativeContext {
         None
     }
 
+    /// Phase 8 #1 — evict the device-side buffer cache entry for
+    /// the given `GpuArray` handle. Called by
+    /// `Native.releaseArray` so a long-running Java program that
+    /// churns through GpuArrays doesn't accumulate device memory.
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override
+    /// calls `runtime::offload::device_cache::release(handle)`.
+    fn gpu_release_array_cache(&mut self, _handle: u64) {}
+
     /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
     /// `GpuFunction` lambda's target method.
     ///
