@@ -21,6 +21,7 @@ it, or extend the feature, read on.
 | [`streams-events.md`](streams-events.md) | Phase 2 reference: `Stream`, `Event`, async memcpy, `launch_on_stream`, stub op log for tests. |
 | [`async-api.md`](async-api.md) | Phase 3 reference: `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload. |
 | [`phase7-summary.md`](phase7-summary.md) | Phase 7 wrap-up: real async overlap, device-buffer caching, lambda SAM args. What landed vs. what was deferred for Phase 8. |
+| [`phase8-summary.md`](phase8-summary.md) | Phase 8 wrap-up: device-cache eviction, benchmark scaffold, multi-arg SAMs. What landed vs. what was deferred for Phase 9+. |
 
 ## At a glance
 
