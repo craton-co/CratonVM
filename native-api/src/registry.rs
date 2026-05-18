@@ -161,6 +161,21 @@ pub trait NativeContext {
     /// calls `runtime::offload::device_cache::release(handle)`.
     fn gpu_release_array_cache(&mut self, _handle: u64) {}
 
+    /// Phase 9 #1 — materialise the device-side buffer's contents
+    /// into host bytes if (and only if) the cache entry is dirty
+    /// from a prior kernel's writes. Returns
+    /// `Some(little-endian-bytes)` when a download happened (and
+    /// the caller should write them into the resident store
+    /// before reading the Java array), or `None` when the entry
+    /// is unknown or clean (host bytes are already current).
+    ///
+    /// Default impl returns None (no GPU offload). The VM
+    /// override calls
+    /// `runtime::offload::device_cache::download_into_bytes_if_dirty(handle)`.
+    fn gpu_array_download_if_dirty(&self, _handle: u64) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
     /// `GpuFunction` lambda's target method.
     ///

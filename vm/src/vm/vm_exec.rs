@@ -916,6 +916,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    /// Phase 9 #1: materialise dirty device-side bytes into a
+    /// host buffer. The caller (the `Native.arrayToHost` shim)
+    /// stamps the returned bytes into the resident store before
+    /// rebuilding the Java array. None means "no download
+    /// needed" — either the entry is unknown or already-clean.
+    fn gpu_array_download_if_dirty(&self, handle: u64) -> Option<Vec<u8>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::download_into_bytes_if_dirty(handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
     /// Phase 6 #5: resolve a lambda proxy back to its target method
     /// + captured values for GPU dispatch.
     fn gpu_resolve_lambda_target(

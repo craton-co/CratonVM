@@ -977,6 +977,15 @@ fn builtin_array_to_host(
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
+    // Phase 9 #1 — pull any pending device-side writes into the
+    // resident store BEFORE we read it. The Resident writebacks
+    // (Phase 7 #2 + Phase 9 #1) defer the D→H copy so kernel
+    // pipelines that don't read host bytes between steps don't
+    // pay for them; this is where the copy finally happens (or
+    // doesn't, if the entry is clean).
+    if let Some(fresh_bytes) = ctx.gpu_array_download_if_dirty(handle) {
+        array_replace_bytes(handle, fresh_bytes);
+    }
     let snapshot = state::with(|s| {
         s.arrays.get(&handle).map(|entry| {
             (entry.element_type, entry.element_count, entry.bytes.clone())

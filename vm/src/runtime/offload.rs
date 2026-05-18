@@ -1605,59 +1605,152 @@ pub(crate) mod device_cache {
         F64(Arc<DeviceBuffer<f64>>),
     }
 
-    static CACHE: OnceLock<Mutex<FxHashMap<u64, CachedBuffer>>> = OnceLock::new();
+    /// Phase 9 #1 — `dirty` tracks whether the device side has
+    /// writes a subsequent `Native.arrayToHost` would need to
+    /// pull back. Set by `mark_dirty` from the post-kernel
+    /// writeback, cleared by `download_into_bytes_if_dirty`.
+    pub(crate) struct Entry {
+        pub buf: CachedBuffer,
+        pub dirty: bool,
+    }
 
-    fn map() -> &'static Mutex<FxHashMap<u64, CachedBuffer>> {
+    static CACHE: OnceLock<Mutex<FxHashMap<u64, Entry>>> = OnceLock::new();
+
+    fn map() -> &'static Mutex<FxHashMap<u64, Entry>> {
         CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
     }
 
     pub(crate) fn get_i32(handle: u64) -> Option<Arc<DeviceBuffer<i32>>> {
         match map().lock().get(&handle) {
-            Some(CachedBuffer::I32(arc)) => Some(arc.clone()),
+            Some(Entry { buf: CachedBuffer::I32(arc), .. }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_i32(handle: u64, buf: Arc<DeviceBuffer<i32>>) {
-        map().lock().insert(handle, CachedBuffer::I32(buf));
+        map().lock().insert(handle, Entry { buf: CachedBuffer::I32(buf), dirty: false });
     }
 
     pub(crate) fn get_i64(handle: u64) -> Option<Arc<DeviceBuffer<i64>>> {
         match map().lock().get(&handle) {
-            Some(CachedBuffer::I64(arc)) => Some(arc.clone()),
+            Some(Entry { buf: CachedBuffer::I64(arc), .. }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_i64(handle: u64, buf: Arc<DeviceBuffer<i64>>) {
-        map().lock().insert(handle, CachedBuffer::I64(buf));
+        map().lock().insert(handle, Entry { buf: CachedBuffer::I64(buf), dirty: false });
     }
 
     pub(crate) fn get_f32(handle: u64) -> Option<Arc<DeviceBuffer<f32>>> {
         match map().lock().get(&handle) {
-            Some(CachedBuffer::F32(arc)) => Some(arc.clone()),
+            Some(Entry { buf: CachedBuffer::F32(arc), .. }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_f32(handle: u64, buf: Arc<DeviceBuffer<f32>>) {
-        map().lock().insert(handle, CachedBuffer::F32(buf));
+        map().lock().insert(handle, Entry { buf: CachedBuffer::F32(buf), dirty: false });
     }
 
     pub(crate) fn get_f64(handle: u64) -> Option<Arc<DeviceBuffer<f64>>> {
         match map().lock().get(&handle) {
-            Some(CachedBuffer::F64(arc)) => Some(arc.clone()),
+            Some(Entry { buf: CachedBuffer::F64(arc), .. }) => Some(arc.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn put_f64(handle: u64, buf: Arc<DeviceBuffer<f64>>) {
-        map().lock().insert(handle, CachedBuffer::F64(buf));
+        map().lock().insert(handle, Entry { buf: CachedBuffer::F64(buf), dirty: false });
+    }
+
+    /// Phase 9 #1 — flag the cache entry as "device has writes the
+    /// host hasn't seen yet". Called by the Resident-variant
+    /// writebacks instead of doing an eager D→H copy. A subsequent
+    /// `Native.arrayToHost` consults
+    /// [`download_into_bytes_if_dirty`] to materialize host bytes
+    /// before returning the Java array.
+    pub fn mark_dirty(handle: u64) {
+        if let Some(entry) = map().lock().get_mut(&handle) {
+            entry.dirty = true;
+        }
+    }
+
+    /// Phase 9 #1 — if the entry is dirty, download the device
+    /// buffer into a fresh `Vec<u8>` (little-endian) and clear the
+    /// flag. Returns `None` when the entry is unknown OR the entry
+    /// is clean (no download needed; the host bytes in the
+    /// native-builtins resident store are already current).
+    ///
+    /// The caller (`Native.arrayToHost` shim, via the
+    /// `gpu_array_download_if_dirty` escape hatch) then passes the
+    /// bytes back to
+    /// [`rustjvm_native_builtins::craton_gpu::array_replace_bytes`]
+    /// to refresh the resident store, after which the existing
+    /// read path returns the up-to-date Java array.
+    pub fn download_into_bytes_if_dirty(handle: u64) -> Option<Vec<u8>> {
+        // Drop the lock around the actual device download so other
+        // threads can hit the cache for unrelated handles. Snapshot
+        // the Arc + clear the dirty bit under the lock, then call
+        // out to cuda-bridge with no lock held.
+        let arc_snapshot: CachedBufferArcs = {
+            let mut guard = map().lock();
+            let entry = guard.get_mut(&handle)?;
+            if !entry.dirty {
+                return None;
+            }
+            entry.dirty = false;
+            match &entry.buf {
+                CachedBuffer::I32(a) => CachedBufferArcs::I32(a.clone()),
+                CachedBuffer::I64(a) => CachedBufferArcs::I64(a.clone()),
+                CachedBuffer::F32(a) => CachedBufferArcs::F32(a.clone()),
+                CachedBuffer::F64(a) => CachedBufferArcs::F64(a.clone()),
+            }
+        };
+        match arc_snapshot {
+            CachedBufferArcs::I32(buf) => {
+                let len = buf.len();
+                let mut dst = vec![0i32; len];
+                crate::runtime::gpu_marshal::download_into(&buf, &mut dst).ok()?;
+                Some(bytemuck::cast_slice(&dst).to_vec())
+            }
+            CachedBufferArcs::I64(buf) => {
+                let len = buf.len();
+                let mut dst = vec![0i64; len];
+                crate::runtime::gpu_marshal::download_into(&buf, &mut dst).ok()?;
+                Some(bytemuck::cast_slice(&dst).to_vec())
+            }
+            CachedBufferArcs::F32(buf) => {
+                let len = buf.len();
+                let mut dst = vec![0f32; len];
+                crate::runtime::gpu_marshal::download_into(&buf, &mut dst).ok()?;
+                Some(bytemuck::cast_slice(&dst).to_vec())
+            }
+            CachedBufferArcs::F64(buf) => {
+                let len = buf.len();
+                let mut dst = vec![0f64; len];
+                crate::runtime::gpu_marshal::download_into(&buf, &mut dst).ok()?;
+                Some(bytemuck::cast_slice(&dst).to_vec())
+            }
+        }
+    }
+
+    /// Lock-released variant of `CachedBuffer` used to escape the
+    /// Mutex guard before doing a cudarc D→H copy. The four `Arc`
+    /// clones keep the device buffers alive across the lock drop.
+    enum CachedBufferArcs {
+        I32(Arc<DeviceBuffer<i32>>),
+        I64(Arc<DeviceBuffer<i64>>),
+        F32(Arc<DeviceBuffer<f32>>),
+        F64(Arc<DeviceBuffer<f64>>),
     }
 
     /// Drop the cached device buffer for `handle` (if any). Called
     /// from `Native.releaseArray` so the device memory is freed when
-    /// the Java `GpuArray` is no longer needed.
+    /// the Java `GpuArray` is no longer needed. Phase 9 #1 note:
+    /// any pending dirty bit is discarded — the user explicitly
+    /// released the array, so the post-kernel device writes are
+    /// implicitly forfeited.
     pub fn release(handle: u64) {
         map().lock().remove(&handle);
     }
@@ -1720,39 +1813,37 @@ impl MarshalWriteback {
                 gpu_marshal::write_back_f64(*obj, &shared.heap, &dst, token);
                 Ok(())
             }
-            // Phase 6 #3 — write back into the resident store via
-            // `native-builtins::craton_gpu::array_replace_bytes`. A
-            // subsequent `GpuArray.toHost()` reads the updated bytes.
-            Self::ResidentI32 { handle, buf, len } => {
-                let mut dst = vec![0i32; *len];
-                gpu_marshal::download_into(buf, &mut dst)
-                    .map_err(|e| format!("download_into i32 (resident): {e}"))?;
-                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
-                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+            // Phase 9 #1 — Resident-arg writebacks no longer
+            // download to host bytes eagerly. They mark the cache
+            // entry dirty; the next `Native.arrayToHost(handle)`
+            // call materializes host bytes on demand via the
+            // `gpu_array_download_if_dirty` escape hatch.
+            //
+            // This saves one D→H copy per kernel for GpuArrays
+            // that the user pipelines through multiple kernels
+            // before reading the result (the common chaining
+            // pattern). For users who DO read after every kernel,
+            // the work just moves from here to `arrayToHost` —
+            // same total bytes, different scheduling.
+            //
+            // The `buf` field stays in the enum (unused here) so
+            // the Arc<DeviceBuffer<T>> stays alive for the
+            // submission's lifetime; the cache itself holds the
+            // parallel Arc that lives until `releaseArray`.
+            Self::ResidentI32 { handle, .. } => {
+                device_cache::mark_dirty(*handle);
                 Ok(())
             }
-            Self::ResidentI64 { handle, buf, len } => {
-                let mut dst = vec![0i64; *len];
-                gpu_marshal::download_into(buf, &mut dst)
-                    .map_err(|e| format!("download_into i64 (resident): {e}"))?;
-                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
-                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+            Self::ResidentI64 { handle, .. } => {
+                device_cache::mark_dirty(*handle);
                 Ok(())
             }
-            Self::ResidentF32 { handle, buf, len } => {
-                let mut dst = vec![0f32; *len];
-                gpu_marshal::download_into(buf, &mut dst)
-                    .map_err(|e| format!("download_into f32 (resident): {e}"))?;
-                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
-                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+            Self::ResidentF32 { handle, .. } => {
+                device_cache::mark_dirty(*handle);
                 Ok(())
             }
-            Self::ResidentF64 { handle, buf, len } => {
-                let mut dst = vec![0f64; *len];
-                gpu_marshal::download_into(buf, &mut dst)
-                    .map_err(|e| format!("download_into f64 (resident): {e}"))?;
-                let bytes: Vec<u8> = bytemuck::cast_slice(&dst).to_vec();
-                rustjvm_native_builtins::craton_gpu::array_replace_bytes(*handle, bytes);
+            Self::ResidentF64 { handle, .. } => {
+                device_cache::mark_dirty(*handle);
                 Ok(())
             }
         }
