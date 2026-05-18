@@ -883,6 +883,62 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    /// Phase 6 #4: query the real GPU submission registry.
+    fn gpu_future_status(&self, handle: u64) -> Option<i32> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            let status = sub.status.lock();
+            Some(match *status {
+                crate::runtime::offload::SubmissionStatus::Running => 0,
+                crate::runtime::offload::SubmissionStatus::Completed { .. } => 1,
+                crate::runtime::offload::SubmissionStatus::Failed { .. } => 2,
+            })
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 6 #4: block on the real GPU submission's event.
+    fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            // If we have an event, wait on it. Otherwise the
+            // submission was finalized synchronously at dispatch
+            // time (the Phase 6 #4 transitional behavior) and the
+            // status field already reflects the outcome.
+            if let Some(event) = &sub.event {
+                if let Err(e) = event.synchronize() {
+                    return Some(Err(format!("event.synchronize: {e}")));
+                }
+            }
+            let status = sub.status.lock();
+            match &*status {
+                crate::runtime::offload::SubmissionStatus::Running => {
+                    // No event but still Running — caller can poll
+                    // again. Treat as Ok for now (the synchronous
+                    // dispatch path means this is unreachable).
+                    Some(Ok(()))
+                }
+                crate::runtime::offload::SubmissionStatus::Completed { .. } => {
+                    Some(Ok(()))
+                }
+                crate::runtime::offload::SubmissionStatus::Failed { message } => {
+                    Some(Err(message.clone()))
+                }
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         match self.shared.load_class_concurrent(class_name) {
             Ok(class_id) => self

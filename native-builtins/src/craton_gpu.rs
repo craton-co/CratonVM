@@ -630,10 +630,17 @@ fn builtin_close_stream(
 ///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
     args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
+    // Phase 6 #4 — prefer the real submission registry. The
+    // synthetic state is the fallback for stub-only fixtures
+    // (`builtin_submit` / `builtin_launch` records that never go
+    // through the real dispatcher).
+    if let Some(code) = ctx.gpu_future_status(handle) {
+        return Ok(Some(Value::Int(code)));
+    }
     let code = state::with(|s| match s.futures.get(&handle) {
         Some(state::FutureState::Pending) => 0i32,
         Some(state::FutureState::Done { .. }) => 1,
@@ -649,9 +656,14 @@ fn builtin_future_status(
 /// is a no-op. With a real device we would `cuStreamSynchronize` here.
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_synchronize(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    args: &[Value],
 ) -> rustjvm_types::error::MethodCallResult {
+    let handle = arg_long(args, 0) as u64;
+    // Phase 6 #4 — if the handle is a real submission, block on
+    // its event. Otherwise no-op (synthetic Failed futures are
+    // immediately observable, no waiting needed).
+    let _ = ctx.gpu_future_synchronize(handle);
     Ok(None)
 }
 

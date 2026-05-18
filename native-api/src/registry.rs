@@ -129,6 +129,29 @@ pub trait NativeContext {
         None
     }
 
+    /// Phase 6 #4 — query the real GPU submission registry for the
+    /// future at `handle`. Returns:
+    ///   * `Some(0)` — Running
+    ///   * `Some(1)` — Completed
+    ///   * `Some(2)` — Failed
+    ///   * `None`    — the handle is not in the real registry
+    ///                 (caller should fall back to the synthetic
+    ///                 future state in native-builtins).
+    /// Default impl returns None (no GPU offload).
+    fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
+        None
+    }
+
+    /// Phase 6 #4 — block until the real GPU submission at `handle`
+    /// completes (via its recorded event). Returns:
+    ///   * `Some(Ok(()))`    — completed
+    ///   * `Some(Err(msg))`  — submission failed; `msg` carries the reason
+    ///   * `None`            — handle not in the real registry
+    /// Default impl returns None.
+    fn gpu_future_synchronize(&self, _handle: u64) -> Option<Result<(), String>> {
+        None
+    }
+
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
     fn new_object(&mut self, class_name: &str) -> MethodCallResult;

@@ -894,6 +894,15 @@ pub struct StreamSubmission {
     /// marshal error) — the Java side still gets a handle whose
     /// status is `Failed`.
     pub stream: Option<std::sync::Arc<Stream>>,
+    /// Phase 6 #4 — completion event recorded on the stream right
+    /// after the kernel launch. Callers (`futureSynchronize`,
+    /// `futureStatus`) can wait or poll on this directly instead of
+    /// going through `stream.synchronize()`, which lets multiple
+    /// submissions on the same stream overlap their launches.
+    ///
+    /// `None` for pre-launch failures and for `dispatch_async` paths
+    /// that haven't been wired through events yet.
+    pub event: Option<std::sync::Arc<cuda_bridge::Event>>,
     /// Current lifecycle state. `Running` until the host observes
     /// completion or failure.
     pub status: parking_lot::Mutex<SubmissionStatus>,
@@ -964,13 +973,18 @@ impl OffloadCache {
         let handle = NEXT_SUBMISSION_HANDLE
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let make = |status: SubmissionStatus| {
-            std::sync::Arc::new(StreamSubmission {
-                handle,
-                stream: Some(stream.clone()),
-                status: parking_lot::Mutex::new(status),
-            })
-        };
+        // `event` is populated only on the success path below, after
+        // the launch is queued. Failure paths leave it None.
+        let make_with_event =
+            |status: SubmissionStatus, event: Option<std::sync::Arc<cuda_bridge::Event>>| {
+                std::sync::Arc::new(StreamSubmission {
+                    handle,
+                    stream: Some(stream.clone()),
+                    event,
+                    status: parking_lot::Mutex::new(status),
+                })
+            };
+        let make = |status: SubmissionStatus| make_with_event(status, None);
 
         // 1. No-device fast path. The Java layer surfaces this as
         //    `GpuException("no CUDA device …")`.
@@ -1026,22 +1040,43 @@ impl OffloadCache {
             });
         }
 
-        // 5. Wait for completion. PHASE5-FOLLOWUP: replace with an
-        //    event recorded after the launch + a poller that
-        //    transitions the submission status when the event fires,
-        //    so the caller thread can do other work in the meantime.
-        if let Err(e) = stream.synchronize() {
+        // 5. Phase 6 #4 — record a completion event on the stream
+        //    so callers can poll or wait without blocking other
+        //    submissions on the same stream. The event lives on the
+        //    returned StreamSubmission; the immediate
+        //    `event.synchronize()` below is the temporary
+        //    PHASE7-FOLLOWUP synchronous-await — Phase 7 moves
+        //    the wait + writebacks into `gpu_finalize_future` so
+        //    multiple submits on one stream can queue without
+        //    serializing.
+        let event = match cuda_bridge::Event::new(ctx) {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(e) => {
+                return make(SubmissionStatus::Failed {
+                    message: format!("Event::new after launch: {e}"),
+                });
+            }
+        };
+        if let Err(e) = stream.record_event(&event) {
             return make(SubmissionStatus::Failed {
-                message: format!("stream.synchronize after launch: {e}"),
+                message: format!("Stream::record_event: {e}"),
+            });
+        }
+        if let Err(e) = event.synchronize() {
+            return make(SubmissionStatus::Failed {
+                message: format!("event.synchronize after launch: {e}"),
             });
         }
 
         // 6. Success. Today every kernel returns `Void`; output array
         //    parameters are written in-place on the host side by the
         //    marshaller, not surfaced through `SerializedResult`.
-        make(SubmissionStatus::Completed {
-            result: SerializedResult::Void,
-        })
+        make_with_event(
+            SubmissionStatus::Completed {
+                result: SerializedResult::Void,
+            },
+            Some(event),
+        )
     }
 }
 
@@ -1133,6 +1168,7 @@ fn record_failed_submission(
     let sub = std::sync::Arc::new(StreamSubmission {
         handle,
         stream,
+        event: None,
         status: parking_lot::Mutex::new(SubmissionStatus::Failed { message }),
     });
     register_submission(sub);
