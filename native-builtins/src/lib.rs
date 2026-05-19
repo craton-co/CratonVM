@@ -15148,7 +15148,12 @@ fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let source = ctx.read_string(source_obj).unwrap_or_default();
     let _ = compile_java_regex(&source, 0)?;
 
-    let pat = ctx.alloc_object(rustjvm_types::ClassId::new(0), PAT_NUM_FIELDS);
+    // HBase-VersionInfo round: alloc with the real `java/util/regex/Pattern`
+    // ClassId (when loadable) so `pattern.matcher(...)` dispatches via the
+    // Pattern vtable instead of `Object.matcher` (which raises NSME).
+    // `alloc_concurrent_synthetic` picks max(num_fields, real_total_fields)
+    // so the synthetic field layout (PAT_FIELD_* indices 0/1) still fits.
+    let pat = alloc_concurrent_synthetic(ctx, "java/util/regex/Pattern", PAT_NUM_FIELDS);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
     ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(0));
     Ok(Some(Value::Object(Some(pat))))
@@ -15166,7 +15171,7 @@ fn native_pattern_compile_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let source = ctx.read_string(source_obj).unwrap_or_default();
     let _ = compile_java_regex(&source, flags)?;
 
-    let pat = ctx.alloc_object(rustjvm_types::ClassId::new(0), PAT_NUM_FIELDS);
+    let pat = alloc_concurrent_synthetic(ctx, "java/util/regex/Pattern", PAT_NUM_FIELDS);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
     ctx.set_field(pat, PAT_FIELD_FLAGS, Value::Int(flags));
     Ok(Some(Value::Object(Some(pat))))
@@ -15181,7 +15186,10 @@ fn native_pattern_matcher(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mat = ctx.alloc_object(rustjvm_types::ClassId::new(0), MAT_NUM_FIELDS);
+    // Same rationale as `native_pattern_compile`: allocate with the real
+    // `java/util/regex/Matcher` ClassId so `m.find()` / `m.group(I)` resolve
+    // through the Matcher vtable instead of falling through to Object.
+    let mat = alloc_concurrent_synthetic(ctx, "java/util/regex/Matcher", MAT_NUM_FIELDS);
     ctx.set_field(mat, MAT_FIELD_PATTERN, Value::Object(Some(this)));
     ctx.set_field(mat, MAT_FIELD_INPUT, Value::Object(Some(input_obj)));
     ctx.set_field(mat, MAT_FIELD_OFFSET, Value::Int(0));
