@@ -83,7 +83,9 @@ fi
 # deps that aren't in the local repo, but it's the honest GPU-mode attempt.
 M2CP=$(find "$M2" -name "*.jar" 2>/dev/null | tr '\n' ';' | sed 's/;$//' | head -c 120000)
 
-if [ -d "$APPS/demo/target/classes" ]; then
+if [ -f "$APPS/demo/target/demo-0.0.1-SNAPSHOT.jar" ]; then
+    ( cd "$APPS/demo" && run demo 25 --jar target/demo-0.0.1-SNAPSHOT.jar )
+elif [ -d "$APPS/demo/target/classes" ]; then
     run demo 25 -c "$APPS/demo/target/classes;$M2CP" com.example.demo.DemoApplication
 fi
 
