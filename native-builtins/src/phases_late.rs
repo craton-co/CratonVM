@@ -30776,12 +30776,17 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         // Clear the slot so the action can drop naturally on the next GC.
         ctx.set_field(this, CLEANABLE_ACTION, Value::Object(None));
         // Per Cleaner contract, exceptions thrown by run() are caught.
-        let _ = ctx.invoke_virtual(
-            action,
-            "run",
-            "()V",
-            &[Value::Object(Some(action))],
-        );
+        // NOTE: `invoke_virtual` prepends the receiver (and for lambda
+        // proxies prepends captured values), so `args` must be the SAM
+        // method's explicit arguments only — `Runnable.run()V` is
+        // zero-arg, so pass `&[]`. Previously this passed
+        // `&[Value::Object(Some(action))]`, which caused the lambda
+        // dispatch path in `vm_exec::invoke_virtual` to build
+        // `full_args = [captured..., action]` — one too many args for
+        // the static impl method, leading to a SEGV inside the
+        // interpreter when reading past the end of locals during
+        // CleanerProbe's `cleanable.clean()` call.
+        let _ = ctx.invoke_virtual(action, "run", "()V", &[]);
         Ok(None)
     });
 }

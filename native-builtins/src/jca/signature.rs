@@ -50,6 +50,46 @@ const SIG_FIELD_PROVIDER: usize = 2;
 const SIG_FIELD_PENDING: usize = 3;
 const SIG_FIELD_KEYID: usize = 4;
 
+// ---------------------------------------------------------------------------
+// SigProbe fix: process-wide side tables for Signature algorithm / state /
+// key id.  Real-JDK `Signature` is allocated against the loaded class whose
+// inherited layout makes raw-slot writes of `Value::Int` collide with
+// `Object`-typed slots (`engine`, `provider`, …), silently coercing reads to
+// `Object(None)`.  Side tables keyed on the `ObjectRef` receiver carry the
+// state reliably across `getInstance` → `init*` → `sign`/`verify`.
+// ---------------------------------------------------------------------------
+
+fn sig_algo_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn sig_state_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn sig_keyid_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, u64>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, u64>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn set_sig_algo(this: ObjectRef, idx: i32) { sig_algo_table().lock().insert(this, idx); }
+fn get_sig_algo(this: ObjectRef) -> Option<i32> { sig_algo_table().lock().get(&this).copied() }
+fn set_sig_state(this: ObjectRef, st: i32) { sig_state_table().lock().insert(this, st); }
+fn get_sig_state(this: ObjectRef) -> Option<i32> { sig_state_table().lock().get(&this).copied() }
+fn set_sig_keyid(this: ObjectRef, kid: u64) { sig_keyid_table().lock().insert(this, kid); }
+fn get_sig_keyid(this: ObjectRef) -> Option<u64> { sig_keyid_table().lock().get(&this).copied() }
+
 const STATE_UNINIT: i32 = 0;
 const STATE_SIGN: i32 = 1;
 const STATE_VERIFY: i32 = 2;
@@ -152,6 +192,11 @@ fn sig_id(this: ObjectRef) -> u64 {
 }
 
 fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
+    if let Some(kid) = get_sig_keyid(this) {
+        if kid != 0 {
+            return kid;
+        }
+    }
     match ctx.get_field(this, SIG_FIELD_KEYID) {
         Value::Long(id) => id as u64,
         Value::Int(id) => id as u64,
@@ -218,6 +263,13 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
     let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 5);
+    // SigProbe fix: side-table is the authoritative store; slot writes
+    // remain for any synthetic-mode caller that goes through slot indexing.
+    set_sig_algo(obj, idx);
+    set_sig_state(obj, STATE_UNINIT);
+    set_sig_keyid(obj, 0);
+    let algo_str = ctx.create_string(&alg);
+    ctx.set_field_by_name(obj, "algorithm", Value::Object(Some(algo_str)));
     ctx.set_field(obj, SIG_FIELD_ALGO, Value::Int(idx));
     ctx.set_field(obj, SIG_FIELD_STATE, Value::Int(STATE_UNINIT));
     ctx.set_field(obj, SIG_FIELD_PROVIDER, Value::Int(0));
@@ -228,10 +280,12 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    set_sig_state(this, STATE_SIGN);
     ctx.set_field(this, SIG_FIELD_STATE, Value::Int(STATE_SIGN));
     ctx.set_field(this, SIG_FIELD_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let kid = extract_key_id_from_key(ctx, *k);
+        set_sig_keyid(this, kid);
         ctx.set_field(this, SIG_FIELD_KEYID, Value::Long(kid as i64));
     }
     crypto_impl::sig_data_clear(sig_id(this));
@@ -240,10 +294,12 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    set_sig_state(this, STATE_VERIFY);
     ctx.set_field(this, SIG_FIELD_STATE, Value::Int(STATE_VERIFY));
     ctx.set_field(this, SIG_FIELD_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let kid = extract_key_id_from_key(ctx, *k);
+        set_sig_keyid(this, kid);
         ctx.set_field(this, SIG_FIELD_KEYID, Value::Long(kid as i64));
     }
     crypto_impl::sig_data_clear(sig_id(this));
@@ -295,20 +351,20 @@ fn sig_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = match ctx.get_field(this, SIG_FIELD_STATE) {
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
         Value::Int(n) => n,
         _ => 0,
-    };
+    });
     if state != STATE_SIGN {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for signing".into(),
         }
         .into());
     }
-    let alg = match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
         Value::Int(n) => n,
         _ => -1,
-    };
+    });
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
 
@@ -319,20 +375,20 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = match ctx.get_field(this, SIG_FIELD_STATE) {
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
         Value::Int(n) => n,
         _ => 0,
-    };
+    });
     if state != STATE_SIGN {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for signing".into(),
         }
         .into());
     }
-    let alg = match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
         Value::Int(n) => n,
         _ => -1,
-    };
+    });
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
     let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
@@ -356,20 +412,20 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = match ctx.get_field(this, SIG_FIELD_STATE) {
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
         Value::Int(n) => n,
         _ => 0,
-    };
+    });
     if state != STATE_VERIFY {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for verification".into(),
         }
         .into());
     }
-    let alg = match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
         Value::Int(n) => n,
         _ => -1,
-    };
+    });
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
     let provided = match args.get(1) {
@@ -383,20 +439,20 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = match ctx.get_field(this, SIG_FIELD_STATE) {
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
         Value::Int(n) => n,
         _ => 0,
-    };
+    });
     if state != STATE_VERIFY {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for verification".into(),
         }
         .into());
     }
-    let alg = match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
         Value::Int(n) => n,
         _ => -1,
-    };
+    });
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
 
@@ -418,10 +474,10 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let idx = match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let idx = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
         Value::Int(i) => i,
         _ => -1,
-    };
+    });
     let s = ctx.create_string(algo_name(idx));
     Ok(Some(Value::Object(Some(s))))
 }

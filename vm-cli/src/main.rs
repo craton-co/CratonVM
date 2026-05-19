@@ -700,6 +700,18 @@ fn run() -> Result<()> {
         config = config.with_boot_classpath(VmConfig::parse_classpath(bcp));
     }
     if let Some(jh) = &args.java_home {
+        // Fail fast when --java-home points at a path that doesn't exist.
+        // Without this, `resolve_java_home` silently returns None, the boot
+        // classpath ends up empty, and the first JDK-class reference (e.g.
+        // `INVOKESTATIC java/lang/Boolean.parseBoolean`) surfaces as a
+        // confusing `NoSuchMethodError` instead of a clear configuration error.
+        let p = std::path::Path::new(jh);
+        if !p.is_dir() {
+            anyhow::bail!(
+                "--java-home path does not exist or is not a directory: {jh}\n\
+                 Provide a valid JDK installation (must contain `jmods/` or `lib/modules`)."
+            );
+        }
         config = config.with_java_home(jh.clone());
     }
 

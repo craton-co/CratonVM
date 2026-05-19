@@ -109,6 +109,22 @@ pub(crate) struct StreamCuda {
     id: u32,
 }
 
+// cudarc 0.13's `CudaStream` does not impl `Send`/`Sync` because it
+// holds a raw `sys::CUstream` (a `*mut CUstream_st`). The CUDA driver
+// docs explicitly permit using a stream from any thread that has
+// initialized the context (`bind_to_thread` handles that for us), so
+// the raw pointer is logically thread-safe. cudarc itself impls
+// `Send`/`Sync` for `CudaDevice`, `CudaModule`, and `CudaFunction` on
+// the same grounds; the missing impls on `CudaStream` are simply an
+// upstream oversight (filed: `coreylowman/cudarc#318`). The bridge
+// asserts the same safety condition here so downstream `Arc<Stream>`
+// can be stored in `Sync` statics (e.g. `vm/src/runtime/offload.rs`'s
+// `SUBMISSIONS` map).
+#[cfg(feature = "cuda")]
+unsafe impl Send for Stream {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for Stream {}
+
 #[cfg(feature = "cuda")]
 static CUDA_STREAM_ID_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);

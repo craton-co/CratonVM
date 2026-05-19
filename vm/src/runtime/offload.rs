@@ -1243,8 +1243,18 @@ pub fn dispatch_method_from_native(
         .offload_registry
         .get_or_create(shared.config.gpu_device_ordinal, &shared.config);
 
-    // 2. Resolve class + method via the class manager.
-    let (class_id, method_index) = {
+    // 2. Resolve class + method via the class manager. Phase 9 #2:
+    //    while we hold the class-manager lock we also extract
+    //    `is_static` and, for non-static methods, dedup the analyzer's
+    //    `this_field_cps` into an ordered list of `(cp_index,
+    //    field_name)` pairs the marshaller can resolve against the
+    //    receiver without holding any class-manager locks afterward.
+    let (class_id, method_index, is_static, this_field_names): (
+        crate::classloading::ClassId,
+        u16,
+        bool,
+        Vec<String>,
+    ) = {
         let cm = shared.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
             Some(id) => id,
@@ -1277,6 +1287,7 @@ pub fn dispatch_method_from_native(
                 );
             }
         };
+        let is_static_local = class.methods[mi as usize].is_static();
         // 3. Ensure the kernel is compiled before dispatch_async runs.
         let outcome = cache.lookup_or_compile(
             class_id,
@@ -1286,7 +1297,49 @@ pub fn dispatch_method_from_native(
             &class.constant_pool,
         );
         match outcome {
-            LookupOutcome::Hit(_) => (class_id, mi),
+            LookupOutcome::Hit(compiled) => {
+                // Phase 9 #2: capture the dedup'd ordered field-name
+                // list. The marshaller below will resolve each name
+                // against the receiver and marshal it as an extra
+                // kernel arg ahead of the regular parameters.
+                let mut seen: Vec<u16> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                for &cp in &compiled.signature.this_field_cps {
+                    if seen.contains(&cp) {
+                        continue;
+                    }
+                    seen.push(cp);
+                    // Field cp_index → NameAndType → Utf8 field name.
+                    let Some(rustjvm_reader::constant_pool::ConstantPoolEntry::FieldReference {
+                        name_and_type_index, ..
+                    }) = class.constant_pool.get(cp)
+                    else {
+                        return record_failed_submission(
+                            None,
+                            format!(
+                                "submitMethod: this_field_cps[{}]=#{cp} is not a FieldReference \
+                                 entry in {class_name}'s constant pool — analyzer / class \
+                                 mismatch",
+                                names.len(),
+                            ),
+                        );
+                    };
+                    let Some((nm, _desc)) =
+                        class.constant_pool.get_name_and_type(*name_and_type_index)
+                    else {
+                        return record_failed_submission(
+                            None,
+                            format!(
+                                "submitMethod: this_field_cps[{}]=#{cp} has no resolvable \
+                                 NameAndType",
+                                names.len(),
+                            ),
+                        );
+                    };
+                    names.push(nm.to_string());
+                }
+                (class_id, mi, is_static_local, names)
+            }
             LookupOutcome::Skip => {
                 return record_failed_submission(
                     None,
@@ -1348,7 +1401,133 @@ pub fn dispatch_method_from_native(
     let mut kernel_args = KernelArgs::new();
     let mut writebacks: Vec<MarshalWriteback> = Vec::new();
 
-    for (i, arg) in java_args.iter().enumerate() {
+    // Phase 9 #2 push 2 — non-static path: marshal `this.<field>`
+    // arrays first (matching the kernel's `pthis_<i>_*` param prefix
+    // emitted by `jit_cuda::lowering::build_param_list`), then fall
+    // through to the regular per-arg marshalling starting at
+    // `java_args[1..]` (the receiver itself is never a kernel arg —
+    // only its named fields are).
+    let java_args_to_marshal: &[rustjvm_types::Value] = if !is_static {
+        // 7a. Pull the receiver from `java_args[0]`.
+        let receiver = match java_args.first() {
+            Some(Value::Object(Some(r))) => *r,
+            Some(Value::Object(None)) => {
+                drop(token);
+                return record_failed_submission(
+                    Some(stream.clone()),
+                    format!(
+                        "submitMethod: non-static receiver is null ({class_name}.{method_name}{descriptor})",
+                    ),
+                );
+            }
+            Some(other) => {
+                drop(token);
+                return record_failed_submission(
+                    Some(stream.clone()),
+                    format!(
+                        "submitMethod: non-static receiver is not an object reference: {other:?}",
+                    ),
+                );
+            }
+            None => {
+                drop(token);
+                return record_failed_submission(
+                    Some(stream.clone()),
+                    format!(
+                        "submitMethod: non-static method called with no arguments \
+                         (expected receiver as arg 0): {class_name}.{method_name}{descriptor}",
+                    ),
+                );
+            }
+        };
+
+        // 7b. Resolve each field name → slot on the receiver's
+        //     concrete class, read the field, marshal it as a
+        //     primitive-array kernel arg.
+        let receiver_class_id = shared.heap.class_id_of(receiver);
+        for (i, field_name) in this_field_names.iter().enumerate() {
+            // Walk the class hierarchy starting at the receiver's
+            // concrete class — the field may be declared on the
+            // declared class (which equals receiver_class_id when the
+            // receiver is exactly that class) or on a superclass.
+            let slot: usize = {
+                let cm = shared.class_manager.read();
+                let mut current = Some(receiver_class_id);
+                let mut found: Option<usize> = None;
+                while let Some(cid) = current {
+                    let Some(cls) = cm.get_class(cid) else { break };
+                    if let Some((idx, _)) = cls.find_own_field(field_name) {
+                        found = Some(idx);
+                        break;
+                    }
+                    current = cls.superclass;
+                }
+                match found {
+                    Some(s) => s,
+                    None => {
+                        drop(token);
+                        return record_failed_submission(
+                            Some(stream.clone()),
+                            format!(
+                                "submitMethod: this_field `{field_name}` not found on receiver's \
+                                 class hierarchy (receiver class_id={receiver_class_id:?})",
+                            ),
+                        );
+                    }
+                }
+            };
+            let field_val = shared.heap.get_field(receiver, slot);
+            let field_obj = match field_val {
+                Value::Object(Some(o)) => o,
+                Value::Object(None) => {
+                    drop(token);
+                    return record_failed_submission(
+                        Some(stream.clone()),
+                        format!(
+                            "submitMethod: this_field `{field_name}` (pthis_{i}) is null on receiver",
+                        ),
+                    );
+                }
+                other => {
+                    drop(token);
+                    return record_failed_submission(
+                        Some(stream.clone()),
+                        format!(
+                            "submitMethod: this_field `{field_name}` (pthis_{i}) is not an \
+                             object reference: {other:?}",
+                        ),
+                    );
+                }
+            };
+            let Some(etype) = shared.heap.array_element_type(field_obj) else {
+                drop(token);
+                return record_failed_submission(
+                    Some(stream.clone()),
+                    format!(
+                        "submitMethod: this_field `{field_name}` (pthis_{i}) does not point at a \
+                         primitive array",
+                    ),
+                );
+            };
+            match marshal_array_arg(shared, ctx, field_obj, etype, &token) {
+                Ok((args_after, wb)) => {
+                    kernel_args = args_after(kernel_args);
+                    writebacks.push(wb);
+                }
+                Err(msg) => {
+                    drop(token);
+                    return record_failed_submission(Some(stream.clone()), msg);
+                }
+            }
+        }
+        // Skip the receiver itself — it's not a kernel arg.
+        &java_args[1..]
+    } else {
+        // Static methods: everything in java_args is a kernel arg.
+        java_args
+    };
+
+    for (i, arg) in java_args_to_marshal.iter().enumerate() {
         match arg {
             Value::Int(v) => kernel_args = kernel_args.push_i32(*v),
             Value::Long(v) => kernel_args = kernel_args.push_i64(*v),

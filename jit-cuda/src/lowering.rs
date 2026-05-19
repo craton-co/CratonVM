@@ -45,6 +45,7 @@ pub fn lower_method(
 ) -> Result<PtxModule, LoweringError> {
     let kernel_name = mangle(class_name, &method.name, &method.descriptor);
     let params = build_param_list(sig);
+    let is_static = method.is_static();
 
     let code = method.code().ok_or_else(|| {
         LoweringError::UnsupportedNode("method has no Code attribute".into())
@@ -52,7 +53,7 @@ pub fn lower_method(
     let bytes = &code.code;
     let shape = detect_loop(bytes)?;
 
-    let mut emitter = Emitter::new(bytes, sig);
+    let mut emitter = Emitter::new(bytes, sig, is_static);
     emitter.bind_param_locals()?;
 
     match shape {
@@ -89,6 +90,10 @@ pub fn lower_method(
                     let bound_reg = emitter.materialise_param_len(idx);
                     emitter.emit_loop_guard(&bound_reg);
                 }
+                BoundSource::ThisFieldLen(idx) => {
+                    let bound_reg = emitter.materialise_this_field_len(idx);
+                    emitter.emit_loop_guard(&bound_reg);
+                }
                 BoundSource::Literal(v) => {
                     let bound_reg = emitter.materialise_literal_s32(v);
                     emitter.emit_loop_guard(&bound_reg);
@@ -122,8 +127,34 @@ pub fn lower_method(
 }
 
 /// Public alongside `lower_method`: the kernel parameter convention.
+///
+/// For non-static methods (Phase 9 #2), the kernel takes one
+/// `(ptr, len)` pair per unique `this.<field>` access *before* the
+/// regular parameter list. The unique-fields list is dedup'd from
+/// `sig.this_field_cps` in body-encounter order — so the marshaller
+/// can match the same ordering on the runtime side.
 pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
     let mut out = Vec::new();
+    // Phase 9 #2 — prepend `pthis_<i>_ptr` / `pthis_<i>_len` for each
+    // unique cp_index in `sig.this_field_cps`. The order of unique
+    // entries is body-encounter order (first occurrence wins), which
+    // matches `Emitter::new`'s dedup pass.
+    let mut seen: Vec<u16> = Vec::new();
+    for &cp in &sig.this_field_cps {
+        if seen.contains(&cp) {
+            continue;
+        }
+        let i = seen.len();
+        out.push(PtxParam {
+            name: format!("pthis_{i}_ptr"),
+            kind: PtxParamKind::U64Ptr,
+        });
+        out.push(PtxParam {
+            name: format!("pthis_{i}_len"),
+            kind: PtxParamKind::S32,
+        });
+        seen.push(cp);
+    }
     for (i, k) in sig.param_kinds.iter().enumerate() {
         match k {
             ParamKind::I32 => out.push(PtxParam {
@@ -223,6 +254,16 @@ impl<'a> Emitter<'a> {
         let r = self.regs.fresh_reg(RegKind::S32);
         use std::fmt::Write;
         writeln!(self.body, "    ld.param.s32 {}, [p{idx}_len];", r.name).unwrap();
+        r
+    }
+
+    /// Phase 9 #2 — materialise `pthis_<i>_len` into a fresh s32 register.
+    /// `idx` is the dedup'd position of a `this.<field>` cp_index in
+    /// [`KernelSignature::this_field_cps`].
+    pub(crate) fn materialise_this_field_len(&mut self, idx: usize) -> emit::Reg {
+        let r = self.regs.fresh_reg(RegKind::S32);
+        use std::fmt::Write;
+        writeln!(self.body, "    ld.param.s32 {}, [pthis_{idx}_len];", r.name).unwrap();
         r
     }
 
@@ -420,6 +461,88 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
             text,
+        );
+    }
+
+    /// Phase 9 #2 push 2 — `NonStaticScale.scaleInPlace(I)V` is the
+    /// first non-static fixture that lowers end-to-end. The method's
+    /// body uses the `aload_0; getfield <data>` pattern (3 occurrences:
+    /// one in the bound computation, one each for the store target /
+    /// load source inside the loop) but accesses the same field every
+    /// time, so dedup'd this-field count = 1.
+    ///
+    /// We assert:
+    /// - `pthis_0_ptr` and `pthis_0_len` are emitted as the first
+    ///   two params (before the regular `p0` int factor parameter).
+    /// - The loop bound is sourced from `pthis_0_len`, not `pN_len`.
+    /// - Each `iaload` / `iastore` emits a bounds check against
+    ///   `pthis_0_len`.
+    /// - `failure_flag` is still the last parameter.
+    #[test]
+    fn non_static_scale_lowers_to_real_ptx() {
+        let m = lower_fixture("NonStaticScale", "scaleInPlace", "(I)V");
+        let text = m.render();
+
+        // Entry name + non-static-this kernel params.
+        assert!(
+            text.contains(".visible .entry NonStaticScale__scaleInPlace_"),
+            "missing entry header:\n{text}"
+        );
+        assert!(
+            text.contains(".param .u64 pthis_0_ptr"),
+            "missing pthis_0_ptr param:\n{text}"
+        );
+        assert!(
+            text.contains(".param .s32 pthis_0_len"),
+            "missing pthis_0_len param:\n{text}"
+        );
+        // Regular int-factor parameter follows.
+        assert!(
+            text.contains(".param .s32 p0"),
+            "missing p0 (factor) param:\n{text}"
+        );
+        assert!(
+            text.contains(".param .u64 failure_flag"),
+            "missing failure_flag param:\n{text}"
+        );
+
+        // The kernel body pre-loads `pthis_0_ptr` so the
+        // `aload_0; getfield` chain can resolve at compile time.
+        assert!(
+            text.contains("ld.param.u64") && text.contains("[pthis_0_ptr]"),
+            "expected `ld.param.u64 _, [pthis_0_ptr]` in body:\n{text}"
+        );
+
+        // Loop bound from `pthis_0_len` (NOT `p0_len` — p0 is the
+        // scalar factor).
+        assert!(
+            text.contains("[pthis_0_len]"),
+            "loop bound must read from pthis_0_len, not pN_len:\n{text}"
+        );
+        assert!(
+            !text.contains("[p0_len]"),
+            "p0 is a scalar — kernel must not reference p0_len:\n{text}"
+        );
+
+        // Element-wise iaload + imul + iastore.
+        assert!(
+            text.contains("ld.global.s32"),
+            "expected an int load:\n{text}"
+        );
+        assert!(
+            text.contains("st.global.s32"),
+            "expected an int store:\n{text}"
+        );
+        assert!(
+            text.contains("mul.lo.s32"),
+            "expected an int multiply:\n{text}"
+        );
+
+        // Bounds-check failure block is emitted because the body does
+        // an array load and a store, both against pthis_0_len.
+        assert!(
+            text.contains("L_bounds_fail:"),
+            "expected bounds-fail label:\n{text}"
         );
     }
 

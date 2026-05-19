@@ -933,8 +933,22 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    /// Phase 6 #5: resolve a lambda proxy back to its target method
-    /// + captured values for GPU dispatch.
+    /// Phase 6 #5 + Phase 9 #2 push 2: resolve a lambda proxy back to
+    /// its target method + captured values for GPU dispatch.
+    ///
+    /// Non-static targets (`InvokeVirtual` / `InvokeSpecial`) are
+    /// admitted when the captured-value list begins with a non-null
+    /// receiver — the receiver becomes `java_args[0]` to
+    /// [`dispatch_method_from_native`], which extracts the analyzer's
+    /// recorded `this_field_cps` from the receiver before processing
+    /// remaining captures as kernel args.
+    ///
+    /// Still rejected:
+    /// - `InvokeInterface` (no fixture today)
+    /// - `NewInvokeSpecial` (heap construction on the device — no GPU
+    ///   semantics)
+    /// - `GetField` / `PutField` / `GetStatic` / `PutStatic` method
+    ///   handles (no GPU semantics for arbitrary field access)
     fn gpu_resolve_lambda_target(
         &self,
         callable: ObjectRef,
@@ -945,24 +959,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let cid = self.shared.heap.class_id_of(callable);
             let proxies = self.shared.lambda_proxies.read();
             let lcs = proxies.get(&cid)?;
-            // Phase 7 #4 (partial): only static-method targets are
-            // GPU-dispatchable today. Non-static kinds need:
-            //   - The analyzer to admit non-static methods (Phase 8
-            //     work; currently Reason::NonStatic rejects them).
-            //   - The marshaller to thread the receiver as a kernel
-            //     arg (straightforward extension once admitted).
-            //   - For NewInvokeSpecial / GetField / etc.: no
-            //     GPU semantics — heap construction and field
-            //     access on the device aren't supported.
-            // Log a tracing::debug so `--print-gpu-decisions` shows
-            // why a lambda fell through to CPU.
-            if !matches!(lcs.impl_handle.kind, MethodHandleKind::InvokeStatic) {
+            // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
+            // InvokeSpecial. The analyzer's non-static relaxation
+            // means a virtual/special call's target can be admitted
+            // when its body uses the `aload_0; getfield <field>`
+            // shape; the marshaller extracts those fields from the
+            // receiver. Other handle kinds remain CPU-only.
+            let kind_admitted = matches!(
+                lcs.impl_handle.kind,
+                MethodHandleKind::InvokeStatic
+                    | MethodHandleKind::InvokeVirtual
+                    | MethodHandleKind::InvokeSpecial
+            );
+            if !kind_admitted {
                 tracing::debug!(
                     target: "gpu.offload",
                     handle_kind = ?lcs.impl_handle.kind,
                     target_class = %lcs.impl_handle.class_name,
                     target_member = %lcs.impl_handle.member_name,
-                    "lambda target rejected: only static-method references are GPU-dispatchable today (PHASE8-FOLLOWUP)",
+                    "lambda target rejected: handle kind has no GPU lowering",
                 );
                 return None;
             }
@@ -7086,7 +7101,80 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "org/jboss/staxmapper/IntVersion"
                             && method_name == "toString"
                             && (descriptor == "()Ljava/lang/String;"
-                                || descriptor == "(I)Ljava/lang/String;"));
+                                || descriptor == "(I)Ljava/lang/String;"))
+                        // SigProbe / WP6.4 / WP6.6: real-JDK
+                        // `java.security.KeyPairGenerator.getInstance(String)`
+                        // is a concrete static that routes through
+                        // `sun.security.jca.GetInstance.getService(...)` →
+                        // `Provider.Service.newInstance(...)` and ultimately
+                        // returns a `KeyPairGenerator$Delegate` whose
+                        // `generateKeyPair` delegates to a `KeyPairGeneratorSpi`
+                        // we don't wire up. The native registered in
+                        // `native-builtins/src/jca/key_factory.rs` allocates a
+                        // synthetic KPG carrying the algorithm index and key
+                        // size in slots 0/1, but the bytecode is non-abstract
+                        // so `check_override` stays false. Force the override
+                        // for `getInstance` / `initialize` / `generateKeyPair`
+                        // / `getAlgorithm` so our natives see the receiver
+                        // they populated.
+                        || (class_name == "java/security/KeyPairGenerator"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "initialize"
+                                | "generateKeyPair"
+                                | "genKeyPair"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: same rationale as KeyPairGenerator for
+                        // `java.security.Signature` (`getInstance` returns a
+                        // `Signature$Delegate` whose SPI we don't implement).
+                        // Natives in `native-builtins/src/jca/signature.rs`.
+                        || (class_name == "java/security/Signature"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "initSign"
+                                | "initVerify"
+                                | "update"
+                                | "sign"
+                                | "verify"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: `java.security.KeyFactory.getInstance` /
+                        // `generatePublic` / `generatePrivate` — natives in
+                        // `native-builtins/src/jca/key_factory.rs`.
+                        || (class_name == "java/security/KeyFactory"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "generatePublic"
+                                | "generatePrivate"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: `java.security.KeyPair` accessors are
+                        // backed by synthetic-slot natives in key_factory.rs;
+                        // the JDK bytecode reads private fields that our
+                        // allocation path never populates.
+                        || (class_name == "java/security/KeyPair"
+                            && matches!(method_name, "getPublic" | "getPrivate"))
+                        // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
+                        // string / DER round-trip. JDK 25 routes through
+                        // `sun.security.x509.X500Name` whose parser depends
+                        // on `sun.security.util.DerInputStream` natives we
+                        // don't implement. Natives in
+                        // `native-builtins/src/jca/x500.rs` re-implement the
+                        // RFC 4514 ↔ DER round-trip directly.
+                        || (class_name == "javax/security/auth/x500/X500Principal"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getEncoded"
+                                | "getName"
+                                | "toString"
+                                | "hashCode"
+                                | "equals"
+                            ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
