@@ -30676,8 +30676,16 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
     register_p69_submission_publisher(registry);
     register_p69_misc(registry);
     register_pbe_diagnostic(registry);
-    register_pbe_workaround(registry);
-    register_de4_demo_stubs(registry);
+    // gauntlet "no synthetic stubs": both register_pbe_workaround and
+    // register_de4_demo_stubs registered unconditional no-ops covering the
+    // ConfigurationClassPostProcessor + AnnotationConfigUtils +
+    // AbstractAutowireCapableBeanFactory.applyPropertyValues surfaces,
+    // short-circuiting all real Spring property injection. With them off,
+    // Spring's real refresh path runs (loads AutoConfiguration.imports,
+    // CGLIB-enhances @Configuration classes); the next blockers surface
+    // for follow-up fix agents.
+    // register_pbe_workaround(registry);
+    // register_de4_demo_stubs(registry);
 }
 
 // =============================================================================
