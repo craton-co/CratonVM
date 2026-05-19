@@ -31397,21 +31397,20 @@ pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Suppress NotWritablePropertyException construction — its very existence
-    // is what Spring later batches into PropertyBatchUpdateException. Returning
-    // `Ok(None)` here makes <init> a no-op so the freshly-allocated exception
-    // object is functionally inert: it carries no message and no stack trace,
-    // and `throw` of it short-circuits with a half-initialized exception that
-    // Spring's wrapper catch swallows. This is risky for legitimate
-    // misconfiguration cases — keep it gated behind the same suppression scope
-    // used by register_pbe_workaround. Caller (orchestrator) decides whether
-    // to enable via the check_override allowlist.
-    r.register(
-        "org/springframework/beans/NotWritablePropertyException",
-        "<init>",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // GAUNTLET ROUND-5: NotWritablePropertyException.<init> no-op DISABLED.
+    // The previous no-op stripped message + stack trace from the inner
+    // exception so PBE diagnostics had nothing to report; worse, throwing
+    // a half-initialized exception caused Spring's wrapper catch to silently
+    // swallow the whole bean failure with no visible signal. Restoring the
+    // real bytecode means PBE diagnostics will see proper messages, AND
+    // failed bean creation will surface as a normal BeanCreationException.
+    // ────────────────────────────────────────────────────────────────────
+    // r.register(
+    //     "org/springframework/beans/NotWritablePropertyException",
+    //     "<init>",
+    //     "(Ljava/lang/Class;Ljava/lang/String;)V",
+    //     |_ctx, _args| Ok(None),
+    // );
 }
 
 // =============================================================================

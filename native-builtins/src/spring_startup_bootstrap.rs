@@ -1181,6 +1181,22 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     const BDRPP: &str = "org/springframework/beans/factory/support/BeanDefinitionRegistryPostProcessor";
     const BFPP: &str = "org/springframework/beans/factory/config/BeanFactoryPostProcessor";
 
+    // GAUNTLET ROUND-5: CCPP/BDRPP/BFPP post-processor shims DISABLED.
+    // These registrations short-circuited the real
+    // `@Configuration`/`@Bean`/post-processor processing path on FIVE
+    // (class, method) pairs — including the INTERFACE-LEVEL ones
+    // (BeanDefinitionRegistryPostProcessor.postProcessBeanDefinitionRegistry
+    // and BeanFactoryPostProcessor.postProcessBeanFactory) which silently
+    // replaced bytecode for ANY Spring bean implementing those interfaces.
+    // With insurance-backend the consequence is that
+    // `AbstractApplicationContext.invokeBeanFactoryPostProcessors` returns
+    // without doing any real work, so refresh() completes Ok in ~1.7s
+    // without actually scanning @Configuration classes or registering
+    // tomcat/JPA beans. Disabling lets real bytecode run; if it surfaces
+    // a real exception, that's progress.
+    let _ = (CCPP, BDRPP, BFPP);
+    let _ = ccpp_process_config_bean_definitions;
+    /*
     registry.register(
         CCPP,
         "processConfigBeanDefinitions",
@@ -1214,6 +1230,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
         ccpp_process_config_bean_definitions,
     );
+    */
 
     // ───────────────────────────────────────────────────────────────────────
     // sportme defence-in-depth, layer 2:
