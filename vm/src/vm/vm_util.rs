@@ -621,20 +621,24 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "org/jboss/modules/Module") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
-                // KC26: Keycloak `Profile` / `FeatureOptions` may finish
-                // <clinit> nominally, yet their lazy cache static stays
-                // null because the populating Stream pipeline drained to
-                // nothing (no-op LambdaMetafactory CallSite). Fire the
-                // fixup so the cache is pre-populated with an empty
-                // container of the matching collection type; this short-
-                // circuits the infinite-loop getter call from
-                // `Profile.getOrderedFeatures` / `FeatureOptions.getFeatureValues`.
-                if matches!(
-                    &*class_name_for_jfr,
-                    "org/keycloak/common/Profile" | "org/keycloak/config/FeatureOptions"
-                ) {
-                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
-                }
+                // KC26: previously we ran a post-clinit fixup that pre-
+                // populated `Profile.FEATURES` with an empty `HashMap` to
+                // avoid a (then-suspected) infinite Stream pipeline in
+                // `Profile.getOrderedFeatures`. That suspicion no longer
+                // holds — Stream/Lambda support now works, and the lazy
+                // cache populates correctly on first call. The empty-
+                // HashMap pre-fill was actively harmful: `Profile.configure`
+                // iterates `getOrderedFeatures()` (which returns the cached
+                // value when non-null) and builds the per-instance features
+                // map from it, so an empty cache yields an empty `features`
+                // map and `Profile.isFeatureEnabled(CLUSTERLESS)` NPEs on
+                // `features.get(...).booleanValue()`. Leaving `FEATURES`
+                // null after `<clinit>` (real-JDK behaviour) lets the
+                // accessor's `ifnonnull` branch populate it from the real
+                // `Feature.values()` array. Same reasoning for
+                // `FeatureOptions` — its `FEATURES`/`FEATURES_DISABLED`
+                // statics are `Option` finals, not lazy caches; no fixup
+                // is appropriate.
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2199,26 +2203,15 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
         }
-        // KC26: Keycloak 26 (Quarkus) — `org/keycloak/common/Profile`
-        // and `org/keycloak/config/FeatureOptions`. Both classes cache
-        // the result of a Stream pipeline in a static field. When our
-        // LambdaMetafactory produces a no-op CallSite, the lambdas
-        // (`lambda$getOrderedFeatures$2/$3`, `lambda$getFeatureValues$1`)
-        // collect into a perpetually-non-terminating source and the CLI
-        // blows past the 60s watchdog with rc=124.
-        //
-        // We pre-populate any plausibly-named static cache field with
-        // an empty container of the matching collection type (HashSet
-        // for Set descriptors, HashMap for Map descriptors, ArrayList
-        // for List descriptors). The accessor returns the cached value
-        // immediately and never enters the broken Stream pipeline. If
-        // no candidate field name matches, we log all static fields on
-        // the class so the next iteration can refine the candidate set
-        // without rebuilding. Each arm only writes a fresh value when
-        // the existing slot is null — never clobber a successful clinit.
-        "org/keycloak/common/Profile" | "org/keycloak/config/FeatureOptions" => {
-            keycloak_prepopulate_cache_statics(shared, class_id, class_name);
-        }
+        // KC26: Keycloak `Profile`/`FeatureOptions` pre-population was
+        // removed. See the call-site comment in `init_class_with_id` for
+        // the full rationale; the short version is that the empty-cache
+        // pre-fill caused `Profile.configure` to build an empty per-
+        // instance `features` map, leading to a NPE in
+        // `Profile.isFeatureEnabled`. `keycloak_prepopulate_cache_statics`
+        // is retained below in case it's needed for a future Keycloak
+        // edition that genuinely loops on a broken Stream pipeline, but
+        // it's no longer invoked from the dispatch path.
         "org/jboss/msc/service/ServiceLogger" => {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {
@@ -2293,6 +2286,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
 /// ArrayList needs `elementData` so `get(i)` doesn't trip arraylength
 /// on null; HashSet's backing `HashMap` field can stay null because
 /// Keycloak's accessor only returns the cached Set reference.
+#[allow(dead_code)] // retained for potential future Keycloak edition; see dispatch-site comment
 fn keycloak_prepopulate_cache_statics(
     shared: &SharedVm,
     class_id: ClassId,
