@@ -616,17 +616,38 @@ fn run() -> Result<()> {
         // KC26: For Quarkus applications, the RunnerClassLoader normally loads
         // classes from jars listed in quarkus-application.dat. Since we can't
         // fully emulate that complex bootstrap, add all application jars to
-        // the VM classpath so ClassLoader.loadClass can find them.
-        if let Some(parent) = jar_path.parent().and_then(|p| p.parent()) {
-            let app_dirs = ["lib/lib/main", "lib/lib/boot", "lib/quarkus", "lib/app"];
-            for dir_name in &app_dirs {
-                let dir = parent.join(dir_name);
-                if dir.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(&dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.extension().map_or(false, |e| e == "jar") {
-                                cp.push(p.to_string_lossy().into_owned());
+        // the VM classpath so ClassLoader.loadClass can find them. Canonicalise
+        // jar_path first so a bare basename (user cd'd into lib/) still resolves
+        // its parent. Probe BOTH the jar's own dir AND its parent, since
+        // Keycloak packaging puts quarkus-run.jar in lib/ (one level deep),
+        // whereas the canonical Quarkus packaging puts it at the project root.
+        {
+            let canon_jar = std::fs::canonicalize(jar_path)
+                .unwrap_or_else(|_| jar_path.to_path_buf());
+            let jar_dir = canon_jar.parent().map(|p| p.to_path_buf());
+            let mut roots = Vec::new();
+            if let Some(d) = jar_dir.as_ref() {
+                roots.push(d.clone());
+                if let Some(pp) = d.parent() {
+                    roots.push(pp.to_path_buf());
+                }
+            }
+            let app_dirs = ["app", "quarkus", "lib/main", "lib/boot", "lib/deployment"];
+            let mut seen = std::collections::HashSet::new();
+            for root in &roots {
+                for dir_name in &app_dirs {
+                    let dir = root.join(dir_name);
+                    let canon_dir = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+                    if !seen.insert(canon_dir.clone()) {
+                        continue;
+                    }
+                    if canon_dir.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&canon_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().map_or(false, |e| e == "jar") {
+                                    cp.push(p.to_string_lossy().into_owned());
+                                }
                             }
                         }
                     }
