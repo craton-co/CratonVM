@@ -991,6 +991,15 @@ fn run() -> Result<()> {
         }
     };
     if let Some(secs) = effective_watchdog {
+        // Enable the native-call ring buffer so the watchdog's "0 Java
+        // threads dumped" fallback can show the last ~64 native methods
+        // every thread entered. Without this, the ring's
+        // `dump_to_stderr` reports "recording disabled" and a hang in
+        // pure Rust runtime code has no actionable diagnostic.
+        // Recording cost (single relaxed AtomicBool load on entry, plus
+        // a parking_lot::Mutex when set) is negligible compared to the
+        // value of identifying the hang site on intermittent hangs.
+        rustjvm_native_api::native_ring::enable(true);
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 — capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives

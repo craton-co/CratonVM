@@ -418,14 +418,19 @@ fn native_module_get_caller_module_loader(
 /// jboss_extras::register_jboss_wildfly_stubs(registry);
 /// ```
 pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
-    // Env-var gate: this module installs jboss-modules / `org/jboss/modules/*`
-    // intercepts that are shared between WildFly and Keycloak-16. Install
-    // only when EITHER `RUSTJVM_WILDFLY_REAL=1` OR `RUSTJVM_KC16_REAL=1`
-    // is set, so unrelated CratonVM runs are not affected by these
-    // bootstrap short-circuits.
-    let wf = std::env::var("RUSTJVM_WILDFLY_REAL").as_deref() == Ok("1");
-    let kc16 = std::env::var("RUSTJVM_KC16_REAL").as_deref() == Ok("1");
-    if !(wf || kc16) {
+    // Real-bytecode audit: the previous BACKWARDS env-var gate has been
+    // removed. These intercepts are legitimate jboss-modules / Module
+    // plumbing (synthetic LocalModuleLoader, MBean install no-ops,
+    // dependency-graph empty arrays) needed for `Module.getBootModuleLoader`
+    // to return non-null and for the reflective Module-graph walk to
+    // terminate. They are NOT main()-short-circuit stubs.
+    //
+    // Opt out via `RUSTJVM_SKIP_JBOSS_PLUMBING=1` if you suspect these
+    // overrides shadow real Java bytecode for a different app.
+    if std::env::var("RUSTJVM_SKIP_JBOSS_PLUMBING").as_deref() == Ok("1") {
+        tracing::warn!(
+            "[jboss-extras] RUSTJVM_SKIP_JBOSS_PLUMBING=1 — skipping jboss-modules plumbing"
+        );
         return;
     }
     // Module.getBootModuleLoader()Lorg/jboss/modules/ModuleLoader;
@@ -641,19 +646,12 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // ------------------------------------------------------------------
-    // Final stretch fallback: env-gated short-circuit of Main.main.
-    // When `RUSTJVM_WILDFLY_SHORTCIRCUIT=1` is set, replace the entire
-    // Main.main entry point with a no-op so WildFly exits with rc=0 —
-    // useful when the goal is only to verify the JVM doesn't crash.
+    // Real-bytecode audit: `RUSTJVM_WILDFLY_SHORTCIRCUIT=1` previously
+    // replaced `org/jboss/modules/Main.main` with a no-op. That fake-out
+    // has been REMOVED so real WildFly bytecode runs. Suppress an
+    // unused-const warning since CN_MAIN is no longer referenced here.
     // ------------------------------------------------------------------
-    if std::env::var("RUSTJVM_WILDFLY_SHORTCIRCUIT").as_deref() == Ok("1") {
-        registry.register(
-            CN_MAIN,
-            "main",
-            "([Ljava/lang/String;)V",
-            native_void_noop,
-        );
-    }
+    let _ = CN_MAIN;
 }
 
 #[cfg(test)]

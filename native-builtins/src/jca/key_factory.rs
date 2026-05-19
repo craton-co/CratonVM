@@ -51,7 +51,7 @@
 #![allow(clippy::collapsible_if)]
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 use rustjvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
@@ -61,14 +61,52 @@ const ALGO_RSA: i32 = 6;
 const ALGO_EC: i32 = 7;
 const ALGO_ED25519: i32 = 8;
 
-const KPG_FIELD_ALGO: usize = 0;
-const KPG_FIELD_KEYSIZE: usize = 1;
-const KPG_FIELD_STATE: usize = 2;
+// ---------------------------------------------------------------------------
+// Real-JDK class instance-field counts (number of slots used by the real
+// layout before our synthetic state begins). All our private state slots
+// are placed *after* the real layout so the VM's descriptor-aware
+// `set_field`/`get_field` doesn't coerce our `Int(...)` writes to
+// `Object(None)` on slots that the real JDK class declares as references.
+//
+// JDK 25:
+//   * `java.security.KeyPairGenerator` extends `KeyPairGeneratorSpi`:
+//        - KPGSpi: 0 instance fields
+//        - KPG: `algorithm: String`, `provider: Provider` -> 2
+//   * `java.security.KeyFactory`:
+//        - 5 instance fields (algorithm, provider, spi, lock, serviceIterator)
+//   * `java.security.KeyPair`:
+//        - 2 fields (privateKey, publicKey) - both Object, order doesn't
+//          matter as long as our accessors match what set_field writes via
+//          the same indices, so we ignore the JDK ordering here and use
+//          slot 0 = pub / slot 1 = priv as our internal convention.
+//
+// We resolve the actual field counts at runtime via `class_num_total_fields`
+// instead of hard-coding so this stays robust against future JDK layout
+// changes. The `kpg_base_offset` helper returns the first usable slot index
+// past the real layout.
+fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
+    let cid = ctx
+        .ensure_class_initialized(class_name)
+        .unwrap_or(ClassId::new(0));
+    ctx.class_num_total_fields(cid)
+}
 
+// Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
+const KPG_OFF_ALGO: usize = 0;
+const KPG_OFF_KEYSIZE: usize = 1;
+const KPG_OFF_STATE: usize = 2;
+const KPG_PRIVATE_SLOTS: usize = 3;
+
+const KF_OFF_ALGO: usize = 0;
+const KF_PRIVATE_SLOTS: usize = 1;
+
+// `PublicKey` / `PrivateKey` are interfaces in JDK 25 (no instance fields),
+// so we can keep using the legacy fixed slot layout here.
 const KEY_FIELD_ALGO: usize = 0;
 const KEY_FIELD_BITS: usize = 1;
 const KEY_FIELD_ENCLEN: usize = 2;
 const KEY_FIELD_KEYID: usize = 3;
+const KEY_FIELD_DER: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -157,7 +195,7 @@ fn alloc_public_key(
     ctx.set_field(obj, KEY_FIELD_ENCLEN, Value::Int(der.len() as i32));
     ctx.set_field(obj, KEY_FIELD_KEYID, Value::Long(key_id as i64));
     let arr = alloc_byte_array(ctx, der);
-    ctx.set_field(obj, 4, Value::Object(Some(arr)));
+    ctx.set_field(obj, KEY_FIELD_DER, Value::Object(Some(arr)));
     obj
 }
 
@@ -174,7 +212,7 @@ fn alloc_private_key(
     ctx.set_field(obj, KEY_FIELD_ENCLEN, Value::Int(der.len() as i32));
     ctx.set_field(obj, KEY_FIELD_KEYID, Value::Long(key_id as i64));
     let arr = alloc_byte_array(ctx, der);
-    ctx.set_field(obj, 4, Value::Object(Some(arr)));
+    ctx.set_field(obj, KEY_FIELD_DER, Value::Object(Some(arr)));
     obj
 }
 
@@ -192,22 +230,28 @@ fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef)
 fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
-    let kpg = alloc_concurrent_synthetic(ctx, "java/security/KeyPairGenerator", 3);
-    ctx.set_field(kpg, KPG_FIELD_ALGO, Value::Int(idx));
+    let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
+    let kpg = alloc_concurrent_synthetic(
+        ctx,
+        "java/security/KeyPairGenerator",
+        base + KPG_PRIVATE_SLOTS,
+    );
+    ctx.set_field(kpg, base + KPG_OFF_ALGO, Value::Int(idx));
     let default_bits = if idx == ALGO_RSA { 2048 } else if idx == ALGO_EC { 256 } else { 0 };
-    ctx.set_field(kpg, KPG_FIELD_KEYSIZE, Value::Int(default_bits));
-    ctx.set_field(kpg, KPG_FIELD_STATE, Value::Int(0));
+    ctx.set_field(kpg, base + KPG_OFF_KEYSIZE, Value::Int(default_bits));
+    ctx.set_field(kpg, base + KPG_OFF_STATE, Value::Int(0));
     Ok(Some(Value::Object(Some(kpg))))
 }
 
 fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let bits = match args.get(1) {
         Some(Value::Int(n)) => *n,
         _ => 2048,
     };
-    ctx.set_field(this, KPG_FIELD_KEYSIZE, Value::Int(bits));
-    ctx.set_field(this, KPG_FIELD_STATE, Value::Int(1));
+    ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
+    ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
     Ok(None)
 }
 
@@ -217,20 +261,21 @@ fn kpg_initialize_int_random(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ECGenParameterSpec / RSAKeyGenParameterSpec — for EC we only support
-    // P-256, so any spec sets bits=256.  RSA spec keysize is at slot 0,
-    // but we just leave whatever was previously set / the default.
+    // P-256, so any spec sets bits=256.  RSA spec keysize is preserved
+    // from the previous value / the default.
     let this = this_arg(args)?;
-    let cur = match ctx.get_field(this, KPG_FIELD_KEYSIZE) {
+    let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
+    let cur = match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
         Value::Int(n) => n,
         _ => 0,
     };
-    let algo = match ctx.get_field(this, KPG_FIELD_ALGO) {
+    let algo = match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     };
     let bits = if algo == ALGO_EC { 256 } else if cur == 0 { 2048 } else { cur };
-    ctx.set_field(this, KPG_FIELD_KEYSIZE, Value::Int(bits));
-    ctx.set_field(this, KPG_FIELD_STATE, Value::Int(1));
+    ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
+    ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
     Ok(None)
 }
 
@@ -240,14 +285,15 @@ fn kpg_initialize_spec_random(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let algo = match ctx.get_field(this, KPG_FIELD_ALGO) {
+    let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
+    let algo = match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => i,
         _ => return Err(RuntimeError::NotImplemented {
             feature: "KeyPairGenerator with no algorithm".into(),
         }
         .into()),
     };
-    let bits = match ctx.get_field(this, KPG_FIELD_KEYSIZE) {
+    let bits = match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
         Value::Int(n) if n > 0 => n as usize,
         _ => 2048,
     };
@@ -296,7 +342,8 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let idx = match ctx.get_field(this, KPG_FIELD_ALGO) {
+    let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
+    let idx = match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     };
@@ -311,8 +358,13 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
-    let kf = alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", 1);
-    ctx.set_field(kf, 0, Value::Int(idx));
+    let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
+    let kf = alloc_concurrent_synthetic(
+        ctx,
+        "java/security/KeyFactory",
+        base + KF_PRIVATE_SLOTS,
+    );
+    ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
     Ok(Some(Value::Object(Some(kf))))
 }
 
@@ -322,7 +374,8 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// a key with `key_id == 0` so verify-time falls through gracefully.
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let algo = match ctx.get_field(this, 0) {
+    let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
+    let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     };
@@ -397,7 +450,8 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `getEncoded` to round-trip the bytes (which is the typical
     // KeyStore-write path).
     let this = this_arg(args)?;
-    let algo = match ctx.get_field(this, 0) {
+    let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
+    let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     };
@@ -415,7 +469,8 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let idx = match ctx.get_field(this, 0) {
+    let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
+    let idx = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     };
@@ -449,7 +504,7 @@ fn key_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn key_get_encoded(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let der = match ctx.get_field(this, 4) {
+    let der = match ctx.get_field(this, KEY_FIELD_DER) {
         Value::Object(Some(arr)) => read_byte_array(ctx, arr),
         _ => Vec::new(),
     };

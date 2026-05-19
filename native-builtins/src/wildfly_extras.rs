@@ -1,71 +1,30 @@
 //! WildFly 39 boot-test shims.
 //!
-//! WildFly's jboss-modules launcher resolves `org.jboss.as.standalone`
-//! module's main class to `org.jboss.as.server.Main.main`. The class is
-//! supposed to live in `<mp>/system/layers/base/org/jboss/as/server/main/
-//! wildfly-server-39.0.1.Final.jar` but our brute-force layered-jar walk
-//! evidently isn't getting it onto the classpath. Short-circuit
-//! `org/jboss/as/server/Main.main` directly so the JVM exits rc=0 —
-//! WildFly doesn't actually run, but for boot-test purposes that's the
-//! win.
+//! **HISTORY**: Previously this module short-circuited
+//! `org.jboss.as.server.Main.main` (plus several legacy / domain-mode
+//! entry points) so the JVM exited rc=0 without running WildFly bytecode.
+//!
+//! **CURRENT STATE (real-bytecode audit)**: every short-circuit
+//! registration has been REMOVED. Real WildFly bytecode now runs. This
+//! file is kept so the call site in `lib.rs::register_essential_natives`
+//! continues to compile.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use rustjvm_native_api::NativeMethodRegistry;
 
-fn wf_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[wildfly-shim] Main.main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-pub fn register_wildfly_stubs(registry: &mut NativeMethodRegistry) {
-    // Env-var gate: only install these WildFly-specific shims when the
-    // operator explicitly opts in via `RUSTJVM_WILDFLY_REAL=1`. Without
-    // the gate, the unconditional registrations short-circuit real
-    // application Main classes (`org/jboss/as/server/Main.main`, etc.)
-    // for every CratonVM run, which is undesirable for non-WildFly apps.
-    if std::env::var("RUSTJVM_WILDFLY_REAL").as_deref() != Ok("1") {
-        return;
+/// Audit cleanup: no longer registers any natives. Previously short-
+/// circuited every WildFly bootstrap entry-class `main(String[])`.
+///
+/// Re-enable via `RUSTJVM_USE_WILDFLY_MAIN_SHIM=1` only for boot-test
+/// (exit-rc-only) work; the shim is OFF by default so real bytecode runs.
+pub fn register_wildfly_stubs(_registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_USE_WILDFLY_MAIN_SHIM").as_deref() == Ok("1") {
+        tracing::warn!(
+            "[wildfly-shim] RUSTJVM_USE_WILDFLY_MAIN_SHIM=1 set — legacy shim opt-in noted but \
+             registration code has been removed in the real-bytecode audit."
+        );
     }
-    // The WildFly standalone entry class (declared in module.xml of
-    // org.jboss.as.standalone). May not exist on disk by the time
-    // jboss-modules tries to invoke it, so register the native intercept
-    // here as a universal shim.
-    registry.register(
-        "org/jboss/as/server/Main",
-        "main",
-        "([Ljava/lang/String;)V",
-        wf_main_noop,
-    );
-    registry.register(
-        "org/jboss/as/server/Main",
-        "<clinit>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
-
-    // Domain mode and several legacy entry points; defensive coverage.
-    // Also covers `org/jboss/as/standalone/Main` (the entry class declared
-    // by org.jboss.as.standalone's module.xml — listed in the WildFly
-    // boot-test task brief alongside the as/server/Main entry).
-    for class in [
-        "org/jboss/as/Main",
-        "org/jboss/as/standalone/Main",
-        "org/jboss/as/host/controller/Main",
-        "org/jboss/as/process/Main",
-        "org/jboss/as/process/ProcessController",
-        "org/jboss/as/host/HostController",
-        "org/jboss/as/process/Main$1",
-    ] {
-        registry.register(class, "main", "([Ljava/lang/String;)V", wf_main_noop);
-        registry.register(class, "<clinit>", "()V", |_ctx, _args| Ok(None));
-    }
+    // Intentionally empty. Real WildFly Main.main bytecode runs.
 }
-
-// Wiring: `register_wildfly_stubs` is invoked from
-// `register_essential_natives` in `native-builtins/src/lib.rs`. The shared
-// `org/jboss/modules/Main` shim (used by both WildFly and Keycloak-16) is
-// owned by `wildfly_method_synth.rs` and wired separately.
 
 #[cfg(test)]
 mod tests {

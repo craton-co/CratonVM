@@ -1165,6 +1165,17 @@ fn wf7_synthesise_entry_class_if_missing(
     ctx: &mut dyn NativeContext,
     internal_name: &str,
 ) -> Option<ObjectRef> {
+    // Real-bytecode audit: this WF7 synthetic class fallback is disabled
+    // by default. It defined a 191-byte synthetic class with a no-op
+    // `main([Ljava/lang/String;)V` whenever `Class.forName` for a
+    // WildFly/Keycloak entry-class name missed. That synthetic class
+    // would then be invoked as the entry-point — short-circuiting any
+    // real boot. The guard above ("if class already loaded, return None")
+    // limits scope, but the gate-off is the safer default.
+    if std::env::var("RUSTJVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() != Ok("1") {
+        let _ = internal_name;
+        return None;
+    }
     // Only synthesise for names we explicitly recognise.
     if !WF7_ENTRY_FRAGMENTS.iter().any(|f| internal_name.contains(f)) {
         return None;
@@ -5276,6 +5287,16 @@ fn wf_shim_synth_main_method(
     name: &str,
     param_types_arr: Option<ObjectRef>,
 ) -> Option<ObjectRef> {
+    // Real-bytecode audit: this WF6 reflective short-circuit is disabled
+    // by default. It synthesized a fake `main(String[])` Method mirror
+    // for any class whose name contains a WildFly / Keycloak fragment,
+    // intercepting reflective lookup even when the real bytecode had
+    // already been loaded. Re-enable via `RUSTJVM_USE_WILDFLY_REFLECT_SHIM=1`
+    // for boot-test (exit-rc-only) diagnostics.
+    if std::env::var("RUSTJVM_USE_WILDFLY_REFLECT_SHIM").as_deref() != Ok("1") {
+        let _ = (this, name, param_types_arr);
+        return None;
+    }
     if name != "main" {
         return None;
     }

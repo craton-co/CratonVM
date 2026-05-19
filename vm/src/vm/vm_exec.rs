@@ -7564,6 +7564,24 @@ fn invoke_on_class_shared_inner(
                                 | "getName"
                                 | "getLevel"
                                 | "getMessageFactory"
+                                // EJBCA / log4j-1.2-api bridge —
+                                // `org.apache.log4j.LogManager.<clinit>`
+                                // → `new Hierarchy(new RootLogger(DEBUG))`
+                                // → `RootLogger.setLevel(DEBUG)` → eventually
+                                // `core.Logger.setLevel(level)` on our
+                                // synthetic Logger. The real bytecode
+                                // builds a new `Logger$PrivateConfig` from
+                                // `this.privateConfig.config` and NPEs
+                                // because the synthetic was allocated
+                                // without a privateConfig. Force the no-op
+                                // native (registered in log4j_extras) to
+                                // win for the level/appender mutators that
+                                // touch privateConfig. See the existing
+                                // `getAppenders` rationale above.
+                                | "setLevel"
+                                | "addAppender"
+                                | "removeAppender"
+                                | "setAdditive"
                             ))
                         // log4j 2.x LogManager surface: getContext /
                         // getLogger / getFormatterLogger / getRootLogger /
