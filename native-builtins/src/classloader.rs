@@ -2182,7 +2182,22 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     raw.map(|p| {
         let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
         let p = p.strip_prefix("//").unwrap_or(&p).to_string();
-        p
+        // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
+        // extracted path is `/C:/dir/...` — a leading slash *before* the
+        // drive letter. `PathBuf::from("/C:/...")` does not resolve on
+        // Windows (`is_dir()` / `exists()` both fail), which made every
+        // directory/jar URL silently skipped by `ClassPath::add_path`.
+        // Strip the spurious leading slash when followed by a drive letter.
+        let bytes = p.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            p[1..].to_string()
+        } else {
+            p
+        }
     })
 }
 

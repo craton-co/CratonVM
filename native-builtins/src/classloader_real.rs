@@ -9,10 +9,77 @@
 
 use std::sync::Mutex;
 
-use rustjvm_native_api::registry::NativeMethodRegistry;
+use rustjvm_native_api::registry::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
+
+/// Normalise a raw URL/path string to a filesystem path the classpath
+/// loader can resolve.
+///
+/// Handles `file:` URLs (`file:/C:/dir/x.jar`), bare paths, and the
+/// Windows leading-slash-before-drive quirk (`/C:/dir` → `C:/dir`),
+/// which otherwise makes `PathBuf::from(...)` fail every `is_dir()` /
+/// `exists()` probe on Windows.
+fn normalise_url_path(raw: &str) -> String {
+    let p = raw.strip_prefix("file:").unwrap_or(raw);
+    let p = p.strip_prefix("//").unwrap_or(p);
+    let bytes = p.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        p[1..].to_string()
+    } else {
+        p.to_string()
+    }
+}
+
+/// Extract a filesystem path from a `java.net.URL` object.
+///
+/// Reads the URL's `path`/`file` fields by NAME (works for both real-JDK
+/// URL objects and CratonVM's synthetic URLs), falling back to the URL's
+/// `toString()`-style full string.
+fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<String> {
+    for field in ["path", "file"] {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(url_obj, field) {
+            if let Some(raw) = ctx.read_string(s) {
+                if !raw.is_empty() {
+                    return Some(normalise_url_path(&raw));
+                }
+            }
+        }
+    }
+    ctx.read_string(url_obj).map(|raw| normalise_url_path(&raw))
+}
+
+/// Register every URL in a `URL[]` array with the dynamic application
+/// classpath so classes inside those jars/dirs become loadable.
+fn register_url_array(ctx: &mut dyn NativeContext, urls: Value) {
+    let arr = match urls {
+        Value::Object(Some(a)) => a,
+        _ => return,
+    };
+    let count = ctx.array_length(arr);
+    let mut paths = Vec::with_capacity(count);
+    for i in 0..count {
+        if let Value::Object(Some(url_obj)) = ctx.get_array_element(arr, i) {
+            if let Some(p) = extract_url_path(ctx, url_obj) {
+                if !p.is_empty() {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    if !paths.is_empty() {
+        tracing::debug!(
+            "URLClassLoader.<init> (real-JDK): registering {} URL(s) to classpath",
+            paths.len()
+        );
+        ctx.register_dynamic_classpath(&paths);
+    }
+}
 
 /// Cached system/platform classloader objects (created lazily).
 static SYSTEM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
@@ -164,6 +231,11 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         // Best-effort: stash URL array into known field name when present.
         let urls = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field_by_name(this, "ucp", urls);
+        // Register the URLs with the application classpath so classes inside
+        // the jars/dirs are actually loadable — without this a custom
+        // URLClassLoader (Tomcat's CommonClassLoader, ActiveMQ's launcher)
+        // can never find its classes and throws ClassNotFoundException.
+        register_url_array(ctx, urls);
         Ok(None)
     });
     r.register(
@@ -179,6 +251,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "parent", parent);
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "ucp", urls);
+            register_url_array(ctx, urls);
             Ok(None)
         },
     );

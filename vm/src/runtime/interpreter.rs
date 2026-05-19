@@ -8956,15 +8956,18 @@ fn execute_invoke_kind(
                             return Ok(CachedCallResult::Handled);
                         }
                     }
-                    if &*method_class_name == "java/lang/String"
-                        && &*method_name == "length"
-                        && &*method_descriptor == "()I"
-                    {
-                        thread.frames[frame_idx]
-                            .stack
-                            .push(Value::Int(0))?;
-                        return Ok(CachedCallResult::Handled);
-                    }
+                    // NOTE: `null.length()` MUST throw NullPointerException
+                    // per the JVM spec — `invokevirtual` null-checks the
+                    // receiver before dispatch. An earlier hack here returned
+                    // 0 for a "Liberty install-root" path, but that silently
+                    // corrupted every other caller: e.g. `new
+                    // StringTokenizer((String) null, ...)` does `str.length()`
+                    // in its constructor, so the hack produced an empty
+                    // tokenizer instead of an NPE, which made OSGi
+                    // `Version`'s `nextToken()` throw NoSuchElementException
+                    // and surface as `IllegalArgumentException: invalid
+                    // version "null"` (Felix framework bootstrap). The hack
+                    // is removed so the spec-compliant NPE below fires.
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
