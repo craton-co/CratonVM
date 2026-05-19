@@ -178,6 +178,14 @@ impl Stream {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             inner: StreamCuda {
+                // cudarc's `CudaStream` is not `Send`/`Sync`, but the
+                // wrapping `Stream` carries an explicit `unsafe impl
+                // Send + Sync` (the CUDA driver permits stream use from
+                // any thread once the primary context is bound — see
+                // the impls below `StreamCuda`). The `Arc` only ever
+                // travels inside that wrapper, so the lint's premise
+                // does not hold here.
+                #[allow(clippy::arc_with_non_send_sync)]
                 stream: std::sync::Arc::new(cuda_stream),
                 id,
             },

@@ -103,15 +103,9 @@ pub struct GpuExcludeAttrs {
 }
 
 /// Parsed `@craton.gpu.EnableGpuAsync` attributes (class-level).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EnableAsyncAttrs {
     pub warmup: u32,
-}
-
-impl Default for EnableAsyncAttrs {
-    fn default() -> Self {
-        Self { warmup: 0 }
-    }
 }
 
 /// What we extracted from a single method's annotation set.

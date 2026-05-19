@@ -273,13 +273,11 @@ unsafe impl<T: Sync> Sync for DeviceBufferInner<T> {}
 impl<T> Drop for DeviceBufferInner<T> {
     fn drop(&mut self) {
         let _ = self.device.bind_to_thread();
-        unsafe {
-            // Sync free: works regardless of whether the device's
-            // async-pool is supported. cudarc's `CudaSlice::drop`
-            // branches on `is_async`; we keep things simple here
-            // because the public API never promised async free.
-            let _ = unsafe { result::free_sync(self.cu_device_ptr) };
-        }
+        // Sync free: works regardless of whether the device's
+        // async-pool is supported. cudarc's `CudaSlice::drop`
+        // branches on `is_async`; we keep things simple here
+        // because the public API never promised async free.
+        let _ = unsafe { result::free_sync(self.cu_device_ptr) };
     }
 }
 
@@ -383,7 +381,7 @@ impl<T> DeviceBufferInner<T> {
     /// Return the raw device address. `sys::CUdeviceptr` is a `u64`
     /// typedef in the driver API, so this is just an integer copy.
     pub(crate) fn device_ptr(&self) -> u64 {
-        self.cu_device_ptr as u64
+        self.cu_device_ptr
     }
 
     pub(crate) fn raw_ptr(&self) -> sys::CUdeviceptr {
