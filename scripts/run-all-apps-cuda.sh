@@ -61,7 +61,7 @@ SLF4J=$(find "$APPS/ejbca-ce/lib/ext" -name "slf4j-api*.jar" 2>/dev/null | head 
 
 # --- Big servers / launchers ---
 ( cd "$APPS/wildfly-32.0.1.Final" && run wildfly 30 --jar jboss-modules.jar -- -mp modules org.jboss.as.standalone -Djboss.home.dir=. -Djboss.server.base.dir=standalone )
-( cd "$APPS/keycloak-16.1.1" && run keycloak16 30 --jar jboss-modules.jar -- -mp modules org.keycloak.Main )
+( cd "$APPS/keycloak-16.1.1" && run keycloak16 30 --jar jboss-modules.jar -- -mp modules org.jboss.as.standalone -Djboss.home.dir=. -Djboss.server.base.dir=standalone )
 ( cd "$APPS/keycloak-26.2.4/lib" && run keycloak26 30 --jar quarkus-run.jar -- --help )
 
 # --- Big data ---
