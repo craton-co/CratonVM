@@ -78,19 +78,12 @@ echo "cratonvm_gpu,${GPU_BEST:-?},${GPU_MEAN:-?},$GPU_OK" >> "$CSV"
 
 # ----- 5. TornadoVM -----
 echo "----- TornadoVM -----"
-if [ -f "$TORNADO_SDK_SETUP" ] && [ -d "$TORNADO_DIR" ]; then
-    (
-        source "$TORNADO_SDK_SETUP"
-        cd "$TORNADO_DIR"
-        if [ ! -f VectorAddTornado.class ]; then
-            javac -cp "$TORNADO_SDK/share/java/tornado/*" VectorAddTornado.java 2> "$LOG/tornado.compile.err"
-        fi
-        tornado -cp "$TORNADO_DIR" VectorAddTornado "$N" "$ITERS" "$WARMUP"
-    ) > "$LOG/tornado.out" 2> "$LOG/tornado.err"
+if [ -x "$TORNADO_DIR/run.sh" ]; then
+    bash "$TORNADO_DIR/run.sh" "$N" "$ITERS" > "$LOG/tornado.out" 2> "$LOG/tornado.err"
     echo "tornado rc=$?"
     echo "tornadovm,$(extract "$LOG/tornado.out")" >> "$CSV"
 else
-    echo "TornadoVM not installed; skipping (expected setvars at $TORNADO_SDK_SETUP)"
+    echo "TornadoVM not installed; skipping (expected $TORNADO_DIR/run.sh)"
     echo "tornadovm,not_installed,not_installed,SKIP" >> "$CSV"
 fi
 
