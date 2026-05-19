@@ -17,7 +17,7 @@
 use thiserror::Error;
 
 // AUDIT 2026-05-16: `#[non_exhaustive]` — variants (e.g. `OutOfMemory`,
-// `InvalidLayout`, `StreamSync`) may be added as the cudarc backend
+// `InvalidLayout`, `StreamSync`)Z may be added as the cudarc backend
 // matures; we don't want a downstream `match` to break.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -156,7 +156,8 @@ pub struct DeviceModule(backend::DeviceModuleInner);
 impl DeviceModule {
     /// Load a PTX text module and resolve the named kernels.
     pub fn from_ptx(ctx: &DeviceContext, ptx: &str, kernel_names: &[&str]) -> Result<Self> {
-        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, kernel_names).map(Self)
+        // Use a default module name for cudarc 0.13 API
+        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", kernel_names).map(Self)
     }
 
     /// Launch a kernel by name with raw argument bytes. The argument
@@ -223,25 +224,19 @@ impl KernelArgs {
     }
 
     pub fn push_device_ptr<T>(mut self, buf: &DeviceBuffer<T>) -> Self {
-        // AUDIT 2026-05-16 (CRIT-1 fix): plumb the stream-ordering guard
-        // returned by `CudaSlice::device_ptr` into the `KernelArg` so it
-        // outlives the eventual kernel launch. See the note on
-        // `KernelArg::DevicePtr` and `DeviceBufferInner::device_ptr_arg`
-        // in `backend_cuda.rs` for the underlying race this prevents.
-        //
-        // Under the real `cuda` backend we ask the buffer for both the
-        // address and the `SyncRecord` guard. In stub mode the buffer
-        // exposes only a bare `u64` (always 0); there is no real
-        // allocation to guard so the variant has no record field.
+        // AUDIT 2026-05-16 (CRIT-1 fix): plumb the device pointer
+        // returned by `CudaSlice::device_ptr` into the `KernelArg`.
+        // In cudarc 0.13, SyncRecord was removed; stream ordering is
+        // now handled via CudaDevice::wait_for and fork_default_stream.
         #[cfg(feature = "cuda")]
         {
-            let (addr, _record) = buf.0.device_ptr_arg();
-            self.raw.push(KernelArg::DevicePtr { addr, _record });
+            let addr = buf.0.device_ptr_arg();
+            self.raw.push(KernelArg::DevicePtr { addr });
         }
         #[cfg(not(feature = "cuda"))]
         {
             self.raw
-                .push(KernelArg::DevicePtr { addr: buf.0.device_ptr() });
+                .push(KernelArg::DevicePtr { addr: buf.0.device_ptr_arg() });
         }
         self
     }
@@ -268,29 +263,16 @@ impl KernelArgs {
 }
 
 // AUDIT 2026-05-16 (CRIT-1 fix): under the `cuda` feature, the
-// `DevicePtr` variant carries both the raw address and the stream-
-// ordering guard returned by `cudarc::CudaSlice::device_ptr` (named
-// `SyncRecord` in cudarc 0.13). The `_record` field is load-bearing
-// **only** via its `Drop` — cudarc uses it to keep the device
-// allocation alive (stream-ordered) until the launch that reads `addr`
-// has actually completed. Dropping it before `builder.launch(...)`
-// returns is a future use-after-free the moment a second stream is
-// introduced. Hence: no `Copy`, no `Clone` on the variant — every
-// guard must reach the launch site exactly once.
+// `DevicePtr` variant carries the raw device address.
+// In cudarc 0.13, SyncRecord was removed; stream ordering is
+// now handled via CudaDevice::wait_for and fork_default_stream.
 //
 // In stub mode (no `cuda` feature) the variant degenerates to a bare
 // `u64` since there is no real allocation to guard.
-//
-// `Debug` is intentionally NOT derived: `SyncRecord` is an opaque
-// cudarc internal that may not implement `Debug` across versions, and
-// the enum is purely an internal staging type — nobody formats it.
 pub(crate) enum KernelArg {
     #[cfg(feature = "cuda")]
     DevicePtr {
         addr: u64,
-        // Load-bearing via `Drop` only — never read.
-        #[allow(dead_code)]
-        _record: cudarc::driver::SyncRecord,
     },
     #[cfg(not(feature = "cuda"))]
     DevicePtr {
@@ -315,6 +297,46 @@ pub(crate) enum KernelArg {
 /// `len()`.
 pub struct DeviceBuffer<T>(backend::DeviceBufferInner<T>);
 
+#[cfg(feature = "cuda")]
+impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBuffer<T> {
+    const ASSERT_DEVICE_REPR: () = assert!(
+        std::mem::size_of::<T>() > 0,
+        "T must implement DeviceRepr when cuda feature is enabled"
+    );
+    /// Allocate `len` elements on the device, contents undefined.
+    pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        backend::DeviceBufferInner::uninit(&ctx.0, len).map(Self)
+    }
+
+    /// Allocate `len` elements, zero-initialised.
+    pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        backend::DeviceBufferInner::zeros(&ctx.0, len).map(Self)
+    }
+
+    /// Allocate and upload from `host` in one shot.
+    pub fn from_host(ctx: &DeviceContext, host: &[T]) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+    }
+
+    /// Copy `len()` elements back into `dst` (must be at least
+    /// `self.len()` long).
+    pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
+        self.0.to_host(dst)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {

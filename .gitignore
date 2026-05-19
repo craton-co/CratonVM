@@ -8,6 +8,9 @@ target/
 .vscode/
 *.iml
 apps/
+!apps/letsgo/
+!apps/SportMe-master/
+!apps/demo/
 .smoke-cache/
 **/*.jar
 **/*.tar.gz
