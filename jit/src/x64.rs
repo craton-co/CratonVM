@@ -3974,6 +3974,32 @@ impl Compiler {
         self.modrm_rbp_disp(reg, offset);
     }
 
+    /// MOV reg, [rbp + positive_disp] — load a stack-passed argument from
+    /// the caller's stack frame. Used in the prologue when a Java param's
+    /// index exceeds the platform's ARG_REGS register file (e.g. the 5th
+    /// arg on Windows x64 when needs_heap consumes ARG_REGS[0] for the VM
+    /// pointer). The 4th-arg-and-beyond live above rbp in the caller's
+    /// reserved stack slots:
+    ///   * Windows: shadow space at [rbp+0x10..0x28] (caller's home for
+    ///     RCX/RDX/R8/R9) + stack args at [rbp+0x30], [rbp+0x38], ...
+    ///   * SysV:   stack args at [rbp+0x10], [rbp+0x18], ...
+    /// `positive_disp` is the byte offset above rbp.
+    fn emit_load_caller_arg(&mut self, reg: u8, positive_disp: i32) {
+        debug_assert!(positive_disp > 0, "caller arg disp must be positive");
+        self.rex_w_r(reg);
+        self.buf.emit_byte(0x8B); // MOV r64, r/m64
+        // ModRM r/m=101 (RBP) with positive displacement.
+        if (-128..=127).contains(&positive_disp) {
+            // mod=01, disp8
+            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
+            self.buf.emit_byte(positive_disp as u8); // Cast: x86-64 immediate encoding
+        } else {
+            // mod=10, disp32
+            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+            self.buf.emit(&positive_disp.to_le_bytes());
+        }
+    }
+
     /// MOV [rbp - offset], reg
     fn emit_store_local(&mut self, offset: i32, reg: u8) {
         self.rex_w_r(reg);
@@ -5793,34 +5819,83 @@ impl Compiler {
             self.emit_movq_mem_rbp_from_xmm(offset, xmm);
         }
 
+        // Layout of caller-passed args:
+        //   * Register-passed: ARG_REGS[ctx_offset..ctx_offset+reg_arg_count]
+        //     (when needs_heap, ARG_REGS[0] carries the hidden VM/heap ptr).
+        //   * Stack-passed: at positive offsets above rbp. After
+        //     `push rbp; mov rbp, rsp`, the saved rbp lives at [rbp+0] and
+        //     the return address at [rbp+8]. On Windows the next 32 bytes
+        //     ([rbp+0x10..0x28]) are the caller's shadow space (home slots
+        //     for the 4 register args); stack args start at [rbp+0x30].
+        //     On SysV there is no shadow space and stack args start at
+        //     [rbp+0x10]. The caller's `emit_stack_arg_setup` pushes
+        //     args in ascending ABI-index order, so arg `k` (where
+        //     `k >= reg_arg_count + ctx_offset`) lives at
+        //     `[rbp + stack_arg_base + (k - ctx_offset - reg_arg_count) * 8]`.
+        //
+        // ROUND-12 fix: previously the prologue only loaded
+        // `ARG_REGS.iter().skip(ctx_offset).take(num_params)`, silently
+        // dropping any param beyond the register file. The result was
+        // garbage in the corresponding local slot (whatever the frame
+        // location happened to hold from the prior call), surfacing as a
+        // `ClassCastException` when the JIT'd lambda's `aload` consumed
+        // the missing reference. The fix below loads register-passed
+        // params (clamped to the available register count) and then
+        // loads the remaining stack-passed params via `emit_load_caller_arg`.
+        let ctx_offset = if self.needs_heap { 1 } else { 0 };
         if self.needs_heap {
             // First ABI arg is the heap pointer — save to frame
             self.emit_store_local(self.heap_local_offset, ARG_REGS[0]);
-            // Java params: XMM/GPR-mapped locals go to assigned reg, others to frame
-            for (i, &reg) in ARG_REGS.iter().skip(1).enumerate().take(self.num_params) {
-                if let Some(xmm) = self.xmm_for_local(i) {
-                    // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
-                    self.emit_mov_reg_reg(RAX, reg);
-                    self.emit_movq_xmm_from_rax(xmm);
-                } else if let Some(local_reg) = self.reg_for_local(i) {
-                    self.emit_mov_reg_reg(local_reg, reg);
-                } else {
-                    let offset = self.local_offset(i);
-                    self.emit_store_local(offset, reg);
-                }
+        }
+        let reg_capacity = ARG_REGS.len() - ctx_offset;
+        let reg_arg_count = self.num_params.min(reg_capacity);
+
+        // Load register-passed Java params (java idx 0..reg_arg_count) from
+        // ARG_REGS[ctx_offset + i] into the destination local slot.
+        for i in 0..reg_arg_count {
+            let reg = ARG_REGS[ctx_offset + i];
+            if let Some(xmm) = self.xmm_for_local(i) {
+                // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
+                self.emit_mov_reg_reg(RAX, reg);
+                self.emit_movq_xmm_from_rax(xmm);
+            } else if let Some(local_reg) = self.reg_for_local(i) {
+                self.emit_mov_reg_reg(local_reg, reg);
+            } else {
+                let offset = self.local_offset(i);
+                self.emit_store_local(offset, reg);
             }
-        } else {
-            // Normal: Java params start at ARG_REGS[0..]
-            for (i, &reg) in ARG_REGS.iter().enumerate().take(self.num_params) {
+        }
+
+        // Load stack-passed Java params (java idx reg_arg_count..num_params)
+        // from the caller's stack frame at [rbp + positive_disp]. This path
+        // is exercised on Windows x64 when needs_heap is true and
+        // num_params == 4 (heap consumes ARG_REGS[0], leaving 3 register
+        // slots for the 4 Java args), and on either platform if num_params
+        // ever exceeds the register file's Java-arg capacity.
+        if self.num_params > reg_arg_count {
+            // The caller's `emit_stack_arg_setup` materializes stack
+            // args at `[rsp + shadow]` (shadow=32 on Windows, 0 on SysV)
+            // immediately before the CALL. After the call sequence
+            // (CALL pushes 8B return addr; prologue pushes 8B rbp), the
+            // first stack arg lives at `[rbp + 16 + shadow]`.
+            #[cfg(target_os = "windows")]
+            let stack_arg_base: i32 = 16 + 32; // 0x30 — past saved rbp + retaddr + 32B shadow space
+            #[cfg(not(target_os = "windows"))]
+            let stack_arg_base: i32 = 16; // 0x10 — past saved rbp + retaddr
+
+            for i in reg_arg_count..self.num_params {
+                let stack_idx = i - reg_arg_count; // 0-based index among stack args
+                let positive_disp = stack_arg_base + (stack_idx as i32) * 8; // Cast: x86-64 immediate encoding
+                // Load via RAX scratch so XMM-mapped float/double params
+                // can still be moved through the existing GPR→XMM helper.
+                self.emit_load_caller_arg(RAX, positive_disp);
                 if let Some(xmm) = self.xmm_for_local(i) {
-                    // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
-                    self.emit_mov_reg_reg(RAX, reg);
                     self.emit_movq_xmm_from_rax(xmm);
                 } else if let Some(local_reg) = self.reg_for_local(i) {
-                    self.emit_mov_reg_reg(local_reg, reg);
+                    self.emit_mov_reg_reg(local_reg, RAX);
                 } else {
                     let offset = self.local_offset(i);
-                    self.emit_store_local(offset, reg);
+                    self.emit_store_local(offset, RAX);
                 }
             }
         }
