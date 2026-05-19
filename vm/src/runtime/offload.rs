@@ -1255,13 +1255,28 @@ pub fn dispatch_method_from_native(
         bool,
         Vec<String>,
     ) = {
+        // Phase 9 #1 fix — load the class on demand. The class name
+        // arrives as a string from `Native.submitMethod`; the user has
+        // no reason to have referenced it from Java code, so it may
+        // not be in the class manager yet. Without this load,
+        // `get_loaded_class_id` returns None and the submission is
+        // marked Failed before any kernel runs. The Java side then
+        // sees a synthetic "handle=0" path that returns from
+        // `f.get()` without throwing, leaving output arrays at their
+        // pre-launch zero values — masquerading as a writeback bug.
+        if let Err(e) = shared.load_class_concurrent(class_name) {
+            return record_failed_submission(
+                None,
+                format!("submitMethod: load class failed for {class_name}: {e:?}"),
+            );
+        }
         let cm = shared.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
             Some(id) => id,
             None => {
                 return record_failed_submission(
                     None,
-                    format!("submitMethod: class not loaded: {class_name}"),
+                    format!("submitMethod: class not loaded after load_class_concurrent: {class_name}"),
                 );
             }
         };
@@ -1609,6 +1624,43 @@ pub fn dispatch_method_from_native(
         }
     }
 
+    // 7c. Append the kernel's trailing `failure_flag` parameter.
+    //     `build_param_list` in `jit-cuda/src/lowering.rs` always emits
+    //     a final `u64*` named `failure_flag`. The PTX bounds-check
+    //     fail block (`emit::Emitter::emit_done_and_bounds_fail`)
+    //     stores 1 to this cell when an indexed load/store would have
+    //     gone out of range. Without an actual device pointer in this
+    //     slot, `cuLaunchKernel` returns `CUDA_ERROR_INVALID_VALUE`
+    //     because the host-side `KernelArgs` length doesn't match the
+    //     compiled kernel's param count.
+    //
+    //     The buffer is owned by `MarshalWriteback::FailureFlag` for
+    //     the submission's lifetime; `finalize_submission` reads it
+    //     after `event.synchronize()` and surfaces a non-zero value
+    //     as a failure message so the Java side gets a real error
+    //     instead of silently corrupt output.
+    let failure_flag_buf = match cuda_bridge::DeviceBuffer::<u64>::zeros(ctx, 1) {
+        Ok(b) => std::sync::Arc::new(b),
+        Err(e) => {
+            drop(token);
+            return record_failed_submission(
+                Some(stream.clone()),
+                format!("submitMethod: failed to allocate failure_flag buffer: {e}"),
+            );
+        }
+    };
+    {
+        // Push the device pointer via a raw-pointer dance identical
+        // to the array-arg closure pattern above — `push_device_ptr`
+        // takes `&DeviceBuffer<T>` and we need the Arc to outlive the
+        // launch.
+        let buf_ref: &cuda_bridge::DeviceBuffer<u64> = &failure_flag_buf;
+        kernel_args = kernel_args.push_device_ptr(buf_ref);
+    }
+    writebacks.push(MarshalWriteback::FailureFlag {
+        buf: failure_flag_buf,
+    });
+
     // 8. Phase 7 #1 — dispatch on the stream. `dispatch_async`
     //    now returns immediately with the kernel queued and the
     //    completion event recorded; it does NOT wait. The Java
@@ -1953,6 +2005,15 @@ pub enum MarshalWriteback {
     ResidentI64 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>, len: usize },
     ResidentF32 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>, len: usize },
     ResidentF64 { handle: u64, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>, len: usize },
+    /// Phase 9 #1 follow-up — owns the 1-element `u64` device buffer
+    /// the kernel uses to signal a bounds-check failure. The writeback
+    /// downloads the cell after `event.synchronize()`; a non-zero
+    /// value surfaces as a failure message (so the Java side gets a
+    /// real `GpuException("bounds check failed")` instead of silent
+    /// corrupt output). The `Arc` form keeps the buffer alive across
+    /// the launch even though only one reference exists today (matches
+    /// the resident-variant ownership pattern).
+    FailureFlag { buf: std::sync::Arc<cuda_bridge::DeviceBuffer<u64>> },
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -2023,6 +2084,22 @@ impl MarshalWriteback {
             }
             Self::ResidentF64 { handle, .. } => {
                 device_cache::mark_dirty(*handle);
+                Ok(())
+            }
+            // Phase 9 #1 follow-up — read the failure flag back.
+            // If non-zero, the kernel hit a bounds check; report as
+            // a writeback error so `finalize_submission` flips the
+            // submission to `Failed` and Java sees a `GpuException`.
+            Self::FailureFlag { buf } => {
+                let mut cell = [0u64; 1];
+                gpu_marshal::download_into(buf, &mut cell)
+                    .map_err(|e| format!("download_into failure_flag: {e}"))?;
+                if cell[0] != 0 {
+                    return Err(format!(
+                        "kernel failure flag set (value={}): out-of-range index inside kernel body",
+                        cell[0]
+                    ));
+                }
                 Ok(())
             }
         }
