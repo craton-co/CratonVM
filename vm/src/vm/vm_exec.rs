@@ -7476,6 +7476,21 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "log" | "info" | "warning" | "severe"
                                     | "fine" | "finer" | "finest"
+                                    // JULI's `DirectJDKLog` (Tomcat) routes
+                                    // every log call through `Logger.logp`,
+                                    // not `warning`/`log`. Without `logp`
+                                    // here the bytecode runs against our
+                                    // synthetic Logger (no Handler chain) and
+                                    // the message is silently dropped — that
+                                    // was the "Tomcat Bootstrap rc=0, no
+                                    // output" symptom. Force the native
+                                    // (registered in logmanager.rs) to win.
+                                    | "logp"
+                                    // `isLoggable` gates JULI's emit path;
+                                    // the real bytecode returns false for our
+                                    // parent-less synthetic Logger, so every
+                                    // log call short-circuits to a no-op.
+                                    | "isLoggable"
                             ))
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(

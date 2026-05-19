@@ -1037,6 +1037,116 @@ fn native_jul_logger_log_level_msg(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(None)
 }
 
+/// `java/util/logging/Logger.logp(Level, sourceClass, sourceMethod, msg)`
+/// intercept. JULI's `DirectJDKLog` (used by Tomcat for every
+/// `log.warn/error/info(...)` call) delegates to this method instead of
+/// the simpler `Logger.warning(String)`. Without a native, the call
+/// drops into our synthetic Logger object (which has no real Handler
+/// chain) and the message is silently discarded — that's the
+/// "Bootstrap rc=0, no output" symptom for `Bootstrap version` and
+/// every other JULI-driven Tomcat command.
+fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    // args[2] = source class, args[3] = source method, args[4] = msg.
+    // args[5] (if present) = Throwable (5-arg overload). We surface the
+    // throwable's class name + message to match Hotspot's
+    // SimpleFormatter output shape closely enough for boot-trace.
+    let message_obj = match args.get(4) { Some(Value::Object(o)) => *o, _ => None };
+    let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let level_name = level_obj
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| "INFO".to_string());
+    // Map JUL level names to the same compact tags log_simple uses so
+    // grep-able output is consistent across the JUL native surface.
+    let tag = match level_name.as_str() {
+        "SEVERE" => "ERROR",
+        "WARNING" => "WARN",
+        "INFO" => "INFO",
+        "CONFIG" => "INFO",
+        "FINE" | "FINER" | "FINEST" => return Ok(None), // suppress noise
+        other => other,
+    };
+    let message = message_obj.and_then(|o| ctx.read_string(o)).unwrap_or_default();
+    if let Some(t) = throwable_obj {
+        // Detail-line, mirroring Tomcat's expectation that a throwable
+        // is co-located with the message. We pull the throwable's
+        // class name and detail message via standard fields; if the
+        // synthetic Throwable layout doesn't carry them we fall back to
+        // a bare class label so the line still emits.
+        let cls = {
+            let cid = ctx.class_id_of_object(t);
+            ctx.class_name_of_id(cid).unwrap_or_else(|| "Throwable".to_string())
+        };
+        let detail = match ctx.get_field_by_name(t, "detailMessage") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if detail.is_empty() {
+            eprintln!("{tag} [{logger_name}] {message} ({cls})");
+        } else {
+            eprintln!("{tag} [{logger_name}] {message} ({cls}: {detail})");
+        }
+    } else {
+        eprintln!("{tag} [{logger_name}] {message}");
+    }
+    Ok(None)
+}
+
+/// `java/util/logging/Logger.isLoggable(Level)Z`.
+///
+/// Our synthetic Logger objects carry a null `level` field and have no
+/// parent/root Logger chain, so the real-JDK `isLoggable` bytecode
+/// (which walks `getEffectiveLevel()`) returns `false` for *every*
+/// level. JULI's `DirectJDKLog.log()` gates on
+/// `if (logger.isLoggable(level))` before emitting — so a false return
+/// here silently drops every Tomcat log line (the "Bootstrap version
+/// prints nothing" symptom). Mirror the JDK default: the root logger
+/// is INFO, so anything at INFO or higher (INTvalue >= 800) is
+/// loggable, and FINE/FINER/FINEST are not.
+fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
+    // `Level` exposes an int `value` field (e.g. WARNING=900, INFO=800,
+    // CONFIG=700, FINE=500). Compare against the JDK default root level.
+    let level_value = level_obj
+        .and_then(|o| match ctx.get_field_by_name(o, "value") {
+            Value::Int(v) => Some(v),
+            _ => None,
+        })
+        .or_else(|| {
+            // Fall back to the level name if the int field isn't laid
+            // out (synthetic Level instances).
+            level_obj
+                .and_then(|o| match ctx.get_field_by_name(o, "name") {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                })
+                .map(|n| match n.as_str() {
+                    "OFF" => i32::MAX,
+                    "SEVERE" => 1000,
+                    "WARNING" => 900,
+                    "INFO" => 800,
+                    "CONFIG" => 700,
+                    "FINE" => 500,
+                    "FINER" => 400,
+                    "FINEST" => 300,
+                    "ALL" => i32::MIN,
+                    _ => 800,
+                })
+        })
+        .unwrap_or(800);
+    Ok(Some(Value::Int(if level_value >= 800 { 1 } else { 0 })))
+}
+
 fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     log_simple(ctx, args, "INFO");
     Ok(None)
@@ -1471,6 +1581,34 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     registry.register(CLS_JUL_LOGGER, "fine", "(Ljava/lang/String;)V", native_jul_logger_fine);
     registry.register(CLS_JUL_LOGGER, "finer", "(Ljava/lang/String;)V", native_jul_logger_fine);
     registry.register(CLS_JUL_LOGGER, "finest", "(Ljava/lang/String;)V", native_jul_logger_fine);
+    // `logp(Level, sourceClass, sourceMethod, msg)` and the 5-arg
+    // variant with a trailing Throwable. JULI's DirectJDKLog routes
+    // every Tomcat/JULI log call through these instead of the simple
+    // `warning(String)` / `log(Level,String)` helpers, so a missing
+    // native here swallows every Tomcat log line silently (rc=0, no
+    // output) — that was the entire "Bootstrap version prints
+    // nothing" symptom.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "logp",
+        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        native_jul_logger_logp,
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "logp",
+        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        native_jul_logger_logp,
+    );
+    // `isLoggable(Level)` — JULI's DirectJDKLog gates every log call on
+    // this; the real bytecode returns false for our parent-less
+    // synthetic Logger, swallowing all output. See native doc comment.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "isLoggable",
+        "(Ljava/util/logging/Level;)Z",
+        native_jul_logger_is_loggable,
+    );
 
     // ---------------- KC16: org.jboss.logmanager.LogContext overrides ----------------
     registry.register(

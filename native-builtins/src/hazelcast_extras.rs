@@ -39,44 +39,34 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_MEMBER_STARTER: &str = "com/hazelcast/core/server/HazelcastMemberStarter";
+#[allow(dead_code)]
 const CN_CLUSTER: &str = "com/hazelcast/cluster/Cluster";
 
 /// Generic `main([Ljava/lang/String;)V` no-op for Hazelcast entry points.
+#[allow(dead_code)]
 fn hazelcast_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[hazelcast-shim] main short-circuited (boot-test mode)");
     Ok(None)
 }
 
 /// Generic `<clinit>()V` no-op for Hazelcast entry-point classes.
+#[allow(dead_code)]
 fn hazelcast_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// Install every Hazelcast boot-test short-circuit this module owns.
 ///
-/// **NOT WIRED YET.** The orchestrator owns `lib.rs` and is responsible
-/// for adding the call to this function from
-/// `register_essential_natives`.
+/// Disabled per "no synthetic stubs" policy (matches the round-8 batch shim
+/// disable in commit 8071d25 for Felix/Jetty/ActiveMQ/Hadoop/HBase). All
+/// registrations were pure fake-out returning `Ok(None)` without doing real
+/// work; they have been removed so Hazelcast runs against real bytecode.
 pub fn register_hazelcast_stubs(registry: &mut NativeMethodRegistry) {
-    // HazelcastMemberStarter.main — `hz start` primary entry point.
-    registry.register(
-        CN_MEMBER_STARTER,
-        "main",
-        "([Ljava/lang/String;)V",
-        hazelcast_main_noop,
-    );
-    registry.register(CN_MEMBER_STARTER, "<clinit>", "()V", hazelcast_clinit_noop);
-
-    // Cluster.main — defensive: some Hazelcast packagings invoke
-    // `Cluster` as the main class directly.
-    registry.register(
-        CN_CLUSTER,
-        "main",
-        "([Ljava/lang/String;)V",
-        hazelcast_main_noop,
-    );
-    registry.register(CN_CLUSTER, "<clinit>", "()V", hazelcast_clinit_noop);
+    let _ = registry;
+    let _ = CN_MEMBER_STARTER;
+    let _ = CN_CLUSTER;
 }
 
 #[cfg(test)]
