@@ -1015,12 +1015,24 @@ impl OffloadCache {
     /// allocate the output buffer, copy it back after the kernel, and
     /// stamp it into `SerializedResult::PrimitiveArray*`. That belongs
     /// to a later round.
+    /// Asynchronously launch a compiled kernel on `stream`.
+    ///
+    /// `runtime_work` is the per-element launch count derived from the
+    /// actual array length the caller marshalled. The analyzer's
+    /// `KernelSignature::estimated_work` is a *compile-time* placeholder
+    /// (`1 << 20` for any counted-loop method); using it directly
+    /// truncates the launch grid for any n > 2^20, leaving the tail of
+    /// the output array unwritten. Always pass the real length from
+    /// the marshaller. `None` falls back to `estimated_work` — only
+    /// safe for scalar-only kernels (no array params) which don't have
+    /// a per-element loop in the first place.
     pub fn dispatch_async(
         &self,
         stream: std::sync::Arc<Stream>,
         class_id: ClassId,
         method_index: u16,
         args: cuda_bridge::KernelArgs,
+        runtime_work: Option<u32>,
     ) -> std::sync::Arc<StreamSubmission> {
         let handle = NEXT_SUBMISSION_HANDLE
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1068,11 +1080,19 @@ impl OffloadCache {
             }
         };
 
-        // 3. Pick a launch configuration. The signature's
-        //    `estimated_work` is the analyzer's read of the canonical
-        //    loop bound — one CUDA thread per element. Phase 5 will
-        //    let the user override via `@GpuKernel(blockX = ...)`.
-        let work = kernel.signature.estimated_work.max(1) as u32;
+        // 3. Pick a launch configuration. The caller-supplied
+        //    `runtime_work` reflects the actual array length the
+        //    kernel will iterate over. The signature's
+        //    `estimated_work` is a fixed `1 << 20` for any
+        //    counted-loop method (see `jit_cuda::analyzer::
+        //    estimate_work`) and is only a safe fallback for kernels
+        //    with no array params (where there is no per-element
+        //    grid loop at all). Using `estimated_work` for arrays
+        //    larger than 2^20 elements leaves the tail unwritten
+        //    because the launch grid undercounts threads.
+        let work = runtime_work
+            .map(|w| w.max(1))
+            .unwrap_or_else(|| kernel.signature.estimated_work.max(1) as u32);
         let cfg = cuda_bridge::LaunchConfig::elementwise(work);
 
         // 4. Launch on the user-supplied stream. The launch itself is
@@ -1413,8 +1433,13 @@ pub fn dispatch_method_from_native(
     let token = shared.heap.enter_gpu_critical();
 
     // 7. Marshal Java args into KernelArgs + remember writebacks.
+    //    `max_array_len` tracks the largest array length we marshal —
+    //    used below as the launch grid's element count so the kernel
+    //    covers every output index regardless of `estimated_work`'s
+    //    compile-time placeholder. See `dispatch_async`'s doc comment.
     let mut kernel_args = KernelArgs::new();
     let mut writebacks: Vec<MarshalWriteback> = Vec::new();
+    let mut max_array_len: usize = 0;
 
     // Phase 9 #2 push 2 — non-static path: marshal `this.<field>`
     // arrays first (matching the kernel's `pthis_<i>_*` param prefix
@@ -1527,6 +1552,9 @@ pub fn dispatch_method_from_native(
             match marshal_array_arg(shared, ctx, field_obj, etype, &token) {
                 Ok((args_after, wb)) => {
                     kernel_args = args_after(kernel_args);
+                    if let Some(l) = wb.array_len() {
+                        if l > max_array_len { max_array_len = l; }
+                    }
                     writebacks.push(wb);
                 }
                 Err(msg) => {
@@ -1554,6 +1582,9 @@ pub fn dispatch_method_from_native(
                     match marshal_array_arg(shared, ctx, *obj_ref, element_type, &token) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
+                            if let Some(l) = wb.array_len() {
+                                if l > max_array_len { max_array_len = l; }
+                            }
                             writebacks.push(wb);
                         }
                         Err(msg) => {
@@ -1579,6 +1610,9 @@ pub fn dispatch_method_from_native(
                     ) {
                         Ok((args_after, wb)) => {
                             kernel_args = args_after(kernel_args);
+                            if let Some(l) = wb.array_len() {
+                                if l > max_array_len { max_array_len = l; }
+                            }
                             writebacks.push(wb);
                         }
                         Err(msg) => {
@@ -1666,7 +1700,28 @@ pub fn dispatch_method_from_native(
     //    completion event recorded; it does NOT wait. The Java
     //    side's `future.get()` triggers `finalize_submission`
     //    (event-sync + writebacks).
-    let submission = cache.dispatch_async(stream.clone(), class_id, method_index, kernel_args);
+    //
+    //    Pass the largest marshalled array length as the launch
+    //    grid's element count. The analyzer's `estimated_work` is
+    //    a fixed compile-time placeholder (1 << 20 for any counted
+    //    loop) — using it directly leaves the tail of the output
+    //    unwritten for n > 2^20. `max_array_len` is the runtime
+    //    truth. `try_from` covers the (in practice never seen) case
+    //    of an array > 2^31 elements; if it overflows we fall back
+    //    to `estimated_work` which fails loudly via the kernel's
+    //    bounds check.
+    let runtime_work: Option<u32> = if max_array_len == 0 {
+        None
+    } else {
+        u32::try_from(max_array_len).ok()
+    };
+    let submission = cache.dispatch_async(
+        stream.clone(),
+        class_id,
+        method_index,
+        kernel_args,
+        runtime_work,
+    );
 
     // 9. If the dispatch itself failed (no device, kernel not in
     //    cache, launch error), there is nothing to finalize — the
@@ -1725,6 +1780,7 @@ pub fn finalize_submission(
         // 1. Wait for the kernel to complete via the recorded event.
         if let Some(event) = &submission.event {
             if let Err(e) = event.synchronize() {
+                eprintln!("[gpu-dbg] finalize event sync FAILED: {e}");
                 let mut status = submission.status.lock();
                 *status = SubmissionStatus::Failed {
                     message: format!("event.synchronize: {e}"),
@@ -2102,6 +2158,25 @@ impl MarshalWriteback {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Element-count of the array this writeback owns. Used by
+    /// `dispatch_method_from_native` to compute the launch grid:
+    /// the kernel needs `>= max(array_len)` threads to cover every
+    /// output index. Returns `None` for the `FailureFlag` variant
+    /// (no array body — just a 1-cell signal).
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            Self::I32 { len, .. }
+            | Self::I64 { len, .. }
+            | Self::F32 { len, .. }
+            | Self::F64 { len, .. }
+            | Self::ResidentI32 { len, .. }
+            | Self::ResidentI64 { len, .. }
+            | Self::ResidentF32 { len, .. }
+            | Self::ResidentF64 { len, .. } => Some(*len),
+            Self::FailureFlag { .. } => None,
         }
     }
 }
