@@ -777,6 +777,62 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `java/util/List.iterator()` / `Collection.iterator()` / `Iterable.iterator()`
+    // are all wired to this native at the interface level (see
+    // `register_interface_natives`).  When the receiver is *not* a
+    // `java/util/ArrayList`-compatible object (i.e. its instance layout
+    // doesn't have `elementData` at the ArrayList slot), the ArrayList$Itr
+    // we build below reads from the wrong field slots and yields an empty
+    // iteration — silently breaking real-JDK collections that the
+    // interpreter cannot dispatch to via bytecode.
+    //
+    // The canonical offender is `java/util/concurrent/CopyOnWriteArrayList`
+    // (used by Spring's `BeanPostProcessorCacheAwareList`): COWAL stores
+    // its backing `Object[]` in the `array` field at instance-slot 1
+    // (slot 0 is the `lock` monitor), with no separate `size` field.
+    // Sending such a receiver through the ArrayList path makes
+    // `al_state` read `lock` as `elementData` (returns `None`), so
+    // `ArrayList$Itr.hasNext()` reports `false` on the first call and
+    // every loop over the list runs zero iterations.  In Spring 6+ this
+    // manifests as `internalConfigurationAnnotationProcessor` setter
+    // injection failing with
+    //   `Property 'metadataReaderFactory' threw exception: ...
+    //    MetadataReaderFactory must not be null`
+    // because `ApplicationContextAwareProcessor.setResourceLoader` is
+    // never invoked on `SharedMetadataReaderFactoryBean` — the
+    // `applyBeanPostProcessorsBeforeInitialization` loop over
+    // `beanPostProcessors` produces zero items.
+    //
+    // Route COWAL receivers (including subclasses) to a snapshot
+    // iterator backed by the live `array` field.
+    let receiver_class_id = ctx.class_id_of_object(this);
+    let cowal_cid = ctx.class_id_by_name("java/util/concurrent/CopyOnWriteArrayList");
+    if let Some(cowal_id) = cowal_cid {
+        if ctx.is_subclass(receiver_class_id, cowal_id) {
+            // Snapshot COWAL's `array` field by resolving the slot by name
+            // — works whether the runtime saw the real JDK class file or a
+            // synthetic stub.  `size()` on COWAL is `array.length`, so we
+            // wrap the snapshot in an ArrayList-shaped object (slot 0 =
+            // backing array, slot 1 = size) and build a normal
+            // ArrayList$Itr on top.  We do *not* mutate the original COWAL.
+            let arr_slot = ctx
+                .resolve_field_index("java/util/concurrent/CopyOnWriteArrayList", "array");
+            let snapshot = arr_slot.and_then(|s| match ctx.get_field(this, s) {
+                Value::Object(Some(a)) => Some(a),
+                _ => None,
+            });
+            let snap_len = snapshot
+                .map(|a| ctx.array_length(a) as i32)
+                .unwrap_or(0);
+            let backing = snapshot.unwrap_or_else(|| alloc_ref_array(ctx, 0));
+            let wrapper = alloc_arraylist_with(ctx, backing, snap_len);
+            let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+            let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+            ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
+            ctx.set_field(itr, cursor_slot, Value::Int(0));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    }
     // Create ArrayList$Itr. Real-JDK has fields: cursor, lastRet,
     // expectedModCount, this$0. Use field-name resolution so we write to
     // the right slots regardless of layout.

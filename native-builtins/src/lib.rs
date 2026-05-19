@@ -17186,80 +17186,248 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     registry.register(cb, "reset", "()V", native_cb_reset);
 
     // --- CopyOnWriteArrayList (M18) ---
-    // Layout: field 0 = data array, field 1 = size.
-    // Copy-on-write semantics: reads go directly to backing array (lock-free);
-    // writes acquire the object monitor, copy the array, mutate the copy,
-    // then swap it in. Iterators see a snapshot at creation time.
+    // Two supported layouts:
+    //   - Real JDK `CopyOnWriteArrayList`: slot 0 = `lock` (Object),
+    //     slot 1 = `array` (Object[]).  `size()` is `array.length`;
+    //     there is no separate size field.
+    //   - Legacy synthetic stub layout (used when the real classfile
+    //     wasn't on the runtime classpath): slot 0 = backing array,
+    //     slot 1 = int size.
+    //
+    // The pre-fix shims assumed the synthetic layout unconditionally,
+    // which on a real COWAL clobbered the `lock` monitor and stored
+    // the backing array into the wrong slot.  Spring 6.x's
+    // `AbstractBeanFactory$BeanPostProcessorCacheAwareList` extends
+    // COWAL, so every BeanPostProcessor add became a no-op-from-the-
+    // outside (the underlying array stayed null/empty), and Spring's
+    // `applyBeanPostProcessorsBeforeInitialization` iterated to an
+    // empty collection.  Net effect: `ApplicationContextAwareProcessor`
+    // never invoked `setResourceLoader` on
+    // `SharedMetadataReaderFactoryBean`, its `metadataReaderFactory`
+    // field stayed null, `getObject()` returned null, and Spring's
+    // `RuntimeBeanReference` resolution wrapped the null in a
+    // `NullBean` — surfacing as
+    //   `BeanCreationException ... Property 'metadataReaderFactory'
+    //    threw exception: ... MetadataReaderFactory must not be null`
+    // on `internalConfigurationAnnotationProcessor`.
+    //
+    // The helpers below resolve `array` / `size` by field name first
+    // (real-JDK path) and only fall back to slot 0/1 when the real
+    // classfile didn't define those fields.  All COWAL natives below
+    // use these helpers so they work for both layouts without further
+    // per-method branching.
     let cowal = "java/util/concurrent/CopyOnWriteArrayList";
-    registry.register(cowal, "<init>", "()V", |ctx, args| {
-        rustjvm_native_collections::native_al_init(ctx, args)
-    });
-    // Reads — no synchronization needed (snapshot array)
+    // We removed the bytecode `<init>` override entirely so the real
+    // JDK constructor runs and properly initialises `lock` and
+    // `array` (=EMPTY_ELEMENTDATA).  The previous override delegated
+    // to `native_al_init`, which wrote `elementData=Object[8]` and
+    // `size=0` — i.e. wrote a non-null Object[] into slot 0 (the
+    // `lock` field) and Int(0) into slot 1 (the `array` field).
+    // That made subsequent reads of `array` (a real `Object[]`-typed
+    // volatile) return `Value::Int(0)`, which `iterator()` then
+    // misinterpreted as "no backing array" and produced an empty
+    // iteration.
+
+    /// Read (array, size) from a COWAL receiver, supporting both real
+    /// and synthetic layouts.
+    fn cowal_read_state(
+        ctx: &dyn NativeContext,
+        this: ObjectRef,
+    ) -> (Option<ObjectRef>, usize) {
+        const COWAL_CLASS: &str = "java/util/concurrent/CopyOnWriteArrayList";
+        if let Some(slot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
+            match ctx.get_field(this, slot) {
+                Value::Object(Some(a)) => {
+                    let n = ctx.array_length(a);
+                    return (Some(a), n);
+                }
+                _ => return (None, 0),
+            }
+        }
+        // Synthetic-stub fallback (legacy layout).
+        let sz = match ctx.get_field(this, 1) {
+            Value::Int(n) => n.max(0) as usize,
+            _ => 0,
+        };
+        let d = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        };
+        (d, sz)
+    }
+
+    /// Write a new backing array into a COWAL receiver (size is implicit
+    /// from `array.length` in real layout). For synthetic layout, also
+    /// update the int size slot.
+    fn cowal_write_array(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        new_arr: ObjectRef,
+    ) {
+        const COWAL_CLASS: &str = "java/util/concurrent/CopyOnWriteArrayList";
+        if let Some(slot) = ctx.resolve_field_index(COWAL_CLASS, "array") {
+            ctx.set_field(this, slot, Value::Object(Some(new_arr)));
+            return;
+        }
+        // Synthetic-stub fallback: write to slot 0/1.
+        let len = ctx.array_length(new_arr) as i32;
+        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+        ctx.set_field(this, 1, Value::Int(len));
+    }
+    // Reads — re-routed to use real-COWAL layout when available.  The
+    // previous registrations delegated to `native_al_*` which assumed
+    // ArrayList slot semantics; on a real COWAL receiver they read the
+    // wrong fields and returned `size=0` regardless of contents.
     registry.register(cowal, "size", "()I", |ctx, args| {
-        rustjvm_native_collections::native_al_size(ctx, args)
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let (_, size) = cowal_read_state(ctx, this);
+        Ok(Some(Value::Int(size as i32)))
     });
     registry.register(cowal, "isEmpty", "()Z", |ctx, args| {
-        rustjvm_native_collections::native_al_is_empty(ctx, args)
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(1))),
+        };
+        let (_, size) = cowal_read_state(ctx, this);
+        Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
     });
     registry.register(cowal, "get", "(I)Ljava/lang/Object;", |ctx, args| {
-        rustjvm_native_collections::native_al_get(ctx, args)
-    });
-    registry.register(cowal, "contains", "(Ljava/lang/Object;)Z", |ctx, args| {
-        rustjvm_native_collections::native_al_contains(ctx, args)
-    });
-    registry.register(cowal, "indexOf", "(Ljava/lang/Object;)I", |ctx, args| {
-        rustjvm_native_collections::native_al_index_of(ctx, args)
-    });
-    registry.register(cowal, "toArray", "()[Ljava/lang/Object;", |ctx, args| {
-        rustjvm_native_collections::native_al_to_array(ctx, args)
-    });
-    registry.register(cowal, "toString", "()Ljava/lang/String;", |ctx, args| {
-        rustjvm_native_collections::native_al_to_string(ctx, args)
-    });
-    // Iterator returns a snapshot — safe for concurrent iteration
-    registry.register(cowal, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
-        // Create snapshot-based iterator: copy current array into a new array
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let size = match ctx.get_field(this, 1) { Value::Int(n) => n.max(0) as usize, _ => 0 };
-        let data = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => {
-                let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
-                ctx.set_field(iter, 0, Value::Int(0));
-                ctx.set_field(iter, 1, Value::Int(0));
-                return Ok(Some(Value::Object(Some(iter))));
+        let idx = match args.get(1) { Some(Value::Int(i)) => *i as usize, _ => return Ok(Some(Value::Object(None))) };
+        let (data, size) = cowal_read_state(ctx, this);
+        if idx >= size { return Ok(Some(Value::Object(None))); }
+        Ok(Some(data.map(|a| ctx.get_array_element(a, idx)).unwrap_or(Value::Object(None))))
+    });
+    registry.register(cowal, "contains", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+        let (data, size) = cowal_read_state(ctx, this);
+        if let Some(arr) = data {
+            for i in 0..size {
+                if ctx.get_array_element(arr, i) == needle { return Ok(Some(Value::Int(1))); }
+            }
+        }
+        Ok(Some(Value::Int(0)))
+    });
+    registry.register(cowal, "indexOf", "(Ljava/lang/Object;)I", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+        let (data, size) = cowal_read_state(ctx, this);
+        if let Some(arr) = data {
+            for i in 0..size {
+                if ctx.get_array_element(arr, i) == needle { return Ok(Some(Value::Int(i as i32))); }
+            }
+        }
+        Ok(Some(Value::Int(-1)))
+    });
+    registry.register(cowal, "toArray", "()[Ljava/lang/Object;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let (data, size) = cowal_read_state(ctx, this);
+        let out = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        if let Some(arr) = data {
+            for i in 0..size {
+                ctx.set_array_element(out, i, ctx.get_array_element(arr, i));
+            }
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+    // Iterator returns a snapshot — safe for concurrent iteration.
+    //
+    // Two layouts are supported:
+    // - Real JDK `CopyOnWriteArrayList`: instance slot 0 is the `lock`
+    //   monitor (a `java/lang/Object`), slot 1 is the volatile `array`
+    //   (`Object[]`). `size()` is `array.length`.
+    // - Legacy synthetic stub (when the real classfile wasn't on the
+    //   classpath): slot 0 is the backing array, slot 1 is an `int`
+    //   size. We keep this path as the fallback.
+    //
+    // The original implementation read slot 0 as the data array
+    // unconditionally, which on a real COWAL pulled the `lock` monitor
+    // out — coerced to `Value::Int`, that produces `0`. Consumers
+    // (`ArrayList$Itr.hasNext`) then saw `size=0` and the iteration ran
+    // zero loops.  The user-visible blast radius is large: Spring
+    // 6.x's `AbstractBeanFactory$BeanPostProcessorCacheAwareList`
+    // extends COWAL, so `applyBeanPostProcessorsBeforeInitialization`
+    // iterated to an empty collection. `ApplicationContextAwareProcessor`
+    // never ran on `SharedMetadataReaderFactoryBean`, its
+    // `setResourceLoader` was skipped, `getObject()` returned null,
+    // and `ConfigurationClassPostProcessor.setMetadataReaderFactory`
+    // failed `Assert.notNull` with
+    //   `IllegalArgumentException: MetadataReaderFactory must not be null`
+    // — surfacing as a `BeanCreationException` on
+    // `internalConfigurationAnnotationProcessor` before Spring Boot
+    // could finish bootstrapping its main config class.
+    registry.register(cowal, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let (data_opt, size) = cowal_read_state(ctx, this);
+        // Copy into snapshot array (matches COWAL semantics: writes after
+        // iterator creation do not affect what the iterator sees).
+        let snap = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        if let Some(data) = data_opt {
+            for i in 0..size {
+                let elem = ctx.get_array_element(data, i);
+                ctx.set_array_element(snap, i, elem);
+            }
+        }
+        // Build an ArrayList wrapper so the registered
+        // `ArrayList$Itr.hasNext` / `next` natives (which use
+        // `al_state(list)` → reads `elementData` / `size`) see the
+        // snapshot.  We can't reuse the COWAL `this` directly: those
+        // natives would re-enter `al_state`, hit the ArrayList slot
+        // fallback, and read the wrong fields again.
+        let (al_data_slot, al_size_slot, al_n_fields) = {
+            let d = ctx.resolve_field_index("java/util/ArrayList", "elementData");
+            let s = ctx.resolve_field_index("java/util/ArrayList", "size");
+            match (d, s) {
+                (Some(a), Some(b)) => (a, b, std::cmp::max(a, b) + 1),
+                _ => (0, 1, 2),
             }
         };
-        // Copy into snapshot array
-        let snap = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
-        for i in 0..size {
-            let elem = ctx.get_array_element(data, i);
-            ctx.set_array_element(snap, i, elem);
-        }
-        let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
-        ctx.set_field(iter, 0, Value::Object(Some(snap)));
-        ctx.set_field(iter, 1, Value::Int(size as i32));
-        ctx.set_field(iter, 2, Value::Int(0)); // cursor
+        let wrapper = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", al_n_fields);
+        ctx.set_field(wrapper, al_data_slot, Value::Object(Some(snap)));
+        ctx.set_field(wrapper, al_size_slot, Value::Int(size as i32));
+        // Real-JDK `ArrayList$Itr` layout:
+        //   cursor: int @ 0
+        //   lastRet: int @ 1
+        //   expectedModCount: int @ 2
+        //   this$0: ArrayList @ 3
+        let (iter_cursor_slot, iter_list_slot, iter_n_fields) = {
+            let c = ctx.resolve_field_index("java/util/ArrayList$Itr", "cursor");
+            let l = ctx.resolve_field_index("java/util/ArrayList$Itr", "this$0");
+            match (c, l) {
+                (Some(a), Some(b)) => {
+                    let n = std::cmp::max(std::cmp::max(a, b) + 1, 4);
+                    (a, b, n)
+                }
+                _ => (1, 0, 2),
+            }
+        };
+        let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", iter_n_fields);
+        ctx.set_field(iter, iter_cursor_slot, Value::Int(0));
+        ctx.set_field(iter, iter_list_slot, Value::Object(Some(wrapper)));
         Ok(Some(Value::Object(Some(iter))))
     });
-    // Writes — true copy-on-write: copy array, mutate copy, swap reference
-    // Helper: copy the backing array into a new array of same or new size
-    fn cowal_copy_array(ctx: &mut dyn NativeContext, this: ObjectRef, extra: usize) -> (ObjectRef, usize) {
-        let size = match ctx.get_field(this, 1) { Value::Int(n) => n.max(0) as usize, _ => 0 };
-        let new_size = size + extra;
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_size.max(size));
-        if let Value::Object(Some(old_arr)) = ctx.get_field(this, 0) {
-            for i in 0..size {
-                let elem = ctx.get_array_element(old_arr, i);
-                ctx.set_array_element(new_arr, i, elem);
-            }
-        }
-        (new_arr, size)
-    }
-
+    // Writes — true copy-on-write: copy array, mutate copy, swap reference.
+    // Uses `cowal_read_state` / `cowal_write_array` so both real and
+    // synthetic COWAL layouts work.
     registry.register(
         cowal,
         "set",
@@ -17272,15 +17440,21 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             let idx = match args.get(1) { Some(Value::Int(i)) => *i as usize, _ => return Ok(Some(Value::Object(None))) };
             let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.monitor_enter(this);
-            let (new_arr, size) = cowal_copy_array(ctx, this, 0);
-            let old_val = if idx < size {
-                let old = ctx.get_array_element(new_arr, idx);
-                ctx.set_array_element(new_arr, idx, new_val);
-                old
-            } else {
-                Value::Object(None)
-            };
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+            let (old_arr, size) = cowal_read_state(ctx, this);
+            if idx >= size {
+                ctx.monitor_exit(this);
+                return Ok(Some(Value::Object(None)));
+            }
+            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+            let mut old_val = Value::Object(None);
+            if let Some(old) = old_arr {
+                for i in 0..size {
+                    let v = ctx.get_array_element(old, i);
+                    if i == idx { old_val = v; ctx.set_array_element(new_arr, i, new_val); }
+                    else { ctx.set_array_element(new_arr, i, v); }
+                }
+            }
+            cowal_write_array(ctx, this, new_arr);
             ctx.monitor_exit(this);
             Ok(Some(old_val))
         },
@@ -17292,10 +17466,15 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         };
         let elem = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.monitor_enter(this);
-        let (new_arr, size) = cowal_copy_array(ctx, this, 1);
+        let (old_arr, size) = cowal_read_state(ctx, this);
+        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+        if let Some(old) = old_arr {
+            for i in 0..size {
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
+            }
+        }
         ctx.set_array_element(new_arr, size, elem);
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-        ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+        cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(1)))
     });
@@ -17306,23 +17485,23 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         };
         let elem = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.monitor_enter(this);
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(n) => n.max(0) as usize,
-            _ => 0,
-        };
-        if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
+        let (old_arr, size) = cowal_read_state(ctx, this);
+        if let Some(old) = old_arr {
             for i in 0..size {
-                let cur = ctx.get_array_element(arr, i);
-                if cur == elem {
+                if ctx.get_array_element(old, i) == elem {
                     ctx.monitor_exit(this);
                     return Ok(Some(Value::Int(0)));
                 }
             }
         }
-        let (new_arr, cur_size) = cowal_copy_array(ctx, this, 1);
-        ctx.set_array_element(new_arr, cur_size, elem);
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-        ctx.set_field(this, 1, Value::Int((cur_size + 1) as i32));
+        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+        if let Some(old) = old_arr {
+            for i in 0..size {
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
+            }
+        }
+        ctx.set_array_element(new_arr, size, elem);
+        cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(1)))
     });
@@ -17334,15 +17513,20 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let idx = match args.get(1) { Some(Value::Int(i)) => *i as usize, _ => return Ok(None) };
         let elem = args.get(2).copied().unwrap_or(Value::Object(None));
         ctx.monitor_enter(this);
-        let (new_arr, size) = cowal_copy_array(ctx, this, 1);
-        // Shift elements right from idx
-        for i in (idx..size).rev() {
-            let val = ctx.get_array_element(new_arr, i);
-            ctx.set_array_element(new_arr, i + 1, val);
+        let (old_arr, size) = cowal_read_state(ctx, this);
+        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+        if let Some(old) = old_arr {
+            for i in 0..idx.min(size) {
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
+            }
+            ctx.set_array_element(new_arr, idx.min(size), elem);
+            for i in idx..size {
+                ctx.set_array_element(new_arr, i + 1, ctx.get_array_element(old, i));
+            }
+        } else {
+            ctx.set_array_element(new_arr, 0, elem);
         }
-        ctx.set_array_element(new_arr, idx.min(size), elem);
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-        ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+        cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
         Ok(None)
     });
@@ -17353,30 +17537,61 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         };
         let idx = match args.get(1) { Some(Value::Int(i)) => *i as usize, _ => return Ok(Some(Value::Object(None))) };
         ctx.monitor_enter(this);
-        let size = match ctx.get_field(this, 1) { Value::Int(n) => n.max(0) as usize, _ => 0 };
+        let (old_arr, size) = cowal_read_state(ctx, this);
         if idx >= size {
             ctx.monitor_exit(this);
             return Ok(Some(Value::Object(None)));
         }
         let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size - 1);
-        let old_val = if let Value::Object(Some(old_arr)) = ctx.get_field(this, 0) {
-            let removed = ctx.get_array_element(old_arr, idx);
+        let mut removed = Value::Object(None);
+        if let Some(old) = old_arr {
             for i in 0..idx {
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(old_arr, i));
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
             }
+            removed = ctx.get_array_element(old, idx);
             for i in (idx + 1)..size {
-                ctx.set_array_element(new_arr, i - 1, ctx.get_array_element(old_arr, i));
+                ctx.set_array_element(new_arr, i - 1, ctx.get_array_element(old, i));
             }
-            removed
-        } else { Value::Object(None) };
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-        ctx.set_field(this, 1, Value::Int((size - 1) as i32));
+        }
+        cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
-        Ok(Some(old_val))
+        Ok(Some(removed))
     });
-    // remove(Object)Z — remove first occurrence by value (delegates to collection impl)
+    // remove(Object)Z — remove first occurrence by value.
     registry.register(cowal, "remove", "(Ljava/lang/Object;)Z", |ctx, args| {
-        rustjvm_native_collections::native_al_remove_obj(ctx, args)
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let needle = args.get(1).copied().unwrap_or(Value::Object(None));
+        ctx.monitor_enter(this);
+        let (old_arr, size) = cowal_read_state(ctx, this);
+        let mut found_idx: Option<usize> = None;
+        if let Some(old) = old_arr {
+            for i in 0..size {
+                if ctx.get_array_element(old, i) == needle {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = found_idx {
+            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size - 1);
+            if let Some(old) = old_arr {
+                for i in 0..idx {
+                    ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
+                }
+                for i in (idx + 1)..size {
+                    ctx.set_array_element(new_arr, i - 1, ctx.get_array_element(old, i));
+                }
+            }
+            cowal_write_array(ctx, this, new_arr);
+            ctx.monitor_exit(this);
+            Ok(Some(Value::Int(1)))
+        } else {
+            ctx.monitor_exit(this);
+            Ok(Some(Value::Int(0)))
+        }
     });
     registry.register(cowal, "clear", "()V", |ctx, args| {
         let this = match args.first() {
@@ -17385,8 +17600,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         };
         ctx.monitor_enter(this);
         let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-        ctx.set_field(this, 1, Value::Int(0));
+        cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
         Ok(None)
     });
