@@ -10415,11 +10415,6 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let class_id = ctx.class_id_of_object(this);
     let kind = ctx.heap_kind_of(this);
-    if std::env::var_os("RUSTJVM_DBG_CLONE").is_some() {
-        let nm = ctx.class_name_of_id(class_id).unwrap_or_else(|| "?".to_string());
-        let nfields = if matches!(kind, rustjvm_types::ObjectKind::Object) { ctx.object_num_fields(this) } else { 0 };
-        eprintln!("[DBG_CLONE] kind={:?} class={} num_fields={}", kind, nm, nfields);
-    }
     match kind {
         rustjvm_types::ObjectKind::Object => {
             let num_fields = ctx.object_num_fields(this);
@@ -10427,6 +10422,30 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             for i in 0..num_fields {
                 let val = ctx.get_field(this, i);
                 ctx.set_field(clone_ref, i, val);
+            }
+            // KC26 LinkedHashMap.clone fix: LHM (and subclasses like
+            // AnnotationAttributes) keeps most of its state in a side-table
+            // overlay keyed by ObjectRef pointer, not in the heap fields the
+            // loop above copies. Without this, the cloned LHM has all state
+            // missing (size, table, head/tail) and a subsequent
+            // `HashMap.clone()` → `reinitialize()` → `putMapEntries()` chain
+            // walks an empty receiver, producing OOM via division-by-zero
+            // load-factor or silent data loss.  Detect LHM ancestry on the
+            // receiver and replicate the overlay onto the clone.
+            let mut cur = class_id;
+            loop {
+                match ctx.class_name_of_id(cur) {
+                    Some(n) if n == "java/util/LinkedHashMap" => {
+                        rustjvm_native_collections::clone_lhm_overlay(this, clone_ref);
+                        break;
+                    }
+                    Some(n) if n == "java/lang/Object" => break,
+                    None => break,
+                    _ => match ctx.superclass_of(cur) {
+                        Some(p) => cur = p,
+                        None => break,
+                    },
+                }
             }
             Ok(Some(Value::Object(Some(clone_ref))))
         }
@@ -31553,14 +31572,6 @@ fn wrap_undeclared_throwable(
 
     // 3) Wrap. Allocate UndeclaredThrowableException and invoke its
     // (Throwable) constructor.
-    if std::env::var_os("RUSTJVM_DBG_UTE").is_some() {
-        let nm = ctx.class_name_of_id(thrown_cid).unwrap_or_else(|| "?".to_string());
-        let method_name = match ctx.get_field_by_name(method_obj, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => "?".to_string(),
-        };
-        eprintln!("[DBG_UTE] wrapping thrown={} method={}", nm, method_name);
-    }
     let ute_cid = match ctx.ensure_class_initialized("java/lang/reflect/UndeclaredThrowableException")
     {
         Ok(c) => c,

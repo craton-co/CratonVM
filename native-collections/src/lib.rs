@@ -10012,6 +10012,20 @@ fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback:
         .insert(name.to_string(), v);
 }
 
+/// Copy the per-object LHM overlay from `src` to `dst`. Used by
+/// `Object.clone()` so that a cloned `LinkedHashMap` retains its bucket
+/// table, head/tail pointers, and other state stored outside the heap
+/// fields. Without this, `lhm.clone()` returns an LHM with all state
+/// missing and downstream `HashMap.clone()` bytecode walks an empty
+/// receiver.
+pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
+    let mut m = lhm_overlay().lock().unwrap();
+    let src_state = m.get(&lhm_overlay_key(src)).cloned();
+    if let Some(s) = src_state {
+        m.insert(lhm_overlay_key(dst), s);
+    }
+}
+
 const LHM_NODE_KEY: usize = 0;
 const LHM_NODE_VALUE: usize = 1;
 const LHM_NODE_HASH: usize = 2;
@@ -10267,6 +10281,18 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(cap as i32));
     lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(None));
     lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(None));
+
+    // KC26 clone path: LinkedHashMap.<init>()V is intercepted natively (we
+    // never run the bytecode chain LHM → HashMap.<init> → putfield loadFactor).
+    // That leaves the JDK-resolved `loadFactor`, `threshold`, and `table` heap
+    // slots zero-initialised. Once any bytecode path reads them — notably
+    // `HashMap.clone()` → `reinitialize()` → `putMapEntries()` → `resize()` —
+    // a loadFactor of 0.0f makes the resize compute `newCap = 1073741824`,
+    // which then OOMs on the `anewarray Node[1073741824]`. Mirror the JDK
+    // defaults into the real heap fields so cloned LHM instances see sane
+    // values when the HashMap.clone bytecode walks them.
+    try_set_jdk_map_field(ctx, this, "loadFactor", Value::Float(0.75_f32));
+    try_set_jdk_map_field(ctx, this, "threshold", Value::Int((cap as i32 * 3) / 4));
 }
 
 fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
