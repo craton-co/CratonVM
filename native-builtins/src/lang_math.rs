@@ -2530,6 +2530,14 @@ pub(crate) fn native_integer_to_hex_string(ctx: &mut dyn NativeContext, args: &[
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // DEBUG-NETTYHANG: log every call
+    if std::env::var_os("RUSTJVM_DBG_TOHEX").is_some() {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 600 || n % 1000 == 0 {
+            eprintln!("[DBG-TOHEX {n}] val={val}");
+        }
+    }
     let hex = format!("{:x}", val as u32);
     let result = ctx.create_string(&hex);
     Ok(Some(Value::Object(Some(result))))

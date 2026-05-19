@@ -130,6 +130,32 @@ pub fn ensure_class_initialized_shared(
                 // other thread, then release LC and block the current thread
                 // until informed that the in-progress initialization has
                 // completed."
+                //
+                // BUGFIX (Spring Boot multi-thread hang): the previous
+                // implementation called `cvar.wait_for(...)` UNCONDITIONALLY
+                // without first checking the `*done` predicate. That is a
+                // textbook missed-notification race:
+                //
+                //   Thread A (initializer)         Thread B (waiter)
+                //   --                             cm.read(): state=Initializing
+                //   --                             class_init_waiters.lock(),
+                //                                     clone Arc, release
+                //   cm.write(): state=Initialized
+                //   class_init_waiters.lock(),
+                //     remove(class_id), release
+                //   waiter.lock(); *done=true;
+                //     notify_all(); drop lock
+                //   --                             waiter.lock() (uncontended)
+                //   --                             cvar.wait_for(30s)
+                //                                     ← BLOCKS FOR 30 SECONDS
+                //
+                // Because Thread B did not check `*done` before waiting, the
+                // notification fired before Thread B was parked, and the wait
+                // does not wake until the 30-second timer expires. Spring
+                // Boot's BackgroundPreinitializer + main thread can stack
+                // several of these cascading misses, easily hanging the boot
+                // for >60s. The fix is the canonical predicate-checked
+                // condvar idiom: lock, then `while !*done` wait.
                 let waiter = shared
                     .class_init_waiters
                     .lock()
@@ -141,9 +167,34 @@ pub fn ensure_class_initialized_shared(
                     // poison handling, wait_for returns a WaitTimeoutResult
                     // (no Result wrapper) since it cannot fail.
                     let mut guard = lock.lock();
-                    // Wait with timeout to avoid deadlock on misconfigured init
-                    let _result = cvar
-                        .wait_for(&mut guard, std::time::Duration::from_secs(30));
+                    // Predicate-checked wait. `*guard` is the `done` flag set
+                    // by `finalize_init`. If the initializer already finished
+                    // (and dropped the lock) between our Arc-clone above and
+                    // this lock acquisition, we observe `*guard == true` and
+                    // skip the wait entirely, going straight back to the
+                    // state re-check at the top of the loop.
+                    //
+                    // The 1-second timeout is a safety net — even if the
+                    // notification is somehow missed (e.g. the waiter Arc was
+                    // removed from the map before we cloned it, but that
+                    // shouldn't be possible given the insert-before-state-
+                    // change ordering), we loop back and re-read the
+                    // ClassManager state at most once per second. This keeps
+                    // perceived latency low while still letting the wait
+                    // park the thread efficiently on the common path.
+                    while !*guard {
+                        let result = cvar.wait_for(
+                            &mut guard,
+                            std::time::Duration::from_secs(1),
+                        );
+                        if result.timed_out() {
+                            // Loop back to re-check ClassManager state.
+                            // The class may have finished initializing while
+                            // we were waiting — even on timeout we want to
+                            // re-check rather than spin.
+                            break;
+                        }
+                    }
                     // Loop back to re-check state (might be Initialized or Error)
                     continue;
                 }

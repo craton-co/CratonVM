@@ -3159,7 +3159,15 @@ fn auto_box_return(ctx: &mut dyn NativeContext, result: MethodCallResult, desc: 
                 other => other,
             }
         }
-        "V" => Ok(Some(Value::Object(None))), // void → null for Object return
+        "V" => match result {
+            // void → null for Object return, but preserve thrown exceptions.
+            // Previously this arm unconditionally returned Ok(Some(Object(None))),
+            // silently swallowing any Err(ExceptionThrown) from dispatch — the
+            // root cause of KC26 / many Quarkus / Spring Boot rc=0 silent exits
+            // when an inner native invocation raised through MethodHandle.invokeExact.
+            Ok(_) => Ok(Some(Value::Object(None))),
+            err => err,
+        },
         _ => result, // already an object reference
     }
 }
