@@ -2324,6 +2324,20 @@ fn try_compile_inner(
     // present — worth retrying later).
     backend_attempted: &mut bool,
 ) -> Option<CompiledMethod> {
+    // TEMP DIAG: log every try_compile_inner invocation for Arrays.fill
+    if std::env::var_os("RUSTJVM_DBG_JIT_DUMP").is_some()
+        && &*cached.class_name == "java/util/Arrays"
+        && &*cached.method_name == "fill"
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open("C:/craton/CratonVM/jit_dump.log")
+        {
+            let _ = writeln!(f, "[JIT_DUMP] try_compile_inner ENTER {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor);
+            let _ = f.flush();
+        }
+    }
     // Architecture-specific backend selection.
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
     // Both x64 and ARM64 backends have bytecode→native compilation pipelines.
@@ -2792,6 +2806,37 @@ fn try_compile_inner(
         std::collections::HashSet::new(), // non_escaping_new — escape analysis done inside x64 too
         inline_sites,
     )?;
+
+    // TEMP DIAG: dump JIT'd machine code for Arrays.fill
+    if std::env::var_os("RUSTJVM_DBG_JIT_DUMP").is_some()
+        && &*cached.class_name == "java/util/Arrays"
+        && &*cached.method_name == "fill"
+    {
+        use std::io::Write;
+        let bytes = compiled._buffer.as_slice();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "[JIT_DUMP] {}.{}{} len={} osr_pc_to_native={:?}\n",
+            cached.class_name, cached.method_name, cached.method_descriptor,
+            bytes.len(),
+            compiled.osr_pc_to_native.as_ref().map(|v| v.iter().enumerate().filter(|(_, x)| **x >= 0).map(|(i, x)| (i, *x)).collect::<Vec<_>>())
+        ));
+        for (i, chunk) in bytes.chunks(16).enumerate() {
+            out.push_str(&format!("[JIT_DUMP] {:04x}:", i * 16));
+            for b in chunk {
+                out.push_str(&format!(" {:02x}", b));
+            }
+            out.push('\n');
+        }
+        // Write directly to file so the dump is preserved even if the
+        // process hangs in compiled code and stderr buffering swallows it.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open("C:/craton/CratonVM/jit_dump.log")
+        {
+            let _ = f.write_all(out.as_bytes());
+            let _ = f.flush();
+        }
+    }
 
     compiled._jit_strings = owned_strings;
     compiled._jit_invoke_infos = owned_invoke_infos;

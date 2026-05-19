@@ -3055,7 +3055,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
             // If the receiver IS a lambda proxy but calling a non-SAM method
             // (e.g. andThen), dispatch on the functional interface class.
-            let class_name = {
+            //
+            // KC26 array.clone() bug: array objects store their COMPONENT class
+            // id (e.g. `OptionCategory`) in the header — NOT the array class
+            // id. Calling `get_class(receiver_class_id).name` for an array
+            // receiver therefore returns the component class name. Routing
+            // dispatch through the component then resolves `clone()` to the
+            // *component's* override (`Enum.clone()` for enum arrays — which
+            // is the JDK's deliberate CNSE-thrower) instead of `Object.clone`
+            // (the array-cloning native). Per JVMS §4.4.1, every array class's
+            // method table is `Object`'s — short-circuit array receivers to
+            // `java/lang/Object` here, matching the parallel logic in
+            // `invoke_or_native` and `try_stackless_invoke`.
+            let class_name = if self.shared.heap.kind_of(receiver)
+                == rustjvm_types::ObjectKind::Array
+            {
+                "java/lang/Object".to_string()
+            } else {
                 let lambda_iface = {
                     let proxies = self.shared.lambda_proxies.read();
                     proxies.get(&receiver_class_id).map(|lcs| lcs.functional_interface.to_string())

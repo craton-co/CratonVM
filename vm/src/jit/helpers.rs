@@ -1914,7 +1914,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
 
         // Entry not cached yet — use cached class name for fast dispatch.
-        let class_name: String = {
+        //
+        // KC26 array.clone() bug: array receivers store the COMPONENT class
+        // id in their header (per the documented invariant in
+        // `runtime/interpreter.rs`). Falling through to
+        // `get_class(receiver_class_id).name` would resolve dispatch on the
+        // component (e.g. `OptionCategory`/`Enum`) and surface
+        // `Enum.clone() → CloneNotSupportedException` for every array clone
+        // of an enum type. Per JVMS §4.4.1, array classes inherit their
+        // method table from `Object`; short-circuit accordingly.
+        let class_name: String = if vm.heap.kind_of(receiver_ref)
+            == rustjvm_types::ObjectKind::Array
+        {
+            "java/lang/Object".to_string()
+        } else {
             let guard = mic.cached_class_name.lock();
             match &*guard {
                 Some(name) => name.clone(),
@@ -2005,7 +2018,15 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // --- Cache miss: full resolution + update cache ---
     mic.record_miss();
 
-    let class_name = {
+    // See the matching block in the cache-hit branch above for the rationale
+    // — array receivers must dispatch through `java/lang/Object` rather than
+    // their component class id, otherwise enum-array `clone()` resolves to
+    // `Enum.clone()` (a JDK-deliberate CNSE thrower).
+    let class_name: std::sync::Arc<str> = if vm.heap.kind_of(receiver_ref)
+        == rustjvm_types::ObjectKind::Array
+    {
+        std::sync::Arc::from("java/lang/Object")
+    } else {
         let cm = vm.class_manager.read();
         cm.get_class(receiver_class_id)
             .map(|c| c.name.clone())

@@ -10415,6 +10415,12 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let class_id = ctx.class_id_of_object(this);
     let kind = ctx.heap_kind_of(this);
+    if std::env::var_os("RUSTJVM_DBG_CLONE").is_some() {
+        let name = ctx
+            .class_name_of_id(class_id)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!("[DBG_CLONE] kind={:?} class={}", kind, name);
+    }
     match kind {
         rustjvm_types::ObjectKind::Object => {
             let num_fields = ctx.object_num_fields(this);
@@ -31542,6 +31548,26 @@ fn wrap_undeclared_throwable(
 ) -> rustjvm_types::ObjectRef {
     // 1) RuntimeException / Error — always propagate.
     let thrown_cid = ctx.class_id_of_object(thrown);
+    if std::env::var_os("RUSTJVM_DBG_UTE").is_some() {
+        let thrown_name = ctx
+            .class_name_of_id(thrown_cid)
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let method_name = match ctx.get_field_by_name(method_obj, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let decl_class = match ctx.get_field_by_name(method_obj, "clazz") {
+            Value::Object(Some(m)) => ctx
+                .class_id_from_mirror(m)
+                .and_then(|c| ctx.class_name_of_id(c))
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            _ => "<unknown>".to_string(),
+        };
+        eprintln!(
+            "[DBG_UTE] method={}.{} thrown={}",
+            decl_class, method_name, thrown_name
+        );
+    }
     if let Ok(rcid) = ctx.ensure_class_initialized("java/lang/RuntimeException") {
         if thrown_cid == rcid || ctx.is_subclass(thrown_cid, rcid) {
             return thrown;
