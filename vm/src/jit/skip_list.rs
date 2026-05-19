@@ -972,8 +972,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // share the same bytecode shape and are skip-listed pre-emptively.
         // Other `java/util/Arrays` methods (sort, copyOf, hashCode) don't
         // exhibit this counted-loop shape and stay JIT-eligible.
-        // ("java/util/Arrays", "fill")  // TEMP DISABLED FOR DIAGNOSIS
-        | ("__never_match_arrays_fill__", "fill")
+        | ("java/util/Arrays", "fill")
         // NEW-1.4 — regalloc parameter-mapping bug, surfaces as
         // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
         // Tracked by the committed reproducer in

@@ -1232,6 +1232,33 @@ unsafe fn jit_typecheck_resolve(
     obj_ref: ObjectRef,
     class_name: &str,
 ) -> bool {
+    // KC26 array.clone() bug — descriptor-based array assignability.
+    //
+    // When the receiver is an array, falling through to the class-hierarchy
+    // `is_subclass_of` path misses every legitimate case: primitive arrays
+    // carry `class_id == 0` (no class entry), and reference arrays store
+    // their *component* class id in the header (which is never a subclass
+    // of the array class). The interpreter's `Checkcast` handler
+    // (`runtime/interpreter.rs::6876`) computes the array's descriptor
+    // and runs `array_is_assignable_to` — mirror that here so JIT-compiled
+    // checkcast/instanceof on arrays returns the same result.
+    //
+    // Reproducer: `() -> SRC.clone()` on an `int[]` field returns null in
+    // the JIT'd lambda body because `checkcast [I` after the clone() return
+    // hit the false branch below and zeroed the result. With this branch
+    // in place, the cast succeeds and the array round-trips correctly.
+    if vm.heap.kind_of(obj_ref) == rustjvm_types::ObjectKind::Array {
+        if let Some(src_desc) =
+            crate::runtime::interpreter::array_descriptor_of(vm, obj_ref)
+        {
+            if crate::runtime::interpreter::array_is_assignable_to(
+                vm, &src_desc, class_name,
+            ) {
+                return true;
+            }
+        }
+    }
+
     // Fast path: target already loaded. Most call sites hit this.
     //
     // IMPORTANT: bind the result to a local so the `RwLockReadGuard` temporary

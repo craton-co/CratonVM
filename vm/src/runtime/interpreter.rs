@@ -7375,7 +7375,7 @@ fn lambda_proxy_satisfies(
 /// Compute the JVM array descriptor (e.g. `"[I"`, `"[Ljava/lang/String;"`)
 /// for a heap object that is known to be an array. Returns `None` if the
 /// object is not actually an array.
-fn array_descriptor_of(shared: &SharedVm, obj_ref: rustjvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn array_descriptor_of(shared: &SharedVm, obj_ref: rustjvm_types::ObjectRef) -> Option<String> {
     if shared.heap.kind_of(obj_ref) != rustjvm_types::ObjectKind::Array {
         return None;
     }
@@ -7415,7 +7415,7 @@ fn array_descriptor_of(shared: &SharedVm, obj_ref: rustjvm_types::ObjectRef) -> 
 ///   - An array descriptor like "[I" or "[Ljava/lang/Object;".
 ///   - A class/interface name like "java/lang/Object", "java/io/Serializable",
 ///     or "java/lang/Cloneable".
-fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_name: &str) -> bool {
+pub(crate) fn array_is_assignable_to(shared: &SharedVm, src_desc: &str, target_name: &str) -> bool {
     // Every array is an Object and implements Serializable + Cloneable.
     if &*target_name == "java/lang/Object"
         || target_name == "java/io/Serializable"
