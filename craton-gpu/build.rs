@@ -35,8 +35,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Always rerun when the Java sources change.
-    println!("cargo:rerun-if-changed=src/main/java");
+    // Java sources moved to a standalone Maven project at
+    // C:/craton/craton-gpu-java/ — see that repo's README.md.
+    // Locate them via, in priority order:
+    //   1. $CRATON_GPU_JAVA_SRC env var (full absolute path to a
+    //      directory containing `craton/gpu/*.java`),
+    //   2. ../craton-gpu-java/src/main/java (works from main repo),
+    //   3. C:/craton/craton-gpu-java/src/main/java (default install).
+    // If none exists, the build script emits empty paths and a warning
+    // — same fallback behaviour as before the move.
+    println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(
@@ -55,7 +63,9 @@ fn main() {
         );
     }
 
-    let java_root = PathBuf::from("src/main/java");
+    let java_root = resolve_java_root();
+    // Tell cargo to rerun when the chosen source tree changes.
+    println!("cargo:rerun-if-changed={}", java_root.display());
 
     // Helper: emit ALL four lines (two rustc-env, two cargo metadata)
     // and return. The rustc-env lines feed `env!()` in this crate's
@@ -140,6 +150,34 @@ fn main() {
     };
 
     emit_env(&jar_str, &classes_dir);
+}
+
+/// Resolve the Java source root, in priority order:
+/// 1. `$CRATON_GPU_JAVA_SRC` (treated as an absolute path to a
+///    directory containing `craton/gpu/*.java`).
+/// 2. `../craton-gpu-java/src/main/java` (sibling of CratonVM repo).
+/// 3. `C:/craton/craton-gpu-java/src/main/java` (default install).
+///
+/// Returns the first path that exists; if none exists, returns the
+/// final default — the caller (`main`) will discover the absence and
+/// emit a `cargo:warning=` instead of failing the build.
+fn resolve_java_root() -> PathBuf {
+    if let Some(v) = std::env::var_os("CRATON_GPU_JAVA_SRC") {
+        let p = PathBuf::from(v);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    let candidates: [PathBuf; 2] = [
+        PathBuf::from("../craton-gpu-java/src/main/java"),
+        PathBuf::from("C:/craton/craton-gpu-java/src/main/java"),
+    ];
+    for c in &candidates {
+        if c.is_dir() {
+            return c.clone();
+        }
+    }
+    candidates[1].clone()
 }
 
 /// Probe for `javac` on PATH by running `javac -version`. Both
