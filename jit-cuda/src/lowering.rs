@@ -363,7 +363,10 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
         };
-        lower_method(class, &method, &sig, 7, 0)
+        // sm_75 (Turing) — the test host's RTX 2060 and the lowest
+        // arch still accepted by both CUDA 12.x and CUDA 13.x `ptxas`
+        // (CUDA 13 dropped Volta / sm_70).
+        lower_method(class, &method, &sig, 7, 5)
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
@@ -373,7 +376,7 @@ mod tests {
         let text = m.render();
         // Headers + entry name
         assert!(text.contains(".version 7.5"));
-        assert!(text.contains(".target sm_70"));
+        assert!(text.contains(".target sm_75"));
         assert!(text.contains(".visible .entry EligibleVectorAdd__vectorAdd_"));
         // tid computation
         assert!(text.contains("%ctaid.x"));
@@ -451,7 +454,7 @@ mod tests {
         std::fs::write(&src_path, &text).expect("write ptx");
         let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
         let out = std::process::Command::new(&ptxas)
-            .arg("-arch=sm_70")
+            .arg("-arch=sm_75")
             .arg(&src_path)
             .output()
             .expect("invoke ptxas");
