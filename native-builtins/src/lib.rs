@@ -10415,6 +10415,11 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let class_id = ctx.class_id_of_object(this);
     let kind = ctx.heap_kind_of(this);
+    if std::env::var_os("RUSTJVM_DBG_CLONE").is_some() {
+        let nm = ctx.class_name_of_id(class_id).unwrap_or_else(|| "?".to_string());
+        let nfields = if matches!(kind, rustjvm_types::ObjectKind::Object) { ctx.object_num_fields(this) } else { 0 };
+        eprintln!("[DBG_CLONE] kind={:?} class={} num_fields={}", kind, nm, nfields);
+    }
     match kind {
         rustjvm_types::ObjectKind::Object => {
             let num_fields = ctx.object_num_fields(this);
@@ -31548,6 +31553,14 @@ fn wrap_undeclared_throwable(
 
     // 3) Wrap. Allocate UndeclaredThrowableException and invoke its
     // (Throwable) constructor.
+    if std::env::var_os("RUSTJVM_DBG_UTE").is_some() {
+        let nm = ctx.class_name_of_id(thrown_cid).unwrap_or_else(|| "?".to_string());
+        let method_name = match ctx.get_field_by_name(method_obj, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => "?".to_string(),
+        };
+        eprintln!("[DBG_UTE] wrapping thrown={} method={}", nm, method_name);
+    }
     let ute_cid = match ctx.ensure_class_initialized("java/lang/reflect/UndeclaredThrowableException")
     {
         Ok(c) => c,

@@ -419,12 +419,26 @@ impl VmConfig {
     }
 
     /// Parse a classpath string using the platform-specific separator.
+    ///
+    /// On Windows, additionally normalises MSYS/Cygwin/Git-Bash style POSIX
+    /// drive paths (`/c/foo/bar.jar`, `/cygdrive/c/foo/bar.jar`) to native
+    /// Windows form (`C:/foo/bar.jar`). MSYS bash's automatic path
+    /// translation only applies to single-argument paths: when multiple
+    /// paths are joined with `;` (the Windows path separator) into one
+    /// argument, MSYS leaves them untranslated. Without this normalisation
+    /// a user running
+    ///   `java.exe -cp "/c/a.jar;/c/b.jar" Main`
+    /// from a MinGW/Git-Bash shell would see every classpath entry
+    /// silently dropped because `/c/a.jar` does not resolve under the
+    /// Win32 file API. A single-jar invocation (`java.exe -cp /c/a.jar`)
+    /// would have worked because MSYS translates that single token to
+    /// `C:/a.jar` before passing it to the child process.
     pub fn parse_classpath(classpath_str: &str) -> Vec<String> {
         let separator = if cfg!(windows) { ';' } else { ':' };
         classpath_str
             .split(separator)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+            .map(normalize_classpath_entry)
             .collect()
     }
 
@@ -472,6 +486,65 @@ impl VmConfig {
 // ---------------------------------------------------------------------------
 // Boot / extension classpath auto-discovery
 // ---------------------------------------------------------------------------
+
+/// Normalise a single classpath entry, converting MSYS/Cygwin/Git-Bash
+/// style POSIX drive paths to Windows form on Windows. On non-Windows
+/// hosts the entry is returned unchanged.
+///
+/// Accepted POSIX-style inputs (Windows only):
+///   `/c/foo/bar.jar`            -> `C:/foo/bar.jar`
+///   `/C/foo/bar.jar`            -> `C:/foo/bar.jar`
+///   `/cygdrive/c/foo/bar.jar`   -> `C:/foo/bar.jar`
+///
+/// Already-native paths (`C:/...`, `C:\...`, relative paths, wildcards
+/// like `lib/*`) are returned unchanged.
+#[cfg(windows)]
+fn normalize_classpath_entry(entry: &str) -> String {
+    // `/cygdrive/<letter>/...`
+    if let Some(rest) = entry.strip_prefix("/cygdrive/") {
+        if let Some(stripped) = posix_drive_tail(rest) {
+            return stripped;
+        }
+    }
+    // `/<letter>/...` (MSYS/Git-Bash style). Require exactly:
+    // leading slash, single ASCII letter, slash. This avoids touching
+    // legitimate Unix-rooted paths like `/etc/...` that some users might
+    // place on a Windows classpath as a literal string.
+    if let Some(rest) = entry.strip_prefix('/') {
+        if let Some(stripped) = posix_drive_tail(rest) {
+            return stripped;
+        }
+    }
+    entry.to_string()
+}
+
+/// Non-Windows: classpath entries are taken verbatim. Forward-slash
+/// POSIX paths are already native here.
+#[cfg(not(windows))]
+fn normalize_classpath_entry(entry: &str) -> String {
+    entry.to_string()
+}
+
+/// Given `<letter>/<rest>` or `<letter>` (where `<letter>` is a single
+/// ASCII alphabetic character), return `Some("<LETTER>:/<rest>")` or
+/// `Some("<LETTER>:/")`. Returns `None` for any other shape so the caller
+/// can leave the original entry untouched.
+#[cfg(windows)]
+fn posix_drive_tail(rest: &str) -> Option<String> {
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    match bytes.get(1) {
+        None => Some(format!("{}:/", (bytes[0] as char).to_ascii_uppercase())),
+        Some(b'/') => Some(format!(
+            "{}:/{}",
+            (bytes[0] as char).to_ascii_uppercase(),
+            &rest[2..]
+        )),
+        _ => None,
+    }
+}
 
 /// Discover boot classpath entries from JAVA_HOME.
 ///
@@ -894,6 +967,73 @@ mod tests {
             let entries = VmConfig::parse_classpath(":lib:classes");
             assert_eq!(entries, vec!["lib", "classes"]);
         }
+    }
+
+    /// MSYS/Git-Bash on Windows leaves `;`-joined classpaths untranslated,
+    /// so `parse_classpath` has to recognise POSIX-drive entries and
+    /// convert them. Verified on Windows only — on POSIX hosts the
+    /// translation is a no-op and `/c/...` is taken verbatim.
+    #[test]
+    #[cfg(windows)]
+    fn parse_classpath_normalizes_msys_paths() {
+        let entries = VmConfig::parse_classpath(
+            "/c/craton/bootstrap.jar;/c/craton/tomcat-juli.jar",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                "C:/craton/bootstrap.jar".to_string(),
+                "C:/craton/tomcat-juli.jar".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parse_classpath_normalizes_cygdrive_paths() {
+        let entries = VmConfig::parse_classpath(
+            "/cygdrive/c/a.jar;/cygdrive/d/b.jar",
+        );
+        assert_eq!(
+            entries,
+            vec!["C:/a.jar".to_string(), "D:/b.jar".to_string()]
+        );
+    }
+
+    /// Native Windows entries and relative entries pass through untouched.
+    #[test]
+    #[cfg(windows)]
+    fn parse_classpath_preserves_native_windows_paths() {
+        let entries = VmConfig::parse_classpath(
+            "C:/foo/a.jar;lib/b.jar;.;C:\\bar\\c.jar",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                "C:/foo/a.jar".to_string(),
+                "lib/b.jar".to_string(),
+                ".".to_string(),
+                "C:\\bar\\c.jar".to_string(),
+            ]
+        );
+    }
+
+    /// An entry that is just a leading slash followed by a name that
+    /// isn't a single drive letter (e.g. `/etc/...`) must not be
+    /// rewritten — we don't want to mangle paths that genuinely start
+    /// at the filesystem root on some other platform that happens to be
+    /// passed through verbatim.
+    #[test]
+    #[cfg(windows)]
+    fn parse_classpath_leaves_non_drive_root_paths_untouched() {
+        let entries = VmConfig::parse_classpath("/etc/foo.jar;/usr/lib/bar.jar");
+        assert_eq!(
+            entries,
+            vec![
+                "/etc/foo.jar".to_string(),
+                "/usr/lib/bar.jar".to_string(),
+            ]
+        );
     }
 
     #[test]

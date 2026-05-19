@@ -17,42 +17,29 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_VERSION_INFO: &str = "org/apache/hadoop/util/VersionInfo";
+#[allow(dead_code)]
 const CN_RUN_JAR: &str = "org/apache/hadoop/util/RunJar";
 
+#[allow(dead_code)]
 fn hadoop_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[hadoop-shim] main short-circuited (boot-test mode)");
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn hadoop_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// Install Hadoop boot-test short-circuits.
 pub fn register_hadoop_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when set to "1", skip installing the boot-test
-    // short-circuits so the real Hadoop main runs (used by the
-    // orchestrator's real-app diagnostics).
-    if std::env::var("RUSTJVM_HADOOP_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    registry.register(
-        CN_VERSION_INFO,
-        "main",
-        "([Ljava/lang/String;)V",
-        hadoop_main_noop,
-    );
-    registry.register(CN_VERSION_INFO, "<clinit>", "()V", hadoop_clinit_noop);
-
-    // Defensive: Hadoop also uses RunJar as the `bin/hadoop jar` entry.
-    registry.register(
-        CN_RUN_JAR,
-        "main",
-        "([Ljava/lang/String;)V",
-        hadoop_main_noop,
-    );
-    registry.register(CN_RUN_JAR, "<clinit>", "()V", hadoop_clinit_noop);
+    // DISABLED per "no synthetic stubs" policy. All four registrations
+    // here were fake-main / fake-<clinit> no-ops for VersionInfo and RunJar,
+    // masking the real failure path. The orchestrator wants the first
+    // real-bytecode failure surfaced, then dispatches follow-up fix agents.
+    let _ = registry;
 }
 
 #[cfg(test)]
