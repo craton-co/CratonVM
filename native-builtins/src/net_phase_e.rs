@@ -556,6 +556,187 @@ fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     }
 }
 
+/// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
+/// relative reference path.
+fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) -> String {
+    if base_has_authority && base_path.is_empty() {
+        let mut s = String::from("/");
+        s.push_str(ref_path);
+        s
+    } else {
+        match base_path.rfind('/') {
+            Some(i) => {
+                let mut s = base_path[..=i].to_string();
+                s.push_str(ref_path);
+                s
+            }
+            None => ref_path.to_string(),
+        }
+    }
+}
+
+/// RFC 3986 §5.2.4 — remove `.` and `..` segments from a path.
+fn uri_remove_dot_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    // A path whose final segment is "." or ".." resolves to a directory, so
+    // the output must end with '/' (RFC 3986 §5.2.4 behaviour, matches JDK).
+    let segs: Vec<&str> = path.split('/').collect();
+    let trailing_slash = path.ends_with('/')
+        || matches!(segs.last(), Some(&".") | Some(&".."));
+    let mut out: Vec<&str> = Vec::new();
+    for seg in &segs {
+        match *seg {
+            "" | "." => {}
+            ".." => { out.pop(); }
+            s => out.push(s),
+        }
+    }
+    let mut result = String::new();
+    if absolute {
+        result.push('/');
+    }
+    result.push_str(&out.join("/"));
+    if trailing_slash && !result.ends_with('/') {
+        result.push('/');
+    }
+    result
+}
+
+/// Split a URI string into (scheme, authority, path, query, fragment).
+/// `authority` is `None` when the URI has no `//` authority component.
+fn uri_split(s: &str) -> (Option<String>, Option<String>, String, Option<String>, Option<String>) {
+    let (without_frag, fragment) = match s.find('#') {
+        Some(i) => (&s[..i], Some(s[i + 1..].to_string())),
+        None => (s, None),
+    };
+    let (without_query, query) = match without_frag.find('?') {
+        Some(i) => (&without_frag[..i], Some(without_frag[i + 1..].to_string())),
+        None => (without_frag, None),
+    };
+    // scheme: leading "alpha *( alpha / digit / + / - / . ) :"
+    let (scheme, rest) = match without_query.find(':') {
+        Some(i) if i > 0
+            && without_query[..i].chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+            && without_query[..i].chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            (Some(without_query[..i].to_string()), &without_query[i + 1..])
+        }
+        _ => (None, without_query),
+    };
+    let (authority, path) = if let Some(after) = rest.strip_prefix("//") {
+        let end = after.find('/').unwrap_or(after.len());
+        (Some(after[..end].to_string()), after[end..].to_string())
+    } else {
+        (None, rest.to_string())
+    };
+    (scheme, authority, path, query, fragment)
+}
+
+/// RFC 3986 §5.2 — resolve a reference against a base URI string.
+fn uri_resolve_ref(base: &str, reference: &str) -> String {
+    if reference.is_empty() {
+        return base.to_string();
+    }
+    let (r_scheme, r_auth, r_path, r_query, r_frag) = uri_split(reference);
+    // Reference has a scheme → it is absolute, return as-is (normalized).
+    if r_scheme.is_some() {
+        let path = uri_remove_dot_segments(&r_path);
+        return uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag);
+    }
+    let (b_scheme, b_auth, b_path, b_query, _b_frag) = uri_split(base);
+    let (t_auth, t_path, t_query);
+    if r_auth.is_some() {
+        t_auth = r_auth;
+        t_path = uri_remove_dot_segments(&r_path);
+        t_query = r_query;
+    } else if r_path.is_empty() {
+        t_auth = b_auth.clone();
+        t_path = b_path.clone();
+        t_query = r_query.or(b_query);
+    } else {
+        t_auth = b_auth.clone();
+        if r_path.starts_with('/') {
+            t_path = uri_remove_dot_segments(&r_path);
+        } else {
+            let merged = uri_merge_paths(&b_path, &r_path, b_auth.is_some());
+            t_path = uri_remove_dot_segments(&merged);
+        }
+        t_query = r_query;
+    }
+    uri_recompose(&b_scheme, &t_auth, &t_path, &t_query, &r_frag)
+}
+
+/// RFC 3986 §5.3 — recompose component parts into a URI string.
+fn uri_recompose(
+    scheme: &Option<String>,
+    authority: &Option<String>,
+    path: &str,
+    query: &Option<String>,
+    fragment: &Option<String>,
+) -> String {
+    let mut s = String::new();
+    if let Some(sc) = scheme {
+        s.push_str(sc);
+        s.push(':');
+    }
+    if let Some(a) = authority {
+        s.push_str("//");
+        s.push_str(a);
+    }
+    s.push_str(path);
+    if let Some(q) = query {
+        s.push('?');
+        s.push_str(q);
+    }
+    if let Some(f) = fragment {
+        s.push('#');
+        s.push_str(f);
+    }
+    s
+}
+
+/// Allocate a synthetic `java.net.URI` carrying `raw` as its full text.
+///
+/// Fields are populated **by name** so the object is consistent with the
+/// real `java.net.URI` slot layout — writing by raw slot index would clobber
+/// e.g. the `path` field (real URI slot 6) with the full URI string and
+/// break `getPath()`/`new File(URI)`.
+fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> ObjectRef {
+    let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 18);
+    let (scheme, authority, path, query, fragment) = uri_split(raw);
+    let ssp = {
+        let mut s = String::new();
+        if let Some(a) = &authority { s.push_str("//"); s.push_str(a); }
+        s.push_str(&path);
+        if let Some(q) = &query { s.push('?'); s.push_str(q); }
+        s
+    };
+    let raw_s = ctx.create_string(raw);
+    // `string` — the volatile full-text cache `uri_raw_string` reads first.
+    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_s)));
+    let set = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
+        if let Some(v) = val {
+            let s = ctx.create_string(v);
+            ctx.set_field_by_name(uri_obj, name, Value::Object(Some(s)));
+        }
+    };
+    set(ctx, "scheme", &scheme);
+    set(ctx, "authority", &authority);
+    set(ctx, "query", &query);
+    set(ctx, "fragment", &fragment);
+    if !path.is_empty() {
+        let p = ctx.create_string(&path);
+        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(p)));
+        let dp = ctx.create_string(&path);
+        ctx.set_field_by_name(uri_obj, "decodedPath", Value::Object(Some(dp)));
+    }
+    let ssp_s = ctx.create_string(&ssp);
+    ctx.set_field_by_name(uri_obj, "schemeSpecificPart", Value::Object(Some(ssp_s)));
+    let dssp = ctx.create_string(&ssp);
+    ctx.set_field_by_name(uri_obj, "decodedSchemeSpecificPart", Value::Object(Some(dssp)));
+    uri_obj
+}
+
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
     let uri = "java/net/URI";
 
@@ -782,9 +963,34 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
     });
 
-    // resolve(URI) → just return the argument
-    r.register(uri, "resolve", "(Ljava/net/URI;)Ljava/net/URI;", |_ctx, args| {
-        Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+    // resolve(URI) → RFC 3986 §5.2 reference resolution. The previous
+    // implementation simply returned the argument, which is wrong for any
+    // relative reference (e.g. ActiveMQ's `new URI(jarUrl).resolve("..")`
+    // for locating ACTIVEMQ_HOME from the launcher jar). Without correct
+    // resolution the launcher fell back to a literal `../.` home and could
+    // not find lib/*.jar.
+    r.register(uri, "resolve", "(Ljava/net/URI;)Ljava/net/URI;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let base = uri_raw_string(ctx, this);
+        let reference = match args.get(1) {
+            Some(Value::Object(Some(o))) => uri_raw_string(ctx, *o),
+            _ => return Ok(Some(Value::Object(Some(this)))),
+        };
+        let resolved = uri_resolve_ref(&base, &reference);
+        Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+    });
+
+    // resolve(String) → resolve(URI.create(str)). Registered explicitly so
+    // the synthetic-URI path does not depend on JDK bytecode chaining.
+    r.register(uri, "resolve", "(Ljava/lang/String;)Ljava/net/URI;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let base = uri_raw_string(ctx, this);
+        let reference = match args.get(1) {
+            Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(Some(this)))),
+        };
+        let resolved = uri_resolve_ref(&base, &reference);
+        Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
     });
 
     // create(String) — static factory
@@ -2308,15 +2514,42 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/net/URLConnection;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Determine the URL's external form so we can pick a carrier
+            // class whose type matches what JDK callers cast the result to.
+            // ActiveMQ's Main.getActiveMQHome() does
+            //   `(JarURLConnection) url.openConnection()` on the
+            //   `jar:file:…!/…` URL returned by ClassLoader.getResource() —
+            // returning an HttpURLConnection there throws ClassCastException,
+            // which is swallowed and forces a wrong `../.` home fallback.
+            let ext = {
+                let s5 = read_field_string_or(ctx, this, 5, "");
+                let s = if s5.contains(':') { s5 } else {
+                    match ctx.invoke_virtual(this, "toExternalForm", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(o)))) => ctx.read_string(o).unwrap_or_default(),
+                        _ => {
+                            let s0 = read_field_string_or(ctx, this, 0, "");
+                            if s0.contains(':') { s0 } else { String::new() }
+                        }
+                    }
+                };
+                s
+            };
             // S111r23-DBG: log openConnection calls for spring.factories
-            {
-                let s0 = read_field_string_or(ctx, this, 5, "");
-                let s1 = if s0.is_empty() { read_field_string_or(ctx, this, 0, "") } else { s0.clone() };
-                if s1.contains("spring.factories") {
-                    eprintln!("[CONN-DBG] URL.openConnection: {}", s1);
-                }
+            if ext.contains("spring.factories") {
+                eprintln!("[CONN-DBG] URL.openConnection: {}", ext);
             }
-            let conn = alloc_concurrent_synthetic(ctx, "java/net/HttpURLConnection", 16);
+            // For `jar:` URLs, return a `java/net/JarURLConnection`-typed
+            // object. JarURLConnection is abstract, but `alloc_object`
+            // bypasses the abstract check; the only method ActiveMQ invokes
+            // is `getJarFileURL()` (registered below), and `getInputStream`
+            // delegates to URL.openStream via the HUC_URL field like the
+            // generic URLConnection path.
+            let carrier = if ext.starts_with("jar:") {
+                "java/net/JarURLConnection"
+            } else {
+                "java/net/HttpURLConnection"
+            };
+            let conn = alloc_concurrent_synthetic(ctx, carrier, 16);
             // Field HUC_URL holds the originating URL so `huc_url_string`
             // and `getInputStream` can recover its external form.
             ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
@@ -2327,6 +2560,56 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
             ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
             Ok(Some(Value::Object(Some(conn))))
+        },
+    );
+    // java/net/JarURLConnection.getJarFileURL() — return the `file:` URL of
+    // the enclosing JAR. The originating `jar:file:…!/entry` URL is stored in
+    // HUC_URL; strip the `jar:` prefix and the `!/entry` suffix to recover
+    // the bare jar URL, then construct a fresh java.net.URL for it.
+    r.register(
+        "java/net/JarURLConnection",
+        "getJarFileURL",
+        "()Ljava/net/URL;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("JarURLConnection.getJarFileURL: no URL")),
+            };
+            // Recover the full `jar:file:…!/…` external form.
+            let mut ext = read_field_string_or(ctx, url_obj, 5, "");
+            if !ext.starts_with("jar:") {
+                if let Ok(Some(Value::Object(Some(o)))) = ctx.invoke_virtual(
+                    url_obj, "toExternalForm", "()Ljava/lang/String;", &[],
+                ) {
+                    ext = ctx.read_string(o).unwrap_or_default();
+                }
+            }
+            // jar:<jarurl>!/<entry>  →  <jarurl>
+            let jar_part = ext
+                .strip_prefix("jar:")
+                .unwrap_or(&ext)
+                .split("!/")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if jar_part.is_empty() {
+                return Err(ioex("JarURLConnection.getJarFileURL: malformed URL"));
+            }
+            let spec = ctx.create_string(&jar_part);
+            // Construct via the regular `new URL(String)` path so the
+            // returned object is a fully-initialised java.net.URL.
+            let new_url = match ctx.new_object("java/net/URL")? {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Err(ioex("JarURLConnection.getJarFileURL: alloc URL")),
+            };
+            ctx.invoke_special(
+                "java/net/URL",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(new_url)), Value::Object(Some(spec))],
+            )?;
+            Ok(Some(Value::Object(Some(new_url))))
         },
     );
     // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
