@@ -87,11 +87,11 @@ pub fn lower_method(
             match bound {
                 BoundSource::ParamLen(idx) => {
                     let bound_reg = emitter.materialise_param_len(idx);
-                    emitter.emit_loop_guard(&bound_reg);
+                    emitter.emit_loop_guard(&bound_reg, &li);
                 }
                 BoundSource::Literal(v) => {
                     let bound_reg = emitter.materialise_literal_s32(v);
-                    emitter.emit_loop_guard(&bound_reg);
+                    emitter.emit_loop_guard(&bound_reg, &li);
                 }
             }
             // Body — walks until it hits the back-branch goto.
@@ -632,6 +632,109 @@ mod tests {
             msg.contains("faload") || msg.contains("fastore"),
             "expected a faload/fastore element-kind mismatch error, got: {msg}",
         );
+    }
+
+    // ─────────── counted-loop canonical-shape validation ────────────
+    //
+    // AUDIT 2026-05-20: the element-wise GPU lowering ("one thread per
+    // iteration, `tid` IS the loop variable") is only correct for the
+    // canonical `for (int i = 0; i < n; i++)` loop. The recognizer in
+    // `loop_recog.rs` previously recorded but never validated the exit
+    // comparison and the `iinc` stride, and never checked the start
+    // value — so `i <= n`, `i != n`, `i += 2`, and `i = 5` loops were
+    // silently mis-lowered (wrong / missing elements). These tests pin
+    // the conservative rejection: every non-canonical shape must fail
+    // `lower_method` (→ CPU fallback), and the canonical baseline must
+    // still lower.
+
+    /// Helper: a `NonCanonicalLoops` method is analyzer-eligible but
+    /// must be rejected by `lower_method`. Returns the error message.
+    fn expect_loop_lowering_rejected(method_name: &str, descriptor: &str) -> String {
+        let method = load_method("NonCanonicalLoops", method_name, descriptor);
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!(
+                "expected NonCanonicalLoops.{method_name} to be analyzer-eligible, got {v:?}"
+            ),
+        };
+        let err = lower_method("NonCanonicalLoops", &method, &sig, 7, 5)
+            .expect_err("non-canonical loop must not lower");
+        format!("{err}")
+    }
+
+    #[test]
+    fn le_loop_is_rejected_by_lowering() {
+        // `for (i = 0; i <= n; i++)` — javac emits `if_icmpgt` for the
+        // exit. The `tid < n` dispatch would drop the last element.
+        let msg = expect_loop_lowering_rejected("leLoop", "([II)V");
+        assert!(
+            msg.contains("non-canonical loop-exit comparison"),
+            "expected exit-comparison rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn ne_loop_is_rejected_by_lowering() {
+        // `for (i = 0; i != n; i++)` — javac emits `if_icmpeq` exit.
+        let msg = expect_loop_lowering_rejected("neLoop", "([II)V");
+        assert!(
+            msg.contains("non-canonical loop-exit comparison"),
+            "expected exit-comparison rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn stride2_loop_is_rejected_by_lowering() {
+        // `for (i = 0; i < n; i += 2)` — `iinc iv, 2`. The lowering
+        // would read element `tid` where the loop wants `2*tid`.
+        let msg = expect_loop_lowering_rejected("stride2Loop", "([I)V");
+        assert!(
+            msg.contains("non-unit loop stride"),
+            "expected stride rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn nonzero_start_loop_is_rejected_by_lowering() {
+        // `for (i = 5; i < n; i++)` — `iconst_5; istore iv`. Every
+        // access would be offset by 5.
+        let msg = expect_loop_lowering_rejected("start5Loop", "([I)V");
+        assert!(
+            msg.contains("non-zero loop start value"),
+            "expected start-value rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn canonical_loop_still_lowers_correctly() {
+        // The canonical `for (i = 0; i < n; i++)` baseline must still
+        // be recognized and lowered to a real element-wise kernel.
+        let m = lower_fixture("NonCanonicalLoops", "canonical", "([I[I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry NonCanonicalLoops__canonical_"));
+        // Canonical guard: `tid >= bound` early-out.
+        assert!(text.contains("setp.ge.s32"));
+        // Two int loads + one int store + one add — the body lowered.
+        assert!(text.matches("ld.global.s32").count() >= 2);
+        assert!(text.contains("st.global.s32"));
+        assert!(text.contains("add.s32"));
+    }
+
+    #[test]
+    fn canonical_loop_recognizer_records_unit_stride() {
+        // White-box: the recognizer accepts the canonical loop and
+        // records exit op `if_icmpge` (0xA2) and stride +1.
+        let method = load_method("NonCanonicalLoops", "canonical", "([I[I[I)V");
+        let code = method.code().expect("canonical has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code)
+            .expect("canonical loop must be recognized");
+        match shape {
+            super::loop_recog::LoopShape::Counted(li) => {
+                assert_eq!(li.exit_op, 0xA2, "canonical exit op must be if_icmpge");
+                assert_eq!(li.iv_stride, 1, "canonical stride must be +1");
+            }
+            other => panic!("expected Counted loop, got {other:?}"),
+        }
     }
 
     #[test]

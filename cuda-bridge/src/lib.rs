@@ -150,6 +150,37 @@ impl DeviceContext {
     }
 }
 
+/// Process-wide kernel-name interner.
+///
+/// AUDIT 2026-05-20 (PERF Fix #2): cudarc 0.13 needs `&'static str`
+/// kernel names. Rather than `Box::leak`-ing on every `from_ptx` call
+/// (which leaks unboundedly when callers load modules with generated /
+/// unique kernel names in a loop), each distinct name is leaked at most
+/// once and cached here. Subsequent loads of the same name return the
+/// already-interned `'static` slot — zero new allocation, zero leak.
+///
+/// The cache only ever grows by *distinct* kernel name, which is the
+/// genuinely bounded quantity (a finite set of kernel identifiers the
+/// process ever compiles), so the total leaked memory is bounded.
+#[cfg(feature = "cuda")]
+fn intern_kernel_name(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static INTERNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let set = INTERNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&existing) = guard.get(name) {
+        return existing;
+    }
+    // First sighting of this name: leak exactly one boxed string and
+    // record the `'static` reference so future calls reuse it.
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    guard.insert(leaked);
+    leaked
+}
+
 /// A loaded PTX module containing one or more named kernel entry points.
 pub struct DeviceModule(backend::DeviceModuleInner);
 
@@ -160,15 +191,20 @@ impl DeviceModule {
         // slice alive for the lifetime of the loaded module, so the
         // backend requires `&[&'static str]`. The public surface stays
         // `&[&str]` for ergonomics; we bridge by interning each name
-        // into a `'static` leak. A PTX module is loaded once and lives
-        // for the rest of the process, so this leak is bounded by the
-        // total distinct kernel-name count — not a per-launch cost.
+        // into a `'static` leak.
+        //
+        // AUDIT 2026-05-20 (PERF Fix #2): the previous comment claimed
+        // the leak was "bounded by the total distinct kernel-name count",
+        // but it leaked unconditionally on *every* call — a caller that
+        // JITs kernels with generated/unique names in a loop, then loads
+        // them, leaked one boxed string per name with no dedup. Now each
+        // name is interned through a process-wide dedup cache so a given
+        // distinct name is leaked at most once; repeat loads of the same
+        // kernel name reuse the existing `'static` slot.
         #[cfg(feature = "cuda")]
         {
-            let static_names: Vec<&'static str> = kernel_names
-                .iter()
-                .map(|n| &*Box::leak(n.to_string().into_boxed_str()))
-                .collect();
+            let static_names: Vec<&'static str> =
+                kernel_names.iter().map(|n| intern_kernel_name(n)).collect();
             backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", &static_names).map(Self)
         }
         #[cfg(not(feature = "cuda"))]

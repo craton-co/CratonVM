@@ -1,0 +1,58 @@
+# Build guard for the `cuda-bridge` crate.
+#
+# `cuda-bridge` ships two backends:
+#   * `backend_stub.rs`  — the default (`default = []`), compiled by every
+#                          normal build and the bulk of CI.
+#   * `backend_cuda.rs`  — the real cudarc-backed driver bridge, only
+#                          compiled behind the `cuda` Cargo feature.
+#
+# Because the real backend is not part of the default feature set, an
+# ordinary `cargo build` / `cargo check` never touches it — so it can
+# silently rot against `cudarc` API changes. This workflow compiles BOTH
+# configurations on every push/PR so the `cuda` feature can never break
+# unnoticed again.
+#
+# Note: `cargo check --features cuda` only links against `cudarc` (which
+# loads `libcuda`/`nvcuda.dll` lazily at runtime) — it does NOT require an
+# attached GPU or the CUDA SDK headers, so it runs fine on public CI.
+
+name: cuda-bridge
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cuda-bridge/**'
+      - '.github/workflows/cuda-bridge.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cuda-bridge/**'
+      - '.github/workflows/cuda-bridge.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  cuda-bridge:
+    name: cuda-bridge (stub + cuda)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Default backend — the stub. Must always stay green.
+      - name: Check default (stub) backend
+        run: cargo check -p cuda-bridge
+
+      # Real cudarc-backed backend. Guards against the `cuda` feature
+      # rotting against cudarc API changes.
+      - name: Check cuda backend
+        run: cargo check -p cuda-bridge --features cuda

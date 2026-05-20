@@ -16,13 +16,34 @@ use rustjvm_reader::method::ClassFileMethod;
 /// Load `class_name.class` from the fixtures directory and return the
 /// named method. Panics if the class or method cannot be found — tests
 /// that depend on a fixture should fail loudly when it goes missing.
+///
+/// The reader builds every attribute as a `LazyAttribute::Raw` and
+/// never structurally parses it; `ClassFileMethod::code()` only returns
+/// `Some` once the `Code` attribute has been *force-decoded* (see its
+/// doc comment). The analyzer and lowering pipeline both call `code()`,
+/// so this helper force-decodes every method's attributes against the
+/// class's constant pool before handing the method back — otherwise
+/// every fixture method would look like it had no `Code` attribute and
+/// the analyzer would (wrongly) reject it with `Reason::NoCode`.
 pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> ClassFileMethod {
     let path = fixture_path(class_name);
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
-    let class = read_class(&bytes)
+    let mut class = read_class(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-    let mut method = class
+    // Force-decode every method's lazy `Raw` attributes against the
+    // class constant pool so `ClassFileMethod::code()` returns `Some`
+    // downstream — otherwise the analyzer rejects every fixture with a
+    // spurious `Reason::NoCode`.
+    for method in &mut class.methods {
+        force_decode_all(&mut method.attributes, &class.constant_pool).unwrap_or_else(|e| {
+            panic!(
+                "failed to decode attributes for a method in {}: {e:?}",
+                path.display()
+            )
+        });
+    }
+    class
         .methods
         .into_iter()
         .find(|m| &*m.name == method_name && &*m.descriptor == descriptor)
@@ -32,22 +53,7 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
                  (did the Java source change without recompiling?)",
                 path.display()
             )
-        });
-    // The class reader leaves attributes in their lazy `Raw` form;
-    // `ClassFileMethod::code()` only sees *decoded* attributes, so
-    // without this the Code attribute is invisible and every
-    // analyzer/lowering test panics with a spurious `NoCode`. Force
-    // every method attribute (and the nested Code attributes) to decode
-    // so fixtures behave like a class loaded by the real VM.
-    rustjvm_reader::attribute::force_decode_all(&mut method.attributes, &class.constant_pool)
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to decode attributes of {method_name}{descriptor} \
-                 in {}: {e:?}",
-                path.display()
-            )
-        });
-    method
+        })
 }
 
 fn fixture_path(class_name: &str) -> std::path::PathBuf {

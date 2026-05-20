@@ -241,7 +241,30 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit `if (tid >= bound) ret;` using a fresh predicate register.
-    pub fn emit_loop_guard(&mut self, bound: &Reg) {
+    ///
+    /// This `tid >= bound` dispatch (one thread runs iff `0 <= tid <
+    /// bound`) is the GPU analogue of the canonical Java loop
+    /// `for (int i = 0; i < bound; i++)`. It is *only* correct for that
+    /// exact shape: start value 0, stride +1, strict-`<` exit. The loop
+    /// recognizer ([`crate::lowering::loop_recog::detect_loop`]) has
+    /// already rejected every other shape — `<=`/`!=`/`>`/`>=` exits,
+    /// non-unit strides, non-zero starts — before emission reaches
+    /// here. The `debug_assert!`s below pin that contract: if a future
+    /// change to the recognizer ever lets a non-canonical loop through,
+    /// a debug build trips here instead of silently corrupting data.
+    pub fn emit_loop_guard(&mut self, bound: &Reg, loop_info: &CountedLoop) {
+        debug_assert_eq!(
+            loop_info.exit_op, 0xA2,
+            "emit_loop_guard: counted loop reached emission with a \
+             non-`if_icmpge` exit (0x{:02x}) — loop_recog must reject it",
+            loop_info.exit_op
+        );
+        debug_assert_eq!(
+            loop_info.iv_stride, 1,
+            "emit_loop_guard: counted loop reached emission with stride {} \
+             — loop_recog must reject any non-unit stride",
+            loop_info.iv_stride
+        );
         let tid = self.tid_reg.clone().expect("emit_tid was called");
         let p = self.regs.fresh_reg(RegKind::Pred);
         writeln!(
