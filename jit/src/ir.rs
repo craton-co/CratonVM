@@ -609,7 +609,7 @@ impl IrBuilder {
                 }
                 // sipush
                 0x11 => {
-                    let val = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i64;
+                    let val = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i64;
                     let c = self.iconst(val);
                     self.push(c);
                     pc += 3;
@@ -817,7 +817,7 @@ impl IrBuilder {
 
                 // ifeq..ifle (0x99..0x9e) — compare int against zero
                 0x99..=0x9e => {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let target_pc = (pc as i32 + offset) as usize;
                     let val = self.pop();
                     let zero = self.iconst(0);
@@ -855,7 +855,7 @@ impl IrBuilder {
 
                 // if_icmpeq..if_icmple (0x9f..0xa4)
                 0x9f..=0xa4 => {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let target_pc = (pc as i32 + offset) as usize;
                     let b = self.pop();
                     let a = self.pop();
@@ -890,7 +890,7 @@ impl IrBuilder {
 
                 // goto
                 0xa7 => {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let target_pc = (pc as i32 + offset) as usize;
                     self.add_merge_predecessor(target_pc);
                     self.ctrl = NO_NODE; // dead after unconditional jump
@@ -956,7 +956,7 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             // ifeq..ifle, if_icmpeq..if_icmple
             0x99..=0xa4 => {
                 if pc + 2 < code_len {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let target_i32 = pc as i32 + offset;
                     // Validate: target must be non-negative and within code bounds.
                     if target_i32 >= 0 && (target_i32 as usize) < code_len {
@@ -972,7 +972,7 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
             // goto
             0xa7 => {
                 if pc + 2 < code_len {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let target_i32 = pc as i32 + offset;
                     if target_i32 >= 0 && (target_i32 as usize) < code_len {
                         targets.push(target_i32 as usize);

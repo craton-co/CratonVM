@@ -1413,12 +1413,11 @@ fn decode_code_body(
     }))
 }
 
-/// Maximum nesting depth for annotation `element_value` structures.
-/// Annotation arrays (`[`) and nested annotations (`@`) recurse on
-/// attacker-controlled class data; this cap (matching the JVMS
-/// array-dimension limit) stops a malicious .class file from blowing
-/// the native stack via unbounded recursion.
-const MAX_ELEMENT_VALUE_DEPTH: u32 = 255;
+/// Maximum nesting depth for the `decode_annotation` ⇄ `decode_element_value`
+/// mutual recursion. An untrusted annotation can nest `@`/`[` element values
+/// arbitrarily deep; without a cap that overflows the stack. 256 far exceeds
+/// anything a real compiler emits.
+const MAX_ANNOTATION_DEPTH: usize = 256;
 
 /// Decode a single annotation structure (JVM spec 4.7.16).
 fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassReaderError> {
@@ -1427,18 +1426,23 @@ fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassR
 
 /// Depth-tracking implementation of [`decode_annotation`]. `depth` counts
 /// the annotation/array nesting so far; it is checked against
-/// [`MAX_ELEMENT_VALUE_DEPTH`] inside [`decode_element_value_depth`].
+/// [`MAX_ANNOTATION_DEPTH`] here and inside [`decode_element_value_depth`].
 fn decode_annotation_depth(
     buf: &mut ClassFileBuffer<'_>,
-    depth: u32,
+    depth: usize,
 ) -> Result<Annotation, ClassReaderError> {
+    if depth >= MAX_ANNOTATION_DEPTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: "annotation nesting depth exceeds limit".to_string(),
+        });
+    }
     let type_index = buf.read_u16()?;
     let num_element_value_pairs = buf.read_u16()?;
     let mut element_value_pairs =
         Vec::with_capacity((num_element_value_pairs as usize).min(PREALLOC_CAP));
     for _ in 0..num_element_value_pairs {
         let element_name_index = buf.read_u16()?;
-        let value = decode_element_value_depth(buf, depth)?;
+        let value = decode_element_value_depth(buf, depth + 1)?;
         element_value_pairs.push(ElementValuePair {
             element_name_index,
             value,
@@ -1459,17 +1463,15 @@ fn decode_element_value(
 
 /// Depth-tracking implementation of [`decode_element_value`]. The `[`
 /// (array) and `@` (nested annotation) tags recurse; each recursion
-/// increments `depth`, and exceeding [`MAX_ELEMENT_VALUE_DEPTH`] returns
+/// increments `depth`, and exceeding [`MAX_ANNOTATION_DEPTH`] returns
 /// an error instead of descending further.
 fn decode_element_value_depth(
     buf: &mut ClassFileBuffer<'_>,
-    depth: u32,
+    depth: usize,
 ) -> Result<ElementValue, ClassReaderError> {
-    if depth >= MAX_ELEMENT_VALUE_DEPTH {
+    if depth >= MAX_ANNOTATION_DEPTH {
         return Err(ClassReaderError::InvalidClassData {
-            message: format!(
-                "annotation element_value nesting exceeds {MAX_ELEMENT_VALUE_DEPTH}"
-            ),
+            message: "annotation element_value nesting depth exceeds limit".to_string(),
         });
     }
     let tag = buf.read_u8()?;
@@ -1755,7 +1757,7 @@ mod tests {
     fn deeply_nested_element_value_array_is_rejected() {
         // Build an element_value that is a 300-deep stack of `[` arrays
         // (each array tag followed by a u16 count of 1). This exceeds the
-        // MAX_ELEMENT_VALUE_DEPTH cap and must return an error rather than
+        // MAX_ANNOTATION_DEPTH cap and must return an error rather than
         // recursing into a native stack overflow.
         let mut data = Vec::new();
         for _ in 0..300 {

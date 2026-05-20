@@ -5693,7 +5693,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let path_ref = obj_arg(args, 1)?;
                 let p = ctx.read_string(path_ref).unwrap_or_default();
                 let canonical = std::fs::canonicalize(&p)
-                    .map(|c| c.to_string_lossy().to_string())
+                    .map(|c| {
+                        // Strip the Windows `\\?\` extended-length prefix —
+                        // the real JDK's canonicalize0 never returns it, and
+                        // it corrupts any subsequent `File.toURI()`.
+                        let s = c.to_string_lossy().into_owned();
+                        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                            format!(r"\\{rest}")
+                        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                            rest.to_string()
+                        } else {
+                            s
+                        }
+                    })
                     .unwrap_or(p);
                 let s = ctx.create_string(&canonical);
                 Ok(Some(Value::Object(Some(s))))
@@ -7310,12 +7322,26 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)))))
     });
+    // Strip the Windows `\\?\` extended-length prefix that
+    // `std::fs::canonicalize` prepends. The real JDK's `getCanonicalPath`
+    // never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
+    // makes a later `File.toURI()` produce `file://?/C:/...`, an invalid
+    // URL that breaks Tomcat's `ClassLoaderFactory.buildClassLoaderUrl`.
+    fn strip_unc(p: &str) -> String {
+        if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            p.to_string()
+        }
+    }
     r.register(file, "getCanonicalPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         match std::fs::canonicalize(&path) {
             Ok(canonical) => {
-                let s = ctx.create_string(&canonical.to_string_lossy());
+                let s = ctx.create_string(&strip_unc(&canonical.to_string_lossy()));
                 Ok(Some(Value::Object(Some(s))))
             }
             Err(_) => {
@@ -7337,7 +7363,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let canonical = std::fs::canonicalize(&path)
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| strip_unc(&p.to_string_lossy()))
             .unwrap_or(path);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &canonical)))))
     });
@@ -7780,13 +7806,30 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "toURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        // Normalise to forward-slashes and ensure absolute path starts with /
+        // Normalise to forward-slashes and ensure absolute path starts with /.
         let norm = path.replace('\\', "/");
         let abs = if norm.starts_with('/') { norm } else { format!("/{norm}") };
-        let full = format!("file://{abs}");
-        // URI is 6-field synthetic: use url_parse helper to populate all fields
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
+        // Per `File.toURI()`, the result is `new URI("file", null, path, null)`
+        // which renders as `file:/C:/...` — a SINGLE slash before the path
+        // (no `//authority`). Emitting `file://` + `/C:/...` here produced
+        // the malformed `file:///C:/...` whose `URI.toURL()` returned null
+        // and broke every `URLClassLoader` built from `File.toURI().toURL()`.
+        let mut dir_path = path.replace('\\', "/");
+        if !dir_path.starts_with('/') {
+            dir_path = format!("/{dir_path}");
+        }
+        let is_dir = std::path::Path::new(&path).is_dir();
+        // Directory URIs end with a trailing slash, matching `slashify(...)`.
+        if is_dir && !dir_path.ends_with('/') {
+            dir_path.push('/');
+        }
+        let full = format!("file:{dir_path}");
+        let _ = abs;
+        // Allocate a real URI and populate named + positional fields so both
+        // `URI` natives and any real-JDK bytecode see consistent state.
+        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         crate::url_parse(ctx, uri, &full);
+        crate::uri_store_named(ctx, uri, &full);
         Ok(Some(Value::Object(Some(uri))))
     });
 

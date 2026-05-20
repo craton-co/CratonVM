@@ -578,7 +578,7 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("expected TwoLoops.clearTwice to be eligible, got {v:?}"),
         };
-        let err = lower_method("TwoLoops", &method, &sig, 7, 0)
+        let err = lower_method("TwoLoops", &method, &sig, 7, 5)
             .expect_err("two-loop method must not lower");
         let msg = format!("{err}");
         assert!(
@@ -599,5 +599,45 @@ mod tests {
         let bytes = vec![0x03, 0xAC];
         let shape = super::loop_recog::detect_loop(&bytes).unwrap();
         assert!(matches!(shape, super::loop_recog::LoopShape::StraightLine));
+    }
+
+    // AUDIT 2026-05-16: `frem`/`drem` previously emitted a non-existent
+    // `rem.f32`/`rem.f64` PTX mnemonic that ptxas rejects on every
+    // kernel. The fix routes both through `LoweringError::UnsupportedNode`
+    // so the analyzer skips the method entirely. These two tests pin the
+    // behavior so the bug cannot regress.
+
+    #[test]
+    fn frem_is_rejected_by_lowering() {
+        let method = load_method("FloatRemainder", "fremScalar", "(FF)F");
+        // `fremScalar` is a straight-line method — analyze decides it is
+        // eligible. Lowering must then reject `frem` (0x72).
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected FloatRemainder.fremScalar to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("FloatRemainder", &method, &sig, 7, 5)
+            .expect_err("frem must not lower (PTX has no rem.f32)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("frem"),
+            "expected error message to mention 'frem', got: {msg}",
+        );
+    }
+
+    #[test]
+    fn drem_is_rejected_by_lowering() {
+        let method = load_method("FloatRemainder", "dremScalar", "(DD)D");
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected FloatRemainder.dremScalar to be analyzer-eligible, got {v:?}"),
+        };
+        let err = lower_method("FloatRemainder", &method, &sig, 7, 5)
+            .expect_err("drem must not lower (PTX has no rem.f64)");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("drem"),
+            "expected error message to mention 'drem', got: {msg}",
+        );
     }
 }

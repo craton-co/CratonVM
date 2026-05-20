@@ -38,24 +38,17 @@ impl FieldType {
         Ok(field_type)
     }
 
-    /// Maximum array nesting depth. The JVMS caps array descriptors at 255
-    /// dimensions; we use the same bound to stop attacker-controlled
-    /// descriptors from blowing the native stack via unbounded recursion.
-    const MAX_ARRAY_DEPTH: u32 = 255;
+    /// JVMS §4.3.2: an array type may have at most 255 dimensions. The cap
+    /// also bounds recursion in `parse_partial`, preventing a stack-overflow
+    /// DoS from an untrusted descriptor of nothing but `[` bytes.
+    const MAX_ARRAY_DIMENSIONS: usize = 255;
 
     /// Parse a field type descriptor, returning the parsed type and the remaining unparsed string.
     pub fn parse_partial(descriptor: &str) -> Result<(Self, &str), ClassReaderError> {
         Self::parse_partial_depth(descriptor, 0)
     }
 
-    /// Depth-tracking implementation of [`FieldType::parse_partial`]. Each
-    /// `[` (array dimension) increments `depth`; exceeding
-    /// [`FieldType::MAX_ARRAY_DEPTH`] returns an error instead of recursing
-    /// deeper, preventing a stack overflow on hostile descriptors.
-    fn parse_partial_depth(
-        descriptor: &str,
-        depth: u32,
-    ) -> Result<(Self, &str), ClassReaderError> {
+    fn parse_partial_depth(descriptor: &str, dimensions: usize) -> Result<(Self, &str), ClassReaderError> {
         let bytes = descriptor.as_bytes();
         if bytes.is_empty() {
             return Err(ClassReaderError::InvalidTypeDescriptor {
@@ -85,13 +78,13 @@ impl FieldType {
                 ))
             }
             b'[' => {
-                if depth >= Self::MAX_ARRAY_DEPTH {
+                if dimensions >= Self::MAX_ARRAY_DIMENSIONS {
                     return Err(ClassReaderError::InvalidTypeDescriptor {
                         descriptor: descriptor.to_string(),
                     });
                 }
                 let (component_type, remaining) =
-                    Self::parse_partial_depth(&descriptor[1..], depth + 1)?;
+                    Self::parse_partial_depth(&descriptor[1..], dimensions + 1)?;
                 Ok((FieldType::Array(Box::new(component_type)), remaining))
             }
             _ => Err(ClassReaderError::InvalidTypeDescriptor {

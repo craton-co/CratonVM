@@ -8517,6 +8517,59 @@ fn invoke_on_class_shared_inner(
                         }
                     }
                 }
+                // Final native-registry fallback: a few real-JDK classes
+                // (e.g. `java/io/PrintStream`) have package-private methods
+                // that real-world bytecode reaches via a wider-typed call
+                // site (`Writer.write(String,int,int)` against a PrintStream
+                // receiver). Method resolution against the class file misses
+                // these, but we provide Rust natives for them. Walk both the
+                // dispatch class chain and the receiver class chain probing
+                // the native registry before surfacing NSME.
+                {
+                    let cm_nat = shared.class_manager.read();
+                    let mut probe_cid = Some(class_id);
+                    while let Some(cid) = probe_cid {
+                        if let Some(cls) = cm_nat.class_store.get(cid) {
+                            if crate::runtime::env_cache::nsme_dbg() {
+                                eprintln!(
+                                    "[NSME_DBG] native-probe class={} method={}{} hit={}",
+                                    cls.name, method_name, descriptor,
+                                    shared.native_methods.find(&cls.name, method_name, descriptor).is_some()
+                                );
+                            }
+                            if let Some(cb) = shared.native_methods.find(
+                                &cls.name, method_name, descriptor,
+                            ) {
+                                drop(cm_nat);
+                                return safe_native_call(shared, thread, cb, args);
+                            }
+                            probe_cid = cls.superclass;
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        let mut probe_cid = Some(recv_cid);
+                        while let Some(cid) = probe_cid {
+                            if cid == class_id {
+                                break;
+                            }
+                            if let Some(cls) = cm_nat.class_store.get(cid) {
+                                if let Some(cb) = shared.native_methods.find(
+                                    &cls.name, method_name, descriptor,
+                                ) {
+                                    drop(cm_nat);
+                                    return safe_native_call(shared, thread, cb, args);
+                                }
+                                probe_cid = cls.superclass;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    drop(cm_nat);
+                }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),
                     "NoSuchMethodError"

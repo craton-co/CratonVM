@@ -905,7 +905,17 @@ fn decode_event_value(
                         ))
                     })?;
                     let start = pos + 1 + lc;
-                    let end = start + len as usize;
+                    // checked_add: `len` is an attacker-controlled compressed-int;
+                    // an unchecked `+` would wrap `usize` past the bounds check.
+                    let end = (start as u64)
+                        .checked_add(len)
+                        .and_then(|e| usize::try_from(e).ok())
+                        .ok_or_else(|| {
+                            JfrDumpError::Io(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "string length overflow",
+                            ))
+                        })?;
                     if end > data.len() {
                         return Err(JfrDumpError::Io(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
@@ -915,7 +925,9 @@ fn decode_event_value(
                     let s = std::str::from_utf8(&data[start..end]).map_err(|e| {
                         JfrDumpError::Io(io::Error::new(io::ErrorKind::InvalidData, e))
                     })?;
-                    Ok((EventValue::String(std::sync::Arc::from(s)), 1 + lc + len as usize))
+                    // `end - pos` == `1 + lc + len` but cannot overflow: `end`
+                    // was validated above and `end >= pos`.
+                    Ok((EventValue::String(std::sync::Arc::from(s)), end - pos))
                 }
                 4 => {
                     // Pool-reference: compressed-int index into the chunk pool.
@@ -971,7 +983,17 @@ fn parse_checkpoint_pool(
             "checkpoint record size decode failed",
         ))
     })?;
-    let record_end = offset + record_size as usize;
+    // checked_add: `record_size` is an attacker-controlled compressed-int; a
+    // huge value would wrap `usize` and slip past the `> data.len()` check.
+    let record_end = (offset as u64)
+        .checked_add(record_size)
+        .and_then(|e| usize::try_from(e).ok())
+        .ok_or_else(|| {
+            JfrDumpError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "checkpoint record size overflow",
+            ))
+        })?;
     if record_end > data.len() {
         return Err(JfrDumpError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1049,7 +1071,17 @@ fn parse_checkpoint_pool(
                     ))
                 })?;
                 pos += lc;
-                let end = pos + slen as usize;
+                // checked_add: `slen` is an attacker-controlled compressed-int;
+                // an unchecked `+` would wrap `usize` past the bounds check.
+                let end = (pos as u64)
+                    .checked_add(slen)
+                    .and_then(|e| usize::try_from(e).ok())
+                    .ok_or_else(|| {
+                        JfrDumpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "pool entry length overflow",
+                        ))
+                    })?;
                 if end > record_end {
                     return Err(JfrDumpError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1146,7 +1178,17 @@ pub fn read_events(
                 "record size decode failed",
             ))
         })?;
-        let record_end = pos + total_size as usize;
+        // checked_add: `total_size` is an attacker-controlled compressed-int;
+        // an unchecked `+` would wrap `usize` past the bounds check below.
+        let record_end = (pos as u64)
+            .checked_add(total_size)
+            .and_then(|e| usize::try_from(e).ok())
+            .ok_or_else(|| {
+                JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record size overflow",
+                ))
+            })?;
         if record_end > events_end {
             return Err(JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,

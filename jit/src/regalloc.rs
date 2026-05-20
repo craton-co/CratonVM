@@ -77,7 +77,8 @@ fn branch_target(code: &[u8], pc: usize) -> Option<usize> {
             if pc + 2 >= code.len() {
                 return None;
             }
-            let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+            // JVM branch offsets are big-endian signed i16.
+            let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
             let target = pc as i32 + offset;
             // Validate the target is non-negative (valid bytecode offset)
             if target < 0 {
@@ -119,7 +120,11 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
             // tableswitch
             if p + 12 > code_len { return targets; }
             let default_off = i32::from_be_bytes([code[p], code[p+1], code[p+2], code[p+3]]);
-            targets.push((base_pc as i32 + default_off) as usize);
+            // Use checked arithmetic: a malformed/negative offset must not
+            // wrap to a huge usize. Skip targets that fall outside the code.
+            if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
+                if t < code_len { targets.push(t); }
+            }
             let low = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
             let high = i32::from_be_bytes([code[p+8], code[p+9], code[p+10], code[p+11]]);
             let count = (high - low + 1).max(0) as usize;
@@ -127,7 +132,9 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
             for _ in 0..count {
                 if p + 4 > code_len { break; }
                 let off = i32::from_be_bytes([code[p], code[p+1], code[p+2], code[p+3]]);
-                targets.push((base_pc as i32 + off) as usize);
+                if let Some(t) = base_pc.checked_add_signed(off as isize) {
+                    if t < code_len { targets.push(t); }
+                }
                 p += 4;
             }
         }
@@ -135,13 +142,17 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
             // lookupswitch
             if p + 8 > code_len { return targets; }
             let default_off = i32::from_be_bytes([code[p], code[p+1], code[p+2], code[p+3]]);
-            targets.push((base_pc as i32 + default_off) as usize);
+            if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
+                if t < code_len { targets.push(t); }
+            }
             let npairs = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]) as usize;
             p += 8;
             for _ in 0..npairs {
                 if p + 8 > code_len { break; }
                 let off = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
-                targets.push((base_pc as i32 + off) as usize);
+                if let Some(t) = base_pc.checked_add_signed(off as isize) {
+                    if t < code_len { targets.push(t); }
+                }
                 p += 8;
             }
         }

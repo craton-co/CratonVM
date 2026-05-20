@@ -2895,7 +2895,17 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
     let mut arg_idx = 0;
 
     while i < chars.len() {
-        if chars[i] == '%' && i + 1 < chars.len() {
+        if chars[i] == '%' {
+            // A '%' that is the final character of the format string is a
+            // truncated conversion — real java.util.Formatter throws an
+            // UnknownFormatConversionException (an IllegalFormatException,
+            // which extends IllegalArgumentException).
+            if i + 1 >= chars.len() {
+                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: "Format string ends with a lone '%'".to_string(),
+                }
+                .into());
+            }
             i += 1;
             // Check for %% and %n first
             if chars[i] == '%' {
@@ -2910,8 +2920,11 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             }
 
             // Parse optional flags: -, +, 0, ' ', #, (
+            // Every chars[i] read below is guarded by `i < chars.len()` via
+            // chars.get(i) — a format specifier that runs off the end of the
+            // string must throw, not panic.
             let mut flags = String::new();
-            while i < chars.len() && "-+0 #(".contains(chars[i]) {
+            while chars.get(i).is_some_and(|c| "-+0 #(".contains(*c)) {
                 flags.push(chars[i]);
                 i += 1;
             }
@@ -2919,7 +2932,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             // Parse optional width
             let mut width: Option<usize> = None;
             let width_start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
+            while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
                 i += 1;
             }
             if i > width_start {
@@ -2932,10 +2945,10 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
 
             // Parse optional .precision
             let mut precision: Option<usize> = None;
-            if i < chars.len() && chars[i] == '.' {
+            if chars.get(i) == Some(&'.') {
                 i += 1;
                 let prec_start = i;
-                while i < chars.len() && chars[i].is_ascii_digit() {
+                while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
                     i += 1;
                 }
                 precision = if i > prec_start {
@@ -2946,8 +2959,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             }
 
             // Parse conversion character
-            if i < chars.len() {
-                let spec = chars[i];
+            if let Some(&spec) = chars.get(i) {
                 i += 1;
                 match spec {
                     's' | 'd' | 'f' | 'x' | 'X' | 'c' | 'b' | 'e' | 'E' | 'g' | 'G' | 'o' | 'h'
@@ -2975,6 +2987,13 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
                         result.push(spec);
                     }
                 }
+            } else {
+                // Reached end of string after consuming flags/width/precision
+                // with no conversion character — a truncated specifier.
+                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: "Format string ends with an incomplete conversion".to_string(),
+                }
+                .into());
             }
         } else {
             result.push(chars[i]);

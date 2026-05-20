@@ -101,18 +101,18 @@ pub struct MethodSig {
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Maximum recursion depth for signature parsing. A generic signature can
-/// nest type arguments / array dimensions arbitrarily deeply; without a cap
-/// an attacker-controlled `Signature` attribute string drives recursive
-/// descent into a native stack overflow. 255 matches the JVMS
-/// array-dimension limit and is far beyond any legitimate signature.
-const MAX_SIG_DEPTH: u32 = 255;
+/// Maximum nesting depth for type signatures. Nested generics and array
+/// dimensions recurse in the parser; an untrusted `Signature` attribute of
+/// nothing but `[` (or deeply nested `<...>`) would otherwise overflow the
+/// stack. 256 comfortably exceeds anything a real compiler emits.
+const MAX_SIG_DEPTH: usize = 256;
 
 struct SigParser<'a> {
     input: &'a [u8],
     pos: usize,
-    /// Current recursive-descent nesting depth; see [`MAX_SIG_DEPTH`].
-    depth: u32,
+    /// Current recursion depth — incremented when descending into a nested
+    /// type signature, decremented on the way back out.
+    depth: usize,
 }
 
 impl<'a> SigParser<'a> {
@@ -224,10 +224,8 @@ impl<'a> SigParser<'a> {
     }
 
     fn parse_type_sig(&mut self) -> Option<TypeSig> {
-        // Bound recursion: every recursive descent (array components,
-        // class type signatures, type arguments) routes through here, so
-        // a single depth guard at this chokepoint defends the whole
-        // grammar against a hostile, deeply-nested signature string.
+        // Bound recursion on untrusted input — nested generics and array
+        // dimensions both descend through this function.
         if self.depth >= MAX_SIG_DEPTH {
             return None;
         }

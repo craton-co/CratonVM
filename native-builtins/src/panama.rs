@@ -18,12 +18,57 @@ const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 /// Maximum length to scan when reading a C string from native memory.
 const MAX_CSTR_LEN: usize = 4096;
 
+/// Native-access gate for Panama downcalls.
+///
+/// A `validated_fn_ptr` call transmutes a Java-supplied raw address to an
+/// `extern "C" fn` and invokes it — arbitrary native code execution. Real
+/// JDK Panama gates this behind `--enable-native-access` / the module's
+/// `enableNativeAccess` permission. This crate has no module-permission
+/// plumbing reachable here, so this is a minimal coarse gate.
+///
+/// Default is `true` to preserve current behavior; a host/launcher that
+/// wants the JDK semantics should call [`set_native_access_enabled(false)`]
+/// at startup and flip it on only for modules granted native access.
+///
+/// TODO: wire this to a real per-module `--enable-native-access` check once
+/// `NativeContext` exposes the caller module's native-access permission.
+static NATIVE_ACCESS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Enable or disable Panama native downcalls process-wide.
+///
+/// When disabled, every downcall through [`validated_fn_ptr`] fails with a
+/// thrown exception instead of executing native code. (The JDK throws
+/// `IllegalCallerException`; the crate's `RuntimeError` has no such variant,
+/// so this surfaces as `IllegalStateException` like the other downcall
+/// validation failures.)
+pub fn set_native_access_enabled(enabled: bool) {
+    NATIVE_ACCESS_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether Panama native downcalls are currently permitted.
+pub fn native_access_enabled() -> bool {
+    NATIVE_ACCESS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Safely transmute a raw function address to an extern "C" fn pointer.
-/// Returns an error if the address is null or misaligned.
+/// Returns an error if native access is not permitted, or if the address
+/// is null or misaligned.
 fn validated_fn_ptr<T>(fn_addr: i64) -> Result<T, MethodCallFailed>
 where
     T: Copy,
 {
+    // Gate arbitrary-native-code-execution: a Java caller controlling
+    // `fn_addr` must not be able to invoke arbitrary native code unless
+    // native access has been granted.
+    if !native_access_enabled() {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Native access is not enabled for this module \
+                      (Panama downcall denied)"
+                .into(),
+        }
+        .into());
+    }
     let addr = fn_addr as usize;
     if addr == 0 {
         return Err(RuntimeError::IllegalStateException {
@@ -2287,8 +2332,13 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
         }
 
         // Read null-terminated C string with a bounded scan.
-        // Clamp scan length to the segment's known size (field 1) to avoid
-        // reading past the allocated region.
+        // The scan length MUST be clamped to the segment's recorded size
+        // (field 1) — `from_raw_parts` over a Java-supplied address with an
+        // unverified length is an out-of-bounds-read primitive. A segment
+        // with size 0 has unknown bounds (e.g. created via ofAddress or
+        // wrapping a raw function pointer); the JDK rejects reading a
+        // C string from such a segment, so we do too rather than blindly
+        // scanning MAX_CSTR_LEN bytes from an unbounded address.
         let seg_size = match ctx.get_field(this, 1) {
             Value::Long(n) if n > 0 => {
                 // Account for offset within the segment
@@ -2304,10 +2354,19 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
                 }
                 (remaining as usize).min(MAX_CSTR_LEN)
             }
-            _ => MAX_CSTR_LEN,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "getUtf8String on a segment with unknown bounds \
+                              (size 0): reinterpret the segment with a known \
+                              size before reading a C string"
+                        .into(),
+                }
+                .into());
+            }
         };
-        // SAFETY: addr has been null-checked above. We scan up to
-        // seg_size bytes (clamped to segment bounds) for a null terminator.
+        // SAFETY: addr has been null-checked above. `seg_size` is clamped to
+        // the segment's recorded byte size (field 1) minus `offset`, so the
+        // scan stays within the region the segment claims to own.
         let slice = unsafe { std::slice::from_raw_parts(addr, seg_size) };
         let nul_pos = slice.iter().position(|&b| b == 0);
         let s = match nul_pos {

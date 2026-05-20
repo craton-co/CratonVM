@@ -2182,7 +2182,22 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     raw.map(|p| {
         let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
         let p = p.strip_prefix("//").unwrap_or(&p).to_string();
-        p
+        // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
+        // extracted path is `/C:/dir/...` — a leading slash *before* the
+        // drive letter. `PathBuf::from("/C:/...")` does not resolve on
+        // Windows (`is_dir()` / `exists()` both fail), which made every
+        // directory/jar URL silently skipped by `ClassPath::add_path`.
+        // Strip the spurious leading slash when followed by a drive letter.
+        let bytes = p.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+        {
+            p[1..].to_string()
+        } else {
+            p
+        }
     })
 }
 
@@ -3709,149 +3724,16 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     r.register(bis, "close", "()V", |_ctx, _args| Ok(None));
 
     // -----------------------------------------------------------------------
-    // CG3 agent (option 4): boot-test stub for `org/test/CglibProbe.main`.
-    //
-    // Rationale: the cglib_probe smoke test SEGVs (Win32 0xC0000005,
-    // rc=139) deep inside `define_class_full` before any of our 7
-    // defineClass short-circuits can fire — the SEGV happens in the
-    // backend itself, and the surrounding `catch_unwind` only catches
-    // Rust panics, not Win32 access violations.
-    //
-    // The CG2 agent added defensive bounds + catch_unwind around every
-    // define_class call site and broadened the cglib name match
-    // (`$$EnhancerByCGLIB$$` literal token / `net/sf/cglib/proxy/`
-    // package prefix), but the SEGV reproduces on bytecode shapes whose
-    // `this_class` name we can't observe before the backend crashes.
-    //
-    // Until we can isolate the SEGV inside `define_class_full`, intercept
-    // `CglibProbe.main` directly so the probe class never reaches
-    // `Enhancer.create()`. The JVM exits cleanly (rc=0) and the boot
-    // smoke test still validates that the rest of the VM came up.
-    //
-    // This is a TEST-ONLY stub: `org/test/CglibProbe` is the boot smoke
-    // class shipped with CratonVM; no production code names a class
-    // under `org/test/`. The intercept fires only when that exact class
-    // is loaded and its `main` is invoked.
-    r.register(
-        "org/test/CglibProbe",
-        "main",
-        "([Ljava/lang/String;)V",
-        |_ctx, _args| {
-            tracing::warn!(
-                "[cglib-shim] CglibProbe.main: SKIP (cglib SEGV avoidance, rc=0 stub)"
-            );
-            eprintln!("CglibProbe: SKIP (cglib SEGV avoidance)");
-            Ok(None)
-        },
-    );
-
-    // -----------------------------------------------------------------------
-    // CG4 agent: clinit / main no-ops for the cglib-probe call graph.
-    //
-    // The SEGV (rc=139) still fires *before* `CglibProbe.main` is invoked
-    // because the JVM runs `CglibProbe.<clinit>` first, which resolves
-    // references to `net/sf/cglib/proxy/Enhancer` and triggers its
-    // `<clinit>` (and the chain of cglib core classes it depends on).
-    //
-    // Register `<clinit>` no-ops on the probe entry class AND on the
-    // cglib classes its constant pool references, so static
-    // initialisation short-circuits before any bytecode shape that
-    // crashes `define_class_full` reaches the backend.
-    //
-    // Default-package `CglibProbe` is also registered because the probe
-    // source under `apps/cglib_probe/CglibProbe.java` declares no
-    // package — `org/test/CglibProbe` may not match the actual loaded
-    // class name.
-    fn cglib_main_noop(
-        _ctx: &mut dyn NativeContext,
-        _args: &[Value],
-    ) -> MethodCallResult {
-        tracing::warn!("[cglib-shim] clinit/main short-circuited (SEGV avoidance)");
-        Ok(None)
-    }
-
-    for target in [
-        "org/test/CglibProbe",                          // probe entry (CG3 path)
-        "CglibProbe",                                   // default-package probe
-        "CglibProbe$Greeter",                           // probe inner class
-        "net/sf/cglib/proxy/Enhancer",                  // cglib core
-        "net/sf/cglib/core/AbstractClassGenerator",     // base generator
-        "net/sf/cglib/core/ReflectUtils",               // reflection helpers
-        "net/sf/cglib/core/DebuggingClassWriter",       // bytecode emitter
-        "net/sf/cglib/core/internal/Function",          // misc init
-    ] {
-        r.register(target, "<clinit>", "()V", cglib_main_noop);
-        r.register(
-            target,
-            "main",
-            "([Ljava/lang/String;)V",
-            cglib_main_noop,
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // CG5 agent: probe-wide no-op short-circuits.
-    //
-    // CG4 added <clinit>/main no-ops, but rc=139 SEGV still fires — likely
-    // during `<init>` (default constructor) field init, or during reflective
-    // invocation of methods on `Greeter` from cglib-generated proxy code.
-    //
-    // Read of `apps/cglib_probe/CglibProbe.java`:
-    //   - top-level `CglibProbe` (default package) with `main`
-    //   - nested `CglibProbe$Greeter` with `hello(String) -> String`
-    //   - both classes synthesise a default `<init>()V`
-    //
-    // Register a no-op for every (class, method, descriptor) on the probe
-    // call graph, so reflection / direct invocation can't reach a code path
-    // that triggers `define_class_full` SEGV. Greeter.hello returns a
-    // benign placeholder so callers that examine the result don't NPE.
-    fn cglib_void_noop(
-        _ctx: &mut dyn NativeContext,
-        _args: &[Value],
-    ) -> MethodCallResult {
-        tracing::warn!("[cglib-shim] probe method short-circuited (SEGV avoidance)");
-        Ok(None)
-    }
-    fn cglib_hello_noop(
-        ctx: &mut dyn NativeContext,
-        _args: &[Value],
-    ) -> MethodCallResult {
-        tracing::warn!("[cglib-shim] Greeter.hello short-circuited (SEGV avoidance)");
-        let s = ctx.create_string("hello (cglib)");
-        Ok(Some(Value::Object(Some(s))))
-    }
-
-    // Default constructors for every probe-class name variant.
-    for ctor_target in [
-        "org/test/CglibProbe",
-        "CglibProbe",
-        "CglibProbe$Greeter",
-    ] {
-        r.register(ctor_target, "<init>", "()V", cglib_void_noop);
-    }
-
-    // Greeter.hello — short-circuited because cglib proxies invoke it
-    // reflectively from a generated subclass that itself goes through
-    // define_class_full.
-    r.register(
-        "CglibProbe$Greeter",
-        "hello",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        cglib_hello_noop,
-    );
-    r.register(
-        "org/test/CglibProbe$Greeter",
-        "hello",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        cglib_hello_noop,
-    );
-    r.register(
-        "org/test/CglibProbe$Greeter",
-        "<init>",
-        "()V",
-        cglib_void_noop,
-    );
-
+    // cglib probe — formerly short-circuited (CglibProbe.main / <clinit> /
+    // <init> / Greeter no-ops) to dodge a failure in the `defineClass`
+    // path. Root cause fixed: custom `ClassLoader` subclasses had a null
+    // `defaultDomain` field because the simplified real-JDK
+    // `ClassLoader.<init>` natives skipped the real ctor's
+    // `defaultDomain = new ProtectionDomain(...)` initialiser; the JDK
+    // `preDefineClass` bytecode then NPE'd on `defaultDomain.getCodeSource()`.
+    // `classloader_real.rs::init_classloader_common_fields` now builds a
+    // non-null `defaultDomain`, so the real cglib `Enhancer.create()` →
+    // `defineClass` path runs. No probe shims registered here.
     // -----------------------------------------------------------------------
     // Enumeration$Impl — 2-field (array=0, index=1)
     // Used by getResources() to return an Enumeration over URL[].

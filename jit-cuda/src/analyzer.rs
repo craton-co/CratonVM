@@ -109,6 +109,26 @@ pub enum Reason {
     NonStaticReceiverMisuse,
     /// An opcode we haven't enumerated yet — be safe and reject.
     UnknownOpcode(u8),
+    /// AUDIT 2026-05-16: the method has at least one array parameter
+    /// and a scalar (non-void) return — i.e. it reduces N array
+    /// elements to a single scalar (e.g. `dot([I[I)J`, `sum([I)I`).
+    /// The current emitter has no block-reduction lowering: every CUDA
+    /// thread would race-overwrite the single scalar slot with its own
+    /// per-element term, producing silently wrong results. Reject the
+    /// shape so the VM falls back to CPU execution until a proper
+    /// reduction lowering is implemented.
+    ReductionNotImplemented,
+    /// AUDIT 2026-05-19: the method has a counted loop (a backward
+    /// branch) and a scalar (non-void) return. The counted-loop
+    /// lowering dispatches one CUDA thread per loop iteration, but
+    /// `scalar_return` writes the result through the single `ret_ptr`;
+    /// every thread races to overwrite that one slot with its own
+    /// per-iteration value — silently wrong results. The
+    /// `ReductionNotImplemented` check above only catches array-in /
+    /// scalar-out shapes, so a scalar-in / scalar-out counted loop
+    /// (e.g. `(II)I` that loops) slips through. Reject it here until a
+    /// guarded single-writer or block-reduction lowering exists.
+    CountedLoopScalarReturn,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,12 +212,28 @@ pub fn analyze_with_annotations(
         .map(|k| k.admit)
         .unwrap_or(AdmissionHint::Strict);
 
-    let this_field_cps = match scan_bytecode(code, hint, is_static) {
-        Ok(cps) => cps,
-        Err(reason) => return OffloadVerdict::Rejected(reason),
-    };
+    // Single bytecode pass: `scan_bytecode` collects the reject reason,
+    // the `this_field_cps` receiver-access CP indices (Phase 9 #2), the
+    // loop-trip work estimate, and the backward-branch flag — no second
+    // walk needed.
+    let (this_field_cps, estimated_work, has_backward) =
+        match scan_bytecode(code, hint, is_static) {
+            Ok(t) => t,
+            Err(reason) => return OffloadVerdict::Rejected(reason),
+        };
 
-    let estimated_work = estimate_work(code);
+    // AUDIT 2026-05-19: a method with a backward branch is a counted
+    // loop; the counted-loop lowering runs one CUDA thread per
+    // iteration. A scalar (non-void) return is written through the
+    // single `ret_ptr` by `scalar_return`, so every thread would race
+    // to overwrite that one slot — silently wrong results. The
+    // `ReductionNotImplemented` check only fires for array-in /
+    // scalar-out shapes; a scalar-in / scalar-out counted loop is not
+    // caught there. Reject it so the VM falls back to the CPU.
+    if has_backward && return_kind.is_scalar() {
+        return OffloadVerdict::Rejected(Reason::CountedLoopScalarReturn);
+    }
+
     OffloadVerdict::Eligible(KernelSignature {
         param_kinds,
         return_kind,
@@ -211,21 +247,50 @@ pub fn analyze_with_annotations(
     })
 }
 
-/// Walk the bytecode once and reject as soon as we hit a forbidden
-/// opcode. `hint` selectively loosens specific rejections — see
-/// [`AdmissionHint`] for the policy table.
+/// Walk the bytecode exactly once. Reject on the first forbidden
+/// opcode; otherwise return `(this_field_cps, loop-trip estimate,
+/// has_backward_branch)`.
+///
+/// `hint` selectively loosens specific rejections — see [`AdmissionHint`]
+/// for the policy table. `this_field_cps` collects the CP indices of the
+/// `getfield` receiver-access pattern (Phase 9 #2). The `has_backward`
+/// flag lets `analyze` recognise counted-loop shapes without a second
+/// pass — the work estimator's branch-direction check needs the same
+/// `pc / instruction_size` walk the classifier already performs.
 fn scan_bytecode(
     code: &CodeAttribute,
     hint: AdmissionHint,
     is_static: bool,
-) -> Result<Vec<u16>, Reason> {
+) -> Result<(Vec<u16>, usize, bool), Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
     let mut prev_op: Option<u8> = None;
     let mut this_field_cps: Vec<u16> = Vec::new();
+    let mut has_backward = false;
 
     while pc < bytes.len() {
         let op = bytes[pc];
+
+        // Branch-direction probe (formerly `estimate_work`): a backward
+        // branch marks a counted loop.
+        if (0x99..=0xA7).contains(&op) || op == 0xC6 || op == 0xC7 {
+            if pc + 3 <= bytes.len() {
+                let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
+                if off < 0 {
+                    has_backward = true;
+                }
+            }
+        } else if op == 0xC8 && pc + 5 <= bytes.len() {
+            let off = i32::from_be_bytes([
+                bytes[pc + 1],
+                bytes[pc + 2],
+                bytes[pc + 3],
+                bytes[pc + 4],
+            ]);
+            if off < 0 {
+                has_backward = true;
+            }
+        }
 
         // Phase 9 #2 — non-static receiver-access pattern handling.
         // For non-static methods, `aload_0` (0x2A) loads `this`. The
@@ -264,7 +329,8 @@ fn scan_bytecode(
         prev_op = Some(op);
         pc += instruction_size(bytes, pc)?;
     }
-    Ok(this_field_cps)
+    let estimated_work = if has_backward { 1 << 20 } else { bytes.len().max(1) };
+    Ok((this_field_cps, estimated_work, has_backward))
 }
 
 enum OpClass {

@@ -614,8 +614,102 @@ fn run() -> Result<()> {
         let manifest = ClassPath::read_jar_manifest(jar_path)
             .ok_or_else(|| anyhow::anyhow!("Cannot read manifest from {}", jar_path.display()))?;
 
-        // Build classpath: JAR itself + manifest Class-Path entries
-        let mut cp = vec![jar_path.to_string_lossy().into_owned()];
+        // JN3: ClassPath::new only accepts entries whose extension is `.jar`
+        // (or `.jmod`/`modules`). WARs, EARs, and other Java archive types
+        // are silently dropped — so `--jar jenkins.war` would never have
+        // its contents indexed and `executable.Main` (the launcher class
+        // declared in `Main-Class`) could not be resolved.
+        //
+        // Work around this in the CLI by materialising any non-`.jar`
+        // archive as a sibling temp file with a `.jar` extension and
+        // adding that path to the classpath instead. The original `jar_path`
+        // is still used for manifest parsing (which doesn't care about the
+        // extension), and the `Class-Path` manifest header is resolved
+        // relative to the original file's parent so sibling lookups still
+        // work.
+        let cp_entry_for_archive = match jar_path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("jar") => jar_path.to_path_buf(),
+            _ => {
+                // Copy <name>.<ext> to <tmp>/<name>.jar so ClassPath::new
+                // recognises it. The temp file lives for the process
+                // lifetime (the OS reclaims it on exit; we don't bother
+                // with explicit cleanup because the orchestrator runs
+                // short-lived CLI invocations).
+                let stem = jar_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("app");
+                // Disambiguate with PID + a millisecond timestamp to
+                // avoid clobbering when multiple VMs run concurrently.
+                let pid = std::process::id();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                // Create the staged file with exclusive-create semantics
+                // (`create_new`): if a file/symlink already sits at this
+                // predictable path, the open fails instead of `fs::copy`
+                // following/clobbering it (a local-attacker arbitrary-write
+                // vector). On collision, retry with a fresh counter suffix
+                // so concurrent VMs don't fail spuriously.
+                let dir = std::env::temp_dir();
+                let mut tmp = dir.join(format!("rustjvm-{pid}-{now_ms}-{stem}.jar"));
+                let mut dst_file = None;
+                for attempt in 0..16 {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&tmp)
+                    {
+                        Ok(f) => {
+                            dst_file = Some(f);
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            tmp = dir.join(format!(
+                                "rustjvm-{pid}-{now_ms}-{attempt}-{stem}.jar"
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "failed to stage {} as {} for classpath registration",
+                                jar_path.display(),
+                                tmp.display()
+                            )));
+                        }
+                    }
+                }
+                let mut dst_file = dst_file.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "failed to stage {} for classpath registration: \
+                         could not create a unique temp file in {}",
+                        jar_path.display(),
+                        dir.display()
+                    )
+                })?;
+                let mut src_file = std::fs::File::open(jar_path).with_context(|| {
+                    format!("failed to open {} for staging", jar_path.display())
+                })?;
+                std::io::copy(&mut src_file, &mut dst_file).with_context(|| {
+                    format!(
+                        "failed to stage {} as {} for classpath registration",
+                        jar_path.display(),
+                        tmp.display()
+                    )
+                })?;
+                tracing::debug!(
+                    "JN3: staged non-.jar archive {} → {} so ClassPath accepts it",
+                    jar_path.display(),
+                    tmp.display()
+                );
+                tmp
+            }
+        };
+
+        // Build classpath: JAR (or staged .jar copy) itself + manifest Class-Path entries.
+        // The manifest's Class-Path header is still resolved relative to the
+        // user-supplied path so sibling JARs are found at their real locations.
+        let mut cp = vec![cp_entry_for_archive.to_string_lossy().into_owned()];
         cp.extend(manifest.resolve_class_path(jar_path));
 
         // KC26: For Quarkus applications, the RunnerClassLoader normally loads
@@ -755,7 +849,14 @@ fn run() -> Result<()> {
         "on" => rustjvm_vm::config::CdsMode::On,
         "auto" => rustjvm_vm::config::CdsMode::Auto,
         "dump" => rustjvm_vm::config::CdsMode::Dump,
-        _ => rustjvm_vm::config::CdsMode::Off,
+        "off" => rustjvm_vm::config::CdsMode::Off,
+        other => {
+            // Warn on a typo rather than silently defaulting to Off.
+            eprintln!(
+                "Warning: ignoring unknown -Xshare mode {other:?}; expected on|auto|dump|off"
+            );
+            rustjvm_vm::config::CdsMode::Off
+        }
     };
 
     // Synthetic JDK mode: default to real JDK when a JDK is available.
@@ -775,7 +876,15 @@ fn run() -> Result<()> {
     config.aot_mode = match args.aot_mode.as_str() {
         "training" => rustjvm_vm::config::AotMode::Training,
         "production" => rustjvm_vm::config::AotMode::Production,
-        _ => rustjvm_vm::config::AotMode::Off,
+        "off" => rustjvm_vm::config::AotMode::Off,
+        other => {
+            // Warn on a typo rather than silently defaulting to Off.
+            eprintln!(
+                "Warning: ignoring unknown -XX:AOTMode value {other:?}; \
+                 expected off|training|production"
+            );
+            rustjvm_vm::config::AotMode::Off
+        }
     };
     if let Some(cache_path) = &args.aot_cache {
         // AOTCache serves as input in production mode and output in training mode
@@ -1989,13 +2098,15 @@ fn parse_size(s: &str) -> Option<usize> {
         _ => (s, 1),
     };
 
-    // Use checked_mul so an oversized input (e.g. "999999999999g") yields
-    // None — surfaced to the user as an invalid-size error — rather than
-    // panicking in debug or silently wrapping to a nonsensical cap in release.
-    num_str
-        .parse::<usize>()
-        .ok()
-        .and_then(|n| n.checked_mul(multiplier))
+    // Use checked_mul so a huge value (e.g. `99999999999g`) fails the parse
+    // rather than wrapping silently in release / panicking in debug. A parsed
+    // size of 0 is also rejected as invalid (a 0-byte heap is meaningless).
+    let n = num_str.parse::<usize>().ok()?;
+    let bytes = n.checked_mul(multiplier)?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]

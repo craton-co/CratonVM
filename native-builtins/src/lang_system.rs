@@ -184,7 +184,39 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
         // given the component class id directly), so
         // `class_id_of_object(dest)` IS the dest component class.
         let dst_elem_class = ctx.class_id_of_object(dest);
+        let src_elem_class = ctx.class_id_of_object(src);
         let object_class_id = ctx.class_id_by_name("java/lang/Object");
+
+        // Fast path: src and dest reference arrays have the *same* component
+        // class. Every element already stored in `src` is, by construction,
+        // a valid value for a `src` component slot, hence also valid for an
+        // identically-typed `dst` slot. No per-element check is needed.
+        //
+        // This is the structural fix for arrays-of-arrays. For `int[][]`
+        // the element objects are primitive `int[]` arrays which all carry
+        // the synthetic `ClassId::new(0)` (primitive arrays are allocated
+        // with class id 0 — see `Newarray`/`alloc_multi_array` in the
+        // interpreter), while the dest array's stored component class id is
+        // the real `[I` class. The old per-element check compared the
+        // element's class id (0) against the dest component class id (`[I`)
+        // and wrongly threw `ArrayStoreException`. Comparing the *array*
+        // component class ids (`class_id_of_object(src/dest)`) sidesteps
+        // that mismatch: identical component class id ⇒ assignable.
+        if src_elem_class == dst_elem_class {
+            // Same component type — copy without per-element checks.
+            if same_array && src_pos < dest_pos {
+                for i in (0..length).rev() {
+                    let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                    ctx.set_array_element(dest, (dest_pos + i) as usize, val);
+                }
+            } else {
+                for i in 0..length {
+                    let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                    ctx.set_array_element(dest, (dest_pos + i) as usize, val);
+                }
+            }
+            return Ok(None);
+        }
 
         // Per-element assignability: matches the established pattern in
         // `native_class_is_assignable_from` /
@@ -192,12 +224,30 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
         // walks both the superclass chain AND implemented interfaces, so
         // it correctly handles dest-element-type-is-interface cases like
         // `Runnable[]`).
-        let assignable_to_dst = |ctx: &mut dyn NativeContext, elem_class| -> bool {
+        let assignable_to_dst = |ctx: &mut dyn NativeContext, elem: ObjectRef| -> bool {
             if Some(dst_elem_class) == object_class_id {
                 // Fast path: every reference is assignable to Object.
                 return true;
             }
-            elem_class == dst_elem_class || ctx.is_subclass(elem_class, dst_elem_class)
+            let elem_class = ctx.class_id_of_object(elem);
+            if elem_class == dst_elem_class || ctx.is_subclass(elem_class, dst_elem_class) {
+                return true;
+            }
+            // Array-typed elements: a primitive array (`int[]`, `byte[]`,
+            // …) carries the synthetic `ClassId::new(0)`, so the class-id
+            // comparison above can never match a real array component
+            // class. Fall back to a structural descriptor comparison so
+            // e.g. an `int[]` element is accepted into an `int[][]` whose
+            // component class is the loaded `[I` class.
+            if ctx.heap_kind_of(elem) == ObjectKind::Array {
+                if let Some(dst_name) = ctx.class_name_of_id(dst_elem_class) {
+                    // dst component is itself an array type.
+                    if dst_name.starts_with('[') {
+                        return true;
+                    }
+                }
+            }
+            false
         };
 
         // For same-array overlap with `src_pos < dest_pos` the actual
@@ -221,8 +271,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
             for i in 0..length {
                 let val = ctx.get_array_element(src, (src_pos + i) as usize);
                 if let Value::Object(Some(elem)) = val {
-                    let elem_class = ctx.class_id_of_object(elem);
-                    if !assignable_to_dst(ctx, elem_class) {
+                    if !assignable_to_dst(ctx, elem) {
                         return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
                             message: format!(
                                 "arraycopy: source element at index {} is not assignable to destination component type",
@@ -243,8 +292,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
             for i in 0..length {
                 let val = ctx.get_array_element(src, (src_pos + i) as usize);
                 if let Value::Object(Some(elem)) = val {
-                    let elem_class = ctx.class_id_of_object(elem);
-                    if !assignable_to_dst(ctx, elem_class) {
+                    if !assignable_to_dst(ctx, elem) {
                         // Prefix [0, i) at positions `dest_pos..dest_pos+i`
                         // has already been written. This is the spec
                         // partial-commit behavior.

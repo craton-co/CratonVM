@@ -2255,10 +2255,11 @@ impl ClassPath {
     ) -> Option<Vec<u8>> {
         let mut guard = archive.lock();
         let result = guard.by_name(name).and_then(|mut zip_entry| {
-            // Audit-fix #2: the declared `size()` comes from the JAR central
-            // directory and is attacker-controlled (up to `u64::MAX`). Clamp
-            // it via `safe_with_capacity` to avoid a multi-GiB pre-allocation
-            // from a crafted JAR, matching the sibling entry-read paths.
+            // Audit-fix #2 / zip-bomb: the declared `size()` comes from the
+            // JAR central directory and is attacker-controlled (up to
+            // `u64::MAX`). Clamp it via `safe_with_capacity` to avoid a
+            // multi-GiB pre-allocation from a crafted JAR, matching the
+            // sibling entry-read paths.
             let mut data = Vec::with_capacity(safe_with_capacity(zip_entry.size()));
             zip_entry.read_to_end(&mut data)?;
             Ok(data)
@@ -2346,7 +2347,9 @@ impl ClassPath {
             if let Some(relative) = name.strip_prefix("classes/") {
                 if !relative.is_empty() && !relative.ends_with('/') {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        let mut buf = Vec::with_capacity(entry.size() as usize);
+                        // Audit-fix (zip-bomb): clamp the attacker-controlled
+                        // central-directory `size()` like every other path.
+                        let mut buf = Vec::with_capacity(safe_with_capacity(entry.size()));
                         if entry.read_to_end(&mut buf).is_ok() {
                             classes_cache.insert(relative.to_string(), buf);
                         }

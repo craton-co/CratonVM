@@ -696,7 +696,44 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;", native_printf);
     registry.register("java/io/PrintStream", "format",
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;", native_printf);
+    // PrintStream writer-path entries. JUnit's ConsoleLauncher wraps
+    // `System.out` (a PrintStream) in a `PrintWriter`; `PrintWriter.write`
+    // delegates `out.write(String,int,int)` straight onto the PrintStream
+    // receiver. The real JDK PrintStream only has a package-private
+    // `write(String)` and no 3-arg form, so without these natives the
+    // launcher aborts with `NoSuchMethodError: PrintStream.write(String,II)V`.
+    registry.register("java/io/PrintStream", "write", "([BII)V", native_printstream_write);
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;)V",
+        native_printstream_write_string,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;II)V",
+        native_printstream_write_string_range,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "append",
+        "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;",
+        native_printstream_append,
+    );
     // PrintWriter
+    registry.register(
+        "java/io/PrintWriter",
+        "write",
+        "(Ljava/lang/String;II)V",
+        native_printstream_write_string_range,
+    );
+    registry.register(
+        "java/io/PrintWriter",
+        "write",
+        "(Ljava/lang/String;)V",
+        native_printstream_write_string,
+    );
     registry.register("java/io/PrintWriter", "println", "(Ljava/lang/String;)V", native_println_string);
     registry.register("java/io/PrintWriter", "println", "()V", native_println_void);
     registry.register("java/io/PrintWriter", "println", "(I)V", native_println_int);
@@ -1426,7 +1463,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     cassandra_extras::register_cassandra_stubs(registry);
     neo4j_extras::register_neo4j_stubs(registry);
     solr_extras::register_solr_stubs(registry);
-    cglib_extras::register_cglib_stubs(registry);
+    // cglib probe shim removed — root cause (null `defaultDomain` on custom
+    // ClassLoaders) fixed in `classloader_real.rs::init_classloader_common_fields`.
     wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
     activemq_extras::register_activemq_stubs(registry);
     felix_extras::register_felix_stubs(registry);
@@ -8001,6 +8039,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "([BII)V",
         native_printstream_write,
     );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;)V",
+        native_printstream_write_string,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;II)V",
+        native_printstream_write_string_range,
+    );
 
     // --- java.io.PrintWriter ---
     registry.register(
@@ -11115,6 +11165,77 @@ fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
+/// `PrintStream.write(String)` — the package-private writer-path entry used by
+/// `print(String)`. Writes the whole string to the underlying stream.
+fn native_printstream_write_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this (PrintStream), args[1]=String
+    let text = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => return Ok(None),
+    };
+    ctx.record_printed_line(text.clone());
+    stream_write(ctx, args, &text);
+    Ok(None)
+}
+
+/// `PrintStream.append(CharSequence)` — appends the text and returns `this`.
+fn native_printstream_append(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this (PrintStream), args[1]=CharSequence
+    let text = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => "null".to_string(),
+    };
+    ctx.record_printed_line(text.clone());
+    stream_write(ctx, args, &text);
+    Ok(args.first().copied())
+}
+
+/// `PrintStream.write(String, int, int)` — writes `str.substring(off, off+len)`
+/// to the underlying stream. This is the writer-path 3-arg entry that JUnit's
+/// console output reaches via `Writer.write(String,int,int)` when a system
+/// `PrintStream` is used through the character-writer chain.
+fn native_printstream_write_string_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this (PrintStream), args[1]=String, args[2]=off, args[3]=len
+    let full = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => return Ok(None),
+    };
+    let off = match args.get(2) {
+        Some(Value::Int(o)) => (*o).max(0) as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(l)) => (*l).max(0) as usize,
+        _ => 0,
+    };
+    // Slice on UTF-16 code units to match Java String.substring semantics.
+    let units: Vec<u16> = full.encode_utf16().collect();
+    let end = off.saturating_add(len).min(units.len());
+    let start = off.min(end);
+    let text = String::from_utf16_lossy(&units[start..end]);
+    ctx.record_printed_line(text.clone());
+    stream_write(ctx, args, &text);
+    Ok(None)
+}
+
 /// Format a double like Java does (no trailing zeros for integers, etc.)
 // ---------------------------------------------------------------------------
 // Step 2: StringBuilder / StringBuffer natives
@@ -11960,7 +12081,21 @@ pub(crate) fn unsafe_offset(args: &[Value], pos: usize) -> usize {
     // decode, but clamp clearly-invalid offsets to 0 (HotSpot-style callers
     // already fail CAS/get semantics safely on wrong offsets).
     const MAX_REASONABLE_OFFSET: usize = 1 << 30; // 1 Gi slot/byte cap
-    let clamp = |u: usize| if u <= MAX_REASONABLE_OFFSET { u } else { 0 };
+    // C32: the Buffer.address probe offset is an intentional high-range
+    // sentinel (`BUFFER_ADDRESS_SENTINEL`) minted by
+    // `native_unsafe_object_field_offset`. It is far above
+    // `MAX_REASONABLE_OFFSET`; the clamp below would otherwise rewrite it
+    // to 0, defeating the sentinel check in `native_unsafe_get_long` and
+    // making Netty's `PlatformDependent0$3.run()` read 0 → return null →
+    // NPE in `PlatformDependent0.<clinit>`. Pass the sentinel through
+    // verbatim so the sentinel-aware reader can answer non-zero.
+    let clamp = |u: usize| {
+        if u == BUFFER_ADDRESS_SENTINEL || u <= MAX_REASONABLE_OFFSET {
+            u
+        } else {
+            0
+        }
+    };
     match args.get(pos) {
         Some(Value::Long(off)) => {
             if *off < 0 {
@@ -25343,8 +25478,56 @@ fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     Ok(Some(Value::Int(h)))
 }
+/// Populate a `java.net.URI` object's named fields from its full text.
+///
+/// The multi-arg `URI` constructors route component values through
+/// `url_parse`, which writes the *URL*-shaped positional slots (0..=5).
+/// A real-JDK `java.net.URI` has a completely different instance-field
+/// layout, so those positional writes land on the wrong slots and the
+/// URI's cached `string` field stays null — making `toString()` /
+/// `toURL()` return empty/null. Writing the canonical `string`,
+/// `scheme`, `path` and `schemeSpecificPart` fields BY NAME fixes this
+/// for both real and synthetic URI objects (the `uri_raw_string`
+/// helper reads `string` by name first).
+pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full: &str) {
+    let full_obj = ctx.create_string(full);
+    ctx.set_field_by_name(this, "string", Value::Object(Some(full_obj)));
+    if let Some(colon) = full.find(':') {
+        let scheme = &full[..colon];
+        let ssp = &full[colon + 1..];
+        if !scheme.is_empty() {
+            let scheme_obj = ctx.create_string(scheme);
+            ctx.set_field_by_name(this, "scheme", Value::Object(Some(scheme_obj)));
+        }
+        let ssp_obj = ctx.create_string(ssp);
+        ctx.set_field_by_name(this, "schemeSpecificPart", Value::Object(Some(ssp_obj)));
+        // Hierarchical path: strip an optional `//authority` prefix.
+        let path = if let Some(after) = ssp.strip_prefix("//") {
+            let slash = after.find('/').unwrap_or(after.len());
+            &after[slash..]
+        } else {
+            ssp
+        };
+        let path = path.split(['?', '#']).next().unwrap_or("");
+        if !path.is_empty() {
+            let path_obj = ctx.create_string(path);
+            ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+        }
+    }
+}
+
 fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_url_init(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let url_str = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    url_parse(ctx, this, &url_str);
+    uri_store_named(ctx, this, &url_str);
+    Ok(None)
 }
 
 /// URI(String scheme, String host, String path, String fragment)
@@ -25369,18 +25552,31 @@ fn native_uri_init_4(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
         _ => None,
     };
-    // Build full URI string: scheme://host/path#fragment
+    // Build full URI string: scheme:[//host]path[#fragment]
+    //
+    // Per RFC 3986 / `java.net.URI`, the `//host` authority component is
+    // only emitted when a host is actually present. When `host` is null
+    // (the case for `File.toURI()` on Windows, which calls
+    // `new URI("file", null, "/C:/path", null)`), the result must be
+    // `file:/C:/path` — a single slash. Emitting `file://` + path here
+    // produced the malformed `file:///C:/path` that broke
+    // `URLClassLoader` (URI.toURL() returned null).
     let full = if scheme.is_empty() {
         path.clone()
     } else {
-        let host_part = _host.as_deref().unwrap_or("");
         let frag_part = match &_fragment {
             Some(f) => format!("#{f}"),
             None => String::new(),
         };
-        format!("{scheme}://{host_part}{path}{frag_part}")
+        match _host.as_deref() {
+            Some(h) if !h.is_empty() => {
+                format!("{scheme}://{h}{path}{frag_part}")
+            }
+            _ => format!("{scheme}:{path}{frag_part}"),
+        }
     };
     url_parse(ctx, this, &full);
+    uri_store_named(ctx, this, &full);
     Ok(None)
 }
 
@@ -25412,6 +25608,7 @@ fn native_uri_init_3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         format!("{scheme}:{ssp}{frag_part}")
     };
     url_parse(ctx, this, &full);
+    uri_store_named(ctx, this, &full);
     Ok(None)
 }
 
@@ -25441,7 +25638,6 @@ fn native_uri_init_5(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
         _ => None,
     };
-    let auth_part = authority.as_deref().unwrap_or("");
     let query_part = match &query {
         Some(q) => format!("?{q}"),
         None => String::new(),
@@ -25450,12 +25646,20 @@ fn native_uri_init_5(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(f) => format!("#{f}"),
         None => String::new(),
     };
+    // Only emit the `//authority` component when an authority is present;
+    // otherwise the URI is `scheme:path` (avoids malformed `scheme:///path`).
     let full = if scheme.is_empty() {
         format!("{path}{query_part}{frag_part}")
     } else {
-        format!("{scheme}://{auth_part}{path}{query_part}{frag_part}")
+        match authority.as_deref() {
+            Some(a) if !a.is_empty() => {
+                format!("{scheme}://{a}{path}{query_part}{frag_part}")
+            }
+            _ => format!("{scheme}:{path}{query_part}{frag_part}"),
+        }
     };
     url_parse(ctx, this, &full);
+    uri_store_named(ctx, this, &full);
     Ok(None)
 }
 
@@ -25493,7 +25697,6 @@ fn native_uri_init_7(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
         _ => None,
     };
-    let host_part = host.as_deref().unwrap_or("");
     let port_part = if port >= 0 { format!(":{port}") } else { String::new() };
     let query_part = match &query {
         Some(q) => format!("?{q}"),
@@ -25503,12 +25706,20 @@ fn native_uri_init_7(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(f) => format!("#{f}"),
         None => String::new(),
     };
+    // Only emit `//host[:port]` when a host is present; otherwise the URI
+    // is `scheme:path` (avoids malformed `scheme:///path`).
     let full = if scheme.is_empty() {
         format!("{path}{query_part}{frag_part}")
     } else {
-        format!("{scheme}://{host_part}{port_part}{path}{query_part}{frag_part}")
+        match host.as_deref() {
+            Some(h) if !h.is_empty() => {
+                format!("{scheme}://{h}{port_part}{path}{query_part}{frag_part}")
+            }
+            _ => format!("{scheme}:{path}{query_part}{frag_part}"),
+        }
     };
     url_parse(ctx, this, &full);
+    uri_store_named(ctx, this, &full);
     Ok(None)
 }
 
@@ -31936,7 +32147,7 @@ fn define_or_get_proxy_class(
     let _ = ctx.ensure_class_initialized("java/lang/reflect/Proxy$Instance");
 
     let (gen_name, spec) = build_proxy_spec_for(ctx, &sorted)?;
-    let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec);
+    let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec).ok()?;
     let opts = rustjvm_native_api::DefineClassFull {
         // WP2.5-v3 item 4 — every method body emitted by `proxy_gen`
         // (constructor super-delegate, per-method dispatch shim, and

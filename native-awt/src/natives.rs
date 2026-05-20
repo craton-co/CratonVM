@@ -992,11 +992,29 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
 // BufferedImage natives
 // ---------------------------------------------------------------------------
 
+/// Maximum width/height accepted for a BufferedImage. Mirrors the practical
+/// per-dimension cap of the reference JDK's raster (a positive 16-bit value)
+/// and bounds the backing allocation to `MAX_IMAGE_DIM^2 * 4` bytes (~4 GiB
+/// worst case) — large requests are rejected instead of aborting the process.
+const MAX_IMAGE_DIM: i32 = 32767;
+
 fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "<init>", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
-            let w = get_int(args, 1).max(1) as u32;
-            let h = get_int(args, 2).max(1) as u32;
+            // Validate the raw signed dimensions before any `as u32` cast so a
+            // negative or absurdly large request cannot reach the allocator.
+            let w_raw = get_int(args, 1);
+            let h_raw = get_int(args, 2);
+            if w_raw <= 0 || h_raw <= 0 || w_raw > MAX_IMAGE_DIM || h_raw > MAX_IMAGE_DIM {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "BufferedImage dimensions {w_raw}x{h_raw} out of range (1..={MAX_IMAGE_DIM})"
+                    ),
+                }
+                .into());
+            }
+            let w = w_raw as u32;
+            let h = h_raw as u32;
             let it = match get_int(args, 3) { 1 => ImageType::IntRgb, 3 => ImageType::IntArgbPre, _ => ImageType::IntArgb };
             // `create` returns `None` when `w * h` overflows the `u32`
             // pixel count (image larger than ~65535x65535). Surface that as

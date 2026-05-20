@@ -2475,8 +2475,16 @@ fn native_st_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let input_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            ctx.set_field(this, ST_FIELD_INPUT, Value::Object(None));
-            return Ok(None);
+            // JDK parity: `new StringTokenizer((String) null)` dereferences
+            // the string in the constructor (`str.length()`), throwing NPE.
+            // Silently accepting null produced an empty tokenizer, which
+            // turned downstream `nextToken()` calls into a spurious
+            // NoSuchElementException instead of the expected NPE — see
+            // OSGi `Version("null")` mis-parse in Felix bootstrap.
+            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Cannot invoke \"String.length()\" because \"str\" is null".into()),
+            }
+            .into());
         }
     };
     ctx.set_field(this, ST_FIELD_INPUT, Value::Object(Some(input_obj)));
@@ -2491,8 +2499,12 @@ fn native_st_init_delims(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let input_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            ctx.set_field(this, ST_FIELD_INPUT, Value::Object(None));
-            return Ok(None);
+            // JDK parity: the StringTokenizer constructors dereference the
+            // input string (`str.length()`) and throw NPE on a null string.
+            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Cannot invoke \"String.length()\" because \"str\" is null".into()),
+            }
+            .into());
         }
     };
     ctx.set_field(this, ST_FIELD_INPUT, Value::Object(Some(input_obj)));

@@ -47,6 +47,20 @@ use std::fmt;
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("CompactValue NaN-boxing requires a 64-bit target pointer width");
 
+// The 47-bit-payload pointer assumption (see SUBTAG_SHIFT / PAYLOAD_MASK below)
+// is only verified for x86-64 and AArch64. A 64-bit target that is neither
+// (e.g. riscv64) would pass the `target_pointer_width = "64"` gate above while
+// using an unaudited address-space layout, so reject it explicitly here rather
+// than silently miscompiling.
+#[cfg(all(
+    target_pointer_width = "64",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+compile_error!(
+    "CompactValue NaN-boxing's 47-bit pointer assumption is only verified for \
+     x86_64 and aarch64; this 64-bit target is unsupported"
+);
+
 /// Mask covering bits 63 + 62-50 (sign + exponent + quiet + marker).
 /// When all these bits are set, the value is a tagged non-double.
 const NANBOX_BITS: u64 = 0xFFFC_0000_0000_0000;
@@ -59,23 +73,19 @@ const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
 /// Shift amount: sub-tag starts at bit 47.
 ///
-/// Gated to x86-64 / AArch64 where user-mode addresses are known to fit in
-/// 47 bits.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const SUBTAG_SHIFT: u32 = 47;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+/// Only x86-64 / AArch64 reach this point (the `compile_error!` above rejects
+/// every other 64-bit target), and on both the user-mode address space fits in
+/// 47 bits, so the value is unconditional.
 const SUBTAG_SHIFT: u32 = 47;
 
 /// Mask for the 47-bit payload (bits 46-0).
 ///
-/// Gated to x86-64 / AArch64 where user-mode object pointers are known to fit
-/// in 47 bits.  See [`CompactValue::try_from_pointer`] for a checked
+/// Only x86-64 / AArch64 reach this point (the `compile_error!` above rejects
+/// every other 64-bit target), where user-mode object pointers are known to
+/// fit in 47 bits.  See [`CompactValue::try_from_pointer`] for a checked
 /// constructor that returns `None` when this assumption is violated (e.g.
 /// AArch64 LVA 52-bit VA, x86-64 5-level paging 57-bit VA, `mmap(MAP_FIXED)`
 /// above `0x0000_7FFF_FFFF_FFFF`).
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const PAYLOAD_MASK: u64 = (1u64 << 47) - 1;
 
 /// Mask for the 3-bit sub-tag (bits 49-47) after the value has been confirmed
@@ -269,26 +279,25 @@ impl CompactValue {
     /// addresses) and on AArch64 user-space the high bits are likewise zero.
     ///
     /// # Panics
-    /// In debug builds, panics if `ptr` is zero or has bits set outside the
-    /// 47-bit payload range.  In release builds the assertions are elided
-    /// (the high bits are masked off via `ptr & PAYLOAD_MASK`); callers
-    /// that derive pointers from platform-supplied addresses where the
-    /// 47-bit assumption may not hold (e.g. `mmap(MAP_FIXED)`, AArch64
-    /// LVA, x86-64 5-level paging) must use
-    /// [`try_from_pointer`](Self::try_from_pointer) instead.
-    ///
-    /// The unconditional `assert!`s that previously guarded this in release
-    /// fired on every operand-stack `Object` push and showed up as a
-    /// measurable overhead in profiles.  Heap allocations are constrained
-    /// to the 47-bit safe range elsewhere in the VM, so the debug-only
-    /// check is sufficient for development and CI.
+    /// Panics (in **both** debug and release builds) if `ptr` is zero or has
+    /// bits set outside the 47-bit payload range.  A pointer that does not fit
+    /// would otherwise be silently truncated by `& PAYLOAD_MASK` into a bogus
+    /// heap reference — an unrecoverable corruption — so an immediate panic is
+    /// strictly better than producing a dangling object handle.  Callers that
+    /// derive pointers from platform-supplied addresses where the 47-bit
+    /// assumption may not hold (e.g. `mmap(MAP_FIXED)`, AArch64 LVA, x86-64
+    /// 5-level paging) must use [`try_from_pointer`](Self::try_from_pointer)
+    /// instead, which reports the failure as `None` rather than panicking.
     #[inline]
     pub fn object(ptr: u64) -> Self {
-        debug_assert!(
+        // Release-active checks: a truncated pointer is unrecoverable, so we
+        // must not let `& PAYLOAD_MASK` silently mask away high bits. The
+        // checks are cheap relative to the cost of a corrupted heap reference.
+        assert!(
             ptr != 0,
             "CompactValue::object called with null pointer; use null() instead"
         );
-        debug_assert!(
+        assert!(
             ptr & !PAYLOAD_MASK == 0,
             "CompactValue::object: pointer {:#x} exceeds 47-bit address space",
             ptr

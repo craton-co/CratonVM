@@ -290,12 +290,19 @@ impl DeviceModuleInner {
             }
         }
         // Build the argument tuple for cudarc 0.13 launch API.
+        //
+        // The CUDA kernel-parameter ABI (and cudarc's `launch_on_stream`)
+        // requires each entry to be a pointer TO the argument value, not
+        // the value itself. For scalars `&value as *const _` is taken
+        // from `args.raw`, which lives for the whole function. For device
+        // pointers we must point at a stable 8-byte slot holding the
+        // device address: `ptr_h` provides that storage and is kept live
+        // (not moved or dropped) until after `launch_on_stream` returns.
+        //
         // PERF Fix 2: reuse the thread-local `ARG_SCRATCH` allocation
         // instead of collecting a fresh `Vec` per launch. Rent it out by
         // `take`-ing it (same pattern as `PTR_SCRATCH` above), clear,
-        // pre-size, and refill. The raw pointers pushed here point into
-        // `args.raw` (scalar args) or carry the `u64` device addresses
-        // copied from `ptr_h`; both `args` and `ptr_h` remain live
+        // pre-size, and refill. Both `args` and `ptr_h` remain live
         // through the `launch_on_stream` call below, so every pointer is
         // valid for the launch exactly as before.
         let mut launch_args =
@@ -310,9 +317,11 @@ impl DeviceModuleInner {
                 KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
                 KernelArg::F64(v) => v as *const f64 as *mut std::ffi::c_void,
                 KernelArg::DevicePtr { .. } => {
-                    let addr = ptr_h[ip] as *mut std::ffi::c_void;
+                    // Pointer to the device-address slot in `ptr_h`, not
+                    // the device address cast to a pointer.
+                    let slot = &ptr_h[ip] as *const u64 as *mut std::ffi::c_void;
                     ip += 1;
-                    addr
+                    slot
                 }
             };
             launch_args.push(p);
@@ -401,6 +410,14 @@ pub(crate) struct DeviceBufferInner<T> {
 
 impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBufferInner<T> {
     pub(crate) fn uninit(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
+        // Reject element counts whose byte size overflows `usize` before
+        // handing `len` to the driver, which would otherwise allocate a
+        // wrapped (too-small) buffer.
+        len.checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| DeviceError::Driver(
+                format!("alloc uninit: size overflow ({len} elements of {} bytes)",
+                    std::mem::size_of::<T>())
+            ))?;
         // Output buffers are bound to the compute stream — the kernel
         // launch that fills them already runs there.
         let slice = unsafe {

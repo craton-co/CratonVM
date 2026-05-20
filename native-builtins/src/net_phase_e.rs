@@ -522,6 +522,16 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
 /// the scheme), so we don't mistake a bare `"file"` scheme token for the
 /// full `file:/C:/...` string.
 fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
+    // Real-JDK `java.net.URI` caches its full text in the `string` field.
+    // Reading it by NAME works regardless of the instance-field slot order
+    // (real URI vs. our synthetic 7-slot URI), so this is tried first.
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
+        if let Some(r) = ctx.read_string(s) {
+            if !r.is_empty() {
+                return r;
+            }
+        }
+    }
     for &idx in &[6usize, 5usize] {
         match ctx.get_field(uri, idx) {
             Value::Object(Some(s)) => {
@@ -559,6 +569,14 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // getScheme() → scheme prefix before ':'
     r.register(uri, "getScheme", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Fast path: real-JDK URI `scheme` field (by name — slot-order safe).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "scheme") {
+            if let Some(v) = ctx.read_string(s) {
+                if !v.is_empty() && !v.contains(':') {
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                }
+            }
+        }
         // Fast path: scheme field (0) if it was set during construction.
         if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
             if let Some(v) = ctx.read_string(s) {
@@ -601,10 +619,11 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
     });
 
-    // getPath() → path field (3) if set, else parse from raw
+    // getPath() → path field (by name) if set, else parse from raw
     r.register(uri, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+        // Real-JDK URI `path` field, read by name (slot-order safe).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
             if let Some(v) = ctx.read_string(s) {
                 if !v.is_empty() {
                     return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));

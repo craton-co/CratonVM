@@ -54,19 +54,32 @@ pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
 
 /// Adapter implementing [`ClassHierarchy`] over the `ClassManager`'s
 /// `ClassStore` + name-to-id index. Used by the verifier (Pass 2 / Pass 3)
-/// during `define_class_with_options`. Each query is name-keyed and walks
-/// the loaded-class indexes; if a referenced class hasn't been loaded yet
-/// the query falls back to conservative defaults that keep verification
-/// permissive (treat unknown classes as `java/lang/Object` subclasses, not
-/// interfaces) — matching HotSpot's "subclass of nothing else" tolerance
-/// for unresolved references during Pass 3.
+/// during `define_class_with_options`.
+///
+/// Audit fix (HIGH #1) — verify-before-store ordering: the class being
+/// defined is verified *before* it is inserted into `class_store`, so any
+/// hierarchy query about the class-under-verification (its own name, its
+/// own `ClassId`) would otherwise miss. `in_flight` carries that class so
+/// self-references resolve during verification without having to register
+/// a not-yet-verified class in the store. This is the lower-risk option:
+/// no partially-registered class is ever visible, and a class that fails
+/// verification is simply dropped.
 struct ClassStoreHierarchy<'a> {
     class_store: &'a ClassStore,
     loaded_classes: &'a FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
+    /// The class currently being verified (not yet in `class_store`).
+    in_flight: Option<&'a Class>,
 }
 
 impl<'a> ClassStoreHierarchy<'a> {
     fn lookup(&self, name: &str) -> Option<ClassId> {
+        // The class-under-verification is not yet in `loaded_classes`;
+        // resolve self-references to its reserved id.
+        if let Some(inflight) = self.in_flight {
+            if &*inflight.name == name {
+                return Some(inflight.id);
+            }
+        }
         // Probe with `Arc<str>` to match the storage map's key type.
         let probe: Arc<str> = Arc::from(name);
         // Round 9 audit fix (HIGH #6): iterate over the canonical
@@ -87,6 +100,17 @@ impl<'a> ClassStoreHierarchy<'a> {
         }
         None
     }
+
+    /// Resolve a `ClassId` to its `Class`, transparently returning the
+    /// in-flight (not-yet-stored) class when the id matches it.
+    fn class_for(&self, id: ClassId) -> Option<&Class> {
+        if let Some(inflight) = self.in_flight {
+            if inflight.id == id {
+                return Some(inflight);
+            }
+        }
+        self.class_store.get(id)
+    }
 }
 
 impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
@@ -94,15 +118,38 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         if child == parent || parent == "java/lang/Object" {
             return true;
         }
-        let (Some(child_id), Some(parent_id)) = (self.lookup(child), self.lookup(parent)) else {
-            // Either class isn't loaded yet — be permissive so the
-            // verifier doesn't reject legitimate forward references.
-            return true;
-        };
-        match self.class_store.get(child_id) {
-            Some(c) => c.is_subclass_of(parent_id, self.class_store),
-            None => true,
+        // Audit fix (HIGH #2): a missing class must NOT be unconditionally
+        // reported as a subtype. Returning `true` for *every* unresolved
+        // reference silently bypassed Pass-3 type-assignability checks for
+        // untrusted classes.
+        //
+        // Regression fix: the blanket-`false` replacement was too strict —
+        // it rejected valid bytecode where a not-yet-loaded JDK class (e.g.
+        // `java/security/NoSuchAlgorithmException`) appears where a
+        // supertype (`java/lang/Throwable`) is expected. The verifier runs
+        // at class-define time and exception-table catch types do not
+        // trigger class loading, so the child class is frequently absent
+        // from `class_store` at verify time.
+        //
+        // The JDK's own class hierarchy is fixed and known, so when a
+        // store-backed walk is not possible we fall back to walking the
+        // static `jdk_superclass` table. That walk terminates at
+        // `java/lang/Object` and only returns `true` for a *genuine*
+        // ancestor relationship — an unrelated pair (e.g. `String` /
+        // `Integer`) still resolves to `false`. This restores correct
+        // JVMS §4.10.1.2 assignability without re-opening the audit hole.
+        let (child_id, parent_id) = (self.lookup(child), self.lookup(parent));
+        if let (Some(child_id), Some(parent_id)) = (child_id, parent_id) {
+            if let Some(c) = self.class_for(child_id) {
+                if c.is_subclass_of(parent_id, self.class_store) {
+                    return true;
+                }
+            }
         }
+        // Fallback: walk the static JDK superclass chain. Used when either
+        // class is not yet loaded (so the store walk above could not run or
+        // could not prove the relationship through unloaded ancestors).
+        jdk_name_is_subclass(child, parent)
     }
 
     fn common_superclass(&self, a: &str, b: &str) -> String {
@@ -112,7 +159,7 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         let (Some(a_id), Some(b_id)) = (self.lookup(a), self.lookup(b)) else {
             return "java/lang/Object".to_string();
         };
-        let a_cls = match self.class_store.get(a_id) {
+        let a_cls = match self.class_for(a_id) {
             Some(c) => c,
             None => return "java/lang/Object".to_string(),
         };
@@ -124,7 +171,7 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             }
             depth += 1;
             let cls_id = cls.id;
-            if let Some(b_cls) = self.class_store.get(b_id) {
+            if let Some(b_cls) = self.class_for(b_id) {
                 if b_cls.is_subclass_of(cls_id, self.class_store) {
                     return cls.name.to_string();
                 }
@@ -135,10 +182,23 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
     }
 
     fn is_interface(&self, name: &str) -> bool {
-        match self.lookup(name).and_then(|id| self.class_store.get(id)) {
+        match self.lookup(name).and_then(|id| self.class_for(id)) {
             Some(c) => c.is_interface(),
             None => false,
         }
+    }
+
+    fn is_resolvable(&self, name: &str) -> bool {
+        // A reference type is "resolvable" for verification purposes when
+        // it is already loaded (present in the store / in-flight) — only
+        // then can `is_subclass` / `is_interface` give a definitive
+        // answer. Array types are always considered resolvable (their
+        // element resolution is handled elsewhere) so array assignability
+        // is not loosened by this hook.
+        if name.starts_with('[') {
+            return true;
+        }
+        self.lookup(name).is_some()
     }
 }
 
@@ -2430,6 +2490,10 @@ impl ClassManager {
             let hierarchy = ClassStoreHierarchy {
                 class_store: &self.class_store,
                 loaded_classes: &self.loaded_classes,
+                // Audit fix (HIGH #1): the class being verified is not yet
+                // in `class_store`; pass it explicitly so self-references
+                // (its own name / id) resolve during verification.
+                in_flight: Some(&class),
             };
             if let Err(verify_err) = crate::verifier::verify_class(
                 &class,
@@ -3589,6 +3653,9 @@ impl ClassManager {
                 let hierarchy = ClassStoreHierarchy {
                     class_store: &self.class_store,
                     loaded_classes: &self.loaded_classes,
+                    // Redefine verifies a class already resident in the
+                    // store (in-place mutation), so no in-flight class.
+                    in_flight: None,
                 };
                 // SAFETY-shape: the class we just mutated is at
                 // `class_id` in `self.class_store`. `get` returns `Some`
@@ -4514,6 +4581,43 @@ pub fn jdk_superclass_lookup(name: &str) -> &'static str {
     jdk_superclass(name)
 }
 
+/// Verifier fallback: is `child` a subclass of `parent` according to the
+/// static JDK superclass table?
+///
+/// Walks the `jdk_superclass` chain from `child` upward. Every chain
+/// terminates at `java/lang/Object` (the table's `_` default), so the walk
+/// always finishes. This is spec-correct for bytecode verification: the JDK
+/// class hierarchy is fixed, and the walk only reports `true` for a genuine
+/// ancestor — it does NOT blanket-accept unrelated reference types.
+///
+/// Interfaces are intentionally not modelled here (the verifier handles
+/// interface targets via the `is_interface` / `is_known_jdk_interface`
+/// relaxation), so this only proves class-to-superclass relationships.
+fn jdk_name_is_subclass(child: &str, parent: &str) -> bool {
+    if child == parent {
+        return true;
+    }
+    let mut current = child;
+    // The deepest JDK hierarchy chains are well under 32 links; the bound
+    // is a belt-and-braces guard against a malformed table entry.
+    for _ in 0..64 {
+        if current == "java/lang/Object" {
+            return parent == "java/lang/Object";
+        }
+        let next = jdk_superclass(current);
+        if next == parent {
+            return true;
+        }
+        if next == current {
+            // No progress (only possible for `Object`, handled above) —
+            // stop to avoid an infinite loop.
+            return false;
+        }
+        current = next;
+    }
+    false
+}
+
 fn jdk_superclass(name: &str) -> &'static str {
     match name {
         // Throwable hierarchy
@@ -4576,6 +4680,37 @@ fn jdk_superclass(name: &str) -> &'static str {
         // java.lang.reflect (JDK hierarchy for reflective wrappers)
         "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
         "java/lang/reflect/InvocationTargetException" => "java/lang/reflect/ReflectiveOperationException",
+
+        // java.security exception hierarchy. These classes appear in
+        // exception tables / `athrow` sites of `jrt:`-resident classes
+        // (e.g. `SecureRandom.getDefaultPRNG`) and the verifier must be
+        // able to prove they are assignable to `Throwable` even before
+        // the concrete class file has been loaded.
+        "java/security/GeneralSecurityException" => "java/lang/Exception",
+        "java/security/NoSuchAlgorithmException"
+        | "java/security/NoSuchProviderException"
+        | "java/security/KeyException"
+        | "java/security/KeyStoreException"
+        | "java/security/DigestException"
+        | "java/security/SignatureException"
+        | "java/security/InvalidAlgorithmParameterException"
+        | "java/security/UnrecoverableKeyException"
+        | "java/security/UnrecoverableEntryException"
+        | "java/security/cert/CertificateException" => "java/security/GeneralSecurityException",
+        "java/security/InvalidKeyException"
+        | "java/security/InvalidKeySpecException" => "java/security/KeyException",
+        "java/security/AccessControlException"
+        | "java/security/ProviderException" => "java/lang/RuntimeException",
+        "java/security/PrivilegedActionException" => "java/lang/Exception",
+
+        // java.nio.charset exception hierarchy.
+        "java/nio/charset/CharacterCodingException" => "java/io/IOException",
+        "java/nio/charset/MalformedInputException"
+        | "java/nio/charset/UnmappableCharacterException" =>
+            "java/nio/charset/CharacterCodingException",
+        "java/nio/charset/IllegalCharsetNameException"
+        | "java/nio/charset/UnsupportedCharsetException" =>
+            "java/lang/IllegalArgumentException",
 
         // java.nio.file.attribute — enum PosixFilePermission extends Enum
         "java/nio/file/attribute/PosixFilePermission" => "java/lang/Enum",

@@ -376,7 +376,11 @@ impl Monitor {
         let mut state = self.state.lock();
         match state.owner {
             Some(owner) if owner == thread_id => {
-                state.entry_count -= 1;
+                // Defense-in-depth: a frame-unwind release racing a manual
+                // `monitorexit` could otherwise decrement an already-zero
+                // count, panicking in debug or wrapping to u32::MAX in
+                // release (permanently corrupting the monitor).
+                state.entry_count = state.entry_count.saturating_sub(1);
                 if state.entry_count == 0 {
                     state.owner = None;
                     // Round-7 HIGH (vm #5): clear the JFR enter-event flag at

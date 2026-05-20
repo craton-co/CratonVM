@@ -89,7 +89,9 @@ fn collect_backward_branches(bytes: &[u8]) -> Result<Vec<(usize, usize)>, Loweri
                 *bytes.get(pc + 2).ok_or_else(truncated)?,
             ]) as i32;
             let target = pc as i32 + off;
-            if target < 0 || target as usize > bytes.len() {
+            // `target == bytes.len()` is one past the last byte — not a
+            // valid instruction boundary — so reject it too (`>=`).
+            if target < 0 || target as usize >= bytes.len() {
                 return Err(LoweringError::UnsupportedNode(format!(
                     "branch at pc={pc} has out-of-range target {target}"
                 )));
@@ -105,7 +107,9 @@ fn collect_backward_branches(bytes: &[u8]) -> Result<Vec<(usize, usize)>, Loweri
                 *bytes.get(pc + 4).ok_or_else(truncated)?,
             ]);
             let target = pc as i32 + off;
-            if target < 0 || target as usize > bytes.len() {
+            // `target == bytes.len()` is one past the last byte — not a
+            // valid instruction boundary — so reject it too (`>=`).
+            if target < 0 || target as usize >= bytes.len() {
                 return Err(LoweringError::UnsupportedNode(format!(
                     "goto_w at pc={pc} has out-of-range target {target}"
                 )));

@@ -4,16 +4,39 @@
 //! that advances on each allocation. Objects cannot be individually freed;
 //! instead, the entire arena is reset when GC swaps the semi-spaces.
 
-/// A linear (bump-pointer) arena allocator.
+/// A reclaimed (swept) region inside the arena, available for reuse by
+/// the non-moving young-gen mark-sweep collector.
 ///
-/// Allocates from a pre-sized `Vec<u8>` buffer. The cursor advances
-/// monotonically. Individual deallocations are not supported — only
-/// full-arena reset.
+/// Free blocks are produced only by [`Arena::add_free_block`], which the
+/// non-moving sweep calls for every dead object it reclaims. The bump
+/// `cursor` continues to govern the high-water mark; free blocks let the
+/// allocator satisfy requests from holes *below* the cursor without
+/// relocating any survivor (which is what makes the collection
+/// JIT-frame-safe — see `gen_heap::sweep_young_non_moving`).
+#[derive(Debug, Clone, Copy)]
+pub struct FreeBlock {
+    /// Byte offset from the start of the backing buffer.
+    pub offset: usize,
+    /// Size of the free region in bytes.
+    pub size: usize,
+}
+
+/// A linear (bump-pointer) arena allocator with an optional free list.
+///
+/// Allocates primarily via a monotonically advancing `cursor`. In
+/// addition, the non-moving young-gen collector may hand reclaimed
+/// regions back via [`Arena::add_free_block`]; subsequent allocations
+/// prefer those holes (first sufficiently-large block) before bumping
+/// the cursor. A full-arena [`Arena::reset`] clears both the cursor and
+/// the free list.
 pub struct Arena {
     /// Backing storage. Pre-allocated to `capacity` bytes.
     data: Vec<u8>,
-    /// Next free byte offset within `data`.
+    /// Next free byte offset within `data` (bump-allocation high-water mark).
     cursor: usize,
+    /// Reclaimed regions below `cursor`, produced by the non-moving sweep.
+    /// Empty unless a JIT-frame-safe mark-sweep has run.
+    free_list: Vec<FreeBlock>,
 }
 
 impl Arena {
@@ -22,7 +45,11 @@ impl Arena {
         // We need the Vec to have length == capacity so we can
         // hand out pointers into it. We zero-initialize for safety.
         let data = vec![0u8; capacity];
-        Self { data, cursor: 0 }
+        Self {
+            data,
+            cursor: 0,
+            free_list: Vec::new(),
+        }
     }
 
     /// Bump-allocate `size` bytes with the given alignment.
@@ -31,7 +58,53 @@ impl Arena {
     /// isn't enough space.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
-        // Align the cursor up (checked to prevent overflow near usize::MAX)
+
+        // Free-list fast path: if a prior non-moving sweep reclaimed any
+        // holes, satisfy the request from the first block large enough to
+        // hold `size` plus the alignment padding. The leftover (head
+        // padding and/or tail) is returned to the free list so no space
+        // is silently lost. This is checked first because the cursor may
+        // already be at the arena's high-water mark after a sweep that
+        // could not move survivors.
+        if !self.free_list.is_empty() {
+            let base = self.data.as_ptr() as usize;
+            for i in 0..self.free_list.len() {
+                let block = self.free_list[i];
+                let block_addr = base + block.offset;
+                let aligned_addr = (block_addr + align - 1) & !(align - 1);
+                let padding = aligned_addr - block_addr;
+                // Overflow here means this block can't satisfy the request;
+                // skip it rather than aborting the whole `alloc` (the bump
+                // path below may still succeed).
+                let Some(total_needed) = padding.checked_add(size) else {
+                    continue;
+                };
+                if total_needed <= block.size {
+                    // swap_remove keeps this O(1).
+                    let block = self.free_list.swap_remove(i);
+                    let alloc_offset = block.offset + padding;
+                    if padding > 0 {
+                        self.free_list.push(FreeBlock {
+                            offset: block.offset,
+                            size: padding,
+                        });
+                    }
+                    let remaining = block.size - padding - size;
+                    if remaining > 0 {
+                        self.free_list.push(FreeBlock {
+                            offset: alloc_offset + size,
+                            size: remaining,
+                        });
+                    }
+                    // SAFETY: `alloc_offset + size <= block.offset + block.size`
+                    // and the block came from a region inside the buffer.
+                    return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+                }
+            }
+        }
+
+        // Bump-allocation path: align the cursor up (checked to prevent
+        // overflow near usize::MAX).
         let aligned = self.cursor.checked_add(align - 1).map(|v| v & !(align - 1));
         let end = aligned.and_then(|a| a.checked_add(size));
         let aligned = aligned?;
@@ -44,6 +117,48 @@ impl Arena {
         let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
         self.cursor = end;
         Some(ptr)
+    }
+
+    /// Register a reclaimed `[offset, offset+size)` region as a free block.
+    ///
+    /// Called by the non-moving young-gen sweep for every dead object it
+    /// reclaims. The region is **not** zeroed here — the sweep zeroes the
+    /// reclaimed span itself so a later conservative root scan cannot
+    /// observe a stale object header inside the hole.
+    ///
+    /// # Panics (debug only)
+    /// Debug-asserts the block lies fully within the live (`< cursor`)
+    /// region of the arena.
+    pub fn add_free_block(&mut self, offset: usize, size: usize) {
+        debug_assert!(
+            offset + size <= self.cursor,
+            "free block must lie within the bump region",
+        );
+        if size == 0 {
+            return;
+        }
+        self.free_list.push(FreeBlock { offset, size });
+    }
+
+    /// Drop every reclaimed region. Called when the arena is about to be
+    /// swapped or reset so the next collection cycle starts clean.
+    pub fn clear_free_list(&mut self) {
+        self.free_list.clear();
+    }
+
+    /// Total bytes currently held on the free list (reclaimed but unallocated).
+    pub fn free_list_bytes(&self) -> usize {
+        self.free_list.iter().map(|b| b.size).sum()
+    }
+
+    /// Snapshot of the current free list as `(offset, size)` pairs,
+    /// sorted by ascending offset. Used by the non-moving sweep's object
+    /// walker to skip holes the same way `OldGen::walk_objects` does.
+    pub fn free_blocks_sorted(&self) -> Vec<(usize, usize)> {
+        let mut v: Vec<(usize, usize)> =
+            self.free_list.iter().map(|b| (b.offset, b.size)).collect();
+        v.sort_by_key(|&(off, _)| off);
+        v
     }
 
     /// Reset the arena, logically freeing all allocations.
@@ -80,6 +195,7 @@ impl Arena {
         // Zero out used region for safety (prevents stale data reads)
         self.data[..self.cursor].fill(0);
         self.cursor = 0;
+        self.free_list.clear();
     }
 
     /// Reset the arena without zeroing memory.
@@ -100,6 +216,7 @@ impl Arena {
     #[allow(dead_code)]
     pub unsafe fn reset_no_zero(&mut self) {
         self.cursor = 0;
+        self.free_list.clear();
     }
 
     /// Returns true if the given pointer falls within this arena's storage.
@@ -164,8 +281,13 @@ impl Arena {
     }
 
     /// The remaining free bytes in this arena.
+    ///
+    /// Counts both the un-bumped tail (`capacity - cursor`) and any holes
+    /// reclaimed by a non-moving sweep. Note that free-list space is
+    /// fragmented: a single allocation can only use one block, so this is
+    /// an upper bound on the largest satisfiable request.
     pub fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.cursor)
+        self.data.len().saturating_sub(self.cursor) + self.free_list_bytes()
     }
 }
 

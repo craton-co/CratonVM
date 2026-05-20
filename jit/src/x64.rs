@@ -2054,7 +2054,7 @@ fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
             // goto — check for backward target
             0xa7 => {
                 if pc + 2 < code_len {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) if t < code_len => t,
                         _ => { pc += 3; continue; } // invalid target — skip
@@ -2068,7 +2068,7 @@ fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
             // Conditional branches — check for backward target (do-while loops)
             0x99..=0xa6 | 0xc6 | 0xc7 => {
                 if pc + 2 < code_len {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) if t < code_len => t,
                         _ => { pc += 3; continue; } // invalid target — skip
@@ -2553,7 +2553,7 @@ fn analyze_loop_bound(
                 if after_bound < back_edge_end && after_bound + 2 < back_edge_end {
                     let cmp_op = code[after_bound];
                     let offset =
-                        ((code[after_bound + 1] as i16) << 8 | code[after_bound + 2] as i16) as i32; // Widening: always safe
+                        i16::from_be_bytes([code[after_bound + 1], code[after_bound + 2]]) as i32; // Widening: always safe
                     let target = (after_bound as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
                     // Pattern A: Exit condition — if_icmpge/if_icmpgt with target OUTSIDE loop
@@ -4524,7 +4524,7 @@ impl Compiler {
 
         self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
 
-        let offset = ((code[next_op_pc + 1] as i16) << 8 | code[next_op_pc + 2] as i16) as i32; // Widening: always safe
+        let offset = i16::from_be_bytes([code[next_op_pc + 1], code[next_op_pc + 2]]) as i32; // Widening: always safe
         let target_pc = (next_op_pc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
         // Pop value1 (already on stack before the constant was pushed)
@@ -4638,7 +4638,7 @@ impl Compiler {
             return None;
         }
         // if_icmp branch offset
-        let off1 = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32;
+        let off1 = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
         let l1_pc = (pc as i32).checked_add(off1)?;
         if l1_pc < 0 {
             return None;
@@ -4657,7 +4657,7 @@ impl Compiler {
         if goto_pc + 3 > code.len() || code[goto_pc] != 0xa7 {
             return None;
         }
-        let goto_off = ((code[goto_pc + 1] as i16) << 8 | code[goto_pc + 2] as i16) as i32;
+        let goto_off = i16::from_be_bytes([code[goto_pc + 1], code[goto_pc + 2]]) as i32;
         let l2_pc = (goto_pc as i32).checked_add(goto_off)?;
         if l2_pc < 0 {
             return None;
@@ -6620,7 +6620,7 @@ impl Compiler {
                 // sipush
                 0x11 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let val = ((callee_code[cpc + 1] as i16) << 8 | callee_code[cpc + 2] as i16) as i32; // Widening: always safe
+                    let val = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     self.emit_mov_imm32_sx(RAX, val);
                     self.push_from_rax();
                     cpc += 3;
@@ -7142,7 +7142,7 @@ impl Compiler {
                 // ifeq (0x99), ifne (0x9a), iflt (0x9b), ifge (0x9c), ifgt (0x9d), ifle (0x9e)
                 0x99..=0x9e => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = ((callee_code[cpc + 1] as i16) << 8 | callee_code[cpc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
                     self.pop_to_rax();
@@ -7168,7 +7168,7 @@ impl Compiler {
                 // if_icmpeq..if_icmple
                 0x9f..=0xa4 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = ((callee_code[cpc + 1] as i16) << 8 | callee_code[cpc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
                     let top = self.pop_stack();
@@ -7195,7 +7195,7 @@ impl Compiler {
                 // goto
                 0xa7 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = ((callee_code[cpc + 1] as i16) << 8 | callee_code[cpc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
                     // JMP rel32
@@ -7364,7 +7364,7 @@ impl Compiler {
                 // if_acmpeq (0xa5), if_acmpne (0xa6)
                 0xa5 | 0xa6 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = ((callee_code[cpc + 1] as i16) << 8 | callee_code[cpc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
                     let top = self.pop_stack();
                     self.pop_to_rax();
@@ -7381,7 +7381,7 @@ impl Compiler {
                 // ifnull (0xc6), ifnonnull (0xc7)
                 0xc6 | 0xc7 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = ((callee_code[cpc + 1] as i16) << 8 | callee_code[cpc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
                     let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
                     self.pop_to_rax();
                     self.rex_w(); self.buf.emit(&[0x85, 0xC0]); // TEST RAX, RAX
@@ -8443,7 +8443,7 @@ impl Compiler {
                     // Conditional and unconditional branches
                     0x99..=0xa6 | 0xa7 | 0xc6 | 0xc7 => {
                         if p + 2 < code_len {
-                            let off = ((code[p + 1] as i16) << 8 | code[p + 2] as i16) as i32; // Widening: always safe
+                            let off = i16::from_be_bytes([code[p + 1], code[p + 2]]) as i32; // Widening: always safe
                             if let Some(target) = p.checked_add_signed(off as isize) { // Cast: address arithmetic
                                 if target < code_len {
                                     branch_targets[target] = true;
@@ -8953,7 +8953,7 @@ impl Compiler {
 
                 // sipush
                 0x11 => {
-                    let val = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let val = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     if self.try_const_arith_peephole(val, pc + 3, code, code_len) {
                         pc += 4;
                     } else if let Some(next_pc) =
@@ -10280,7 +10280,7 @@ impl Compiler {
                 // ifeq..ifle (0x99..0x9e) — compare int against zero
                 0x99..=0x9e => {
                     self.flush_scratch_registers();
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -10327,7 +10327,7 @@ impl Compiler {
                 // if_icmpeq..if_icmple (0x9f..0xa4)
                 0x9f..=0xa4 => {
                     self.flush_scratch_registers();
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -10390,7 +10390,7 @@ impl Compiler {
 
                 // goto
                 0xa7 => {
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -12296,7 +12296,7 @@ impl Compiler {
                 // if_acmpeq (0xa5) — reference equality branch
                 0xa5 => {
                     self.flush_scratch_registers();
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -12324,7 +12324,7 @@ impl Compiler {
                 // if_acmpne (0xa6) — reference inequality branch
                 0xa6 => {
                     self.flush_scratch_registers();
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -12455,7 +12455,7 @@ impl Compiler {
                 // ifnull (0xc6) — branch if reference is null
                 0xc6 => {
                     self.flush_scratch_registers();
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -12506,7 +12506,7 @@ impl Compiler {
                 // ifnonnull (0xc7) — branch if reference is not null
                 0xc7 => {
                     self.flush_scratch_registers();
-                    let offset = ((code[pc + 1] as i16) << 8 | code[pc + 2] as i16) as i32; // Widening: always safe
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
                     let target_pc = match pc.checked_add_signed(offset as isize) { // Cast: address arithmetic
                         Some(t) => t,
                         None => return false, // invalid branch target
@@ -12705,9 +12705,19 @@ pub fn compile(
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
 ) -> Option<CompiledMethod> {
-    // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each)
-    let inline_extra: usize = inline_sites.values().map(|s| s.callee_code_len * 48).sum();
-    let estimated_size = code_len * 48 + 1024 + invoke_info.len() * 64 + inline_extra;
+    // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
+    // This is a heuristic only — see the `buf.overflowed()` bailout below for
+    // the safety net. The multipliers are kept generous (and saturating to
+    // avoid usize wrap on huge inputs) so the common case never overflows.
+    let inline_extra: usize = inline_sites
+        .values()
+        .map(|s| s.callee_code_len.saturating_mul(64))
+        .sum();
+    let estimated_size = code_len
+        .saturating_mul(64)
+        .saturating_add(4096)
+        .saturating_add(invoke_info.len().saturating_mul(96))
+        .saturating_add(inline_extra);
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
     // Calculate max stack depth statically (simplified: use a generous upper bound)
@@ -12963,6 +12973,13 @@ pub fn compile(
 
     // Patch self-recursive calls to point to entry
     compiler.patch_self_calls(entry_offset);
+
+    // `estimated_size` is a heuristic; a pathological method can emit past it.
+    // The emit hot path records the overflow instead of panicking — bail to
+    // the interpreter here rather than returning a truncated, unsafe method.
+    if compiler.buf.overflowed() {
+        return None;
+    }
 
     // Build the CompiledMethod with OSR metadata
     let has_dispatch = !compiler.invoke_info.is_empty()

@@ -152,8 +152,14 @@ impl BufferedImageData {
 
     /// Bulk-read a rectangular region as a Vec of ARGB values (row-major).
     pub fn get_rgb_region(&self, x: u32, y: u32, w: u32, h: u32) -> Vec<u32> {
+        // `checked_add` — a plain `x + w` on `u32` can wrap (e.g. x=u32::MAX,
+        // w=2) and spuriously pass the `<= width` comparison.
+        let in_bounds = x
+            .checked_add(w)
+            .zip(y.checked_add(h))
+            .is_some_and(|(x1, y1)| x1 <= self.width && y1 <= self.height);
         assert!(
-            x + w <= self.width && y + h <= self.height,
+            in_bounds,
             "region ({},{} {}x{}) exceeds image ({}x{})",
             x,
             y,
@@ -172,8 +178,14 @@ impl BufferedImageData {
 
     /// Bulk-write a rectangular region from a slice of ARGB values (row-major).
     pub fn set_rgb_region(&mut self, x: u32, y: u32, w: u32, h: u32, pixels: &[u32]) {
+        // `checked_add` — see `get_rgb_region`: a plain `u32` add can wrap and
+        // spuriously pass the bounds check for a crafted (x, w) pair.
+        let in_bounds = x
+            .checked_add(w)
+            .zip(y.checked_add(h))
+            .is_some_and(|(x1, y1)| x1 <= self.width && y1 <= self.height);
         assert!(
-            x + w <= self.width && y + h <= self.height,
+            in_bounds,
             "region ({},{} {}x{}) exceeds image ({}x{})",
             x,
             y,

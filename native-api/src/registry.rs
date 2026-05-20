@@ -1014,7 +1014,11 @@ pub trait NativeContext {
             // non-Long slot. The previous default impl's `_ => 0` arm
             // turned a wrong-typed field (Int, Reference, …) into
             // `Value::Long(delta)`, permanently corrupting the slot's
-            // type tag.
+            // type tag. A `panic!` here would unwind across the native
+            // boundary and abort the VM, so instead `debug_assert!`
+            // (loud in debug builds) and return the current value
+            // unchanged in release — a type mismatch indicates a native
+            // dispatch bug (caller used the wrong accessor).
             let old = match current {
                 Value::Long(v) => v,
                 other => {
@@ -1513,33 +1517,31 @@ pub trait NativeContext {
 
     /// Check if `module_name` exports `pkg` unconditionally (to all modules).
     ///
-    /// AUDIT 2026-05-16: this default returns `true` (fail-open). That is
-    /// deliberate for classpath-mode contexts and mock contexts where no
-    /// JPMS configuration is loaded. **Production VM implementations MUST
-    /// override** this method with a real readability check; relying on
-    /// the default in a JPMS-enabled VM is a privilege-escalation hole.
-    fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
-        let _ = (module_name, pkg);
-        true
-    }
+    /// AUDIT 2026-05-19: this method has **no default** and is REQUIRED. A
+    /// fail-open default (`true`) silently grants arbitrary cross-module
+    /// access for any implementor that forgets to override it. Forcing every
+    /// `NativeContext` impl to provide a body makes the security decision
+    /// explicit. Classpath-only / mock contexts should return `true`
+    /// deliberately; a JPMS-enabled VM must perform a real readability check.
+    fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool;
 
     /// Check if `module_name` exports `pkg` to `to_module`.
-    fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
-        let _ = (module_name, pkg, to_module);
-        true
-    }
+    ///
+    /// AUDIT 2026-05-19: REQUIRED, no default — see
+    /// `is_package_exported_unqualified` for the fail-open rationale.
+    fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool;
 
     /// Check if `module_name` opens `pkg` unconditionally.
-    fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
-        let _ = (module_name, pkg);
-        true
-    }
+    ///
+    /// AUDIT 2026-05-19: REQUIRED, no default — see
+    /// `is_package_exported_unqualified` for the fail-open rationale.
+    fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool;
 
     /// Check if `module_name` opens `pkg` to `to_module`.
-    fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
-        let _ = (module_name, pkg, to_module);
-        true
-    }
+    ///
+    /// AUDIT 2026-05-19: REQUIRED, no default — see
+    /// `is_package_exported_unqualified` for the fail-open rationale.
+    fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool;
 
     /// Add a dynamic read edge: `reader` reads `provider`.
     fn module_add_reads(&mut self, reader: &str, provider: &str) {
@@ -1627,19 +1629,19 @@ pub trait NativeContext {
     /// Called by reflection natives (`Method.invoke`, `Field.get/set`,
     /// `Constructor.newInstance`) when `setAccessible(true)` is used on a
     /// member in a different module.
+    ///
+    /// AUDIT 2026-05-19: this method has **no default** and is REQUIRED. The
+    /// previous `Ok(())` default silently allowed arbitrary cross-module
+    /// `setAccessible` for any implementor that forgot to override it.
+    /// Forcing every `NativeContext` impl to provide a body makes the
+    /// security decision explicit — classpath-only / mock contexts may
+    /// return `Ok(())` deliberately; a JPMS-enabled VM must perform a real
+    /// module-readability + opens check.
     fn check_deep_reflection_access(
         &self,
-        _accessor_class_id: ClassId,
-        _target_class_id: ClassId,
-    ) -> Result<(), String> {
-        // Default: allow (classpath-only mode, or VM without JPMS configured).
-        //
-        // AUDIT 2026-05-16: fail-open by design for mock contexts; the
-        // production VM **MUST** override this with a real
-        // module-readability + opens check. Relying on the default in a
-        // JPMS-enabled VM allows arbitrary cross-module `setAccessible`.
-        Ok(())
-    }
+        accessor_class_id: ClassId,
+        target_class_id: ClassId,
+    ) -> Result<(), String>;
 
     // -- T13 java/lang/Class reflection metadata --
 
@@ -1776,10 +1778,19 @@ pub struct NativeMethodRegistry {
 
 impl NativeMethodRegistry {
     pub fn new() -> Self {
+        // ~3,100 native methods are registered at boot; size the maps
+        // up front so `register()` does not repeatedly rehash/grow.
+        const BOOT_REGISTRATION_HINT: usize = 4096;
         Self {
-            methods: FxHashMap::default(),
-            registrations: Vec::new(),
-            by_method_desc: FxHashMap::default(),
+            methods: FxHashMap::with_capacity_and_hasher(
+                BOOT_REGISTRATION_HINT,
+                Default::default(),
+            ),
+            registrations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            by_method_desc: FxHashMap::with_capacity_and_hasher(
+                BOOT_REGISTRATION_HINT,
+                Default::default(),
+            ),
         }
     }
 
@@ -1825,10 +1836,11 @@ impl NativeMethodRegistry {
         self.by_method_desc.insert(md_key, callback);
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
-        // method names. Native-ring recording is off by default; the
-        // pointer→name map is only ever consulted on the enabled path,
-        // so skip the per-registration `format!` (~3,100 String
-        // allocations at boot) unless recording is enabled.
+        // method names. The ring is disabled by default, so gate the
+        // `format!` (a String allocation) and the mutex-locking
+        // `register_name` call behind `is_enabled()` — otherwise boot
+        // does ~3,100 needless allocations + lock acquisitions for a
+        // name map nothing will ever read.
         if crate::native_ring::is_enabled() {
             let triple = format!("{class_name}.{method_name}{descriptor}");
             crate::native_ring::register_name(callback as usize, &triple);
