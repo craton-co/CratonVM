@@ -5658,6 +5658,66 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
 
     // toList (Java 16+ convenience)
     r.register(c, "toList", "()Ljava/util/List;", native_stream_to_list);
+
+    // spliterator() — declared abstract on `java.util.stream.BaseStream` and
+    // inherited by Stream/IntStream/LongStream/DoubleStream. Real-JDK bytecode
+    // (e.g. Netty's iterator-from-stream paths) calls `stream.spliterator()`;
+    // with no Java-side pipeline our synthetic Stream has nothing to dispatch
+    // to, surfacing as `NoSuchMethodError Stream.spliterator()`. Register a
+    // native on every Stream sub-interface (plus BaseStream) that materialises
+    // the stream's backing Object[] into a synthetic 3-field Spliterator
+    // (field 0 = array, field 1 = pos, field 2 = fence) — the exact layout the
+    // existing Spliterator natives (estimateSize/tryAdvance/forEachRemaining/
+    // characteristics) already understand.
+    for sc in &[
+        "java/util/stream/Stream",
+        "java/util/stream/BaseStream",
+        "java/util/stream/IntStream",
+        "java/util/stream/LongStream",
+        "java/util/stream/DoubleStream",
+        "java/util/stream/ReferencePipeline",
+    ] {
+        r.register(
+            sc,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_stream_spliterator,
+        );
+    }
+}
+
+/// `Stream.spliterator()` / `BaseStream.spliterator()` — build a synthetic
+/// Spliterator over the stream's backing elements.
+///
+/// The returned object is our standard 3-field synthetic Spliterator
+/// (field 0 = backing Object[], field 1 = cursor/pos, field 2 = fence),
+/// which `native_spliterator_{estimate_size,characteristics,try_advance,
+/// for_each_remaining}` all consume directly. Works for both synthetic
+/// Streams (field-0 array read) and real-JDK ReferencePipeline instances
+/// (materialised via `toArray()` inside `stream_elements_mut`).
+fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            // Null receiver — return an empty spliterator.
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let elements = stream_elements_mut(ctx, this);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, v) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
+    Ok(Some(Value::Object(Some(spl))))
 }
 
 // -- Source methods --
