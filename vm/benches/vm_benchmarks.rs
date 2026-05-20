@@ -12,12 +12,12 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use std::sync::Arc;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::{SharedVm, Vm, invoke_on_class_shared};
-use rustjvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
-use rustjvm_vm::classloading::{ClassId, ClassState, ClassLoaderId};
-use rustjvm_vm::types::Value;
-use rustjvm_vm::native::builtins::register_builtins;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::{SharedVm, Vm, invoke_on_class_shared};
+use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
+use cratonvm_vm::classloading::{ClassId, ClassState, ClassLoaderId};
+use cratonvm_vm::types::Value;
+use cratonvm_vm::native::builtins::register_builtins;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -27,12 +27,12 @@ use rustjvm_vm::native::builtins::register_builtins;
 fn register_bench_class(
     shared: &Arc<SharedVm>,
     name: &str,
-    methods: Vec<rustjvm_reader::method::ClassFileMethod>,
+    methods: Vec<cratonvm_reader::method::ClassFileMethod>,
 ) -> ClassId {
-    use rustjvm_vm::classloading::Class;
-    use rustjvm_reader::class_access_flags::ClassAccessFlags;
-    use rustjvm_reader::class_file_version::ClassFileVersion;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_vm::classloading::Class;
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_reader::class_file_version::ClassFileVersion;
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     let mut cm = shared.class_manager.write();
     let id = cm.class_store.next_id();
@@ -298,8 +298,8 @@ fn bench_vm_startup(c: &mut Criterion) {
 }
 
 fn bench_startup_to_first_bytecode(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     // iconst_1; ireturn РІР‚вЂќ simplest possible method
     let code = vec![0x04, 0xAC];
@@ -310,14 +310,14 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
             let class_id = register_bench_class(
                 &shared,
                 "HelloWorld",
-                vec![rustjvm_reader::method::ClassFileMethod {
+                vec![cratonvm_reader::method::ClassFileMethod {
                     name: "main".into(),
                     descriptor: "()I".into(),
                     access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                    attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                    attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
-                        code: rustjvm_reader::ByteView::from_vec(code.clone()),
+                        code: cratonvm_reader::ByteView::from_vec(code.clone()),
                         exception_table: vec![],
                         attributes: vec![],
                     }))],
@@ -387,7 +387,7 @@ fn bench_native_method_dispatch(c: &mut Criterion) {
             if let Some(cb) = shared.native_methods.find(
                 "java/lang/Object", "<init>", "()V",
             ) {
-                let mut ctx = rustjvm_vm::vm::NativeContextImpl {
+                let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                     shared: &shared,
                     thread: &mut thread,
                 };
@@ -398,8 +398,8 @@ fn bench_native_method_dispatch(c: &mut Criterion) {
 }
 
 fn bench_interpreter_counting_loop(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
@@ -410,14 +410,14 @@ fn bench_interpreter_counting_loop(c: &mut Criterion) {
         let class_id = register_bench_class(
             &shared,
             &class_name,
-            vec![rustjvm_reader::method::ClassFileMethod {
+            vec![cratonvm_reader::method::ClassFileMethod {
                 name: "count".into(),
                 descriptor: "()I".into(),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 1,
-                    code: rustjvm_reader::ByteView::from_vec(code),
+                    code: cratonvm_reader::ByteView::from_vec(code),
                     exception_table: vec![],
                     attributes: vec![],
                 }))],
@@ -437,22 +437,22 @@ fn bench_interpreter_counting_loop(c: &mut Criterion) {
 }
 
 fn bench_interpreter_fibonacci(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let code = make_fib_bytecode();
     let class_id = register_bench_class(
         &shared,
         "bench/Fibonacci",
-        vec![rustjvm_reader::method::ClassFileMethod {
+        vec![cratonvm_reader::method::ClassFileMethod {
             name: "fib".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 5,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -475,22 +475,22 @@ fn bench_interpreter_fibonacci(c: &mut Criterion) {
 }
 
 fn bench_shootout_nbody(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let code = make_nbody_bytecode();
     let class_id = register_bench_class(
         &shared,
         "bench/NBody",
-        vec![rustjvm_reader::method::ClassFileMethod {
+        vec![cratonvm_reader::method::ClassFileMethod {
             name: "nbodyLoop".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 4,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -513,22 +513,22 @@ fn bench_shootout_nbody(c: &mut Criterion) {
 }
 
 fn bench_shootout_binary_trees(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let code = make_binary_trees_bytecode();
     let class_id = register_bench_class(
         &shared,
         "bench/BinaryTrees",
-        vec![rustjvm_reader::method::ClassFileMethod {
+        vec![cratonvm_reader::method::ClassFileMethod {
             name: "treeSum".into(),
             descriptor: "(I)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 3,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -574,8 +574,8 @@ fn bench_specjvm_compiler(c: &mut Criterion) {
 
     c.bench_function("specjvm_compiler_throughput", |b| {
         b.iter(|| {
-            let padded = rustjvm_vm::runtime::frame::padded_bytecode(&code);
-            let scan = rustjvm_vm::jit::x64::jit_scan(&padded, code.len(), "(I)I");
+            let padded = cratonvm_vm::runtime::frame::padded_bytecode(&code);
+            let scan = cratonvm_vm::jit::x64::jit_scan(&padded, code.len(), "(I)I");
             black_box(scan);
         });
     });
@@ -596,7 +596,7 @@ fn bench_specjvm_crypto_dispatch(c: &mut Criterion) {
                 if let Some(cb) = shared.native_methods.find(
                     "java/lang/Object", "<init>", "()V",
                 ) {
-                    let mut ctx = rustjvm_vm::vm::NativeContextImpl {
+                    let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                         shared: &shared,
                         thread: &mut thread,
                     };
@@ -703,22 +703,22 @@ fn make_sor_bytecode() -> Vec<u8> {
 }
 
 fn bench_specjvm_scimark_sor(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let code = make_sor_bytecode();
     let class_id = register_bench_class(
         &shared,
         "bench/ScimarkSOR",
-        vec![rustjvm_reader::method::ClassFileMethod {
+        vec![cratonvm_reader::method::ClassFileMethod {
             name: "sor".into(),
             descriptor: "(II)I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 4,
                 max_locals: 7,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -759,22 +759,22 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
 /// higher trip count (100k iterations), measuring sustained
 /// interpreter throughput rather than startup.
 fn bench_dacapo_avrora_sim(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let code = make_counting_loop_bytecode(100_000);
     let class_id = register_bench_class(
         &shared,
         "bench/AvroraSim",
-        vec![rustjvm_reader::method::ClassFileMethod {
+        vec![cratonvm_reader::method::ClassFileMethod {
             name: "simulate".into(),
             descriptor: "()I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 1,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -826,22 +826,22 @@ fn bench_dacapo_avrora_sim(c: &mut Criterion) {
 /// TODO: wire to actual JIT-only entry path once a `compile_now` hook is
 /// exposed by the runtime; today we rely on the threshold counter.
 fn bench_jit_hot_loop(c: &mut Criterion) {
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let code = make_counting_loop_bytecode(100_000);
     let class_id = register_bench_class(
         &shared,
         "bench/JitHotLoop",
-        vec![rustjvm_reader::method::ClassFileMethod {
+        vec![cratonvm_reader::method::ClassFileMethod {
             name: "hot".into(),
             descriptor: "()I".into(),
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 1,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -956,7 +956,7 @@ fn bench_string_creation(c: &mut Criterion) {
             // Fresh VM per iteration to avoid OOM
             let shared = Arc::new(SharedVm::new(VmConfig::default()));
             for i in 0..100 {
-                let s = rustjvm_vm::vm::create_java_string(&shared, &format!("hello_{}", i));
+                let s = cratonvm_vm::vm::create_java_string(&shared, &format!("hello_{}", i));
                 black_box(s);
             }
         });

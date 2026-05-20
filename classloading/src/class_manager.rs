@@ -2,7 +2,7 @@
 //!
 //! The `ClassManager` is the central component that:
 //! 1. Locates `.class` files via the parent-delegation model (bootstrap → extension → application)
-//! 2. Parses them via `rustjvm_reader::read_class`
+//! 2. Parses them via `cratonvm_reader::read_class`
 //! 3. Recursively loads superclasses and interfaces
 //! 4. Stores them in a `ClassStore` indexed by `ClassId`
 //! 5. Provides lookup by name and id
@@ -21,11 +21,11 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use rustjvm_reader::attribute::{force_decode_all, Attribute};
-use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
-use rustjvm_reader::class_file_version::ClassFileVersion;
-use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::attribute::{force_decode_all, Attribute};
+use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags, MethodAccessFlags};
+use cratonvm_reader::class_file_version::ClassFileVersion;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use cratonvm_reader::method::ClassFileMethod;
 use tracing::debug;
 
 use crate::class::{
@@ -41,7 +41,7 @@ use crate::module::{
     ModuleRegistry,
 };
 use crate::vtype::ClassHierarchy;
-use rustjvm_types::error::{ClassFileError, LinkageError, VmError};
+use cratonvm_types::error::{ClassFileError, LinkageError, VmError};
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
 ///
@@ -395,7 +395,7 @@ fn fire_resolution_invalidate_hook(class_id: u32) {
 /// A `None` variant means "no snapshot" (abstract or native method) — the
 /// caller falls through to the slower resolution path.
 ///
-/// Fields line up with `rustjvm_jit_api::CachedBytecodeMethod` so the VM
+/// Fields line up with `cratonvm_jit_api::CachedBytecodeMethod` so the VM
 /// adapter can build that type directly. `code` is stored as `Vec<u8>`
 /// because classloading runs before the VM's padded-bytecode helper is
 /// reachable; the adapter pads-and-Arc's before handing off.
@@ -425,7 +425,7 @@ pub struct VtableMethodSnapshot {
     /// only needs to pad once into the final Arc.
     pub code: Arc<[u8]>,
     /// Exception handler table.
-    pub exception_table: Vec<rustjvm_reader::attribute::ExceptionTableEntry>,
+    pub exception_table: Vec<cratonvm_reader::attribute::ExceptionTableEntry>,
     /// Max operand-stack depth.
     pub max_stack: u16,
     /// Max local-variable count.
@@ -1113,7 +1113,7 @@ impl ClassManager {
     /// Parse a `module-info.class` byte array and register the contained
     /// module descriptor in `registry`.  Silently ignores parse failures.
     fn try_register_module_info(registry: &mut ModuleRegistry, bytes: &[u8]) {
-        let mut class_file = match rustjvm_reader::read_class(bytes) {
+        let mut class_file = match cratonvm_reader::read_class(bytes) {
             Ok(cf) => cf,
             Err(e) => {
                 debug!("Failed to parse module-info.class: {e}");
@@ -1234,15 +1234,15 @@ impl ClassManager {
         let class = Class {
             id,
             loader_id: ClassLoaderId::Bootstrap,
-            name: rustjvm_types::intern_arc(name),
+            name: cratonvm_types::intern_arc(name),
             source_file: None,
-            version: rustjvm_reader::class_file_version::ClassFileVersion::JAVA_8,
+            version: cratonvm_reader::class_file_version::ClassFileVersion::JAVA_8,
             state: ClassState::Initialized,
             initializing_thread: None,
-            constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+            constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
             ]),
-            access_flags: rustjvm_reader::class_access_flags::ClassAccessFlags::from_bits_truncate(0x0021),
+            access_flags: cratonvm_reader::class_access_flags::ClassAccessFlags::from_bits_truncate(0x0021),
             superclass: None,
             interfaces: vec![],
             fields: vec![],
@@ -1875,7 +1875,7 @@ impl ClassManager {
         }
 
         // Parse the class file
-        let mut class_file = rustjvm_reader::read_class(bytes).map_err(|e| {
+        let mut class_file = cratonvm_reader::read_class(bytes).map_err(|e| {
             VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -2351,7 +2351,7 @@ impl ClassManager {
             // Intern the class name through the global pool. If the reader
             // already interned this exact `this_class` string (the common
             // path), this is a hash-lookup + refcount bump — no allocation.
-            name: rustjvm_types::intern_arc(&stored_name),
+            name: cratonvm_types::intern_arc(&stored_name),
             source_file,
             version: class_file.version,
             // CDS-loaded classes are pre-verified — skip straight to Verified state.
@@ -2633,7 +2633,7 @@ impl ClassManager {
             .filter(|m| {
                 !m.is_static()
                     && !m.access_flags.contains(
-                        rustjvm_reader::class_access_flags::MethodAccessFlags::PRIVATE,
+                        cratonvm_reader::class_access_flags::MethodAccessFlags::PRIVATE,
                     )
                     && &*m.name != "<init>"
                     && &*m.name != "<clinit>"
@@ -2700,7 +2700,7 @@ impl ClassManager {
             }
             if method
                 .access_flags
-                .contains(rustjvm_reader::class_access_flags::MethodAccessFlags::PRIVATE)
+                .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::PRIVATE)
             {
                 continue;
             }
@@ -2720,10 +2720,10 @@ impl ClassManager {
             // populate the slot so name-based lookup succeeds; the
             // interpreter routes them through the native registry.
             let is_abstract = method.access_flags.contains(
-                rustjvm_reader::class_access_flags::MethodAccessFlags::ABSTRACT,
+                cratonvm_reader::class_access_flags::MethodAccessFlags::ABSTRACT,
             );
             let is_native = method.is_native();
-            let num_params_u16 = rustjvm_jit::count_param_slots(&method.descriptor) as u16;
+            let num_params_u16 = cratonvm_jit::count_param_slots(&method.descriptor) as u16;
             let dispatch: Option<VtableMethodSnapshot> = if is_abstract {
                 None
             } else if let Some(code_attr) = method.code() {
@@ -3205,7 +3205,7 @@ impl ClassManager {
         };
 
         // ---- Step 2: parse new bytes ----
-        let mut new_class_file = rustjvm_reader::read_class(&effective_new_bytes).map_err(|e| {
+        let mut new_class_file = cratonvm_reader::read_class(&effective_new_bytes).map_err(|e| {
             LinkageError::UnsupportedClassRedefinitionError {
                 class_name: existing_name.clone(),
                 message: format!("new_bytes failed to parse: {e}"),
@@ -3839,7 +3839,7 @@ impl ClassManager {
             // a *fresh* Arc per probe, forcing the HashMap to fall
             // through to a full `str` comparison on every loader-tuple
             // lookup.
-            let arc_key: Arc<str> = rustjvm_types::intern_arc(key.as_str());
+            let arc_key: Arc<str> = cratonvm_types::intern_arc(key.as_str());
             for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
                 if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
                     if let Some(class) = self.get_class(id) {
@@ -3867,7 +3867,7 @@ impl ClassManager {
             for key in &keys {
                 // Round 8 audit fix (HIGH #6): same intern_arc routing as
                 // the builtin loaders loop above.
-                let arc_key: Arc<str> = rustjvm_types::intern_arc(key.as_str());
+                let arc_key: Arc<str> = cratonvm_types::intern_arc(key.as_str());
                 for loader_id in &self.user_loaders {
                     if let Some(&id) =
                         self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key)))
@@ -3893,7 +3893,7 @@ impl ClassManager {
         // shares the global pool Arc with the original registration —
         // `Arc::ptr_eq` hits before any byte comparison. Previously
         // `Arc::<str>::from(name)` minted a fresh Arc per probe.
-        if let Some(&id) = self.loaded_classes.get(&(loader_id, rustjvm_types::intern_arc(name))) {
+        if let Some(&id) = self.loaded_classes.get(&(loader_id, cratonvm_types::intern_arc(name))) {
             return Some(id);
         }
         // Delegate to parent chain
@@ -3936,7 +3936,7 @@ impl ClassManager {
         // Round 4 audit fix: previously also wrote into the redundant
         // collision-unsafe `name_to_id` shadow map; that map is gone now
         // and `loaded_classes` is the only index.
-        let name_arc = rustjvm_types::intern_arc(name);
+        let name_arc = cratonvm_types::intern_arc(name);
         self.loaded_classes.insert((loader_id, name_arc), id);
         // Round 5 audit fix (HIGH): keep `user_loaders` in sync — see
         // `define_class_with_options` for the rationale (avoid the
@@ -4047,7 +4047,7 @@ impl ClassManager {
         let class = Class {
             id,
             loader_id: ClassLoaderId::Bootstrap,
-            name: rustjvm_types::intern_arc(name),
+            name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -4252,7 +4252,7 @@ impl ClassManager {
         let class = Class {
             id,
             loader_id: ClassLoaderId::Bootstrap,
-            name: rustjvm_types::intern_arc(name),
+            name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Initialized,
@@ -4353,9 +4353,9 @@ impl ClassManager {
         bytes: &[u8],
         loader_id: ClassLoaderId,
     ) -> Result<(), VmError> {
-        use rustjvm_reader::attribute::Attribute;
+        use cratonvm_reader::attribute::Attribute;
 
-        let mut class_file = rustjvm_reader::read_class(bytes).map_err(|e| {
+        let mut class_file = cratonvm_reader::read_class(bytes).map_err(|e| {
             VmError::ClassFile(ClassFileError::InvalidClassFile {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -4929,8 +4929,8 @@ fn is_jdk_class(name: &str) -> bool {
 ///
 /// Most stubs have no fields. Special cases provide the fields that native
 /// implementations expect, so that `new` + `<init>` works correctly.
-fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileField> {
-    use rustjvm_reader::field::ClassFileField;
+fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileField> {
+    use cratonvm_reader::field::ClassFileField;
 
     /// Helper to create N unnamed instance fields (for synthetic objects
     /// whose native code accesses fields by index, not by name).
@@ -4938,8 +4938,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         (0..n)
             .map(|i| ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc(&format!("_f{i}")),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc(&format!("_f{i}")),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             })
             .collect()
@@ -4955,20 +4955,20 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/lang/System" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC,
-                name: rustjvm_types::intern_arc("in"),
-                descriptor: rustjvm_types::intern_arc("Ljava/io/InputStream;"),
+                name: cratonvm_types::intern_arc("in"),
+                descriptor: cratonvm_types::intern_arc("Ljava/io/InputStream;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC,
-                name: rustjvm_types::intern_arc("out"),
-                descriptor: rustjvm_types::intern_arc("Ljava/io/PrintStream;"),
+                name: cratonvm_types::intern_arc("out"),
+                descriptor: cratonvm_types::intern_arc("Ljava/io/PrintStream;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC,
-                name: rustjvm_types::intern_arc("err"),
-                descriptor: rustjvm_types::intern_arc("Ljava/io/PrintStream;"),
+                name: cratonvm_types::intern_arc("err"),
+                descriptor: cratonvm_types::intern_arc("Ljava/io/PrintStream;"),
                 attributes: vec![],
             },
         ],
@@ -5009,8 +5009,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "java/lang/Void" => {
             let mut fields = vec![ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("TYPE"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"),
+                name: cratonvm_types::intern_arc("TYPE"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"),
                 attributes: vec![],
             }];
             fields.extend(instance_fields(1));
@@ -5097,38 +5097,38 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/nio/charset/StandardCharsets" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("UTF_8"),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/charset/Charset;"),
+                name: cratonvm_types::intern_arc("UTF_8"),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/Charset;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("US_ASCII"),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/charset/Charset;"),
+                name: cratonvm_types::intern_arc("US_ASCII"),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/Charset;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("ISO_8859_1"),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/charset/Charset;"),
+                name: cratonvm_types::intern_arc("ISO_8859_1"),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/Charset;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("UTF_16"),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/charset/Charset;"),
+                name: cratonvm_types::intern_arc("UTF_16"),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/Charset;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("UTF_16BE"),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/charset/Charset;"),
+                name: cratonvm_types::intern_arc("UTF_16BE"),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/Charset;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("UTF_16LE"),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/charset/Charset;"),
+                name: cratonvm_types::intern_arc("UTF_16LE"),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/Charset;"),
                 attributes: vec![],
             },
         ],
@@ -5153,48 +5153,48 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("NEW"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                name: cratonvm_types::intern_arc("NEW"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("RUNNABLE"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                name: cratonvm_types::intern_arc("RUNNABLE"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("BLOCKED"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                name: cratonvm_types::intern_arc("BLOCKED"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("WAITING"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                name: cratonvm_types::intern_arc("WAITING"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("TIMED_WAITING"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                name: cratonvm_types::intern_arc("TIMED_WAITING"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("TERMINATED"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Thread$State;"),
+                name: cratonvm_types::intern_arc("TERMINATED"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Thread$State;"),
                 attributes: vec![],
             },
         ],
@@ -5263,8 +5263,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/util/concurrent/TimeUnit" => {
             let mut fields = vec![ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("_f0"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("_f0"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             }];
             for name in &[
@@ -5278,8 +5278,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             ] {
                 fields.push(ClassFileField {
                     access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC,
-                    name: rustjvm_types::intern_arc(name),
-                    descriptor: rustjvm_types::intern_arc("Ljava/util/concurrent/TimeUnit;"),
+                    name: cratonvm_types::intern_arc(name),
+                    descriptor: cratonvm_types::intern_arc("Ljava/util/concurrent/TimeUnit;"),
                     attributes: vec![],
                 });
             }
@@ -5328,36 +5328,36 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
             // AccessibleObject.override (boolean, JDK field name `override`)
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("override"),
-                descriptor: rustjvm_types::intern_arc("Z"),
+                name: cratonvm_types::intern_arc("override"),
+                descriptor: cratonvm_types::intern_arc("Z"),
                 attributes: vec![],
             },
         ],
         "java/lang/reflect/Field" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("override"), descriptor: rustjvm_types::intern_arc("Z"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("clazz"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("slot"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("type"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("modifiers"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("trustedFinal"), descriptor: rustjvm_types::intern_arc("Z"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("override"), descriptor: cratonvm_types::intern_arc("Z"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("clazz"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("slot"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("type"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("modifiers"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("trustedFinal"), descriptor: cratonvm_types::intern_arc("Z"), attributes: vec![] },
         ],
         "java/lang/reflect/Method" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("override"), descriptor: rustjvm_types::intern_arc("Z"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("clazz"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("slot"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("returnType"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("parameterTypes"), descriptor: rustjvm_types::intern_arc("[Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("modifiers"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("callerSensitive"), descriptor: rustjvm_types::intern_arc("B"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("override"), descriptor: cratonvm_types::intern_arc("Z"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("clazz"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("slot"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("returnType"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("parameterTypes"), descriptor: cratonvm_types::intern_arc("[Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("modifiers"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("callerSensitive"), descriptor: cratonvm_types::intern_arc("B"), attributes: vec![] },
         ],
         "java/lang/reflect/Constructor" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("override"), descriptor: rustjvm_types::intern_arc("Z"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("clazz"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("slot"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("parameterTypes"), descriptor: rustjvm_types::intern_arc("[Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("modifiers"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("override"), descriptor: cratonvm_types::intern_arc("Z"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("clazz"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("slot"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("parameterTypes"), descriptor: cratonvm_types::intern_arc("[Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("modifiers"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
 
         // ---- T16.5 / T16.6: NIO async channels + UDP ----
@@ -5425,8 +5425,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
                 access_flags: FieldAccessFlags::PUBLIC
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc(n),
-                descriptor: rustjvm_types::intern_arc("Ljava/nio/file/attribute/PosixFilePermission;"),
+                name: cratonvm_types::intern_arc(n),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/file/attribute/PosixFilePermission;"),
                 attributes: vec![],
             };
             vec![
@@ -5484,18 +5484,18 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //   ProtectionDomain(CodeSource cs, PermissionCollection p, ClassLoader cl, Principal[] ps)
         // that real JDK bytecode targets.
         "java/security/ProtectionDomain" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("codesource"), descriptor: rustjvm_types::intern_arc("Ljava/security/CodeSource;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("permissions"), descriptor: rustjvm_types::intern_arc("Ljava/security/PermissionCollection;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("classloader"), descriptor: rustjvm_types::intern_arc("Ljava/lang/ClassLoader;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("principals"), descriptor: rustjvm_types::intern_arc("[Ljava/security/Principal;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("codesource"), descriptor: cratonvm_types::intern_arc("Ljava/security/CodeSource;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("permissions"), descriptor: cratonvm_types::intern_arc("Ljava/security/PermissionCollection;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("classloader"), descriptor: cratonvm_types::intern_arc("Ljava/lang/ClassLoader;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("principals"), descriptor: cratonvm_types::intern_arc("[Ljava/security/Principal;"), attributes: vec![] },
         ],
         // CodeSource = 2 fields (location URL, signer certs array).  The
         // JDK layout has additional internals (`signers`, `codeSigners`) that
         // are computed lazily; a 2-field stub is enough for our
         // reflectively-retrieved PD to expose `getLocation()` + `getCertificates()`.
         "java/security/CodeSource" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("location"), descriptor: rustjvm_types::intern_arc("Ljava/net/URL;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("certs"), descriptor: rustjvm_types::intern_arc("[Ljava/security/cert/Certificate;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("location"), descriptor: cratonvm_types::intern_arc("Ljava/net/URL;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("certs"), descriptor: cratonvm_types::intern_arc("[Ljava/security/cert/Certificate;"), attributes: vec![] },
         ],
 
         // ---- T19.1: JBoss MSC (Modular Service Container) field layouts ----
@@ -5506,25 +5506,25 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // fields 0..=4 (the documented Java-visible shape) while natives
         // round-trip controller ids via the extra slot.
         "org/jboss/msc/service/ServiceName" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("segments"), descriptor: rustjvm_types::intern_arc("[Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("canonical"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("segments"), descriptor: cratonvm_types::intern_arc("[Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("canonical"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
         "org/jboss/msc/service/ServiceController" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("mode"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("value"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("listeners"), descriptor: rustjvm_types::intern_arc("Ljava/util/ArrayList;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("mode"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("value"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("listeners"), descriptor: cratonvm_types::intern_arc("Ljava/util/ArrayList;"), attributes: vec![] },
             // Synthetic trailing back-reference: Rust controller id.
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("_mscId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("_mscId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         "org/jboss/msc/service/ServiceContainer" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("services"), descriptor: rustjvm_types::intern_arc("Ljava/util/concurrent/ConcurrentHashMap;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("workerPoolHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("services"), descriptor: cratonvm_types::intern_arc("Ljava/util/concurrent/ConcurrentHashMap;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("workerPoolHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         "org/jboss/msc/service/StartContext"
         | "org/jboss/msc/service/StopContext" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("controllerId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("controllerId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
 
         // ---- T19.H4: JBoss Modules boot-path field layouts ----
@@ -5540,13 +5540,13 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //
         // T19_H4_ANCHOR_LOCAL_MODULE_LOADER
         "org/jboss/modules/LocalModuleLoader" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("root"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("root"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
         // `ModuleLoader` — the abstract base.  Some bytecode holds a
         // `ModuleLoader` reference; give it the same 1-slot root layout so
         // field resolution doesn't OOB.
         "org/jboss/modules/ModuleLoader" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("root"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("root"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
         // `DefaultBootModuleLoaderHolder` — single static field INSTANCE
         // that post_clinit_fixup writes with a LocalModuleLoader ref.
@@ -5554,23 +5554,23 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "org/jboss/modules/DefaultBootModuleLoaderHolder" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC | FieldAccessFlags::FINAL,
-                name: rustjvm_types::intern_arc("INSTANCE"),
-                descriptor: rustjvm_types::intern_arc("Lorg/jboss/modules/ModuleLoader;"),
+                name: cratonvm_types::intern_arc("INSTANCE"),
+                descriptor: cratonvm_types::intern_arc("Lorg/jboss/modules/ModuleLoader;"),
                 attributes: vec![],
             },
         ],
         // `Module` — 4 instance slots (name, loader, classLoader, resourceRoots).
         // T19_H4_ANCHOR_MODULE
         "org/jboss/modules/Module" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("loader"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/modules/ModuleLoader;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("classLoader"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/modules/ModuleClassLoader;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("resourceRoots"), descriptor: rustjvm_types::intern_arc("[Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("loader"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/modules/ModuleLoader;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("classLoader"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/modules/ModuleClassLoader;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("resourceRoots"), descriptor: cratonvm_types::intern_arc("[Ljava/lang/String;"), attributes: vec![] },
         ],
         // `ModuleClassLoader` — 1 back-reference field to its owning Module.
         // T19_H4_ANCHOR_MODULE_CLASSLOADER
         "org/jboss/modules/ModuleClassLoader" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("module"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/modules/Module;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("module"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/modules/Module;"), attributes: vec![] },
         ],
         // `ModuleNotFoundException` — Throwable 2-slot shape (message, cause).
         // T19_H4_ANCHOR_MODULE_NOT_FOUND
@@ -5583,9 +5583,9 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // lives Rust-side in the DeploymentUnit Arc.  The fields below
         // are the minimal surface bytecode `getfield` calls must find.
         "org/jboss/as/server/deployment/DeploymentUnit" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("attachments"), descriptor: rustjvm_types::intern_arc("Ljava/util/Map;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("serviceName"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("attachments"), descriptor: cratonvm_types::intern_arc("Ljava/util/Map;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("serviceName"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
         ],
         // Services is a pure-static utility class (Services.deploymentUnitName, etc.).
         "org/jboss/as/server/deployment/Services" => vec![],
@@ -5593,30 +5593,30 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // max_size (Int), tasks_queue (Object).  The real queue lives in
         // the Rust `EnhancedQueueExecutor` registry keyed by `name`.
         "org/jboss/threads/EnhancedQueueExecutor" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("coreSize"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("maxSize"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("tasksQueue"), descriptor: rustjvm_types::intern_arc("Ljava/util/Queue;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("coreSize"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("maxSize"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("tasksQueue"), descriptor: cratonvm_types::intern_arc("Ljava/util/Queue;"), attributes: vec![] },
         ],
         // Logger mirror: name (String), parent_handle (Object).  The
         // real log machinery is the `tracing` subscriber — this just
         // bridges the JDK calls through.
         "org/jboss/logmanager/Logger" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("parentHandle"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("parentHandle"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
         ],
         // Level: name (String) + intValue (Int) matching JDK constants.
         "org/jboss/logmanager/Level" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("value"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("value"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // ModelController: single field holds the cached state ordinal.
         "org/jboss/as/controller/ModelController" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // ControlledProcessState: state-enum ordinal.
         "org/jboss/as/controller/ControlledProcessState" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("stateOrdinal"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("stateOrdinal"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
 
         // ---- T19.2.b: WildFly / JBoss Naming (JNDI) field layouts ----
@@ -5630,28 +5630,28 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //
         // InitialContext: 2 fields (environment_map, default_init_ctx_handle).
         "javax/naming/InitialContext" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("environment"), descriptor: rustjvm_types::intern_arc("Ljava/util/Hashtable;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("defaultInitCtx"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("environment"), descriptor: cratonvm_types::intern_arc("Ljava/util/Hashtable;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("defaultInitCtx"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // Binding: 3 fields (name, className, object) — wraps a single JNDI
         // entry for enumeration-style APIs (listBindings / list).
         "javax/naming/Binding" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("className"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("object"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("className"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("object"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
         ],
         // ServiceBasedNamingStore: 2 fields (bindings_map, service_base).
         "org/jboss/as/naming/ServiceBasedNamingStore" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("bindings"), descriptor: rustjvm_types::intern_arc("Ljava/util/concurrent/ConcurrentHashMap;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("serviceBase"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("bindings"), descriptor: cratonvm_types::intern_arc("Ljava/util/concurrent/ConcurrentHashMap;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("serviceBase"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
         ],
         // ContextNames$BindInfo: 2 fields (binder_service_name, binding_name).
         // Returned by `ContextNames.bindInfoFor(String absolute)` so the caller
         // has both the MSC ServiceName (used to register the binder) and the
         // stripped JNDI name for lookup.
         "org/jboss/as/naming/deployment/ContextNames$BindInfo" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("binderServiceName"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("bindingName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("binderServiceName"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/msc/service/ServiceName;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("bindingName"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
         // NameNotFoundException / NamingException / InvalidNameException inherit
         // Throwable — reuse the 2-slot (message, cause) shape.
@@ -5670,14 +5670,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/runtime/RuntimeValue" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("value"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc("value"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("supplier"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/function/Supplier;"),
+                name: cratonvm_types::intern_arc("supplier"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/function/Supplier;"),
                 attributes: vec![],
             },
         ],
@@ -5689,14 +5689,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/runtime/StartupContext" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("shutdownTasks"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/List;"),
+                name: cratonvm_types::intern_arc("shutdownTasks"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/List;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("values"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/concurrent/ConcurrentMap;"),
+                name: cratonvm_types::intern_arc("values"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/concurrent/ConcurrentMap;"),
                 attributes: vec![],
             },
         ],
@@ -5704,14 +5704,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/runtime/ApplicationConfig" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("name"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("name"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("version"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("version"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
         ],
@@ -5719,26 +5719,26 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/runtime/DataSourceRuntimeConfig" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("jdbcUrl"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("jdbcUrl"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("username"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("username"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("password"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("password"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("driver"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("driver"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
         ],
@@ -5749,26 +5749,26 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/runtime/Timing" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("bootStart"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("bootStart"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("bootStop"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("bootStop"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("mainStart"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("mainStart"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("mainStop"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("mainStop"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
         ],
@@ -5784,14 +5784,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/bootstrap/runner/SerializedApplication" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("mainClass"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("mainClass"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("runnerClassLoader"),
-                descriptor: rustjvm_types::intern_arc("Lio/quarkus/bootstrap/runner/RunnerClassLoader;"),
+                name: cratonvm_types::intern_arc("runnerClassLoader"),
+                descriptor: cratonvm_types::intern_arc("Lio/quarkus/bootstrap/runner/RunnerClassLoader;"),
                 attributes: vec![],
             },
         ],
@@ -5802,8 +5802,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/bootstrap/runner/RunnerClassLoader" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("parent"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/ClassLoader;"),
+                name: cratonvm_types::intern_arc("parent"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/ClassLoader;"),
                 attributes: vec![],
             },
         ],
@@ -5820,26 +5820,26 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "java/util/concurrent/atomic/AtomicLongFieldUpdater$RustJvmImpl" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("tclassId"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("tclassId"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("slotIndex"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("slotIndex"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("descTag"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("descTag"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("vclassId"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("vclassId"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
         ],
@@ -5851,26 +5851,26 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/util/logging/LogManager" | "org/jboss/logmanager/LogManager" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("properties"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/Properties;"),
+                name: cratonvm_types::intern_arc("properties"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/Properties;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("loggerRegistry"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc("loggerRegistry"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("rootLogger"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/logging/Logger;"),
+                name: cratonvm_types::intern_arc("rootLogger"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Logger;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("ready"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("ready"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
         ],
@@ -5879,14 +5879,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/util/logging/LogManager$StringEnumeration" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("names"),
-                descriptor: rustjvm_types::intern_arc("[Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc("names"),
+                descriptor: cratonvm_types::intern_arc("[Ljava/lang/Object;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("cursor"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("cursor"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
         ],
@@ -5894,20 +5894,20 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "java/util/logging/Logger" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("name"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"),
+                name: cratonvm_types::intern_arc("name"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("level"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/logging/Level;"),
+                name: cratonvm_types::intern_arc("level"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Level;"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("parent"),
-                descriptor: rustjvm_types::intern_arc("Ljava/util/logging/Logger;"),
+                name: cratonvm_types::intern_arc("parent"),
+                descriptor: cratonvm_types::intern_arc("Ljava/util/logging/Logger;"),
                 attributes: vec![],
             },
         ],
@@ -5922,36 +5922,36 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //   Configuration    = 6 (jdbc_url, driver, username, password,
         //                         min_size, max_size)
         "io/agroal/api/AgroalDataSource" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("config"), descriptor: rustjvm_types::intern_arc("Lio/agroal/api/configuration/AgroalDataSourceConfiguration;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("pool"), descriptor: rustjvm_types::intern_arc("Lio/agroal/pool/ConnectionPool;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("closed"), descriptor: rustjvm_types::intern_arc("Z"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("config"), descriptor: cratonvm_types::intern_arc("Lio/agroal/api/configuration/AgroalDataSourceConfiguration;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("pool"), descriptor: cratonvm_types::intern_arc("Lio/agroal/pool/ConnectionPool;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("closed"), descriptor: cratonvm_types::intern_arc("Z"), attributes: vec![] },
         ],
         "io/agroal/pool/ConnectionPool" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("handlers"), descriptor: rustjvm_types::intern_arc("Ljava/util/List;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("config"), descriptor: rustjvm_types::intern_arc("Lio/agroal/api/configuration/AgroalDataSourceConfiguration;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("size"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("handlers"), descriptor: cratonvm_types::intern_arc("Ljava/util/List;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("config"), descriptor: cratonvm_types::intern_arc("Lio/agroal/api/configuration/AgroalDataSourceConfiguration;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("size"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         "io/agroal/api/configuration/AgroalDataSourceConfiguration" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("jdbcUrl"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("driver"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("username"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("password"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("minSize"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("maxSize"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("jdbcUrl"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("driver"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("username"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("password"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("minSize"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("maxSize"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // IronJacamar:
         //   AbstractPool         = 3 (config, managed_factory, sub_pools)
         //   ManagedConnectionPool = 3 (connections, semaphore, state)
         "org/jboss/jca/core/connectionmanager/pool/AbstractPool" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("config"), descriptor: rustjvm_types::intern_arc("Lorg/jboss/jca/core/connectionmanager/pool/PoolConfiguration;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("managedFactory"), descriptor: rustjvm_types::intern_arc("Ljavax/resource/spi/ManagedConnectionFactory;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("subPools"), descriptor: rustjvm_types::intern_arc("Ljava/util/Map;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("config"), descriptor: cratonvm_types::intern_arc("Lorg/jboss/jca/core/connectionmanager/pool/PoolConfiguration;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("managedFactory"), descriptor: cratonvm_types::intern_arc("Ljavax/resource/spi/ManagedConnectionFactory;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("subPools"), descriptor: cratonvm_types::intern_arc("Ljava/util/Map;"), attributes: vec![] },
         ],
         "org/jboss/jca/core/connectionmanager/pool/ManagedConnectionPool" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("connections"), descriptor: rustjvm_types::intern_arc("Ljava/util/List;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("semaphore"), descriptor: rustjvm_types::intern_arc("Ljava/util/concurrent/Semaphore;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("connections"), descriptor: cratonvm_types::intern_arc("Ljava/util/List;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("semaphore"), descriptor: cratonvm_types::intern_arc("Ljava/util/concurrent/Semaphore;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
 
         // ---- T19.2.c: WildFly Security (JAAS + SecurityDomains + login modules) ----
@@ -5968,35 +5968,35 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // reads these fields sees a non-null handle it can pass to
         // follow-up getPrincipals/... natives.
         "javax/security/auth/Subject" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("principals"), descriptor: rustjvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("publicCreds"), descriptor: rustjvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("privateCreds"), descriptor: rustjvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("principals"), descriptor: cratonvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("publicCreds"), descriptor: cratonvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("privateCreds"), descriptor: cratonvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
         ],
         // LoginContext = 4 (name, subject, handler, modules).
         "javax/security/auth/login/LoginContext" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("subject"), descriptor: rustjvm_types::intern_arc("Ljavax/security/auth/Subject;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("handler"), descriptor: rustjvm_types::intern_arc("Ljavax/security/auth/callback/CallbackHandler;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("modules"), descriptor: rustjvm_types::intern_arc("Ljava/util/List;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("subject"), descriptor: cratonvm_types::intern_arc("Ljavax/security/auth/Subject;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("handler"), descriptor: cratonvm_types::intern_arc("Ljavax/security/auth/callback/CallbackHandler;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("modules"), descriptor: cratonvm_types::intern_arc("Ljava/util/List;"), attributes: vec![] },
         ],
         // AppConfigurationEntry = 3 (loginModuleClassName, controlFlag,
         // options). Matches JDK's canonical 3-field shape so reflective
         // access from the WildFly login-config parser reads sensible
         // values.
         "javax/security/auth/login/AppConfigurationEntry" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("loginModuleClassName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("controlFlag"), descriptor: rustjvm_types::intern_arc("Ljavax/security/auth/login/AppConfigurationEntry$LoginModuleControlFlag;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("options"), descriptor: rustjvm_types::intern_arc("Ljava/util/Map;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("loginModuleClassName"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("controlFlag"), descriptor: cratonvm_types::intern_arc("Ljavax/security/auth/login/AppConfigurationEntry$LoginModuleControlFlag;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("options"), descriptor: cratonvm_types::intern_arc("Ljava/util/Map;"), attributes: vec![] },
         ],
         // SecurityDomainService = 2 (name, authMgr).
         "org/jboss/as/security/SecurityDomainService" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("authMgr"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("authMgr"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
         ],
         // SecurityIdentity = 2 (principal, roles).
         "org/wildfly/security/auth/server/SecurityIdentity" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("principal"), descriptor: rustjvm_types::intern_arc("Ljava/security/Principal;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("roles"), descriptor: rustjvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("principal"), descriptor: cratonvm_types::intern_arc("Ljava/security/Principal;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("roles"), descriptor: cratonvm_types::intern_arc("Ljava/util/Set;"), attributes: vec![] },
         ],
 
         // ---- T19.2.e: WildFly Datasources subsystem + JTA TX glue ----
@@ -6013,20 +6013,20 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //
         // `javax.sql.DataSource` is a pure interface — no instance fields.
         "org/jboss/as/connector/subsystems/datasources/DataSourceService" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("jndiName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("poolHandle"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("jndiName"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("poolHandle"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         "javax/transaction/TransactionManager" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("currentTxId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("currentTxId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         "com/arjuna/ats/jta/TransactionManagerImple" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("singletonHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("singletonHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         "javax/transaction/xa/Xid" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("formatId"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("globalTransactionId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("branchQualifier"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("formatId"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("globalTransactionId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("branchQualifier"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
 
         // ---- T19.2.d: WildFly Undertow (HTTP subsystem) field layouts ----
@@ -6041,43 +6041,43 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //               bound_fds — a long id into the native
         //               `undertow_instances` registry).
         "io/undertow/Undertow" | "io/undertow/Undertow$Builder" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("listeners"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("handler"), descriptor: rustjvm_types::intern_arc("Lio/undertow/server/HttpHandler;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("workerThreads"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("ioThreads"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("boundFds"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("listeners"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("handler"), descriptor: cratonvm_types::intern_arc("Lio/undertow/server/HttpHandler;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("workerThreads"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("ioThreads"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("boundFds"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // HttpServerExchange = 7 (method, uri, request_headers,
         //                          request_body, response_status,
         //                          response_headers, response_sender).
         "io/undertow/server/HttpServerExchange" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("method"), descriptor: rustjvm_types::intern_arc("Lio/undertow/util/HttpString;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("uri"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("requestHeaders"), descriptor: rustjvm_types::intern_arc("Lio/undertow/util/HeaderMap;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("requestBody"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("responseStatus"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("responseHeaders"), descriptor: rustjvm_types::intern_arc("Lio/undertow/util/HeaderMap;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("responseSender"), descriptor: rustjvm_types::intern_arc("Lio/undertow/io/Sender;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("method"), descriptor: cratonvm_types::intern_arc("Lio/undertow/util/HttpString;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("uri"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("requestHeaders"), descriptor: cratonvm_types::intern_arc("Lio/undertow/util/HeaderMap;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("requestBody"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("responseStatus"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("responseHeaders"), descriptor: cratonvm_types::intern_arc("Lio/undertow/util/HeaderMap;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("responseSender"), descriptor: cratonvm_types::intern_arc("Lio/undertow/io/Sender;"), attributes: vec![] },
         ],
         // HeaderMap = 1 (entries_map long id into native registry).
         "io/undertow/util/HeaderMap" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("entriesMap"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("entriesMap"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // HttpString = 1 (bytes String mirror).
         "io/undertow/util/HttpString" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("bytes"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("bytes"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
         ],
         // UndertowService = 3 (name, server_handle, state).
         "org/wildfly/extension/undertow/UndertowService" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("serverHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("serverHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // ListenerService = 3 (port, host, bound_address).
         "org/wildfly/extension/undertow/ListenerService" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("port"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("host"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("boundAddress"), descriptor: rustjvm_types::intern_arc("Ljava/net/InetSocketAddress;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("port"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("host"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("boundAddress"), descriptor: cratonvm_types::intern_arc("Ljava/net/InetSocketAddress;"), attributes: vec![] },
         ],
 
         // ---- T19.7.b: JBoss XNIO (XnioWorker + Xnio) field layouts ----
@@ -6091,17 +6091,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // XnioWorker = 5 (name, ioThreadsArr, taskThreadsCount, state,
         //                 optionsHandle).
         "org/xnio/XnioWorker" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("ioThreadsArr"), descriptor: rustjvm_types::intern_arc("[Lorg/xnio/XnioIoThread;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("taskThreadsCount"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("optionsHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("ioThreadsArr"), descriptor: cratonvm_types::intern_arc("[Lorg/xnio/XnioIoThread;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("taskThreadsCount"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("optionsHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // Xnio = 2 (name, providerHandle).  Singleton provider — the handle
         // always round-trips to the same global Arc.
         "org/xnio/Xnio" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("providerHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("providerHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // NioXnioWorker inherits every slot from XnioWorker; no extra
         // instance fields at this level.  The synthetic class hierarchy
@@ -6110,11 +6110,11 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // `alloc_concurrent_synthetic` happy if the bytecode ever
         // allocates a `NioXnioWorker` directly.
         "org/xnio/nio/NioXnioWorker" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("ioThreadsArr"), descriptor: rustjvm_types::intern_arc("[Lorg/xnio/XnioIoThread;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("taskThreadsCount"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("optionsHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("ioThreadsArr"), descriptor: cratonvm_types::intern_arc("[Lorg/xnio/XnioIoThread;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("taskThreadsCount"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("optionsHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
 
         // ---- T19.7.d: XNIO Conduit stream channels + ChannelListener ----
@@ -6128,27 +6128,27 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //                                  read_listener, read_ready_flag,
         //                                  read_suspended).
         "org/xnio/conduits/ConduitStreamSourceChannel" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("channelId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("selectionKey"), descriptor: rustjvm_types::intern_arc("Ljava/nio/channels/SelectionKey;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("readListener"), descriptor: rustjvm_types::intern_arc("Lorg/xnio/ChannelListener;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("readReadyFlag"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("readSuspended"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("channelId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("selectionKey"), descriptor: cratonvm_types::intern_arc("Ljava/nio/channels/SelectionKey;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("readListener"), descriptor: cratonvm_types::intern_arc("Lorg/xnio/ChannelListener;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("readReadyFlag"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("readSuspended"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // ConduitStreamSinkChannel = 6 (channel_id, selection_key,
         //                                write_listener, write_ready_flag,
         //                                write_suspended, buffered_bytes).
         "org/xnio/conduits/ConduitStreamSinkChannel" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("channelId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("selectionKey"), descriptor: rustjvm_types::intern_arc("Ljava/nio/channels/SelectionKey;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("writeListener"), descriptor: rustjvm_types::intern_arc("Lorg/xnio/ChannelListener;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("writeReadyFlag"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("writeSuspended"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("bufferedBytes"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("channelId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("selectionKey"), descriptor: cratonvm_types::intern_arc("Ljava/nio/channels/SelectionKey;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("writeListener"), descriptor: cratonvm_types::intern_arc("Lorg/xnio/ChannelListener;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("writeReadyFlag"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("writeSuspended"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("bufferedBytes"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // ChannelListener$Setter = 2 (channel_handle, listener_slot_index).
         "org/xnio/ChannelListener$Setter" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("channelHandle"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("listenerSlotIndex"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("channelHandle"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("listenerSlotIndex"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
 
         // ---- T19.7.c: XNIO I/O-thread + executor-key field layouts ----
@@ -6164,17 +6164,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // NioIoThread shares the layout (extends XnioIoThread, no extra
         // instance fields at the nio subclass level).
         "org/xnio/XnioIoThread" | "org/xnio/nio/NioIoThread" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("id"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("workerHandle"), descriptor: rustjvm_types::intern_arc("Lorg/xnio/XnioWorker;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("selectorHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("state"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("id"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("workerHandle"), descriptor: cratonvm_types::intern_arc("Lorg/xnio/XnioWorker;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("selectorHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("state"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // XnioExecutor$Key = 2 (task_id long, cancelled int-boolean).
         // `Key.remove()` flips the `cancelled` slot + the process-wide
         // AtomicBool stored in the T19.7.c key-cancel registry.
         "org/xnio/XnioExecutor$Key" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("taskId"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("cancelled"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("taskId"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("cancelled"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
 
         // ---- T19.7.e: XNIO OptionMap + IoFuture + Options layouts ----
@@ -6189,29 +6189,29 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // populates all three; the static final instances in `Options` share
         // this layout.
         "org/xnio/Option" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("declaringClass"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("typeClass"), descriptor: rustjvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("declaringClass"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("typeClass"), descriptor: cratonvm_types::intern_arc("Ljava/lang/Class;"), attributes: vec![] },
         ],
         // OptionMap = 1 (entries_arc_handle).  Immutable-after-build; the
         // Long round-trips to `lookup_map(handle)` for every read.
         "org/xnio/OptionMap" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("entriesHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("entriesHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // OptionMap$Builder = 1 (pending_entries handle).  Mutable until
         // `getMap()` flips `consumed` atomically; subsequent `set()` raises
         // IllegalStateException.
         "org/xnio/OptionMap$Builder" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("pendingHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("pendingHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // IoFuture = 3 (status int snapshot, result_slot handle, notifier_list
         // mirror handle).  Real state (AtomicU8, Mutex<FutureState>, Condvar)
         // lives in the process-wide `futures` registry.  Transitions are
         // monotonic: WAITING → {DONE, CANCELLED, FAILED}.
         "org/xnio/IoFuture" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("status"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("resultSlot"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("notifierList"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("status"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("resultSlot"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("notifierList"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // FutureResult = 1 (future_handle).  The producer side wires
         // `setResult/setException/setCancelled` to the same IoFutureInner
@@ -6220,7 +6220,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         // `tracing::warn!` but not auto-FAILED — the tracked handle
         // stays in the registry so subsequent rebind does not NPE.
         "org/xnio/FutureResult" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("futureHandle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("futureHandle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // Options is a pure-static class — no instance fields.  The
         // well-known option constants (WORKER_IO_THREADS, BACKLOG, …)
@@ -6239,45 +6239,45 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         //
         // DefaultCacheManager = 3 (handle J, configName String, started I).
         "org/infinispan/manager/DefaultCacheManager" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("handle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("configName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("started"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("handle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("configName"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("started"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // EmbeddedCacheManager (interface) — no instance fields; method
         // dispatch goes through the native registry directly.
         "org/infinispan/manager/EmbeddedCacheManager" => vec![],
         // CacheImpl = 3 (handle J, name String, manager DefaultCacheManager).
         "org/infinispan/cache/impl/CacheImpl" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("handle"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("manager"), descriptor: rustjvm_types::intern_arc("Lorg/infinispan/manager/DefaultCacheManager;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("handle"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("manager"), descriptor: cratonvm_types::intern_arc("Lorg/infinispan/manager/DefaultCacheManager;"), attributes: vec![] },
         ],
         // Cache (interface) and AdvancedCache (interface) — no instance fields;
         // method dispatch goes through the native registry directly.
         "org/infinispan/Cache" | "org/infinispan/AdvancedCache" => vec![],
         // Configuration = 3 (name String, sizeLimit I, ttlMs J).
         "org/infinispan/configuration/cache/Configuration" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("sizeLimit"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("ttlMs"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("sizeLimit"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("ttlMs"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // ConfigurationBuilder = 3 (mirrors Configuration for build() pass-through).
         "org/infinispan/configuration/cache/ConfigurationBuilder" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("name"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("sizeLimit"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("ttlMs"), descriptor: rustjvm_types::intern_arc("J"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("name"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("sizeLimit"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("ttlMs"), descriptor: cratonvm_types::intern_arc("J"), attributes: vec![] },
         ],
         // GlobalConfiguration = 3 (siteName String, jmxEnabled I, reserved I).
         "org/infinispan/configuration/global/GlobalConfiguration" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("siteName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("jmxEnabled"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("reserved"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("siteName"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("jmxEnabled"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("reserved"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // GlobalConfigurationBuilder = 3 (mirrors GlobalConfiguration).
         "org/infinispan/configuration/global/GlobalConfigurationBuilder" => vec![
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("siteName"), descriptor: rustjvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("jmxEnabled"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
-            ClassFileField { access_flags: FieldAccessFlags::empty(), name: rustjvm_types::intern_arc("reserved"), descriptor: rustjvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("siteName"), descriptor: cratonvm_types::intern_arc("Ljava/lang/String;"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("jmxEnabled"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
+            ClassFileField { access_flags: FieldAccessFlags::empty(), name: cratonvm_types::intern_arc("reserved"), descriptor: cratonvm_types::intern_arc("I"), attributes: vec![] },
         ],
         // CacheNotifier — interface; no instance fields.
         "org/infinispan/notifications/cachelistener/CacheNotifier" => vec![],
@@ -6299,8 +6299,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "io/quarkus/arc/impl/ArcContainerImpl" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("containerId"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("containerId"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
         ],
@@ -6312,14 +6312,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "io/quarkus/arc/impl/InstanceHandleImpl" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("containerId"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("containerId"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("beanRef"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc("beanRef"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             },
         ],
@@ -6329,14 +6329,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/arc/InjectableBean" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("containerId"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("containerId"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("beanRef"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc("beanRef"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             },
         ],
@@ -6346,14 +6346,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "jakarta/enterprise/inject/Instance" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("containerId"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("containerId"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("beanRef"),
-                descriptor: rustjvm_types::intern_arc("Ljava/lang/Object;"),
+                name: cratonvm_types::intern_arc("beanRef"),
+                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             },
         ],
@@ -6364,8 +6364,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         | "jakarta/enterprise/inject/spi/BeanManager" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("containerId"),
-                descriptor: rustjvm_types::intern_arc("J"),
+                name: cratonvm_types::intern_arc("containerId"),
+                descriptor: cratonvm_types::intern_arc("J"),
                 attributes: vec![],
             },
         ],
@@ -6374,8 +6374,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<rustjvm_reader::field::ClassFileFiel
         "io/quarkus/arc/ManagedContext" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: rustjvm_types::intern_arc("active"),
-                descriptor: rustjvm_types::intern_arc("I"),
+                name: cratonvm_types::intern_arc("active"),
+                descriptor: cratonvm_types::intern_arc("I"),
                 attributes: vec![],
             },
         ],
@@ -6439,8 +6439,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     let mut out = Vec::new();
     let mk_ctor = |descriptor: &str| ClassFileMethod {
         access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-        name: rustjvm_types::intern_arc("<init>"),
-        descriptor: rustjvm_types::intern_arc(descriptor),
+        name: cratonvm_types::intern_arc("<init>"),
+        descriptor: cratonvm_types::intern_arc(descriptor),
         attributes: vec![],
     };
     let is_throwable_like =
@@ -6456,8 +6456,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     if name == "java/nio/file/attribute/PosixFilePermission" {
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::STATIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc("<clinit>"),
-            descriptor: rustjvm_types::intern_arc("()V"),
+            name: cratonvm_types::intern_arc("<clinit>"),
+            descriptor: cratonvm_types::intern_arc("()V"),
             attributes: vec![],
         });
     }
@@ -6484,8 +6484,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         ] {
             out.push(ClassFileMethod {
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-                name: rustjvm_types::intern_arc("<init>"),
-                descriptor: rustjvm_types::intern_arc(desc),
+                name: cratonvm_types::intern_arc("<init>"),
+                descriptor: cratonvm_types::intern_arc(desc),
                 attributes: vec![],
             });
         }
@@ -6499,41 +6499,41 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         ] {
             out.push(ClassFileMethod {
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-                name: rustjvm_types::intern_arc(method),
-                descriptor: rustjvm_types::intern_arc(desc),
+                name: cratonvm_types::intern_arc(method),
+                descriptor: cratonvm_types::intern_arc(desc),
                 attributes: vec![],
             });
         }
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc("getThreadGroup"),
-            descriptor: rustjvm_types::intern_arc("()Ljava/lang/ThreadGroup;"),
+            name: cratonvm_types::intern_arc("getThreadGroup"),
+            descriptor: cratonvm_types::intern_arc("()Ljava/lang/ThreadGroup;"),
             attributes: vec![],
         });
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc("getPriority"),
-            descriptor: rustjvm_types::intern_arc("()I"),
+            name: cratonvm_types::intern_arc("getPriority"),
+            descriptor: cratonvm_types::intern_arc("()I"),
             attributes: vec![],
         });
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc("isDaemon"),
-            descriptor: rustjvm_types::intern_arc("()Z"),
+            name: cratonvm_types::intern_arc("isDaemon"),
+            descriptor: cratonvm_types::intern_arc("()Z"),
             attributes: vec![],
         });
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc("setDaemon"),
-            descriptor: rustjvm_types::intern_arc("(Z)V"),
+            name: cratonvm_types::intern_arc("setDaemon"),
+            descriptor: cratonvm_types::intern_arc("(Z)V"),
             attributes: vec![],
         });
     }
     if name == "java/util/concurrent/CountDownLatch" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc(method),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
         out.extend([
@@ -6548,8 +6548,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     if name == "java/util/concurrent/Semaphore" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc(method),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
         out.extend([
@@ -6572,8 +6572,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     if name == "java/util/concurrent/atomic/AtomicBoolean" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc(method),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
         out.extend([mk("<init>", "()V"), mk("<init>", "(Z)V")]);
@@ -6581,8 +6581,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     if name == "java/util/concurrent/ScheduledThreadPoolExecutor" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc(method),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
         out.extend([
@@ -6593,8 +6593,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     if name == "java/util/concurrent/CopyOnWriteArrayList" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: rustjvm_types::intern_arc(method),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
         out.extend([
@@ -6626,7 +6626,7 @@ impl std::fmt::Debug for ClassManager {
 /// This class's own instance fields start at `N`. Static fields don't need
 /// object slots; only instance fields are counted.
 fn compute_field_layout(
-    fields: &[rustjvm_reader::field::ClassFileField],
+    fields: &[cratonvm_reader::field::ClassFileField],
     superclass_id: Option<ClassId>,
     store: &ClassStore,
 ) -> (usize, usize) {
@@ -6654,24 +6654,24 @@ fn compute_field_layout(
 mod tests {
     use super::*;
     use crate::class::ClassStore;
-    use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
-    use rustjvm_reader::class_file_version::ClassFileVersion;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
+    use cratonvm_reader::class_file_version::ClassFileVersion;
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     fn empty_constant_pool() -> ConstantPool {
         ConstantPool::new(vec![ConstantPoolEntry::Tombstone])
     }
 
-    fn make_field(name: &str, is_static: bool) -> rustjvm_reader::field::ClassFileField {
+    fn make_field(name: &str, is_static: bool) -> cratonvm_reader::field::ClassFileField {
         let flags = if is_static {
             FieldAccessFlags::STATIC
         } else {
             FieldAccessFlags::empty()
         };
-        rustjvm_reader::field::ClassFileField {
+        cratonvm_reader::field::ClassFileField {
             access_flags: flags,
             name: Arc::from(name),
-            descriptor: rustjvm_types::intern_arc("I"),
+            descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
     }
@@ -6707,7 +6707,7 @@ mod tests {
         store.add(Class {
             id: parent_id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("Parent"),
+            name: cratonvm_types::intern_arc("Parent"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -6924,7 +6924,7 @@ mod tests {
         store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("com/example/Point"),
+            name: cratonvm_types::intern_arc("com/example/Point"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -6989,7 +6989,7 @@ mod tests {
         store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("com/example/Shape"),
+            name: cratonvm_types::intern_arc("com/example/Shape"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -7037,7 +7037,7 @@ mod tests {
         store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("com/example/Plain"),
+            name: cratonvm_types::intern_arc("com/example/Plain"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -7083,7 +7083,7 @@ mod tests {
         store.add(Class {
             id: parent_id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("test/Sealed"),
+            name: cratonvm_types::intern_arc("test/Sealed"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -7132,15 +7132,15 @@ mod tests {
 
     #[test]
     fn m19_declares_finalize_false_for_object() {
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::method::ClassFileMethod;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::method::ClassFileMethod;
 
         let mut store = ClassStore::new();
         let id = store.next_id();
         store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("java/lang/Object"),
+            name: cratonvm_types::intern_arc("java/lang/Object"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -7150,8 +7150,8 @@ mod tests {
             interfaces: vec![],
             fields: vec![],
             methods: vec![ClassFileMethod {
-                name: rustjvm_types::intern_arc("finalize"),
-                descriptor: rustjvm_types::intern_arc("()V"),
+                name: cratonvm_types::intern_arc("finalize"),
+                descriptor: cratonvm_types::intern_arc("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
                 attributes: vec![],
             }],
@@ -7182,15 +7182,15 @@ mod tests {
 
     #[test]
     fn m19_declares_finalize_true_for_subclass() {
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::method::ClassFileMethod;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::method::ClassFileMethod;
 
         let mut store = ClassStore::new();
         let id = store.next_id();
         store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("com/example/MyResource"),
+            name: cratonvm_types::intern_arc("com/example/MyResource"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -7200,8 +7200,8 @@ mod tests {
             interfaces: vec![],
             fields: vec![],
             methods: vec![ClassFileMethod {
-                name: rustjvm_types::intern_arc("finalize"),
-                descriptor: rustjvm_types::intern_arc("()V"),
+                name: cratonvm_types::intern_arc("finalize"),
+                descriptor: cratonvm_types::intern_arc("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
                 attributes: vec![],
             }],
@@ -7236,7 +7236,7 @@ mod tests {
         store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("com/example/Plain"),
+            name: cratonvm_types::intern_arc("com/example/Plain"),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -7271,7 +7271,7 @@ mod tests {
     }
 
     // ── Boot classpath module discovery integration tests ─────────────
-    // Run with: cargo test -p rustjvm-classloading -- --ignored
+    // Run with: cargo test -p cratonvm-classloading -- --ignored
 
     /// Helper: find the jmods directory on this machine.
     fn find_jmods_dir() -> Option<std::path::PathBuf> {
@@ -7494,8 +7494,8 @@ mod tests {
     // logic that lives in this crate.
     // ------------------------------------------------------------------
 
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
-    use rustjvm_reader::method::ClassFileMethod;
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::method::ClassFileMethod;
 
     fn stub_method(name: &str, descriptor: &str, flags: MethodAccessFlags) -> ClassFileMethod {
         ClassFileMethod {
@@ -7755,7 +7755,7 @@ mod tests {
     /// `dispatch` field for each concrete bytecode method.
     #[test]
     fn t10_9_a_build_vtable_populates_dispatch_for_concrete_methods() {
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
 
         let mut mgr = ClassManager::new(&[], &[], &[]);
         let id = mgr.class_store.next_id();
@@ -7773,7 +7773,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 3,
                 max_locals: 4,
-                code: rustjvm_reader::ByteView::from_slice(&[0x01u8, 0xb1]), // aconst_null; return
+                code: cratonvm_reader::ByteView::from_slice(&[0x01u8, 0xb1]), // aconst_null; return
                 exception_table: vec![],
                 attributes: vec![],
             }))],

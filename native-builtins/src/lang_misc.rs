@@ -2,9 +2,9 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ClassId, ObjectRef, Value};
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
 
 use crate::obj_arg;
 
@@ -215,7 +215,7 @@ pub(crate) fn native_throwable_fill_in_stack_trace(
     let this = match args.first() {
         Some(Value::Object(Some(obj_ref))) => *obj_ref,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("fillInStackTrace on null".to_string()),
             }
             .into());
@@ -255,7 +255,7 @@ pub(crate) fn native_throwable_get_stack_trace_element(
     let this = match args.first() {
         Some(Value::Object(Some(obj_ref))) => *obj_ref,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("getStackTraceElement on null".to_string()),
             }
             .into());
@@ -596,7 +596,7 @@ pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -643,7 +643,7 @@ pub(crate) fn native_throwable_get_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
@@ -667,7 +667,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {

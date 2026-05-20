@@ -55,8 +55,8 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
-use rustjvm_native_api::registry::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{error::MethodCallResult, ObjectRef, Value};
+use cratonvm_native_api::registry::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{error::MethodCallResult, ObjectRef, Value};
 
 /// Bound the per-process map to defend against runaway leaks. In practice
 /// the JDK creates O(few) AbstractClassLoaderValue instances (ServicesCatalog,

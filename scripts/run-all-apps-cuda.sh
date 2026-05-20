@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Run every app in C:/craton/CratonVM/apps/ under the CUDA-enabled rustjvm
-# (`cargo build --release -p rustjvm-cli --bin rustjvm --features gpu-driver`)
+# Run every app in C:/craton/CratonVM/apps/ under the CUDA-enabled cratonvm
+# (`cargo build --release -p cratonvm-cli --bin cratonvm --features gpu-driver`)
 # IN GPU MODE ONLY (--gpu --print-gpu-decisions). Captures rc + first error
 # line per app into ROLLUP.md.
 set +e
 
 ROOT=C:/craton/CratonVM/.claude/worktrees/angry-brown-38c5dc
 APPS=C:/craton/CratonVM/apps
-RJVM="$ROOT/target/release/rustjvm.exe"
+RJVM="$ROOT/target/release/cratonvm.exe"
 JDK="C:/Program Files/Java/jdk-25"
 CRATON_GPU=$(ls -d "$ROOT/target/release/build/craton-gpu-"*/out/classes 2>/dev/null | head -1)
 M2="$HOME/.m2/repository"
@@ -15,7 +15,7 @@ LOG="$ROOT/applogs/all-apps-gpu-$(date +%H%M%S)"
 mkdir -p "$LOG"
 
 ROLLUP="$LOG/ROLLUP.md"
-echo "# All-apps run under CUDA-enabled rustjvm (GPU mode only)" > "$ROLLUP"
+echo "# All-apps run under CUDA-enabled cratonvm (GPU mode only)" > "$ROLLUP"
 echo "" >> "$ROLLUP"
 echo "JVM: \`$RJVM\` (--features gpu-driver)" >> "$ROLLUP"
 echo "Flags: \`--gpu --print-gpu-decisions\`" >> "$ROLLUP"
@@ -29,15 +29,15 @@ run() {
     local name="$1"; shift
     local timeout_s="$1"; shift
     echo "----- $name -----" >&2
-    # GPU mode is on for every app. RUSTJVM_DISABLE_JIT=1 to dodge the
+    # GPU mode is on for every app. CRATONVM_DISABLE_JIT=1 to dodge the
     # known JIT int[]-loop regression so the runner isn't dominated by
     # that single bug.
-    RUSTJVM_DISABLE_JIT=1 timeout "$timeout_s" "$RJVM" \
+    CRATONVM_DISABLE_JIT=1 timeout "$timeout_s" "$RJVM" \
         --java-home "$JDK" --gpu --print-gpu-decisions "$@" \
         > "$LOG/$name.out" 2> "$LOG/$name.err"
     local rc=$?
     local first_err
-    first_err=$(grep -vE '^\[rustjvm\]|^\[2m2026-|^WARN |^\[GRES-DBG|^\[URLRES-DBG|^\[OSTR-DBG|^\[CCE-DBG|^\[DEBUG|^SLF4J' "$LOG/$name.err" 2>/dev/null | head -1 | head -c 160)
+    first_err=$(grep -vE '^\[cratonvm\]|^\[2m2026-|^WARN |^\[GRES-DBG|^\[URLRES-DBG|^\[OSTR-DBG|^\[CCE-DBG|^\[DEBUG|^SLF4J' "$LOG/$name.err" 2>/dev/null | head -1 | head -c 160)
     if [ -z "$first_err" ]; then
         first_err=$(tail -1 "$LOG/$name.out" 2>/dev/null | head -c 160)
     fi

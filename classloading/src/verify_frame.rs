@@ -4,11 +4,11 @@
 //! operand stack at a specific bytecode offset. The verifier maintains a
 //! current frame and advances it through each instruction.
 
-use rustjvm_reader::constant_pool::ConstantPool;
-use rustjvm_reader::stack_map::StackMapFrame;
+use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::stack_map::StackMapFrame;
 
 use super::vtype::{param_types_from_descriptor, ClassHierarchy, VType};
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 /// The verification frame: local variable types and operand stack types.
 #[derive(Debug, Clone)]

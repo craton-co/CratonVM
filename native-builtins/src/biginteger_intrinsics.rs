@@ -42,9 +42,9 @@
 //! * No `unwrap()` on caller-provided values; only on the always-safe
 //!   `MethodCallResult::Ok` constructor.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 /// `java.math.BigInteger.LONG_MASK = 0xFFFFFFFFL`.
 const LONG_MASK: u64 = 0xFFFF_FFFF;
@@ -59,7 +59,7 @@ fn read_int(
     arr: ObjectRef,
     idx: usize,
     len: usize,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     if idx >= len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
             index: idx as i32,
@@ -84,7 +84,7 @@ fn write_int(
     idx: usize,
     len: usize,
     val: i32,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if idx >= len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
             index: idx as i32,
@@ -99,7 +99,7 @@ fn write_int(
 /// (Java spec: the JDK's intrinsic never receives null because the wrapper
 /// always allocates first; defensive check anyway so a malformed bytecode
 /// caller cannot crash us).
-fn require_int_array(v: Option<&Value>, name: &str) -> Result<ObjectRef, rustjvm_types::error::MethodCallFailed> {
+fn require_int_array(v: Option<&Value>, name: &str) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     match v {
         Some(Value::Object(Some(o))) => Ok(*o),
         _ => Err(RuntimeError::NullPointerException {
@@ -109,7 +109,7 @@ fn require_int_array(v: Option<&Value>, name: &str) -> Result<ObjectRef, rustjvm
     }
 }
 
-fn require_int(v: Option<&Value>, name: &str) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+fn require_int(v: Option<&Value>, name: &str) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
         _ => Err(RuntimeError::IllegalArgumentException {
@@ -119,7 +119,7 @@ fn require_int(v: Option<&Value>, name: &str) -> Result<i32, rustjvm_types::erro
     }
 }
 
-fn require_long(v: Option<&Value>, name: &str) -> Result<i64, rustjvm_types::error::MethodCallFailed> {
+fn require_long(v: Option<&Value>, name: &str) -> Result<i64, cratonvm_types::error::MethodCallFailed> {
     match v {
         Some(Value::Long(i)) => Ok(*i),
         _ => Err(RuntimeError::IllegalArgumentException {
@@ -388,7 +388,7 @@ pub fn shift_right_impl_worker(
 fn read_int_array(
     ctx: &dyn NativeContext,
     arr: ObjectRef,
-) -> Result<Vec<i32>, rustjvm_types::error::MethodCallFailed> {
+) -> Result<Vec<i32>, cratonvm_types::error::MethodCallFailed> {
     let n = ctx.array_length(arr);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -415,7 +415,7 @@ fn write_int_array(
     ctx: &dyn NativeContext,
     arr: ObjectRef,
     src: &[i32],
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let n = ctx.array_length(arr);
     if src.len() > n {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
@@ -676,7 +676,7 @@ pub fn register_biginteger_intrinsics(registry: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_types::Value;
+    use cratonvm_types::Value;
 
     fn alloc_int_arr(ctx: &mut dyn NativeContext, vals: &[i32]) -> ObjectRef {
         let arr = ctx.new_array(ArrayElementType::Int, vals.len());

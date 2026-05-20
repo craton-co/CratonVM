@@ -31,8 +31,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::SharedVm;
 
 fn shared() -> Arc<SharedVm> {
     Arc::new(SharedVm::new(VmConfig::default()))
@@ -60,15 +60,15 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -116,7 +116,7 @@ fn run_scanner_probe(stdin_payload: &str, timeout: Duration) -> Option<(String, 
         eprintln!("wave3_scanner: ScannerProbe.class missing and javac unavailable; skipping");
         return None;
     }
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let jh = java_home()?;
     let dir = scanner_probe_dir();
 
@@ -168,7 +168,7 @@ fn scanner_reads_line_and_int_from_stdin() {
     else {
         eprintln!(
             "wave3_scanner: prerequisites missing; skipping \
-             (set RUSTJVM_BIN + JAVA_HOME or build target/release/rustjvm)"
+             (set CRATONVM_BIN + JAVA_HOME or build target/release/cratonvm)"
         );
         return;
     };

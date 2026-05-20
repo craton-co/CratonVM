@@ -5,19 +5,19 @@
 //! shim the property pipeline. Short-circuit DemoApplication.main
 //! directly so the JVM exits rc=0 — boot-test success.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn demo_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[demo-shim] DemoApplication.main short-circuited (boot-test mode)");
     Ok(None)
 }
 
-/// Diagnostic gate — `RUSTJVM_DEMO_REAL=1` skips shim registration so
+/// Diagnostic gate — `CRATONVM_DEMO_REAL=1` skips shim registration so
 /// the real bytecode runs under CratonVM.
 fn demo_real_mode() -> bool {
-    std::env::var("RUSTJVM_DEMO_REAL")
+    std::env::var("CRATONVM_DEMO_REAL")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
@@ -25,7 +25,7 @@ fn demo_real_mode() -> bool {
 pub fn register_demo_stubs(registry: &mut NativeMethodRegistry) {
     if demo_real_mode() {
         tracing::warn!(
-            "[demo-shim] RUSTJVM_DEMO_REAL=1 — shim DISABLED, running real bytecode"
+            "[demo-shim] CRATONVM_DEMO_REAL=1 — shim DISABLED, running real bytecode"
         );
         return;
     }

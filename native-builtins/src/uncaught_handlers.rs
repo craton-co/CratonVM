@@ -29,8 +29,8 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
-use rustjvm_native_api::registry::NativeMethodRegistry;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::registry::NativeMethodRegistry;
+use cratonvm_types::{ObjectRef, Value};
 
 /// Soft cap on tracked threads.  Each entry is two pointers
 /// (`ObjectRef` + handler `ObjectRef`) so the worst-case memory
@@ -95,7 +95,7 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
         "setUncaughtExceptionHandler",
         "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
         |_ctx, args| {
-            if std::env::var_os("RUSTJVM_UEH_DEBUG").is_some() {
+            if std::env::var_os("CRATONVM_UEH_DEBUG").is_some() {
                 eprintln!("[UEH] setUncaughtExceptionHandler invoked, args.len={}", args.len());
             }
             let this = match args.first() {

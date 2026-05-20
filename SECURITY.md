@@ -1,12 +1,12 @@
 # Security Policy
 
-> **WARNING: RustJVM is an experimental Java Virtual Machine implementation.
+> **WARNING: CratonVM is an experimental Java Virtual Machine implementation.
 > It is NOT intended for production use and MUST NOT be used to run untrusted
 > Java code in security-sensitive environments.**
 
 ## Scope
 
-RustJVM is a research and learning project. It has not undergone a security
+CratonVM is a research and learning project. It has not undergone a security
 audit and makes no guarantees about isolation, sandboxing, or resistance to
 adversarial input.
 
@@ -28,24 +28,24 @@ adversarial input.
 
 ## Configuration Hardening
 
-When running RustJVM in any context where the input is not fully trusted:
+When running CratonVM in any context where the input is not fully trusted:
 
 1. **Always enable bytecode verification** — do not use `--noverify`, which
    disables structural and type checks on loaded class files.
 2. **Limit heap size** — use `--Xmx` to cap memory consumption (e.g., `--Xmx 256m`).
    Without a limit the GC will attempt to grow the heap until the OS refuses.
 3. **Restrict the classpath** — only include directories and JARs you control.
-   RustJVM will load any `.class` file found on the classpath.
+   CratonVM will load any `.class` file found on the classpath.
 4. **Disable JIT for untrusted code** — the JIT compiler (`--nojit`) can be
    disabled to reduce the attack surface. The interpreter is simpler and has
    fewer unsafe code paths.
-5. **Run with minimal OS privileges** — RustJVM does not drop privileges
+5. **Run with minimal OS privileges** — CratonVM does not drop privileges
    itself. Use OS-level sandboxing (containers, seccomp, AppArmor) for
    defense in depth.
 
 ## Unsafe Code Inventory
 
-RustJVM uses `unsafe` Rust in the following subsystems:
+CratonVM uses `unsafe` Rust in the following subsystems:
 
 | Subsystem | Purpose | Mitigations |
 |-----------|---------|-------------|
@@ -59,10 +59,10 @@ All `unsafe` blocks carry `// SAFETY:` comments documenting the relied-upon inva
 ## Reporting a Vulnerability
 
 For **non-sensitive** issues, open a
-[GitHub Issue](https://github.com/craton-co/rust-jvm/issues) with the label `security`.
+[GitHub Issue](https://github.com/craton-co/cratonvm/issues) with the label `security`.
 
 For **sensitive** issues (exploitable vulnerabilities, crashes on untrusted input),
-please use [GitHub Security Advisories](https://github.com/craton-co/rust-jvm/security/advisories/new)
+please use [GitHub Security Advisories](https://github.com/craton-co/cratonvm/security/advisories/new)
 to report privately. This ensures the issue is not publicly visible until a fix is available.
 
 In your report, please include:

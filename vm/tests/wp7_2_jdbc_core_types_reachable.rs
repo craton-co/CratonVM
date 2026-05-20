@@ -41,21 +41,21 @@
 //!      (a baseline gap shared with WP7.1). Registry pins still hold.
 //!
 //! The Java fixture lives at
-//! `vm/tests/resources/rustjvm/Wp72JdbcCoreTypes.java` and is auto-compiled
+//! `vm/tests/resources/cratonvm/Wp72JdbcCoreTypes.java` and is auto-compiled
 //! by `build.rs`. If `javac` is not available at build time, the test is
 //! skipped (matching the convention used by `jck_conformance.rs`).
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::native::register_builtins;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::native::register_builtins;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp72JdbcCoreTypes";
+const FIXTURE_CLASS: &str = "cratonvm/Wp72JdbcCoreTypes";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -64,7 +64,7 @@ fn test_resources_dir() -> String {
 
 fn fixture_compiled() -> bool {
     let path = format!(
-        "{}/rustjvm/Wp72JdbcCoreTypes.class",
+        "{}/cratonvm/Wp72JdbcCoreTypes.class",
         test_resources_dir()
     );
     std::path::Path::new(&path).exists()
@@ -92,7 +92,7 @@ fn run_probe(method: &str) -> Result<i32, String> {
 #[test]
 fn class_for_name_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -113,7 +113,7 @@ fn class_for_name_native_registered() {
 #[test]
 fn class_get_declared_methods_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -575,11 +575,11 @@ fn fixture_class_file_is_staged() {
     // We only fail loudly if the fixture .java exists but the .class does
     // not, which would mean the build pipeline regressed.
     let java = format!(
-        "{}/rustjvm/Wp72JdbcCoreTypes.java",
+        "{}/cratonvm/Wp72JdbcCoreTypes.java",
         test_resources_dir()
     );
     let class = format!(
-        "{}/rustjvm/Wp72JdbcCoreTypes.class",
+        "{}/cratonvm/Wp72JdbcCoreTypes.class",
         test_resources_dir()
     );
     assert!(

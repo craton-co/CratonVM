@@ -1,18 +1,19 @@
 [package]
-name = "rustjvm-jit"
+name = "cratonvm-jit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "x86-64 JIT compiler for RustJVM"
+description = "x86-64 JIT compiler for CratonVM"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rustjvm-types = { path = "../types" }
-rustjvm-reader = { path = "../reader" }
-rustjvm-jit-api = { path = "../jit-api" }
+cratonvm-types = { path = "../types" }
+cratonvm-reader = { path = "../reader" }
+cratonvm-jit-api = { path = "../jit-api" }
 parking_lot.workspace = true
 rustc-hash.workspace = true
 
@@ -20,7 +21,7 @@ rustc-hash.workspace = true
 vm-tests = []
 
 [dev-dependencies]
-rustjvm-gc = { path = "../gc" }
+cratonvm-gc = { path = "../gc" }
 
 [lints]
 workspace = true

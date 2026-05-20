@@ -25,7 +25,7 @@ if [[ ! -s "$JAR" ]]; then
     cp "$APP_DIR/target/"SpringSmoke-*.jar "$JAR"
 fi
 
-SMOKE_TIMEOUT=300 smoke_run_rustjvm --Xmx 1500m --jar "$JAR" -- --server.port=0 &
+SMOKE_TIMEOUT=300 smoke_run_cratonvm --Xmx 1500m --jar "$JAR" -- --server.port=0 &
 BOOT_PID=$!
 for _ in $(seq 1 30); do
     if grep -q "Started SpringSmokeApplication" "$SMOKE_LOG" 2>/dev/null; then

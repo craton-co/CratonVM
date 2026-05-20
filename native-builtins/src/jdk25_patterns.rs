@@ -8,9 +8,9 @@
 //! Phase 15.4: `java/lang/StableValue` — a lazily-initialized, write-once
 //! container with list/map factory methods.
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
 
 use crate::{obj_arg, alloc_concurrent_synthetic};
 
@@ -575,7 +575,7 @@ pub(crate) fn register_jdk25_patterns_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod jdk25_patterns_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // -----------------------------------------------------------------------
     // PrimitiveType::from_type_code

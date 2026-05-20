@@ -2666,7 +2666,7 @@ pub fn emit_physical_memory_event(
 ///
 /// Per-process startup snapshot of one OS environment variable. Called from
 /// `vm_init` for each environment variable the VM cares about (typically
-/// `RUSTJVM_*`, `JAVA_*`, `_JAVA_OPTIONS`, ...). The event is registered
+/// `CRATONVM_*`, `JAVA_*`, `_JAVA_OPTIONS`, ...). The event is registered
 /// `EveryChunk` so it appears in every chunk header; emitting it once at
 /// startup is the OpenJDK reference behaviour.
 ///

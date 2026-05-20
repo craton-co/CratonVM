@@ -42,8 +42,8 @@ fn chm_basic_dir() -> PathBuf {
         .join("chm_basic")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -51,7 +51,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -102,7 +102,7 @@ fn run_chm_scale(timeout: Duration) -> Option<(String, String)> {
         eprintln!("wave2_chm: ChmScale.class missing and javac unavailable; skipping");
         return None;
     }
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let jh = java_home()?;
     let dir = chm_basic_dir();
 
@@ -146,10 +146,10 @@ fn run_chm_scale(timeout: Duration) -> Option<(String, String)> {
 fn chm_scale_pins_integer_valueof_jit_miscompile() {
     let Some((stdout, stderr)) = run_chm_scale(Duration::from_secs(60)) else {
         // Build artifacts or environment unavailable — skip rather than
-        // false-fail. Real CI sets JAVA_HOME and builds the rustjvm
+        // false-fail. Real CI sets JAVA_HOME and builds the cratonvm
         // binary up front, so this branch only fires for the developer
-        // running `cargo test -p rustjvm-vm` without those preconditions.
-        eprintln!("wave2_chm: prerequisites missing; skipping (set RUSTJVM_BIN + JAVA_HOME)");
+        // running `cargo test -p cratonvm-vm` without those preconditions.
+        eprintln!("wave2_chm: prerequisites missing; skipping (set CRATONVM_BIN + JAVA_HOME)");
         return;
     };
     let combined = format!("{stdout}\n{stderr}");

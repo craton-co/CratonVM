@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{error::MethodCallResult, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{error::MethodCallResult, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 

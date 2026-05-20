@@ -100,9 +100,9 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub use rustjvm_jit_api::{CachedBytecodeMethod, JitRuntimeHelpers};
+pub use cratonvm_jit_api::{CachedBytecodeMethod, JitRuntimeHelpers};
 #[allow(unused_imports)]
-use rustjvm_types::{ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE};
+use cratonvm_types::{ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE};
 
 // Compile-time size assertions for Value on all platforms.
 // Value must be exactly 16 bytes for JIT slot layout. If this fails on a new
@@ -2325,7 +2325,7 @@ fn try_compile_inner(
     backend_attempted: &mut bool,
 ) -> Option<CompiledMethod> {
     // TEMP DIAG: log every try_compile_inner invocation for Arrays.fill
-    if std::env::var_os("RUSTJVM_DBG_JIT_DUMP").is_some()
+    if std::env::var_os("CRATONVM_DBG_JIT_DUMP").is_some()
         && &*cached.class_name == "java/util/Arrays"
         && &*cached.method_name == "fill"
     {
@@ -2808,7 +2808,7 @@ fn try_compile_inner(
     )?;
 
     // TEMP DIAG: dump JIT'd machine code for Arrays.fill
-    if std::env::var_os("RUSTJVM_DBG_JIT_DUMP").is_some()
+    if std::env::var_os("CRATONVM_DBG_JIT_DUMP").is_some()
         && &*cached.class_name == "java/util/Arrays"
         && &*cached.method_name == "fill"
     {
@@ -4203,7 +4203,7 @@ mod tests {
     /// here first.
     #[test]
     fn rg10_reader_decodes_putfield_putstatic() {
-        use rustjvm_reader::instruction::Instruction;
+        use cratonvm_reader::instruction::Instruction;
         // putfield #1
         let (inst, next) = Instruction::decode(&[0xb5, 0x00, 0x01], 0).unwrap();
         assert_eq!(next, 3);
@@ -4219,7 +4219,7 @@ mod tests {
     /// variants) with the widened index. Method with >255 locals must work.
     #[test]
     fn rg11_wide_prefix_decodes_u16_index() {
-        use rustjvm_reader::instruction::Instruction;
+        use cratonvm_reader::instruction::Instruction;
         // wide iload 300 → 0xc4 0x15 0x01 0x2c
         let (inst, next) = Instruction::decode(&[0xc4, 0x15, 0x01, 0x2c], 0).unwrap();
         assert_eq!(next, 4);
@@ -4246,7 +4246,7 @@ mod tests {
     /// `vm/src/runtime/invokedynamic.rs`.
     #[test]
     fn rg12_reader_decodes_invokedynamic() {
-        use rustjvm_reader::instruction::Instruction;
+        use cratonvm_reader::instruction::Instruction;
         // invokedynamic #42, 0, 0 → 0xba 0x00 0x2a 0x00 0x00
         let (inst, next) = Instruction::decode(&[0xba, 0x00, 0x2a, 0x00, 0x00], 0).unwrap();
         assert_eq!(next, 5);

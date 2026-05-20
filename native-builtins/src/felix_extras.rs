@@ -20,9 +20,9 @@
 //! felix_extras::register_felix_stubs(registry);
 //! ```
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 #[allow(dead_code)]
 fn felix_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {

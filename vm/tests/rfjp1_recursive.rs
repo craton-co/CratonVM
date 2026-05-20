@@ -13,7 +13,7 @@
 //!     `RecursiveTask.compute()` runs against the real Adoptium 25
 //!     ForkJoinTask hierarchy. Synthetic-JDK mode has its own stub
 //!     implementations and does not exercise the JIT regalloc path.
-//!   * Therefore the test spawns the freshly-built `rustjvm.exe` as a
+//!   * Therefore the test spawns the freshly-built `cratonvm.exe` as a
 //!     subprocess. Skips when neither the binary nor a JDK 25
 //!     `java-home` is available.
 
@@ -21,11 +21,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Path to the freshly-built CLI binary the harness should exercise.
-/// Honors `RUSTJVM_BIN` for callers that want to point at a custom
+/// Honors `CRATONVM_BIN` for callers that want to point at a custom
 /// build; otherwise resolves to the workspace's
-/// `target/release/rustjvm.exe`.
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RUSTJVM_BIN") {
+/// `target/release/cratonvm.exe`.
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CRATONVM_BIN") {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Some(pb);
@@ -34,7 +34,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let candidate = PathBuf::from(manifest_dir)
         .parent()
-        .map(|p| p.join("target").join("release").join("rustjvm.exe"))?;
+        .map(|p| p.join("target").join("release").join("cratonvm.exe"))?;
     if candidate.exists() {
         Some(candidate)
     } else {
@@ -76,7 +76,7 @@ fn fjp_probe_classes() -> Option<PathBuf> {
     }
 }
 
-/// RFJP.1 acceptance: spawn the freshly-built rustjvm in real-JDK mode
+/// RFJP.1 acceptance: spawn the freshly-built cratonvm in real-JDK mode
 /// against `apps/fjp_probe/FjpProbe`, assert stdout contains
 /// `sum = 499999500000` and `OK`.
 ///
@@ -107,13 +107,13 @@ fn fjp_probe_classes() -> Option<PathBuf> {
 // stack overflow) were downstream symptoms of the boxing-zero bug.
 #[test]
 fn fjp_probe_recursive_returns_correct_sum() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "Skipping: rustjvm release binary not available at \
-                 target/release/rustjvm.exe (build with `cargo build \
-                 --release -p rustjvm-cli`)"
+                "Skipping: cratonvm release binary not available at \
+                 target/release/cratonvm.exe (build with `cargo build \
+                 --release -p cratonvm-cli`)"
             );
             return;
         }
@@ -149,14 +149,14 @@ fn fjp_probe_recursive_returns_correct_sum() {
             "FjpProbe",
         ])
         .output()
-        .expect("must spawn rustjvm.exe");
+        .expect("must spawn cratonvm.exe");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "rustjvm exited non-zero. stdout: {stdout}\nstderr: {stderr}"
+        "cratonvm exited non-zero. stdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stdout.contains("sum = 499999500000"),

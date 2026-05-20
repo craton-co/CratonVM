@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use rustjvm_reader::attribute::{Attribute, LineNumberEntry};
+use cratonvm_reader::attribute::{Attribute, LineNumberEntry};
 
 use crate::classloading::{Class, ClassId, ClassStore};
 use crate::native::registry::StackTraceEntry;
@@ -185,15 +185,15 @@ pub fn source_file_of_class(class: &Class) -> Option<Arc<str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute, LineNumberEntry};
-    use rustjvm_reader::method::ClassFileMethod;
-    use rustjvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute, LineNumberEntry};
+    use cratonvm_reader::method::ClassFileMethod;
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
     fn make_method_with_line_table(entries: Vec<LineNumberEntry>) -> ClassFileMethod {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: rustjvm_reader::ByteView::from_vec(vec![0xb1]), // return
+            code: cratonvm_reader::ByteView::from_vec(vec![0xb1]), // return
             exception_table: Vec::new(),
             attributes: vec![Attribute::LineNumberTable(entries)],
         };
@@ -201,7 +201,7 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC,
             name: Arc::from("probe"),
             descriptor: Arc::from("()V"),
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
                 Attribute::Code(code),
             )],
         }
@@ -249,7 +249,7 @@ mod tests {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
-            code: rustjvm_reader::ByteView::from_vec(vec![0xb1]),
+            code: cratonvm_reader::ByteView::from_vec(vec![0xb1]),
             exception_table: Vec::new(),
             attributes: vec![
                 Attribute::LineNumberTable(vec![LineNumberEntry {
@@ -266,7 +266,7 @@ mod tests {
             access_flags: MethodAccessFlags::PUBLIC,
             name: Arc::from("probe"),
             descriptor: Arc::from("()V"),
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
                 Attribute::Code(code),
             )],
         };

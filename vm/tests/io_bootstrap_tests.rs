@@ -4,9 +4,9 @@
 //! ByteArrayInputStream, ByteArrayOutputStream, ByteBuffer, CharBuffer,
 //! and the java.io class hierarchy.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -15,7 +15,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!("{dir}/rustjvm/IoBootstrapTest.class")).exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/IoBootstrapTest.class")).exists()
 }
 
 fn test_vm() -> Vm {
@@ -35,7 +35,7 @@ macro_rules! require_class_files {
 fn invoke_expect_int(method: &str, expected: i32) {
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/IoBootstrapTest",
+        "cratonvm/IoBootstrapTest",
         method,
         "()I",
         &[],

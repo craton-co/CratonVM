@@ -47,7 +47,7 @@ JAVA
 
 "$JAVA_HOME_FOR_SMOKE/bin/javac" -cp "$EMBED_JAR:$SERVLET_JAR" -d "$FIX_DIR" "$FIX_DIR/TomcatSmoke.java"
 
-SMOKE_TIMEOUT=300 smoke_run_rustjvm \
+SMOKE_TIMEOUT=300 smoke_run_cratonvm \
     --Xmx 1g \
     --classpath "$FIX_DIR:$EMBED_JAR:$SERVLET_JAR" \
     -- TomcatSmoke

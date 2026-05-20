@@ -4,7 +4,7 @@
 //! real implementations, covering MethodHandleNatives, Finalizer,
 //! ClassLoader.defineClass, and Array.newArray.
 //!
-//!     cargo test -p rustjvm-vm --test t15_app_bootstrap_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test t15_app_bootstrap_conformance -- --nocapture
 
 use std::path::{Path, PathBuf};
 

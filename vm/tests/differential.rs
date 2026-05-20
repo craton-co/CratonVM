@@ -1,24 +1,24 @@
 //! T4.10 -- Differential testing harness.
 //!
-//! Runs the same Java method under both RustJVM and HotSpot (via
+//! Runs the same Java method under both CratonVM and HotSpot (via
 //! `std::process::Command`) and compares stdout + return values to detect
 //! behavioral divergences.
 //!
 //! Requirements:
 //! - `java` must be on PATH (for HotSpot comparison)
-//! - `.class` files in `vm/tests/resources/rustjvm/`
+//! - `.class` files in `vm/tests/resources/cratonvm/`
 //!
 //! All tests requiring external resources are `#[ignore]`.
 //!
 //! Run with:
-//!     cargo test -p rustjvm-vm --test differential -- --ignored
+//!     cargo test -p cratonvm-vm --test differential -- --ignored
 
 use std::path::Path;
 use std::process::Command;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
 // T4.10.1 -- Core types and harness
@@ -39,46 +39,46 @@ impl std::fmt::Display for Outcome {
     }
 }
 
-/// Result of running a method under both RustJVM and HotSpot.
+/// Result of running a method under both CratonVM and HotSpot.
 #[derive(Debug, Clone)]
 pub struct DiffResult {
-    /// Outcome from RustJVM execution.
-    pub rustjvm_outcome: Outcome,
+    /// Outcome from CratonVM execution.
+    pub cratonvm_outcome: Outcome,
     /// Outcome from HotSpot execution.
     pub hotspot_outcome: Outcome,
     /// Whether the two outcomes match (stdout and return value).
     pub matches: bool,
 }
 
-/// Run a Java static method under both RustJVM and HotSpot, comparing results.
+/// Run a Java static method under both CratonVM and HotSpot, comparing results.
 ///
 /// # Arguments
-/// - `class`: JVM internal class name (e.g. `"rustjvm/DiffArithmetic"`)
+/// - `class`: JVM internal class name (e.g. `"cratonvm/DiffArithmetic"`)
 /// - `method`: method name (e.g. `"add"`)
 /// - `descriptor`: JVM method descriptor (e.g. `"()I"`)
 ///
 /// # Returns
 /// A `DiffResult` with both outcomes and whether they match.
 pub fn differential_run(class: &str, method: &str, descriptor: &str) -> DiffResult {
-    let rustjvm_outcome = run_rustjvm(class, method, descriptor);
+    let cratonvm_outcome = run_cratonvm(class, method, descriptor);
     let hotspot_outcome = run_hotspot(class, method, descriptor);
 
-    let matches = rustjvm_outcome.stdout == hotspot_outcome.stdout
-        && rustjvm_outcome.return_value == hotspot_outcome.return_value;
+    let matches = cratonvm_outcome.stdout == hotspot_outcome.stdout
+        && cratonvm_outcome.return_value == hotspot_outcome.return_value;
 
     DiffResult {
-        rustjvm_outcome,
+        cratonvm_outcome,
         hotspot_outcome,
         matches,
     }
 }
 
 // ---------------------------------------------------------------------------
-// RustJVM runner
+// CratonVM runner
 // ---------------------------------------------------------------------------
 
-/// Run a static method under RustJVM, capturing stdout and return value.
-fn run_rustjvm(class: &str, method: &str, descriptor: &str) -> Outcome {
+/// Run a static method under CratonVM, capturing stdout and return value.
+fn run_cratonvm(class: &str, method: &str, descriptor: &str) -> Outcome {
     let classpath = test_resources_dir();
     let config = VmConfig::new().with_classpath(vec![classpath]);
     let mut vm = Vm::new(config);
@@ -182,7 +182,7 @@ fn run_hotspot(class: &str, method: &str, descriptor: &str) -> Outcome {
     );
 
     // Write wrapper to a temp directory alongside the classpath.
-    let temp_dir = std::env::temp_dir().join("rustjvm_diff_test");
+    let temp_dir = std::env::temp_dir().join("cratonvm_diff_test");
     std::fs::create_dir_all(&temp_dir).ok();
 
     let wrapper_java = temp_dir.join("DiffWrapper__.java");
@@ -274,14 +274,14 @@ fn javac_executable() -> &'static str {
 // Divergence tracking
 // ---------------------------------------------------------------------------
 
-/// A single divergence between RustJVM and HotSpot.
+/// A single divergence between CratonVM and HotSpot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Divergence {
     pub class_name: String,
     pub method: String,
     pub descriptor: String,
-    pub rustjvm_stdout: String,
-    pub rustjvm_return: String,
+    pub cratonvm_stdout: String,
+    pub cratonvm_return: String,
     pub hotspot_stdout: String,
     pub hotspot_return: String,
 }
@@ -309,8 +309,8 @@ impl DivergenceReport {
                 class_name: class.to_string(),
                 method: method.to_string(),
                 descriptor: descriptor.to_string(),
-                rustjvm_stdout: result.rustjvm_outcome.stdout.clone(),
-                rustjvm_return: result.rustjvm_outcome.return_value.clone(),
+                cratonvm_stdout: result.cratonvm_outcome.stdout.clone(),
+                cratonvm_return: result.cratonvm_outcome.return_value.clone(),
                 hotspot_stdout: result.hotspot_outcome.stdout.clone(),
                 hotspot_return: result.hotspot_outcome.return_value.clone(),
             });
@@ -338,7 +338,7 @@ impl DivergenceReport {
 
 /// Test basic arithmetic operations through the differential harness.
 ///
-/// Runs `rustjvm/DiffArithmetic` static methods under both RustJVM and HotSpot,
+/// Runs `cratonvm/DiffArithmetic` static methods under both CratonVM and HotSpot,
 /// comparing return values for add, multiply, divide, modulo, negation, and a
 /// mixed expression.
 #[test]
@@ -357,38 +357,38 @@ fn diff_basic_arithmetic() {
 
     for (method, descriptor) in &methods {
         eprintln!("diff_basic_arithmetic: DiffArithmetic.{method}");
-        let result = differential_run("rustjvm/DiffArithmetic", method, descriptor);
+        let result = differential_run("cratonvm/DiffArithmetic", method, descriptor);
         eprintln!(
-            "  RustJVM: {} | HotSpot: {} | match={}",
-            result.rustjvm_outcome.return_value,
+            "  CratonVM: {} | HotSpot: {} | match={}",
+            result.cratonvm_outcome.return_value,
             result.hotspot_outcome.return_value,
             result.matches
         );
-        report.record("rustjvm/DiffArithmetic", method, descriptor, &result);
+        report.record("cratonvm/DiffArithmetic", method, descriptor, &result);
         assert!(
             result.matches,
             "Arithmetic divergence in DiffArithmetic.{method}!\n  \
-             RustJVM: {}\n  HotSpot: {}",
-            result.rustjvm_outcome,
+             CratonVM: {}\n  HotSpot: {}",
+            result.cratonvm_outcome,
             result.hotspot_outcome
         );
     }
 
     // Also test the main method which prints all results to stdout.
     let main_result = differential_run(
-        "rustjvm/DiffArithmetic",
+        "cratonvm/DiffArithmetic",
         "main",
         "([Ljava/lang/String;)V",
     );
     eprintln!(
         "diff_basic_arithmetic: DiffArithmetic.main\n  \
-         RustJVM stdout: {:?}\n  HotSpot stdout: {:?}\n  match={}",
-        main_result.rustjvm_outcome.stdout,
+         CratonVM stdout: {:?}\n  HotSpot stdout: {:?}\n  match={}",
+        main_result.cratonvm_outcome.stdout,
         main_result.hotspot_outcome.stdout,
         main_result.matches
     );
     report.record(
-        "rustjvm/DiffArithmetic",
+        "cratonvm/DiffArithmetic",
         "main",
         "([Ljava/lang/String;)V",
         &main_result,
@@ -406,7 +406,7 @@ fn diff_basic_arithmetic() {
 
 /// Test String operations through the differential harness.
 ///
-/// Runs `rustjvm/DiffString` static methods under both RustJVM and HotSpot,
+/// Runs `cratonvm/DiffString` static methods under both CratonVM and HotSpot,
 /// comparing return values for length, concat, charAt, substring, indexOf,
 /// toUpperCase, trim, equals, and valueOf.
 #[test]
@@ -428,21 +428,21 @@ fn diff_string_operations() {
 
     for (method, descriptor) in &methods {
         eprintln!("diff_string_operations: DiffString.{method}");
-        let result = differential_run("rustjvm/DiffString", method, descriptor);
+        let result = differential_run("cratonvm/DiffString", method, descriptor);
         eprintln!(
-            "  RustJVM: {} | HotSpot: {} | match={}",
-            result.rustjvm_outcome.return_value,
+            "  CratonVM: {} | HotSpot: {} | match={}",
+            result.cratonvm_outcome.return_value,
             result.hotspot_outcome.return_value,
             result.matches
         );
-        report.record("rustjvm/DiffString", method, descriptor, &result);
+        report.record("cratonvm/DiffString", method, descriptor, &result);
         // String operations may diverge due to incomplete String support.
         // Log divergences but don't fail the test -- the report captures them.
         if !result.matches {
             eprintln!(
                 "  WARNING: String divergence in DiffString.{method}!\n    \
-                 RustJVM: {}\n    HotSpot: {}",
-                result.rustjvm_outcome,
+                 CratonVM: {}\n    HotSpot: {}",
+                result.cratonvm_outcome,
                 result.hotspot_outcome
             );
         }
@@ -450,19 +450,19 @@ fn diff_string_operations() {
 
     // Also test main which prints all results to stdout.
     let main_result = differential_run(
-        "rustjvm/DiffString",
+        "cratonvm/DiffString",
         "main",
         "([Ljava/lang/String;)V",
     );
     eprintln!(
         "diff_string_operations: DiffString.main\n  \
-         RustJVM stdout: {:?}\n  HotSpot stdout: {:?}\n  match={}",
-        main_result.rustjvm_outcome.stdout,
+         CratonVM stdout: {:?}\n  HotSpot stdout: {:?}\n  match={}",
+        main_result.cratonvm_outcome.stdout,
         main_result.hotspot_outcome.stdout,
         main_result.matches
     );
     report.record(
-        "rustjvm/DiffString",
+        "cratonvm/DiffString",
         "main",
         "([Ljava/lang/String;)V",
         &main_result,
@@ -485,13 +485,13 @@ fn diff_string_operations() {
         .map(|(m, _)| *m)
         .collect();
     for m in &int_methods {
-        let r = differential_run("rustjvm/DiffString", m, "()I");
+        let r = differential_run("cratonvm/DiffString", m, "()I");
         if !r.matches {
             eprintln!(
                 "  NOTE: Integer String method DiffString.{m} diverged \
                  (expected once String natives are complete):\n    \
-                 RustJVM: {}\n    HotSpot: {}",
-                r.rustjvm_outcome,
+                 CratonVM: {}\n    HotSpot: {}",
+                r.cratonvm_outcome,
                 r.hotspot_outcome
             );
         }
@@ -509,7 +509,7 @@ mod unit_tests {
     #[test]
     fn diff_result_matches_when_equal() {
         let r = DiffResult {
-            rustjvm_outcome: Outcome {
+            cratonvm_outcome: Outcome {
                 stdout: "hello".into(),
                 return_value: "42".into(),
             },
@@ -525,7 +525,7 @@ mod unit_tests {
     #[test]
     fn diff_result_diverges_when_different() {
         let r = DiffResult {
-            rustjvm_outcome: Outcome {
+            cratonvm_outcome: Outcome {
                 stdout: "hello".into(),
                 return_value: "42".into(),
             },
@@ -543,7 +543,7 @@ mod unit_tests {
         let mut report = DivergenceReport::new();
 
         let match_result = DiffResult {
-            rustjvm_outcome: Outcome {
+            cratonvm_outcome: Outcome {
                 stdout: "ok".into(),
                 return_value: "1".into(),
             },
@@ -556,7 +556,7 @@ mod unit_tests {
         report.record("Test1", "test", "()I", &match_result);
 
         let div_result = DiffResult {
-            rustjvm_outcome: Outcome {
+            cratonvm_outcome: Outcome {
                 stdout: "foo".into(),
                 return_value: "1".into(),
             },

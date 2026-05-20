@@ -1,8 +1,8 @@
 //! Math, StrictMath, and Number subclass native method implementations.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
 
 use crate::lang_string::{
     format_double, format_float, native_string_chars, native_string_code_point_at,
@@ -1609,8 +1609,8 @@ pub(crate) fn native_math_ieee_remainder(_ctx: &mut dyn NativeContext, args: &[V
 // Phase 13 Step 1: Math exact arithmetic
 // ---------------------------------------------------------------------------
 
-pub(crate) fn math_overflow_err() -> rustjvm_types::error::MethodCallFailed {
-    rustjvm_types::error::RuntimeError::ArithmeticException {
+pub(crate) fn math_overflow_err() -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::ArithmeticException {
         message: "integer overflow".to_string(),
     }
     .into()
@@ -1823,7 +1823,7 @@ pub(crate) fn native_math_floor_div_int(_ctx: &mut dyn NativeContext, args: &[Va
         _ => 1,
     };
     if b == 0 {
-        return Err(rustjvm_types::error::RuntimeError::ArithmeticException {
+        return Err(cratonvm_types::error::RuntimeError::ArithmeticException {
             message: "/ by zero".to_string(),
         }
         .into());
@@ -1846,7 +1846,7 @@ pub(crate) fn native_math_floor_div_long(_ctx: &mut dyn NativeContext, args: &[V
         _ => 1,
     };
     if b == 0 {
-        return Err(rustjvm_types::error::RuntimeError::ArithmeticException {
+        return Err(cratonvm_types::error::RuntimeError::ArithmeticException {
             message: "/ by zero".to_string(),
         }
         .into());
@@ -1868,7 +1868,7 @@ pub(crate) fn native_math_floor_mod_int(_ctx: &mut dyn NativeContext, args: &[Va
         _ => 1,
     };
     if b == 0 {
-        return Err(rustjvm_types::error::RuntimeError::ArithmeticException {
+        return Err(cratonvm_types::error::RuntimeError::ArithmeticException {
             message: "/ by zero".to_string(),
         }
         .into());
@@ -1890,7 +1890,7 @@ pub(crate) fn native_math_floor_mod_long(_ctx: &mut dyn NativeContext, args: &[V
         _ => 1,
     };
     if b == 0 {
-        return Err(rustjvm_types::error::RuntimeError::ArithmeticException {
+        return Err(cratonvm_types::error::RuntimeError::ArithmeticException {
             message: "/ by zero".to_string(),
         }
         .into());
@@ -2232,12 +2232,12 @@ fn wrapper_cid_slot(class_name: &str) -> Option<&'static std::sync::atomic::Atom
 /// Boolean, Byte, Short, Character) the resolved ClassId is cached in a
 /// process-wide atomic after the first successful `ensure_class_initialized`,
 /// so subsequent autoboxes skip the name lookup entirely.
-pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> rustjvm_types::ObjectRef {
+pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> cratonvm_types::ObjectRef {
     // Fast path: hit the wrapper-CID cache for the 8 well-known names.
     if let Some(slot) = wrapper_cid_slot(class_name) {
         let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
         if cached != 0 {
-            return ctx.alloc_object(rustjvm_types::ClassId::new(cached), 1);
+            return ctx.alloc_object(cratonvm_types::ClassId::new(cached), 1);
         }
         // First call: resolve, cache, then allocate.
         if let Ok(class_id) = ctx.ensure_class_initialized(class_name) {
@@ -2250,14 +2250,14 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> ru
             return ctx.alloc_object(class_id, 1);
         }
         eprintln!("[alloc_wrapper] Failed to init {}", class_name);
-        return ctx.alloc_object(rustjvm_types::ClassId::new(0), 1);
+        return ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
     }
     // Non-cached class name (caller used a non-wrapper name).
     match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => ctx.alloc_object(class_id, 1),
         Err(e) => {
             eprintln!("[alloc_wrapper] Failed to init {}: {:?}", class_name, e);
-            ctx.alloc_object(rustjvm_types::ClassId::new(0), 1)
+            ctx.alloc_object(cratonvm_types::ClassId::new(0), 1)
         }
     }
 }
@@ -2278,24 +2278,24 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> ru
 //       into `vm/src/memory/{roots.rs,gc.rs}` so the cached entries are
 //       both kept live and re-pointed after compaction.
 static INTEGER_CACHE: std::sync::OnceLock<
-    parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 256]>,
+    parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]>,
 > = std::sync::OnceLock::new();
 
-fn integer_cache() -> &'static parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 256]> {
+fn integer_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]> {
     INTEGER_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 256]))
 }
 
 static BOOLEAN_CACHE: std::sync::OnceLock<
-    parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 2]>,
+    parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 2]>,
 > = std::sync::OnceLock::new();
 
-fn boolean_cache() -> &'static parking_lot::Mutex<[Option<rustjvm_types::ObjectRef>; 2]> {
+fn boolean_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 2]> {
     BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 2]))
 }
 
 /// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
 /// Reports every cached Integer/Boolean ObjectRef so the GC keeps it live.
-pub fn gc_scan_value_of_cache_roots(out: &mut Vec<rustjvm_types::ObjectRef>) {
+pub fn gc_scan_value_of_cache_roots(out: &mut Vec<cratonvm_types::ObjectRef>) {
     {
         let cache = integer_cache().lock();
         for slot in cache.iter() {
@@ -2327,7 +2327,7 @@ pub fn gc_update_value_of_cache_refs(pointer_map: &std::collections::HashMap<usi
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
                     debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { rustjvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
         }
@@ -2339,7 +2339,7 @@ pub fn gc_update_value_of_cache_refs(pointer_map: &std::collections::HashMap<usi
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
                     debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { rustjvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
         }
@@ -2393,7 +2393,7 @@ pub(crate) fn native_integer_parse_int(ctx: &mut dyn NativeContext, args: &[Valu
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2402,7 +2402,7 @@ pub(crate) fn native_integer_parse_int(ctx: &mut dyn NativeContext, args: &[Valu
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match text.trim().parse::<i32>() {
         Ok(v) => Ok(Some(Value::Int(v))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -2413,7 +2413,7 @@ pub(crate) fn native_integer_parse_int_radix(ctx: &mut dyn NativeContext, args: 
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2426,7 +2426,7 @@ pub(crate) fn native_integer_parse_int_radix(ctx: &mut dyn NativeContext, args: 
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match i32::from_str_radix(text.trim(), radix) {
         Ok(v) => Ok(Some(Value::Int(v))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -2439,7 +2439,7 @@ pub(crate) fn native_byte_parse_byte(ctx: &mut dyn NativeContext, args: &[Value]
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2448,7 +2448,7 @@ pub(crate) fn native_byte_parse_byte(ctx: &mut dyn NativeContext, args: &[Value]
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match text.trim().parse::<i8>() {
         Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -2459,7 +2459,7 @@ pub(crate) fn native_byte_parse_byte_radix(ctx: &mut dyn NativeContext, args: &[
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2472,7 +2472,7 @@ pub(crate) fn native_byte_parse_byte_radix(ctx: &mut dyn NativeContext, args: &[
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match i8::from_str_radix(text.trim(), radix) {
         Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -2485,7 +2485,7 @@ pub(crate) fn native_short_parse_short(ctx: &mut dyn NativeContext, args: &[Valu
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2494,7 +2494,7 @@ pub(crate) fn native_short_parse_short(ctx: &mut dyn NativeContext, args: &[Valu
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match text.trim().parse::<i16>() {
         Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -2505,7 +2505,7 @@ pub(crate) fn native_short_parse_short_radix(ctx: &mut dyn NativeContext, args: 
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2518,7 +2518,7 @@ pub(crate) fn native_short_parse_short_radix(ctx: &mut dyn NativeContext, args: 
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match i16::from_str_radix(text.trim(), radix) {
         Ok(v) => Ok(Some(Value::Int(v as i32))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -2531,7 +2531,7 @@ pub(crate) fn native_integer_to_hex_string(ctx: &mut dyn NativeContext, args: &[
         _ => 0,
     };
     // DEBUG-NETTYHANG: log every call
-    if std::env::var_os("RUSTJVM_DBG_TOHEX").is_some() {
+    if std::env::var_os("CRATONVM_DBG_TOHEX").is_some() {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 600 || n % 1000 == 0 {
@@ -2611,7 +2611,7 @@ pub(crate) fn native_long_parse_long(ctx: &mut dyn NativeContext, args: &[Value]
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -2620,7 +2620,7 @@ pub(crate) fn native_long_parse_long(ctx: &mut dyn NativeContext, args: &[Value]
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match text.trim().parse::<i64>() {
         Ok(v) => Ok(Some(Value::Long(v))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -3470,7 +3470,7 @@ pub(crate) fn native_long_parse_long_radix(ctx: &mut dyn NativeContext, args: &[
     let s_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -3483,7 +3483,7 @@ pub(crate) fn native_long_parse_long_radix(ctx: &mut dyn NativeContext, args: &[
     let text = ctx.read_string(s_obj).unwrap_or_default();
     match i64::from_str_radix(text.trim(), radix) {
         Ok(v) => Ok(Some(Value::Long(v))),
-        Err(_) => Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::NumberFormatException {
             message: format!("For input string: \"{text}\""),
         }
         .into()),
@@ -3619,7 +3619,7 @@ pub(crate) fn native_double_is_infinite(_ctx: &mut dyn NativeContext, args: &[Va
 
 // --- Float/Double parsing and utilities (Phase 8 Part 7) ---
 
-fn parse_float_string(s: &str) -> Result<f32, rustjvm_types::error::RuntimeError> {
+fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
     let trimmed = s.trim();
     match trimmed {
         "NaN" => Ok(f32::NAN),
@@ -3628,14 +3628,14 @@ fn parse_float_string(s: &str) -> Result<f32, rustjvm_types::error::RuntimeError
         _ => {
             trimmed
                 .parse::<f32>()
-                .map_err(|_| rustjvm_types::error::RuntimeError::NumberFormatException {
+                .map_err(|_| cratonvm_types::error::RuntimeError::NumberFormatException {
                     message: format!("For input string: \"{s}\""),
                 })
         }
     }
 }
 
-fn parse_double_string(s: &str) -> Result<f64, rustjvm_types::error::RuntimeError> {
+fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeError> {
     let trimmed = s.trim();
     match trimmed {
         "NaN" => Ok(f64::NAN),
@@ -3644,7 +3644,7 @@ fn parse_double_string(s: &str) -> Result<f64, rustjvm_types::error::RuntimeErro
         _ => {
             trimmed
                 .parse::<f64>()
-                .map_err(|_| rustjvm_types::error::RuntimeError::NumberFormatException {
+                .map_err(|_| cratonvm_types::error::RuntimeError::NumberFormatException {
                     message: format!("For input string: \"{s}\""),
                 })
         }
@@ -3655,7 +3655,7 @@ pub(crate) fn native_float_parse_float(ctx: &mut dyn NativeContext, args: &[Valu
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -3669,7 +3669,7 @@ pub(crate) fn native_double_parse_double(ctx: &mut dyn NativeContext, args: &[Va
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -3683,7 +3683,7 @@ pub(crate) fn native_float_value_of_string(ctx: &mut dyn NativeContext, args: &[
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())
@@ -3699,7 +3699,7 @@ pub(crate) fn native_double_value_of_string(ctx: &mut dyn NativeContext, args: &
     let s = match args.first() {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NumberFormatException {
+            return Err(cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: "null".to_string(),
             }
             .into())

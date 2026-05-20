@@ -54,9 +54,9 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
 use super::asn1;

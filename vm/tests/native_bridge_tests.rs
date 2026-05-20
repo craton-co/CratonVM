@@ -4,9 +4,9 @@
 //! System.identityHashCode, System.currentTimeMillis, System.nanoTime,
 //! and inherited native method dispatch.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -15,7 +15,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!("{dir}/rustjvm/NativeBridgeTest.class")).exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/NativeBridgeTest.class")).exists()
 }
 
 fn test_vm() -> Vm {
@@ -35,7 +35,7 @@ macro_rules! require_class_files {
 fn invoke_expect_int(method: &str, expected: i32) {
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/NativeBridgeTest",
+        "cratonvm/NativeBridgeTest",
         method,
         "()I",
         &[],
@@ -188,11 +188,11 @@ fn native_nano_time() {
 // (The deeper invoke-arg-popping bug is a separate, orchestrator-owned
 // `vm_exec.rs` change.)
 mod print_long_compact_tag_regression {
-    use rustjvm_native_api::NativeMethodRegistry;
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::types::Value;
-    use rustjvm_vm::vm::NativeContextImpl;
-    use rustjvm_vm::{ClassId, JvmThread, SharedVm, ThreadId};
+    use cratonvm_native_api::NativeMethodRegistry;
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::types::Value;
+    use cratonvm_vm::vm::NativeContextImpl;
+    use cratonvm_vm::{ClassId, JvmThread, SharedVm, ThreadId};
     use std::sync::Arc;
 
     fn run_print(method: &str, arg: Value) -> Vec<String> {
@@ -200,7 +200,7 @@ mod print_long_compact_tag_regression {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
         let mut registry = NativeMethodRegistry::new();
-        rustjvm_native_builtins::register_essential_natives(&mut registry);
+        cratonvm_native_builtins::register_essential_natives(&mut registry);
         let callback = registry
             .find("java/io/PrintStream", method, "(J)V")
             .unwrap_or_else(|| panic!("PrintStream.{method}(J)V must be registered"));
@@ -271,7 +271,7 @@ mod print_long_compact_tag_regression {
 
 #[test]
 fn jni_name_mangling_short() {
-    use rustjvm_vm::native::jni::jni_short_name;
+    use cratonvm_vm::native::jni::jni_short_name;
 
     assert_eq!(
         jni_short_name("java/lang/System", "arraycopy"),
@@ -289,7 +289,7 @@ fn jni_name_mangling_short() {
 
 #[test]
 fn jni_name_mangling_long() {
-    use rustjvm_vm::native::jni::jni_long_name;
+    use cratonvm_vm::native::jni::jni_long_name;
 
     assert_eq!(
         jni_long_name(
@@ -307,7 +307,7 @@ fn jni_name_mangling_long() {
 
 #[test]
 fn jni_name_mangling_underscore_escape() {
-    use rustjvm_vm::native::jni::jni_short_name;
+    use cratonvm_vm::native::jni::jni_short_name;
 
     // Method with underscore in name should get _1 encoding
     assert_eq!(
@@ -318,7 +318,7 @@ fn jni_name_mangling_underscore_escape() {
 
 #[test]
 fn jni_name_mangling_array_descriptor() {
-    use rustjvm_vm::native::jni::jni_long_name;
+    use cratonvm_vm::native::jni::jni_long_name;
 
     // Array types in descriptor: [ → _3
     assert_eq!(

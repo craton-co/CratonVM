@@ -1,8 +1,8 @@
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 
@@ -10,16 +10,16 @@ use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 // System.exit / Runtime.exit pre-termination hook.
 //
 // `native_system_exit` and `native_runtime_exit` both `std::process::exit`
-// after printing the `[rustjvm] System.exit(N) called` line. Once the
+// after printing the `[cratonvm] System.exit(N) called` line. Once the
 // process exits, downstream observers (dispatch_trace ring, watchdog
 // printers) lose their chance to dump state. Crates higher up the
-// dependency stack (e.g. `rustjvm-vm` / `vm-cli`) can register a pre-exit
+// dependency stack (e.g. `cratonvm-vm` / `vm-cli`) can register a pre-exit
 // hook here so they get one last shot at printing diagnostics before
 // we terminate.
 //
 // Wired by `vm-cli::main::run()` so a silent `System.exit(0)` during real
 // app boot (e.g. Cassandra NodeTool's airline NPE catch path) at least
-// dumps the dispatch_trace ring when `RUSTJVM_DBG_EXIT=1` is set.
+// dumps the dispatch_trace ring when `CRATONVM_DBG_EXIT=1` is set.
 // ---------------------------------------------------------------------------
 type PreExitHook = fn(code: i32);
 static PRE_EXIT_HOOK: std::sync::OnceLock<PreExitHook> = std::sync::OnceLock::new();
@@ -75,7 +75,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     let src = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("arraycopy: src is null".to_string()),
             }
             .into());
@@ -88,7 +88,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     let dest = match args.get(2) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("arraycopy: dest is null".to_string()),
             }
             .into());
@@ -104,15 +104,15 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     };
 
     // Validate that src and dest are arrays
-    use rustjvm_types::ObjectKind;
+    use cratonvm_types::ObjectKind;
     if ctx.heap_kind_of(src) != ObjectKind::Array {
-        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
             message: "arraycopy: src is not an array".to_string(),
         }
         .into());
     }
     if ctx.heap_kind_of(dest) != ObjectKind::Array {
-        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
             message: "arraycopy: dest is not an array".to_string(),
         }
         .into());
@@ -128,7 +128,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
         || src_pos + length > src_len
         || dest_pos + length > dest_len
     {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index: if src_pos < 0 {
                 src_pos
             } else if dest_pos < 0 {
@@ -155,11 +155,11 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     //  3. Both reference arrays → per-element assignability check against
     //     the destination component class, with prefix-commit on failure
     //     (JLS §5.5 / `java.lang.System.arraycopy` contract).
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let src_elem = ctx.heap_element_type_of(src);
     let dest_elem = ctx.heap_element_type_of(dest);
     if src_elem != dest_elem {
-        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
             message: format!(
                 "arraycopy: incompatible array element types (src={:?}, dest={:?})",
                 src_elem, dest_elem
@@ -223,7 +223,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
                 if let Value::Object(Some(elem)) = val {
                     let elem_class = ctx.class_id_of_object(elem);
                     if !assignable_to_dst(ctx, elem_class) {
-                        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+                        return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
                             message: format!(
                                 "arraycopy: source element at index {} is not assignable to destination component type",
                                 src_pos + i
@@ -248,7 +248,7 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
                         // Prefix [0, i) at positions `dest_pos..dest_pos+i`
                         // has already been written. This is the spec
                         // partial-commit behavior.
-                        return Err(rustjvm_types::error::RuntimeError::ArrayStoreException {
+                        return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
                             message: format!(
                                 "arraycopy: source element at index {} is not assignable to destination component type",
                                 src_pos + i
@@ -325,13 +325,13 @@ pub(crate) fn native_thread_sleep_millis_nanos(
         _ => 0,
     };
     if millis < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Thread.sleep: timeout value is negative".to_string(),
         }
         .into());
     }
     if !(0..=999_999).contains(&nanos) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Thread.sleep: nanosecond timeout value out of range".to_string(),
         }
         .into());
@@ -365,8 +365,8 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
     if millis > 0 {
         // Check interrupted before sleeping
         if ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(rustjvm_types::error::RuntimeError::InterruptedException),
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
             ));
         }
         // NEW-15.4: virtual-thread aware sleep.
@@ -413,8 +413,8 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         ctx.record_thread_sleep(millis * 1_000_000, actual_dur.as_nanos() as u64);
         // Check interrupted after sleeping (with clear).
         if interrupted || ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(rustjvm_types::error::RuntimeError::InterruptedException),
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
             ));
         }
     }
@@ -467,7 +467,7 @@ pub(crate) fn native_thread_join_timed(ctx: &mut dyn NativeContext, args: &[Valu
         _ => 0,
     };
     if millis < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Thread.join: timeout value is negative".to_string(),
         }
         .into());
@@ -491,9 +491,9 @@ pub(crate) fn native_thread_join_timed(ctx: &mut dyn NativeContext, args: &[Valu
         // Honour an interrupt that arrived while we were waiting — throw
         // InterruptedException so caller code behaves like HotSpot.
         if ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::InterruptedException,
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
                 ),
             ));
         }
@@ -520,13 +520,13 @@ pub(crate) fn native_thread_join_millis_nanos(
         _ => 0,
     };
     if millis < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Thread.join: timeout value is negative".to_string(),
         }
         .into());
     }
     if !(0..=999_999).contains(&nanos) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Thread.join: nanosecond timeout value out of range".to_string(),
         }
         .into());
@@ -652,11 +652,11 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let trace = ctx.capture_stack_trace(0);
 
-    // RUSTJVM_DBG_EXIT=1 — capture and log the Java caller chain BEFORE we
+    // CRATONVM_DBG_EXIT=1 — capture and log the Java caller chain BEFORE we
     // either soft-return or terminate. Helps identify which class/method in
     // the upstream code invoked System.exit. Env-gated so default output is
     // unchanged.
-    if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_DBG_EXIT").as_deref() == Ok("1") {
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
             use std::fmt::Write as _;
@@ -669,8 +669,8 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
             );
         }
         tracing::warn!(
-            target: "rustjvm::system_exit",
-            "[RUSTJVM_DBG_EXIT] System.exit({code}) caller chain:{rendered}"
+            target: "cratonvm::system_exit",
+            "[CRATONVM_DBG_EXIT] System.exit({code}) caller chain:{rendered}"
         );
     }
 
@@ -687,20 +687,20 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
             .unwrap_or(false)
     {
         tracing::warn!(
-            target: "rustjvm::system_exit",
-            "[rustjvm] Soft-returning ForkedBooter.exit(1) guard"
+            target: "cratonvm::system_exit",
+            "[cratonvm] Soft-returning ForkedBooter.exit(1) guard"
         );
         return Ok(None);
     }
 
-    // RUSTJVM_SOFT_EXIT=1 — opt-in. Convert ANY System.exit(I)V into a soft
+    // CRATONVM_SOFT_EXIT=1 — opt-in. Convert ANY System.exit(I)V into a soft
     // return so the calling Java frame keeps executing (and `main` can reach
     // further). Used to expose downstream failures hidden behind an explicit
     // upstream exit. Default behaviour (env unset) is unchanged: terminate.
-    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
         tracing::warn!(
-            target: "rustjvm::system_exit",
-            "[rustjvm] System.exit({code}) soft-returned (RUSTJVM_SOFT_EXIT=1)"
+            target: "cratonvm::system_exit",
+            "[cratonvm] System.exit({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
         );
         return Ok(None);
     }
@@ -709,7 +709,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // via an uncaught-exception handler after some earlier failure that would
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
-    eprintln!("[rustjvm] System.exit({code}) called — process terminating");
+    eprintln!("[cratonvm] System.exit({code}) called — process terminating");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -836,7 +836,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
 pub(crate) fn native_runtime_get_runtime(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
@@ -908,7 +908,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
 
     // Mirror native_system_exit: env-gated caller-chain dump and soft-return.
-    if std::env::var("RUSTJVM_DBG_EXIT").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_DBG_EXIT").as_deref() == Ok("1") {
         let trace = ctx.capture_stack_trace(0);
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
@@ -922,21 +922,21 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
             );
         }
         tracing::warn!(
-            target: "rustjvm::system_exit",
-            "[RUSTJVM_DBG_EXIT] Runtime.exit({code}) caller chain:{rendered}"
+            target: "cratonvm::system_exit",
+            "[CRATONVM_DBG_EXIT] Runtime.exit({code}) caller chain:{rendered}"
         );
     }
 
-    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
         tracing::warn!(
-            target: "rustjvm::system_exit",
-            "[rustjvm] Runtime.exit({code}) soft-returned (RUSTJVM_SOFT_EXIT=1)"
+            target: "cratonvm::system_exit",
+            "[cratonvm] Runtime.exit({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
         );
         return Ok(None);
     }
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
-    eprintln!("[rustjvm] Runtime.exit({code}) called — process terminating");
+    eprintln!("[cratonvm] Runtime.exit({code}) called — process terminating");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -1118,7 +1118,7 @@ pub(crate) fn native_system_getenv(ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn native_system_getenv_all(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
 
     // Build a HashMap with all environment variables.
     //
@@ -1297,7 +1297,7 @@ pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
 
 pub(crate) fn native_thread_get_stack_trace(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Return empty StackTraceElement[]
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -1335,8 +1335,8 @@ pub(crate) fn native_thread_sleep_nanos(ctx: &mut dyn NativeContext, args: &[Val
     if nanos > 0 {
         // Check interrupted before sleeping — clear flag and throw
         if ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(rustjvm_types::error::RuntimeError::InterruptedException),
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
             ));
         }
         let duration = std::time::Duration::from_nanos(nanos as u64);
@@ -1359,8 +1359,8 @@ pub(crate) fn native_thread_sleep_nanos(ctx: &mut dyn NativeContext, args: &[Val
         ctx.record_thread_sleep(nanos, actual_dur.as_nanos() as u64);
         // Check interrupted after sleeping — clear flag and throw
         if ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(rustjvm_types::error::RuntimeError::InterruptedException),
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
             ));
         }
     }
@@ -1396,14 +1396,14 @@ pub(crate) fn native_thread_sleep0(ctx: &mut dyn NativeContext, args: &[Value]) 
         Some(Value::Double(d)) => d.to_bits() as i64,
         Some(Value::Int(i)) => *i as i64,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: "sleep0: missing long millis arg".to_string(),
             }
             .into());
         }
     };
     if raw_millis < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "timeout value is negative".to_string(),
         }
         .into());
@@ -1413,9 +1413,9 @@ pub(crate) fn native_thread_sleep0(ctx: &mut dyn NativeContext, args: &[Value]) 
     // 0ms case: check interrupt status (and clear) then return immediately.
     if millis == 0 {
         if ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::InterruptedException,
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
                 ),
             ));
         }
@@ -1449,9 +1449,9 @@ pub(crate) fn native_thread_sleep0(ctx: &mut dyn NativeContext, args: &[Value]) 
         crate::scheduled_pump::registry().pump(ctx);
         // Poll interrupt flag before each chunk — clear + throw if set.
         if ctx.is_interrupted(true) {
-            break Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::InterruptedException,
+            break Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
                 ),
             ));
         }
@@ -1637,7 +1637,7 @@ pub(crate) fn native_vm_get_runtime_arguments(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -1704,18 +1704,18 @@ pub(crate) fn native_array_new_array(
 
     // Map primitive type names to ArrayElementType
     let arr = match comp_name.as_str() {
-        "int" => ctx.new_array(rustjvm_types::ArrayElementType::Int, length),
-        "long" => ctx.new_array(rustjvm_types::ArrayElementType::Long, length),
-        "float" => ctx.new_array(rustjvm_types::ArrayElementType::Float, length),
-        "double" => ctx.new_array(rustjvm_types::ArrayElementType::Double, length),
-        "boolean" => ctx.new_array(rustjvm_types::ArrayElementType::Boolean, length),
-        "byte" => ctx.new_array(rustjvm_types::ArrayElementType::Byte, length),
-        "char" => ctx.new_array(rustjvm_types::ArrayElementType::Char, length),
-        "short" => ctx.new_array(rustjvm_types::ArrayElementType::Short, length),
+        "int" => ctx.new_array(cratonvm_types::ArrayElementType::Int, length),
+        "long" => ctx.new_array(cratonvm_types::ArrayElementType::Long, length),
+        "float" => ctx.new_array(cratonvm_types::ArrayElementType::Float, length),
+        "double" => ctx.new_array(cratonvm_types::ArrayElementType::Double, length),
+        "boolean" => ctx.new_array(cratonvm_types::ArrayElementType::Boolean, length),
+        "byte" => ctx.new_array(cratonvm_types::ArrayElementType::Byte, length),
+        "char" => ctx.new_array(cratonvm_types::ArrayElementType::Char, length),
+        "short" => ctx.new_array(cratonvm_types::ArrayElementType::Short, length),
         _ => {
             // Reference array — resolve the component class
             let comp_id = ctx.ensure_class_initialized(&comp_name)
-                .unwrap_or(rustjvm_types::ClassId::new(0));
+                .unwrap_or(cratonvm_types::ClassId::new(0));
             ctx.new_ref_array(comp_id, length)
         }
     };
@@ -1796,7 +1796,7 @@ pub(crate) fn native_classloader_define_class1(
         }
     }
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
         ..Default::default()
     };
@@ -1918,7 +1918,7 @@ pub(crate) fn native_classloader_define_class0(
         None
     };
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         override_name,
         hidden,
         code_source_url: pd_url,
@@ -2141,9 +2141,9 @@ mod t19_n2_thread_sleep0_tests {
         let r = native_thread_sleep0(&mut ctx, &[Value::Long(-1)]);
         assert!(r.is_err(), "negative millis must throw");
         match r {
-            Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::IllegalArgumentException { message },
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException { message },
                 ),
             )) => {
                 assert!(
@@ -2195,9 +2195,9 @@ mod t19_n2_thread_sleep0_tests {
         let elapsed = start.elapsed();
         assert!(r.is_err(), "sleep0 with interrupt must throw");
         match r {
-            Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::InterruptedException,
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::InterruptedException,
                 ),
             )) => { /* expected */ }
             other => panic!("expected InterruptedException, got {:?}", other),
@@ -2320,7 +2320,7 @@ mod t15_tests {
     #[test]
     fn finalizer_register_with_object() {
         let mut ctx = mock_ctx();
-        let obj = ctx.alloc_object(rustjvm_types::ClassId::new(0), 2);
+        let obj = ctx.alloc_object(cratonvm_types::ClassId::new(0), 2);
         let r = native_finalizer_register(&mut ctx, &[Value::Object(Some(obj))]);
         assert!(r.is_ok());
         assert_eq!(r.unwrap(), None); // void
@@ -2365,7 +2365,7 @@ mod t15_tests {
     fn define_class1_empty_bytes_returns_null() {
         let mut ctx = mock_ctx();
         // Create a byte array with non-CAFEBABE bytes
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 4);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
         ctx.set_array_element(arr, 0, Value::Int(0));
         ctx.set_array_element(arr, 1, Value::Int(0));
         ctx.set_array_element(arr, 2, Value::Int(0));
@@ -2390,7 +2390,7 @@ mod t15_tests {
     #[test]
     fn define_class1_out_of_bounds() {
         let mut ctx = mock_ctx();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 2);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 2);
         let name = ctx.create_string("com/example/Foo");
         let r = native_classloader_define_class1(
             &mut ctx,

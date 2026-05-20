@@ -1,7 +1,7 @@
 {
   "$schema_version": 1,
   "generated_at": "2026-04-29T00:00:00Z",
-  "rustjvm_version": "unknown",
+  "cratonvm_version": "unknown",
   "fixture": {
     "mode": "real",
     "placeholder_source": "apps/ejbca_min_fixture/src/Main.java",
@@ -17,7 +17,7 @@
     {
       "name": "run",
       "rc": 0,
-      "notes": "rust-jvm runs the cesecore-common DirectRunner subset to completion (12/12 enum tests pass). Validates real-EJBCA-code execution under the JVM: enum constants, multi-enum dispatch, BC bouncy-castle integration probe."
+      "notes": "cratonvm runs the cesecore-common DirectRunner subset to completion (12/12 enum tests pass). Validates real-EJBCA-code execution under the JVM: enum constants, multi-enum dispatch, BC bouncy-castle integration probe."
     }
   ],
   "expected_stderr_contains": [],
@@ -44,7 +44,7 @@
     {
       "session": 99,
       "rc": 0,
-      "notes": "All Wave 1+2 closure work cumulatively delivered: WP0.1 fix + WP1.1-1.5/1.7-1.12 + WP1.6 lang.invoke + WP2.1-2.10 (incl. WP2.5 v3 real Proxy bytecode generation). 12/12 cesecore enum tests pass under default-built rust-jvm."
+      "notes": "All Wave 1+2 closure work cumulatively delivered: WP0.1 fix + WP1.1-1.5/1.7-1.12 + WP1.6 lang.invoke + WP2.1-2.10 (incl. WP2.5 v3 real Proxy bytecode generation). 12/12 cesecore enum tests pass under default-built cratonvm."
     }
   ],
   "update_policy": "Update this file any time a WP lands that changes expected_final_rc or the expected_stderr_* sets. diff-baseline.sh compares a fresh run against these fields. A 'baseline match' result is mandatory for CI green; a mismatch either indicates a regression (bad) or an unshipped fix (update this file in the same PR)."

@@ -2,7 +2,7 @@
 //! UncaughtExceptionHandler regression test.
 //!
 //! Pins the runtime behavior of the four sub-tests in `apps/executor_probe/ExecProbe.java`
-//! through the `rustjvm.exe` CLI binary against the real JDK 25:
+//! through the `cratonvm.exe` CLI binary against the real JDK 25:
 //!
 //!   * test1: `Executors.newFixedThreadPool(4).submit(() -> 42).get()` returns `42`.
 //!   * test2: 4-thread x 4000-task throughput against an `AtomicInteger` + `CountDownLatch`
@@ -14,7 +14,7 @@
 //!            on an `ExceptionThrown` result).
 //!
 //! Pattern adapted from `vm/tests/vthread_probe_regression.rs`. The binary path is
-//! resolved via `RUSTJVM_BIN` env var, then the cargo `target/{release,debug}` fallback.
+//! resolved via `CRATONVM_BIN` env var, then the cargo `target/{release,debug}` fallback.
 //! Class files are produced on-demand via `javac --release 21` if absent. If neither
 //! the binary nor `javac` is available the test reports `skipped` rather than failing.
 
@@ -28,8 +28,8 @@ fn probe_dir() -> PathBuf {
     manifest.parent().unwrap().join("apps").join("executor_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -37,7 +37,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -72,12 +72,12 @@ fn run_probe() -> Option<(String, String)> {
         eprintln!("[wave1_c_executor] ExecProbe class file unavailable; skipping");
         return None;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[wave1_c_executor] rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[wave1_c_executor] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return None;
         }
@@ -93,7 +93,7 @@ fn run_probe() -> Option<(String, String)> {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave1_c_executor] failed to spawn rustjvm: {e}");
+            eprintln!("[wave1_c_executor] failed to spawn cratonvm: {e}");
             return None;
         }
     };

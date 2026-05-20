@@ -3,7 +3,7 @@ name: T2 Missing-Natives Census
 # T2.1.1: dedicated CI job that runs the workspace test suite with the
 # NEW-11 default feature set (which already EXCLUDES `synthetic-jdk`).
 # This is the "no-default-natives" gate required by roadmap-100.md
-# step T2.1.1 — any test that needs a native RustJVM hasn't provided
+# step T2.1.1 — any test that needs a native CratonVM hasn't provided
 # yet will surface here rather than in downstream tiers.
 #
 # The job also uploads `bench/missing-natives.json` as a CI artifact so
@@ -46,7 +46,7 @@ jobs:
       # change to Cargo.toml defaults cannot silently weaken the gate.
       - name: Test under no-default-natives feature set
         run: |
-          cargo test -p rustjvm-vm \
+          cargo test -p cratonvm-vm \
             --no-default-features \
             --features "experimental-tls,experimental-crypto,experimental-jmx,experimental-serialization,experimental-aot,experimental-debug" \
             --all-targets
@@ -56,8 +56,8 @@ jobs:
       # bench class that already exists at bench/HelloWorld.class.
       - name: Generate missing-natives census
         run: |
-          cargo build -p rustjvm-cli --release
-          ./target/release/rustjvm \
+          cargo build -p cratonvm-cli --release
+          ./target/release/cratonvm \
             --dump-missing-natives bench/missing-natives.json \
             --dump-missing-natives-grouped bench/missing-natives-grouped.json \
             -cp bench HelloWorld || true

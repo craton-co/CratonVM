@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
-use rustjvm_types::{self as types, ObjectHeader};
+use cratonvm_types::{self as types, ObjectHeader};
 
 use crate::error::{MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::ThreadId;
@@ -231,7 +231,7 @@ pub fn inflate(
 }
 
 /// Look up an `&ObjectHeader` from an `ObjectRef`. Mirrors the pattern used by
-/// the GC (`rustjvm_gc::heap::Heap::get_header`) — the first
+/// the GC (`cratonvm_gc::heap::Heap::get_header`) — the first
 /// `HEADER_SIZE` bytes of every heap allocation are a `repr(C)` `ObjectHeader`.
 #[inline]
 fn header_of(obj_ref: ObjectRef) -> &'static ObjectHeader {
@@ -280,7 +280,7 @@ struct MonitorState {
     entry_count: u32,
     /// Round-7 HIGH (vm #5): JFR enter/exit event-pair consistency.
     ///
-    /// JFR can be enabled or disabled at any moment (`rustjvm_jfr::is_enabled()`
+    /// JFR can be enabled or disabled at any moment (`cratonvm_jfr::is_enabled()`
     /// flips via a global AtomicBool). The interpreter's `Monitorenter` path
     /// snapshots `is_enabled()` *before* acquiring the lock and only emits the
     /// JFR monitor-enter event if that snapshot was true. The corresponding
@@ -1078,7 +1078,7 @@ impl Default for MonitorTable {
     }
 }
 
-impl rustjvm_gc::MonitorCleanup for MonitorTable {
+impl cratonvm_gc::MonitorCleanup for MonitorTable {
     fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         self.remap_after_gc(pointer_map);
     }

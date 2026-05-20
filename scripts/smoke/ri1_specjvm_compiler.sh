@@ -20,6 +20,6 @@ if [[ ! -s "$JAR" ]]; then
     fi
 fi
 
-SMOKE_TIMEOUT=900 smoke_run_rustjvm --Xmx 2g --jar "$JAR" -- -bt 1 -i 1 compiler.compiler
+SMOKE_TIMEOUT=900 smoke_run_cratonvm --Xmx 2g --jar "$JAR" -- -bt 1 -i 1 compiler.compiler
 
 smoke_require_signal "Composite result:|Valid run, Score"

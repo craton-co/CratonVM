@@ -52,9 +52,9 @@ use std::sync::{Mutex, OnceLock};
 // native-api's T10.9.B migration.
 use rustc_hash::FxHashMap;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Accounting — Bits.reserveMemory / Bits.unreserveMemory
@@ -406,7 +406,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let cleaner_id = if cap > 0 { register_cleaner(addr, cap) } else { 0 };
     let cid = ctx
         .ensure_class_initialized("java/nio/DirectByteBuffer")
-        .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+        .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
     // 8 fields covers position/limit/capacity/mark/address/_native_size/_cleaner_id/_pad.
     let buf = ctx.alloc_object(cid, 8);
     ctx.set_field_by_name(buf, "address", Value::Long(addr as i64));
@@ -445,7 +445,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if cap > 0 && cleaner_id != 0 {
         let dealloc_cid = ctx
             .ensure_class_initialized("jdk/internal/ref/BucketDirectBufferDeallocator")
-            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
         let dealloc = ctx.alloc_object(dealloc_cid, 2);
         // field 0 = cleaner_id (Int) — matches our `bucket_dealloc_run` ABI
         // field 1 = addr (Long) — diagnostics
@@ -454,7 +454,7 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
         let cleanable_cid = ctx
             .ensure_class_initialized("java/lang/ref/Cleaner$Cleanable")
-            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
         let cleanable = ctx.alloc_object(cleanable_cid, 3);
         ctx.set_field(cleanable, 0, Value::Object(Some(dealloc))); // action
         ctx.set_field(cleanable, 1, Value::Int(0));                // cleaned

@@ -20,10 +20,10 @@ use parking_lot::Mutex;
 
 use crate::arena::Arena;
 use crate::numa;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // Re-export heap types from the shared types crate.
-pub use rustjvm_types::{
+pub use cratonvm_types::{
     array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
     ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
     HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
@@ -2205,7 +2205,7 @@ mod tests {
     //
     // The whole block is doubly-gated (#[cfg(test)] from the surrounding
     // module + #[cfg(feature = "gpu-offload")]) so that the default
-    // `cargo test -p rustjvm-gc` invocation does not even compile this code.
+    // `cargo test -p cratonvm-gc` invocation does not even compile this code.
 
     #[cfg(feature = "gpu-offload")]
     mod gpu_offload_tests {

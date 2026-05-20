@@ -1,14 +1,14 @@
 {
   "$schema_version": 1,
   "generated_at": "2026-04-29T00:00:00Z",
-  "rustjvm_version": "unknown",
+  "cratonvm_version": "unknown",
   "wp": "WP8.10",
   "fixture": {
     "mode": "real-distribution",
     "wildfly_version": "32.0.1.Final",
     "wildfly_url": "https://github.com/wildfly/wildfly/releases/download/32.0.1.Final/wildfly-32.0.1.Final.tar.gz",
     "wildfly_sha256": "REPLACE_WITH_REAL_SHA256_ON_FIRST_RUN",
-    "notes": "Boots a real WildFly 32 distribution under rust-jvm via jboss-modules.jar (NOT JPMS). The first-failure baseline below is a best-guess from JBoss Modules architecture and the known rust-jvm gaps in waves 1-7 — to be replaced with the actual stderr signature once the parent runs the harness once."
+    "notes": "Boots a real WildFly 32 distribution under cratonvm via jboss-modules.jar (NOT JPMS). The first-failure baseline below is a best-guess from JBoss Modules architecture and the known cratonvm gaps in waves 1-7 — to be replaced with the actual stderr signature once the parent runs the harness once."
   },
   "steps": [
     {
@@ -19,7 +19,7 @@
     {
       "name": "run",
       "rc": 1,
-      "notes": "run-under-rustjvm.{sh,ps1} invokes rustjvm --jar staged/wildfly/jboss-modules.jar -mp staged/wildfly/modules org.jboss.as.standalone --server-config=standalone.xml. Boot is killed by TIMEOUT_SEC (default 60) — most-likely outcome is a JBoss Modules clinit / SPI failure long before 'WFLYSRV0025: WildFly Full ... started in Nms' is emitted."
+      "notes": "run-under-cratonvm.{sh,ps1} invokes cratonvm --jar staged/wildfly/jboss-modules.jar -mp staged/wildfly/modules org.jboss.as.standalone --server-config=standalone.xml. Boot is killed by TIMEOUT_SEC (default 60) — most-likely outcome is a JBoss Modules clinit / SPI failure long before 'WFLYSRV0025: WildFly Full ... started in Nms' is emitted."
     }
   ],
   "expected_final_rc": 1,
@@ -55,7 +55,7 @@
     },
     {
       "id": "WP8.10.8",
-      "summary": "DONE this session — RUSTJVM_JBOSS_MP_ROOT env-var fallback added to find_mp_argument so external integration tests can inject -mp value without touching argv. Two unit tests added in jboss_module_loader.rs::tests."
+      "summary": "DONE this session — CRATONVM_JBOSS_MP_ROOT env-var fallback added to find_mp_argument so external integration tests can inject -mp value without touching argv. Two unit tests added in jboss_module_loader.rs::tests."
     },
     {
       "id": "WP1.8",
@@ -70,7 +70,7 @@
     {
       "session": 99,
       "rc": 1,
-      "blocker": "WP8.10 first-failure hypothesis only — no real boot run yet. expected_stderr_contains pinned to the conservative 'JBoss Modules' substring (banner) so diff-baseline passes only if rust-jvm gets at least far enough to emit the JBoss Modules header line."
+      "blocker": "WP8.10 first-failure hypothesis only — no real boot run yet. expected_stderr_contains pinned to the conservative 'JBoss Modules' substring (banner) so diff-baseline passes only if cratonvm gets at least far enough to emit the JBoss Modules header line."
     },
     {
       "session": 100,

@@ -2,13 +2,13 @@
 //!
 //! Provides java.net.http.HttpClient, HttpRequest, HttpResponse,
 //! HttpHeaders, HttpRequest$BodyPublisher, HttpResponse$BodyHandlers,
-//! and WebSocket support for the RustJVM native layer.
+//! and WebSocket support for the CratonVM native layer.
 //!
 //! Implements Java HTTP Client API (java.net.http) introduced in Java 11,
 //! with HTTP/2 (RFC 7540) and HPACK header compression (RFC 7541) stubs.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 use crate::{native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 
 use std::io::Write;
@@ -364,7 +364,7 @@ fn http11_request_impl(host: &str, port: u16, method: &str, path: &str, tls: boo
     tcp_stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
 
     let request_line = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: */*\r\nUser-Agent: RustJVM/1.0\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: */*\r\nUser-Agent: CratonVM/1.0\r\n\r\n"
     );
 
     let response_bytes = if tls {
@@ -1801,7 +1801,7 @@ pub(crate) fn register_http2_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod http2_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // --- Registration tests ------------------------------------------------
 
@@ -2324,7 +2324,7 @@ mod http2_tests {
             let request = String::from_utf8_lossy(&buf[..n]);
             assert!(request.starts_with("GET /hello"), "M14: expected GET /hello, got: {}", request);
 
-            let body = "Hello from RustJVM!";
+            let body = "Hello from CratonVM!";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -2338,7 +2338,7 @@ mod http2_tests {
             .expect("M14: http11_request failed");
 
         assert_eq!(status, 200, "M14: expected status 200, got {status}");
-        assert_eq!(body, "Hello from RustJVM!", "M14: body mismatch");
+        assert_eq!(body, "Hello from CratonVM!", "M14: body mismatch");
         server.join().expect("M14: server thread panicked");
     }
 

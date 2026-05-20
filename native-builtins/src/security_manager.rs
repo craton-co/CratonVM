@@ -13,9 +13,9 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -24,7 +24,7 @@ pub mod x509;
 pub use policy::{Grant, PermissionEntry, Policy, PolicyError};
 
 // ---------------------------------------------------------------------------
-// Cached `RUSTJVM_DBG_DOPRIV` env-var lookup
+// Cached `CRATONVM_DBG_DOPRIV` env-var lookup
 //
 // `doPrivileged` is called ~50k times during JDK boot; reading
 // `env::var_os` per call funnels every thread through the platform
@@ -36,7 +36,7 @@ static DBG_DOPRIV: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn dbg_dopriv_enabled() -> bool {
-    *DBG_DOPRIV.get_or_init(|| std::env::var_os("RUSTJVM_DBG_DOPRIV").is_some())
+    *DBG_DOPRIV.get_or_init(|| std::env::var_os("CRATONVM_DBG_DOPRIV").is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ fn set_security_manager(sm: Option<ObjectRef>) {
 // process-wide reference that `Policy.setPolicy(Policy)` writes to and
 // `Policy.getPolicy()` reads from. Real JDK 25 throws
 // `UnsupportedOperationException` from these entry points (JEP 411 sealing
-// the SecurityManager surface), but rustjvm's lenient model accepts the
+// the SecurityManager surface), but cratonvm's lenient model accepts the
 // installation: we simply hold the reference so callers like JBoss Modules,
 // WildFly, and EJBCA — which call `Policy.setPolicy(new ModulesPolicy())`
 // during boot — can proceed.
@@ -1020,18 +1020,18 @@ fn register_access_control_context(r: &mut NativeMethodRegistry) {
 // boot — KC16's `Main.main` does it via `Module.<clinit>` →
 // `ModulesPolicy.install`. Throwing kills boot.
 //
-// rustjvm's lenient model accepts the installation: we store the reference
+// cratonvm's lenient model accepts the installation: we store the reference
 // in a process-wide singleton and answer subsequent queries from it. We
 // do not enforce the installed Policy at runtime — `implies(...)` always
-// returns `true` because rustjvm has no permission-check choke points
+// returns `true` because cratonvm has no permission-check choke points
 // (the `SecurityManager.checkPermission` flow above is policy-aware but
 // `policy_allows_full` short-circuits to `true` whenever no Rust-side
 // `Policy` (the parsed `java.policy` flavour) is installed).
 //
 // SECURITY POSTURE: this is a deliberate no-enforcement design, NOT a
-// regression. rustjvm operates in real-JDK-mode without the
+// regression. cratonvm operates in real-JDK-mode without the
 // SecurityManager call sites that would consult the Policy. Apps that
-// embed rustjvm and *do* require permission enforcement must layer that
+// embed cratonvm and *do* require permission enforcement must layer that
 // on top — the OS sandbox, container limits, or a Java-side
 // `java.policy` are all viable. The `implies(...)`-returns-true contract
 // is documented here so the next agent doesn't mistake it for a bug.
@@ -1122,7 +1122,7 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Int(1))),
     );
 
-    // refresh()V — no-op: rustjvm has no Policy provider to reload.
+    // refresh()V — no-op: cratonvm has no Policy provider to reload.
     r.register(p, "refresh", "()V", |_ctx, _args| Ok(None));
 
     // <init>()V — Policy is abstract in real JDK so `new Policy()` would
@@ -1875,11 +1875,11 @@ mod tests {
         // confirm that define_class() attaches a CodeSource with the
         // right URL; the security_manager-side behavior is covered by
         // the SM trait method (see `t11_action_code_base_reads_real_url`).
-        use rustjvm_classloading::{ClassManager, ClassLoaderId};
+        use cratonvm_classloading::{ClassManager, ClassLoaderId};
         use std::io::Write as _;
 
         // Build a minimal JAR with one fake .class entry.
-        let dir = std::env::temp_dir().join("rustjvm-t11-pd-jar");
+        let dir = std::env::temp_dir().join("cratonvm-t11-pd-jar");
         let _ = std::fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         {
@@ -1918,9 +1918,9 @@ mod tests {
     #[test]
     fn t11_protection_domain_from_directory() {
         // A class loaded from a plain directory gets a `file:/.../` URL.
-        use rustjvm_classloading::ClassManager;
+        use cratonvm_classloading::ClassManager;
 
-        let dir = std::env::temp_dir().join("rustjvm-t11-pd-dir");
+        let dir = std::env::temp_dir().join("cratonvm-t11-pd-dir");
         let sub = dir.join("com").join("acme");
         let _ = std::fs::create_dir_all(&sub);
         std::fs::write(sub.join("Bar.class"), b"\xCA\xFE\xBA\xBE").unwrap();
@@ -2135,10 +2135,10 @@ mod tests {
         // Feed a JAR containing a META-INF/*.RSA block through
         // find_class_code_source_info and verify the cert digests
         // vector is populated with the SHA-256 of the block bytes.
-        use rustjvm_classloading::ClassManager;
+        use cratonvm_classloading::ClassManager;
         use std::io::Write as _;
 
-        let dir = std::env::temp_dir().join("rustjvm-t11-signed-jar");
+        let dir = std::env::temp_dir().join("cratonvm-t11-signed-jar");
         let _ = std::fs::create_dir_all(&dir);
         let jar_path = dir.join("signed.jar");
 
@@ -2183,7 +2183,7 @@ mod tests {
         let _guard = policy_test_lock();
         clear_policy_and_stack();
 
-        let dir = std::env::temp_dir().join("rustjvm-sm-policy");
+        let dir = std::env::temp_dir().join("cratonvm-sm-policy");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("load_test.policy");
         {

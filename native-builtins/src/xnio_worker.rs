@@ -68,7 +68,7 @@
 //! a stub loop (`park_timeout(1 s)` on the `shutting_down` flag) so the
 //! worker is still fully constructible and shutdown works end-to-end.
 //! Once T19.7.c lands, swap `io_thread_stub_body` for a direct call to
-//! `rustjvm_native_builtins::xnio_io_thread::run_io_loop(handle)`.
+//! `cratonvm_native_builtins::xnio_io_thread::run_io_loop(handle)`.
 //!
 //! See `docs/roadmap-100.md` T19.7.b.
 
@@ -81,9 +81,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -760,7 +760,7 @@ fn native_worker_get_io_threads(
     let worker = read_worker(ctx, this)
         .ok_or_else(|| mcf_runtime("XnioWorker.getIoThreads: not registered"))?;
     let count = worker.io_threads.len();
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), count);
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), count);
     for (i, h) in worker.io_threads.iter().enumerate() {
         let obj = alloc_concurrent_synthetic(ctx, "org/xnio/XnioIoThread", 2);
         ctx.set_field(obj, 0, Value::Int(h.id as i32));
@@ -820,7 +820,7 @@ fn native_worker_shutdown_now(
     }
     // Real JDK returns List<Runnable> of non-executed tasks; we return
     // an empty array ref (callers typically ignore it).
-    let empty = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+    let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
     Ok(Some(Value::Object(Some(empty))))
 }
 

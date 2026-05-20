@@ -1,8 +1,8 @@
 //! T4.7 -- JFR Conformance Tests
 //!
-//! These tests verify that the RustJVM Java Flight Recorder implementation
+//! These tests verify that the CratonVM Java Flight Recorder implementation
 //! conforms to the `jdk.jfr` API surface expected by OpenJDK 25.  They exercise
-//! the Rust-side JFR crate (`rustjvm-jfr`) directly, covering:
+//! the Rust-side JFR crate (`cratonvm-jfr`) directly, covering:
 //!
 //! - Recording lifecycle (new -> start -> record -> stop -> close)
 //! - Binary dump to the JFR v2.0 format with correct magic/version
@@ -10,18 +10,18 @@
 //!
 //! Run with:
 //!
-//!     cargo test -p rustjvm-vm --test t4_7_jfr_conformance
+//!     cargo test -p cratonvm-vm --test t4_7_jfr_conformance
 //!
 //! Some tests are `#[ignore]` because they depend on full JFR wiring through the
 //! VM.  The non-ignored tests exercise the JFR crate's public API directly.
 
 use std::sync::Arc;
 
-use rustjvm_jfr::event::{EventInstance, EventTypeId, EventValue};
-use rustjvm_jfr::recording::{FlightRecorder, RecordingSettings, RecordingState};
-use rustjvm_jfr::dump::{JFR_MAGIC, JFR_VERSION_MAJOR, JFR_VERSION_MINOR, HEADER_SIZE};
-use rustjvm_jfr::stream::EventStream;
-use rustjvm_jfr::create_flight_recorder;
+use cratonvm_jfr::event::{EventInstance, EventTypeId, EventValue};
+use cratonvm_jfr::recording::{FlightRecorder, RecordingSettings, RecordingState};
+use cratonvm_jfr::dump::{JFR_MAGIC, JFR_VERSION_MAJOR, JFR_VERSION_MINOR, HEADER_SIZE};
+use cratonvm_jfr::stream::EventStream;
+use cratonvm_jfr::create_flight_recorder;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,7 +65,7 @@ fn make_event_with_fields(
 
 /// Create a temporary directory for JFR dump tests.
 fn jfr_temp_dir(test_name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rustjvm_t4_7_{test_name}"));
+    let dir = std::env::temp_dir().join(format!("cratonvm_t4_7_{test_name}"));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -111,10 +111,10 @@ fn t4_7_1_jfr_event_recording_start_stop() {
 
     // Phase 3: Record events via the built-in emitters.
     // Use the GC event as a representative built-in event.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1 Mixed", "G1 Evacuation Pause", 2_000_000, 300_000);
-    rustjvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 10, 3_000_000);
-    rustjvm_jfr::builtin::emit_class_load_event(
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1 Mixed", "G1 Evacuation Pause", 2_000_000, 300_000);
+    cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 10, 3_000_000);
+    cratonvm_jfr::builtin::emit_class_load_event(
         &mut fr,
         "java/lang/String",
         "bootstrap",
@@ -138,7 +138,7 @@ fn t4_7_1_jfr_event_recording_start_stop() {
     assert_eq!(fr.active_recording_count(), 0, "no recordings should be active after stop");
 
     // Phase 5: Events recorded while stopped must be dropped.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1 Full", "System.gc()", 5_000_000, 1_000_000);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1 Full", "System.gc()", 5_000_000, 1_000_000);
     {
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(
@@ -177,14 +177,14 @@ fn t4_7_1_jfr_multiple_simultaneous_recordings() {
     assert_eq!(fr.active_recording_count(), 2);
 
     // Emit one event -- both recordings should capture it.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "Alloc", 1000, 500);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "Alloc", 1000, 500);
 
     assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
     assert_eq!(fr.get_recording(r2).unwrap().event_count(), 1);
 
     // Stop r1, emit another event -- only r2 should capture.
     fr.stop_recording(r1);
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "Alloc", 2000, 300);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "Alloc", 2000, 300);
 
     assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
     assert_eq!(fr.get_recording(r2).unwrap().event_count(), 2);
@@ -212,9 +212,9 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
     fr.start_recording(rid);
 
     // Emit a representative set of events to produce a non-trivial dump.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
-    rustjvm_jfr::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
-    rustjvm_jfr::builtin::emit_class_load_event(
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
+    cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
+    cratonvm_jfr::builtin::emit_class_load_event(
         &mut fr,
         "java/lang/Object",
         "bootstrap",
@@ -222,7 +222,7 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
         3_000_000,
         100_000,
     );
-    rustjvm_jfr::builtin::emit_compilation_event(
+    cratonvm_jfr::builtin::emit_compilation_event(
         &mut fr,
         "java/lang/String.hashCode",
         1,     // compile_id
@@ -274,7 +274,7 @@ fn t4_7_2_jfr_recording_dump_produces_valid_file() {
     assert_eq!(minor, JFR_VERSION_MINOR, "JFR minor version must match crate constant");
 
     // Assertion 5: Parse the full header for structural validity.
-    let header = rustjvm_jfr::read_jfr_header(&dump_path)
+    let header = cratonvm_jfr::read_jfr_header(&dump_path)
         .expect("read_jfr_header must succeed on a valid dump");
     assert_eq!(header.magic, JFR_MAGIC);
     assert_eq!(header.major, 2);
@@ -318,7 +318,7 @@ fn t4_7_2_jfr_dump_empty_recording_produces_valid_file() {
     let bytes_written = fr.dump_recording(rid, &dump_path).expect("empty dump must succeed");
     assert!(bytes_written > 0, "even an empty dump must produce a non-zero file");
 
-    let header = rustjvm_jfr::read_jfr_header(&dump_path).expect("header must be valid");
+    let header = cratonvm_jfr::read_jfr_header(&dump_path).expect("header must be valid");
     assert_eq!(header.magic, JFR_MAGIC);
     assert_eq!(header.major, 2);
     assert_eq!(header.minor, 0);
@@ -370,9 +370,9 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     }
 
     // Emit events into the recording.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Alloc", 1_000_000, 500_000);
-    rustjvm_jfr::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1 Mixed", "Evacuation", 3_000_000, 300_000);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Alloc", 1_000_000, 500_000);
+    cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1 Mixed", "Evacuation", 3_000_000, 300_000);
 
     // Poll the stream -- should see all 3 new events.
     {
@@ -389,7 +389,7 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     }
 
     // Emit one more event, verify incremental delivery.
-    rustjvm_jfr::builtin::emit_class_load_event(
+    cratonvm_jfr::builtin::emit_class_load_event(
         &mut fr,
         "java/lang/String",
         "boot",
@@ -407,7 +407,7 @@ fn t4_7_3_jfr_event_stream_consumes_events() {
     stream.close();
     assert!(stream.is_closed());
     {
-        rustjvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1", "System.gc()", 5_000_000, 100_000);
+        cratonvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1", "System.gc()", 5_000_000, 100_000);
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
         assert!(events.is_empty(), "closed stream must not deliver events");
@@ -446,10 +446,10 @@ fn t4_7_3_jfr_event_stream_filtered_with_callback() {
     assert_eq!(stream.callback_count(), 1);
 
     // Emit a mix of event types.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "Alloc", 1000, 500);
-    rustjvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 2, 2000);
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "Alloc", 3000, 300);
-    rustjvm_jfr::builtin::emit_class_load_event(&mut fr, "Foo", "app", "app", 4000, 100);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "Alloc", 1000, 500);
+    cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 2, 2000);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "Alloc", 3000, 300);
+    cratonvm_jfr::builtin::emit_class_load_event(&mut fr, "Foo", "app", "app", 4000, 100);
 
     // Poll: only GC events should pass the filter.
     {
@@ -481,9 +481,9 @@ fn t4_7_3_jfr_event_stream_next_event() {
     let mut stream = EventStream::new_from_start();
 
     // Emit three events.
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "A", 100, 50);
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "B", 200, 50);
-    rustjvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1", "C", 300, 50);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "G1", "A", 100, 50);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 2, "G1", "B", 200, 50);
+    cratonvm_jfr::builtin::emit_gc_event(&mut fr, 3, "G1", "C", 300, 50);
 
     let rec = fr.get_recording(rid).unwrap();
     let repo = rec.repository();

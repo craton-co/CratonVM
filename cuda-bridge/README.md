@@ -1,6 +1,6 @@
 # cuda-bridge
 
-Thin CUDA Driver API bridge for RustJVM GPU offload. **No JVM-specific
+Thin CUDA Driver API bridge for CratonVM GPU offload. **No JVM-specific
 code lives here** — only device discovery, module loading, memory
 allocation, memcpy, and kernel launch.
 

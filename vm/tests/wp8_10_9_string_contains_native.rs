@@ -21,9 +21,9 @@
 
 use std::sync::Arc;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{create_java_string, NativeContextImpl, SharedVm, Vm};
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{create_java_string, NativeContextImpl, SharedVm, Vm};
 
 fn shared() -> Arc<SharedVm> {
     Arc::new(SharedVm::new(VmConfig::default()))
@@ -135,7 +135,7 @@ fn string_contains_empty_needle_is_true() {
 #[test]
 fn string_starts_with_offset_via_dispatch() {
     let mut vm = Vm::new(VmConfig::default());
-    let s = create_java_string(&vm.shared, "rustjvm.boot.fixture");
+    let s = create_java_string(&vm.shared, "cratonvm.boot.fixture");
     let prefix = create_java_string(&vm.shared, "boot");
 
     let cb = vm
@@ -147,7 +147,7 @@ fn string_starts_with_offset_via_dispatch() {
         shared: &vm.shared,
         thread: &mut vm.main_thread,
     };
-    // "rustjvm.boot.fixture".startsWith("boot", 8) == true
+    // "cratonvm.boot.fixture".startsWith("boot", 8) == true
     let r = cb(
         &mut ctx,
         &[

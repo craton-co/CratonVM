@@ -1,22 +1,23 @@
 [package]
-name = "rustjvm-gc"
+name = "cratonvm-gc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Garbage collector and memory management for RustJVM"
+description = "Garbage collector and memory management for CratonVM"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rustjvm-types = { path = "../types" }
+cratonvm-types = { path = "../types" }
 parking_lot.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
-rustjvm-jit = { path = "../jit" }
+cratonvm-jit = { path = "../jit" }
 
 [features]
 default = []

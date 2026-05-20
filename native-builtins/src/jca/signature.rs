@@ -37,9 +37,9 @@
 
 #![allow(clippy::collapsible_if)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
 use crate::crypto_impl;
@@ -114,7 +114,7 @@ fn algo_name(idx: i32) -> &'static str {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn this_arg(args: &[Value]) -> Result<ObjectRef, rustjvm_types::error::MethodCallFailed> {
+fn this_arg(args: &[Value]) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(o))) => Ok(*o),
         _ => Err(RuntimeError::NullPointerException {

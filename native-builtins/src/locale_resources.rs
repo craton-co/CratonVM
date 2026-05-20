@@ -23,14 +23,14 @@
 //! classpath), matching the behaviour of the synthetic-mode override in
 //! `phases_late.rs::register_p63_resource_bundle`.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
 fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, items.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
     for (i, s) in items.iter().enumerate() {
         let js = ctx.create_string(s);
         ctx.set_array_element(arr, i, Value::Object(Some(js)));
@@ -41,7 +41,7 @@ fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
 fn put_arr(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, items: &[&str]) {
     let k = ctx.create_string(key);
     let arr = make_string_array(ctx, items);
-    rustjvm_native_collections::native_map_put_pub(
+    cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
@@ -55,7 +55,7 @@ fn put_arr(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, items: &[&str
 fn put_str(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, value: &str) {
     let k = ctx.create_string(key);
     let v = ctx.create_string(value);
-    rustjvm_native_collections::native_map_put_pub(
+    cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
@@ -302,7 +302,7 @@ fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
 fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-    rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     ctx.set_field(obj, 0, Value::Object(Some(map)));
     ctx.set_field(obj, 1, Value::Object(None));
 
@@ -322,7 +322,7 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
                     let value = line[pos + 1..].trim();
                     let k = ctx.create_string(key);
                     let v = ctx.create_string(value);
-                    rustjvm_native_collections::native_map_put_pub(
+                    cratonvm_native_collections::native_map_put_pub(
                         ctx,
                         &[
                             Value::Object(Some(map)),
@@ -384,7 +384,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Object(None))),
     };
-    rustjvm_native_collections::native_map_get_pub(
+    cratonvm_native_collections::native_map_get_pub(
         ctx,
         &[Value::Object(Some(map)), Value::Object(Some(key))],
     )
@@ -411,7 +411,7 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Int(0))),
     };
-    rustjvm_native_collections::native_map_contains_key_pub(
+    cratonvm_native_collections::native_map_contains_key_pub(
         ctx,
         &[Value::Object(Some(map)), Value::Object(Some(key))],
     )
@@ -554,7 +554,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "getDecimalFormatSymbolsData",
         "()[Ljava/lang/Object;",
         |ctx, _args| {
-            let outer = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 3);
+            let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 3);
             // 13-element layout: indices 0-10 are mandatory (decimal,
             // grouping, pattern sep, percent, zero, digit, minus,
             // exponent, perMille, infinity, NaN), 11=monetary decimal

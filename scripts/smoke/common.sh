@@ -2,8 +2,8 @@
 # Shared helpers for the Phase-I smoke runners (RI.1 .. RI.17).
 #
 # Every runner source-includes this file as its first action, which:
-#   * validates required env vars ($RUSTJVM, $FIXTURE_CACHE, $JAVA_HOME*),
-#   * exposes `smoke_download`, `smoke_run_rustjvm`, and
+#   * validates required env vars ($CRATONVM, $FIXTURE_CACHE, $JAVA_HOME*),
+#   * exposes `smoke_download`, `smoke_run_cratonvm`, and
 #     `smoke_require_signal` so each runner stays ≤ 30 LoC of real logic,
 #   * installs `set -euo pipefail` so missing pieces fail loudly.
 
@@ -12,11 +12,11 @@ set -euo pipefail
 SMOKE_DIR_ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SMOKE_REPO_ROOT="$(cd "$SMOKE_DIR_ME/../.." && pwd)"
 
-if [[ -z "${RUSTJVM:-}" ]]; then
-    RUSTJVM="$SMOKE_REPO_ROOT/target/release/rustjvm"
+if [[ -z "${CRATONVM:-}" ]]; then
+    CRATONVM="$SMOKE_REPO_ROOT/target/release/cratonvm"
 fi
-if [[ ! -x "$RUSTJVM" ]]; then
-    echo "smoke/common: rustjvm binary not found at $RUSTJVM" >&2
+if [[ ! -x "$CRATONVM" ]]; then
+    echo "smoke/common: cratonvm binary not found at $CRATONVM" >&2
     exit 2
 fi
 
@@ -29,7 +29,7 @@ mkdir -p "$FIXTURE_CACHE"
 # actions/setup-java or the caller's shell.
 JAVA_HOME_FOR_SMOKE="${JAVA_HOME_FOR_SMOKE:-${JAVA_HOME:-}}"
 if [[ -z "$JAVA_HOME_FOR_SMOKE" ]]; then
-    echo "smoke/common: JAVA_HOME is not set; cannot run rustjvm" >&2
+    echo "smoke/common: JAVA_HOME is not set; cannot run cratonvm" >&2
     exit 2
 fi
 
@@ -56,26 +56,26 @@ smoke_download() {
     return 1
 }
 
-# Run rustjvm with the workload and tee stdout+stderr into $SMOKE_LOG.
+# Run cratonvm with the workload and tee stdout+stderr into $SMOKE_LOG.
 # Extra args: passed through as JVM+program arguments.
-smoke_run_rustjvm() {
+smoke_run_cratonvm() {
     SMOKE_LOG="$(mktemp)"
     if [[ -z "${SMOKE_TIMEOUT:-}" ]]; then
         SMOKE_TIMEOUT=600
     fi
     if command -v timeout >/dev/null 2>&1; then
-        timeout "${SMOKE_TIMEOUT}" "$RUSTJVM" \
+        timeout "${SMOKE_TIMEOUT}" "$CRATONVM" \
             --java-home "$JAVA_HOME_FOR_SMOKE" \
             "$@" 2>&1 | tee "$SMOKE_LOG" || true
     else
-        "$RUSTJVM" \
+        "$CRATONVM" \
             --java-home "$JAVA_HOME_FOR_SMOKE" \
             "$@" 2>&1 | tee "$SMOKE_LOG" || true
     fi
     export SMOKE_LOG
 }
 
-# Assert that a specific signal appears in the last rustjvm run's output.
+# Assert that a specific signal appears in the last cratonvm run's output.
 # Exits 0 on match, 1 otherwise, printing the last 30 lines on failure.
 smoke_require_signal() {
     local pattern="$1"

@@ -194,7 +194,7 @@ pub mod stats {
 // `proxy.getClass().getInterfaces()` round-trip lives in
 // `native-builtins/src/lib.rs::PROXY_LAST_INTERFACES_BITS`. We can't
 // host it here because `native-builtins` does not depend on
-// `rustjvm-vm` (the dependency goes the other way), so the cache must
+// `cratonvm-vm` (the dependency goes the other way), so the cache must
 // live where both the writer (`native_proxy_new_instance`) and the
 // reader (`native_class_get_interfaces`) can reach it.
 

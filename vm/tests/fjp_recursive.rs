@@ -14,7 +14,7 @@
 //! `java/util/concurrent/ForkJoinTask` so this probe runs in the interpreter
 //! end-to-end.
 //!
-//! The binary path is resolved via `RUSTJVM_BIN` env var, then the cargo
+//! The binary path is resolved via `CRATONVM_BIN` env var, then the cargo
 //! `target/{release,debug}` fallback. Class files are produced on-demand via
 //! `javac --release 21` if absent. If neither the binary nor `javac` is
 //! available the test reports `skipped` rather than failing.
@@ -32,8 +32,8 @@ fn probe_classes_dir() -> PathBuf {
     probe_dir().join("classes")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -41,7 +41,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -80,7 +80,7 @@ fn ensure_probe_compiled() -> bool {
 }
 
 fn jdk_home() -> Option<PathBuf> {
-    if let Ok(j) = std::env::var("RUSTJVM_TEST_JDK") {
+    if let Ok(j) = std::env::var("CRATONVM_TEST_JDK") {
         let p = PathBuf::from(&j);
         if p.exists() {
             return Some(p);
@@ -105,12 +105,12 @@ fn fjp_probe_recursive_returns_correct_sum() {
         eprintln!("[fjp_recursive] FjpProbe.class unavailable; skipping");
         return;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[fjp_recursive] rustjvm binary not found; build with \
-                 `cargo build --release -p rustjvm-cli`"
+                "[fjp_recursive] cratonvm binary not found; build with \
+                 `cargo build --release -p cratonvm-cli`"
             );
             return;
         }
@@ -119,7 +119,7 @@ fn fjp_probe_recursive_returns_correct_sum() {
         Some(j) => j,
         None => {
             eprintln!(
-                "[fjp_recursive] no JDK home (set RUSTJVM_TEST_JDK or JAVA_HOME); skipping"
+                "[fjp_recursive] no JDK home (set CRATONVM_TEST_JDK or JAVA_HOME); skipping"
             );
             return;
         }
@@ -137,7 +137,7 @@ fn fjp_probe_recursive_returns_correct_sum() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[fjp_recursive] failed to spawn rustjvm: {e}");
+            eprintln!("[fjp_recursive] failed to spawn cratonvm: {e}");
             return;
         }
     };

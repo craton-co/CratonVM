@@ -76,9 +76,9 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 use crate::keystore;
@@ -1084,7 +1084,7 @@ fn read_chain_arg(ctx: &mut dyn NativeContext, v: &Value) -> Vec<Vec<u8>> {
 }
 
 fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
-    let by_name = ctx.get_field_by_name(this, "rustjvm$x509km$id");
+    let by_name = ctx.get_field_by_name(this, "cratonvm$x509km$id");
     if let Value::Int(i) = by_name {
         if i != 0 {
             return i;
@@ -1102,7 +1102,7 @@ fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
 }
 
 fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
-    ctx.set_field_by_name(this, "rustjvm$x509km$id", Value::Int(id));
+    ctx.set_field_by_name(this, "cratonvm$x509km$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > 0 {
         ctx.set_field(this, 0, Value::Int(id));
@@ -1110,7 +1110,7 @@ fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
 }
 
 fn get_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
-    let by_name = ctx.get_field_by_name(this, "rustjvm$x509tm$id");
+    let by_name = ctx.get_field_by_name(this, "cratonvm$x509tm$id");
     if let Value::Int(i) = by_name {
         if i != 0 {
             return i;
@@ -1128,7 +1128,7 @@ fn get_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
 }
 
 fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
-    ctx.set_field_by_name(this, "rustjvm$x509tm$id", Value::Int(id));
+    ctx.set_field_by_name(this, "cratonvm$x509tm$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > 0 {
         ctx.set_field(this, 0, Value::Int(id));
@@ -1139,13 +1139,13 @@ fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
 /// dedicated field; our `keystore.rs` stash convention sets it both by name
 /// and at slot index 4.
 fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
-    let by_name = ctx.get_field_by_name(ks, "rustjvm$keystore$storeId");
+    let by_name = ctx.get_field_by_name(ks, "cratonvm$keystore$storeId");
     if let Value::Int(i) = by_name {
         if i != 0 {
             return i;
         }
     }
-    if let Value::Long(l) = ctx.get_field_by_name(ks, "rustjvm$keystore$storeId") {
+    if let Value::Long(l) = ctx.get_field_by_name(ks, "cratonvm$keystore$storeId") {
         if l != 0 {
             return l as i32;
         }
@@ -1306,7 +1306,7 @@ fn get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     let cls_id = ctx
         .ensure_class_initialized("java/security/cert/X509Certificate")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
         let mirror = make_x509_mirror(ctx, &alias, der);
@@ -1362,7 +1362,7 @@ fn get_client_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn materialize_string_array(ctx: &mut dyn NativeContext, items: &[String]) -> ObjectRef {
     let cls_id = ctx
         .ensure_class_initialized("java/lang/String")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, items.len());
     for (i, s) in items.iter().enumerate() {
         let js = ctx.create_string(s);
@@ -1433,7 +1433,7 @@ fn get_accepted_issuers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
     let cls_id = ctx
         .ensure_class_initialized("java/security/cert/X509Certificate")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, ders.len());
     for (i, der) in ders.iter().enumerate() {
         let mirror = make_x509_mirror(ctx, "trust-anchor", der);
@@ -1495,7 +1495,7 @@ fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // wired to the same id.
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/KeyManager")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
     let km = alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2);
     set_km_id(ctx, km, id);
@@ -1522,7 +1522,7 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/TrustManager")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
     let tm = alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2);
     set_tm_id(ctx, tm, id);

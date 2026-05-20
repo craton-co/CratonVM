@@ -37,9 +37,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_CMDLINE_STARTUP: &str = "org/apache/ignite/startup/cmdline/CommandLineStartup";
 const CN_IGNITION: &str = "org/apache/ignite/Ignition";
@@ -63,7 +63,7 @@ fn ignite_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_ignite_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_IGNITE_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_IGNITE_REAL").as_deref() == Ok("1") {
         return;
     }
     // CommandLineStartup.main — primary `bin/ignite.sh` entry point.

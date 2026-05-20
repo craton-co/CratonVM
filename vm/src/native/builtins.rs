@@ -1,10 +1,10 @@
-// Re-exported from rustjvm-native-builtins. All crate::native::builtins::* paths continue to work.
-pub use rustjvm_native_builtins::*;
+// Re-exported from cratonvm-native-builtins. All crate::native::builtins::* paths continue to work.
+pub use cratonvm_native_builtins::*;
 
 // ---------------------------------------------------------------------------
 // NEW-4: no-op shims for when the `synthetic-jdk` feature is OFF.
 //
-// `rustjvm-native-builtins` gates `register_builtins` and
+// `cratonvm-native-builtins` gates `register_builtins` and
 // `register_synthetic_overrides` behind `#[cfg(feature = "synthetic-jdk")]`,
 // so they simply do not exist in non-synthetic builds. The vm crate has
 // inline-test call sites that reference these symbols via the
@@ -18,13 +18,13 @@ pub use rustjvm_native_builtins::*;
 // expectations.
 
 #[cfg(not(feature = "synthetic-jdk"))]
-pub fn register_builtins(_registry: &mut rustjvm_native_api::NativeMethodRegistry) {
+pub fn register_builtins(_registry: &mut cratonvm_native_api::NativeMethodRegistry) {
     // No-op shim. See module documentation above.
 }
 
 #[cfg(not(feature = "synthetic-jdk"))]
 pub fn register_synthetic_overrides(
-    _registry: &mut rustjvm_native_api::NativeMethodRegistry,
+    _registry: &mut cratonvm_native_api::NativeMethodRegistry,
 ) {
     // No-op shim. See module documentation above.
 }

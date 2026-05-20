@@ -1482,7 +1482,7 @@ mod tests {
     #[test]
     fn test_from_file_roundtrip() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join("rustjvm-policy-test");
+        let dir = std::env::temp_dir().join("cratonvm-policy-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("test.policy");
         {
@@ -1768,7 +1768,7 @@ mod tests {
             "/tmp/x",
             "read",
             None,
-            &[],
+            &[] as &[&str],
         ));
         // Wrong signer digest → filtered out.
         assert!(!p.implies_full(
@@ -2251,7 +2251,7 @@ mod tests {
             "/secret/x",
             "read",
             None,
-            &[],
+            &[] as &[&str],
             &[],
         ));
         // Wrong principal → grant must not apply.
@@ -2260,7 +2260,7 @@ mod tests {
             "/secret/x",
             "read",
             None,
-            &[],
+            &[] as &[&str],
             &[(
                 "javax.security.auth.x500.X500Principal".to_string(),
                 "CN=Bob".to_string(),
@@ -2272,7 +2272,7 @@ mod tests {
             "/secret/x",
             "read",
             None,
-            &[],
+            &[] as &[&str],
             &[(
                 "javax.security.auth.x500.X500Principal".to_string(),
                 "CN=Alice".to_string(),
@@ -2303,7 +2303,7 @@ mod tests {
             "doX",
             "",
             None,
-            &[],
+            &[] as &[&str],
             &[alice.clone()],
         ));
 
@@ -2317,7 +2317,7 @@ mod tests {
             "doY",
             "",
             None,
-            &[],
+            &[] as &[&str],
             &[bob.clone()],
         ));
 
@@ -2328,7 +2328,7 @@ mod tests {
             "doZ",
             "",
             None,
-            &[],
+            &[] as &[&str],
             &[any.clone()],
         ));
         // But still rejects unauthenticated callers (every grant
@@ -2338,7 +2338,7 @@ mod tests {
             "doZ",
             "",
             None,
-            &[],
+            &[] as &[&str],
             &[],
         ));
     }
@@ -2359,7 +2359,7 @@ mod tests {
             "doIt",
             "",
             None,
-            &[],
+            &[] as &[&str],
             &[("A".to_string(), "alpha".to_string())],
         ));
         // Both principals → matches.
@@ -2368,7 +2368,7 @@ mod tests {
             "doIt",
             "",
             None,
-            &[],
+            &[] as &[&str],
             &[
                 ("A".to_string(), "alpha".to_string()),
                 ("B".to_string(), "beta".to_string()),

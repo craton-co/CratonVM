@@ -28,16 +28,16 @@
 //!   - Java-fixture probes for each acceptance bullet, hard-asserted.
 //!   - fixture-staging guard.
 //!
-//! The Java fixture lives at `vm/tests/resources/rustjvm/Wp21FieldSurface.java`
+//! The Java fixture lives at `vm/tests/resources/cratonvm/Wp21FieldSurface.java`
 //! and is auto-compiled by `vm/build.rs` (which detects `javac` on PATH).
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::native::register_builtins;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::native::register_builtins;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp21FieldSurface";
+const FIXTURE_CLASS: &str = "cratonvm/Wp21FieldSurface";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -46,7 +46,7 @@ fn test_resources_dir() -> String {
 
 fn fixture_compiled() -> bool {
     let path = format!(
-        "{}/rustjvm/Wp21FieldSurface.class",
+        "{}/cratonvm/Wp21FieldSurface.class",
         test_resources_dir()
     );
     std::path::Path::new(&path).exists()
@@ -306,11 +306,11 @@ fn all_field_probes_pass() {
 #[test]
 fn fixture_class_file_is_staged() {
     let java = format!(
-        "{}/rustjvm/Wp21FieldSurface.java",
+        "{}/cratonvm/Wp21FieldSurface.java",
         test_resources_dir()
     );
     let class = format!(
-        "{}/rustjvm/Wp21FieldSurface.class",
+        "{}/cratonvm/Wp21FieldSurface.class",
         test_resources_dir()
     );
     assert!(

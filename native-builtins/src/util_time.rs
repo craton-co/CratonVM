@@ -28,9 +28,9 @@
 //! path directly; in real-JDK mode the JDK's own JCK-equivalent
 //! test suite exercises the same contract through the bytecode path.
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use std::fmt::Write;
 use crate::{obj_arg, alloc_concurrent_synthetic};
@@ -105,7 +105,7 @@ pub(crate) fn alloc_duration(ctx: &mut dyn NativeContext, seconds: i64, nanos: i
 pub(crate) fn alloc_time_synthetic(ctx: &mut dyn NativeContext, class: &str, n: usize) -> ObjectRef {
     match ctx.ensure_class_initialized(class) {
         Ok(cid) => ctx.alloc_object(cid, n),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), n),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), n),
     }
 }
 
@@ -559,7 +559,7 @@ fn native_ld_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let obj = alloc_local_date(ctx, y, m, d);
         Ok(Some(Value::Object(Some(obj))))
     } else {
-        Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("Invalid date: {s}"),
         }
         .into())
@@ -1035,7 +1035,7 @@ fn native_lt_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let obj = alloc_local_time(ctx, h, m, sec, nano);
         Ok(Some(Value::Object(Some(obj))))
     } else {
-        Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("Invalid time: {s}"),
         }
         .into())
@@ -1782,7 +1782,7 @@ fn native_dur_divided_by(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 1,
     };
     if divisor == 0 {
-        return Err(rustjvm_types::error::RuntimeError::ArithmeticException {
+        return Err(cratonvm_types::error::RuntimeError::ArithmeticException {
             message: "/ by zero".to_string(),
         }
         .into());
@@ -4815,7 +4815,7 @@ fn native_zone_id_get_available(
     ];
     // Return as a HashSet — use a simple ArrayList for now (consumers iterate)
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, zones.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, zones.len());
     for (i, z) in zones.iter().enumerate() {
         let s = ctx.create_string(z);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -5211,7 +5211,7 @@ fn native_dur_between(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let start = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Duration.between: startInclusive is null".into()),
             }
             .into())
@@ -5220,7 +5220,7 @@ fn native_dur_between(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let end = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Duration.between: endExclusive is null".into()),
             }
             .into())
@@ -5352,7 +5352,7 @@ fn native_month_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => 0,
     };
     if !(1..=12).contains(&m) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("Invalid value for MonthOfYear (valid values 1 - 12): {m}"),
         }
         .into());
@@ -5437,7 +5437,7 @@ fn native_dow_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => 0,
     };
     if !(1..=7).contains(&d) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("Invalid value for DayOfWeek (valid values 1 - 7): {d}"),
         }
         .into());
@@ -5495,7 +5495,7 @@ fn native_dow_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let t = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("DayOfWeek.from: temporal is null".into()),
             }
             .into())
@@ -5546,7 +5546,7 @@ fn native_dow_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let epoch_days = sec.div_euclid(86_400);
         (((epoch_days + 3).rem_euclid(7)) + 1) as i32
     } else {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!(
                 "DayOfWeek.from: unsupported TemporalAccessor class: {class_str}"
             ),

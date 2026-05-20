@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-use rustjvm_reader::instruction::Instruction;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use cratonvm_reader::instruction::Instruction;
 
 use super::verify_frame::VerificationFrame;
 use super::vtype::{return_type_from_descriptor, ClassHierarchy, VType};
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 /// The result of verifying a single instruction's type effects.
 pub struct InsnVerifyResult {
@@ -1494,7 +1494,7 @@ mod tests {
     use super::super::verify_frame::VerificationFrame;
     use super::super::vtype::ClassHierarchy;
     use super::*;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     struct MockHierarchy;
 

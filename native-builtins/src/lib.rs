@@ -5,10 +5,10 @@
 
 #![allow(clippy::collapsible_if, clippy::needless_range_loop, dead_code)]
 
-use rustjvm_types::ClassId;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 /// Normalise property keys after `read_string` (trim stray control/NUL).
 #[inline]
@@ -100,7 +100,7 @@ fn essential_dur_parse(
     let s_obj = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: "Text cannot be null".to_string(),
             }
             .into())
@@ -108,7 +108,7 @@ fn essential_dur_parse(
     };
     let text = ctx.read_string(s_obj).unwrap_or_default();
     let trimmed = text.trim().to_string();
-    let raw_err = || rustjvm_types::error::RuntimeError::IllegalArgumentException {
+    let raw_err = || cratonvm_types::error::RuntimeError::IllegalArgumentException {
         message: format!("Text cannot be parsed to a Duration: {trimmed}"),
     };
     let bytes = trimmed.as_bytes();
@@ -312,7 +312,7 @@ pub(crate) fn property_key_from_java_string(ctx: &mut dyn NativeContext, key_obj
     let Value::Object(Some(arr)) = ctx.get_field_by_name(key_obj, "value") else {
         return String::new();
     };
-    if ctx.heap_element_type_of(arr) != rustjvm_types::ArrayElementType::Byte {
+    if ctx.heap_element_type_of(arr) != cratonvm_types::ArrayElementType::Byte {
         return String::new();
     }
     let coder = match ctx.get_field_by_name(key_obj, "coder") {
@@ -483,7 +483,7 @@ pub mod keystore;
 // deterministic output.
 pub mod securerandom;
 // WP5.3: X509KeyManager / X509TrustManager per-connection. Added here so the
-// module is reachable from `cargo test -p rustjvm-native-builtins --lib
+// module is reachable from `cargo test -p cratonvm-native-builtins --lib
 // x509_manager`.  Wave-coordinator wires the registration call separately.
 pub mod x509_manager;
 // WP6.x — JCA umbrella.  Currently only `jca::cipher` is wired
@@ -795,7 +795,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
-                _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("String.charAt on null".to_string()),
                 }.into()),
             };
@@ -803,7 +803,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let s = ctx.read_string(this).unwrap_or_default();
             let chars: Vec<char> = s.chars().collect();
             if index < 0 || (index as usize) >= chars.len() {
-                return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
+                return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
             }
             Ok(Some(Value::Int(chars[index as usize] as i32)))
         },
@@ -985,7 +985,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // RKC16N.9 RECON-STUB: JDKSpecific.addInternalPackages no-op.
     // org/jboss/modules/Module.<clinit> PC 154 invokes
     // JDKSpecific.addInternalPackages(list). JDKSpecific.<clinit> uses
-    // heavy MethodHandle reflection and likely half-fails on rustjvm,
+    // heavy MethodHandle reflection and likely half-fails on cratonvm,
     // so its static `hack` field is null and the inner call NPEs.
     // No-op mirrors HotSpot when --add-modules adds nothing extra:
     // KC16 advances and resolves packages via its other paths.
@@ -1026,7 +1026,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     if let Some(m) = ctx.read_string(*msg) {
                         if m.len() > 2
                             && matches!(
-                                std::env::var("RUSTJVM_DIAG_EXINIT").as_deref(),
+                                std::env::var("CRATONVM_DIAG_EXINIT").as_deref(),
                                 Ok("1") | Ok("true") | Ok("yes")
                             )
                         {
@@ -1076,7 +1076,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let s = ctx.read_string(this).unwrap_or_default();
             let chars: Vec<char> = s.chars().collect();
             if end > chars.len() || begin > end {
-                return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin as i32 }.into());
+                return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin as i32 }.into());
             }
             let slice: String = chars[begin..end].iter().collect();
             Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
@@ -1093,7 +1093,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let s = ctx.read_string(this).unwrap_or_default();
             let chars: Vec<char> = s.chars().collect();
             if begin > chars.len() {
-                return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin as i32 }.into());
+                return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin as i32 }.into());
             }
             let slice: String = chars[begin..].iter().collect();
             Ok(Some(Value::Object(Some(ctx.create_string(&slice)))))
@@ -1254,7 +1254,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
             match args.get(1) {
                 Some(Value::Object(Some(_))) => Ok(Some(Value::Int(1))),
-                _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("Module.canUse: service class is null".into()),
                 }
                 .into()),
@@ -1326,7 +1326,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // Session 108 (Cluster D v2 — fix #1): java/io/Console.istty()Z native.
     // The real-JDK `java.io.Console.<clinit>` calls `istty()` to detect a
-    // controlling terminal. RustJVM has no JNI binding for this (and we are
+    // controlling terminal. CratonVM has no JNI binding for this (and we are
     // never a TTY anyway — stdin is always non-interactive in our embedding),
     // so the missing native dispatch in `vm_exec` raises an
     // `UnsatisfiedLinkError` that gets swallowed at <clinit>. Returning
@@ -1912,7 +1912,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_surefire_forkedbooter_exit1,
     );
     // Surefire's Java `lookupDecoderFactory()` picks a provider only when
-    // `canUse(connectionString)` returns true. On rustjvm bootstrap runs the
+    // `canUse(connectionString)` returns true. On cratonvm bootstrap runs the
     // connection string can be transiently null/partially materialized, which
     // leaves both built-in providers rejected and `channelProcessorFactory`
     // null. Force both built-ins to accept the bootstrap connection string.
@@ -2380,7 +2380,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let index = match args.first() { Some(Value::Int(v)) => *v, _ => 0 };
         let length = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
         if index < 0 || index >= length {
-            Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                 index: index,
             }.into())
         } else {
@@ -2393,7 +2393,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let index = match args.first() { Some(Value::Int(v)) => *v, _ => 0 };
         let length = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
         if index < 0 || index >= length {
-            Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                 index: index,
             }.into())
         } else {
@@ -2407,7 +2407,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let to = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
         let length = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
         if from < 0 || from > to || to > length {
-            Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                 index: from,
             }.into())
         } else {
@@ -2420,7 +2420,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let to = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
         let length = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
         if from < 0 || from > to || to > length {
-            Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                 index: from,
             }.into())
         } else {
@@ -2434,7 +2434,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let size = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
         let length = match args.get(2) { Some(Value::Int(v)) => *v, _ => 0 };
         if from < 0 || size < 0 || from + size > length {
-            Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                 index: from,
             }.into())
         } else {
@@ -2740,7 +2740,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Public-name `Class.forName` overloads. In stock OpenJDK these are
     // Java methods that forward to `forName0`; in synthetic-jdk mode the
     // bridge in `register_synthetic_overrides` registers the same set.
-    // Promote them to essential so default-built rust-jvm (no
+    // Promote them to essential so default-built cratonvm (no
     // `synthetic-jdk` feature) still resolves them — needed by
     // `bench/wave2-4` instrument probe's `RetransformAgent.premain` and
     // generally by any agent / DI framework that calls `Class.forName(...)`.
@@ -2925,7 +2925,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `ApplicationConversionService.<clinit>` (and is reproducible with a
     // 5-line program that just touches `ArrayList.class.getGenericInterfaces()`).
     // Our natives parse the Signature attribute via
-    // `rustjvm_reader::signature` and build the synthetic
+    // `cratonvm_reader::signature` and build the synthetic
     // `ParameterizedType` / `Class` mirror tree directly, side-stepping
     // the broken JDK parse path entirely. The matching `check_override`
     // entry in `vm_exec.rs` lets these natives take precedence over the
@@ -3058,7 +3058,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // JDK `Class` mirrors often lack a reverse-map entry early in boot;
         // Spring Boot 3.2's loader calls `Archive.create(Launcher.class)` and
         // needs a non-null `CodeSource`. Fall back to the first `java.class.path`
-        // entry (the executable JAR for `rustjvm --jar …`).
+        // entry (the executable JAR for `cratonvm --jar …`).
         let path_opt = path_opt.or_else(|| {
             ctx.get_system_property("java.class.path").and_then(|cp| {
                 let sep = if cfg!(windows) { ';' } else { ':' };
@@ -3160,7 +3160,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/security/CodeSource", "getCertificates", "()[Ljava/security/cert/Certificate;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
-            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+            ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
         ))))
     });
     // URL.getPath() — prefer real-JDK 13-field layout (path@6, file@3,
@@ -3517,7 +3517,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let obj = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 Some(Value::Object(None)) => {
-                    return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                         message: Some("Thread.holdsLock(null)".to_string()),
                     }
                     .into());
@@ -3587,9 +3587,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let len = ctx.array_length(input_arr);
-        let outer = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+        let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         for i in 0..len {
-            let inner = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let inner = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_array_element(outer, i, Value::Object(Some(inner)));
         }
         Ok(Some(Value::Object(Some(outer))))
@@ -3597,7 +3597,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Thread", "getThreads", "()[Ljava/lang/Thread;", |ctx, _args| {
         // Return all live thread objects via the VM's enumerate_threads API.
         let threads = ctx.enumerate_threads(usize::MAX);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, threads.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, threads.len());
         for (i, t) in threads.into_iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(t)));
         }
@@ -3688,7 +3688,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     //   * 3 — after `System.initPhase2()` completes,
     //   * 4 — right before `main()` runs.
     // The vm-cli bootstrap path drives transitions via
-    // `rustjvm_native_api::init_level::set_init_level`.
+    // `cratonvm_native_api::init_level::set_init_level`.
     // Level <2 routes `ClassLoader.getSystemClassLoader()` through
     // `getBuiltinAppClassLoader()` which reads `ClassLoaders.APP_LOADER`
     // (populated by `ClassLoaders.<clinit>`).  Levels 3/4 route through
@@ -3707,7 +3707,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // only care "is the VM up enough to look at properties"; real
         // callers gated on initPhase3 still see the accurate higher
         // level once the bootstrap advances.
-        let live = rustjvm_native_api::init_level::get_init_level();
+        let live = cratonvm_native_api::init_level::get_init_level();
         Ok(Some(Value::Int(live.max(2))))
     });
     // WP1.3: awaitInitLevel(int) blocks on the process-wide condvar
@@ -3728,7 +3728,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) => *n,
                 _ => 0,
             };
-            rustjvm_native_api::init_level::await_init_level(target);
+            cratonvm_native_api::init_level::await_init_level(target);
             Ok(None)
         },
     );
@@ -4062,7 +4062,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let exec = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
-                    return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                         message: Some(
                             "ReflectionFactory.getExecutableSharedParameterTypes: executable is null"
                                 .to_string(),
@@ -4084,7 +4084,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/reflect/Executable;)[B",
         |ctx, _args| {
             Ok(Some(Value::Object(Some(
-                ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0),
+                ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
             ))))
         },
     );
@@ -4236,7 +4236,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // subsequent Method.invoke / Field.get/set / Constructor.newInstance
     // see the access override (otherwise CGLib's reflective
     // ClassLoader.defineClass call fails with IllegalAccessException).
-    // Also write the RustJVM extra-slot accessible flag for paths that
+    // Also write the CratonVM extra-slot accessible flag for paths that
     // consult it directly.
     fn native_set_accessible_write_override(
         ctx: &mut dyn NativeContext,
@@ -4365,7 +4365,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) if *v > 0 => *v as usize,
             _ => 0usize,
         };
-        let backing = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        let backing = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
         ctx.set_field_by_name(this, "elementData", Value::Object(Some(backing)));
         ctx.set_field_by_name(this, "size", Value::Int(0));
         Ok(None)
@@ -4647,7 +4647,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/util/logging/Logger", "addHandler", "(Ljava/util/logging/Handler;)V", |_ctx, _args| Ok(None));
     registry.register("java/util/logging/Logger", "removeHandler", "(Ljava/util/logging/Handler;)V", |_ctx, _args| Ok(None));
     registry.register("java/util/logging/Logger", "getHandlers", "()[Ljava/util/logging/Handler;", |ctx, _args| {
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
@@ -4697,7 +4697,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "setHandlers",
         "([Ljava/util/logging/Handler;)[Ljava/util/logging/Handler;",
         |ctx, _args| {
-            use rustjvm_types::ArrayElementType;
+            use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
@@ -5338,7 +5338,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     // Spring Boot loader calls `URL.setURLStreamHandlerFactory` very early.
     // Full `register_net_natives` is not always on the minimal classpath
-    // ordering that `rustjvm-cli` uses before linkage runs.
+    // ordering that `cratonvm-cli` uses before linkage runs.
     registry.register(
         "java/net/URL",
         "setURLStreamHandlerFactory",
@@ -5360,10 +5360,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     //   0=name, 1=specTitle, 2=specVersion, 3=specVendor,
     //   4=implTitle, 5=implVersion, 6=implVendor.
     let pkg_cls = "java/lang/Package";
-    fn pkg_obj_arg(args: &[Value]) -> Result<rustjvm_types::ObjectRef, rustjvm_types::error::RuntimeError> {
+    fn pkg_obj_arg(args: &[Value]) -> Result<cratonvm_types::ObjectRef, cratonvm_types::error::RuntimeError> {
         match args.first() {
             Some(Value::Object(Some(o))) => Ok(*o),
-            _ => Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Package method called on null".to_string()),
             }),
         }
@@ -5651,7 +5651,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             buf,
             "session",
             "()Ljdk/internal/foreign/MemorySessionImpl;",
-            |_ctx, _args| Ok(Some(rustjvm_types::Value::Object(None))),
+            |_ctx, _args| Ok(Some(cratonvm_types::Value::Object(None))),
         );
         registry.register(buf, "checkSession", "()V", |_ctx, _args| Ok(None));
     }
@@ -5821,7 +5821,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     fn alloc_synth_timezone(
         ctx: &mut dyn NativeContext,
         id_str: &str,
-    ) -> rustjvm_types::Value {
+    ) -> cratonvm_types::Value {
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
         // caller only needs an object whose `getID()` returns id_str.
@@ -5829,7 +5829,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(c) => c,
             Err(_) => match ctx.ensure_class_initialized("java/util/TimeZone") {
                 Ok(c) => c,
-                Err(_) => return rustjvm_types::Value::Object(None),
+                Err(_) => return cratonvm_types::Value::Object(None),
             },
         };
         // Field count: be generous (16) to cover both TimeZone (ID) and
@@ -5843,7 +5843,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         ctx.set_field_by_name(obj, "rawOffset", Value::Int(0));
         ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
         ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
-        rustjvm_types::Value::Object(Some(obj))
+        cratonvm_types::Value::Object(Some(obj))
     }
 
     registry.register(
@@ -6229,7 +6229,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
             };
             let total = ctx.array_length(arr);
             if from > to || to > total {
-                return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                     index: to as i32,
                 }
                 .into());
@@ -6752,9 +6752,9 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             let locale = match args.get(2) {
                 Some(Value::Object(Some(l))) => *l,
                 _ => {
-                    return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                        rustjvm_types::error::VmError::Runtime(
-                            rustjvm_types::error::RuntimeError::NullPointerException {
+                    return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                        cratonvm_types::error::VmError::Runtime(
+                            cratonvm_types::error::RuntimeError::NullPointerException {
                                 message: Some(
                                     "ResourceBundle$Control.getCandidateLocales: locale is null"
                                         .to_string(),
@@ -6891,7 +6891,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             let _map = args.get(1).copied().unwrap_or(Value::Object(None));
             let cap = 16usize;
             let set = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-            let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+            let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
             for i in 0..cap {
                 ctx.set_array_element(buckets, i, Value::Object(None));
             }
@@ -7692,8 +7692,8 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
-    // --- rustjvm/VirtualThreadTest native helpers (Session 25) ---
-    let vt_test = "rustjvm/VirtualThreadTest";
+    // --- cratonvm/VirtualThreadTest native helpers (Session 25) ---
+    let vt_test = "cratonvm/VirtualThreadTest";
     // startVirtualThread(Runnable) -> Thread — creates and starts a virtual thread
     registry.register(
         vt_test,
@@ -8876,7 +8876,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     register_reflect_proxy_natives(registry);
 
     // --- java.lang.reflect.AccessibleObject ---
-    // setAccessible — instance setter; RustJVM's reflection layer
+    // setAccessible — instance setter; CratonVM's reflection layer
     // ignores the accessible flag (all reflection is effectively
     // `setAccessible(true)` already, matching JEP 403 relaxation).
     // NEW-6: documented intentional no-op.
@@ -8896,25 +8896,25 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // --- Test harness: tempPrint ---
     // Used by integration tests to capture output without needing full I/O.
     registry.register(
-        "rustjvm/test/Util",
+        "cratonvm/test/Util",
         "tempPrint",
         "(I)V",
         native_temp_print_int,
     );
     registry.register(
-        "rustjvm/test/Util",
+        "cratonvm/test/Util",
         "tempPrint",
         "(Ljava/lang/String;)V",
         native_temp_print_string,
     );
     registry.register(
-        "rustjvm/Util",
+        "cratonvm/Util",
         "tempPrint",
         "(I)V",
         native_temp_print_int,
     );
     registry.register(
-        "rustjvm/Util",
+        "cratonvm/Util",
         "tempPrint",
         "(Ljava/lang/String;)V",
         native_temp_print_string,
@@ -9304,7 +9304,7 @@ fn native_lazy_launcher_discover(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use rustjvm_types::error::RuntimeError;
+    use cratonvm_types::error::RuntimeError;
 
     const LAZY: &str = "org/apache/maven/surefire/junitplatform/LazyLauncher";
     const FACTORY: &str = "org/junit/platform/launcher/core/LauncherFactory";
@@ -9332,8 +9332,8 @@ fn native_lazy_launcher_discover(
     };
 
     let materialize_from_factory = |ctx: &mut dyn NativeContext| -> Result<
-        rustjvm_types::ObjectRef,
-        rustjvm_types::error::MethodCallFailed,
+        cratonvm_types::ObjectRef,
+        cratonvm_types::error::MethodCallFailed,
     > {
         match ctx.invoke(FACTORY, "create", DESC_GET, &[]) {
             Ok(Some(Value::Object(Some(d)))) => Ok(d),
@@ -9367,7 +9367,7 @@ fn native_test_plan_scanner_filter_accept(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use rustjvm_types::error::RuntimeError;
+    use cratonvm_types::error::RuntimeError;
 
     const BUILDER: &str = "org/junit/platform/launcher/core/LauncherDiscoveryRequestBuilder";
     const SELECTORS: &str = "org/junit/platform/engine/discovery/DiscoverySelectors";
@@ -9555,7 +9555,7 @@ fn native_surefire_properties_wrapper_get_property_1(
     };
     let map_field = ctx.get_field_by_name(this, "properties");
     if let Value::Object(Some(props_map)) = map_field {
-        match rustjvm_native_collections::native_map_get_pub(
+        match cratonvm_native_collections::native_map_get_pub(
             ctx,
             &[Value::Object(Some(props_map)), Value::Object(Some(key_obj))],
         ) {
@@ -9609,7 +9609,7 @@ fn native_surefire_properties_wrapper_get_property_2(
         _ => return Ok(Some(default)),
     };
     if let Value::Object(Some(props_map)) = ctx.get_field_by_name(this, "properties") {
-        if let Ok(Some(Value::Object(Some(v)))) = rustjvm_native_collections::native_map_get_pub(
+        if let Ok(Some(Value::Object(Some(v)))) = cratonvm_native_collections::native_map_get_pub(
             ctx,
             &[Value::Object(Some(props_map)), Value::Object(Some(key_obj))],
         ) {
@@ -9766,7 +9766,7 @@ fn native_surefire_system_property_manager_load_properties(
     // non-null Map. Use a HashMap (well-known to our natives) rather
     // than ConcurrentHashMap to keep the placeholder layout-stable.
     let placeholder = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8);
-    if let Ok(_) = rustjvm_native_collections::native_map_init(
+    if let Ok(_) = cratonvm_native_collections::native_map_init(
         ctx,
         &[Value::Object(Some(placeholder))],
     ) {}
@@ -9784,7 +9784,7 @@ fn native_surefire_system_property_manager_load_properties(
         // class name into `StartupConfiguration`.
         let k_obj = ctx.create_string(k);
         let v_obj = ctx.create_string(v);
-        let _ = rustjvm_native_collections::native_map_put_pub(
+        let _ = cratonvm_native_collections::native_map_put_pub(
             ctx,
             &[
                 Value::Object(Some(placeholder)),
@@ -9877,7 +9877,7 @@ fn native_forkedbooter_create_surefire_properties_if_file_exists(
         Ok(b) => b,
         Err(_) => return Ok(Some(Value::Object(None))),
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i32));
     }
@@ -10048,7 +10048,7 @@ fn native_surefire_forkedbooter_run(
             eprint_java_throwable(ctx, "setupBooter (first)", *exc);
         }
         // Surefire forks occasionally race during very early bootstrap in
-        // rustjvm shim mode (factory/connection state not fully materialized
+        // cratonvm shim mode (factory/connection state not fully materialized
         // yet). Retry setup once before taking the hard exit1() branch.
         let setup_retry = ctx.invoke_special(
             "org/apache/maven/surefire/booter/ForkedBooter",
@@ -10121,8 +10121,8 @@ fn native_surefire_forkedbooter_exit1(
         is_null(sc),
         is_null(ts),
     );
-    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
-        eprintln!("[SUREFIRE-EXIT] soft-returning due to RUSTJVM_SOFT_EXIT=1");
+    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+        eprintln!("[SUREFIRE-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
     std::process::exit(1);
@@ -10146,8 +10146,8 @@ fn native_surefire_forkedbooter_exit_code(
         is_null(ev),
         is_null(cr),
     );
-    if std::env::var("RUSTJVM_SOFT_EXIT").as_deref() == Ok("1") {
-        eprintln!("[SUREFIRE-EXIT] soft-returning due to RUSTJVM_SOFT_EXIT=1");
+    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+        eprintln!("[SUREFIRE-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
     std::process::exit(code);
@@ -10181,7 +10181,7 @@ pub(crate) fn platform_lib_name(name: &str) -> String {
     }
 }
 
-pub(crate) fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, rustjvm_types::error::MethodCallFailed> {
+pub(crate) fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => Ok(*o),
         _ => {
@@ -10190,13 +10190,13 @@ pub(crate) fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, rustjvm_t
             // frame at this point we cannot tell *which* native helper
             // is being invoked with a null.
             //
-            // When `RUSTJVM_DBG_NULL_NATIVE` is set, dump a Rust
+            // When `CRATONVM_DBG_NULL_NATIVE` is set, dump a Rust
             // backtrace + the offending arg index/length to stderr.
             // The topmost non-`obj_arg` frame names the native helper.
             // Gated so production NPEs stay quiet — Java code legally
             // throws NPE in many places (`HashMap.get(null)` etc.) and
             // we don't want to drown those in backtraces.
-            if std::env::var_os("RUSTJVM_DBG_NULL_NATIVE").is_some() {
+            if std::env::var_os("CRATONVM_DBG_NULL_NATIVE").is_some() {
                 eprintln!(
                     "[obj_arg] null at idx={} args.len={}\n{}",
                     idx,
@@ -10204,7 +10204,7 @@ pub(crate) fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, rustjvm_t
                     std::backtrace::Backtrace::force_capture()
                 );
             }
-            Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("null object argument".to_string()),
             }
             .into())
@@ -10213,8 +10213,8 @@ pub(crate) fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, rustjvm_t
 }
 
 pub(crate) fn native_not_implemented(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Err(rustjvm_types::error::MethodCallFailed::InternalError(
-        rustjvm_types::error::VmError::Runtime(rustjvm_types::error::RuntimeError::NotImplemented {
+    Err(cratonvm_types::error::MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::NotImplemented {
             feature: "native method not yet implemented".to_string(),
         }),
     ))
@@ -10229,7 +10229,7 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this = match args.first() {
         Some(Value::Object(Some(obj_ref))) => *obj_ref,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("hashCode on null".to_string()),
             }
             .into());
@@ -10243,7 +10243,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("getClass on null".to_string()),
             }
             .into());
@@ -10254,7 +10254,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // (e.g., "[I" for int[], "[Ljava/lang/String;" for String[]).
     // Primitive arrays use ClassId(0) + element_type; reference arrays store
     // the component ClassId in the header.
-    if ctx.heap_kind_of(this) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(this) == cratonvm_types::ObjectKind::Array {
         let class_id = ctx.class_id_of_object(this);
         let element_type = ctx.heap_element_type_of(this);
         // Primitive-array type-name constants — `&'static str` so the eight
@@ -10275,15 +10275,15 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // either uniformly to `class_id_by_name` / `load_class` /
         // `primitive_class_mirror` without an extra copy.
         let array_class_name: std::borrow::Cow<'static, str> = match element_type {
-            rustjvm_types::ArrayElementType::Boolean => std::borrow::Cow::Borrowed(ARRAY_BOOLEAN),
-            rustjvm_types::ArrayElementType::Char    => std::borrow::Cow::Borrowed(ARRAY_CHAR),
-            rustjvm_types::ArrayElementType::Float   => std::borrow::Cow::Borrowed(ARRAY_FLOAT),
-            rustjvm_types::ArrayElementType::Double  => std::borrow::Cow::Borrowed(ARRAY_DOUBLE),
-            rustjvm_types::ArrayElementType::Byte    => std::borrow::Cow::Borrowed(ARRAY_BYTE),
-            rustjvm_types::ArrayElementType::Short   => std::borrow::Cow::Borrowed(ARRAY_SHORT),
-            rustjvm_types::ArrayElementType::Int     => std::borrow::Cow::Borrowed(ARRAY_INT),
-            rustjvm_types::ArrayElementType::Long    => std::borrow::Cow::Borrowed(ARRAY_LONG),
-            rustjvm_types::ArrayElementType::Reference => {
+            cratonvm_types::ArrayElementType::Boolean => std::borrow::Cow::Borrowed(ARRAY_BOOLEAN),
+            cratonvm_types::ArrayElementType::Char    => std::borrow::Cow::Borrowed(ARRAY_CHAR),
+            cratonvm_types::ArrayElementType::Float   => std::borrow::Cow::Borrowed(ARRAY_FLOAT),
+            cratonvm_types::ArrayElementType::Double  => std::borrow::Cow::Borrowed(ARRAY_DOUBLE),
+            cratonvm_types::ArrayElementType::Byte    => std::borrow::Cow::Borrowed(ARRAY_BYTE),
+            cratonvm_types::ArrayElementType::Short   => std::borrow::Cow::Borrowed(ARRAY_SHORT),
+            cratonvm_types::ArrayElementType::Int     => std::borrow::Cow::Borrowed(ARRAY_INT),
+            cratonvm_types::ArrayElementType::Long    => std::borrow::Cow::Borrowed(ARRAY_LONG),
+            cratonvm_types::ArrayElementType::Reference => {
                 // Component class_id is stored in the array header
                 let comp_name = ctx.class_name_of_id(class_id)
                     .unwrap_or_else(|| "java/lang/Object".to_string());
@@ -10371,7 +10371,7 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("toString on null".to_string()),
             }
             .into());
@@ -10407,7 +10407,7 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("clone on null".to_string()),
             }
             .into());
@@ -10415,14 +10415,14 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let class_id = ctx.class_id_of_object(this);
     let kind = ctx.heap_kind_of(this);
-    if std::env::var_os("RUSTJVM_DBG_CLONE").is_some() {
+    if std::env::var_os("CRATONVM_DBG_CLONE").is_some() {
         let name = ctx
             .class_name_of_id(class_id)
             .unwrap_or_else(|| "<unknown>".to_string());
         eprintln!("[DBG_CLONE] kind={:?} class={}", kind, name);
     }
     match kind {
-        rustjvm_types::ObjectKind::Object => {
+        cratonvm_types::ObjectKind::Object => {
             let num_fields = ctx.object_num_fields(this);
             let clone_ref = ctx.alloc_object(class_id, num_fields);
             for i in 0..num_fields {
@@ -10442,7 +10442,7 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             loop {
                 match ctx.class_name_of_id(cur) {
                     Some(n) if n == "java/util/LinkedHashMap" => {
-                        rustjvm_native_collections::clone_lhm_overlay(this, clone_ref);
+                        cratonvm_native_collections::clone_lhm_overlay(this, clone_ref);
                         break;
                     }
                     Some(n) if n == "java/lang/Object" => break,
@@ -10455,10 +10455,10 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             }
             Ok(Some(Value::Object(Some(clone_ref))))
         }
-        rustjvm_types::ObjectKind::Array => {
+        cratonvm_types::ObjectKind::Array => {
             let len = ctx.array_length(this);
             let et = ctx.heap_element_type_of(this);
-            let clone = if et == rustjvm_types::ArrayElementType::Reference {
+            let clone = if et == cratonvm_types::ArrayElementType::Reference {
                 ctx.new_ref_array(class_id, len)
             } else {
                 ctx.new_array(et, len)
@@ -10473,8 +10473,8 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         // sentinel that should never reach the Object.clone() path.
         // If it ever does, treat it as an NPE rather than silently
         // returning a clone of garbage.
-        rustjvm_types::ObjectKind::HumongousFiller => Err(
-            rustjvm_types::error::RuntimeError::NullPointerException {
+        cratonvm_types::ObjectKind::HumongousFiller => Err(
+            cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some(
                     "clone on humongous-continuation filler (GC sentinel)".to_string(),
                 ),
@@ -10583,13 +10583,13 @@ fn native_object_wait_timeout_nanos(
         _ => 0,
     };
     if millis < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Object.wait: timeout value is negative".to_string(),
         }
         .into());
     }
     if !(0..=999_999).contains(&nanos) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "Object.wait: nanosecond timeout value out of range".to_string(),
         }
         .into());
@@ -11047,7 +11047,7 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 if !wrote_string {
                     let bytes = text.as_bytes();
                     let arr =
-                        ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+                        ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
                     for (i, b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
                     }
@@ -11184,18 +11184,18 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
 const UUID_FIELD_MSB: usize = 0;
 const UUID_FIELD_LSB: usize = 1;
 
-fn uuid_set_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef, v: i64) {
+fn uuid_set_msb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef, v: i64) {
     ctx.set_field_by_name(obj, "mostSigBits", Value::Long(v));
     // Best-effort fallback for synthetic-jdk layout where the natives use indices 0/1.
     ctx.set_field(obj, UUID_FIELD_MSB, Value::Long(v));
 }
 
-fn uuid_set_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef, v: i64) {
+fn uuid_set_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef, v: i64) {
     ctx.set_field_by_name(obj, "leastSigBits", Value::Long(v));
     ctx.set_field(obj, UUID_FIELD_LSB, Value::Long(v));
 }
 
-fn uuid_get_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i64 {
+fn uuid_get_msb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> i64 {
     if let Value::Long(v) = ctx.get_field_by_name(obj, "mostSigBits") {
         if v != 0 { return v; }
     }
@@ -11205,7 +11205,7 @@ fn uuid_get_msb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i
     }
 }
 
-fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i64 {
+fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> i64 {
     if let Value::Long(v) = ctx.get_field_by_name(obj, "leastSigBits") {
         if v != 0 { return v; }
     }
@@ -11215,10 +11215,10 @@ fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: rustjvm_types::ObjectRef) -> i
     }
 }
 
-fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> rustjvm_types::ObjectRef {
+fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> cratonvm_types::ObjectRef {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(class_id, 2);
     uuid_set_msb(ctx, obj, msb);
@@ -11276,7 +11276,7 @@ fn native_uuid_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // Parse UUID format: 8-4-4-4-12 hex
     let hex: String = s.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("Invalid UUID string: {s}"),
         }
         .into());
@@ -12030,20 +12030,20 @@ pub(crate) fn unsafe_offset(args: &[Value], pos: usize) -> usize {
 /// pass raw indices like 0, 1, 2 directly).
 pub(crate) fn unsafe_array_index_from_offset(
     ctx: &dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
+    obj: cratonvm_types::ObjectRef,
     offset: usize,
 ) -> usize {
     let len = ctx.array_length(obj);
     let scale = match ctx.heap_element_type_of(obj) {
-        rustjvm_types::ArrayElementType::Boolean
-        | rustjvm_types::ArrayElementType::Byte => 1usize,
-        rustjvm_types::ArrayElementType::Char
-        | rustjvm_types::ArrayElementType::Short => 2usize,
-        rustjvm_types::ArrayElementType::Int
-        | rustjvm_types::ArrayElementType::Float => 4usize,
-        rustjvm_types::ArrayElementType::Long
-        | rustjvm_types::ArrayElementType::Double
-        | rustjvm_types::ArrayElementType::Reference => 8usize,
+        cratonvm_types::ArrayElementType::Boolean
+        | cratonvm_types::ArrayElementType::Byte => 1usize,
+        cratonvm_types::ArrayElementType::Char
+        | cratonvm_types::ArrayElementType::Short => 2usize,
+        cratonvm_types::ArrayElementType::Int
+        | cratonvm_types::ArrayElementType::Float => 4usize,
+        cratonvm_types::ArrayElementType::Long
+        | cratonvm_types::ArrayElementType::Double
+        | cratonvm_types::ArrayElementType::Reference => 8usize,
     };
     // ABASE is 16 in `native_unsafe_array_base_offset`; matching JDK layout.
     const ABASE: usize = 16;
@@ -12068,7 +12068,7 @@ pub(crate) fn unsafe_array_index_from_offset(
 }
 
 /// Extract the object from args at the given position.
-pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<rustjvm_types::ObjectRef> {
+pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<cratonvm_types::ObjectRef> {
     match args.get(pos) {
         Some(Value::Object(Some(obj))) => Some(*obj),
         _ => None,
@@ -12139,8 +12139,8 @@ fn static_int_store() -> &'static UnsafeShardedMap<usize, i32> {
     T.get_or_init(new_unsafe_sharded_map)
 }
 
-fn static_obj_store() -> &'static UnsafeShardedMap<usize, Option<rustjvm_types::ObjectRef>> {
-    static T: std::sync::OnceLock<UnsafeShardedMap<usize, Option<rustjvm_types::ObjectRef>>> =
+fn static_obj_store() -> &'static UnsafeShardedMap<usize, Option<cratonvm_types::ObjectRef>> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, Option<cratonvm_types::ObjectRef>>> =
         std::sync::OnceLock::new();
     T.get_or_init(new_unsafe_sharded_map)
 }
@@ -12198,7 +12198,7 @@ pub(crate) fn is_synthetic_offset(off: usize) -> bool {
 /// reuse forever" pattern stays consistent.
 ///
 /// Perf note: the key type is `(Arc<str>, Arc<str>)` interned via
-/// `rustjvm_types::intern_arc` so repeat lookups perform zero heap
+/// `cratonvm_types::intern_arc` so repeat lookups perform zero heap
 /// allocations (the string pool returns an existing Arc on hit).  The
 /// map is sharded across `UNSAFE_SHARDS` parking_lot mutexes to avoid
 /// the single-mutex contention point under concurrent <clinit> traffic.
@@ -12213,8 +12213,8 @@ fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
     // first-time miss allocates once and is amortised across the lifetime
     // of the JIT/class-loader state that derives these names.
     let key: Key = (
-        rustjvm_types::intern_arc(class_name),
-        rustjvm_types::intern_arc(field_name),
+        cratonvm_types::intern_arc(class_name),
+        cratonvm_types::intern_arc(field_name),
     );
     let shard_idx = unsafe_shard_of(&key);
     let mut map = shards[shard_idx].lock();
@@ -12254,7 +12254,7 @@ fn synthetic_field_store()
 
 pub(crate) fn synthetic_get(
     ctx: &mut dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
+    obj: cratonvm_types::ObjectRef,
     offset: usize,
 ) -> Value {
     // Round-9 Bug 7: identity hash is GC-stable; raw pointer is not.
@@ -12267,7 +12267,7 @@ pub(crate) fn synthetic_get(
 
 pub(crate) fn synthetic_put(
     ctx: &mut dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
+    obj: cratonvm_types::ObjectRef,
     offset: usize,
     val: Value,
 ) {
@@ -12281,7 +12281,7 @@ pub(crate) fn synthetic_put(
 /// raw bit pattern (Object identity for refs, value for primitives).
 pub(crate) fn synthetic_cas(
     ctx: &mut dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
+    obj: cratonvm_types::ObjectRef,
     offset: usize,
     expected: Value,
     new_val: Value,
@@ -12331,12 +12331,12 @@ pub(crate) fn synthetic_cas(
 // lookup and making the CAS loop livelock again. Identity hash is
 // GC-stable.
 fn class_atomic_side_store()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(i32, u8), Option<rustjvm_types::ObjectRef>>>
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<(i32, u8), Option<cratonvm_types::ObjectRef>>>
 {
     // Key: (Class mirror identity hash, slot tag). Tag distinguishes the
     // three slots (reflectionData=0, annotationType=1, annotationData=2).
     static T: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<(i32, u8), Option<rustjvm_types::ObjectRef>>>,
+        parking_lot::Mutex<rustc_hash::FxHashMap<(i32, u8), Option<cratonvm_types::ObjectRef>>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -12516,7 +12516,7 @@ fn native_unsafe_object_field_offset(
     args: &[Value],
 ) -> MethodCallResult {
     // args[0] = Unsafe this, args[1] = Field object.
-    // Use read_field_meta so the slot index is read from the RustJVM
+    // Use read_field_meta so the slot index is read from the CratonVM
     // extra-metadata slot (the JDK `slot` field has different semantics
     // and won't match our heap offsets).
     if let Some(Value::Object(Some(field_obj))) = args.get(1) {
@@ -12575,7 +12575,7 @@ fn native_unsafe_object_field_offset(
                         let mut g = seen.lock().unwrap_or_else(|e| e.into_inner());
                         if g.insert((cname.clone(), field_name.clone())) {
                             tracing::info!(
-                                target: "rustjvm::unsafe",
+                                target: "cratonvm::unsafe",
                                 "objectFieldOffset(Field): class={cname:?} field={field_name:?} \
                                  rj_slot=0 → resolved via declared_fields walk to slot={s}"
                             );
@@ -12686,7 +12686,7 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
         let ok = synthetic_cas(ctx, obj, offset, expected, new_val);
         return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // Route through the locked CAS path so concurrent threads can't
         // interleave inside the load+compare+store. See the matching note
         // in `native_unsafe_cas_object` above.
@@ -12721,7 +12721,7 @@ pub(crate) fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]
         let ok = synthetic_cas(ctx, obj, offset, expected, new_val);
         return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // Route through the locked CAS path. See `native_unsafe_cas_object`.
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
@@ -12779,7 +12779,7 @@ pub(crate) fn recover_object_arg(value: Value) -> Value {
                 // and does not dereference the address until a later heap
                 // access validates it.
                 Value::Object(Some(unsafe {
-                    rustjvm_types::ObjectRef::from_raw(bits as usize as *mut u8)
+                    cratonvm_types::ObjectRef::from_raw(bits as usize as *mut u8)
                 }))
             } else {
                 Value::Object(None)
@@ -12828,7 +12828,7 @@ pub(crate) fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Valu
     // bin-list head installs. Pre-converting the byte offset to an element
     // index keeps the contract: `compare_and_swap_field` reuses the second
     // arg directly when `is_array` is true.
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
         return Ok(Some(Value::Int(if result { 1 } else { 0 })));
@@ -12852,7 +12852,7 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
             _ => Value::Int(0),
         }));
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
     } else {
@@ -12875,7 +12875,7 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
         synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
     } else {
@@ -12903,7 +12903,7 @@ fn native_unsafe_get_long_volatile(
             _ => Value::Long(0),
         }));
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
     } else {
@@ -12929,7 +12929,7 @@ fn native_unsafe_put_long_volatile(
         synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
     } else {
@@ -12953,7 +12953,7 @@ fn native_unsafe_get_object_volatile(
     if is_synthetic_offset(offset) {
         return Ok(Some(recover_object_arg(synthetic_get(ctx, obj, offset))));
     }
-    let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
     } else {
@@ -12983,7 +12983,7 @@ fn native_unsafe_put_object_volatile(
         synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
     } else {
@@ -13004,7 +13004,7 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
     if is_synthetic_offset(offset) {
         return Ok(Some(recover_object_arg(synthetic_get(ctx, obj, offset))));
     }
-    let val = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
     } else {
@@ -13029,7 +13029,7 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
         synthetic_put(ctx, obj, offset, val);
         return Ok(None);
     }
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
     } else {
@@ -13047,7 +13047,7 @@ pub(crate) fn native_unsafe_get_int(ctx: &mut dyn NativeContext, args: &[Value])
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         Ok(Some(ctx.get_array_element(obj, idx)))
     } else {
@@ -13066,7 +13066,7 @@ pub(crate) fn native_unsafe_put_int(ctx: &mut dyn NativeContext, args: &[Value])
             return Ok(None);
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
     } else {
@@ -13089,7 +13089,7 @@ pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
-    let v = if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    let v = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
     } else {
@@ -13115,7 +13115,7 @@ pub(crate) fn native_unsafe_put_long(ctx: &mut dyn NativeContext, args: &[Value]
             return Ok(None);
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.set_array_element(obj, idx, val);
     } else {
@@ -13134,7 +13134,7 @@ fn native_unsafe_allocate_instance(
         let cid_opt = ctx
             .class_id_from_mirror(*class_obj)
             .or_else(|| match ctx.get_field(*class_obj, 0) {
-                Value::Int(cid) if cid >= 0 => Some(rustjvm_types::ClassId::new(cid as u32)),
+                Value::Int(cid) if cid >= 0 => Some(cratonvm_types::ClassId::new(cid as u32)),
                 _ => None,
             });
         if let Some(class_id) = cid_opt {
@@ -13220,7 +13220,7 @@ pub(crate) fn native_unsafe_get_and_add_int(ctx: &mut dyn NativeContext, args: &
             return Ok(Some(Value::Int(old)));
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let current = ctx.get_array_element(obj, idx);
         if let Value::Int(old) = current {
@@ -13260,7 +13260,7 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             return Ok(Some(Value::Int(prev)));
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let prev = ctx.get_array_element(obj, idx);
         ctx.set_array_element(obj, idx, new_val);
@@ -13347,7 +13347,7 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Long(old)));
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let current = ctx.get_array_element(obj, idx);
         if let Value::Long(old) = current {
@@ -13385,7 +13385,7 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Long(prev)));
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let prev = ctx.get_array_element(obj, idx);
         ctx.set_array_element(obj, idx, new_val);
@@ -13415,7 +13415,7 @@ fn native_unsafe_get_and_set_object(ctx: &mut dyn NativeContext, args: &[Value])
             return Ok(Some(Value::Object(prev)));
         }
     };
-    if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = unsafe_array_index_from_offset(ctx, obj, offset);
         let prev = ctx.get_array_element(obj, idx);
         ctx.set_array_element(obj, idx, new_val);
@@ -13817,10 +13817,10 @@ fn native_unsafe_object_field_offset1(
     // ObjectRef), so we go through the reverse-map registered when the
     // mirror is allocated. The synthetic-jdk path keeps slot 0 = Int(cid)
     // and is handled by the fallback below.
-    let resolved_cid: Option<rustjvm_types::ClassId> = ctx
+    let resolved_cid: Option<cratonvm_types::ClassId> = ctx
         .class_id_from_mirror(class_mirror)
         .or_else(|| match ctx.get_field(class_mirror, 0) {
-            Value::Int(cid) => Some(rustjvm_types::ClassId::new(cid as u32)),
+            Value::Int(cid) => Some(cratonvm_types::ClassId::new(cid as u32)),
             _ => None,
         });
     if let Some(class_id) = resolved_cid {
@@ -13883,7 +13883,7 @@ fn native_unsafe_object_field_offset1(
         .unwrap_or_default();
     let synthetic = synthetic_offset_for(&cname, &field_name);
     tracing::warn!(
-        target: "rustjvm::unsafe",
+        target: "cratonvm::unsafe",
         "objectFieldOffset1: field {field_name:?} not found on class {cname:?} — minting synthetic offset {synthetic:#x} (CAS routed via side store)"
     );
     Ok(Some(Value::Long(synthetic as i64)))
@@ -14339,7 +14339,7 @@ fn register_atomic_long_natives(r: &mut NativeMethodRegistry) {
 /// compare-exchange on every 64-bit target (tier-1 and tier-2). `cmpxchg16b`
 /// advertises a 128-bit CAS on x86-64 and implies the narrower 64-bit CAS as
 /// well. 32-bit hosts that genuinely lack an 8-byte CAS (e.g. ARM v6 without
-/// LDREXD/STREXD, SPARC v8) fall through to `false`; rustjvm ships only
+/// LDREXD/STREXD, SPARC v8) fall through to `false`; cratonvm ships only
 /// 64-bit targets so in practice this always answers `true`.
 ///
 /// Zero args, no side effects, no panics.
@@ -14788,7 +14788,7 @@ fn native_objects_require_non_null(
 ) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(None)) | None => {
-            Err(rustjvm_types::error::RuntimeError::NullPointerException { message: None }.into())
+            Err(cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into())
         }
         Some(val) => Ok(Some(*val)),
     }
@@ -14804,7 +14804,7 @@ fn native_objects_require_non_null_msg(
                 Some(Value::Object(Some(s))) => ctx.read_string(*s),
                 _ => None,
             };
-            Err(rustjvm_types::error::RuntimeError::NullPointerException { message: msg }.into())
+            Err(cratonvm_types::error::RuntimeError::NullPointerException { message: msg }.into())
         }
         Some(val) => Ok(Some(*val)),
     }
@@ -15166,13 +15166,13 @@ fn fancy_splitn(r: &fancy_regex::Regex, text: &str, limit: usize) -> Vec<String>
 pub(crate) fn compile_java_regex(
     pattern: &str,
     flags: i32,
-) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
+) -> Result<JavaRegex, cratonvm_types::error::RuntimeError> {
     // LITERAL flag: treat pattern as a literal string (no regex metacharacters).
     if flags & JAVA_REGEX_LITERAL != 0 {
         let escaped = regex::escape(pattern);
         return regex::Regex::new(&escaped)
             .map(JavaRegex::Std)
-            .map_err(|e| rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            .map_err(|e| cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: format!("PatternSyntaxException: {e}"),
             });
     }
@@ -15205,7 +15205,7 @@ pub(crate) fn compile_java_regex(
     // Fallback: `fancy-regex` for lookaround/backrefs/etc.
     match fancy_regex::Regex::new(&full) {
         Ok(r) => Ok(JavaRegex::Fancy(Box::new(r))),
-        Err(e) => Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        Err(e) => Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("PatternSyntaxException: {e}"),
         }),
     }
@@ -15358,8 +15358,8 @@ fn utf8_char_len(b: u8) -> usize {
 /// Read the pattern source string + flags from a Pattern object and compile.
 pub(crate) fn read_pattern_regex(
     ctx: &mut dyn NativeContext,
-    pattern_obj: rustjvm_types::ObjectRef,
-) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
+    pattern_obj: cratonvm_types::ObjectRef,
+) -> Result<JavaRegex, cratonvm_types::error::RuntimeError> {
     let source = match ctx.get_field(pattern_obj, PAT_FIELD_SOURCE) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -15588,7 +15588,7 @@ fn native_pattern_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let pat_cid = ctx
         .class_id_by_name("java/util/regex/Pattern")
         .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
     let pat = ctx.alloc_object(pat_cid, n);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
@@ -15612,7 +15612,7 @@ fn native_pattern_compile_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let pat_cid = ctx
         .class_id_by_name("java/util/regex/Pattern")
         .or_else(|| ctx.ensure_class_initialized("java/util/regex/Pattern").ok())
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let n = ctx.class_num_total_fields(pat_cid).max(PAT_NUM_FIELDS);
     let pat = ctx.alloc_object(pat_cid, n);
     ctx.set_field(pat, PAT_FIELD_SOURCE, Value::Object(Some(source_obj)));
@@ -15636,7 +15636,7 @@ fn native_pattern_matcher(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let mat_cid = ctx
         .class_id_by_name("java/util/regex/Matcher")
         .or_else(|| ctx.ensure_class_initialized("java/util/regex/Matcher").ok())
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let n = ctx.class_num_total_fields(mat_cid).max(MAT_NUM_FIELDS);
     let mat = ctx.alloc_object(mat_cid, n);
     ctx.set_field(mat, MAT_FIELD_PATTERN, Value::Object(Some(this)));
@@ -15736,7 +15736,7 @@ fn native_pattern_split_impl(
 
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -15748,7 +15748,7 @@ fn native_pattern_split_impl(
 
 // --- Matcher natives ---
 
-fn matcher_read_input(ctx: &mut dyn NativeContext, mat: rustjvm_types::ObjectRef) -> String {
+fn matcher_read_input(ctx: &mut dyn NativeContext, mat: cratonvm_types::ObjectRef) -> String {
     match ctx.get_field(mat, MAT_FIELD_INPUT) {
         Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
         _ => String::new(),
@@ -15757,8 +15757,8 @@ fn matcher_read_input(ctx: &mut dyn NativeContext, mat: rustjvm_types::ObjectRef
 
 fn matcher_get_pattern(
     ctx: &mut dyn NativeContext,
-    mat: rustjvm_types::ObjectRef,
-) -> Option<rustjvm_types::ObjectRef> {
+    mat: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
     match ctx.get_field(mat, MAT_FIELD_PATTERN) {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -15882,7 +15882,7 @@ fn native_matcher_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let start = match ctx.get_field(this, MAT_FIELD_MATCH_START) {
         Value::Int(s) if s >= 0 => s as usize,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "No match found".to_string(),
             }
             .into());
@@ -15921,7 +15921,7 @@ fn native_matcher_group_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let start = match ctx.get_field(this, MAT_FIELD_MATCH_START) {
         Value::Int(s) if s >= 0 => s as usize,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "No match found".to_string(),
             }
             .into());
@@ -16370,7 +16370,7 @@ fn alloc_duration(ctx: &mut dyn NativeContext, seconds: i64, nanos: i32) -> Obje
 fn alloc_time_synthetic(ctx: &mut dyn NativeContext, class: &str, n: usize) -> ObjectRef {
     match ctx.ensure_class_initialized(class) {
         Ok(cid) => ctx.alloc_object(cid, n),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), n),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), n),
     }
 }
 
@@ -16519,7 +16519,7 @@ pub(crate) fn alloc_concurrent_synthetic(
             let n = num_fields.max(real);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), num_fields),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), num_fields),
     }
 }
 
@@ -16542,7 +16542,7 @@ pub(crate) fn build_real_layout_string_hashset(
     ctx: &mut dyn NativeContext,
     keys: &[ObjectRef],
 ) -> ObjectRef {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
 
     // Resolve real HashMap + HashMap$Node + HashSet field layout.
     let _ = ctx.ensure_class_initialized("java/util/HashMap");
@@ -16655,7 +16655,7 @@ pub(crate) fn build_real_layout_string_hashset(
     // Fallback: legacy synthetic-2-field (data_array, size) layout used by
     // older callers that don't go through the JDK spliterator/stream path.
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
     for (i, &k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(k)));
     }
@@ -16696,7 +16696,7 @@ pub(crate) fn build_real_layout_string_hashset(
 /// back-reference); native methods registered on `java/lang/System$1`
 /// read nothing from it.
 fn get_or_build_jla_shim(ctx: &mut dyn NativeContext) -> ObjectRef {
-    // Per-thread cache: because rustjvm's per-thread heap means a cached
+    // Per-thread cache: because cratonvm's per-thread heap means a cached
     // ObjectRef from another thread could be stale, we allocate a fresh
     // `System$1` each call. The backing class is shared, so every
     // returned object routes to the same `JavaLangAccess.*` natives —
@@ -16708,7 +16708,7 @@ fn get_or_build_jla_shim(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn native_shared_secrets_get_jla(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let shim = get_or_build_jla_shim(ctx);
     Ok(Some(Value::Object(Some(shim))))
 }
@@ -16717,7 +16717,7 @@ fn native_shared_secrets_get_jla(
 fn native_shared_secrets_misc_get_jla(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let shim = get_or_build_jla_shim(ctx);
     Ok(Some(Value::Object(Some(shim))))
 }
@@ -16728,7 +16728,7 @@ fn native_shared_secrets_misc_get_jla(
 fn native_jla_current_carrier_thread(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let thread_obj = ctx.current_thread_object();
     Ok(Some(Value::Object(Some(thread_obj))))
 }
@@ -17205,7 +17205,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/Set;",
         |ctx, _args| {
             // Return an empty HashSet via the existing helper.
-            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
             Ok(Some(Value::Object(Some(empty))))
         },
     );
@@ -17216,7 +17216,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         "findAll",
         "()Ljava/util/Set;",
         |ctx, _args| {
-            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
             Ok(Some(Value::Object(Some(empty))))
         },
     );
@@ -17252,7 +17252,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
     // concrete receiver class `jdk/internal/module/ModuleReferenceImpl`
     // directly (the dispatcher checks the receiver class FIRST before
     // walking parents).
-    let descriptor_native: rustjvm_native_api::NativeCallback = |ctx, args| {
+    let descriptor_native: cratonvm_native_api::NativeCallback = |ctx, args| {
         let this = match args.first().copied() {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(Some(Value::Object(None))),
@@ -17323,7 +17323,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
 //   6. `new Lookup(Object.class, null, 32)` → putstatic PUBLIC_LOOKUP
 //   7. `new ConcurrentHashMap()` → putstatic LOOKASIDE_TABLE
 //
-// Steps 2 and 3 were unregistered in rustjvm, which triggered the NPE
+// Steps 2 and 3 were unregistered in cratonvm, which triggered the NPE
 // on step 1's Set.of(Obj,Obj) returning null (because the 2-arg Set.of
 // overload was missing from `phases_early.rs`).
 //
@@ -17331,7 +17331,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
 //   - `Set.of` overloads for 2..=8 arguments and the varargs form,
 //     each returning a populated HashSet.
 //   - `Reflection.registerFieldsToFilter(Class, Set)` as a no-op (we do
-//     not enforce field-filter checks in rustjvm).
+//     not enforce field-filter checks in cratonvm).
 //   - `ClassFileDumper.getInstance(String, String)` returning a disabled
 //     dumper object (so downstream `dumper.isEnabled()` returns false).
 
@@ -17348,7 +17348,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
 /// backing-HashMap layout, matching `<init>()` / 0..3-arg `Set.of`
 /// behaviour and unblocking Spring `getConvertibleTypes()` paths.
 fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> ObjectRef {
-    rustjvm_native_collections::make_hashset_with_elements(ctx, args)
+    cratonvm_native_collections::make_hashset_with_elements(ctx, args)
 }
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
@@ -17787,7 +17787,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let (data, size) = cowal_read_state(ctx, this);
-        let out = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         if let Some(arr) = data {
             for i in 0..size {
                 ctx.set_array_element(out, i, ctx.get_array_element(arr, i));
@@ -17829,7 +17829,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let (data_opt, size) = cowal_read_state(ctx, this);
         // Copy into snapshot array (matches COWAL semantics: writes after
         // iterator creation do not affect what the iterator sees).
-        let snap = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         if let Some(data) = data_opt {
             for i in 0..size {
                 let elem = ctx.get_array_element(data, i);
@@ -17894,7 +17894,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 ctx.monitor_exit(this);
                 return Ok(Some(Value::Object(None)));
             }
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
             let mut old_val = Value::Object(None);
             if let Some(old) = old_arr {
                 for i in 0..size {
@@ -17916,7 +17916,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let elem = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.monitor_enter(this);
         let (old_arr, size) = cowal_read_state(ctx, this);
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
         if let Some(old) = old_arr {
             for i in 0..size {
                 ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -17943,7 +17943,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
                 }
             }
         }
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
         if let Some(old) = old_arr {
             for i in 0..size {
                 ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -17963,7 +17963,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
         let elem = args.get(2).copied().unwrap_or(Value::Object(None));
         ctx.monitor_enter(this);
         let (old_arr, size) = cowal_read_state(ctx, this);
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
         if let Some(old) = old_arr {
             for i in 0..idx.min(size) {
                 ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -17991,7 +17991,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             ctx.monitor_exit(this);
             return Ok(Some(Value::Object(None)));
         }
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size - 1);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
         let mut removed = Value::Object(None);
         if let Some(old) = old_arr {
             for i in 0..idx {
@@ -18025,7 +18025,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             }
         }
         if let Some(idx) = found_idx {
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size - 1);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size - 1);
             if let Some(old) = old_arr {
                 for i in 0..idx {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(old, i));
@@ -18048,7 +18048,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         ctx.monitor_enter(this);
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         cowal_write_array(ctx, this, new_arr);
         ctx.monitor_exit(this);
         Ok(None)
@@ -18277,7 +18277,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(i32::MAX));
@@ -18292,7 +18292,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => i32::MAX,
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap.min(64) as usize);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap.min(64) as usize);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(cap));
@@ -18303,7 +18303,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(i32::MAX));
@@ -18511,14 +18511,14 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
     registry.register(lbq, "toArray", "()[Ljava/lang/Object;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => { let e = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
+            _ => { let e = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
         };
         let size = match ctx.get_field(this, 1) { Value::Int(n) => n as usize, _ => 0 };
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
-            _ => { let e = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
+            _ => { let e = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
         };
-        let result = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         for i in 0..size { ctx.set_array_element(result, i, ctx.get_array_element(arr, i)); }
         Ok(Some(Value::Object(Some(result))))
     });
@@ -18537,7 +18537,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(iter))));
             }
         };
-        let snap = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         for i in 0..size { ctx.set_array_element(snap, i, ctx.get_array_element(arr, i)); }
         let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
         ctx.set_field(iter, 0, Value::Object(Some(snap)));
@@ -18581,7 +18581,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => (*v).max(1) as usize,
             _ => 16,
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -18596,7 +18596,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => (*v).max(1) as usize,
             _ => 16,
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(0));
@@ -18819,16 +18819,16 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
     registry.register(abq, "toArray", "()[Ljava/lang/Object;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => { let e = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
+            _ => { let e = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
         };
         let size = match ctx.get_field(this, 1) { Value::Int(n) => n, _ => 0 };
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
-            _ => { let e = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
+            _ => { let e = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0); return Ok(Some(Value::Object(Some(e)))); }
         };
         let cap = ctx.array_length(arr) as i32;
         let head = match ctx.get_field(this, 2) { Value::Int(n) => n, _ => 0 };
-        let result = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size as usize);
+        let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size as usize);
         for i in 0..size {
             let idx = ((head + i) % cap) as usize;
             ctx.set_array_element(result, i as usize, ctx.get_array_element(arr, idx));
@@ -18877,7 +18877,7 @@ fn m18_lbq_add_internal(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Valu
     let cap = ctx.array_length(arr);
     if size >= cap {
         let new_cap = (cap * 2).max(16);
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
         for i in 0..size { ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i)); }
         ctx.set_array_element(new_arr, size, elem);
         ctx.set_field(this, 0, Value::Object(Some(new_arr)));
@@ -18936,8 +18936,8 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let keys = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
-        let vals = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+        let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(this, 0, Value::Object(Some(keys)));
         ctx.set_field(this, 1, Value::Object(Some(vals)));
         ctx.set_field(this, 2, Value::Int(0));
@@ -18981,8 +18981,8 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
         let cap = ctx.array_length(keys_arr);
         if size >= cap {
             let new_cap = cap * 2;
-            let new_keys = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
-            let new_vals = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+            let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+            let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
             for i in 0..size {
                 ctx.set_array_element(new_keys, i, ctx.get_array_element(keys_arr, i));
                 ctx.set_array_element(new_vals, i, ctx.get_array_element(vals_arr, i));
@@ -19177,7 +19177,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(i32::MAX)); // unbounded
@@ -19411,7 +19411,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
         };
         // Fields: 0=subscribers_list, 1=closed
         let subs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 8);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
         ctx.set_field(subs, 0, Value::Object(Some(arr)));
         ctx.set_field(subs, 1, Value::Int(0));
         ctx.set_field(this, 0, Value::Object(Some(subs)));
@@ -19455,8 +19455,8 @@ fn cslm_subrange(
     // Build a new map with the subrange
     let result = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentSkipListMap", 3);
     let cap = size.max(4);
-    let new_keys = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
-    let new_vals = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+    let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(result, 0, Value::Object(Some(new_keys)));
     ctx.set_field(result, 1, Value::Object(Some(new_vals)));
 
@@ -19668,8 +19668,8 @@ fn native_rl_try_lock_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.monitor_wait(this, Some(wait_ms))?;
         ctx.monitor_exit(this);
         if ctx.is_interrupted(true) {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(rustjvm_types::error::RuntimeError::InterruptedException),
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(cratonvm_types::error::RuntimeError::InterruptedException),
             ));
         }
     }
@@ -20748,7 +20748,7 @@ fn b64_read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
 
 /// Helper: write Vec<u8> into a new byte[] on the heap
 fn b64_write_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let result = ctx.new_array(ArrayElementType::Byte, data.len());
     for (i, &b) in data.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i32));
@@ -20985,7 +20985,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         // layout (array=0, pos=1, limit=2). Returns (char[] arr, pos,
         // lim, offset).
         fn cb_state(
-            ctx: &dyn rustjvm_native_api::NativeContext,
+            ctx: &dyn cratonvm_native_api::NativeContext,
             this: ObjectRef,
         ) -> Option<(ObjectRef, i32, i32, i32)> {
             let arr = match ctx.get_field_by_name(this, "hb") {
@@ -21010,7 +21010,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Some((arr, pos, lim, off))
         }
 
-        fn cb_set_pos(ctx: &dyn rustjvm_native_api::NativeContext, this: ObjectRef, new_pos: i32) {
+        fn cb_set_pos(ctx: &dyn cratonvm_native_api::NativeContext, this: ObjectRef, new_pos: i32) {
             ctx.set_field_by_name(this, "position", Value::Int(new_pos));
             ctx.set_field(this, 1, Value::Int(new_pos));
         }
@@ -21157,12 +21157,12 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lib, "globalPool", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
     registry.register(lib, "versionString", "()Ljava/lang/String;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
-            ctx.create_string("2.0.38-rustjvm-stub"),
+            ctx.create_string("2.0.38-cratonvm-stub"),
         ))))
     });
     registry.register(lib, "aprVersionString", "()Ljava/lang/String;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
-            ctx.create_string("1.7.0-rustjvm-stub"),
+            ctx.create_string("1.7.0-cratonvm-stub"),
         ))))
     });
     registry.register(lib, "initialize", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
@@ -21187,7 +21187,7 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register(ssl, "versionString", "()Ljava/lang/String;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
-            ctx.create_string("OpenSSL 1.1.1w-rustjvm-stub"),
+            ctx.create_string("OpenSSL 1.1.1w-cratonvm-stub"),
         ))))
     });
     registry.register(ssl, "fipsModeGet", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
@@ -21247,7 +21247,7 @@ fn register_netty_internal_tcnative_natives(registry: &mut NativeMethodRegistry)
     registry.register(lib, "initialize0", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
     registry.register(lib, "aprVersionString", "()Ljava/lang/String;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
-            ctx.create_string("1.7.0-rustjvm-netty-stub"),
+            ctx.create_string("1.7.0-cratonvm-netty-stub"),
         ))))
     });
 
@@ -21361,7 +21361,7 @@ fn register_netty_internal_tcnative_natives(registry: &mut NativeMethodRegistry)
     registry.register(ssl, "version", "()I", |_ctx, _args| Ok(Some(Value::Int(0x1010107f))));
     registry.register(ssl, "versionString", "()Ljava/lang/String;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
-            ctx.create_string("OpenSSL rustjvm-stub"),
+            ctx.create_string("OpenSSL cratonvm-stub"),
         ))))
     });
 }
@@ -21688,7 +21688,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
         // Real-JDK layout: write signum + mag[].  This is the canonical
         // representation that bytecode reads via `getfield`.
         let mag_words = decimal_to_mag_words(value);
-        let mag_arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, mag_words.len());
+        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, mag_words.len());
         for (i, w) in mag_words.iter().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
         }
@@ -22299,7 +22299,7 @@ fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
                 bytes.iter().position(|&b| b != 0xFF).unwrap_or(15).saturating_sub(1)
             };
             let significant = &bytes[start..];
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, significant.len().max(1));
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, significant.len().max(1));
             for (i, &b) in significant.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -22311,7 +22311,7 @@ fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         let pad_len = (8 - (binary.len() % 8)) % 8;
         let padded = format!("{}{}", "0".repeat(pad_len + 8), binary); // extra byte for sign
         let byte_count = padded.len() / 8;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, byte_count);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_count);
         for i in 0..byte_count {
             let byte_str = &padded[i * 8..(i + 1) * 8];
             let byte_val = u8::from_str_radix(byte_str, 2).unwrap_or(0);
@@ -22423,7 +22423,7 @@ fn bi_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str) {
     };
     if let Some((sig_i, mag_i)) = bi_layout(ctx) {
         let mag_words = decimal_to_mag_words(value);
-        let mag_arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, mag_words.len());
+        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, mag_words.len());
         for (i, w) in mag_words.iter().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
         }
@@ -23548,7 +23548,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
+        cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
         let iter_val = ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])?;
         if let Some(Value::Object(Some(iter))) = iter_val {
             loop {
@@ -23613,7 +23613,7 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let iter_val = ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[])?;
-        let mut last_err: Option<rustjvm_types::error::MethodCallFailed> = None;
+        let mut last_err: Option<cratonvm_types::error::MethodCallFailed> = None;
         if let Some(Value::Object(Some(iter))) = iter_val {
             loop {
                 let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[])?;
@@ -23728,7 +23728,7 @@ fn native_es_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
     // Return empty list
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
+    cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -24056,11 +24056,11 @@ pub(crate) fn native_cf_then_apply(ctx: &mut dyn NativeContext, args: &[Value]) 
 
 fn cf_capture_throwable(
     ctx: &mut dyn NativeContext,
-    err: &rustjvm_types::error::MethodCallFailed,
+    err: &cratonvm_types::error::MethodCallFailed,
 ) -> Value {
     match err {
-        rustjvm_types::error::MethodCallFailed::InternalError(
-            rustjvm_types::error::VmError::Runtime(r),
+        cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::Runtime(r),
         ) => {
             let msg = format!("{r}");
             let s = ctx.create_string(&msg);
@@ -25225,7 +25225,7 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     } else {
         String::new()
     };
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] URL.toURI() nfields={} full={:?}", nfields, full);
     }
     let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
@@ -25717,7 +25717,7 @@ fn native_inet_get_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
         std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
     }
@@ -26918,11 +26918,11 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(None)));
         }
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         for (k, v) in snapshot {
             let key_obj = ctx.create_string(&k);
             let val_obj = ctx.create_string(&v);
-            rustjvm_native_collections::native_map_put_pub(
+            cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[
                     Value::Object(Some(map)),
@@ -26944,7 +26944,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         // Get key set
-        let key_set = match rustjvm_native_collections::native_map_key_set_pub(
+        let key_set = match cratonvm_native_collections::native_map_key_set_pub(
             ctx,
             &[Value::Object(Some(map))],
         ) {
@@ -26953,7 +26953,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         };
         // Convert set to array via toArray (HashSet has 1-field backing array structure).
         // Iterate the set's backing storage instead by getting size first.
-        let size_val = rustjvm_native_collections::native_map_size_pub(
+        let size_val = cratonvm_native_collections::native_map_size_pub(
             ctx,
             &[Value::Object(Some(map))],
         );
@@ -26984,7 +26984,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             };
             let key_str = ctx.read_string(key_obj).unwrap_or_default();
             // Get value via map.get(key)
-            let val_result = rustjvm_native_collections::native_map_get_pub(
+            let val_result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), Value::Object(Some(key_obj))],
             );
@@ -27085,12 +27085,12 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(lst)) => lst,
                 _ => {
                     let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                    rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
+                    cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
                     ctx.set_field(this, 2, Value::Object(Some(lst)));
                     lst
                 }
             };
-            rustjvm_native_collections::native_al_add(
+            cratonvm_native_collections::native_al_add(
                 ctx,
                 &[Value::Object(Some(handlers)), handler],
             )
@@ -27106,7 +27106,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         let handler = args.get(1).copied().unwrap_or(Value::Object(None));
         if ctx.object_num_fields(this) > 2 {
             if let Value::Object(Some(handlers)) = ctx.get_field(this, 2) {
-                rustjvm_native_collections::native_al_remove_obj(
+                cratonvm_native_collections::native_al_remove_obj(
                     ctx,
                     &[Value::Object(Some(handlers)), handler],
                 )
@@ -27562,7 +27562,7 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
     registry.register(loc, "getAvailableLocales", "()[Ljava/util/Locale;", |ctx, _args| {
         let locales_data = [("en", "US"), ("en", "GB"), ("en", ""), ("fr", "FR"), ("de", "DE"),
             ("ja", "JP"), ("zh", "CN"), ("es", "ES"), ("it", "IT"), ("pt", "BR")];
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), locales_data.len());
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), locales_data.len());
         for (i, (lang, country)) in locales_data.iter().enumerate() {
             let s1 = ctx.create_string(lang);
             let s2 = ctx.create_string(country);
@@ -27919,7 +27919,7 @@ fn native_md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 2);
     let algo_str = ctx.create_string(&algo);
     ctx.set_field(md, MD_FIELD_ALGO, Value::Object(Some(algo_str)));
-    let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+    let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field(md, MD_FIELD_DATA, Value::Object(Some(data)));
     Ok(Some(Value::Object(Some(md))))
 }
@@ -27931,7 +27931,7 @@ fn md_append_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
     };
     let old_len = ctx.array_length(old_data);
     let new_len = old_len + bytes.len();
-    let new_data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+    let new_data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
     for i in 0..old_len {
         let v = ctx.get_array_element(old_data, i);
         ctx.set_array_element(new_data, i, v);
@@ -28007,7 +28007,7 @@ fn native_md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Classical digests (MD5, SHA-1, SHA-2 family) are served by the
 /// in-tree constant-time implementations (`real_md5` / `real_sha1` /
 /// `real_sha256` / `real_sha384` / `real_sha512`). The SHA-3 family is
-/// provided by the RustCrypto `sha3` crate so RustJVM does not have to
+/// provided by the RustCrypto `sha3` crate so CratonVM does not have to
 /// re-implement the Keccak permutation.
 pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Vec<u8> {
     use sha3::Digest as _;
@@ -28625,12 +28625,12 @@ fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
     let digest = compute_digest(&algo, &data);
-    let result = ctx.new_array(rustjvm_types::ArrayElementType::Byte, digest.len());
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
     for (i, &b) in digest.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
     }
     // Reset
-    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
     Ok(Some(Value::Object(Some(result))))
 }
@@ -28659,7 +28659,7 @@ fn native_md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
     Ok(None)
 }
@@ -28874,7 +28874,7 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, num_bytes);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, num_bytes);
     // Use OS entropy directly (CSPRNG) for seed generation.
     let mut buf = vec![0u8; num_bytes];
     if !sr_os_random_bytes(&mut buf) {
@@ -29684,7 +29684,7 @@ fn native_aia_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, len);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     Ok(None)
 }
@@ -29912,7 +29912,7 @@ fn native_ala_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, len);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, len);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     Ok(None)
 }
@@ -30484,7 +30484,7 @@ fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
             let obj = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 Some(Value::Object(None)) => {
-                    return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                         message: Some("Thread.holdsLock(null)".to_string()),
                     }
                     .into());
@@ -31117,11 +31117,11 @@ fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let arr = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: "Array argument is null".to_string(),
             }
             .into())
@@ -31197,10 +31197,10 @@ fn native_array_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// null or the stored field has an unexpected tag.
 fn unbox_for_array_set(
     ctx: &dyn NativeContext,
-    elem: rustjvm_types::ArrayElementType,
+    elem: cratonvm_types::ArrayElementType,
     v: Value,
 ) -> Value {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let raw = match v {
         Value::Object(Some(o)) => ctx.get_field(o, 0),
         other => other,
@@ -31239,7 +31239,7 @@ fn native_array_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let arr = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: "Array argument is null".to_string(),
             }
             .into())
@@ -31384,8 +31384,8 @@ fn array_new_instance_for_component(
     ctx: &mut dyn NativeContext,
     comp_name: &str,
     length: usize,
-) -> rustjvm_types::ObjectRef {
-    use rustjvm_types::ArrayElementType;
+) -> cratonvm_types::ObjectRef {
+    use cratonvm_types::ArrayElementType;
     match comp_name {
         "int" | "I" => ctx.new_array(ArrayElementType::Int, length),
         "long" | "J" => ctx.new_array(ArrayElementType::Long, length),
@@ -31398,7 +31398,7 @@ fn array_new_instance_for_component(
         _ => {
             let comp_id = ctx
                 .ensure_class_initialized(comp_name)
-                .unwrap_or(rustjvm_types::ClassId::new(0));
+                .unwrap_or(cratonvm_types::ClassId::new(0));
             ctx.new_ref_array(comp_id, length)
         }
     }
@@ -31456,7 +31456,7 @@ static PROXY_INSTANCES_CREATED: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// `(loader_id, sorted_iface_class_ids)`. One generated `$ProxyN` class
 /// per (loader, interface-set) — the JDK `ProxyGenerator` does the same.
 static PROXY_CLASS_CACHE: parking_lot::RwLock<
-    Option<rustc_hash::FxHashMap<(u32, Vec<rustjvm_types::ClassId>), rustjvm_types::ClassId>>,
+    Option<rustc_hash::FxHashMap<(u32, Vec<cratonvm_types::ClassId>), cratonvm_types::ClassId>>,
 > = parking_lot::RwLock::new(None);
 
 /// WP2.5-B — global counter for the `$ProxyN` suffix. JDK uses
@@ -31548,7 +31548,7 @@ fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                 // Secondary path: resolve through class_id.
                 match ctx.get_field(*class_mirror, 0) {
                     Value::Int(cid_raw) if cid_raw >= 0 => {
-                        let cid = rustjvm_types::ClassId::new(cid_raw as u32);
+                        let cid = cratonvm_types::ClassId::new(cid_raw as u32);
                         ctx.class_name_of_id(cid)
                             .map(|n| n == "java/lang/reflect/Proxy$Instance")
                             .unwrap_or(false)
@@ -31594,7 +31594,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let handler = args.get(2).cloned().unwrap_or(Value::Object(None));
 
     // Walk the Class[] arg into a list of iface ClassIds for cache keying.
-    let mut iface_cids: Vec<rustjvm_types::ClassId> = Vec::new();
+    let mut iface_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     if let Value::Object(Some(arr)) = interfaces {
         let n = ctx.array_length(arr);
         for i in 0..n {
@@ -31680,7 +31680,7 @@ fn native_proxy_dispatch_invoke(
     let proxy = match args.first() {
         Some(Value::Object(Some(p))) => *p,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Proxy$Dispatch.invokeProxy: null proxy receiver".to_string()),
             }
             .into());
@@ -31689,7 +31689,7 @@ fn native_proxy_dispatch_invoke(
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Proxy$Dispatch.invokeProxy: null Method arg".to_string()),
             }
             .into());
@@ -31704,7 +31704,7 @@ fn native_proxy_dispatch_invoke(
     let handler = match ctx.get_field(proxy, 0) {
         Value::Object(Some(h)) => h,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some(
                     "Proxy$Dispatch.invokeProxy: proxy InvocationHandler is null".to_string(),
                 ),
@@ -31737,9 +31737,9 @@ fn native_proxy_dispatch_invoke(
     // subclass). VM-internal failures propagate verbatim.
     match result {
         Ok(v) => Ok(v),
-        Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) => {
+        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) => {
             let final_obj = wrap_undeclared_throwable(ctx, method_obj, thrown);
-            Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
                 final_obj,
             ))
         }
@@ -31757,12 +31757,12 @@ fn native_proxy_dispatch_invoke(
 /// losing the exception entirely.
 fn wrap_undeclared_throwable(
     ctx: &mut dyn NativeContext,
-    method_obj: rustjvm_types::ObjectRef,
-    thrown: rustjvm_types::ObjectRef,
-) -> rustjvm_types::ObjectRef {
+    method_obj: cratonvm_types::ObjectRef,
+    thrown: cratonvm_types::ObjectRef,
+) -> cratonvm_types::ObjectRef {
     // 1) RuntimeException / Error — always propagate.
     let thrown_cid = ctx.class_id_of_object(thrown);
-    if std::env::var_os("RUSTJVM_DBG_UTE").is_some() {
+    if std::env::var_os("CRATONVM_DBG_UTE").is_some() {
         let thrown_name = ctx
             .class_name_of_id(thrown_cid)
             .unwrap_or_else(|| "<unknown>".to_string());
@@ -31836,10 +31836,10 @@ fn wrap_undeclared_throwable(
 fn define_or_get_proxy_class(
     ctx: &mut dyn NativeContext,
     loader_id: u32,
-    iface_class_ids: &[rustjvm_types::ClassId],
-) -> Option<rustjvm_types::ClassId> {
+    iface_class_ids: &[cratonvm_types::ClassId],
+) -> Option<cratonvm_types::ClassId> {
     // Sort + dedup ClassIds for deterministic cache keying.
-    let mut sorted: Vec<rustjvm_types::ClassId> = iface_class_ids.to_vec();
+    let mut sorted: Vec<cratonvm_types::ClassId> = iface_class_ids.to_vec();
     sorted.sort_by_key(|c| c.as_u32());
     sorted.dedup();
     let cache_key = (loader_id, sorted.clone());
@@ -31859,8 +31859,8 @@ fn define_or_get_proxy_class(
     let _ = ctx.ensure_class_initialized("java/lang/reflect/Proxy$Instance");
 
     let (gen_name, spec) = build_proxy_spec_for(ctx, &sorted)?;
-    let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec);
-    let opts = rustjvm_native_api::DefineClassFull {
+    let bytes = cratonvm_classloading::proxy_gen::emit_proxy_classfile(&spec);
+    let opts = cratonvm_native_api::DefineClassFull {
         // WP2.5-v3 item 4 — every method body emitted by `proxy_gen`
         // (constructor super-delegate, per-method dispatch shim, and
         // the v3 `<clinit>` initialiser) is straight-line: no IF*,
@@ -31884,16 +31884,16 @@ fn define_or_get_proxy_class(
     }
 }
 
-/// Build a [`rustjvm_classloading::proxy_gen::ProxyClassSpec`] for the
+/// Build a [`cratonvm_classloading::proxy_gen::ProxyClassSpec`] for the
 /// given sorted interface ClassId set. Walks each interface (and its
 /// super-interfaces transitively) collecting public abstract + default
 /// instance methods, deduplicated by `(name, descriptor)`. Returns
 /// `None` if any ClassId fails to resolve to a name.
 fn build_proxy_spec_for(
     ctx: &mut dyn NativeContext,
-    sorted_ifaces: &[rustjvm_types::ClassId],
-) -> Option<(String, rustjvm_classloading::proxy_gen::ProxyClassSpec)> {
-    use rustjvm_classloading::proxy_gen::{ProxyClassSpec, ProxyMethod};
+    sorted_ifaces: &[cratonvm_types::ClassId],
+) -> Option<(String, cratonvm_classloading::proxy_gen::ProxyClassSpec)> {
+    use cratonvm_classloading::proxy_gen::{ProxyClassSpec, ProxyMethod};
 
     const ACC_STATIC: u16 = 0x0008;
     const ACC_PUBLIC: u16 = 0x0001;
@@ -31914,9 +31914,9 @@ fn build_proxy_spec_for(
     // BFS over interface inheritance. Collect public, non-static,
     // non-`<init>`/`<clinit>` methods. Abstract beats default if the
     // same `(name, descriptor)` key appears with both flavours.
-    let mut visited: std::collections::HashSet<rustjvm_types::ClassId> =
+    let mut visited: std::collections::HashSet<cratonvm_types::ClassId> =
         std::collections::HashSet::new();
-    let mut work: Vec<rustjvm_types::ClassId> = sorted_ifaces.to_vec();
+    let mut work: Vec<cratonvm_types::ClassId> = sorted_ifaces.to_vec();
     let mut by_key: std::collections::HashMap<(String, String), ProxyMethod> =
         std::collections::HashMap::new();
     while let Some(cid) = work.pop() {
@@ -33332,7 +33332,7 @@ fn pd_gather_window_fixed(
     for chunk in elems.chunks(window_size) {
         let al = alloc_concurrent_synthetic(_ctx, "java/util/ArrayList", 2);
         let arr = _ctx.new_array(
-            rustjvm_types::ArrayElementType::Reference,
+            cratonvm_types::ArrayElementType::Reference,
             chunk.len(),
         );
         for (i, v) in chunk.iter().enumerate() {
@@ -33360,7 +33360,7 @@ fn pd_gather_window_sliding(
             let window = &elems[start..start + window_size];
             let al = alloc_concurrent_synthetic(_ctx, "java/util/ArrayList", 2);
             let arr = _ctx.new_array(
-                rustjvm_types::ArrayElementType::Reference,
+                cratonvm_types::ArrayElementType::Reference,
                 window.len(),
             );
             for (i, v) in window.iter().enumerate() {
@@ -33415,7 +33415,7 @@ fn pd_gather_custom(
     // Create a downstream collector: [0]=backing array, [1]=size
     let downstream = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer$Downstream", 2);
     let downstream_arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         elems.len() + 16,
     );
     ctx.set_field(downstream, 0, Value::Object(Some(downstream_arr)));
@@ -33660,7 +33660,7 @@ fn pd_collect_carrier_bindings(
 /// Shared helper: initialize a StructuredTaskScope (or subclass) with subtask list.
 fn pd_init_scope(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let subtasks = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
     ctx.set_field(subtasks, 0, Value::Object(Some(arr)));
     ctx.set_field(subtasks, 1, Value::Int(0));
     ctx.set_field(this, 0, Value::Object(Some(subtasks)));
@@ -34568,20 +34568,20 @@ mod concurrency_tests {
         // CopyOnWriteArrayList iterator should see a snapshot, not live data
         let mut ctx = make_ctx();
         let cowal = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2);
-        rustjvm_native_collections::native_al_init(&mut ctx, &[Value::Object(Some(cowal))]).unwrap();
+        cratonvm_native_collections::native_al_init(&mut ctx, &[Value::Object(Some(cowal))]).unwrap();
 
         // Add two elements
-        rustjvm_native_collections::native_al_add(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(10)]).unwrap();
-        rustjvm_native_collections::native_al_add(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(20)]).unwrap();
+        cratonvm_native_collections::native_al_add(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(10)]).unwrap();
+        cratonvm_native_collections::native_al_add(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(20)]).unwrap();
 
         // Size should be 2
-        let size = rustjvm_native_collections::native_al_size(&mut ctx, &[Value::Object(Some(cowal))]).unwrap().unwrap();
+        let size = cratonvm_native_collections::native_al_size(&mut ctx, &[Value::Object(Some(cowal))]).unwrap().unwrap();
         assert_eq!(size, Value::Int(2));
 
         // Verify elements
-        let elem0 = rustjvm_native_collections::native_al_get(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(0)]).unwrap().unwrap();
+        let elem0 = cratonvm_native_collections::native_al_get(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(0)]).unwrap().unwrap();
         assert_eq!(elem0, Value::Int(10));
-        let elem1 = rustjvm_native_collections::native_al_get(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(1)]).unwrap().unwrap();
+        let elem1 = cratonvm_native_collections::native_al_get(&mut ctx, &[Value::Object(Some(cowal)), Value::Int(1)]).unwrap().unwrap();
         assert_eq!(elem1, Value::Int(20));
     }
 
@@ -34631,8 +34631,8 @@ mod concurrency_tests {
 
     use crate::phases_early;
 
-    fn register_atomics() -> rustjvm_native_api::NativeMethodRegistry {
-        let mut r = rustjvm_native_api::NativeMethodRegistry::new();
+    fn register_atomics() -> cratonvm_native_api::NativeMethodRegistry {
+        let mut r = cratonvm_native_api::NativeMethodRegistry::new();
         phases_early::register_phase54_atomics(&mut r);
         r
     }
@@ -34732,7 +34732,7 @@ mod concurrency_tests {
 
     #[test]
     fn t19_n4_atomic_long_vm_supports_cs8_registered() {
-        let mut registry = rustjvm_native_api::NativeMethodRegistry::new();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
         super::register_atomic_long_natives(&mut registry);
         assert!(registry
             .find(
@@ -34827,7 +34827,7 @@ mod concurrency_tests {
         };
 
         // TimeUnit.SECONDS ordinal = 3; field 0 carries the ordinal.
-        let tu = ctx.alloc_object(rustjvm_types::ClassId::new(0), 1);
+        let tu = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
         ctx.set_field(tu, 0, Value::Int(3));
         let res = native_cond_await_timeout(
             &mut ctx,
@@ -34853,7 +34853,7 @@ mod concurrency_tests {
         ctx.set_field(cf, FUT_FIELD_RESULT, Value::Object(Some(err_msg)));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(2));
 
-        let func = ctx.alloc_object(rustjvm_types::ClassId::new(0), 1);
+        let func = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
         let result = native_cf_then_apply(
             &mut ctx,
             &[Value::Object(Some(cf)), Value::Object(Some(func))],
@@ -34906,7 +34906,7 @@ mod concurrency_tests {
     #[test]
     fn rd10_thread_join_rejects_negative_timeout() {
         let mut ctx = make_ctx();
-        let t = ctx.alloc_object(rustjvm_types::ClassId::new(0), 2);
+        let t = ctx.alloc_object(cratonvm_types::ClassId::new(0), 2);
         let err = crate::lang_system::native_thread_join_timed(
             &mut ctx,
             &[Value::Object(Some(t)), Value::Long(-5)],
@@ -34918,7 +34918,7 @@ mod concurrency_tests {
     #[test]
     fn rd10_thread_join_nanos_range() {
         let mut ctx = make_ctx();
-        let t = ctx.alloc_object(rustjvm_types::ClassId::new(0), 2);
+        let t = ctx.alloc_object(cratonvm_types::ClassId::new(0), 2);
         let err = crate::lang_system::native_thread_join_millis_nanos(
             &mut ctx,
             &[Value::Object(Some(t)), Value::Long(10), Value::Int(2_000_000)],
@@ -35003,7 +35003,7 @@ mod new2_net_tests {
     #[test]
     fn inet_get_by_address_ipv4_round_trip() {
         let mut ctx = MockNativeContext::new();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 4);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
         // 192.168.1.42 — last octet sign-extends if cast naively.
         ctx.set_array_element(arr, 0, Value::Int((192u8 as i8) as i32));
         ctx.set_array_element(arr, 1, Value::Int((168u8 as i8) as i32));
@@ -35025,7 +35025,7 @@ mod new2_net_tests {
     #[test]
     fn inet_get_by_address_ipv6_uses_real_bytes() {
         let mut ctx = MockNativeContext::new();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 16);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
         // fe80::1 — link-local
         let bytes = [
             0xfeu8, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
@@ -35053,7 +35053,7 @@ mod new2_net_tests {
     #[test]
     fn inet_get_by_address_invalid_length_throws() {
         let mut ctx = MockNativeContext::new();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 7);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 7);
         let result = native_inet_get_by_address(&mut ctx, &[Value::Object(Some(arr))]);
         assert!(
             result.is_err(),
@@ -35481,7 +35481,7 @@ mod t2_6_crypto_acceptance_tests {
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let nonce = Nonce::from_slice(&nonce_bytes);
         let plaintext = b"T2.6.5 ChaCha20-Poly1305 acceptance".to_vec();
-        let aad = b"rustjvm-t2.6".to_vec();
+        let aad = b"cratonvm-t2.6".to_vec();
 
         let ct = cipher
             .encrypt(nonce, Payload { msg: &plaintext, aad: &aad })
@@ -35561,7 +35561,7 @@ mod t2_6_crypto_acceptance_tests {
     /// test is marked `#[ignore]` so `cargo test` stays fast by
     /// default; the full acceptance run is:
     ///
-    ///     cargo test --release -p rustjvm-native-builtins \
+    ///     cargo test --release -p cratonvm-native-builtins \
     ///         t2_6_20_rsa_2048_sign_verify_round_trip -- --ignored
     #[test]
     #[ignore = "RSA 2048 keygen slow in debug; run with --release --ignored"]
@@ -35583,7 +35583,7 @@ mod t2_6_crypto_acceptance_tests {
             RsaKeyPairData { public_key: pubk, private_key: privk },
         );
 
-        let message = b"T2.6.20 - rust-jvm RSA 2048 acceptance vector";
+        let message = b"T2.6.20 - cratonvm RSA 2048 acceptance vector";
         let sig = rsa_sign(id, message).expect("rsa_sign must produce a signature");
         assert!(
             sig.len() >= 256,
@@ -35614,7 +35614,7 @@ mod t2_6_crypto_acceptance_tests {
         };
 
         let (_pk_bytes, key_id) = ed25519_generate_keypair();
-        let message = b"T2.6.8 - rust-jvm Ed25519 acceptance vector";
+        let message = b"T2.6.8 - cratonvm Ed25519 acceptance vector";
 
         let sig = ed25519_sign(key_id, message)
             .expect("ed25519_sign must produce a signature");

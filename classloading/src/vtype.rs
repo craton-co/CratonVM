@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
-use rustjvm_reader::constant_pool::ConstantPool;
-use rustjvm_reader::stack_map::VerificationTypeInfo;
+use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::stack_map::VerificationTypeInfo;
 
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 // ---------------------------------------------------------------------------
 // ClassHierarchy trait — abstraction over class hierarchy queries

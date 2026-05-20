@@ -1,13 +1,13 @@
 //! T4.8 -- JDWP Conformance Tests
 //!
-//! These tests verify that the RustJVM JDWP (Java Debug Wire Protocol)
+//! These tests verify that the CratonVM JDWP (Java Debug Wire Protocol)
 //! implementation conforms to the wire protocol specification used by IDE
 //! debuggers (IntelliJ, Eclipse, VS Code).  They exercise the debug module
 //! at `vm/src/debug/`.
 //!
 //! Run with:
 //!
-//!     cargo test -p rustjvm-vm --test t4_8_jdwp_conformance
+//!     cargo test -p cratonvm-vm --test t4_8_jdwp_conformance
 //!
 //! Most tests are `#[ignore]` because they require starting the VM in debug
 //! mode with a JDWP listener.  The non-ignored tests exercise protocol-level
@@ -17,12 +17,12 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use rustjvm_vm::debug::events::{
+use cratonvm_vm::debug::events::{
     Event, EventKind, EventModifier, StepDepth, StepSize, SuspendPolicy,
 };
-use rustjvm_vm::debug::protocol::JdwpPacket;
-use rustjvm_vm::debug::transport::JDWP_HANDSHAKE;
-use rustjvm_vm::debug::{self, DebugEvent, DebugState, FrameEntry};
+use cratonvm_vm::debug::protocol::JdwpPacket;
+use cratonvm_vm::debug::transport::JDWP_HANDSHAKE;
+use cratonvm_vm::debug::{self, DebugEvent, DebugState, FrameEntry};
 
 // ---------------------------------------------------------------------------
 // Helpers

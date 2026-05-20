@@ -35,9 +35,9 @@
 //! All public surface is registered via `register_socket_channel_real`.
 
 use parking_lot::RwLock;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 fn ipc_dbg_enabled() -> bool {
-    std::env::var("RUSTJVM_SUREFIRE_IPC_DBG")
+    std::env::var("CRATONVM_SUREFIRE_IPC_DBG")
         .map(|v| {
             let t = v.trim();
             !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
@@ -179,7 +179,7 @@ fn connect_pool_sender() -> &'static std::sync::mpsc::Sender<ConnectJob> {
         for w in 0..workers {
             let rx = std::sync::Arc::clone(&rx);
             let _ = std::thread::Builder::new()
-                .name(format!("rustjvm-connect-pool-{w}"))
+                .name(format!("cratonvm-connect-pool-{w}"))
                 .spawn(move || connect_pool_worker(rx));
         }
         // Bug 3 / Bug 6 (HIGH round-9 carryover): the pool currently has

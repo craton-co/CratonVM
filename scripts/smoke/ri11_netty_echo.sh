@@ -73,6 +73,6 @@ JAVA
 
 "$JAVA_HOME_FOR_SMOKE/bin/javac" -cp "$CP" -d "$FIX_DIR" "$FIX_DIR/NettyEchoSmoke.java"
 
-SMOKE_TIMEOUT=180 smoke_run_rustjvm --Xmx 512m --classpath "$FIX_DIR:$CP" -- NettyEchoSmoke
+SMOKE_TIMEOUT=180 smoke_run_cratonvm --Xmx 512m --classpath "$FIX_DIR:$CP" -- NettyEchoSmoke
 
 smoke_require_signal "NETTY_ECHO_GOT=NETTY_OK"

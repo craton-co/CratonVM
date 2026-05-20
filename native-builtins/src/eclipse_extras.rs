@@ -5,13 +5,13 @@
 //! bundle resolution, native library loading, and SWT initialization
 //! that CratonVM cannot fully execute today.
 //!
-//! # Default mode (RUSTJVM_ECLIPSE_REAL unset)
+//! # Default mode (CRATONVM_ECLIPSE_REAL unset)
 //!
 //! Short-circuit `main` and `<clinit>` so the JVM returns rc=0 without
 //! exercising the Equinox / OSGi bootstrap chain. Boot-test success
 //! criterion is "no crash".
 //!
-//! # Real mode (RUSTJVM_ECLIPSE_REAL=1)
+//! # Real mode (CRATONVM_ECLIPSE_REAL=1)
 //!
 //! Let the real launcher run, but plug the two known failure points
 //! that otherwise cascade into a JNIBridge NPE chain:
@@ -49,9 +49,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_EQUINOX_MAIN: &str = "org/eclipse/equinox/launcher/Main";
 const CN_JNI_BRIDGE: &str = "org/eclipse/equinox/launcher/JNIBridge";
@@ -112,11 +112,11 @@ fn jni_bridge_null_string(
 
 /// Install Eclipse IDE boot-test short-circuits.
 ///
-/// **Default mode** (`RUSTJVM_ECLIPSE_REAL` unset): short-circuit
+/// **Default mode** (`CRATONVM_ECLIPSE_REAL` unset): short-circuit
 /// `Main.main` and `Main.<clinit>` so the JVM returns rc=0 without
 /// running the Equinox bootstrap.
 ///
-/// **Real mode** (`RUSTJVM_ECLIPSE_REAL=1`): install the targeted
+/// **Real mode** (`CRATONVM_ECLIPSE_REAL=1`): install the targeted
 /// `openLogFile` + JNIBridge no-ops described in the file-level
 /// docs, so the real launcher can proceed past its log-file write
 /// without NPE'ing on the JNIBridge native chain. The launcher will
@@ -124,7 +124,7 @@ fn jni_bridge_null_string(
 /// adaptor.EclipseStarter` (osgi jar not reachable from our flat
 /// classpath) and exit non-zero, but the JVM itself stays healthy.
 pub fn register_eclipse_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_ECLIPSE_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_ECLIPSE_REAL").as_deref() == Ok("1") {
         // Real mode: don't short-circuit main, but defuse the two
         // known crash sources the real launcher hits under CratonVM.
         registry.register(

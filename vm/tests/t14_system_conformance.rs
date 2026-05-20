@@ -3,7 +3,7 @@
 //! Verifies that all T14 System and VM native methods are registered,
 //! the bootstrap chain (initPhase1/2/3) is wired, and no stubs remain.
 //!
-//!     cargo test -p rustjvm-vm --test t14_system_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test t14_system_conformance -- --nocapture
 
 use std::path::{Path, PathBuf};
 

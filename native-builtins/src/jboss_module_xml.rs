@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
-use rustjvm_native_api::NativeContext;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
-use rustjvm_types::Value;
+use cratonvm_native_api::NativeContext;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use cratonvm_types::Value;
 
 #[derive(Debug, Default, Clone)]
 pub struct ModuleXml {

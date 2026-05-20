@@ -47,7 +47,7 @@ use crate::classloading::resolution::MethodHandleKind;
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::classloading::ClassState;
 #[cfg(all(test, feature = "synthetic-jdk"))]
-use rustjvm_native_api::NativeContext;
+use cratonvm_native_api::NativeContext;
 
 // ---------------------------------------------------------------------------
 // Tests (synthetic-jdk only РІР‚вЂќ see NEW-11 in docs/roadmap.md)
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn resolve_constant_value_integer() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Integer(42)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Int(42)));
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn resolve_constant_value_float() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Float(3.125),
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn resolve_constant_value_long() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Long(123_456_789_000),
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn resolve_constant_value_double() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Double(2.75),
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn resolve_constant_value_string_returns_none() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Utf8("hello".into()),
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn resolve_constant_value_invalid_index() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 99), None);
@@ -453,7 +453,7 @@ mod tests {
         assert!(props.contains_key("java.version"));
         assert_eq!(
             props.get("java.vendor").map(|s| s.as_str()),
-            Some("RustJVM")
+            Some("CratonVM")
         );
     }
 
@@ -480,7 +480,7 @@ mod tests {
         use std::io::Write;
         // Create a temp file to simulate a library existing on the search path.
         let dir = std::env::temp_dir();
-        let lib_name = "rustjvm_test_dummy.dll";
+        let lib_name = "cratonvm_test_dummy.dll";
         let lib_path = dir.join(lib_name);
         // Create a placeholder file so Path::exists() returns true.
         let _ = std::fs::File::create(&lib_path).and_then(|mut f| f.write_all(b""));
@@ -2743,13 +2743,13 @@ mod tests {
     fn make_test_class(
         shared: &Arc<SharedVm>,
         name: &str,
-        fields: Vec<rustjvm_reader::field::ClassFileField>,
-        methods: Vec<rustjvm_reader::method::ClassFileMethod>,
+        fields: Vec<cratonvm_reader::field::ClassFileField>,
+        methods: Vec<cratonvm_reader::method::ClassFileMethod>,
     ) -> ClassId {
         use crate::classloading::{Class, ClassLoaderId, ClassState};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
         let mut cm = shared.class_manager.write();
         let id = cm.class_store.next_id();
@@ -2757,7 +2757,7 @@ mod tests {
         cm.class_store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc(name),
+            name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Initialized, initializing_thread: None,
@@ -2794,13 +2794,13 @@ mod tests {
         shared: &Arc<SharedVm>,
         name: &str,
         access_flags_raw: u16,
-        fields: &[rustjvm_reader::field::ClassFileField],
-        methods: &[rustjvm_reader::method::ClassFileMethod],
+        fields: &[cratonvm_reader::field::ClassFileField],
+        methods: &[cratonvm_reader::method::ClassFileMethod],
     ) -> ClassId {
         use crate::classloading::{Class, ClassLoaderId, ClassState};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
         let mut cm = shared.class_manager.write();
         let id = cm.class_store.next_id();
@@ -2809,7 +2809,7 @@ mod tests {
         cm.class_store.add(Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc(&class_name),
+            name: cratonvm_types::intern_arc(&class_name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Initialized, initializing_thread: None,
@@ -2845,7 +2845,7 @@ mod tests {
 
     #[test]
     fn reflect_get_declared_fields() {
-        use rustjvm_reader::class_access_flags::FieldAccessFlags;
+        use cratonvm_reader::class_access_flags::FieldAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -2854,13 +2854,13 @@ mod tests {
             &shared,
             "test/ReflectTarget",
             vec![
-                rustjvm_reader::field::ClassFileField {
+                cratonvm_reader::field::ClassFileField {
                     name: Arc::from("x"),
                     descriptor: Arc::from("I"),
                     access_flags: FieldAccessFlags::PUBLIC,
                     attributes: vec![],
                 },
-                rustjvm_reader::field::ClassFileField {
+                cratonvm_reader::field::ClassFileField {
                     name: Arc::from("name"),
                     descriptor: Arc::from("Ljava/lang/String;"),
                     access_flags: FieldAccessFlags::PRIVATE,
@@ -2890,7 +2890,7 @@ mod tests {
 
     #[test]
     fn reflect_get_declared_field_by_name() {
-        use rustjvm_reader::class_access_flags::FieldAccessFlags;
+        use cratonvm_reader::class_access_flags::FieldAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -2898,7 +2898,7 @@ mod tests {
         let class_id = make_test_class(
             &shared,
             "test/FieldLookup",
-            vec![rustjvm_reader::field::ClassFileField {
+            vec![cratonvm_reader::field::ClassFileField {
                 name: Arc::from("value"),
                 descriptor: Arc::from("I"),
                 access_flags: FieldAccessFlags::PUBLIC,
@@ -2947,7 +2947,7 @@ mod tests {
 
     #[test]
     fn reflect_field_get_set_instance() {
-        use rustjvm_reader::class_access_flags::FieldAccessFlags;
+        use cratonvm_reader::class_access_flags::FieldAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -2955,7 +2955,7 @@ mod tests {
         let class_id = make_test_class(
             &shared,
             "test/GetSet",
-            vec![rustjvm_reader::field::ClassFileField {
+            vec![cratonvm_reader::field::ClassFileField {
                 name: Arc::from("x"),
                 descriptor: Arc::from("I"),
                 access_flags: FieldAccessFlags::PUBLIC,
@@ -3014,7 +3014,7 @@ mod tests {
 
     #[test]
     fn reflect_field_get_name_and_modifiers() {
-        use rustjvm_reader::class_access_flags::FieldAccessFlags;
+        use cratonvm_reader::class_access_flags::FieldAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -3022,7 +3022,7 @@ mod tests {
         let class_id = make_test_class(
             &shared,
             "test/Modifiers",
-            vec![rustjvm_reader::field::ClassFileField {
+            vec![cratonvm_reader::field::ClassFileField {
                 name: Arc::from("count"),
                 descriptor: Arc::from("I"),
                 access_flags: FieldAccessFlags::PUBLIC | FieldAccessFlags::STATIC,
@@ -3079,7 +3079,7 @@ mod tests {
 
     #[test]
     fn reflect_get_declared_methods_filters_init() {
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -3089,19 +3089,19 @@ mod tests {
             "test/MethodFilter",
             vec![],
             vec![
-                rustjvm_reader::method::ClassFileMethod {
+                cratonvm_reader::method::ClassFileMethod {
                     name: Arc::from("<init>"),
                     descriptor: Arc::from("()V"),
                     access_flags: MethodAccessFlags::PUBLIC,
                     attributes: vec![],
                 },
-                rustjvm_reader::method::ClassFileMethod {
+                cratonvm_reader::method::ClassFileMethod {
                     name: Arc::from("run"),
                     descriptor: Arc::from("()V"),
                     access_flags: MethodAccessFlags::PUBLIC,
                     attributes: vec![],
                 },
-                rustjvm_reader::method::ClassFileMethod {
+                cratonvm_reader::method::ClassFileMethod {
                     name: Arc::from("helper"),
                     descriptor: Arc::from("(I)I"),
                     access_flags: MethodAccessFlags::PRIVATE,
@@ -3131,7 +3131,7 @@ mod tests {
 
     #[test]
     fn reflect_get_declared_constructors() {
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -3141,19 +3141,19 @@ mod tests {
             "test/Constructors",
             vec![],
             vec![
-                rustjvm_reader::method::ClassFileMethod {
+                cratonvm_reader::method::ClassFileMethod {
                     name: Arc::from("<init>"),
                     descriptor: Arc::from("()V"),
                     access_flags: MethodAccessFlags::PUBLIC,
                     attributes: vec![],
                 },
-                rustjvm_reader::method::ClassFileMethod {
+                cratonvm_reader::method::ClassFileMethod {
                     name: Arc::from("<init>"),
                     descriptor: Arc::from("(I)V"),
                     access_flags: MethodAccessFlags::PUBLIC,
                     attributes: vec![],
                 },
-                rustjvm_reader::method::ClassFileMethod {
+                cratonvm_reader::method::ClassFileMethod {
                     name: Arc::from("doStuff"),
                     descriptor: Arc::from("()V"),
                     access_flags: MethodAccessFlags::PUBLIC,
@@ -3357,7 +3357,7 @@ mod tests {
 
         // Create a temp file path
         let tmp = std::env::temp_dir()
-            .join("rustjvm_io_test_wr.txt")
+            .join("cratonvm_io_test_wr.txt")
             .to_string_lossy()
             .to_string();
         let path_obj = create_java_string(&shared, &tmp);
@@ -3447,7 +3447,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let tmp = std::env::temp_dir()
-            .join("rustjvm_io_test_append.txt")
+            .join("cratonvm_io_test_append.txt")
             .to_string_lossy()
             .to_string();
 
@@ -3532,7 +3532,7 @@ mod tests {
 
         // Write a multi-line file
         let tmp = std::env::temp_dir()
-            .join("rustjvm_io_test_br.txt")
+            .join("cratonvm_io_test_br.txt")
             .to_string_lossy()
             .to_string();
         std::fs::write(&tmp, "line1\nline2\n").unwrap();
@@ -3647,7 +3647,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let dir = std::env::temp_dir()
-            .join("rustjvm_io_test_dir")
+            .join("cratonvm_io_test_dir")
             .to_string_lossy()
             .to_string();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3744,7 +3744,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let tmp = std::env::temp_dir()
-            .join("rustjvm_io_test_bw.txt")
+            .join("cratonvm_io_test_bw.txt")
             .to_string_lossy()
             .to_string();
 
@@ -11315,9 +11315,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Set an env var for testing
-        std::env::set_var("RUSTJVM_TEST_VAR", "hello");
+        std::env::set_var("CRATONVM_TEST_VAR", "hello");
 
-        let key = create_java_string(&shared, "RUSTJVM_TEST_VAR");
+        let key = create_java_string(&shared, "CRATONVM_TEST_VAR");
         let result = call_native(
             &shared,
             &mut thread,
@@ -11338,7 +11338,7 @@ mod tests {
         }
 
         // Clean up
-        std::env::remove_var("RUSTJVM_TEST_VAR");
+        std::env::remove_var("CRATONVM_TEST_VAR");
     }
 
     #[test]
@@ -11346,7 +11346,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let key = create_java_string(&shared, "RUSTJVM_NONEXISTENT_VAR_12345");
+        let key = create_java_string(&shared, "CRATONVM_NONEXISTENT_VAR_12345");
         let result = call_native(
             &shared,
             &mut thread,
@@ -24329,8 +24329,8 @@ mod tests {
     #[test]
     fn convert_annotation_data() {
         // Test the convert_annotation helper directly
-        use rustjvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
         // Build a minimal constant pool:
         // index 0 = Tombstone
@@ -24370,8 +24370,8 @@ mod tests {
 
     #[test]
     fn convert_annotation_enum_value() {
-        use rustjvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
         let entries = vec![
             ConstantPoolEntry::Tombstone,
@@ -24407,8 +24407,8 @@ mod tests {
 
     #[test]
     fn convert_annotation_int_value() {
-        use rustjvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
         let entries = vec![
             ConstantPoolEntry::Tombstone,
@@ -24441,8 +24441,8 @@ mod tests {
 
     #[test]
     fn convert_annotation_array_value() {
-        use rustjvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::attribute::{Annotation, ElementValue, ElementValuePair};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
         let entries = vec![
             ConstantPoolEntry::Tombstone,
@@ -33891,8 +33891,8 @@ mod tests {
     #[test]
     fn reflect_method_invoke_static_void() {
         // Test Method.invoke on a static void method (bytecode: return)
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -33902,14 +33902,14 @@ mod tests {
             "test/InvokeVoid",
             0x0021, // PUBLIC | SUPER
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("doNothing"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return (void)
+                    code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return (void)
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -33952,8 +33952,8 @@ mod tests {
     fn reflect_method_invoke_static_returns_int() {
         // Test Method.invoke on a static method returning int constant 42
         // Bytecode: bipush 42; ireturn
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -33963,14 +33963,14 @@ mod tests {
             "test/InvokeStaticInt",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("getFortyTwo"),
                 descriptor: Arc::from("()I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 1,
                     max_locals: 0,
-                    code: rustjvm_reader::ByteView::from_vec(vec![
+                    code: cratonvm_reader::ByteView::from_vec(vec![
                         0x10, 42,  // bipush 42
                         0xAC,      // ireturn
                     ]),
@@ -34021,8 +34021,8 @@ mod tests {
     fn reflect_method_invoke_static_with_int_param() {
         // Static method: takes int param, returns it doubled
         // Bytecode: iload_0; iload_0; iadd; ireturn
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34032,14 +34032,14 @@ mod tests {
             "test/InvokeWithParam",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("doubleIt"),
                 descriptor: Arc::from("(I)I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 1,
-                    code: rustjvm_reader::ByteView::from_vec(vec![
+                    code: cratonvm_reader::ByteView::from_vec(vec![
                         0x1A,       // iload_0
                         0x1A,       // iload_0
                         0x60,       // iadd
@@ -34108,8 +34108,8 @@ mod tests {
         // Instance method on an object with field 0 = int value
         // Method returns field 0 of this: aload_0; getfield #?
         // Since getfield needs constant pool, use simpler: iload_1; ireturn (identity on arg)
-        use rustjvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34118,13 +34118,13 @@ mod tests {
             &shared,
             "test/InvokeInstance",
             0x0021,
-            &[rustjvm_reader::field::ClassFileField {
+            &[cratonvm_reader::field::ClassFileField {
                 name: Arc::from("value"),
                 descriptor: Arc::from("I"),
                 access_flags: FieldAccessFlags::PUBLIC,
                 attributes: vec![],
             }],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 // Instance method: identity(int x) returns x
                 // In instance methods, local 0 = this, local 1 = first param
                 name: Arc::from("identity"),
@@ -34133,7 +34133,7 @@ mod tests {
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 1,
                     max_locals: 2, // this + int param
-                    code: rustjvm_reader::ByteView::from_vec(vec![
+                    code: cratonvm_reader::ByteView::from_vec(vec![
                         0x1B,  // iload_1 (first int param)
                         0xAC,  // ireturn
                     ]),
@@ -34201,8 +34201,8 @@ mod tests {
     #[test]
     fn reflect_method_invoke_null_receiver_throws() {
         // Calling instance method with null receiver should throw NullPointerException
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34212,14 +34212,14 @@ mod tests {
             "test/InvokeNullRecv",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("run"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PUBLIC, // instance method (not static)
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                    code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34260,8 +34260,8 @@ mod tests {
     fn reflect_method_invoke_static_two_params() {
         // Static method: add(int a, int b) returns a + b
         // Bytecode: iload_0; iload_1; iadd; ireturn
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34271,14 +34271,14 @@ mod tests {
             "test/InvokeTwoParams",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("add"),
                 descriptor: Arc::from("(II)I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 2,
-                    code: rustjvm_reader::ByteView::from_vec(vec![
+                    code: cratonvm_reader::ByteView::from_vec(vec![
                         0x1A, // iload_0
                         0x1B, // iload_1
                         0x60, // iadd
@@ -34348,8 +34348,8 @@ mod tests {
     fn reflect_method_invoke_returns_long() {
         // Static method: returns long constant
         // Bytecode: ldc2_w would need constant pool; use lconst_1; lreturn instead
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34359,14 +34359,14 @@ mod tests {
             "test/InvokeLong",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("getOne"),
                 descriptor: Arc::from("()J"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 0,
-                    code: rustjvm_reader::ByteView::from_vec(vec![
+                    code: cratonvm_reader::ByteView::from_vec(vec![
                         0x0A, // lconst_1
                         0xAD, // lreturn
                     ]),
@@ -34414,7 +34414,7 @@ mod tests {
     #[test]
     fn reflect_method_get_name_and_modifiers() {
         // Verify Method.getName() and Method.getModifiers() work
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34424,7 +34424,7 @@ mod tests {
             "test/MethodMeta",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("compute"),
                 descriptor: Arc::from("(I)I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -34490,7 +34490,7 @@ mod tests {
     #[test]
     fn reflect_method_get_parameter_count() {
         // Verify Method.getParameterCount() returns correct count
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
@@ -34500,7 +34500,7 @@ mod tests {
             "test/ParamCount",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("threeArgs"),
                 descriptor: Arc::from("(IJD)V"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -34558,8 +34558,8 @@ mod tests {
     #[test]
     fn m19_class_declares_finalize_detected() {
         // A class overriding finalize()V should have declares_finalize() == true
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(
@@ -34567,14 +34567,14 @@ mod tests {
             "test/WithFinalizer",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("finalize"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                    code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34623,8 +34623,8 @@ mod tests {
         // Register a test class with a finalize()V bytecode method (just return),
         // allocate an object of that class, enqueue for finalization, and verify
         // run_pending_finalizers invokes it.
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(
@@ -34632,14 +34632,14 @@ mod tests {
             "test/Finalizable",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("finalize"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                    code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -34661,8 +34661,8 @@ mod tests {
 
     #[test]
     fn m19_multiple_finalizers_run_in_order() {
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(
@@ -34670,14 +34670,14 @@ mod tests {
             "test/FinMulti",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("finalize"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
                 attributes: vec![Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                    code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 })],
@@ -38033,7 +38033,7 @@ mod tests {
         // T2.6.15 seeded the registry with the five standard Sun providers
         // (SUN, SunJCE, SunRsaSign, SunEC, SunJSSE) to match the JDK's
         // default provider list; earlier revisions of this test asserted a
-        // single "RustJVM" entry, which predated that work.
+        // single "CratonVM" entry, which predated that work.
         assert_eq!(shared.heap.array_length(arr), 5);
         let prov = shared.heap.get_array_element(arr, 0).unwrap();
         let prov_ref = prov.as_object().unwrap().unwrap();
@@ -42576,7 +42576,7 @@ mod tests {
         let name_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
             read_java_string(&shared.heap, name_ref),
-            Some("RustJVM".to_string())
+            Some("CratonVM".to_string())
         );
         let version = call_native(
             &shared,
@@ -43170,7 +43170,7 @@ mod tests {
         let name_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
             read_java_string(&shared.heap, name_ref),
-            Some("RustJVM JIT".to_string())
+            Some("CratonVM JIT".to_string())
         );
     }
 
@@ -45662,7 +45662,7 @@ mod tests {
         // Build a tiny JAR with:
         //   META-INF/services/com.example.MyService  РІвЂ вЂ™ com.example.FooImpl
         //   (FooImpl class file is absent РІР‚вЂќ loader should gracefully skip it)
-        let tmp = std::env::temp_dir().join("rustjvm_sl_test.jar");
+        let tmp = std::env::temp_dir().join("cratonvm_sl_test.jar");
         {
             let file = std::fs::File::create(&tmp).unwrap();
             let mut zw = zip::ZipWriter::new(file);
@@ -45749,7 +45749,7 @@ mod tests {
         if let Some(sid) = string_id {
             // Build a services JAR that lists java.lang.String as a provider of itself
             // (semantically silly but tests the machinery)
-            let tmp = std::env::temp_dir().join("rustjvm_sl_test2.jar");
+            let tmp = std::env::temp_dir().join("cratonvm_sl_test2.jar");
             {
                 let file = std::fs::File::create(&tmp).unwrap();
                 let mut zw = zip::ZipWriter::new(file);
@@ -52495,8 +52495,8 @@ mod tests {
     #[test]
     fn record_class_with_components_tostring() {
         use crate::classloading::{Class, ClassLoaderId, ClassState, RecordComponentInfo};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
@@ -52508,12 +52508,12 @@ mod tests {
             cm.class_store.add(Class {
                 id,
                 loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("com/example/Point"),
+                name: cratonvm_types::intern_arc("com/example/Point"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
                 state: ClassState::Loaded, initializing_thread: None,
-                constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                    rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+                constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                    cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
                 superclass: None,
@@ -52576,8 +52576,8 @@ mod tests {
     #[test]
     fn record_equals_different_classes() {
         use crate::classloading::{Class, ClassLoaderId, ClassState, RecordComponentInfo};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
@@ -52589,12 +52589,12 @@ mod tests {
             cm.class_store.add(Class {
                 id: id1,
                 loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("com/example/Point2D"),
+                name: cratonvm_types::intern_arc("com/example/Point2D"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
                 state: ClassState::Loaded, initializing_thread: None,
-                constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                    rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+                constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                    cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
                 superclass: None,
@@ -52633,12 +52633,12 @@ mod tests {
             cm.class_store.add(Class {
                 id: id2,
                 loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("com/example/Size"),
+                name: cratonvm_types::intern_arc("com/example/Size"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
                 state: ClassState::Loaded, initializing_thread: None,
-                constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                    rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+                constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                    cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
                 superclass: None,
@@ -52726,8 +52726,8 @@ mod tests {
     fn native_context_record_sealed_methods() {
         use crate::classloading::{Class, ClassLoaderId, ClassState, RecordComponentInfo};
         use crate::native::registry::NativeContext;
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
@@ -52738,12 +52738,12 @@ mod tests {
             cm.class_store.add(Class {
                 id: rid,
                 loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("test/Record1"),
+                name: cratonvm_types::intern_arc("test/Record1"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
                 state: ClassState::Loaded, initializing_thread: None,
-                constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                    rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+                constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                    cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
                 superclass: None,
@@ -52777,12 +52777,12 @@ mod tests {
             cm.class_store.add(Class {
                 id: sid,
                 loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("test/Sealed1"),
+                name: cratonvm_types::intern_arc("test/Sealed1"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
                 state: ClassState::Loaded, initializing_thread: None,
-                constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                    rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+                constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                    cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
                 superclass: None,
@@ -52813,12 +52813,12 @@ mod tests {
             cm.class_store.add(Class {
                 id: pid,
                 loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("test/Plain1"),
+                name: cratonvm_types::intern_arc("test/Plain1"),
                 source_file: None,
                 version: ClassFileVersion::JAVA_8,
                 state: ClassState::Loaded, initializing_thread: None,
-                constant_pool: rustjvm_reader::constant_pool::ConstantPool::new(vec![
-                    rustjvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
+                constant_pool: cratonvm_reader::constant_pool::ConstantPool::new(vec![
+                    cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
                 ]),
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
                 superclass: None,
@@ -53793,7 +53793,7 @@ mod tests {
 
     #[test]
     fn class_file_version_java_25_supported() {
-        use rustjvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
         assert!(ClassFileVersion::JAVA_22.is_supported());
         assert!(ClassFileVersion::JAVA_23.is_supported());
         assert!(ClassFileVersion::JAVA_24.is_supported());
@@ -55381,12 +55381,12 @@ mod tests {
         // bytecode verification. This tests R1: interface subtyping in verifier.
         // The class has a method calling Pattern.matcher(CharSequence) with a String arg.
         use crate::classloading::bytecode_verifier::verify_bytecode;
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-        use rustjvm_reader::method::ClassFileMethod;
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::method::ClassFileMethod;
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
         use crate::{Class, ClassId, ClassLoaderId, ClassState};
 
         // This tests the invokevirtual arg-type check:
@@ -55429,7 +55429,7 @@ mod tests {
         let code = CodeAttribute {
             max_stack: 2,
             max_locals: 2,
-            code: rustjvm_reader::ByteView::from_vec(vec![
+            code: cratonvm_reader::ByteView::from_vec(vec![
                 0x2B,             // aload_1 (Pattern, local 1)
                 0x2A,             // aload_0 (String, local 0)
                 0xB6, 0x00, 0x01, // invokevirtual #1  Pattern.matcher(CharSequence)
@@ -55449,7 +55449,7 @@ mod tests {
         let class = Class {
             id: ClassId::new(999),
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc("TestClass"),
+            name: cratonvm_types::intern_arc("TestClass"),
             source_file: None,
             version: ClassFileVersion::JAVA_11,
             state: ClassState::Verifying, initializing_thread: None,
@@ -59133,9 +59133,9 @@ mod tests {
     #[test]
     fn m7_gc_heap_alloc_does_not_panic_on_zero_fields() {
         // Allocating an object with 0 fields should succeed, not panic
-        use rustjvm_gc::VmHeap;
-        use rustjvm_types::ClassId;
-        let heap = VmHeap::new(rustjvm_gc::GcBackend::Generational, 1024 * 1024);
+        use cratonvm_gc::VmHeap;
+        use cratonvm_types::ClassId;
+        let heap = VmHeap::new(cratonvm_gc::GcBackend::Generational, 1024 * 1024);
         let obj = heap.alloc_object(ClassId::new(0), 0);
         // ObjectRef is always non-null from successful allocation
         let _ = obj;
@@ -59144,9 +59144,9 @@ mod tests {
     #[test]
     fn m7_gc_heap_alloc_array_zero_length() {
         // Allocating a zero-length array should succeed
-        use rustjvm_gc::{VmHeap, ArrayElementType};
-        use rustjvm_types::ClassId;
-        let heap = VmHeap::new(rustjvm_gc::GcBackend::Generational, 1024 * 1024);
+        use cratonvm_gc::{VmHeap, ArrayElementType};
+        use cratonvm_types::ClassId;
+        let heap = VmHeap::new(cratonvm_gc::GcBackend::Generational, 1024 * 1024);
         let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 0);
         let _ = arr;
     }
@@ -59181,11 +59181,11 @@ mod tests {
     fn m2_default_interface_method_resolution() {
         // Verify that find_method_recursive finds default methods on interfaces
         // when the concrete class doesn't override them.
-        use rustjvm_classloading::{ClassStore, Class, ClassState, ClassLoaderId, find_method_recursive};
-        use rustjvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::method::ClassFileMethod;
+        use cratonvm_classloading::{ClassStore, Class, ClassState, ClassLoaderId, find_method_recursive};
+        use cratonvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::method::ClassFileMethod;
 
         let mut store = ClassStore::new();
 
@@ -59487,7 +59487,7 @@ mod tests {
     #[test]
     fn m4_try_alloc_object_returns_none_on_oom() {
         // Verify try_alloc_object returns None instead of panicking
-        use rustjvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{VmHeap, GcBackend};
         let heap = VmHeap::new(GcBackend::Generational, 4096); // tiny heap
         // Try to allocate a large object РІР‚вЂќ should return None
         let result = heap.try_alloc_object(ClassId::new(0), 10_000);
@@ -59496,7 +59496,7 @@ mod tests {
 
     #[test]
     fn m4_try_alloc_array_returns_none_on_oom() {
-        use rustjvm_gc::{VmHeap, GcBackend, ArrayElementType};
+        use cratonvm_gc::{VmHeap, GcBackend, ArrayElementType};
         let heap = VmHeap::new(GcBackend::Generational, 4096); // tiny heap
         let result = heap.try_alloc_array(ClassId::new(0), ArrayElementType::Long, 100_000);
         assert!(result.is_none(), "try_alloc_array should return None on OOM, not panic");
@@ -59513,7 +59513,7 @@ mod tests {
         // Allocate 2000 arrays
         for _ in 0..2000 {
             let _arr = shared.heap.alloc_array(
-                ClassId::new(0), rustjvm_gc::ArrayElementType::Int, 100,
+                ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100,
             );
         }
     }
@@ -59522,7 +59522,7 @@ mod tests {
     fn m4_heap_expansion_under_pressure() {
         // With 256KB heap, GC must run to survive 2000 allocations.
         // Using try_alloc + GC pattern that the interpreter uses.
-        use rustjvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{VmHeap, GcBackend};
 
         let heap = VmHeap::new(GcBackend::Generational, 256 * 1024); // 256 KB
         let monitors = crate::threading::monitor::MonitorTable::new();
@@ -59543,7 +59543,7 @@ mod tests {
     #[test]
     fn m4_tlab_basic_alloc() {
         // Verify TLAB allocates objects correctly.
-        use rustjvm_gc::Tlab;
+        use cratonvm_gc::Tlab;
         let mut buf = vec![0u8; 4096];
         let mut tlab = unsafe { Tlab::new(buf.as_mut_ptr(), 4096) };
         assert!(!tlab.is_empty());
@@ -59555,7 +59555,7 @@ mod tests {
     #[test]
     fn m4_tlab_refill_from_heap() {
         // Verify the heap can carve out TLABs.
-        use rustjvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{VmHeap, GcBackend};
         let heap = VmHeap::new(GcBackend::Generational, 4 * 1024 * 1024);
         let result = heap.refill_tlab(64 * 1024);
         assert!(result.is_some(), "refill_tlab should succeed on fresh heap");
@@ -59567,7 +59567,7 @@ mod tests {
     #[test]
     fn m4_arena_grow() {
         // Verify arena can expand capacity.
-        use rustjvm_gc::arena::Arena;
+        use cratonvm_gc::arena::Arena;
         let mut arena = Arena::new(1024);
         assert_eq!(arena.capacity(), 1024);
         arena.grow(4096);
@@ -59580,7 +59580,7 @@ mod tests {
     #[test]
     fn m4_gc_with_expandable_heap() {
         // Heap starts small, GC runs when needed.
-        use rustjvm_gc::{VmHeap, GcBackend};
+        use cratonvm_gc::{VmHeap, GcBackend};
 
         let heap = VmHeap::new(GcBackend::Generational, 256 * 1024); // 256 KB
         let monitors = crate::threading::monitor::MonitorTable::new();
@@ -59617,7 +59617,7 @@ mod tests {
         }
         for _ in 0..5_000 {
             let _arr = shared.heap.alloc_array(
-                ClassId::new(0), rustjvm_gc::ArrayElementType::Int, 50,
+                ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 50,
             );
         }
     }
@@ -59780,7 +59780,7 @@ mod tests {
         // Two threads write to different elements of a shared array.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let arr = shared.heap.alloc_array(
-            ClassId::new(0), rustjvm_gc::ArrayElementType::Int, 100,
+            ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100,
         );
 
         let s1 = shared.clone();
@@ -59847,7 +59847,7 @@ mod tests {
                 for _ in 0..200 {
                     let _obj = s.heap.alloc_object(ClassId::new(0), 2);
                     let _arr = s.heap.alloc_array(
-                        ClassId::new(0), rustjvm_gc::ArrayElementType::Int, 10,
+                        ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 10,
                     );
                 }
             })
@@ -59863,8 +59863,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build a ConstantPool with UTF-8 entries at 1-based indices.
-    fn annotation_cp(entries: &[&str]) -> rustjvm_reader::constant_pool::ConstantPool {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    fn annotation_cp(entries: &[&str]) -> cratonvm_reader::constant_pool::ConstantPool {
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let mut cp_entries = vec![ConstantPoolEntry::Tombstone]; // index 0
         for s in entries {
             cp_entries.push(ConstantPoolEntry::Utf8((*s).into()));
@@ -59873,8 +59873,8 @@ mod tests {
     }
 
     /// Helper: build a reader Annotation (no elements).
-    fn mk_annotation(type_index: u16) -> rustjvm_reader::attribute::Annotation {
-        rustjvm_reader::attribute::Annotation {
+    fn mk_annotation(type_index: u16) -> cratonvm_reader::attribute::Annotation {
+        cratonvm_reader::attribute::Annotation {
             type_index,
             element_value_pairs: vec![],
         }
@@ -59883,9 +59883,9 @@ mod tests {
     /// Helper: build a reader Annotation with element-value pairs.
     fn mk_annotation_with_elems(
         type_index: u16,
-        pairs: Vec<rustjvm_reader::attribute::ElementValuePair>,
-    ) -> rustjvm_reader::attribute::Annotation {
-        rustjvm_reader::attribute::Annotation {
+        pairs: Vec<cratonvm_reader::attribute::ElementValuePair>,
+    ) -> cratonvm_reader::attribute::Annotation {
+        cratonvm_reader::attribute::Annotation {
             type_index,
             element_value_pairs: pairs,
         }
@@ -59906,7 +59906,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_with_string_element() {
-        use rustjvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
         // @Service(value="myService")
         // CP: [0]=Tombstone, [1]="Lorg/springframework/stereotype/Service;", [2]="value", [3]="myService"
         let cp = annotation_cp(&[
@@ -59934,8 +59934,8 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_with_int_element() {
-        use rustjvm_reader::attribute::{ElementValuePair, ElementValue};
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         // @Retention(value=1)  РІР‚вЂќ simplified: int element
         // CP: [0]=Tombstone, [1]="Ljava/lang/annotation/Retention;", [2]="value", [3]=Integer(1)
         let cp = ConstantPool::new(vec![
@@ -59960,7 +59960,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_with_enum_element() {
-        use rustjvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
         // @Retention(RetentionPolicy.RUNTIME)
         // CP: [0]=Tombstone, [1]="Ljava/lang/annotation/Retention;", [2]="value",
         //     [3]="Ljava/lang/annotation/RetentionPolicy;", [4]="RUNTIME"
@@ -59988,7 +59988,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_invalid_cp_index_returns_none() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         // Annotation with type_index pointing beyond CP bounds.
         let cp = ConstantPool::new(vec![ConstantPoolEntry::Tombstone]);
         let ann = mk_annotation(99); // index 99 doesn't exist
@@ -60000,9 +60000,9 @@ mod tests {
     fn m12_class_annotations_via_shared_vm() {
         // Build a Class with annotations, register it in SharedVm, and verify
         // class_annotations() returns the correct data.
-        use rustjvm_classloading::{Class, ClassState, ClassLoaderId};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_classloading::{Class, ClassState, ClassLoaderId};
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
@@ -60015,7 +60015,7 @@ mod tests {
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id, loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("com/example/MyService"), source_file: None,
+                name: cratonvm_types::intern_arc("com/example/MyService"), source_file: None,
                 version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
                 constant_pool: cp,
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
@@ -60060,9 +60060,9 @@ mod tests {
     #[test]
     fn m12_multiple_annotations_on_class() {
         // A class with @Component + @Service should return both.
-        use rustjvm_classloading::{Class, ClassState, ClassLoaderId};
-        use rustjvm_reader::class_access_flags::ClassAccessFlags;
-        use rustjvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_classloading::{Class, ClassState, ClassLoaderId};
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
@@ -60079,7 +60079,7 @@ mod tests {
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id, loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("com/example/DualAnnotated"), source_file: None,
+                name: cratonvm_types::intern_arc("com/example/DualAnnotated"), source_file: None,
                 version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
                 constant_pool: cp,
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
@@ -60108,7 +60108,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_nested() {
-        use rustjvm_reader::attribute::{Annotation, ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{Annotation, ElementValuePair, ElementValue};
         // @Outer(inner=@Inner)
         // CP: [0]=Tombstone, [1]="Louter;", [2]="inner", [3]="Linner;"
         let cp = annotation_cp(&["Louter;", "inner", "Linner;"]);
@@ -60131,7 +60131,7 @@ mod tests {
 
     #[test]
     fn m12_convert_annotation_array_element() {
-        use rustjvm_reader::attribute::{ElementValuePair, ElementValue};
+        use cratonvm_reader::attribute::{ElementValuePair, ElementValue};
         // @Target({ElementType.TYPE, ElementType.FIELD})  РІР‚вЂќ simplified as string array
         // CP: [0]=Tombstone, [1]="Ltarget;", [2]="value", [3]="TYPE", [4]="FIELD"
         let cp = annotation_cp(&["Ltarget;", "value", "TYPE", "FIELD"]);
@@ -60169,15 +60169,15 @@ mod tests {
 
         let class_id;
         {
-            use rustjvm_classloading::{Class, ClassState, ClassLoaderId};
-            use rustjvm_reader::class_access_flags::ClassAccessFlags;
-            use rustjvm_reader::class_file_version::ClassFileVersion;
+            use cratonvm_classloading::{Class, ClassState, ClassLoaderId};
+            use cratonvm_reader::class_access_flags::ClassAccessFlags;
+            use cratonvm_reader::class_file_version::ClassFileVersion;
 
             let mut cm = shared.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id, loader_id: ClassLoaderId::Application,
-                name: rustjvm_types::intern_arc("com/example/Plain"), source_file: None,
+                name: cratonvm_types::intern_arc("com/example/Plain"), source_file: None,
                 version: ClassFileVersion::JAVA_8, state: ClassState::Loaded, initializing_thread: None,
                 constant_pool: cp,
                 access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
@@ -60413,8 +60413,8 @@ mod tests {
         name: &str,
         field_defs: &[(&str, &str)], // (name, descriptor)
     ) -> ClassId {
-        use rustjvm_reader::class_access_flags::FieldAccessFlags;
-        use rustjvm_reader::field::ClassFileField;
+        use cratonvm_reader::class_access_flags::FieldAccessFlags;
+        use cratonvm_reader::field::ClassFileField;
 
         let fields: Vec<ClassFileField> = field_defs.iter().map(|(n, d)| {
             ClassFileField {
@@ -61193,7 +61193,7 @@ mod tests {
     fn m17_define_class_rejects_invalid_magic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bad_bytes = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Byte, 10);
+        let bad_bytes = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
         for i in 0..10 {
             let _ = shared.heap.set_array_element(bad_bytes, i, Value::Int(0));
         }
@@ -61216,7 +61216,7 @@ mod tests {
     fn m17_define_class_rejects_negative_offset() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bytes = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Byte, 10);
+        let bytes = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
         let cl = shared.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/Neg");
         let result = call_native(
@@ -61236,7 +61236,7 @@ mod tests {
     fn m17_define_class_rejects_out_of_bounds() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bytes = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Byte, 10);
+        let bytes = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
         let cl = shared.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/OOB");
         let result = call_native(
@@ -62076,7 +62076,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Real JDK Field layout + RustJVM extra slots:
+        // Real JDK Field layout + CratonVM extra slots:
         //   0=override, 1=clazz, 2=slot, 3=name, 4=type,
         //   5=modifiers, 6=trustedFinal, then extras [desc, rj_slot, accessible].
         // field_extra_base floors at 7 slots when class_num_total_fields(Field)
@@ -63314,7 +63314,7 @@ mod tests {
 
     /// Helper: create a SharedVm with custom native methods registered.
     fn m6_shared_with_natives(
-        registrations: &[(&str, &str, &str, fn(&mut dyn rustjvm_native_api::NativeContext, &[Value]) -> MethodCallResult)],
+        registrations: &[(&str, &str, &str, fn(&mut dyn cratonvm_native_api::NativeContext, &[Value]) -> MethodCallResult)],
     ) -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
         for &(class_name, method_name, descriptor, callback) in registrations {
@@ -63334,7 +63334,7 @@ mod tests {
 
         static CALL_COUNT: AtomicI32 = AtomicI32::new(0);
 
-        fn native_add(_ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_add(_ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             CALL_COUNT.fetch_add(1, Ordering::SeqCst);
             let a = match args.get(0) { Some(Value::Int(v)) => *v, _ => 0 };
             let b = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
@@ -63383,7 +63383,7 @@ mod tests {
 
         static COUNTER: AtomicI32 = AtomicI32::new(0);
 
-        fn native_increment_synchronized(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_increment_synchronized(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             // args[0] = lock object, args[1] = iteration count
             let lock_obj = match args.get(0) {
                 Some(Value::Object(Some(obj))) => *obj,
@@ -63446,7 +63446,7 @@ mod tests {
         static PRODUCED: AtomicBool = AtomicBool::new(false);
         static CONSUMED: AtomicI32 = AtomicI32::new(0);
 
-        fn native_consumer(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_consumer(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let lock_obj = match args.get(0) {
                 Some(Value::Object(Some(obj))) => *obj,
                 _ => return Ok(None),
@@ -63460,7 +63460,7 @@ mod tests {
             Ok(None)
         }
 
-        fn native_producer(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_producer(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let lock_obj = match args.get(0) {
                 Some(Value::Object(Some(obj))) => *obj,
                 _ => return Ok(None),
@@ -63513,7 +63513,7 @@ mod tests {
         // Two threads call native methods via invoke_shared that allocate objects
         // on the shared heap. Proves end-to-end thread safety of the full
         // invoke_shared РІвЂ вЂ™ native callback РІвЂ вЂ™ heap allocation path.
-        fn native_alloc_objects(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_alloc_objects(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let count = match args.get(0) { Some(Value::Int(v)) => *v, _ => 10 };
             let mut last_obj = None;
             for i in 0..count {
@@ -63559,7 +63559,7 @@ mod tests {
     fn m6_concurrent_class_loading_via_invoke() {
         // Two threads load different classes concurrently.
         // Proves the class manager's RwLock allows safe concurrent access.
-        fn native_noop(_ctx: &mut dyn rustjvm_native_api::NativeContext, _args: &[Value]) -> MethodCallResult {
+        fn native_noop(_ctx: &mut dyn cratonvm_native_api::NativeContext, _args: &[Value]) -> MethodCallResult {
             Ok(Some(Value::Int(1)))
         }
 
@@ -63607,7 +63607,7 @@ mod tests {
 
         static WRITER_DONE: AtomicBool = AtomicBool::new(false);
 
-        fn native_volatile_write(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_volatile_write(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let obj = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             // Write value 42 via volatile semantics
             ctx.set_field_volatile(obj, 0, Value::Int(42));
@@ -63615,7 +63615,7 @@ mod tests {
             Ok(None)
         }
 
-        fn native_volatile_read(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_volatile_read(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let obj = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             // Spin-read the volatile field until writer is done
             for _ in 0..100_000 {
@@ -63699,7 +63699,7 @@ mod tests {
 
         static ITEMS_CONSUMED: AtomicI32 = AtomicI32::new(0);
 
-        fn native_produce_items(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_produce_items(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             let queue = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             for i in 0..5 {
@@ -63715,7 +63715,7 @@ mod tests {
             Ok(None)
         }
 
-        fn native_consume_items(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_consume_items(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             let queue = match args.get(1) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             let mut consumed = 0;
@@ -63780,7 +63780,7 @@ mod tests {
 
         static COUNTER: AtomicI32 = AtomicI32::new(0);
 
-        fn native_increment(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_increment(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             let n = match args.get(1) { Some(Value::Int(v)) => *v, _ => 50 };
             for _ in 0..n {
@@ -63823,7 +63823,7 @@ mod tests {
     fn p86_synchronized_block_reentrant() {
         // A single thread re-enters a synchronized block (recursive monitor lock).
         // Proves monitor reentrancy doesn't deadlock.
-        fn native_reentrant(ctx: &mut dyn rustjvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
+        fn native_reentrant(ctx: &mut dyn cratonvm_native_api::NativeContext, args: &[Value]) -> MethodCallResult {
             let lock = match args.get(0) { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
             ctx.monitor_enter(lock);
             ctx.monitor_enter(lock); // reentrant
@@ -64304,7 +64304,7 @@ mod tests {
         use crate::vm::vm_exec::safe_native_call;
 
         fn panicking_native(
-            _ctx: &mut dyn rustjvm_native_api::NativeContext,
+            _ctx: &mut dyn cratonvm_native_api::NativeContext,
             _args: &[Value],
         ) -> MethodCallResult {
             panic!("deliberate test panic in native method");
@@ -64331,7 +64331,7 @@ mod tests {
         use crate::vm::vm_exec::safe_native_call;
 
         fn normal_native(
-            _ctx: &mut dyn rustjvm_native_api::NativeContext,
+            _ctx: &mut dyn cratonvm_native_api::NativeContext,
             _args: &[Value],
         ) -> MethodCallResult {
             Ok(Some(Value::Int(42)))
@@ -64530,14 +64530,14 @@ mod tests {
         let shared = p90_shared();
         let rec_id = {
             let mut fr = shared.flight_recorder.lock();
-            let id = fr.new_recording(rustjvm_jfr::RecordingSettings::new("test"));
+            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         // Emit a GC event
         {
             let mut fr = shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_gc_event(
+            cratonvm_jfr::builtin::emit_gc_event(
                 &mut fr, 1, "YoungGC", "Allocation Failure", 1000, 500,
             );
         }
@@ -64554,13 +64554,13 @@ mod tests {
         let shared = p90_shared();
         let rec_id = {
             let mut fr = shared.flight_recorder.lock();
-            let id = fr.new_recording(rustjvm_jfr::RecordingSettings::new("test"));
+            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
             let mut fr = shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_class_load_event(
+            cratonvm_jfr::builtin::emit_class_load_event(
                 &mut fr, "java/lang/Object", "app", "app", 1000, 200,
             );
         }
@@ -64577,16 +64577,16 @@ mod tests {
         let shared = p90_shared();
         let rec_id = {
             let mut fr = shared.flight_recorder.lock();
-            let id = fr.new_recording(rustjvm_jfr::RecordingSettings::new("test"));
+            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
             let mut fr = shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_thread_start_event(
+            cratonvm_jfr::builtin::emit_thread_start_event(
                 &mut fr, "worker-1", "platform", 1, 1000,
             );
-            rustjvm_jfr::builtin::emit_thread_end_event(
+            cratonvm_jfr::builtin::emit_thread_end_event(
                 &mut fr, "worker-1", 1, 2000,
             );
         }
@@ -64603,13 +64603,13 @@ mod tests {
         let shared = p90_shared();
         let rec_id = {
             let mut fr = shared.flight_recorder.lock();
-            let id = fr.new_recording(rustjvm_jfr::RecordingSettings::new("test"));
+            let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
             let mut fr = shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_compilation_event(
+            cratonvm_jfr::builtin::emit_compilation_event(
                 &mut fr,
                 "com/example/Main::main([Ljava/lang/String;)V",
                 1, 4, true, false, 0, 0, 1000, 500,
@@ -64761,15 +64761,15 @@ mod tests {
             "test/HelloBudget",
             0x0021,
             &[],
-            &[rustjvm_reader::method::ClassFileMethod {
+            &[cratonvm_reader::method::ClassFileMethod {
                 name: Arc::from("main"),
                 descriptor: Arc::from("()I"),
-                access_flags: rustjvm_reader::class_access_flags::MethodAccessFlags::from_bits_truncate(0x0009),
-                attributes: vec![rustjvm_reader::attribute::Attribute::Code(
-                    rustjvm_reader::attribute::CodeAttribute {
+                access_flags: cratonvm_reader::class_access_flags::MethodAccessFlags::from_bits_truncate(0x0009),
+                attributes: vec![cratonvm_reader::attribute::Attribute::Code(
+                    cratonvm_reader::attribute::CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
-                        code: rustjvm_reader::ByteView::from_vec(vec![0x04, 0xAC]), // iconst_1; ireturn
+                        code: cratonvm_reader::ByteView::from_vec(vec![0x04, 0xAC]), // iconst_1; ireturn
                         exception_table: vec![],
                         attributes: vec![],
                     },
@@ -64876,15 +64876,15 @@ public class SkippedTest {
         let source = r#"/*
  * @test
  * @summary Test magic number detection
- * @run main rustjvm.TckClassFile
+ * @run main cratonvm.TckClassFile
  */
 "#;
-        let desc = runner.parse_test("rustjvm/TckClassFile.java", source);
+        let desc = runner.parse_test("cratonvm/TckClassFile.java", source);
         assert!(desc.is_test);
-        assert_eq!(desc.main_class.as_deref(), Some("rustjvm.TckClassFile"));
+        assert_eq!(desc.main_class.as_deref(), Some("cratonvm.TckClassFile"));
 
         // Execute the test РІР‚вЂќ the .class file already exists from build.rs
-        let class_path = format!("{}/rustjvm/TckClassFile.class", test_dir);
+        let class_path = format!("{}/cratonvm/TckClassFile.class", test_dir);
         if !std::path::Path::new(&class_path).exists() {
             // Skip if .class files not available
             return;
@@ -64894,7 +64894,7 @@ public class SkippedTest {
         let config = crate::config::VmConfig::new()
             .with_classpath(vec![test_dir.clone()]);
         let mut vm = crate::vm::Vm::new(config);
-        let result = vm.invoke("rustjvm/TckClassFile", "testMagicNumber", "()I", &[]);
+        let result = vm.invoke("cratonvm/TckClassFile", "testMagicNumber", "()I", &[]);
         assert!(result.is_ok(), "testMagicNumber should succeed: {:?}", result);
         match result.unwrap() {
             Some(Value::Int(1)) => {} // PASS
@@ -64918,14 +64918,14 @@ public class SkippedTest {
     fn p97_core_tck_chapter4_class_file_format() {
         // Run JVMS Chapter 4 tests: class file structure
         let test_dir = format!("{}/tests/resources", env!("CARGO_MANIFEST_DIR"));
-        let class_path = format!("{}/rustjvm/TckClassFile.class", test_dir);
+        let class_path = format!("{}/cratonvm/TckClassFile.class", test_dir);
         if !std::path::Path::new(&class_path).exists() {
             return; // Skip if .class files not available
         }
 
         use crate::runtime::tck::CoreLanguageTck;
         let mut tck = CoreLanguageTck::new(&test_dir);
-        let results = tck.run_class_tests("rustjvm/TckClassFile", &[
+        let results = tck.run_class_tests("cratonvm/TckClassFile", &[
             ("testMagicNumber", 1),
             ("testClassVersion", 1),
             ("testConstantPool", 1),
@@ -64948,14 +64948,14 @@ public class SkippedTest {
     fn p97_core_tck_chapter5_loading_linking() {
         // Run JVMS Chapter 5 tests: loading, linking, initialization
         let test_dir = format!("{}/tests/resources", env!("CARGO_MANIFEST_DIR"));
-        let class_path = format!("{}/rustjvm/TckLoading.class", test_dir);
+        let class_path = format!("{}/cratonvm/TckLoading.class", test_dir);
         if !std::path::Path::new(&class_path).exists() {
             return;
         }
 
         use crate::runtime::tck::CoreLanguageTck;
         let mut tck = CoreLanguageTck::new(&test_dir);
-        let results = tck.run_class_tests("rustjvm/TckLoading", &[
+        let results = tck.run_class_tests("cratonvm/TckLoading", &[
             ("testClassLoading", 1),
             ("testStaticInit", 1),
             ("testInterfaceInit", 1),
@@ -64977,14 +64977,14 @@ public class SkippedTest {
     fn p97_core_tck_chapter6_instruction_set() {
         // Run JVMS Chapter 6 tests: instruction set
         let test_dir = format!("{}/tests/resources", env!("CARGO_MANIFEST_DIR"));
-        let class_path = format!("{}/rustjvm/TckInstructions.class", test_dir);
+        let class_path = format!("{}/cratonvm/TckInstructions.class", test_dir);
         if !std::path::Path::new(&class_path).exists() {
             return;
         }
 
         use crate::runtime::tck::CoreLanguageTck;
         let mut tck = CoreLanguageTck::new(&test_dir);
-        let results = tck.run_class_tests("rustjvm/TckInstructions", &[
+        let results = tck.run_class_tests("cratonvm/TckInstructions", &[
             ("testIntArithmetic", 1),
             ("testLongArithmetic", 1),
             ("testFloatArithmetic", 1),
@@ -65014,7 +65014,7 @@ public class SkippedTest {
     fn p97_core_tck_full_pass_rate_tracking() {
         // Run all JVMS Chapter 4/5/6 tests and track overall pass rate
         let test_dir = format!("{}/tests/resources", env!("CARGO_MANIFEST_DIR"));
-        let class_path = format!("{}/rustjvm/TckClassFile.class", test_dir);
+        let class_path = format!("{}/cratonvm/TckClassFile.class", test_dir);
         if !std::path::Path::new(&class_path).exists() {
             return;
         }
@@ -65724,7 +65724,7 @@ public class SkippedTest {
         // Create stream of strings: ["a", "bb", "cc", "ddd", "ee"]
         // Classifier: String::length РІвЂ вЂ™ groups by length
         let words = ["a", "bb", "cc", "ddd", "ee"];
-        let arr = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Reference, words.len());
+        let arr = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Reference, words.len());
         for (i, w) in words.iter().enumerate() {
             let s = create_java_string(&shared, w);
             let _ = shared.heap.set_array_element(arr, i, Value::Object(Some(s)));
@@ -65785,7 +65785,7 @@ public class SkippedTest {
 
         // Stream of integers: [1, 2, 3, 4, 5]
         let nums: Vec<i32> = vec![1, 2, 3, 4, 5];
-        let arr = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Reference, nums.len());
+        let arr = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Reference, nums.len());
         for (i, n) in nums.iter().enumerate() {
             let boxed = shared.heap.alloc_object(ClassId::new(0), 1);
             shared.heap.set_field(boxed, 0, Value::Int(*n));
@@ -65834,7 +65834,7 @@ public class SkippedTest {
 
         // Stream of ["apple", "ant", "banana", "bat"]
         let words = ["apple", "ant", "banana", "bat"];
-        let arr = shared.heap.alloc_array(ClassId::new(0), rustjvm_types::ArrayElementType::Reference, words.len());
+        let arr = shared.heap.alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Reference, words.len());
         for (i, w) in words.iter().enumerate() {
             let s = create_java_string(&shared, w);
             let _ = shared.heap.set_array_element(arr, i, Value::Object(Some(s)));
@@ -65887,18 +65887,18 @@ public class SkippedTest {
     #[test]
     fn cds_dump_archive_to_file() {
         use std::io::Read;
-        let tmp = std::env::temp_dir().join("rustjvm_cds_test_dump.jsa");
+        let tmp = std::env::temp_dir().join("cratonvm_cds_test_dump.jsa");
         let tmp_path = tmp.to_string_lossy().into_owned();
 
         // Use the generator directly (dump_cds_archive delegates to this in production)
-        let mut gen = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
-        gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+        let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
+        gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
             "java/lang/StringBuilder", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01],
         ));
-        gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+        gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
             "java/lang/Integer", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x02],
         ));
-        gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+        gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
             "java/util/ArrayList", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03],
         ));
         assert_eq!(gen.entry_count(), 3, "Should have 3 entries to dump");
@@ -65912,7 +65912,7 @@ public class SkippedTest {
         assert_eq!(magic, 0xF00D_1234, "Archive should start with CDS magic");
 
         // Verify we can round-trip load it
-        let mut loader = rustjvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
+        let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
         assert!(loader.try_load(), "Should be able to load the dumped archive");
         assert_eq!(loader.classes_loaded(), 3, "Should load all 3 classes");
 
@@ -65923,23 +65923,23 @@ public class SkippedTest {
     /// 94.1 Test 2: Load a dumped archive and verify entries.
     #[test]
     fn cds_load_archive_entries() {
-        let tmp = std::env::temp_dir().join("rustjvm_cds_test_load.jsa");
+        let tmp = std::env::temp_dir().join("cratonvm_cds_test_load.jsa");
         let tmp_path = tmp.to_string_lossy().into_owned();
 
         // Generate an archive with known classes
         {
-            let mut gen = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
-            gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+            let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
+            gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                 "test/Alpha", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01],
             ));
-            gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+            gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                 "test/Beta", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x02],
             ));
             gen.write_archive().expect("write should succeed");
         }
 
         // Load it back
-        let mut loader = rustjvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
+        let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
         assert!(loader.try_load(), "Archive should load successfully");
         assert_eq!(loader.classes_loaded(), 2);
 
@@ -65959,13 +65959,13 @@ public class SkippedTest {
     #[test]
     fn cds_checksum_verification() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join("rustjvm_cds_test_checksum.jsa");
+        let tmp = std::env::temp_dir().join("cratonvm_cds_test_checksum.jsa");
         let tmp_path = tmp.to_string_lossy().into_owned();
 
         // Write a valid archive
         {
-            let mut gen = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
-            gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+            let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
+            gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                 "test/Foo", 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x03],
             ));
             gen.write_archive().expect("write should succeed");
@@ -65983,7 +65983,7 @@ public class SkippedTest {
         }
 
         // Loading should fail due to checksum mismatch
-        let mut loader = rustjvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
+        let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
         assert!(!loader.try_load(), "Corrupted archive should fail to load");
         assert_eq!(loader.classes_loaded(), 0);
 
@@ -65993,14 +65993,14 @@ public class SkippedTest {
     /// 94.2 Test 1: Classes load from CDS archive on startup.
     #[test]
     fn cds_classes_load_from_archive() {
-        let tmp = std::env::temp_dir().join("rustjvm_cds_test_startup.jsa");
+        let tmp = std::env::temp_dir().join("cratonvm_cds_test_startup.jsa");
         let tmp_path = tmp.to_string_lossy().into_owned();
 
         // Create archive with fake class bytes
         let fake_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x34, 0x00, 0x00];
         {
-            let mut gen = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
-            gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+            let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
+            gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                 "test/CdsLoaded", 0, fake_bytes.clone(),
             ));
             gen.write_archive().expect("write should succeed");
@@ -66031,7 +66031,7 @@ public class SkippedTest {
     /// 94.2 Test 2: Class identity is preserved through dump-and-load cycle.
     #[test]
     fn cds_class_identity_preserved() {
-        let tmp = std::env::temp_dir().join("rustjvm_cds_test_identity.jsa");
+        let tmp = std::env::temp_dir().join("cratonvm_cds_test_identity.jsa");
         let tmp_path = tmp.to_string_lossy().into_owned();
 
         // Create known class bytes
@@ -66040,18 +66040,18 @@ public class SkippedTest {
 
         // Dump phase: write archive with known entries
         {
-            let mut gen = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
-            gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+            let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
+            gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                 "java/lang/StringBuilder", 0, sb_bytes.clone(),
             ));
-            gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+            gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                 "java/lang/Integer", 0, int_bytes.clone(),
             ));
             gen.write_archive().expect("dump should succeed");
         }
 
         // Load phase: verify bytes are identical
-        let mut loader = rustjvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
+        let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
         assert!(loader.try_load(), "Archive should load");
 
         let loaded_sb = loader.find_class_bytes("java/lang/StringBuilder");
@@ -66068,14 +66068,14 @@ public class SkippedTest {
     /// 94.2 Test 3: Startup time delta РІР‚вЂќ CDS loading is faster than cold loading.
     #[test]
     fn cds_startup_time_improvement() {
-        let tmp = std::env::temp_dir().join("rustjvm_cds_test_timing.jsa");
+        let tmp = std::env::temp_dir().join("cratonvm_cds_test_timing.jsa");
         let tmp_path = tmp.to_string_lossy().into_owned();
 
         // Create a valid archive with several entries
         {
-            let mut gen = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
+            let mut gen = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(&tmp_path);
             for i in 0..50 {
-                gen.add_entry(rustjvm_native_builtins::cds::CdsArchiveEntry::new(
+                gen.add_entry(cratonvm_native_builtins::cds::CdsArchiveEntry::new(
                     format!("bench/Class{}", i), 0, vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, i as u8],
                 ));
             }
@@ -66084,7 +66084,7 @@ public class SkippedTest {
 
         // Measure load time
         let start = std::time::Instant::now();
-        let mut loader = rustjvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
+        let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(&tmp_path);
         assert!(loader.try_load(), "Archive should load");
         let load_duration = start.elapsed();
 
@@ -66108,7 +66108,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_slot_lifecycle_new_prepopulate_update() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
@@ -66131,7 +66131,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_hit_rate_tracks_monomorphic_dispatch() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
 
         let mic = JitMICSlot::new();
         mic.prepopulate(5);
@@ -66145,7 +66145,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_megamorphic_detection_after_many_misses() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
 
         let mic = JitMICSlot::new();
         // Simulate dispatches to many different receiver types
@@ -66157,7 +66157,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_cache_update_on_class_change() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
@@ -66178,7 +66178,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_entry_ptr_direct_dispatch_simulation() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
@@ -66198,7 +66198,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_concurrent_hit_miss_stress() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::Arc;
 
         let mic = Arc::new(JitMICSlot::new());
@@ -66230,7 +66230,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_polymorphic_not_mono_not_mega() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
 
         let mic = JitMICSlot::new();
         // 60% hits, 40% misses РІР‚вЂќ not mono (< 90%), not mega (> 50%)
@@ -66242,7 +66242,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_needs_context_flag_propagates() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
@@ -66257,7 +66257,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_zero_entry_ptr_does_not_enable_fast_path() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
@@ -66274,7 +66274,7 @@ public class SkippedTest {
 
     #[test]
     fn s33_mic_update_after_prepopulate_preserves_class_id() {
-        use rustjvm_jit::JitMICSlot;
+        use cratonvm_jit::JitMICSlot;
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
@@ -66333,7 +66333,7 @@ public class SkippedTest {
         code.push(0); code.push(0); // padding
 
         // Verify it scans as compatible
-        assert!(rustjvm_jit::x64::is_jit_compatible(&code, code_len, "(I)I"));
+        assert!(cratonvm_jit::x64::is_jit_compatible(&code, code_len, "(I)I"));
     }
 
     #[test]
@@ -66366,7 +66366,7 @@ public class SkippedTest {
         let code_len = code.len();
         code.push(0); code.push(0);
 
-        assert!(rustjvm_jit::x64::is_jit_compatible(&code, code_len, "(I)I"));
+        assert!(cratonvm_jit::x64::is_jit_compatible(&code, code_len, "(I)I"));
     }
 
     #[test]
@@ -66411,7 +66411,7 @@ public class SkippedTest {
         code.push(0); code.push(0);
 
         let helpers = crate::jit::helpers::build_helpers();
-        let compiled = rustjvm_jit::x64::compile(
+        let compiled = cratonvm_jit::x64::compile(
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
@@ -66471,7 +66471,7 @@ public class SkippedTest {
         code.push(0); code.push(0);
 
         let helpers = crate::jit::helpers::build_helpers();
-        let compiled = rustjvm_jit::x64::compile(
+        let compiled = cratonvm_jit::x64::compile(
             &code, code_len, 1, 1, false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
@@ -66506,8 +66506,8 @@ public class SkippedTest {
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
         // Insert a dummy compiled method
-        let buf = rustjvm_jit::ExecutableBuffer::new(64).unwrap();
-        let compiled = rustjvm_jit::CompiledMethod::new(buf);
+        let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        let compiled = cratonvm_jit::CompiledMethod::new(buf);
         vm.jit_cache.write().put(
             "TestClass".into(),
             "testMethod".into(),
@@ -66522,14 +66522,14 @@ public class SkippedTest {
             "TestClass",
             "testMethod",
             "()V",
-            rustjvm_jit::deopt::DeoptReason::NullCheck,
+            cratonvm_jit::deopt::DeoptReason::NullCheck,
             42,
         );
 
         // The compiled method should be evicted from the JIT cache
         assert_eq!(vm.jit_cache.read().len(), 0);
         // First deopt for NullCheck should recommend Reinterpret (count-based: first occurrence)
-        assert_eq!(action, rustjvm_jit::deopt::DeoptAction::Reinterpret);
+        assert_eq!(action, cratonvm_jit::deopt::DeoptAction::Reinterpret);
     }
 
     #[test]
@@ -66538,44 +66538,44 @@ public class SkippedTest {
 
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_NULL_CHECK),
-            rustjvm_jit::deopt::DeoptReason::NullCheck,
+            cratonvm_jit::deopt::DeoptReason::NullCheck,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_CLASS_CHECK),
-            rustjvm_jit::deopt::DeoptReason::ClassCheck,
+            cratonvm_jit::deopt::DeoptReason::ClassCheck,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_BOUNDS_CHECK),
-            rustjvm_jit::deopt::DeoptReason::BoundsCheck,
+            cratonvm_jit::deopt::DeoptReason::BoundsCheck,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_DIV_BY_ZERO),
-            rustjvm_jit::deopt::DeoptReason::DivByZero,
+            cratonvm_jit::deopt::DeoptReason::DivByZero,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_RECEIVER_TYPE_CHANGED),
-            rustjvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
+            cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_CLASS_LOADING),
-            rustjvm_jit::deopt::DeoptReason::ClassLoading,
+            cratonvm_jit::deopt::DeoptReason::ClassLoading,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_UNCOMMON_TRAP),
-            rustjvm_jit::deopt::DeoptReason::UncommonTrap,
+            cratonvm_jit::deopt::DeoptReason::UncommonTrap,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_SPECULATION_FAILED),
-            rustjvm_jit::deopt::DeoptReason::SpeculationFailed,
+            cratonvm_jit::deopt::DeoptReason::SpeculationFailed,
         );
         assert_eq!(
             reason_code_to_deopt_reason(DEOPT_REASON_UNREACHED_CODE),
-            rustjvm_jit::deopt::DeoptReason::UnreachedCode,
+            cratonvm_jit::deopt::DeoptReason::UnreachedCode,
         );
         // Unknown codes default to UncommonTrap
         assert_eq!(
             reason_code_to_deopt_reason(999),
-            rustjvm_jit::deopt::DeoptReason::UncommonTrap,
+            cratonvm_jit::deopt::DeoptReason::UncommonTrap,
         );
     }
 
@@ -66594,10 +66594,10 @@ public class SkippedTest {
             "Foo",
             "bar",
             "()V",
-            rustjvm_jit::deopt::DeoptReason::UnreachedCode,
+            cratonvm_jit::deopt::DeoptReason::UnreachedCode,
             0,
         );
-        assert_eq!(action, rustjvm_jit::deopt::DeoptAction::MakeNotCompilable);
+        assert_eq!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Method should be in the jit_skip_set
         let skip = vm.jit_skip_set.read();
@@ -66618,7 +66618,7 @@ public class SkippedTest {
             let mut inv = vm.invalidation_manager.lock();
             inv.register_assumption(
                 "MyClass.myMethod:()V",
-                rustjvm_jit::deopt::CompilationAssumption::LeafClass(42),
+                cratonvm_jit::deopt::CompilationAssumption::LeafClass(42),
             );
         }
 
@@ -66628,7 +66628,7 @@ public class SkippedTest {
             "MyClass",
             "myMethod",
             "()V",
-            rustjvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
+            cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
             10,
         );
 
@@ -66658,7 +66658,7 @@ public class SkippedTest {
                 "Hot",
                 "loop",
                 "(I)I",
-                rustjvm_jit::deopt::DeoptReason::BoundsCheck,
+                cratonvm_jit::deopt::DeoptReason::BoundsCheck,
                 0,
             );
         }
@@ -66687,20 +66687,20 @@ public class SkippedTest {
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
-        let reason = rustjvm_jit::deopt::DeoptReason::BoundsCheck;
+        let reason = cratonvm_jit::deopt::DeoptReason::BoundsCheck;
 
         // First deopt РІвЂ вЂ™ Reinterpret
         let a1 = crate::jit::helpers::DeoptimizationController::deoptimize(
             &vm, "C", "m", "()V", reason, 0,
         );
-        assert_eq!(a1, rustjvm_jit::deopt::DeoptAction::Reinterpret);
+        assert_eq!(a1, cratonvm_jit::deopt::DeoptAction::Reinterpret);
 
         // Deopts 2..10 РІвЂ вЂ™ RecompileAndReinterpret (count < threshold/2 = 10)
         for _ in 1..10 {
             let a = crate::jit::helpers::DeoptimizationController::deoptimize(
                 &vm, "C", "m", "()V", reason, 0,
             );
-            assert_eq!(a, rustjvm_jit::deopt::DeoptAction::RecompileAndReinterpret);
+            assert_eq!(a, cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret);
         }
 
         // Deopts 11..20 РІвЂ вЂ™ MakeNotEntrant (count in threshold/2..threshold)
@@ -66708,14 +66708,14 @@ public class SkippedTest {
             let a = crate::jit::helpers::DeoptimizationController::deoptimize(
                 &vm, "C", "m", "()V", reason, 0,
             );
-            assert_eq!(a, rustjvm_jit::deopt::DeoptAction::MakeNotEntrant);
+            assert_eq!(a, cratonvm_jit::deopt::DeoptAction::MakeNotEntrant);
         }
 
         // Deopt 21+ РІвЂ вЂ™ MakeNotCompilable (count >= threshold)
         let a_final = crate::jit::helpers::DeoptimizationController::deoptimize(
             &vm, "C", "m", "()V", reason, 0,
         );
-        assert_eq!(a_final, rustjvm_jit::deopt::DeoptAction::MakeNotCompilable);
+        assert_eq!(a_final, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Method should now be in skip set
         assert!(vm.jit_skip_set.read().contains(&("C".into(), "m".into(), "()V".into())));
@@ -66735,15 +66735,15 @@ public class SkippedTest {
             let mut inv = vm.invalidation_manager.lock();
             inv.register_assumption(
                 "A.foo:()V",
-                rustjvm_jit::deopt::CompilationAssumption::LeafClass(100),
+                cratonvm_jit::deopt::CompilationAssumption::LeafClass(100),
             );
             inv.register_assumption(
                 "B.bar:()V",
-                rustjvm_jit::deopt::CompilationAssumption::LeafClass(100),
+                cratonvm_jit::deopt::CompilationAssumption::LeafClass(100),
             );
             inv.register_assumption(
                 "C.baz:()V",
-                rustjvm_jit::deopt::CompilationAssumption::LeafClass(200),
+                cratonvm_jit::deopt::CompilationAssumption::LeafClass(200),
             );
         }
 
@@ -66782,9 +66782,9 @@ public class SkippedTest {
 
         // Install a compiled entry for `Animal.speak:()V`. The JitCache
         // key is (Class, method, descriptor).
-        let buf = rustjvm_jit::ExecutableBuffer::new(64)
+        let buf = cratonvm_jit::ExecutableBuffer::new(64)
             .expect("failed to allocate executable buffer");
-        let compiled = rustjvm_jit::CompiledMethod::new(buf);
+        let compiled = cratonvm_jit::CompiledMethod::new(buf);
         vm.jit_cache.write().put(
             "Animal".into(),
             "speak".into(),
@@ -66806,7 +66806,7 @@ public class SkippedTest {
             let mut inv = vm.invalidation_manager.lock();
             inv.register_assumption(
                 "Animal.speak:()V",
-                rustjvm_jit::deopt::CompilationAssumption::LeafClass(animal_cid_u32),
+                cratonvm_jit::deopt::CompilationAssumption::LeafClass(animal_cid_u32),
             );
         }
 
@@ -66841,9 +66841,9 @@ public class SkippedTest {
             .ensure_synthetic_class("Unrelated", 0);
 
         // Install one unrelated compiled entry.
-        let buf = rustjvm_jit::ExecutableBuffer::new(64)
+        let buf = cratonvm_jit::ExecutableBuffer::new(64)
             .expect("failed to allocate executable buffer");
-        let compiled = rustjvm_jit::CompiledMethod::new(buf);
+        let compiled = cratonvm_jit::CompiledMethod::new(buf);
         vm.jit_cache.write().put(
             "Other".into(),
             "run".into(),
@@ -66906,10 +66906,10 @@ public class SkippedTest {
             "Loader",
             "load",
             "()V",
-            rustjvm_jit::deopt::DeoptReason::ClassLoading,
+            cratonvm_jit::deopt::DeoptReason::ClassLoading,
             0,
         );
-        assert_eq!(action, rustjvm_jit::deopt::DeoptAction::RecompileAndReinterpret);
+        assert_eq!(action, cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret);
 
         // ClassLoading should also clear invalidation assumptions
         // (verified via the code path, no assertions needed beyond action check)
@@ -66938,17 +66938,17 @@ public class SkippedTest {
             "TestClass",
             "speculativeLoop",
             "([I)I",
-            rustjvm_jit::deopt::DeoptReason::BoundsCheck,
+            cratonvm_jit::deopt::DeoptReason::BoundsCheck,
             10,
         );
         // First deopt should recommend reinterpret (fall back to interpreter)
-        assert_eq!(action, rustjvm_jit::deopt::DeoptAction::Reinterpret);
+        assert_eq!(action, cratonvm_jit::deopt::DeoptAction::Reinterpret);
     }
 
     #[test]
     fn s36_deopt_point_stores_frame_state() {
         // Verify DeoptimizationPoint can store frame state for reconstruction
-        use rustjvm_jit::deopt::*;
+        use cratonvm_jit::deopt::*;
         let fs = FrameState {
             method_key: "Foo.bar:()I".to_string(),
             bci: 42,
@@ -66973,10 +66973,10 @@ public class SkippedTest {
     #[test]
     fn s36_compiled_method_stores_deopt_points() {
         // Verify CompiledMethod can hold deopt points
-        use rustjvm_jit::deopt::*;
-        if let Some(mut buf) = rustjvm_jit::ExecutableBuffer::new(64) {
+        use cratonvm_jit::deopt::*;
+        if let Some(mut buf) = cratonvm_jit::ExecutableBuffer::new(64) {
             buf.emit(&[0xC3]);
-            let mut cm = rustjvm_jit::CompiledMethod::new(buf);
+            let mut cm = cratonvm_jit::CompiledMethod::new(buf);
             assert!(cm.deopt_points.is_empty());
 
             cm.deopt_points.push(DeoptimizationPoint {
@@ -67010,9 +67010,9 @@ public class SkippedTest {
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
         // First, add a fake entry to the JIT cache
-        if let Some(mut buf) = rustjvm_jit::ExecutableBuffer::new(64) {
+        if let Some(mut buf) = cratonvm_jit::ExecutableBuffer::new(64) {
             buf.emit(&[0xC3]);
-            let cm = rustjvm_jit::CompiledMethod::new(buf);
+            let cm = cratonvm_jit::CompiledMethod::new(buf);
             let mut cache = vm.jit_cache.write();
             cache.put("Deopt".into(), "target".into(), "()I".into(), cm);
         }
@@ -67029,14 +67029,14 @@ public class SkippedTest {
             "Deopt",
             "target",
             "()I",
-            rustjvm_jit::deopt::DeoptReason::BoundsCheck,
+            cratonvm_jit::deopt::DeoptReason::BoundsCheck,
             0,
         );
 
         // Method should be evicted from JIT cache
         assert!(vm.jit_cache.read().get(&cn, &mn, &desc).is_none());
         // First deopt РІвЂ вЂ™ recompile (not blacklist)
-        assert_ne!(action, rustjvm_jit::deopt::DeoptAction::MakeNotCompilable);
+        assert_ne!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Trigger many more deopts to escalate to blacklist
         for _ in 0..20 {
@@ -67045,7 +67045,7 @@ public class SkippedTest {
                 "Deopt",
                 "target",
                 "()I",
-                rustjvm_jit::deopt::DeoptReason::BoundsCheck,
+                cratonvm_jit::deopt::DeoptReason::BoundsCheck,
                 0,
             );
         }
@@ -67066,7 +67066,7 @@ public class SkippedTest {
     #[test]
     fn s31_inline_site_metadata_roundtrip() {
         // Verify InlineSite can be constructed and all fields are preserved
-        let site = rustjvm_jit::InlineSite {
+        let site = cratonvm_jit::InlineSite {
             callee_code: vec![0x1a, 0xac, 0, 0],
             callee_code_len: 2,
             callee_max_locals: 1,
@@ -67106,24 +67106,24 @@ public class SkippedTest {
     #[test]
     fn s31_invalidate_for_class_evicts_inlined_methods() {
         // Verify that JitCache.invalidate_for_class evicts methods that inlined from that class
-        let mut cache = rustjvm_jit::JitCache::new();
+        let mut cache = cratonvm_jit::JitCache::new();
 
         // Insert a compiled method with no inlined methods
-        let buf1 = rustjvm_jit::ExecutableBuffer::new(64).unwrap();
-        let cm1 = rustjvm_jit::CompiledMethod::new(buf1);
+        let buf1 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        let cm1 = cratonvm_jit::CompiledMethod::new(buf1);
         cache.put("Caller".into(), "methodA".into(), "()V".into(), cm1);
 
         // Insert a compiled method that inlined from "Helper"
-        let buf2 = rustjvm_jit::ExecutableBuffer::new(64).unwrap();
-        let mut cm2 = rustjvm_jit::CompiledMethod::new(buf2);
+        let buf2 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        let mut cm2 = cratonvm_jit::CompiledMethod::new(buf2);
         cm2.inlined_methods = vec![
             ("Helper".to_string(), "getX".to_string(), "()I".to_string()),
         ];
         cache.put("Caller".into(), "methodB".into(), "()V".into(), cm2);
 
         // Insert another method that also inlined from "Helper"
-        let buf3 = rustjvm_jit::ExecutableBuffer::new(64).unwrap();
-        let mut cm3 = rustjvm_jit::CompiledMethod::new(buf3);
+        let buf3 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        let mut cm3 = cratonvm_jit::CompiledMethod::new(buf3);
         cm3.inlined_methods = vec![
             ("Helper".to_string(), "getY".to_string(), "()I".to_string()),
             ("Other".to_string(), "foo".to_string(), "()V".to_string()),
@@ -67145,10 +67145,10 @@ public class SkippedTest {
 
     #[test]
     fn s31_invalidate_for_class_no_match_evicts_nothing() {
-        let mut cache = rustjvm_jit::JitCache::new();
+        let mut cache = cratonvm_jit::JitCache::new();
 
-        let buf = rustjvm_jit::ExecutableBuffer::new(64).unwrap();
-        let mut cm = rustjvm_jit::CompiledMethod::new(buf);
+        let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        let mut cm = cratonvm_jit::CompiledMethod::new(buf);
         cm.inlined_methods = vec![
             ("Alpha".to_string(), "foo".to_string(), "()V".to_string()),
         ];
@@ -67164,18 +67164,18 @@ public class SkippedTest {
 
     #[test]
     fn s31_max_inline_bytecode_size_constant() {
-        assert_eq!(rustjvm_jit::MAX_INLINE_BYTECODE_SIZE, 35);
+        assert_eq!(cratonvm_jit::MAX_INLINE_BYTECODE_SIZE, 35);
     }
 
     #[test]
     fn s31_max_inline_budget_constant() {
-        assert_eq!(rustjvm_jit::MAX_INLINE_BUDGET, 250);
+        assert_eq!(cratonvm_jit::MAX_INLINE_BUDGET, 250);
     }
 
     #[test]
     fn s31_compiled_method_tracks_inlined_methods() {
-        let buf = rustjvm_jit::ExecutableBuffer::new(64).unwrap();
-        let mut cm = rustjvm_jit::CompiledMethod::new(buf);
+        let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
+        let mut cm = cratonvm_jit::CompiledMethod::new(buf);
 
         // Initially empty
         assert!(cm.inlined_methods.is_empty());
@@ -67213,7 +67213,7 @@ public class SkippedTest {
         // Start a JFR recording
         {
             let mut jfr = vm.flight_recorder.lock();
-            let rid = jfr.new_recording(rustjvm_jfr::RecordingSettings::new("test"));
+            let rid = jfr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             jfr.start_recording(rid);
         }
 
@@ -67223,7 +67223,7 @@ public class SkippedTest {
             "TestClass",
             "testMethod",
             "()V",
-            rustjvm_jit::deopt::DeoptReason::NullCheck,
+            cratonvm_jit::deopt::DeoptReason::NullCheck,
             10,
         );
 
@@ -67232,14 +67232,14 @@ public class SkippedTest {
         let rec = jfr.get_recording_mut(1).unwrap();
         let events = rec.get_events();
         let deopt_events: Vec<_> = events.iter().filter(|e| {
-            e.fields.iter().any(|f| matches!(f, rustjvm_jfr::EventValue::String(s) if s.contains("TestClass")))
+            e.fields.iter().any(|f| matches!(f, cratonvm_jfr::EventValue::String(s) if s.contains("TestClass")))
         }).collect();
         assert!(!deopt_events.is_empty(), "Deoptimization JFR event should have been recorded");
     }
 
     #[test]
     fn s41_flight_recorder_has_all_28_event_types() {
-        let fr = rustjvm_jfr::create_flight_recorder();
+        let fr = cratonvm_jfr::create_flight_recorder();
         // Session 85 added more JFR event types (~47 now). When new events land,
         // the count grows organically; assert the floor of the original S41 set.
         assert!(fr.type_registry.len() >= 28, "expected >= 28 JFR types, got {}", fr.type_registry.len());
@@ -67264,13 +67264,13 @@ public class SkippedTest {
     #[test]
     fn s41_jfr_gc_events_emitted_on_gc_cycle() {
         // Verify the GC event emission helpers produce valid events
-        let mut fr = rustjvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(rustjvm_jfr::RecordingSettings::new("gc-test"));
+        let mut fr = cratonvm_jfr::create_flight_recorder();
+        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("gc-test"));
         fr.start_recording(rid);
 
-        rustjvm_jfr::builtin::emit_gc_event(&mut fr, 1, "YoungGC", "Allocation Failure", 1000, 500);
-        rustjvm_jfr::builtin::emit_young_gc_event(&mut fr, 1, 15, 1000, 500);
-        rustjvm_jfr::builtin::emit_gc_heap_summary_event(&mut fr, 1, "After GC", "Eden", 1024, 2048, 4096, 1500);
+        cratonvm_jfr::builtin::emit_gc_event(&mut fr, 1, "YoungGC", "Allocation Failure", 1000, 500);
+        cratonvm_jfr::builtin::emit_young_gc_event(&mut fr, 1, 15, 1000, 500);
+        cratonvm_jfr::builtin::emit_gc_heap_summary_event(&mut fr, 1, "After GC", "Eden", 1024, 2048, 4096, 1500);
 
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 3);
@@ -67278,16 +67278,16 @@ public class SkippedTest {
 
     #[test]
     fn s41_jfr_thread_events_cover_lifecycle() {
-        let mut fr = rustjvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(rustjvm_jfr::RecordingSettings::new("thread-test"));
+        let mut fr = cratonvm_jfr::create_flight_recorder();
+        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("thread-test"));
         fr.start_recording(rid);
 
-        rustjvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 1, 1000);
-        rustjvm_jfr::builtin::emit_thread_sleep_event(&mut fr, 100_000_000, 1, 2000, 100_000_000);
-        rustjvm_jfr::builtin::emit_thread_park_event(&mut fr, "AQS", 0, 0, 1, 3000, 500);
-        rustjvm_jfr::builtin::emit_monitor_enter_event(&mut fr, "Object", "main", 0xCAFE, 1, 4000, 100);
-        rustjvm_jfr::builtin::emit_monitor_wait_event(&mut fr, "Object", "worker-1", 0, false, 0xBEEF, 1, 5000, 200);
-        rustjvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 6000);
+        cratonvm_jfr::builtin::emit_thread_start_event(&mut fr, "worker-1", "main", 1, 1000);
+        cratonvm_jfr::builtin::emit_thread_sleep_event(&mut fr, 100_000_000, 1, 2000, 100_000_000);
+        cratonvm_jfr::builtin::emit_thread_park_event(&mut fr, "AQS", 0, 0, 1, 3000, 500);
+        cratonvm_jfr::builtin::emit_monitor_enter_event(&mut fr, "Object", "main", 0xCAFE, 1, 4000, 100);
+        cratonvm_jfr::builtin::emit_monitor_wait_event(&mut fr, "Object", "worker-1", 0, false, 0xBEEF, 1, 5000, 200);
+        cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 6000);
 
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 6);
@@ -67295,14 +67295,14 @@ public class SkippedTest {
 
     #[test]
     fn s41_jfr_io_events_cover_read_write() {
-        let mut fr = rustjvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(rustjvm_jfr::RecordingSettings::new("io-test"));
+        let mut fr = cratonvm_jfr::create_flight_recorder();
+        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("io-test"));
         fr.start_recording(rid);
 
-        rustjvm_jfr::builtin::emit_file_read_event(&mut fr, "fd:3", 4096, false, 1, 1000, 500);
-        rustjvm_jfr::builtin::emit_file_write_event(&mut fr, "fd:1", 2048, 1, 2000, 300);
-        rustjvm_jfr::builtin::emit_socket_read_event(&mut fr, "10.0.0.1", 80, 512, false, 1, 3000, 1000);
-        rustjvm_jfr::builtin::emit_socket_write_event(&mut fr, "10.0.0.1", 80, 256, 1, 4000, 800);
+        cratonvm_jfr::builtin::emit_file_read_event(&mut fr, "fd:3", 4096, false, 1, 1000, 500);
+        cratonvm_jfr::builtin::emit_file_write_event(&mut fr, "fd:1", 2048, 1, 2000, 300);
+        cratonvm_jfr::builtin::emit_socket_read_event(&mut fr, "10.0.0.1", 80, 512, false, 1, 3000, 1000);
+        cratonvm_jfr::builtin::emit_socket_write_event(&mut fr, "10.0.0.1", 80, 256, 1, 4000, 800);
 
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 4);
@@ -67310,12 +67310,12 @@ public class SkippedTest {
 
     #[test]
     fn s41_jfr_class_loading_events() {
-        let mut fr = rustjvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(rustjvm_jfr::RecordingSettings::new("class-test"));
+        let mut fr = cratonvm_jfr::create_flight_recorder();
+        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("class-test"));
         fr.start_recording(rid);
 
-        rustjvm_jfr::builtin::emit_class_load_event(&mut fr, "com/example/Foo", "app", "app", 1000, 50);
-        rustjvm_jfr::builtin::emit_class_unload_event(&mut fr, "com/example/Foo", "app", 5000);
+        cratonvm_jfr::builtin::emit_class_load_event(&mut fr, "com/example/Foo", "app", "app", 1000, 50);
+        cratonvm_jfr::builtin::emit_class_unload_event(&mut fr, "com/example/Foo", "app", 5000);
 
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 2);
@@ -67323,14 +67323,14 @@ public class SkippedTest {
 
     #[test]
     fn s41_jfr_compilation_and_deopt_events() {
-        let mut fr = rustjvm_jfr::create_flight_recorder();
-        let rid = fr.new_recording(rustjvm_jfr::RecordingSettings::new("jit-test"));
+        let mut fr = cratonvm_jfr::create_flight_recorder();
+        let rid = fr.new_recording(cratonvm_jfr::RecordingSettings::new("jit-test"));
         fr.start_recording(rid);
 
-        rustjvm_jfr::builtin::emit_compilation_event(
+        cratonvm_jfr::builtin::emit_compilation_event(
             &mut fr, "Foo.bar:()V", 1, 4, true, false, 256, 64, 1000, 5000,
         );
-        rustjvm_jfr::builtin::emit_deoptimization_event(
+        cratonvm_jfr::builtin::emit_deoptimization_event(
             &mut fr, "Foo.bar:()V", 1, "ReceiverTypeChanged", "RecompileAndReinterpret", 10, 1, 6000,
         );
 
@@ -67351,7 +67351,7 @@ public class SkippedTest {
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
         let _ = vm.load_class_concurrent("java/lang/Object");
 
-        let tmp = std::env::temp_dir().join("rustjvm_s42_vm_test.hprof");
+        let tmp = std::env::temp_dir().join("cratonvm_s42_vm_test.hprof");
         let path = tmp.to_str().unwrap();
         let size = crate::runtime::hprof::dump_heap(&vm, path)
             .expect("dump_heap should succeed");
@@ -67476,7 +67476,7 @@ public class SkippedTest {
 
     #[test]
     fn s42_heap_dump_arrays() {
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let config = crate::config::VmConfig {
             use_synthetic_jdk: true,
             ..Default::default()
@@ -67485,7 +67485,7 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Allocate a primitive array
-        let _arr = vm.heap.alloc_array(rustjvm_types::ClassId::new(0), ArrayElementType::Int, 10);
+        let _arr = vm.heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 10);
 
         let mut output = Vec::new();
         let mut dumper = crate::runtime::hprof::HprofDumper::new(&vm);
@@ -67720,8 +67720,8 @@ public class SkippedTest {
 
     #[test]
     fn s54_compact_header_vs_legacy_size() {
-        use rustjvm_gc::compact_header::CompactHeader;
-        use rustjvm_gc::heap::HEADER_SIZE;
+        use cratonvm_gc::compact_header::CompactHeader;
+        use cratonvm_gc::heap::HEADER_SIZE;
         assert_eq!(std::mem::size_of::<CompactHeader>(), 8);
         assert_eq!(HEADER_SIZE, 32);
         // 24 bytes saved per object
@@ -67730,12 +67730,12 @@ public class SkippedTest {
 
     #[test]
     fn s54_narrow_klass_table_integration() {
-        use rustjvm_gc::NarrowKlassTable;
+        use cratonvm_gc::NarrowKlassTable;
         let table = NarrowKlassTable::new();
 
         // Simulate loading classes and compressing their IDs
-        let class_ids: Vec<rustjvm_types::ClassId> = (0..20)
-            .map(|i| rustjvm_types::ClassId::new(i + 1))
+        let class_ids: Vec<cratonvm_types::ClassId> = (0..20)
+            .map(|i| cratonvm_types::ClassId::new(i + 1))
             .collect();
 
         for &cid in &class_ids {
@@ -67749,13 +67749,13 @@ public class SkippedTest {
 
     #[test]
     fn s54_compact_allocator_with_vm_class_ids() {
-        use rustjvm_gc::CompactAllocator;
+        use cratonvm_gc::CompactAllocator;
         let alloc = CompactAllocator::new(1024 * 1024);
 
         // Allocate objects as if loading VM classes
-        let object_cid = rustjvm_types::ClassId::new(1);
-        let string_cid = rustjvm_types::ClassId::new(2);
-        let array_cid = rustjvm_types::ClassId::new(3);
+        let object_cid = cratonvm_types::ClassId::new(1);
+        let string_cid = cratonvm_types::ClassId::new(2);
+        let array_cid = cratonvm_types::ClassId::new(3);
 
         let obj = alloc.alloc_object(object_cid, 0);
         assert!(obj.is_some());
@@ -67765,7 +67765,7 @@ public class SkippedTest {
 
         let arr = alloc.alloc_array(
             array_cid,
-            rustjvm_gc::heap::ArrayElementType::Int,
+            cratonvm_gc::heap::ArrayElementType::Int,
             100,
         );
         assert!(arr.is_some());
@@ -67781,7 +67781,7 @@ public class SkippedTest {
 
     #[test]
     fn s54_header_view_from_vm_object() {
-        use rustjvm_gc::HeaderView;
+        use cratonvm_gc::HeaderView;
         let config = crate::config::VmConfig {
             use_synthetic_jdk: true,
             ..Default::default()
@@ -67790,7 +67790,7 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Allocate a real VM object and create a HeaderView from its legacy header
-        let obj = vm.heap.alloc_object(rustjvm_types::ClassId::new(1), 2);
+        let obj = vm.heap.alloc_object(cratonvm_types::ClassId::new(1), 2);
         let header = vm.heap.get_header(obj);
         let view = HeaderView::from_legacy(header);
         assert!(!view.is_array());
@@ -67799,12 +67799,12 @@ public class SkippedTest {
 
     #[test]
     fn s54_compact_savings_report_integration() {
-        use rustjvm_gc::CompactAllocator;
+        use cratonvm_gc::CompactAllocator;
         let alloc = CompactAllocator::new(1024 * 1024);
 
         // Simulate a workload
         for i in 0..1000 {
-            alloc.alloc_object(rustjvm_types::ClassId::new(i % 50), 3).unwrap();
+            alloc.alloc_object(cratonvm_types::ClassId::new(i % 50), 3).unwrap();
         }
 
         let report = alloc.savings_report();
@@ -67832,7 +67832,7 @@ public class SkippedTest {
 
     #[test]
     fn s54_hash_code_side_table_savings() {
-        use rustjvm_gc::HashCodeTable;
+        use cratonvm_gc::HashCodeTable;
         let ht = HashCodeTable::new();
 
         // 10000 objects, none request hash codes
@@ -67850,13 +67850,13 @@ public class SkippedTest {
 
     #[test]
     fn s54_compact_header_migration_roundtrip() {
-        use rustjvm_gc::compact_header::{migrate_to_compact, to_legacy_fields};
-        use rustjvm_gc::HashCodeTable;
+        use cratonvm_gc::compact_header::{migrate_to_compact, to_legacy_fields};
+        use cratonvm_gc::HashCodeTable;
 
-        let old = rustjvm_gc::heap::ObjectHeader {
-            class_id: rustjvm_types::ClassId::new(42),
-            kind: rustjvm_gc::heap::ObjectKind::Array,
-            element_type: rustjvm_gc::heap::ArrayElementType::Long,
+        let old = cratonvm_gc::heap::ObjectHeader {
+            class_id: cratonvm_types::ClassId::new(42),
+            kind: cratonvm_gc::heap::ObjectKind::Array,
+            element_type: cratonvm_gc::heap::ArrayElementType::Long,
             _padding: [0; 2],
             identity_hash_code: 777,
             array_length: 10,
@@ -67874,7 +67874,7 @@ public class SkippedTest {
         assert!(compact.is_array());
         assert_eq!(compact.narrow_klass(), 42);
         assert_eq!(compact.gc_age(), 3);
-        assert_eq!(compact.element_type(), rustjvm_gc::heap::ArrayElementType::Long as u8);
+        assert_eq!(compact.element_type(), cratonvm_gc::heap::ArrayElementType::Long as u8);
         assert!(compact.has_hash_code());
         assert_eq!(ht.get(0x2000), Some(777));
 
@@ -68120,21 +68120,21 @@ public class SkippedTest {
     /// vtable hit РІР‚вЂќ the entry is fully self-contained).
     #[test]
     fn t10_9_a_vtable_manager_populated_for_registered_class() {
-        use rustjvm_reader::attribute::{Attribute, CodeAttribute};
-        use rustjvm_reader::class_access_flags::MethodAccessFlags;
-        use rustjvm_reader::method::ClassFileMethod;
+        use cratonvm_reader::attribute::{Attribute, CodeAttribute};
+        use cratonvm_reader::class_access_flags::MethodAccessFlags;
+        use cratonvm_reader::method::ClassFileMethod;
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
         // Register a class with a single virtual method "tick()V".
         let method = ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC,
-            name: rustjvm_types::intern_arc("tick"),
-            descriptor: rustjvm_types::intern_arc("()V"),
+            name: cratonvm_types::intern_arc("tick"),
+            descriptor: cratonvm_types::intern_arc("()V"),
             attributes: vec![Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 1,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xb1]), // return
+                code: cratonvm_reader::ByteView::from_vec(vec![0xb1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             })],
@@ -68165,7 +68165,7 @@ public class SkippedTest {
             let padded_code: Arc<[u8]> =
                 Arc::from(vec![0xb1u8, 0x00, 0x00].into_boxed_slice());
             let cached =
-                Arc::new(rustjvm_jit_api::CachedBytecodeMethod {
+                Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
                     declaring_class_id: class_id,
                     class_name: Arc::from("test/T10_9_A_Target"),
                     method_name: Arc::from("tick"),

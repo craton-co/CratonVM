@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
-use rustjvm_types::intern_arc;
+use cratonvm_types::intern_arc;
 
 // TODO: switch `metrics_cache` to `rustc_hash::FxHashMap` once `rustc-hash`
 // is added to `native-awt/Cargo.toml`. FxHashMap has smaller per-entry

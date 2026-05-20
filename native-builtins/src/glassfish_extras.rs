@@ -20,9 +20,9 @@
 //! glassfish_extras::register_glassfish_stubs(registry);
 //! ```
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn glassfish_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!(
@@ -36,7 +36,7 @@ fn glassfish_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 pub fn register_glassfish_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_PAYARA_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_PAYARA_REAL").as_deref() == Ok("1") {
         return;
     }
     // com.sun.enterprise.glassfish.bootstrap.ASMain.main([Ljava/lang/String;)V

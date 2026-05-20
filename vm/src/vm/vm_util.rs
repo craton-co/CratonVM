@@ -5,8 +5,8 @@ use crate::classloading::{Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::Value;
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::ObjectRef;
 
 use super::SharedVm;
 
@@ -280,7 +280,7 @@ pub fn ensure_class_initialized_shared(
 #[inline]
 pub fn is_class_initialized_fast(class: &Class) -> bool {
     class.init_state.load(std::sync::atomic::Ordering::Acquire)
-        == rustjvm_classloading::CLASS_INIT_INITIALIZED
+        == cratonvm_classloading::CLASS_INIT_INITIALIZED
 }
 
 /// Round-9 vm CRIT-1 fix: convenience wrapper that takes a
@@ -548,7 +548,7 @@ fn initialize_class_shared(
             if matches!(new_state, ClassState::Initialized) {
                 cm.set_class_init_state(
                     class_id,
-                    rustjvm_classloading::CLASS_INIT_INITIALIZED,
+                    cratonvm_classloading::CLASS_INIT_INITIALIZED,
                 );
             }
         }
@@ -648,7 +648,7 @@ fn initialize_class_shared(
                 // Round-9 HIGH-5 fix (2026-05-17): use `_arc` to skip the
                 // per-event `Arc::from(&str)` clone — `class_name_for_jfr`
                 // is already `Arc<str>` (cloned from `Class.name`).
-                rustjvm_jfr::builtin::emit_class_load_event_arc(
+                cratonvm_jfr::builtin::emit_class_load_event_arc(
                     &mut jfr, class_name_for_jfr.clone(), "app", "app",
                     now_ns.saturating_sub(duration_ns), duration_ns,
                 );
@@ -803,7 +803,7 @@ fn initialize_class_shared(
                     // operator-visible "BigDecimal swallow" log line that the
                     // KC16 boot map calls out as a blocker simply disappears.
                     // The swallow counter is still incremented so
-                    // `RUSTJVM_STRICT_SWALLOWS=1` continues to escalate (the
+                    // `CRATONVM_STRICT_SWALLOWS=1` continues to escalate (the
                     // gate is preserved for callers actively triaging this
                     // path) and the "main() completed with N swallowed VM
                     // error(s)" tally remains accurate.
@@ -815,7 +815,7 @@ fn initialize_class_shared(
                         );
                         if crate::runtime::env_cache::strict_swallows() {
                             panic!(
-                                "RUSTJVM_STRICT_SWALLOWS=1: swallow at <clinit> [non-critical-exception]: class={} exc={}",
+                                "CRATONVM_STRICT_SWALLOWS=1: swallow at <clinit> [non-critical-exception]: class={} exc={}",
                                 class_name_for_jfr, exc_detail
                             );
                         }
@@ -1113,7 +1113,7 @@ fn initialize_class_shared(
         let mut jfr = shared.flight_recorder.lock();
         // Round-9 HIGH-5 fix (2026-05-17): use `_arc` variant — name is
         // already `Arc<str>` from `Class.name.clone()`.
-        rustjvm_jfr::builtin::emit_class_load_event_arc(
+        cratonvm_jfr::builtin::emit_class_load_event_arc(
             &mut jfr, class_name_for_jfr.clone(), "app", "app",
             now_ns.saturating_sub(duration_ns), duration_ns,
         );
@@ -1133,7 +1133,7 @@ fn initialize_class_shared(
 /// - `String`  в†’ resolves the Utf8, allocates a Java String via the VM's
 ///   string pool, and stores the reference in the slot.
 fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmError> {
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     // Gather static field info with read lock. For each static field, capture
     // the descriptor and (if present) the resolved ConstantValue: either a
@@ -1214,10 +1214,10 @@ pub fn default_value_for_descriptor(descriptor: &str) -> Value {
 
 /// Resolve a `ConstantValue` attribute index into a `Value`.
 pub fn resolve_constant_value(
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
     index: u16,
 ) -> Option<Value> {
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
     match cp.get(index)? {
         ConstantPoolEntry::Integer(v) => Some(Value::Int(*v)),
         ConstantPoolEntry::Float(v) => Some(Value::Float(*v)),
@@ -2589,7 +2589,7 @@ mod tests {
 
     #[test]
     fn resolve_integer() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Integer(42)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Int(42)));
@@ -2597,7 +2597,7 @@ mod tests {
 
     #[test]
     fn resolve_float() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Float(1.5)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Float(1.5)));
@@ -2605,7 +2605,7 @@ mod tests {
 
     #[test]
     fn resolve_long() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Long(9999999),
@@ -2617,7 +2617,7 @@ mod tests {
 
     #[test]
     fn resolve_double() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Double(3.25),
@@ -2629,7 +2629,7 @@ mod tests {
 
     #[test]
     fn resolve_string_ref_returns_none() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Utf8("hello".into()),
@@ -2641,7 +2641,7 @@ mod tests {
 
     #[test]
     fn resolve_out_of_bounds() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 99), None);
@@ -2649,7 +2649,7 @@ mod tests {
 
     #[test]
     fn resolve_negative_integer() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Integer(-1)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Int(-1)));
@@ -2734,11 +2734,11 @@ mod tests {
     #[test]
     fn prepare_class_shared_applies_constant_values_for_all_supported_types() {
         use crate::classloading::{Class, ClassLoaderId, ClassState};
-        use rustjvm_reader::attribute::Attribute;
-        use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-        use rustjvm_reader::field::ClassFileField;
+        use cratonvm_reader::attribute::Attribute;
+        use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::field::ClassFileField;
 
         // Constant pool layout (1-based):
         //   #1 Integer(42)         -> for IConst
@@ -2767,7 +2767,7 @@ mod tests {
                 | FieldAccessFlags::FINAL,
             name: std::sync::Arc::from(name),
             descriptor: std::sync::Arc::from(descriptor),
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
                 Attribute::ConstantValue {
                     constant_value_index: cv_index,
                 },

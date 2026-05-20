@@ -13,7 +13,7 @@
 //! the load-bearing primitive for hashCode), plus drive the probe through
 //! a real VM and observe its stdout via the standard `Vm::invoke`.
 
-use rustjvm_vm::vm::java_string_hash;
+use cratonvm_vm::vm::java_string_hash;
 
 #[test]
 fn java_string_hash_matches_jdk_for_empty_string() {
@@ -81,7 +81,7 @@ fn annotation_proxy_class_constant_is_stable() {
     // someone renames it to e.g. `java/lang/annotation/Proxy` every
     // `getAnnotation` site silently breaks. Pin the constant.
     assert_eq!(
-        rustjvm_native_builtins::lang_class::ANN_PROXY_FIELDS,
+        cratonvm_native_builtins::lang_class::ANN_PROXY_FIELDS,
         4,
         "annotation proxy must keep its 4-field layout"
     );
@@ -89,7 +89,7 @@ fn annotation_proxy_class_constant_is_stable() {
 
 #[test]
 fn annotation_proxy_field_indices_constant() {
-    use rustjvm_native_builtins::lang_class::{
+    use cratonvm_native_builtins::lang_class::{
         ANN_PROXY_ELEM_NAMES, ANN_PROXY_ELEM_VALUES, ANN_PROXY_TYPE_DESC,
         ANN_PROXY_TYPE_MIRROR,
     };
@@ -122,9 +122,9 @@ fn annotation_proxy_probe_compiled_class_files_exist() {
 }
 
 #[test]
-fn annotation_proxy_probe_loads_under_rustjvm_when_staged() {
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::vm::Vm;
+fn annotation_proxy_probe_loads_under_cratonvm_when_staged() {
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::vm::Vm;
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let probe_dir = manifest

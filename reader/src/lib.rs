@@ -2,7 +2,7 @@
 // are added to all spec-derived types (struct fields, enum variants, etc.).
 #![allow(missing_docs)]
 
-//! Java `.class` file parser for the RustJVM project.
+//! Java `.class` file parser for the CratonVM project.
 //!
 //! This crate handles parsing of Java class files according to the JVM specification,
 //! supporting class file versions from Java 1.1 (major version 45) through Java 25

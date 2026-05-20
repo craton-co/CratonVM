@@ -31,7 +31,7 @@
 //! # Public API
 //!
 //! ```ignore
-//! use rustjvm_vm::runtime::agent_loader::{parse_javaagent_spec, invoke_premains};
+//! use cratonvm_vm::runtime::agent_loader::{parse_javaagent_spec, invoke_premains};
 //!
 //! let agent = parse_javaagent_spec("-javaagent:my-agent.jar=opt1,opt2")?;
 //! invoke_premains(&vm.shared, &mut vm.main_thread, &[agent])?;
@@ -192,10 +192,10 @@ pub fn parse_javaagent_spec(spec: &str) -> Result<LoadedAgent, AgentLoadError> {
     };
     let jar_path = PathBuf::from(jar_path_str);
 
-    // Parse the manifest. We use rustjvm-classloading's `read_jar_manifest`
+    // Parse the manifest. We use cratonvm-classloading's `read_jar_manifest`
     // which already opens the JAR via the `zip` crate and runs
     // `ManifestInfo::parse` over `META-INF/MANIFEST.MF`.
-    let manifest = rustjvm_classloading::ClassPath::read_jar_manifest(&jar_path)
+    let manifest = cratonvm_classloading::ClassPath::read_jar_manifest(&jar_path)
         .ok_or_else(|| AgentLoadError::JarNotFound {
             path: jar_path.clone(),
             source: "open or parse failed".to_string(),
@@ -467,7 +467,7 @@ fn build_instrumentation_mirror(
     shared: &SharedVm,
     thread: &mut JvmThread,
     agent: &LoadedAgent,
-) -> Option<rustjvm_types::ObjectRef> {
+) -> Option<cratonvm_types::ObjectRef> {
     let class_internal = "sun/instrument/InstrumentationImpl";
     let class_id = match shared.load_class_concurrent(class_internal) {
         Ok(id) => id,

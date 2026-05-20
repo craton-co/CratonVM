@@ -2,17 +2,17 @@
 //!
 //! Reads two committed baseline files:
 //!
-//! - `bench/baseline.json`           — RustJVM median_ns per metric.
+//! - `bench/baseline.json`           — CratonVM median_ns per metric.
 //! - `bench/hotspot-baseline.json`   — HotSpot C2 median_ns per metric.
 //!
-//! Emits a human-readable ratio table (`RustJVM / HotSpot` per metric)
+//! Emits a human-readable ratio table (`CratonVM / HotSpot` per metric)
 //! plus the geometric mean, and exits non-zero when the geomean exceeds
 //! the configured threshold (default 1.5× per T5.8.1).
 //!
 //! Unlike `bench-gate`, this tool never reads criterion's live
 //! `target/criterion/` output — it only compares the two committed
 //! baselines. That keeps it cheap to run from CI as a separate gate and
-//! means re-measuring RustJVM is decoupled from re-measuring HotSpot.
+//! means re-measuring CratonVM is decoupled from re-measuring HotSpot.
 //!
 //! ## CLI
 //!
@@ -61,9 +61,9 @@ pub struct MetricEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct RatioEntry {
     pub metric: String,
-    pub rustjvm_ns: f64,
+    pub cratonvm_ns: f64,
     pub hotspot_ns: f64,
-    /// `rustjvm_ns / hotspot_ns`, or `None` when either side is zero
+    /// `cratonvm_ns / hotspot_ns`, or `None` when either side is zero
     /// (bootstrap) or the HotSpot side is not yet captured.
     pub ratio: Option<f64>,
     pub status: RatioStatus,
@@ -76,7 +76,7 @@ pub enum RatioStatus {
     Measured,
     /// HotSpot baseline is a placeholder (0) — can't compute ratio.
     HotspotBootstrap,
-    /// RustJVM baseline is a placeholder (0) — nothing to compare.
+    /// CratonVM baseline is a placeholder (0) — nothing to compare.
     RustjvmBootstrap,
     /// Metric exists only on one side.
     Asymmetric,
@@ -156,7 +156,7 @@ pub fn compare(rust: &Baseline, hotspot: &Baseline, threshold: f64) -> CompareRe
 
         entries.push(RatioEntry {
             metric: key,
-            rustjvm_ns: r,
+            cratonvm_ns: r,
             hotspot_ns: h,
             ratio,
             status,
@@ -186,7 +186,7 @@ pub fn format_report(report: &CompareReport) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "{:<40}  {:>14}  {:>14}  {:>8}  {}\n",
-        "metric", "rustjvm (ns)", "hotspot (ns)", "ratio", "status",
+        "metric", "cratonvm (ns)", "hotspot (ns)", "ratio", "status",
     ));
     s.push_str(&format!("{}\n", "-".repeat(95)));
     for e in &report.entries {
@@ -197,7 +197,7 @@ pub fn format_report(report: &CompareReport) -> String {
         s.push_str(&format!(
             "{:<40}  {:>14.0}  {:>14.0}  {:>8}  {}\n",
             e.metric,
-            e.rustjvm_ns,
+            e.cratonvm_ns,
             e.hotspot_ns,
             ratio,
             e.status.label(),
@@ -261,7 +261,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<CliArgs, String> 
 fn print_help() {
     println!(
         "\
-bench-hotspot-compare — compare RustJVM baselines against HotSpot C2
+bench-hotspot-compare — compare CratonVM baselines against HotSpot C2
 
 USAGE:
     bench-hotspot-compare [OPTIONS]
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn placeholder_hotspot_is_bootstrap() {
-        // HotSpot = 0 (placeholder), RustJVM = 100 → no ratio.
+        // HotSpot = 0 (placeholder), CratonVM = 100 → no ratio.
         let r = bl(&[("a", 100.0)]);
         let h = bl(&[("a", 0.0)]);
         let rep = compare(&r, &h, 1.5);
@@ -530,7 +530,7 @@ mod tests {
     }
 
     // T17.E.1 — every metric name the capture scripts write is the exact
-    // set of criterion IDs the RustJVM side also writes into
+    // set of criterion IDs the CratonVM side also writes into
     // `bench/baseline.json`. If someone adds a new kernel on either side
     // without the other, the comparator silently marks it `Asymmetric`
     // — this test wedges that contract so the next roadmap entry has
@@ -591,19 +591,19 @@ mod tests {
     // The earlier `bl(...)` helper tests use 1–3 synthetic keys. Those
     // are fine for wiring, but they don't stress the comparator on the
     // same surface that will hit CI. The tests below build a realistic
-    // 20-kernel RustJVM baseline (same keys the capture scripts emit)
+    // 20-kernel CratonVM baseline (same keys the capture scripts emit)
     // and drive it against a HotSpot baseline derived at a target
     // ratio, so the geomean math walks the same code paths as a
     // live CI run.
     // -----------------------------------------------------------------
 
-    /// Canonical realistic RustJVM baseline — 20+ kernels modelled on
+    /// Canonical realistic CratonVM baseline — 20+ kernels modelled on
     /// the surface `scripts/capture-hotspot-baseline.{sh,ps1}` emit.
     ///
     /// Numbers are representative orders of magnitude (ns) so that
     /// ratio arithmetic exercises a non-trivial dynamic range rather
     /// than a single scale.
-    fn realistic_rustjvm() -> Baseline {
+    fn realistic_cratonvm() -> Baseline {
         let metrics: Vec<(&str, f64)> = vec![
             ("vm_startup", 150_000.0),
             ("shared_vm_startup", 82_000.0),
@@ -633,11 +633,11 @@ mod tests {
         bl(&metrics)
     }
 
-    /// Build a HotSpot-shaped baseline that mirrors the RustJVM keys,
+    /// Build a HotSpot-shaped baseline that mirrors the CratonVM keys,
     /// but with each `median_ns` divided by `ratio` so that
-    /// `rustjvm_ns / hotspot_ns == ratio` for every row.
+    /// `cratonvm_ns / hotspot_ns == ratio` for every row.
     fn realistic_hotspot_at_ratio(ratio: f64) -> Baseline {
-        let r = realistic_rustjvm();
+        let r = realistic_cratonvm();
         let pairs: Vec<(String, f64)> = r
             .metrics
             .iter()
@@ -650,10 +650,10 @@ mod tests {
 
     #[test]
     fn t18_h3_realistic_hotspot_ratio_all_under_threshold() {
-        // 20+ kernels, every one 1.1× slower on RustJVM. Geomean of a
+        // 20+ kernels, every one 1.1× slower on CratonVM. Geomean of a
         // flat 1.1× distribution is exactly 1.1×, which sits well under
         // the default 1.5× gate → PASS.
-        let rust = realistic_rustjvm();
+        let rust = realistic_cratonvm();
         let hotspot = realistic_hotspot_at_ratio(1.1);
         let rep = compare(&rust, &hotspot, 1.5);
 
@@ -683,15 +683,15 @@ mod tests {
 
     #[test]
     fn t18_h3_realistic_mixed_ratios_geomean_still_passes() {
-        // Some kernels are actually faster on RustJVM, some slower, and
+        // Some kernels are actually faster on CratonVM, some slower, and
         // a handful are near the ceiling. The geomean of a symmetric
         // mix should stay ≤ 1.5×, so the verdict is still PASS.
         //
         // Pick a mix whose log-mean is below ln(1.5):
-        //   9 × 0.9    (rustjvm wins)
+        //   9 × 0.9    (cratonvm wins)
         //   8 × 1.1    (modest regression)
         //   3 × 1.4    (near-ceiling)
-        let rust = realistic_rustjvm();
+        let rust = realistic_cratonvm();
         let keys: Vec<String> = rust.metrics.keys().cloned().collect();
         assert!(keys.len() >= 20);
 
@@ -716,7 +716,7 @@ mod tests {
                 .iter()
                 .all(|e| e.status == RatioStatus::Measured),
         );
-        // Sanity: at least one ratio is below 1.0 (rustjvm faster).
+        // Sanity: at least one ratio is below 1.0 (cratonvm faster).
         assert!(rep.entries.iter().any(|e| e.ratio.unwrap() < 1.0));
         // And at least one near 1.4×.
         assert!(rep
@@ -742,7 +742,7 @@ mod tests {
         // models e.g. a kernel where a JIT tier unexpectedly fell
         // back to the interpreter — rare but real, and exactly the
         // kind of thing the gate must catch.
-        let rust = realistic_rustjvm();
+        let rust = realistic_cratonvm();
         let keys: Vec<String> = rust.metrics.keys().cloned().collect();
         assert!(keys.len() >= 20);
         // Pick first key deterministically (BTreeMap gives sorted order).
@@ -793,7 +793,7 @@ mod tests {
         // the other half have a HotSpot placeholder of 0 (bootstrap).
         // The measured half drives the geomean; bootstrap rows must
         // not sneak into the log-sum. Verdict has to stay well-defined.
-        let rust = realistic_rustjvm();
+        let rust = realistic_cratonvm();
         let keys: Vec<String> = rust.metrics.keys().cloned().collect();
         assert!(keys.len() >= 20);
         let split = keys.len() / 2;
@@ -843,14 +843,14 @@ mod tests {
 
     #[test]
     fn t18_h3_realistic_asymmetric_metrics_surface() {
-        // RustJVM adds two brand-new kernels (`future_bench_a/b`) that
+        // CratonVM adds two brand-new kernels (`future_bench_a/b`) that
         // the HotSpot capture script hasn't been updated for yet. The
         // comparator must:
         //   - flag the two new rows as Asymmetric (not bootstrap).
         //   - keep them OUT of the geomean.
         //   - still deliver a PASS verdict when the measured surface
         //     is clean.
-        let mut rust = realistic_rustjvm();
+        let mut rust = realistic_cratonvm();
         rust.metrics.insert(
             "future_bench_a".into(),
             MetricEntry { median_ns: 999_999.0 },

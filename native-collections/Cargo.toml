@@ -1,10 +1,11 @@
 [package]
-name = "rustjvm-native-collections"
+name = "cratonvm-native-collections"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Java collections native methods for RustJVM"
+description = "Java collections native methods for CratonVM"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -14,8 +15,8 @@ default = []
 synthetic-jdk = []
 
 [dependencies]
-rustjvm-types = { path = "../types" }
-rustjvm-native-api = { path = "../native-api" }
+cratonvm-types = { path = "../types" }
+cratonvm-native-api = { path = "../native-api" }
 parking_lot.workspace = true
 
 [lints]

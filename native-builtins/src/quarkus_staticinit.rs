@@ -46,9 +46,9 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Field layout constants
@@ -427,7 +427,7 @@ fn native_runner_class_loader_load_class(
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("RunnerClassLoader.loadClass: name is null".to_string()),
             }
             .into());
@@ -435,7 +435,7 @@ fn native_runner_class_loader_load_class(
     };
     let name_raw = ctx.read_string(name_obj).unwrap_or_default();
     let Some(cleaned) = sanitize_load_class_name(&name_raw) else {
-        return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+        return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
             class_name: name_raw,
         }
         .into());
@@ -446,7 +446,7 @@ fn native_runner_class_loader_load_class(
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
         }
-        Err(_) => Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+        Err(_) => Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
             class_name: cleaned,
         }
         .into()),
@@ -525,11 +525,11 @@ fn native_serialized_application_read(
     );
     let sa = match sa_cid {
         Some(cid) => ctx.alloc_object(cid, sa_n),
-        None => ctx.alloc_object(rustjvm_types::ClassId::new(0), sa_n),
+        None => ctx.alloc_object(cratonvm_types::ClassId::new(0), sa_n),
     };
     let rcl = match rcl_cid {
         Some(cid) => ctx.alloc_object(cid, rcl_n),
-        None => ctx.alloc_object(rustjvm_types::ClassId::new(0), rcl_n),
+        None => ctx.alloc_object(cratonvm_types::ClassId::new(0), rcl_n),
     };
 
     let main_class = resolve_main_class();
@@ -1287,8 +1287,8 @@ fn reset_supplier_state() {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::NativeMethodRegistry;
-    use rustjvm_types::Value;
+    use cratonvm_native_api::NativeMethodRegistry;
+    use cratonvm_types::Value;
 
     fn make_runtime_value_obj(ctx: &mut crate::test_utils::MockNativeContext) -> ObjectRef {
         let cid = ctx.ensure_class_initialized(CLS_RUNTIME_VALUE).unwrap();
@@ -1996,9 +1996,9 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::NullPointerException { .. },
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException { .. },
                 ),
             ) => {}
             other => panic!("expected NPE, got {other:?}"),
@@ -2017,9 +2017,9 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::ClassNotFoundException { class_name },
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::ClassNotFoundException { class_name },
                 ),
             ) => {
                 assert_eq!(class_name, "../../etc/passwd");

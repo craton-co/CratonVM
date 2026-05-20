@@ -1,7 +1,7 @@
 //! Java Class-File API (JEP 484, JDK 24) native method registrations.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 
@@ -98,7 +98,7 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
 
     // build(ClassDesc, Consumer<ClassBuilder>) -> byte[]
     r.register(cf, "build", "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
@@ -110,13 +110,13 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
 
     // buildModule(ModuleDesc, Consumer) -> byte[]
     r.register(cf, "buildModule", "(Ljava/lang/module/ModuleDescriptor;Ljava/util/function/Consumer;)[B", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
     // transformClass(ClassModel, ClassTransform) -> byte[]
     r.register(cf, "transformClass", "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
@@ -454,7 +454,7 @@ fn register_class_builder(r: &mut NativeMethodRegistry) {
 
     // build() -> byte[]
     r.register(cb, "build", "()[B", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 }
@@ -688,7 +688,7 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
 
     // transformClass(ClassModel) -> byte[]
     r.register(ct, "transformClass", "(Ljava/lang/classfile/ClassModel;)[B", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 }
@@ -789,7 +789,7 @@ pub(crate) fn register_classfile_api_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod classfile_api_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

@@ -18,7 +18,7 @@
 //!    present in `shared.native_methods` after VM construction.
 //! 2. Subprocess: `apps/console_probe/ConsoleProbe.java` (`System.console()`
 //!    on a non-TTY) prints `console=null` + `OK` and exits 0 under
-//!    `RUSTJVM_STRICT_SWALLOWS=1`. Any regression that lets the
+//!    `CRATONVM_STRICT_SWALLOWS=1`. Any regression that lets the
 //!    `Module.canUse` NPE escape `ServiceConfigurationError` would fail
 //!    here — strict-swallows surfaces panics that the loop's catch
 //!    block would otherwise hide.
@@ -28,8 +28,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::SharedVm;
 
 fn shared() -> Arc<SharedVm> {
     Arc::new(SharedVm::new(VmConfig::default()))
@@ -57,15 +57,15 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -116,7 +116,7 @@ fn run_console_probe(timeout: Duration) -> Option<(String, String, Option<i32>)>
         eprintln!("wave3_console_module: ConsoleProbe.class missing and javac unavailable; skipping");
         return None;
     }
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let jh = java_home()?;
     let dir = console_probe_dir();
 
@@ -126,7 +126,7 @@ fn run_console_probe(timeout: Duration) -> Option<(String, String, Option<i32>)>
         .arg("-c")
         .arg(&dir)
         .arg("ConsoleProbe")
-        .env("RUSTJVM_STRICT_SWALLOWS", "1");
+        .env("CRATONVM_STRICT_SWALLOWS", "1");
 
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
@@ -160,7 +160,7 @@ fn console_probe_no_canuse_npe_under_strict_swallows() {
     let Some((stdout, stderr, rc)) = run_console_probe(Duration::from_secs(120)) else {
         eprintln!(
             "wave3_console_module: prerequisites missing; skipping \
-             (set RUSTJVM_BIN + JAVA_HOME or build target/release/rustjvm)"
+             (set CRATONVM_BIN + JAVA_HOME or build target/release/cratonvm)"
         );
         return;
     };
@@ -180,6 +180,6 @@ fn console_probe_no_canuse_npe_under_strict_swallows() {
     assert_eq!(
         rc,
         Some(0),
-        "ConsoleProbe must exit 0 under RUSTJVM_STRICT_SWALLOWS=1"
+        "ConsoleProbe must exit 0 under CRATONVM_STRICT_SWALLOWS=1"
     );
 }

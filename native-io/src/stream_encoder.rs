@@ -13,10 +13,10 @@
 //! | 1    | `java.lang.String` — canonical charset name|
 //! | 2    | `int` — `1` if closed, `0` otherwise        |
 
-use rustjvm_native_api::charset as engine;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_native_api::charset as engine;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 const SE_OUTPUT: usize = 0;
 const SE_NAME: usize = 1;
@@ -35,7 +35,7 @@ fn int_arg(args: &[Value], i: usize) -> i32 {
 }
 
 fn normalize(n: &str) -> String {
-    // Small copy — see stream_decoder::rustjvm_native_builtins_normalize.
+    // Small copy — see stream_decoder::cratonvm_native_builtins_normalize.
     match n.to_uppercase().replace(['-', '_'], "").as_str() {
         "UTF8" => "UTF-8".to_string(),
         "UTF16" => "UTF-16".to_string(),
@@ -140,7 +140,7 @@ fn write_bytes(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     chars: &[u16],
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if chars.is_empty() {
         return Ok(());
     }

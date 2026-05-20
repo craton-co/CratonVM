@@ -20,7 +20,7 @@
 #
 # The generated Java source lives under a temporary directory; it is
 # the in-process equivalent of the bytecode criterion builds for
-# RustJVM, so the two sides measure the same workload on the same
+# CratonVM, so the two sides measure the same workload on the same
 # inputs. HotSpot's JIT (C2, tiered stop at level 4) warms the code
 # for three iterations before we record ten timed runs; we report
 # the median.

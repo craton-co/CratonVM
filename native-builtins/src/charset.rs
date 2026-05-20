@@ -1,7 +1,7 @@
 //! Real transcoding implementations for `java.nio.charset.*`.
 //!
 //! The pure-Rust transcoding engine lives in
-//! `rustjvm_native_api::charset`; this module adapts it to the
+//! `cratonvm_native_api::charset`; this module adapts it to the
 //! synthetic layouts used by `Charset` (1 field: name), `CharsetEncoder`
 //! / `CharsetDecoder` (3 fields: charset, avg, max), `ByteBuffer` /
 //! `CharBuffer` (5 fields: array, pos, limit, capacity, mark) and
@@ -14,10 +14,10 @@
 //! replaces the previously-stubbed `encode` / `decode` methods (which
 //! returned `UNDERFLOW` without transcoding any bytes) with real ones.
 
-use rustjvm_native_api::charset as engine;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::charset as engine;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::{alloc_concurrent_synthetic, normalize_charset_name, CHARSET_FIELD_NAME};
 
@@ -567,7 +567,7 @@ fn native_string_get_bytes_named(
 // Helpers shared with the rest of the crate
 // ---------------------------------------------------------------------------
 
-fn arg_obj(args: &[Value], i: usize) -> Result<ObjectRef, rustjvm_types::error::MethodCallFailed> {
+fn arg_obj(args: &[Value], i: usize) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     match args.get(i) {
         Some(Value::Object(Some(o))) => Ok(*o),
         _ => Err(RuntimeError::NullPointerException {

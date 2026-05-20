@@ -259,7 +259,7 @@ pub struct JvmThread {
     pub scoped_values: Vec<(u64, Option<ObjectRef>, Value)>,
 
     /// Thread-local allocation buffer for lock-free young-gen allocation.
-    pub tlab: rustjvm_gc::Tlab,
+    pub tlab: cratonvm_gc::Tlab,
 
     /// T1.5.1 — pending asynchronous exception to deliver at the next
     /// safepoint.
@@ -331,7 +331,7 @@ impl JvmThread {
         *OFFSET.get_or_init(|| {
             let t = JvmThread::default();
             let base = &t as *const JvmThread as usize;
-            let tlab_addr = &t.tlab as *const rustjvm_gc::Tlab as usize;
+            let tlab_addr = &t.tlab as *const cratonvm_gc::Tlab as usize;
             tlab_addr - base
         })
     }
@@ -359,7 +359,7 @@ impl JvmThread {
             pin_count: 0,
             pin_reason: "",
             scoped_values: Vec::new(),
-            tlab: rustjvm_gc::Tlab::empty(),
+            tlab: cratonvm_gc::Tlab::empty(),
             pending_async_exception: None,
             single_step_enabled: AtomicBool::new(false),
             frame_pop_requests: Vec::new(),
@@ -466,7 +466,7 @@ mod tests {
     fn tlab_offset_matches_field_address() {
         let t = JvmThread::default();
         let base = &t as *const JvmThread as usize;
-        let tlab_addr = &t.tlab as *const rustjvm_gc::Tlab as usize;
+        let tlab_addr = &t.tlab as *const cratonvm_gc::Tlab as usize;
         let expected = tlab_addr - base;
         assert_eq!(
             JvmThread::tlab_offset(),

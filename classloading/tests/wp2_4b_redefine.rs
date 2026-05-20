@@ -25,7 +25,7 @@
 //! plus `Bar.class`, `Foo.extra_field.class`, `Foo.extra_method.class`,
 //! and `Foo.impl_serializable.class`.
 
-use rustjvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions, RedefineOptions};
+use cratonvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions, RedefineOptions};
 use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -445,7 +445,7 @@ fn redefine_unknown_class_id_rejected() {
     };
     let mut cm = fresh_manager();
     // Allocate an id that's beyond the store's range.
-    let bogus = rustjvm_classloading::ClassId::new(99_999);
+    let bogus = cratonvm_classloading::ClassId::new(99_999);
     let err = cm
         .redefine_class(bogus, v1, RedefineOptions::default())
         .unwrap_err();

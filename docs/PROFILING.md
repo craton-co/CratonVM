@@ -1,14 +1,14 @@
 # Performance Profiling Guide
 
-How to measure and improve RustJVM performance.
+How to measure and improve CratonVM performance.
 
 ## Running Benchmarks
 
 ### QuickBench (standard suite)
 
 ```bash
-# RustJVM
-cargo run --release -p rustjvm-cli -- --classpath bench QuickBench
+# CratonVM
+cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
 
 # Compare with HotSpot JDK
 java -cp bench QuickBench
@@ -45,8 +45,8 @@ public class MyBench {
 
 ```bash
 # Record CPU profile
-cargo build --release -p rustjvm-cli
-perf record -g ./target/release/rustjvm-cli --classpath bench QuickBench
+cargo build --release -p cratonvm-cli
+perf record -g ./target/release/cratonvm --classpath bench QuickBench
 perf report
 
 # Generate flamegraph
@@ -61,7 +61,7 @@ Use Windows Performance Recorder (WPR) or Tracy profiler with the release binary
 
 ```bash
 # Cargo flamegraph (install: cargo install flamegraph)
-cargo flamegraph --release -p rustjvm-cli -- --classpath bench QuickBench
+cargo flamegraph --release -p cratonvm-cli -- --classpath bench QuickBench
 
 # Criterion benchmarks (if available)
 cargo bench
@@ -69,9 +69,9 @@ cargo bench
 
 ## Interpreting Results
 
-- **Ratio < 1.0x**: RustJVM is faster than HotSpot
+- **Ratio < 1.0x**: CratonVM is faster than HotSpot
 - **Ratio = 1.0x**: Performance parity with HotSpot
-- **Ratio > 1.0x**: RustJVM is slower by that factor
+- **Ratio > 1.0x**: CratonVM is slower by that factor
 
 Current performance: ~1.41x overall vs HotSpot JDK 25 C2 (Round 26).
 Fibonacci is within 7% of C2.

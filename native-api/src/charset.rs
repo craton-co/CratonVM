@@ -3,7 +3,7 @@
 //! `StreamEncoder` shims.
 //!
 //! The engine accepts a canonical charset name (as produced by
-//! `normalize_charset_name` in `rustjvm-native-builtins`) and transcodes
+//! `normalize_charset_name` in `cratonvm-native-builtins`) and transcodes
 //! between UTF-16 code units — the representation used internally by our
 //! Java `String` objects — and arbitrary byte sequences.
 //!

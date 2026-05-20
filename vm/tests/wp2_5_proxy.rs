@@ -12,14 +12,14 @@
 //!     a non-zero value after a proxy is created (driven by the
 //!     `last-interfaces` cache update in `native_proxy_new_instance`).
 //!   * The `ProxyProbe` Java app under `apps/proxy_probe/` compiles and
-//!     loads under rust-jvm.
+//!     loads under cratonvm.
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 #[test]
 fn proxy_natives_registered_with_jdk25_signatures() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_reflect_proxy_natives(&mut r);
+    cratonvm_native_builtins::register_reflect_proxy_natives(&mut r);
 
     // isProxyClass(Ljava/lang/Class;)Z
     assert!(
@@ -68,7 +68,7 @@ fn proxy_natives_registered_with_jdk25_signatures() {
 
 #[test]
 fn proxy_module_field_layout_constants() {
-    use rustjvm_vm::runtime::proxy::{
+    use cratonvm_vm::runtime::proxy::{
         PROXY_FIELD_HANDLER, PROXY_FIELD_IDENTITY_HASH, PROXY_FIELD_INTERFACES,
         PROXY_INSTANCE_CLASS, PROXY_INSTANCE_FIELD_COUNT,
     };
@@ -81,7 +81,7 @@ fn proxy_module_field_layout_constants() {
 
 #[test]
 fn proxy_module_classify_object_methods() {
-    use rustjvm_vm::runtime::proxy::ProxyObjectMethod;
+    use cratonvm_vm::runtime::proxy::ProxyObjectMethod;
 
     assert_eq!(
         ProxyObjectMethod::classify("getClass", "()Ljava/lang/Class;"),
@@ -109,7 +109,7 @@ fn proxy_module_classify_object_methods() {
 
 #[test]
 fn proxy_module_descriptor_param_count() {
-    use rustjvm_vm::runtime::proxy::count_descriptor_params;
+    use cratonvm_vm::runtime::proxy::count_descriptor_params;
 
     // Signature shapes encountered on real JDK proxies.
     assert_eq!(count_descriptor_params("()V"), 0);
@@ -131,7 +131,7 @@ fn proxy_module_descriptor_param_count() {
 fn proxy_native_call_populates_last_interfaces_after_a_proxy_is_made() {
     // White-box: bumping the global counter from a unit test path
     // proves the symbol is exposed and the cache is reachable.
-    let bits_before = rustjvm_native_builtins::proxy_last_interfaces_bits();
+    let bits_before = cratonvm_native_builtins::proxy_last_interfaces_bits();
     // Without an actual `newProxyInstance` call we can't write to the
     // cache (it's intentionally process-wide and only updated from the
     // native). We just sanity-check that the accessor compiles, links,
@@ -165,9 +165,9 @@ fn proxy_probe_compiled_class_files_exist() {
 }
 
 #[test]
-fn proxy_probe_loads_under_rustjvm_when_staged() {
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::vm::Vm;
+fn proxy_probe_loads_under_cratonvm_when_staged() {
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::vm::Vm;
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let probe_dir = manifest.parent().unwrap().join("apps").join("proxy_probe");
@@ -195,7 +195,7 @@ fn proxy_get_interfaces_handles_non_proxy_class() {
     // standard interface-list lookup. Without a full VM context the
     // best we can do here is reach the module API and confirm it
     // exists.
-    use rustjvm_vm::runtime::proxy::is_proxy_class_name;
+    use cratonvm_vm::runtime::proxy::is_proxy_class_name;
     assert!(!is_proxy_class_name("java/lang/Object"));
     assert!(!is_proxy_class_name("java/util/HashMap"));
     assert!(is_proxy_class_name("java/lang/reflect/Proxy$Instance"));
@@ -203,7 +203,7 @@ fn proxy_get_interfaces_handles_non_proxy_class() {
 
 #[test]
 fn proxy_diagnostic_counters_exposed() {
-    use rustjvm_vm::runtime::proxy::stats;
+    use cratonvm_vm::runtime::proxy::stats;
 
     let before = stats::instances_created();
     stats::inc_instances_created();
@@ -218,7 +218,7 @@ fn proxy_diagnostic_counters_exposed() {
 fn proxy_native_builtins_diagnostic_counter_exposed() {
     // Sanity-check that the native-builtins-side counter is a stable
     // symbol callers can monitor.
-    let n = rustjvm_native_builtins::proxy_instances_created();
+    let n = cratonvm_native_builtins::proxy_instances_created();
     // Just check the call doesn't panic and returns a u64.
     let _ = n;
 }
@@ -234,7 +234,7 @@ fn proxy_native_builtins_diagnostic_counter_exposed() {
 // (which has no Code attribute) and crashed with a linkage error.
 //
 // All four tests share the same scaffolding: compile a small Java
-// shape, run it under `rustjvm`, and assert the expected `pass-N`
+// shape, run it under `cratonvm`, and assert the expected `pass-N`
 // line appears in stdout.
 
 /// Helper: locate the proxy_probe directory if staged. Returns `None`
@@ -259,9 +259,9 @@ fn proxy_probe_dir() -> Option<std::path::PathBuf> {
 /// process stdout. The return value is just a marker that the call
 /// completed without a hard error.
 fn run_proxy_main(class_name: &str) -> Result<(), String> {
-    use rustjvm_types::Value;
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::vm::Vm;
+    use cratonvm_types::Value;
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::vm::Vm;
 
     let probe = proxy_probe_dir().ok_or_else(|| "proxy_probe classes not staged".to_string())?;
     let cp = vec![probe.to_string_lossy().to_string()];
@@ -320,8 +320,8 @@ fn proxy_invoke_handler_shared_with_object_handler_smoke() {
     // dispatch through the standard `invoke_or_native` path. This is
     // a smoke test that the new `handler_is_lambda` branch doesn't
     // inadvertently swallow the non-lambda path.
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::vm::SharedVm;
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::vm::SharedVm;
     use std::sync::Arc;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -332,7 +332,7 @@ fn proxy_invoke_handler_shared_with_object_handler_smoke() {
     // similar — but importantly, *not* with the lambda dispatch
     // branch. The mere fact that the call returns is what we're
     // verifying.
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
     let cls = ClassId::new(1);
     let handler = shared.heap.alloc_object(cls, 0);
     let handler_class_id = shared.heap.class_id_of(handler);
@@ -349,7 +349,7 @@ fn proxy_lambda_dispatch_preserves_diagnostic_counters() {
     // The dispatch counter must be incremented when a lambda handler
     // runs end-to-end. Even if the probe isn't staged, the counter
     // surface itself is reachable.
-    use rustjvm_vm::runtime::proxy::stats;
+    use cratonvm_vm::runtime::proxy::stats;
     let _ = stats::dispatches();
     let _ = stats::instances_created();
     // Bump and verify monotonic.
@@ -369,7 +369,7 @@ fn proxy_invoke_handler_shared_is_exported() {
     // check via `let _: fn(...) = ...` would be ideal — but the fn is
     // `pub(crate)` and not exposed. Instead, verify via a related
     // public symbol that the dispatch module is wired in.
-    use rustjvm_vm::runtime::proxy::PROXY_INSTANCE_CLASS;
+    use cratonvm_vm::runtime::proxy::PROXY_INSTANCE_CLASS;
     assert_eq!(PROXY_INSTANCE_CLASS, "java/lang/reflect/Proxy$Instance");
 
     // Also sanity-check the lambda interpreter entry point is exposed
@@ -378,12 +378,12 @@ fn proxy_invoke_handler_shared_is_exported() {
     // we *can* verify the related `lambda_proxy` module's stats are
     // reachable, proving the lambda subsystem is linked into this
     // test binary.
-    let _ = rustjvm_vm::runtime::lambda_proxy::dispatch_count();
-    let _ = rustjvm_vm::runtime::lambda_proxy::bootstrap_count();
+    let _ = cratonvm_vm::runtime::lambda_proxy::dispatch_count();
+    let _ = cratonvm_vm::runtime::lambda_proxy::bootstrap_count();
 }
 
 // ---------------------------------------------------------------------------
-// WP2.5 6-case acceptance matrix — driven by spawning the rustjvm CLI
+// WP2.5 6-case acceptance matrix — driven by spawning the cratonvm CLI
 // against `apps/proxy_probe/ProxyProbe.java`.
 //
 // The probe (see `apps/proxy_probe/ProxyProbe.java`) prints a `pass-N` or
@@ -436,10 +436,10 @@ fn probe_source_file() -> PathBuf {
         .join("ProxyProbe.java")
 }
 
-/// Resolve the rustjvm CLI binary. Prefer release (faster), fall back to
-/// debug; honor `RUSTJVM_BIN` for hermetic CI builds.
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+/// Resolve the cratonvm CLI binary. Prefer release (faster), fall back to
+/// debug; honor `CRATONVM_BIN` for hermetic CI builds.
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -447,7 +447,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -500,11 +500,11 @@ fn run_probe_once() -> Option<String> {
                 eprintln!("[wp2_5] proxy_probe class files unavailable; skipping");
                 return None;
             }
-            let bin = match rustjvm_binary() {
+            let bin = match cratonvm_binary() {
                 Some(b) => b,
                 None => {
                     eprintln!(
-                        "[wp2_5] rustjvm binary not found; build with `cargo build --release -p rustjvm-cli`"
+                        "[wp2_5] cratonvm binary not found; build with `cargo build --release -p cratonvm-cli`"
                     );
                     return None;
                 }
@@ -528,7 +528,7 @@ fn run_probe_once() -> Option<String> {
                     Some(format!("{stdout}\n--- STDERR ---\n{stderr}"))
                 }
                 Err(e) => {
-                    eprintln!("[wp2_5] failed to spawn rustjvm: {e}");
+                    eprintln!("[wp2_5] failed to spawn cratonvm: {e}");
                     None
                 }
             }

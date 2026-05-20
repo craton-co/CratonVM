@@ -8,9 +8,9 @@ param(
 $ErrorActionPreference = "Stop"
 $src = Join-Path $WorkspaceRoot "target\$Profile\java.exe"
 if (-not (Test-Path $src)) {
-    throw "Missing '$src'. Build first: cargo build --$Profile -p rustjvm-cli"
+    throw "Missing '$src'. Build first: cargo build --$Profile -p cratonvm-cli"
 }
-$dstDir = Join-Path $WorkspaceRoot "target\rustjvm-maven-shim\bin"
+$dstDir = Join-Path $WorkspaceRoot "target\cratonvm-maven-shim\bin"
 $dst = Join-Path $dstDir "java.exe"
 New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
 Copy-Item -LiteralPath $src -Destination $dst -Force

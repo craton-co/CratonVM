@@ -1,17 +1,17 @@
 //! Phase B integration tests for the shared charset engine
-//! (`rustjvm_native_api::charset`). These tests correspond to the
+//! (`cratonvm_native_api::charset`). These tests correspond to the
 //! success criteria listed in `docs/roadmap-any-java-app.md`:
 //!
 //! * RB.1 — UTF-8 / US-ASCII / ISO-8859-1 / UTF-16LE/BE round-trip
 //!   a 256-byte fixture.
 //! * RB.6 — a 20-char surrogate-pair + embedded-NUL fixture survives a
 //!   modified-UTF-8 encoder/decoder round-trip.  (Modified-UTF-8 lives
-//!   in `rustjvm-native-io` but the shared round-trip property is the
+//!   in `cratonvm-native-io` but the shared round-trip property is the
 //!   underlying UTF-16 invariant tested here with real UTF-8.)
 //! * Misc.  Round-trip checks for the single-byte code pages we claim
 //!   to support (windows-1252, KOI8-R, ISO-8859-15).
 
-use rustjvm_native_api::charset::{
+use cratonvm_native_api::charset::{
     average_bytes_per_char, average_chars_per_byte, decode_bytes, decode_bytes_lossy,
     encode_chars, encode_chars_lossy, max_bytes_per_char, max_chars_per_byte,
 };

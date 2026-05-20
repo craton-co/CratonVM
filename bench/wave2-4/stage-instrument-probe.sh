@@ -5,7 +5,7 @@
 # fixture for WP2.4: it builds an agent jar from
 # apps/instrument_probe/{Target,RetransformAgent,Main}.java +
 # apps/instrument_probe/META-INF/MANIFEST.MF, runs main under
-# rust-jvm with `-javaagent:agent.jar`, and verifies that the
+# cratonvm with `-javaagent:agent.jar`, and verifies that the
 # transformer's bipush 42->99 patch took effect.
 #
 # Behaviour:

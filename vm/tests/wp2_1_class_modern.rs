@@ -28,20 +28,20 @@
 //!
 //! # Fixture
 //!
-//! `vm/tests/resources/rustjvm/Wp21ClassModern.java` contains a sealed
+//! `vm/tests/resources/cratonvm/Wp21ClassModern.java` contains a sealed
 //! interface (`Shape` permits `Circle, Square, Triangle`), a record
 //! (`Point(int x, int y)`), and nested classes (`Inner` / `Inner.Deeper`).
 //! The fixture is marked `// JAVA21+` on line 1 so `vm/build.rs` compiles
 //! it with `--release 21` (sealed classes need Java 17+; record patterns
 //! and the sealed-class API stabilised in Java 17).
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::native::register_builtins;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::native::register_builtins;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp21ClassModern";
+const FIXTURE_CLASS: &str = "cratonvm/Wp21ClassModern";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -50,7 +50,7 @@ fn test_resources_dir() -> String {
 
 fn fixture_compiled() -> bool {
     let path = format!(
-        "{}/rustjvm/Wp21ClassModern.class",
+        "{}/cratonvm/Wp21ClassModern.class",
         test_resources_dir()
     );
     std::path::Path::new(&path).exists()
@@ -77,7 +77,7 @@ fn run_probe(method: &str) -> Result<i32, String> {
 #[test]
 fn class_get_annotated_interfaces_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -207,11 +207,11 @@ fn get_type_annotations_probe() {
 #[test]
 fn fixture_class_file_is_staged() {
     let java = format!(
-        "{}/rustjvm/Wp21ClassModern.java",
+        "{}/cratonvm/Wp21ClassModern.java",
         test_resources_dir()
     );
     let class = format!(
-        "{}/rustjvm/Wp21ClassModern.class",
+        "{}/cratonvm/Wp21ClassModern.class",
         test_resources_dir()
     );
     assert!(

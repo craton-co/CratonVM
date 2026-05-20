@@ -2,10 +2,10 @@
 
 use std::sync::atomic::{fence, Ordering};
 
-use rustjvm_types::ClassId;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 use crate::{FUT_FIELD_RESULT, FUT_FIELD_DONE, BI_FIELD_VALUE, BI_FIELD_SIGNUM};
@@ -734,7 +734,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
             ctx.set_field(es, 0, Value::Int(0)); // not shutdown
             ctx.set_field(es, 1, Value::Int(1)); // pool size = 1
-            let queue = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+            let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0)); // task count
             Ok(Some(Value::Object(Some(es))))
@@ -749,7 +749,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(pool_size));
-            let queue = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+            let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
             Ok(Some(Value::Object(Some(es))))
@@ -763,7 +763,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(i32::MAX)); // unbounded
-            let queue = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+            let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
             Ok(Some(Value::Object(Some(es))))
@@ -779,7 +779,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(pool_size));
-            let queue = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+            let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
             Ok(Some(Value::Object(Some(es))))
@@ -793,7 +793,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(i32::MAX));
-            let queue = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+            let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
             Ok(Some(Value::Object(Some(es))))
@@ -828,7 +828,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Int(1));
         // Return list of pending (unexecuted) tasks
         let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0) as usize;
-        let pending = ctx.new_array(rustjvm_types::ArrayElementType::Reference, task_count);
+        let pending = ctx.new_array(cratonvm_types::ArrayElementType::Reference, task_count);
         if task_count > 0 {
             if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
                 for i in 0..task_count {
@@ -1278,7 +1278,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let elem = args[0];
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             ctx.set_field(set, 1, Value::Int(0));
             ctx.set_field(set, 2, Value::Int(16));
@@ -1296,7 +1296,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let elem = args[0];
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, elem);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(1));
@@ -1311,7 +1311,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             let key = args[0];
             let val = args[1];
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(map, 0, Value::Object(Some(arr)));
             ctx.set_field(map, 1, Value::Int(0));
             ctx.set_field(map, 2, Value::Int(16));
@@ -1334,7 +1334,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             let n = args[0].as_int().unwrap_or(0) as usize;
             let elem = args[1];
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, n);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
             for i in 0..n {
                 ctx.set_array_element(arr, i, elem);
             }
@@ -1383,7 +1383,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
 fn native_al_init_default_for_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let cap = 16;
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, Value::Int(cap as i32));
@@ -1482,7 +1482,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         let arr = if let Value::Object(Some(a)) = arr_val {
             a
         } else {
-            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)
+            ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
         };
         let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
@@ -1496,7 +1496,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         let arr = if let Value::Object(Some(a)) = arr_val {
             a
         } else {
-            ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)
+            ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
         };
         let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
@@ -1796,7 +1796,7 @@ pub(crate) fn p56_read_stream_elems(ctx: &mut dyn NativeContext, this: ObjectRef
 
 // --- Helper: build a new Stream from a Vec<Value> ---
 pub(crate) fn p56_build_stream(ctx: &mut dyn NativeContext, elems: Vec<Value>, class: &str) -> ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let len = elems.len();
     let arr = ctx.new_array(ArrayElementType::Reference, len);
     for (i, v) in elems.into_iter().enumerate() {
@@ -3723,7 +3723,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
             let path_obj = p57_alloc_path(ctx, part);
@@ -3830,7 +3830,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 break;
             }
             let os_path = p57_to_os_path(&path_str);
-            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
                 eprintln!("[DBG_SBLOAD] Path.of(URI) -> {:?}", os_path);
             }
             let result = p57_alloc_path(ctx, &os_path);
@@ -4140,7 +4140,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getFileStores",
         "()Ljava/lang/Iterable;",
         |ctx, _args| {
-            use rustjvm_types::ArrayElementType;
+            use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
             ctx.set_field(list, 0, Value::Int(0));
@@ -4164,7 +4164,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getRootDirectories",
         "()Ljava/lang/Iterable;",
         |ctx, _args| {
-            use rustjvm_types::ArrayElementType;
+            use cratonvm_types::ArrayElementType;
             let root = if cfg!(windows) { "C:\\" } else { "/" };
             let root_path = p57_alloc_path(ctx, root);
             let arr = ctx.new_array(ArrayElementType::Reference, 1);
@@ -4215,7 +4215,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
 
     r.register(fsp, "installedProviders", "()Ljava/util/List;", |ctx, _args| {
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
         let file_s = ctx.create_string("file");
         ctx.set_field(file_p, 0, Value::Object(Some(file_s)));
@@ -4306,7 +4306,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getConfigSources",
         "(Lio/smallrye/config/ConfigSourceContext;)Ljava/lang/Iterable;",
         |ctx, _args| {
-            use rustjvm_types::ArrayElementType;
+            use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
             ctx.set_field(list, 0, Value::Int(0));
@@ -4401,20 +4401,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn picocli_style_lookup(
         ctx: &mut dyn NativeContext,
         prefix: &str,
-        raw_name: rustjvm_types::ObjectRef,
-    ) -> rustjvm_types::Value {
+        raw_name: cratonvm_types::ObjectRef,
+    ) -> cratonvm_types::Value {
         let style_cls = "picocli/CommandLine$Help$Ansi$Style";
         let class_id = match ctx.ensure_class_initialized(style_cls) {
             Ok(id) => id,
             Err(_) => {
-                if std::env::var("RUSTJVM_DBG_PICOCLI_STYLE").is_ok() {
+                if std::env::var("CRATONVM_DBG_PICOCLI_STYLE").is_ok() {
                     eprintln!("[picocli-style] ensure_class_initialized failed");
                 }
-                return rustjvm_types::Value::Object(None);
+                return cratonvm_types::Value::Object(None);
             }
         };
         let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
-        let dbg = std::env::var("RUSTJVM_DBG_PICOCLI_STYLE").is_ok();
+        let dbg = std::env::var("CRATONVM_DBG_PICOCLI_STYLE").is_ok();
         // Round 93: Style constants are STATIC enum fields — must use
         // `static_field_index_by_name`, not `resolve_field_index` (which
         // only walks INSTANCE fields). Round 92's fallback was reaching
@@ -4424,9 +4424,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some(idx) = ctx.static_field_index_by_name(class_id, &name) {
             let v = ctx.get_static_field(class_id, idx);
             if dbg {
-                eprintln!("[picocli-style] plain {} -> idx={} val_null={}", name, idx, matches!(v, rustjvm_types::Value::Object(None)));
+                eprintln!("[picocli-style] plain {} -> idx={} val_null={}", name, idx, matches!(v, cratonvm_types::Value::Object(None)));
             }
-            if !matches!(v, rustjvm_types::Value::Object(None)) {
+            if !matches!(v, cratonvm_types::Value::Object(None)) {
                 return v;
             }
         } else if dbg {
@@ -4437,9 +4437,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some(idx) = ctx.static_field_index_by_name(class_id, &prefixed) {
             let v = ctx.get_static_field(class_id, idx);
             if dbg {
-                eprintln!("[picocli-style] prefixed {} -> idx={} val_null={}", prefixed, idx, matches!(v, rustjvm_types::Value::Object(None)));
+                eprintln!("[picocli-style] prefixed {} -> idx={} val_null={}", prefixed, idx, matches!(v, cratonvm_types::Value::Object(None)));
             }
-            if !matches!(v, rustjvm_types::Value::Object(None)) {
+            if !matches!(v, cratonvm_types::Value::Object(None)) {
                 return v;
             }
         } else if dbg {
@@ -4450,14 +4450,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some(idx) = ctx.static_field_index_by_name(class_id, "reset") {
             let v = ctx.get_static_field(class_id, idx);
             if dbg {
-                eprintln!("[picocli-style] reset fallback idx={} val_null={}", idx, matches!(v, rustjvm_types::Value::Object(None)));
+                eprintln!("[picocli-style] reset fallback idx={} val_null={}", idx, matches!(v, cratonvm_types::Value::Object(None)));
             }
             return v;
         }
         if dbg {
             eprintln!("[picocli-style] reset static field not found, returning null");
         }
-        rustjvm_types::Value::Object(None)
+        cratonvm_types::Value::Object(None)
     }
     r.register(
         "picocli/CommandLine$Help$Ansi$Style",
@@ -4607,7 +4607,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn read_all_lines_impl(
         ctx: &mut dyn NativeContext,
         args: &[Value],
-    ) -> rustjvm_types::error::MethodCallResult {
+    ) -> cratonvm_types::error::MethodCallResult {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
         match std::fs::read_to_string(&p) {
@@ -4625,7 +4625,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .unwrap_or(1);
                 let n_fields = std::cmp::max(data_slot, size_slot) + 1;
                 let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
-                use rustjvm_types::ArrayElementType;
+                use cratonvm_types::ArrayElementType;
                 let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
                 for (i, line) in lines.iter().enumerate() {
                     let s = ctx.create_string(line);
@@ -4664,7 +4664,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match std::fs::read_to_string(&p) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
-                    use rustjvm_types::ArrayElementType;
+                    use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
                     for (i, line) in lines.iter().enumerate() {
                         let s = ctx.create_string(line);
@@ -4904,7 +4904,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match std::fs::read(&p) {
                 Ok(data) => {
                     let channel = alloc_concurrent_synthetic(ctx, "java/nio/channels/SeekableByteChannel", 3);
-                    use rustjvm_types::ArrayElementType;
+                    use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
@@ -4931,7 +4931,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match std::fs::read(&p) {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    use rustjvm_types::ArrayElementType;
+                    use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
@@ -5002,7 +5002,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .collect(),
                 Err(_) => vec![],
             };
-            use rustjvm_types::ArrayElementType;
+            use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
             for (i, entry) in entries.iter().enumerate() {
                 let ep = p57_alloc_path(ctx, entry);
@@ -5156,7 +5156,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match std::fs::read(&p) {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    use rustjvm_types::ArrayElementType;
+                    use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
@@ -5469,7 +5469,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, path_obj);
             match std::fs::read(&p) {
                 Ok(data) => {
-                    use rustjvm_types::ArrayElementType;
+                    use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
@@ -5607,7 +5607,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
             let ep = p57_alloc_path(ctx, part);
@@ -5773,7 +5773,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .collect(),
                     Err(_) => vec![],
                 };
-                use rustjvm_types::ArrayElementType;
+                use cratonvm_types::ArrayElementType;
                 let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
                 for (i, name) in entries.iter().enumerate() {
                     let s = ctx.create_string(name);
@@ -5939,7 +5939,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn write_iterable_impl(
         ctx: &mut dyn NativeContext,
         args: &[Value],
-    ) -> rustjvm_types::error::MethodCallResult {
+    ) -> cratonvm_types::error::MethodCallResult {
         let path_obj = obj_arg(args, 0)?;
         let iterable = obj_arg(args, 1)?;
         let p = p57_read_path(ctx, path_obj);
@@ -6391,7 +6391,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
             };
             // Create ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, stdout_bytes.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stdout_bytes.len());
             for (i, &b) in stdout_bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -6418,7 +6418,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 _ => Vec::new(),
             };
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, stderr_bytes.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stderr_bytes.len());
             for (i, &b) in stderr_bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -7353,7 +7353,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let exists = std::path::Path::new(&path).exists();
-        if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
             eprintln!("[DBG_SBLOAD] File.exists() path={:?} -> {}", path, exists);
         }
         Ok(Some(Value::Int(if exists { 1 } else { 0 })))
@@ -7368,7 +7368,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let result = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
-        if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+        if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
             eprintln!("[DBG_SBLOAD] File.isDirectory() path={:?} -> {}", path, result);
         }
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
@@ -7584,7 +7584,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect();
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, names.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, names.len());
                 for (i, name) in names.iter().enumerate() {
                     let s = ctx.create_string(name);
                     ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -7603,7 +7603,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .filter_map(|e| e.ok())
                     .map(|e| e.path().to_string_lossy().into_owned())
                     .collect();
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, paths.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
                 for (i, p) in paths.iter().enumerate() {
                     let f = file_alloc(ctx, p);
                     ctx.set_array_element(arr, i, Value::Object(Some(f)));
@@ -7639,7 +7639,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 accepted.push(file_obj);
             }
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, accepted.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
         for (i, f) in accepted.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(*f)));
         }
@@ -7680,7 +7680,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 accepted.push(file_alloc(ctx, full));
             }
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, accepted.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
         for (i, f) in accepted.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(*f)));
         }
@@ -7717,7 +7717,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 accepted.push(name.clone());
             }
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, accepted.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
         for (i, name) in accepted.iter().enumerate() {
             let s = ctx.create_string(name);
             ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -7806,7 +7806,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         };
         #[cfg(not(windows))]
         let roots: Vec<String> = vec!["/".to_string()];
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, roots.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, roots.len());
         for (i, r) in roots.iter().enumerate() {
             let f = file_alloc(ctx, r);
             ctx.set_array_element(arr, i, Value::Object(Some(f)));
@@ -8085,7 +8085,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Long(0)));
         }
         // Wrap in a ByteBuffer and call target.write(ByteBuffer)
-        let byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, n);
+        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
         for i in 0..n {
             ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
         }
@@ -8114,7 +8114,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Long(0)));
         }
         // Allocate a ByteBuffer and call src.read(ByteBuffer)
-        let byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, count as usize);
+        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, count as usize);
         let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
         ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
         ctx.set_field(bb, 1, Value::Int(0));
@@ -9476,7 +9476,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _args| {
         let sel = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 4);
         ctx.set_field(sel, 0, Value::Int(1));
-        let keys = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
         ctx.set_field(sel, 1, Value::Object(Some(keys)));
         ctx.set_field(sel, 2, Value::Int(0));
         ctx.set_field(sel, 3, Value::Int(0)); // wakeup_flag
@@ -9508,7 +9508,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             }
         }
         let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, ready.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, ready.len());
         for (i, k) in ready.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(*k)));
         }
@@ -9520,7 +9520,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let kc = ctx.get_field(this, 2).as_int().unwrap_or(0) as usize;
         let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, kc);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, kc);
         if let Value::Object(Some(ka)) = ctx.get_field(this, 1) {
             for i in 0..kc { ctx.set_array_element(arr, i, ctx.get_array_element(ka, i)); }
         }
@@ -9762,8 +9762,8 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             let cursor = std::io::Cursor::new(&all_bytes);
             if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
                 let count = archive.len();
-                let names_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
-                let data_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+                let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+                let data_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
                 for i in 0..count {
                     if let Ok(mut entry) = archive.by_index(i) {
                         let name = ctx.create_string(entry.name());
@@ -9771,7 +9771,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                         let mut entry_bytes = Vec::new();
                         use std::io::Read;
                         let _ = entry.read_to_end(&mut entry_bytes);
-                        let byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, entry_bytes.len());
+                        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, entry_bytes.len());
                         for (j, &b) in entry_bytes.iter().enumerate() {
                             ctx.set_array_element(byte_arr, j, Value::Int(b as i8 as i32));
                         }
@@ -9875,8 +9875,8 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
         // Initialize empty entry lists (using arrays as dynamic lists with a count sentinel)
-        let names = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
-        let datas = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+        let names = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+        let datas = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
         ctx.set_field(this, 1, Value::Object(Some(names)));
         ctx.set_field(this, 2, Value::Object(Some(datas)));
         ctx.set_field(this, 3, Value::Object(None)); // no current entry
@@ -10054,7 +10054,7 @@ fn p58_gzip_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     } else {
         Vec::new()
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, decompressed.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, decompressed.len());
     for (i, &b) in decompressed.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
@@ -10123,7 +10123,7 @@ fn p58_gzip_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn p58_gzip_out_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Field 0 = accumulated bytes array, field 1 = count, field 2 = underlying OutputStream
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 1024);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
@@ -10162,7 +10162,7 @@ fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
         // Grow if needed
         let target = if new_count > cap {
             let new_cap = (new_count * 2).max(1024);
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_cap);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_cap);
             for i in 0..count {
                 ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
             }
@@ -10223,7 +10223,7 @@ fn zo_finalize_current_entry(ctx: &mut dyn NativeContext, this: ObjectRef) {
         ctx.set_array_element(names_arr, count, entry_name);
     }
     if let Value::Object(Some(datas_arr)) = ctx.get_field(this, 2) {
-        let byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, data.len());
+        let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
         for (i, &b) in data.iter().enumerate() {
             ctx.set_array_element(byte_arr, i, Value::Int(b as i8 as i32));
         }
@@ -10398,7 +10398,7 @@ pub(crate) fn register_p58_pushback(r: &mut NativeMethodRegistry) {
 fn p58_pushback_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 1);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(1)); // pos = buf.length means buffer empty
     Ok(None)
@@ -10411,7 +10411,7 @@ fn p58_pushback_in_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(v)) => *v as usize,
         _ => 1,
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, size);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, size);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(size as i32)); // pos = size means buffer empty
     Ok(None)
@@ -10483,7 +10483,7 @@ fn p58_pushback_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 fn p58_pushback_reader_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(1));
     Ok(None)
@@ -10496,7 +10496,7 @@ fn p58_pushback_reader_init_size(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(v)) => *v as usize,
         _ => 1,
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(size as i32));
     Ok(None)
@@ -10820,7 +10820,7 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     });
     r.register(sq, "iterator", "()Ljava/util/Iterator;", |ctx, _args| {
         // Empty iterator
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, 0);
         let itr = alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2);
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
@@ -10828,7 +10828,7 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(itr))))
     });
     r.register(sq, "toArray", "()[Ljava/lang/Object;", |ctx, _args| {
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
@@ -11037,7 +11037,7 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     });
     r.register(tmx, "getAllThreadIds", "()[J", |ctx, _args| {
         let threads = ctx.enumerate_threads(256);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, threads.len().max(1));
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, threads.len().max(1));
         if threads.is_empty() {
             ctx.set_array_element(arr, 0, Value::Long(1));
         } else {
@@ -11061,11 +11061,11 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Long(start.elapsed().as_millis() as i64)))
     });
     r.register(rmx, "getName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("1@rustjvm");
+        let s = ctx.create_string("1@cratonvm");
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(rmx, "getVmName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("RustJVM");
+        let s = ctx.create_string("CratonVM");
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(rmx, "getVmVersion", "()Ljava/lang/String;", |ctx, _args| {
@@ -11150,7 +11150,7 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     // CompilationMXBean = 0-field synthetic
     let cmx = "java/lang/management/CompilationMXBean";
     r.register(cmx, "getName", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("RustJVM Native Compiler");
+        let s = ctx.create_string("CratonVM Native Compiler");
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(cmx, "getTotalCompilationTime", "()J", |_ctx, _args| {
@@ -12121,7 +12121,7 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => String::new(),
     };
     let elems = p59_jar_collect_entries(ctx, &path);
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] JarFile.stream() path={:?} entries={}", path, elems.len());
     }
     Ok(Some(Value::Object(Some(p56_build_stream(
@@ -12186,13 +12186,13 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         }
         _ => String::new(),
     };
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}", jar_path);
     }
 
     let urls = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
 
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls", urls.len());
     }
 
@@ -12203,7 +12203,7 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
     // the synthetic-HashSet layout drift between `phases_early::Set.of`
     // (3-field) and `native_collections::HashSet` (1-field).
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     for (i, v) in urls.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
@@ -12227,14 +12227,14 @@ fn sb3_executable_archive_launcher_create_class_loader_collection(
     let cid = ctx.class_id_of_object(this);
     let cn = ctx.class_name_of_id(cid).unwrap_or_default();
     let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!(
             "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
             cn, jar_path
         );
     }
     let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
-    let url_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, url_values.len());
+    let url_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, url_values.len());
     for (i, v) in url_values.iter().enumerate() {
         ctx.set_array_element(url_arr, i, *v);
     }
@@ -12297,7 +12297,7 @@ fn sb2_launcher_get_main_class(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let jar_path = sb2_launcher_jar_path(ctx, this).unwrap_or_default();
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getMainClass jar_path={:?}", jar_path);
     }
     let start_class = sb2_read_start_class(&jar_path);
@@ -12360,7 +12360,7 @@ fn sb2_launcher_build_archive_list(
             }
         }
     }
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchives -> {} entries", archives.len());
     }
     archives
@@ -12374,7 +12374,7 @@ fn sb2_launcher_get_class_path_archives_list(
     let this = obj_arg(args, 0)?;
     let archives = sb2_launcher_build_archive_list(ctx, this);
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, archives.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
     for (i, v) in archives.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
@@ -12405,14 +12405,14 @@ fn sb2_launcher_get_class_path_archives_iterator(
     // our `try_stackless_invoke` resolves against the receiver's class:
     // `Enumeration$Impl` has the native registered, so the JDK bytecode
     // never runs.
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, archives.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
     for (i, v) in archives.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
     let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries", archives.len());
     }
     Ok(Some(Value::Object(Some(itr))))
@@ -12443,7 +12443,7 @@ fn sb2_launcher_create_class_loader_bypass_archive_walk(
             urls.push(url);
         }
     }
-    let url_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    let url_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
         ctx.set_array_element(url_arr, i, Value::Object(Some(*u)));
     }
@@ -12495,7 +12495,7 @@ fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // Pack into a 2-field Enumeration synthetic: array=0, cursor=1. The
     // existing Enumeration.hasMoreElements/nextElement natives walk this
     // shape (see register_p59_spliterator / Iterator collateral).
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, elems.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
     for (i, v) in elems.into_iter().enumerate() {
         ctx.set_array_element(arr, i, v);
     }
@@ -12535,7 +12535,7 @@ fn p59_jar_file_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     } else {
         String::new()
     };
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] JarFile.<init>(File) path={:?}", path);
     }
     let manifest = p98_read_jar_manifest(ctx, &path);
@@ -12573,7 +12573,7 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     // Create Attributes as a HashMap-like synthetic (3-field: buckets, size, capacity)
     let attrs = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 3);
     let mut attr_count = 0;
-    let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 64);
+    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
     for line in manifest_content.lines() {
         if let Some((key, value)) = line.split_once(": ") {
             let key_str = ctx.create_string(key.trim());
@@ -12609,7 +12609,7 @@ const P59_ATTR_CAPACITY: usize = 64;
 fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> ObjectRef {
     let attrs = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 3);
     let buckets = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         P59_ATTR_CAPACITY * 2,
     );
     ctx.set_field(attrs, 0, Value::Object(Some(buckets)));
@@ -12627,7 +12627,7 @@ fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn p59_manifest_new_entries_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
     let buckets = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         P59_ATTR_CAPACITY * 2,
     );
     ctx.set_field(map, 0, Value::Object(Some(buckets)));
@@ -12787,7 +12787,7 @@ fn p59_read_input_stream_fully(
             Some(Value::Int(v)) => out.push((v & 0xff) as u8),
             None | Some(Value::Object(None)) => break,
             Some(other) => {
-                return Err(MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+                return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                     RuntimeError::IOException {
                         message: format!(
                             "Manifest(InputStream): unexpected read() return {:?}",
@@ -12800,7 +12800,7 @@ fn p59_read_input_stream_fully(
         // Guard against runaway streams (e.g., buggy read() that never
         // returns -1). Manifest files are tiny — 1 MB is plenty of headroom.
         if out.len() > 1024 * 1024 {
-            return Err(MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IOException {
                     message: "Manifest(InputStream): stream exceeds 1 MB limit".to_string(),
                 },
@@ -12936,7 +12936,7 @@ pub(crate) fn p59_manifest_init_from_input_stream(
     let stream = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
         _ => {
-            return Err(MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::NullPointerException {
                     message: Some("Manifest(InputStream): stream is null".to_string()),
                 },
@@ -12947,7 +12947,7 @@ pub(crate) fn p59_manifest_init_from_input_stream(
     let parsed = match p59_parse_manifest_bytes(&bytes) {
         Ok(p) => p,
         Err(msg) => {
-            return Err(MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IOException {
                     message: format!("invalid manifest: {}", msg),
                 },
@@ -13029,7 +13029,7 @@ fn p59_attributes_put_value(
     // use alloc_concurrent_synthetic directly).
     if !matches!(ctx.get_field(this, 0), Value::Object(Some(_))) {
         let buckets = ctx.new_array(
-            rustjvm_types::ArrayElementType::Reference,
+            cratonvm_types::ArrayElementType::Reference,
             P59_ATTR_CAPACITY * 2,
         );
         ctx.set_field(this, 0, Value::Object(Some(buckets)));
@@ -13168,7 +13168,7 @@ fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let arr = match ctx.get_field(spl, 0) {
         Value::Object(Some(a)) => a,
         _ => {
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(empty)));
             return Ok(Some(Value::Object(Some(stream))));
@@ -13186,7 +13186,7 @@ fn p59_int_stream_from_spliterator(
     let spl = obj_arg(args, 0)?;
     let arr = match ctx.get_field(spl, 0) {
         Value::Object(Some(a)) => a,
-        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -13200,7 +13200,7 @@ fn p59_long_stream_from_spliterator(
     let spl = obj_arg(args, 0)?;
     let arr = match ctx.get_field(spl, 0) {
         Value::Object(Some(a)) => a,
-        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -13214,7 +13214,7 @@ fn p59_double_stream_from_spliterator(
     let spl = obj_arg(args, 0)?;
     let arr = match ctx.get_field(spl, 0) {
         Value::Object(Some(a)) => a,
-        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -13226,7 +13226,7 @@ fn p59_collection_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = obj_arg(args, 0)?;
     let data = match ctx.get_field(this, 0) {
         Value::Object(Some(arr)) => arr,
-        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
     let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
@@ -13276,7 +13276,7 @@ fn p59_hashset_spliterator(
             }
         }
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
     }
@@ -14008,7 +14008,7 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
         "getPackages",
         "()[Ljava/lang/Package;",
         |ctx, _args| {
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(empty))))
         },
     );
@@ -14131,8 +14131,8 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
 /// pre-existing 4 slots.
 fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
-    entry: &rustjvm_native_api::StackTraceEntry,
-) -> rustjvm_types::ObjectRef {
+    entry: &cratonvm_native_api::StackTraceEntry,
+) -> cratonvm_types::ObjectRef {
     let sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
     let cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
     let meth_str = ctx.create_string(&entry.method_name);
@@ -14420,7 +14420,7 @@ fn read_module_name(ctx: &dyn NativeContext, module_obj: ObjectRef) -> String {
 
 /// Helper: build a `HashSet<String>` Java object from a Vec of Rust strings.
 fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let len = items.len();
     let arr = ctx.new_array(ArrayElementType::Reference, len);
     for (i, s) in items.iter().enumerate() {
@@ -14450,7 +14450,7 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     // ModuleLayer.modules() → Set<Module>
     // Returns Module objects for all registered modules in the boot layer.
     r.register(ml, "modules", "()Ljava/util/Set;", |ctx, _args| {
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let names = ctx.all_module_names();
         let len = names.len();
         let arr = ctx.new_array(ArrayElementType::Reference, len);
@@ -15223,7 +15223,7 @@ pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/util/stream/Stream;",
         |ctx, _args| {
             // Return empty stream
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
@@ -15234,7 +15234,7 @@ pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "descendants",
         "()Ljava/util/stream/Stream;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
@@ -15552,8 +15552,8 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         // Parse pattern: segments separated by '|', each is "limit#format" or "limit<format"
         let segments: Vec<&str> = pattern_str.split('|').collect();
         let count = segments.len();
-        let limits_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
-        let formats_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+        let limits_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let formats_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
         for (i, seg) in segments.iter().enumerate() {
             let (limit, format_str) = if let Some(pos) = seg.find('#') {
                 let limit: f64 = seg[..pos].trim().parse().unwrap_or(0.0);
@@ -15739,7 +15739,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
         "Saturday",
     ];
     let wd_arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         weekdays.len(),
     );
     for (i, &w) in weekdays.iter().enumerate() {
@@ -15750,7 +15750,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
 
     let short_weekdays = ["", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let swd_arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         short_weekdays.len(),
     );
     for (i, &w) in short_weekdays.iter().enumerate() {
@@ -15775,7 +15775,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
         "",
     ];
     let m_arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         months.len(),
     );
     for (i, &m) in months.iter().enumerate() {
@@ -15788,7 +15788,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "",
     ];
     let sm_arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         short_months.len(),
     );
     for (i, &m) in short_months.iter().enumerate() {
@@ -15798,7 +15798,7 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
     ctx.set_field(this, 3, Value::Object(Some(sm_arr)));
 
     let ampm = ["AM", "PM"];
-    let ap_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, ampm.len());
+    let ap_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, ampm.len());
     for (i, &a) in ampm.iter().enumerate() {
         let s = ctx.create_string(a);
         ctx.set_array_element(ap_arr, i, Value::Object(Some(s)));
@@ -15834,14 +15834,14 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             // Logger field 2 = handlers ArrayList (added in Phase O).
             if ctx.object_num_fields(this) > 2 {
                 if let Value::Object(Some(lst)) = ctx.get_field(this, 2) {
-                    return rustjvm_native_collections::native_al_to_array(
+                    return cratonvm_native_collections::native_al_to_array(
                         ctx,
                         &[Value::Object(Some(lst))],
                     );
                 }
             }
             // No handlers registered — return empty Handler[]
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -16143,7 +16143,7 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
                 "UTF-8",
             ];
             let data_arr = ctx.new_array(
-                rustjvm_types::ArrayElementType::Reference,
+                cratonvm_types::ArrayElementType::Reference,
                 charsets.len() * 2,
             );
             for (i, &name) in charsets.iter().enumerate() {
@@ -16215,7 +16215,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             if urls.is_empty() && ctx.find_resource(resource_name).is_some() {
                 urls.push(format!("classpath:{name}"));
             }
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
             for (i, u) in urls.iter().enumerate() {
                 let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
                 let full = ctx.create_string(u);
@@ -16401,7 +16401,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "getAnnotations",
         "()[Ljava/lang/annotation/Annotation;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -16422,7 +16422,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "getParameters",
         "()[Ljava/lang/reflect/Parameter;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -16434,7 +16434,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "getTypeParameters",
         "()[Ljava/lang/reflect/TypeVariable;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -16443,7 +16443,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "getAnnotations",
         "()[Ljava/lang/annotation/Annotation;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -16503,7 +16503,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "getAnnotations",
         "()[Ljava/lang/annotation/Annotation;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -16835,7 +16835,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
                 ctx.set_field(enum_obj, 1, Value::Int(0));
             }
             _ => {
-                let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 ctx.set_field(enum_obj, 0, Value::Object(Some(empty)));
                 ctx.set_field(enum_obj, 1, Value::Int(0));
             }
@@ -16869,7 +16869,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     });
     r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
         // Return a dummy MAC address (00:00:00:00:00:00) — real MAC requires platform APIs
-        let mac = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 6);
+        let mac = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 6);
         for i in 0..6 { ctx.set_array_element(mac, i, Value::Int(0)); }
         Ok(Some(Value::Object(Some(mac))))
     });
@@ -16878,7 +16878,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     });
     r.register(ni, "getSubInterfaces", "()Ljava/util/Enumeration;", |ctx, _args| {
         let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
         ctx.set_field(enum_obj, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(enum_obj))))
@@ -16939,7 +16939,7 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
     let lo_ip = ctx.create_string("127.0.0.1");
     ctx.set_field(lo_addr, 0, Value::Object(Some(lo_host)));
     ctx.set_field(lo_addr, 1, Value::Object(Some(lo_ip)));
-    let lo_addrs = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+    let lo_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(lo_addrs, 0, Value::Object(Some(lo_addr)));
     ctx.set_field(lo, 2, Value::Object(Some(lo_addrs)));
     ctx.set_field(lo, 3, Value::Int(1)); // index
@@ -16964,7 +16964,7 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
         let eth_ip = ctx.create_string(&primary_ip);
         ctx.set_field(eth_addr, 0, Value::Object(Some(eth_host)));
         ctx.set_field(eth_addr, 1, Value::Object(Some(eth_ip)));
-        let eth_addrs = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let eth_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(eth_addrs, 0, Value::Object(Some(eth_addr)));
         ctx.set_field(eth, 2, Value::Object(Some(eth_addrs)));
         ctx.set_field(eth, 3, Value::Int(2)); // index
@@ -17035,7 +17035,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let chars: Vec<u16> = s.encode_utf16().collect();
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Char, chars.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, chars.len());
             for (i, &ch) in chars.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(ch as i32));
             }
@@ -17265,7 +17265,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
 }
 
 fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Char, cap);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
     ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
     ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
@@ -18401,7 +18401,7 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
     r.register(whm, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let cap = 16usize;
-        let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
         ctx.set_field(this, 0, Value::Object(Some(buckets)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(cap as i32));
@@ -18413,7 +18413,7 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => (*v).max(1) as usize,
             _ => 16,
         };
-        let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
         ctx.set_field(this, 0, Value::Object(Some(buckets)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(cap as i32));
@@ -18567,7 +18567,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            rustjvm_native_collections::native_map_get_pub(
+            cratonvm_native_collections::native_map_get_pub(
                 ctx, &[Value::Object(Some(map)), Value::Object(Some(key))]
             )
         },
@@ -18586,7 +18586,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            rustjvm_native_collections::native_map_get_pub(
+            cratonvm_native_collections::native_map_get_pub(
                 ctx, &[Value::Object(Some(map)), Value::Object(Some(key))]
             )
         },
@@ -18601,7 +18601,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
             Value::Object(Some(m)) => m,
             _ => return Ok(Some(Value::Int(0))),
         };
-        rustjvm_native_collections::native_map_contains_key_pub(
+        cratonvm_native_collections::native_map_contains_key_pub(
             ctx, &[Value::Object(Some(map)), Value::Object(Some(key))]
         )
     });
@@ -18623,7 +18623,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
 
 /// Build a Java String[] from a Rust slice of &str.
 fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, items.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
     for (i, s) in items.iter().enumerate() {
         let js = ctx.create_string(s);
         ctx.set_array_element(arr, i, Value::Object(Some(js)));
@@ -18640,7 +18640,7 @@ fn put_arr(
 ) {
     let k = ctx.create_string(key);
     let arr = make_string_array(ctx, items);
-    rustjvm_native_collections::native_map_put_pub(
+    cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
@@ -18660,7 +18660,7 @@ fn put_str(
 ) {
     let k = ctx.create_string(key);
     let v = ctx.create_string(value);
-    rustjvm_native_collections::native_map_put_pub(
+    cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
@@ -18886,7 +18886,7 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-    rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     ctx.set_field(obj, 0, Value::Object(Some(map)));
     ctx.set_field(obj, 1, Value::Object(None));
 
@@ -18907,7 +18907,7 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     let value = line[pos + 1..].trim();
                     let k = ctx.create_string(key);
                     let v = ctx.create_string(value);
-                    rustjvm_native_collections::native_map_put_pub(
+                    cratonvm_native_collections::native_map_put_pub(
                         ctx, &[Value::Object(Some(map)), Value::Object(Some(k)), Value::Object(Some(v))]
                     ).ok();
                     populated_from_props = true;
@@ -18995,7 +18995,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .copied()
                 .unwrap_or(&[]);
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, providers.len().max(1));
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, providers.len().max(1));
             for (i, &pname) in providers.iter().enumerate() {
                 let s = ctx.create_string(pname);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -19028,7 +19028,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .copied()
                 .unwrap_or(&[]);
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, providers.len().max(1));
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, providers.len().max(1));
             for (i, &pname) in providers.iter().enumerate() {
                 let s = ctx.create_string(pname);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -19053,7 +19053,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(al)) = ctx.get_field(this, 0) {
             if let Value::Object(Some(arr)) = ctx.get_field(al, 0) {
                 let len = ctx.get_field(al, 1).as_int().unwrap_or(0) as usize;
-                let stream_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+                let stream_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
                 for i in 0..len {
                     ctx.set_array_element(stream_arr, i, ctx.get_array_element(arr, i));
                 }
@@ -19062,7 +19062,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(stream))));
             }
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
         ctx.set_field(stream, 0, Value::Object(Some(arr)));
         Ok(Some(Value::Object(Some(stream))))
@@ -19232,7 +19232,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     // can look the task up and flip the cancelled flag. Field 0 used to
     // carry the result reference for `Future.get()` — we keep that
     // surface by routing `get()` through the pump's done-tracking.
-    fn build_sf(ctx: &mut dyn rustjvm_native_api::NativeContext, id: u64) -> rustjvm_types::ObjectRef {
+    fn build_sf(ctx: &mut dyn cratonvm_native_api::NativeContext, id: u64) -> cratonvm_types::ObjectRef {
         let sf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2);
         ctx.set_field(sf, 0, Value::Long(id as i64));
         ctx.set_field(sf, 1, Value::Int(0));
@@ -19805,14 +19805,14 @@ fn native_p64_al_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Object(Some(a)) => a,
         _ => {
             let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(new_al, 0, Value::Object(Some(new_arr)));
             ctx.set_field(new_al, 1, Value::Int(0));
             return Ok(Some(Value::Object(Some(new_al))));
         }
     };
     let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
     for i in 0..size {
         let elem = ctx.get_array_element(arr, size - 1 - i);
         ctx.set_array_element(new_arr, i, elem);
@@ -19839,7 +19839,7 @@ fn native_p64_ll_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // Build new ArrayList with reversed elements
     let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     let new_arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         elements.len(),
     );
     for (i, elem) in elements.iter().enumerate() {
@@ -19994,7 +19994,7 @@ fn native_p64_lhm_seq_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     // Return as ArrayList (simplification — real Java returns a Set view)
     let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
     }
@@ -20012,7 +20012,7 @@ fn native_p64_lhm_seq_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         cur = ctx.get_field(node, 5);
     }
     let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, vals.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, vals.len());
     for (i, v) in vals.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
@@ -20033,7 +20033,7 @@ fn native_p64_lhm_seq_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     }
     let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     let arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         entries.len(),
     );
     for (i, e) in entries.iter().enumerate() {
@@ -20060,7 +20060,7 @@ fn native_p64_lhm_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let new_lhm = alloc_concurrent_synthetic(ctx, "java/util/LinkedHashMap", 5);
     let init_cap = 16i32;
     let buckets = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         init_cap as usize,
     );
     ctx.set_field(new_lhm, 0, Value::Object(Some(buckets)));
@@ -20276,7 +20276,7 @@ fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => String::new(),
     };
     let bytes_len = hex_str.len() / 2;
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes_len);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes_len);
     for i in 0..bytes_len {
         let byte_str = &hex_str[i * 2..i * 2 + 2];
         let b = u8::from_str_radix(byte_str, 16).unwrap_or(0);
@@ -20319,7 +20319,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
             } else {
                 1
             };
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
             if count > 0 {
                 ctx.set_array_element(arr, 0, val);
             }
@@ -20341,7 +20341,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
             let (b_arr, b_len) =
                 p64_stream_elements(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
             let total = a_len + b_len;
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, total);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, total);
             for i in 0..a_len {
                 if let Some(a) = a_arr {
                     ctx.set_array_element(new_arr, i, ctx.get_array_element(a, i));
@@ -20387,7 +20387,7 @@ fn native_p64_stream_to_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
     let len = ctx.array_length(arr);
-    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
     for i in 0..len {
         ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
     }
@@ -20578,7 +20578,7 @@ pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
                     // Return single-element array with the original string
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                     ctx.set_array_element(arr, 0, Value::Object(Some(this)));
                     return Ok(Some(Value::Object(Some(arr))));
                 }
@@ -20594,7 +20594,7 @@ pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
             let re = match regex::Regex::new(&regex_str) {
                 Ok(r) => r,
                 Err(_) => {
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                     ctx.set_array_element(arr, 0, Value::Object(Some(this)));
                     return Ok(Some(Value::Object(Some(arr))));
                 }
@@ -20609,7 +20609,7 @@ pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
             results.push(this_str[last..].to_string());
 
             let arr = ctx.new_array(
-                rustjvm_types::ArrayElementType::Reference,
+                cratonvm_types::ArrayElementType::Reference,
                 results.len(),
             );
             for (i, part) in results.iter().enumerate() {
@@ -20843,7 +20843,7 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
     let pbq = "java/util/concurrent/PriorityBlockingQueue";
     r.register(pbq, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 11);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 11);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Object(None));
@@ -20855,7 +20855,7 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
             Some(Value::Int(v)) => (*v).max(1) as usize,
             _ => 11,
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Object(None));
@@ -20922,11 +20922,11 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
         let arr = match ctx.get_field(this, 0) {
             Value::Object(Some(a)) => a,
             _ => {
-                let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 return Ok(Some(Value::Object(Some(empty))));
             }
         };
-        let result = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         for i in 0..size {
             ctx.set_array_element(result, i, ctx.get_array_element(arr, i));
         }
@@ -20949,7 +20949,7 @@ fn native_p65_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // Grow if needed
     if size >= cap {
         let new_cap = cap * 2 + 1;
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
         for i in 0..size {
             ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
         }
@@ -21251,7 +21251,7 @@ pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
                 _ => {
                     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
                     let buckets =
-                        ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                     ctx.set_field(map, 0, Value::Object(Some(buckets)));
                     ctx.set_field(map, 1, Value::Int(0));
                     ctx.set_field(map, 2, Value::Int(16));
@@ -21261,7 +21261,7 @@ pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
             let len = ctx.array_length(entries);
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
             let cap = (len * 2).max(16);
-            let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+            let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
             ctx.set_field(map, 0, Value::Object(Some(buckets)));
             ctx.set_field(map, 1, Value::Int(0));
             ctx.set_field(map, 2, Value::Int(cap as i32));
@@ -21306,7 +21306,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
             let input_ref = match args.get(1) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
                     ctx.set_field(stream, 0, Value::Object(Some(arr)));
                     return Ok(Some(Value::Object(Some(stream))));
@@ -21327,7 +21327,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
                 }
             };
             let arr = ctx.new_array(
-                rustjvm_types::ArrayElementType::Reference,
+                cratonvm_types::ArrayElementType::Reference,
                 parts.len(),
             );
             for (i, part) in parts.iter().enumerate() {
@@ -21456,7 +21456,7 @@ pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
         "values",
         "()[Ljava/time/format/FormatStyle;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
             let names = ["FULL", "LONG", "MEDIUM", "SHORT"];
             for (i, name) in names.iter().enumerate() {
                 if let Ok(Some(e)) =
@@ -21758,7 +21758,7 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
             _ => String::new(),
         };
         let bytes = key.as_bytes();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -22058,7 +22058,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "values",
         "()[Ljava/nio/file/FileVisitResult;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
             let names = ["CONTINUE", "TERMINATE", "SKIP_SUBTREE", "SKIP_SIBLINGS"];
             for (i, name) in names.iter().enumerate() {
                 if let Ok(Some(e)) =
@@ -22286,7 +22286,7 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
     r.register(wk, "pollEvents", "()Ljava/util/List;", |ctx, _args| {
         // Return empty list (events are detected via poll)
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(list, 0, Value::Object(Some(empty)));
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
@@ -22303,7 +22303,7 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
 /// Returns a WatchKey if changes detected, None otherwise.
 fn watch_service_poll(
     ctx: &mut dyn NativeContext,
-    ws: rustjvm_types::ObjectRef,
+    ws: cratonvm_types::ObjectRef,
     timeout_ms: Option<u64>,
 ) -> MethodCallResult {
     let dir_path = match ctx.get_field(ws, 0) {
@@ -22680,7 +22680,7 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
     r.register(pr, "<init>", "(Ljava/io/Reader;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, 1);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 1);
         ctx.set_field(this, 1, Value::Object(Some(buf)));
         ctx.set_field(this, 2, Value::Int(1)); // pos = buf.length means no pushback data
         Ok(None)
@@ -22692,7 +22692,7 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => (*v).max(1) as usize,
             _ => 1,
         };
-        let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, size);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, size);
         ctx.set_field(this, 1, Value::Object(Some(buf)));
         ctx.set_field(this, 2, Value::Int(size as i32));
         Ok(None)
@@ -23377,16 +23377,16 @@ fn j25_register_scope_common(
     // <init>()V and <init>(String, ThreadFactory)V — pick the policy-specific trampoline.
     let (init_nullary, init_named) = match policy {
         J25_STS_POLICY_SHUTDOWN_ON_SUCCESS => (
-            j25_sts_init_sos as rustjvm_native_api::NativeCallback,
-            j25_sts_init_named_sos as rustjvm_native_api::NativeCallback,
+            j25_sts_init_sos as cratonvm_native_api::NativeCallback,
+            j25_sts_init_named_sos as cratonvm_native_api::NativeCallback,
         ),
         J25_STS_POLICY_SHUTDOWN_ON_FAILURE => (
-            j25_sts_init_sof as rustjvm_native_api::NativeCallback,
-            j25_sts_init_named_sof as rustjvm_native_api::NativeCallback,
+            j25_sts_init_sof as cratonvm_native_api::NativeCallback,
+            j25_sts_init_named_sof as cratonvm_native_api::NativeCallback,
         ),
         _ => (
-            j25_sts_init_base as rustjvm_native_api::NativeCallback,
-            j25_sts_init_named_base as rustjvm_native_api::NativeCallback,
+            j25_sts_init_base as cratonvm_native_api::NativeCallback,
+            j25_sts_init_named_base as cratonvm_native_api::NativeCallback,
         ),
     };
     r.register(cls, "<init>", "()V", init_nullary);
@@ -23397,7 +23397,7 @@ fn j25_register_scope_common(
         init_named,
     );
 
-    let fork_cb: rustjvm_native_api::NativeCallback = match policy {
+    let fork_cb: cratonvm_native_api::NativeCallback = match policy {
         J25_STS_POLICY_SHUTDOWN_ON_SUCCESS => j25_sts_fork_sos,
         J25_STS_POLICY_SHUTDOWN_ON_FAILURE => j25_sts_fork_sof,
         _ => j25_sts_fork_base,
@@ -25275,7 +25275,7 @@ fn mac_append_data(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
     };
     let old_len = ctx.array_length(old_data);
     let new_len = old_len + bytes.len();
-    let new_data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+    let new_data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
     for i in 0..old_len {
         let v = ctx.get_array_element(old_data, i);
         ctx.set_array_element(new_data, i, v);
@@ -25297,7 +25297,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Int(0));
-            let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(obj, 3, Value::Object(Some(data)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -25311,7 +25311,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Int(0));
-            let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(obj, 3, Value::Object(Some(data)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -25321,7 +25321,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
         ctx.set_field(this, 2, Value::Int(1));
         // Reset the data accumulator on (re)init
-        let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, 3, Value::Object(Some(data)));
         Ok(None)
     });
@@ -25387,12 +25387,12 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         };
         let hmac_result = mac_compute_hmac(&algo, &key_bytes, &data_bytes);
         // Create result byte array
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, hmac_result.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
         for (i, &b) in hmac_result.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         // Reset accumulator
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Object(Some(arr))))
     });
@@ -25430,19 +25430,19 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             _ => String::new(),
         };
         let hmac_result = mac_compute_hmac(&algo, &key_bytes, &data_bytes);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, hmac_result.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
         for (i, &b) in hmac_result.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         // Reset accumulator
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Object(Some(arr))))
     });
     // reset()V — clear the accumulator
     r.register(mac, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(None)
     });
@@ -25469,7 +25469,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         let data_copy = match ctx.get_field(this, 3) {
             Value::Object(Some(src)) => {
                 let len = ctx.array_length(src);
-                let dst = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+                let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
                 for i in 0..len {
                     ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
                 }
@@ -25794,7 +25794,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
             ];
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, suites.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
             for (i, &s) in suites.iter().enumerate() {
                 let str_obj = ctx.create_string(s);
                 ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
@@ -25818,7 +25818,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
             ];
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, suites.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
             for (i, &s) in suites.iter().enumerate() {
                 let str_obj = ctx.create_string(s);
                 ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
@@ -26168,7 +26168,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 seed = seed.wrapping_mul(1099511628211).wrapping_add(*b as u64);
             }
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 32);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         let mut rng = seed | 1;
         for i in 0..32 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -26219,7 +26219,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 ctx.set_field(cert, 2, Value::Long(0));
                 // Copy DER bytes into a Java byte[] stored at field 3.
                 let der_arr = ctx.new_array(
-                    rustjvm_types::ArrayElementType::Byte,
+                    cratonvm_types::ArrayElementType::Byte,
                     der.len(),
                 );
                 for (j, &b) in der.iter().enumerate() {
@@ -26332,7 +26332,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 2);
             ctx.set_field(tm, 0, keystore_ref);
             ctx.set_field(tm, 1, Value::Int(0));
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))
         },
@@ -26391,7 +26391,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()[Ljavax/net/ssl/KeyManager;",
         |ctx, _args| {
             let km = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(km)));
             Ok(Some(Value::Object(Some(arr))))
         },
@@ -26458,7 +26458,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(arr)) => Ok(Some(Value::Object(Some(arr)))),
                 _ => {
                     // Default: TLSv1.2, TLSv1.3
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 2);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
                     let p1 = ctx.create_string("TLSv1.2");
                     let p2 = ctx.create_string("TLSv1.3");
                     ctx.set_array_element(arr, 0, Value::Object(Some(p1)));
@@ -26487,7 +26487,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             match ctx.get_field(this, 4) {
                 Value::Object(Some(arr)) => Ok(Some(Value::Object(Some(arr)))),
                 _ => {
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                     let s = ctx.create_string("TLS_AES_128_GCM_SHA256");
                     ctx.set_array_element(arr, 0, Value::Object(Some(s)));
                     Ok(Some(Value::Object(Some(arr))))
@@ -27035,7 +27035,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             // Try to parse a single certificate and return it in a list
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 10);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
             ctx.set_field(al, 0, Value::Object(Some(arr)));
 
             // Try reading a cert from the input stream
@@ -27088,7 +27088,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                     let len = ctx.array_length(der_arr);
                     if len > 0 {
                         let out = ctx.new_array(
-                            rustjvm_types::ArrayElementType::Byte,
+                            cratonvm_types::ArrayElementType::Byte,
                             len,
                         );
                         for i in 0..len {
@@ -27103,7 +27103,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         if let Some(Value::Object(Some(this))) = args.get(0) {
             let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, parsed.encoded.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
                 for (i, &b) in parsed.encoded.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -27111,7 +27111,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
         }
         let _ = args; // suppress unused warning
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(
@@ -27298,7 +27298,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         if let Some(Value::Object(Some(this))) = args.get(0) {
             let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, parsed.encoded.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
                 for (i, &b) in parsed.encoded.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -27306,7 +27306,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
         }
         let _ = args;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(
@@ -27390,7 +27390,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         if let Some(Value::Object(Some(this))) = args.get(0) {
             let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, parsed.signature_bytes.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.signature_bytes.len());
                 for (i, &b) in parsed.signature_bytes.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -27398,7 +27398,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
         }
         let _ = args;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
@@ -27408,7 +27408,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         if let Some(Value::Object(Some(this))) = args.get(0) {
             let cert_id = match ctx.get_field(*this, 2) { Value::Long(id) => id as u64, _ => 0 };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, parsed.tbs_bytes.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.tbs_bytes.len());
                 for (i, &b) in parsed.tbs_bytes.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -27416,7 +27416,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
         }
         let _ = args;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 }
@@ -28287,7 +28287,7 @@ mod jdbc_registry {
 
     /// Fixed-value driver name exposed through `DatabaseMetaData`.
     pub fn driver_name() -> &'static str {
-        "RustJVM JDBC"
+        "CratonVM JDBC"
     }
 
     /// Driver version string.
@@ -28757,7 +28757,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let ps_id = match ctx.get_field(this, 0) { Value::Long(v) => v, Value::Int(v) => v as i64, _ => 0 };
         match jdbc_registry::execute_batch(ps_id) {
             Ok(counts) => {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, counts.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, counts.len());
                 for (i, &c) in counts.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(c));
                 }
@@ -28964,7 +28964,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     r.register(rs, "getBytes", "(I)[B", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(rs, "wasNull", "()Z", |ctx, args| {
@@ -29180,7 +29180,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         // the shape used by other enumerator sites in native-builtins.
         let drivers = jdbc_registry::list_drivers();
         let arr =
-            ctx.new_array(rustjvm_types::ArrayElementType::Reference, drivers.len());
+            ctx.new_array(cratonvm_types::ArrayElementType::Reference, drivers.len());
         for (i, name) in drivers.iter().enumerate() {
             let s = ctx.create_string(name);
             ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -29223,7 +29223,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let length = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let bytes = jdbc_registry::blob_get_bytes(id, pos, length);
         let arr =
-            ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+            ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
@@ -29803,7 +29803,7 @@ fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
             ctx.set_field(elem, 0, Value::Object(Some(tag_s))); // tag_name
 
             // Build attributes array
-            let attrs_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, attributes.len());
+            let attrs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, attributes.len());
             for (i, (name, value)) in attributes.iter().enumerate() {
                 let attr = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 2);
                 let n = ctx.create_string(name);
@@ -29815,7 +29815,7 @@ fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
             ctx.set_field(elem, 1, Value::Object(Some(attrs_arr))); // attributes
 
             // Build children array
-            let children_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, children.len());
+            let children_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, children.len());
             for (i, child) in children.iter().enumerate() {
                 let child_obj = xml_build_dom(ctx, child);
                 ctx.set_array_element(children_arr, i, Value::Object(Some(child_obj)));
@@ -29877,7 +29877,7 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
             let qname = ctx.create_string(tag);
             // SAX Attributes = synthetic with attr data
             let sax_attrs = alloc_concurrent_synthetic(ctx, "org/xml/sax/helpers/AttributesImpl", 1);
-            let attrs_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, attributes.len() * 2);
+            let attrs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, attributes.len() * 2);
             for (i, (name, value)) in attributes.iter().enumerate() {
                 let n = ctx.create_string(name);
                 let v = ctx.create_string(value);
@@ -29907,7 +29907,7 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
         }
         XmlNode::Text(text) | XmlNode::CData(text) => {
             // characters(char[], int, int)
-            let char_arr = ctx.new_array(rustjvm_types::ArrayElementType::Char, text.len());
+            let char_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, text.len());
             for (i, ch) in text.chars().enumerate() {
                 if i < text.len() {
                     ctx.set_array_element(char_arr, i, Value::Int(ch as i32));
@@ -29928,7 +29928,7 @@ fn dom_get_elements_by_tag(ctx: &mut dyn NativeContext, elem: ObjectRef, tag_nam
     let mut results = Vec::new();
     dom_collect_by_tag(ctx, elem, tag_name, &mut results);
     let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, results.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, results.len());
     for (i, obj) in results.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(*obj)));
     }
@@ -30000,7 +30000,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, Value::Int(0)); // namespaceAware
             ctx.set_field(obj, 1, Value::Int(0)); // validating
             let features = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))]).ok();
             ctx.set_field(obj, 2, Value::Object(Some(features)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -30044,7 +30044,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 // Store as Boolean wrapper
                 let bool_obj = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
                 ctx.set_field(bool_obj, 0, Value::Int(val_int));
-                rustjvm_native_collections::native_map_put_pub(
+                cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(features)), key, Value::Object(Some(bool_obj))],
                 )?;
@@ -30057,7 +30057,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         if ctx.object_num_fields(this) > 2 {
             if let Value::Object(Some(features)) = ctx.get_field(this, 2) {
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
-                let result = rustjvm_native_collections::native_map_get_pub(
+                let result = cratonvm_native_collections::native_map_get_pub(
                     ctx,
                     &[Value::Object(Some(features)), key],
                 )?;
@@ -30157,7 +30157,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, Value::Int(0));
             ctx.set_field(obj, 1, Value::Int(0));
             let features = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))]).ok();
             ctx.set_field(obj, 2, Value::Object(Some(features)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -30200,7 +30200,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 let val_int = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
                 let bool_obj = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
                 ctx.set_field(bool_obj, 0, Value::Int(val_int));
-                rustjvm_native_collections::native_map_put_pub(
+                cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(features)), key, Value::Object(Some(bool_obj))],
                 )?;
@@ -30213,7 +30213,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         if ctx.object_num_fields(this) > 2 {
             if let Value::Object(Some(features)) = ctx.get_field(this, 2) {
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
-                let result = rustjvm_native_collections::native_map_get_pub(
+                let result = cratonvm_native_collections::native_map_get_pub(
                     ctx,
                     &[Value::Object(Some(features)), key],
                 )?;
@@ -30297,8 +30297,8 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     r.register(doc_cls, "createElement", "(Ljava/lang/String;)Lorg/w3c/dom/Element;", |ctx, args| {
         let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
         ctx.set_field(elem, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        let attrs = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
-        let children = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let attrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+        let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(elem, 1, Value::Object(Some(attrs)));
         ctx.set_field(elem, 2, Value::Object(Some(children)));
         ctx.set_field(elem, 3, Value::Int(0));
@@ -30328,7 +30328,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Value::Object(Some(r)) => r,
             _ => {
                 let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 ctx.set_field(nl, 0, Value::Object(Some(arr)));
                 ctx.set_field(nl, 1, Value::Int(0));
                 return Ok(Some(Value::Object(Some(nl))));
@@ -30714,7 +30714,7 @@ const REF_TYPE_CLEANER: u8 = 3;
 fn alloc_cleaner(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", 2);
     let arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
+        cratonvm_types::ArrayElementType::Reference,
         CLEANER_INITIAL_CAP as usize,
     );
     ctx.set_field(obj, CLEANER_ARR, Value::Object(Some(arr)));
@@ -30771,7 +30771,7 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(a)) => a,
                 _ => {
                     let a = ctx.new_array(
-                        rustjvm_types::ArrayElementType::Reference,
+                        cratonvm_types::ArrayElementType::Reference,
                         CLEANER_INITIAL_CAP as usize,
                     );
                     ctx.set_field(this, CLEANER_ARR, Value::Object(Some(a)));
@@ -30783,7 +30783,7 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
             if len >= cap {
                 let new_cap = (cap.max(1) * 2) as usize;
                 let new_arr = ctx.new_array(
-                    rustjvm_types::ArrayElementType::Reference,
+                    cratonvm_types::ArrayElementType::Reference,
                     new_cap,
                 );
                 for i in 0..cap as usize {
@@ -30992,7 +30992,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "emptySpliterator",
         "()Ljava/util/Spliterator;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
@@ -31024,7 +31024,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             let iter = match args.first() {
                 Some(Value::Object(Some(it))) => *it,
                 _ => {
-                    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
                     ctx.set_field(obj, 0, Value::Object(Some(empty)));
                     ctx.set_field(obj, 1, Value::Int(0));
@@ -31060,7 +31060,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                     break;
                 }
             }
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, collected.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, collected.len());
             for (i, v) in collected.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
             }
@@ -31096,7 +31096,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             let spliterator = match args.first() {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
-                    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
                     ctx.set_field(stream, 0, Value::Object(Some(empty)));
                     return Ok(Some(Value::Object(Some(stream))));
@@ -31104,7 +31104,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             };
             let field0 = ctx.get_field(spliterator, 0);
             let arr = match field0 {
-                Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+                Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
                 _ => {
                     // Real Spliterator subclass — drain via a collecting
                     // consumer.
@@ -31121,7 +31121,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "intStream",
         "(Ljava/util/Spliterator$OfInt;Z)Ljava/util/stream/IntStream;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
@@ -31132,7 +31132,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "longStream",
         "(Ljava/util/Spliterator$OfLong;Z)Ljava/util/stream/LongStream;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
@@ -31143,7 +31143,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "doubleStream",
         "(Ljava/util/Spliterator$OfDouble;Z)Ljava/util/stream/DoubleStream;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
@@ -31155,7 +31155,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
     //   field 1: Int — current logical length
     // `accept(Object)V` appends, growing the storage on demand.
     r.register(
-        "rustjvm/internal/StreamCollector",
+        "cratonvm/internal/StreamCollector",
         "accept",
         "(Ljava/lang/Object;)V",
         |ctx, args| {
@@ -31167,12 +31167,12 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             };
             let storage = match ctx.get_field(this, 0) {
                 Value::Object(Some(a)) => a,
-                _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16),
+                _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16),
             };
             let cap = ctx.array_length(storage);
             let storage = if len >= cap {
                 let new_cap = (cap * 2).max(16);
-                let bigger = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+                let bigger = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
                 for i in 0..len {
                     let v = ctx.get_array_element(storage, i);
                     ctx.set_array_element(bigger, i, v);
@@ -31200,8 +31200,8 @@ fn drain_spliterator(
     spliterator: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
     // Allocate the collector consumer.
-    let collector = alloc_concurrent_synthetic(ctx, "rustjvm/internal/StreamCollector", 2);
-    let initial = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+    let collector = alloc_concurrent_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
+    let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     ctx.set_field(collector, 0, Value::Object(Some(initial)));
     ctx.set_field(collector, 1, Value::Int(0));
 
@@ -31227,9 +31227,9 @@ fn drain_spliterator(
     };
     let storage = match ctx.get_field(collector, 0) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0)),
+        _ => return Ok(ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)),
     };
-    let out = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+    let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
     for i in 0..len {
         let v = ctx.get_array_element(storage, i);
         ctx.set_array_element(out, i, v);
@@ -31249,7 +31249,7 @@ fn drain_spliterator(
 // messages, which describe WHICH property setter failed and WHY.
 //
 // This diagnostic intercepts the PBE constructor that takes
-// `PropertyAccessException[]` and, when `RUSTJVM_DBG_PBE` is set in the
+// `PropertyAccessException[]` and, when `CRATONVM_DBG_PBE` is set in the
 // environment, prints each inner exception's message to stderr before
 // completing construction. We never alter normal control flow — the
 // `Throwable.<init>` chain still runs via `invoke_special` on the super-
@@ -31292,7 +31292,7 @@ pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
             // Diagnostic block — gated on env var so production runs stay
             // silent. Best-effort: any failure in the diagnostic itself is
             // swallowed so we never break the failing-bean path further.
-            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
                 if let Value::Object(Some(arr)) = arr_val {
                     let n = ctx.array_length(arr);
                     eprintln!("[PBE] PropertyBatchUpdateException constructed with {} inner PropertyAccessException(s)", n);
@@ -31501,7 +31501,7 @@ pub(crate) fn register_pbe_workaround(registry: &mut NativeMethodRegistry) {
                 || bean_name.contains("internalAutowiredAnnotationProcessor")
                 || bean_name.contains("internalCommonAnnotationProcessor")
             {
-                if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+                if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
                     eprintln!(
                         "[applyPropertyValues] skipping {} (CratonVM partial-bootstrap recovery)",
                         bean_name
@@ -31566,14 +31566,14 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
         "registerAnnotationConfigProcessors",
         "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, _args| {
-            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
                 eprintln!("[demo-shim] skipping registerAnnotationConfigProcessors(reg,src)");
             }
             // Synthesize an empty java/util/HashSet (2-field layout: backing
             // Object[] at field 0, size Int at field 1). Matches the rest of
             // phases_late.rs HashSet allocations.
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             ctx.set_field(set, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(set))))
@@ -31585,11 +31585,11 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
         "registerAnnotationConfigProcessors",
         "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)Ljava/util/Set;",
         |ctx, _args| {
-            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
                 eprintln!("[demo-shim] skipping registerAnnotationConfigProcessors(reg)");
             }
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             ctx.set_field(set, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(set))))
@@ -31608,7 +31608,7 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
     // bean is harmless even if instantiated.
     let ccpp = "org/springframework/context/annotation/ConfigurationClassPostProcessor";
     registry.register(ccpp, "<init>", "()V", |_ctx, _args| {
-        if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+        if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
             eprintln!("[demo-shim] CCPP.<init> no-op");
         }
         Ok(None)
@@ -31655,7 +31655,7 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
         "postProcessBeanDefinitionRegistry",
         "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
         |_ctx, _args| {
-            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
                 eprintln!("[demo-shim] CCPP.postProcessBeanDefinitionRegistry no-op");
             }
             Ok(None)
@@ -31666,7 +31666,7 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
         "postProcessBeanFactory",
         "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
         |_ctx, _args| {
-            if std::env::var_os("RUSTJVM_DBG_PBE").is_some() {
+            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
                 eprintln!("[demo-shim] CCPP.postProcessBeanFactory no-op");
             }
             Ok(None)
@@ -31674,7 +31674,7 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // --- DE5: opt-in escape hatch — skip ALL BFPP invocation --------------
-    // If RUSTJVM_DEMO_SKIP_BFPP=1 is set in the environment AT REGISTRATION
+    // If CRATONVM_DEMO_SKIP_BFPP=1 is set in the environment AT REGISTRATION
     // TIME, intercept AbstractApplicationContext.invokeBeanFactoryPostProcessors
     // entirely (no-op return). This loses @Configuration scanning for the
     // whole app but guarantees the PBE-throwing wiring path never runs.
@@ -31684,14 +31684,14 @@ pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
     // every other Spring app that runs after the demo. Gating registration
     // on the env var means the real Java method runs whenever the flag is
     // unset, preserving normal Spring behavior for all non-demo workloads.
-    if std::env::var_os("RUSTJVM_DEMO_SKIP_BFPP").is_some() {
+    if std::env::var_os("CRATONVM_DEMO_SKIP_BFPP").is_some() {
         registry.register(
             "org/springframework/context/support/AbstractApplicationContext",
             "invokeBeanFactoryPostProcessors",
             "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
             |_ctx, _args| {
                 tracing::warn!(
-                    "[demo-shim] invokeBeanFactoryPostProcessors skipped (RUSTJVM_DEMO_SKIP_BFPP=1)"
+                    "[demo-shim] invokeBeanFactoryPostProcessors skipped (CRATONVM_DEMO_SKIP_BFPP=1)"
                 );
                 Ok(None)
             },
@@ -32815,7 +32815,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         "values",
         "()[Ljava/nio/file/attribute/PosixFilePermission;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 9);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 9);
             // Can't iterate/capture — just return the array (elements are null but array exists)
             Ok(Some(Value::Object(Some(arr))))
         },
@@ -32839,7 +32839,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Return empty HashSet
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-            let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+            let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(set, 0, Value::Object(Some(buckets)));
             ctx.set_field(set, 1, Value::Int(0));
             ctx.set_field(set, 2, Value::Int(16));
@@ -33614,7 +33614,7 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Use same layout as existing EnumSet: field 0 = ArrayList backing, field 1 = type
             let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
             ctx.set_field(backing, 0, Value::Object(Some(arr)));
             ctx.set_field(backing, 1, Value::Int(0));
@@ -33629,7 +33629,7 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
         |ctx, _args| {
             let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
             ctx.set_field(backing, 0, Value::Object(Some(arr)));
             ctx.set_field(backing, 1, Value::Int(0));
@@ -34271,7 +34271,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             start += 1;
         }
         let trim = &bytes[start..];
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, trim.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, trim.len());
         for (i, &b) in trim.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -34420,7 +34420,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             match std::fs::read(&p) {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, data.len());
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
@@ -34446,7 +34446,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             match std::fs::read(&p) {
                 Ok(bytes) => {
                     let arr =
-                        ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+                        ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
                     for (i, &b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
@@ -34501,7 +34501,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/nio/file/LinkOption;)Ljava/util/Map;",
         |ctx, _args| {
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+            let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(map, 0, Value::Object(Some(buckets)));
             ctx.set_field(map, 1, Value::Int(0));
             ctx.set_field(map, 2, Value::Int(16));
@@ -34575,7 +34575,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(ts, "values", "()[Ljava/lang/Thread$State;", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 6);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 6);
         // Inline each state (no captures allowed)
         let e0 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
         let n0 = ctx.create_string("NEW");
@@ -35045,7 +35045,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     r.register(zf, "entries", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         let itr = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipFile$Itr", 2);
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
@@ -35292,7 +35292,7 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
             }
         }
         // Return empty Object[] if not set
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(lr, "setParameters", "([Ljava/lang/Object;)V", |ctx, args| {
@@ -35367,7 +35367,7 @@ pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
 fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 2);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-    rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     ctx.set_field(prefs, 0, Value::Object(Some(map)));
     let name_str = ctx.create_string("");
     ctx.set_field(prefs, 1, Value::Object(Some(name_str)));
@@ -35379,7 +35379,7 @@ fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
         Value::Object(Some(m)) => m,
         _ => {
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             ctx.set_field(this, 0, Value::Object(Some(map)));
             map
         }
@@ -35431,7 +35431,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         r.register(cls, "<init>", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             ctx.set_field(this, 0, Value::Object(Some(map)));
             let name_str = ctx.create_string("");
             ctx.set_field(this, 1, Value::Object(Some(name_str)));
@@ -35457,7 +35457,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
                 let def = args.get(2).copied().unwrap_or(Value::Object(None));
                 let map = p72_prefs_map(ctx, this);
-                let result = rustjvm_native_collections::native_map_get_pub(
+                let result = cratonvm_native_collections::native_map_get_pub(
                     ctx,
                     &[Value::Object(Some(map)), key],
                 )?;
@@ -35476,7 +35476,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
                 let val = args.get(2).copied().unwrap_or(Value::Object(None));
                 let map = p72_prefs_map(ctx, this);
-                rustjvm_native_collections::native_map_put_pub(
+                cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(map)), key, val],
                 )?;
@@ -35488,7 +35488,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Int(0));
             let map = p72_prefs_map(ctx, this);
-            let result = rustjvm_native_collections::native_map_get_pub(
+            let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
             )?;
@@ -35510,7 +35510,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             };
             let map = p72_prefs_map(ctx, this);
             let sv = ctx.create_string(&v.to_string());
-            rustjvm_native_collections::native_map_put_pub(
+            cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[Value::Object(Some(map)), key, Value::Object(Some(sv))],
             )?;
@@ -35521,7 +35521,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Int(0));
             let map = p72_prefs_map(ctx, this);
-            let result = rustjvm_native_collections::native_map_get_pub(
+            let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
             )?;
@@ -35547,7 +35547,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             };
             let map = p72_prefs_map(ctx, this);
             let sv = ctx.create_string(if v { "true" } else { "false" });
-            rustjvm_native_collections::native_map_put_pub(
+            cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[Value::Object(Some(map)), key, Value::Object(Some(sv))],
             )?;
@@ -35558,7 +35558,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Long(0));
             let map = p72_prefs_map(ctx, this);
-            let result = rustjvm_native_collections::native_map_get_pub(
+            let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
             )?;
@@ -35580,7 +35580,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             };
             let map = p72_prefs_map(ctx, this);
             let sv = ctx.create_string(&v.to_string());
-            rustjvm_native_collections::native_map_put_pub(
+            cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[Value::Object(Some(map)), key, Value::Object(Some(sv))],
             )?;
@@ -35591,7 +35591,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Double(0.0));
             let map = p72_prefs_map(ctx, this);
-            let result = rustjvm_native_collections::native_map_get_pub(
+            let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
             )?;
@@ -35613,7 +35613,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             };
             let map = p72_prefs_map(ctx, this);
             let sv = ctx.create_string(&v.to_string());
-            rustjvm_native_collections::native_map_put_pub(
+            cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[Value::Object(Some(map)), key, Value::Object(Some(sv))],
             )?;
@@ -35624,7 +35624,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Float(0.0));
             let map = p72_prefs_map(ctx, this);
-            let result = rustjvm_native_collections::native_map_get_pub(
+            let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
             )?;
@@ -35646,7 +35646,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             };
             let map = p72_prefs_map(ctx, this);
             let sv = ctx.create_string(&v.to_string());
-            rustjvm_native_collections::native_map_put_pub(
+            cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[Value::Object(Some(map)), key, Value::Object(Some(sv))],
             )?;
@@ -35656,7 +35656,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let map = p72_prefs_map(ctx, this);
-            rustjvm_native_collections::native_map_remove_pub(
+            cratonvm_native_collections::native_map_remove_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
             )?;
@@ -35665,7 +35665,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         r.register(cls, "clear", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let map = p72_prefs_map(ctx, this);
-            rustjvm_native_collections::native_map_clear_pub(ctx, &[Value::Object(Some(map))])?;
+            cratonvm_native_collections::native_map_clear_pub(ctx, &[Value::Object(Some(map))])?;
             Ok(None)
         });
         r.register(cls, "sync", "()V", |_ctx, _args| {
@@ -35680,7 +35680,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         r.register(cls, "keys", "()[Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let map = p72_prefs_map(ctx, this);
-            let keys_result = rustjvm_native_collections::native_map_key_set_pub(
+            let keys_result = cratonvm_native_collections::native_map_key_set_pub(
                 ctx,
                 &[Value::Object(Some(map))],
             )?;
@@ -35756,7 +35756,7 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
         _ => return,
     };
     // Get listener count
-    let size = match rustjvm_native_collections::native_al_size(
+    let size = match cratonvm_native_collections::native_al_size(
         ctx,
         &[Value::Object(Some(listeners))],
     ) {
@@ -35764,7 +35764,7 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
         _ => 0,
     };
     for i in 0..size {
-        let listener_val = match rustjvm_native_collections::native_al_get(
+        let listener_val = match cratonvm_native_collections::native_al_get(
             ctx,
             &[Value::Object(Some(listeners)), Value::Int(i)],
         ) {
@@ -35831,7 +35831,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
         let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
+        cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
         ctx.set_field(this, 1, Value::Object(Some(lst)));
         Ok(None)
     });
@@ -35843,7 +35843,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let listener = args.get(1).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
-                rustjvm_native_collections::native_al_add(
+                cratonvm_native_collections::native_al_add(
                     ctx,
                     &[Value::Object(Some(lst)), listener],
                 )
@@ -35860,7 +35860,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let listener = args.get(2).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
-                rustjvm_native_collections::native_al_add(
+                cratonvm_native_collections::native_al_add(
                     ctx,
                     &[Value::Object(Some(lst)), listener],
                 )
@@ -35877,7 +35877,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let listener = args.get(1).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
-                rustjvm_native_collections::native_al_remove_obj(
+                cratonvm_native_collections::native_al_remove_obj(
                     ctx,
                     &[Value::Object(Some(lst)), listener],
                 )
@@ -35895,7 +35895,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             // We don't track per-property listener subsets, so just remove from the main list.
             let listener = args.get(2).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
-                rustjvm_native_collections::native_al_remove_obj(
+                cratonvm_native_collections::native_al_remove_obj(
                     ctx,
                     &[Value::Object(Some(lst)), listener],
                 )
@@ -35911,9 +35911,9 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
-                rustjvm_native_collections::native_al_to_array(ctx, &[Value::Object(Some(lst))])
+                cratonvm_native_collections::native_al_to_array(ctx, &[Value::Object(Some(lst))])
             } else {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 Ok(Some(Value::Object(Some(arr))))
             }
         },
@@ -35923,7 +35923,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         "getPropertyChangeListeners",
         "(Ljava/lang/String;)[Ljava/beans/PropertyChangeListener;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -36077,7 +36077,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
         let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
+        cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
         ctx.set_field(this, 1, Value::Object(Some(lst)));
         Ok(None)
     });
@@ -36089,7 +36089,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let listener = args.get(1).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
-                rustjvm_native_collections::native_al_add(
+                cratonvm_native_collections::native_al_add(
                     ctx,
                     &[Value::Object(Some(lst)), listener],
                 )
@@ -36202,7 +36202,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         match pd {
             Value::Object(Some(_)) => Ok(Some(pd)),
             _ => {
-                let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
                 Ok(Some(Value::Object(Some(arr))))
             }
         }
@@ -36230,7 +36230,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         match mds {
             Value::Object(Some(_)) => Ok(Some(mds)),
             _ => {
-                let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
                 Ok(Some(Value::Object(Some(arr))))
             }
         }
@@ -36249,7 +36249,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.register(bi, "getEventSetDescriptors", "()[Ljava/beans/EventSetDescriptor;", |ctx, _args| {
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
@@ -36433,7 +36433,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             if trace { eprintln!("BI-TRACE: mirror_class_id returned None"); }
             // Empty BeanInfo is safer than null (matches JDK behaviour for
             // classes with no introspectable bean properties).
-            let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 2);
             ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
             return Ok(Some(Value::Object(Some(bean_info))));
@@ -36580,7 +36580,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(cid) => ctx.class_num_total_fields(cid),
         None => 0,
     };
-    let pd_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), properties.len());
+    let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), properties.len());
     for (i, (prop_name, getter, setter, type_mirror)) in properties.iter().enumerate() {
         let pd = match pd_class_id {
             Some(cid) => ctx.alloc_object(cid, pd_real_fields + 4),
@@ -36618,7 +36618,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .iter()
         .filter_map(|(_, _, setter, _)| *setter)
         .collect();
-    let md_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), setter_methods.len());
+    let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), setter_methods.len());
     for (i, m) in setter_methods.iter().enumerate() {
         let md = alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1);
         // Write to the JDK-named field if it exists, falling back to slot 0
@@ -36662,17 +36662,17 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
     r.register(ic, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
         ctx.set_field(this, 0, Value::Object(Some(bindings)));
         let env = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(env))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(env))]).ok();
         ctx.set_field(this, 1, Value::Object(Some(env)));
         Ok(None)
     });
     r.register(ic, "<init>", "(Ljava/util/Hashtable;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
         ctx.set_field(this, 0, Value::Object(Some(bindings)));
         let env_arg = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field(this, 1, env_arg);
@@ -36686,7 +36686,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-                let result = rustjvm_native_collections::native_map_get_pub(
+                let result = cratonvm_native_collections::native_map_get_pub(
                     ctx,
                     &[Value::Object(Some(bindings)), key],
                 )?;
@@ -36705,7 +36705,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let val = args.get(2).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-                rustjvm_native_collections::native_map_put_pub(
+                cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(bindings)), key, val],
                 )?;
@@ -36722,7 +36722,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let val = args.get(2).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-                rustjvm_native_collections::native_map_put_pub(
+                cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(bindings)), key, val],
                 )?;
@@ -36734,7 +36734,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let key = args.get(1).copied().unwrap_or(Value::Object(None));
         if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-            rustjvm_native_collections::native_map_remove_pub(
+            cratonvm_native_collections::native_map_remove_pub(
                 ctx,
                 &[Value::Object(Some(bindings)), key],
             )?;
@@ -36747,7 +36747,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
         |ctx, _args| {
             let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
+            cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
             Ok(Some(Value::Object(Some(lst))))
         },
     );
@@ -36755,7 +36755,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Clear bindings on close
         let empty = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(empty))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(empty))]).ok();
         ctx.set_field(this, 0, Value::Object(Some(empty)));
         Ok(None)
     });
@@ -36778,14 +36778,14 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let new_name = args.get(2).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
                 // Get the value under old name
-                let val = rustjvm_native_collections::native_map_get_pub(
+                let val = cratonvm_native_collections::native_map_get_pub(
                     ctx, &[Value::Object(Some(bindings)), old_name],
                 )?.unwrap_or(Value::Object(None));
                 // Remove old, put new
-                rustjvm_native_collections::native_map_remove_pub(
+                cratonvm_native_collections::native_map_remove_pub(
                     ctx, &[Value::Object(Some(bindings)), old_name],
                 )?;
-                rustjvm_native_collections::native_map_put_pub(
+                cratonvm_native_collections::native_map_put_pub(
                     ctx, &[Value::Object(Some(bindings)), new_name, val],
                 )?;
             }
@@ -36799,7 +36799,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             let sub = alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", 2);
             let b2 = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(b2))]).ok();
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(b2))]).ok();
             ctx.set_field(sub, 0, Value::Object(Some(b2)));
             Ok(Some(Value::Object(Some(sub))))
         },
@@ -36813,7 +36813,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-                rustjvm_native_collections::native_map_remove_pub(
+                cratonvm_native_collections::native_map_remove_pub(
                     ctx, &[Value::Object(Some(bindings)), key],
                 )?;
             }
@@ -37116,7 +37116,7 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 let data_arr = match ctx.get_field(packet, 0) {
                     Value::Object(Some(a)) => a,
                     _ => {
-                        let a = ctx.new_array(rustjvm_types::ArrayElementType::Byte, n);
+                        let a = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
                         ctx.set_field(packet, 0, Value::Object(Some(a)));
                         a
                     }
@@ -37963,7 +37963,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
             ctx.set_field(srv, 1, Value::Int(0));
             let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
+            cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
             ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
             Ok(Some(Value::Object(Some(srv))))
         },
@@ -37979,7 +37979,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
                 ctx.set_field(srv, 1, Value::Int(0));
                 let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                rustjvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
+                cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
                 ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
                 Ok(Some(Value::Object(Some(srv))))
             },
@@ -38056,7 +38056,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     );
     r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, _args| {
         let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))]).ok();
         Ok(Some(Value::Object(Some(m))))
     });
 
@@ -38098,44 +38098,44 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // Headers = HashMap pattern (3-field)
     let hdrs = "com/sun/net/httpserver/Headers";
     r.register(hdrs, "<init>", "()V", |ctx, args| {
-        rustjvm_native_collections::native_map_init(ctx, args)
+        cratonvm_native_collections::native_map_init(ctx, args)
     });
     r.register(
         hdrs,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_get_pub,
+        cratonvm_native_collections::native_map_get_pub,
     );
     r.register(
         hdrs,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_put_pub,
+        cratonvm_native_collections::native_map_put_pub,
     );
     r.register(
         hdrs,
         "containsKey",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_key_pub,
+        cratonvm_native_collections::native_map_contains_key_pub,
     );
     r.register(
         hdrs,
         "size",
         "()I",
-        rustjvm_native_collections::native_map_size_pub,
+        cratonvm_native_collections::native_map_size_pub,
     );
     r.register(
         hdrs,
         "getFirst",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        rustjvm_native_collections::native_map_get_pub,
+        cratonvm_native_collections::native_map_get_pub,
     );
     r.register(
         hdrs,
         "add",
         "(Ljava/lang/String;Ljava/lang/String;)V",
         |ctx, args| {
-            rustjvm_native_collections::native_map_put_pub(ctx, args)?;
+            cratonvm_native_collections::native_map_put_pub(ctx, args)?;
             Ok(None)
         },
     );
@@ -38144,7 +38144,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         "set",
         "(Ljava/lang/String;Ljava/lang/String;)V",
         |ctx, args| {
-            rustjvm_native_collections::native_map_put_pub(ctx, args)?;
+            cratonvm_native_collections::native_map_put_pub(ctx, args)?;
             Ok(None)
         },
     );
@@ -38608,7 +38608,7 @@ fn field_json_name(ctx: &mut dyn NativeContext, class_id: ClassId, field_name: &
             // Try to extract annotation "value" element
             for (name, elem) in &ann.elements {
                 if name == "value" {
-                    if let rustjvm_native_api::AnnotationElementValue::StringVal(val) = elem {
+                    if let cratonvm_native_api::AnnotationElementValue::StringVal(val) = elem {
                         if !val.is_empty() {
                             return Some(val.clone());
                         }
@@ -39110,11 +39110,11 @@ fn json_str_to_value_depth(ctx: &mut dyn NativeContext, val_str: &str, descripto
                     elements.push(val);
                 }
                 let arr_type = match elem_desc {
-                    "I" | "B" | "S" | "C" | "Z" => rustjvm_types::ArrayElementType::Int,
-                    "J" => rustjvm_types::ArrayElementType::Long,
-                    "F" => rustjvm_types::ArrayElementType::Float,
-                    "D" => rustjvm_types::ArrayElementType::Double,
-                    _ => rustjvm_types::ArrayElementType::Reference,
+                    "I" | "B" | "S" | "C" | "Z" => cratonvm_types::ArrayElementType::Int,
+                    "J" => cratonvm_types::ArrayElementType::Long,
+                    "F" => cratonvm_types::ArrayElementType::Float,
+                    "D" => cratonvm_types::ArrayElementType::Double,
+                    _ => cratonvm_types::ArrayElementType::Reference,
                 };
                 let arr = ctx.new_array(arr_type, elements.len());
                 for (idx, elem_str) in elements.iter().enumerate() {
@@ -39193,13 +39193,13 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             let obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
                     return Ok(Some(Value::Object(Some(arr))));
                 }
             };
             let json = reflection_serialize_to_json(ctx, obj);
             let bytes = json.as_bytes();
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i32));
             }
@@ -39722,8 +39722,8 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
         let pairs = parse_json_object(trimmed);
         let count = pairs.len();
         let node = alloc_json_node(ctx, 1);
-        let children = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
-        let keys = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+        let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+        let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
         for (i, (key, val_str)) in pairs.iter().enumerate() {
             let key_obj = ctx.create_string(key);
             ctx.set_array_element(keys, i, Value::Object(Some(key_obj)));
@@ -39759,7 +39759,7 @@ fn build_json_tree_node_depth(ctx: &mut dyn NativeContext, json: &str, depth: us
         }
         let count = elements.len();
         let node = alloc_json_node(ctx, 2);
-        let children = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+        let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
         for (idx, elem) in elements.iter().enumerate() {
             let child_json = if elem.starts_with('{') || elem.starts_with('[') {
                 elem.clone()
@@ -39967,7 +39967,7 @@ pub(crate) fn register_es4_elasticsearch_stubs(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod new13_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     fn build_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();
@@ -40370,7 +40370,7 @@ mod new14_jdbc_tests {
             version.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false),
             "version must start with a digit: {version:?}"
         );
-        assert_eq!(jdbc_registry::driver_name(), "RustJVM JDBC");
+        assert_eq!(jdbc_registry::driver_name(), "CratonVM JDBC");
         assert_eq!(jdbc_registry::driver_version(), "1.0");
     }
 }
@@ -40390,7 +40390,7 @@ mod new14_jdbc_tests {
 //     `false`, which is the JDK contract for "could not yield — caller is
 //     pinned". The virtual-thread path still works end-to-end because
 //     higher-level `Thread.ofVirtual().start(r)` does **not** go through
-//     `Continuation.yield` in RustJVM — it is handled by `startVirtualThread`
+//     `Continuation.yield` in CratonVM — it is handled by `startVirtualThread`
 //     + carrier-semaphore release on `Thread.sleep`/`LockSupport.park`,
 //     which are the calls that actually benefit from unmounting.
 //
@@ -40399,7 +40399,7 @@ mod new14_jdbc_tests {
 //
 //   * `java.util.concurrent.ForkJoinPool.commonPool` — returns the shared
 //     default scheduler used as the carrier pool for virtual threads.
-//     In RustJVM the pool is a synthetic 2-field object (parallelism, active)
+//     In CratonVM the pool is a synthetic 2-field object (parallelism, active)
 //     whose `parallelism` matches the VT scheduler's carrier count.
 
 /// Synthetic field layout for `jdk.internal.vm.Continuation`:
@@ -40464,7 +40464,7 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
 // silenced by the B6 swallow, and `SUPPORTED` remains `false` by default.
 // The downstream effect is that `newVirtualThread` allocates a
 // `BoundVirtualThread` (the carrier-bound fallback) — which is exactly the
-// path RustJVM can support: spawn a real OS thread (acquired from the
+// path CratonVM can support: spawn a real OS thread (acquired from the
 // virtual-thread carrier semaphore) and run the task inline.
 //
 // We therefore explicitly register `isSupported0()Z` returning **false**.
@@ -40502,7 +40502,7 @@ fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
     r.register(vt, "registerNatives", "()V", |_ctx, _args| Ok(None));
 
     // JVMTI notification natives — called from the VirtualThread state
-    // machine. They are pure JVMTI hooks; rust-jvm doesn't have a JVMTI
+    // machine. They are pure JVMTI hooks; cratonvm doesn't have a JVMTI
     // agent attached to the virtual-thread mount/unmount lifecycle, so
     // no-ops are spec-correct.
     r.register(vt, "notifyJvmtiStart", "()V", |_ctx, _args| Ok(None));
@@ -40517,7 +40517,7 @@ fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
     );
 
     // postPinnedEvent(String) — JFR pinned-event reporter. Funnel into the
-    // existing rust-jvm JFR pinned-thread emitter so pin reports surface
+    // existing cratonvm JFR pinned-thread emitter so pin reports surface
     // even when the JDK records them rather than our `Thread.sleep` shim.
     r.register(
         vt,
@@ -40576,18 +40576,18 @@ fn register_new15_continuation(r: &mut NativeMethodRegistry) {
             let target = args.get(2).copied().unwrap_or(Value::Object(None));
             // The JDK would throw NullPointerException for either arg being null.
             if !matches!(scope, Value::Object(Some(_))) {
-                return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                    rustjvm_types::error::VmError::Runtime(
-                        rustjvm_types::error::RuntimeError::NullPointerException {
+                return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException {
                             message: Some("Continuation scope must not be null".into()),
                         },
                     ),
                 ));
             }
             if !matches!(target, Value::Object(Some(_))) {
-                return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                    rustjvm_types::error::VmError::Runtime(
-                        rustjvm_types::error::RuntimeError::NullPointerException {
+                return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException {
                             message: Some("Continuation target must not be null".into()),
                         },
                     ),
@@ -40615,9 +40615,9 @@ fn register_new15_continuation(r: &mut NativeMethodRegistry) {
             _ => NEW15_CONT_STATE_NEW,
         };
         if prev_state == NEW15_CONT_STATE_DONE {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::IllegalStateException {
                         message: "Continuation already completed".to_string(),
                     },
                 ),
@@ -40939,7 +40939,7 @@ fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> String {
 /// `getFactory()` registration to ensure
 /// `getFactory().getClass().getName()` round-trips to the system
 /// property's dot-form.
-fn alloc_common_factory(ctx: &mut dyn NativeContext) -> rustjvm_types::ObjectRef {
+fn alloc_common_factory(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
     let target = resolve_common_factory_internal_name(ctx);
     match ctx.ensure_class_initialized(&target) {
         Ok(cid) => {
@@ -40955,7 +40955,7 @@ fn alloc_common_factory(ctx: &mut dyn NativeContext) -> rustjvm_types::ObjectRef
 /// loaded class shape lacks that field (legacy synthetic mode).
 fn populate_common_factory(
     ctx: &mut dyn NativeContext,
-    pool: rustjvm_types::ObjectRef,
+    pool: cratonvm_types::ObjectRef,
 ) {
     let factory = alloc_common_factory(ctx);
     // Set by name so we work whether the class is the real JDK shape
@@ -41140,7 +41140,7 @@ mod new15_tests {
 mod ra1_char_buffer_roundtrip_tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+    use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
     #[test]
     fn char_buffer_capacity10_put5_flip_get5_round_trip() {
@@ -41215,13 +41215,13 @@ mod ra1_char_buffer_roundtrip_tests {
 mod t10_manifest_input_stream_tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+    use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
     /// Build a synthetic java/io/ByteArrayInputStream holding the given
     /// bytes. Mirrors the 4-field layout (buf=0, pos=1, mark=2, count=3)
     /// that the p59 fast path in `p59_read_input_stream_fully` reads.
     fn make_bais(ctx: &mut crate::test_utils::MockNativeContext, data: &[u8]) -> ObjectRef {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, data.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
         for (i, b) in data.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
         }
@@ -41294,7 +41294,7 @@ mod t10_manifest_input_stream_tests {
 
         // Manifest with three main attributes (CRLF line endings, as real
         // MANIFEST.MF files use), no per-entry sections.
-        let mf_bytes = b"Manifest-Version: 1.0\r\nMain-Class: com.example.Foo\r\nCreated-By: rustjvm\r\n\r\n";
+        let mf_bytes = b"Manifest-Version: 1.0\r\nMain-Class: com.example.Foo\r\nCreated-By: cratonvm\r\n\r\n";
         let mf = call_manifest_init(&reg, &mut ctx, mf_bytes);
 
         // Drive getMainAttributes() to retrieve the Attributes object.
@@ -41324,7 +41324,7 @@ mod t10_manifest_input_stream_tests {
         );
         assert_eq!(
             get_value(&reg, &mut ctx, attrs, "Created-By"),
-            Some("rustjvm".to_string())
+            Some("cratonvm".to_string())
         );
         // Case-insensitive key lookup, per manifest spec.
         assert_eq!(
@@ -41462,7 +41462,7 @@ mod t10_manifest_input_stream_tests {
         // and the `getValue("Main-Class")` lookup now hits the updated
         // Attributes.getValue native (previously a no-op stub that
         // returned null even when the manifest was parsed).
-        let tmp_dir = std::env::temp_dir().join("rustjvm_t10_manifest_roundtrip");
+        let tmp_dir = std::env::temp_dir().join("cratonvm_t10_manifest_roundtrip");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let jar_path = tmp_dir.join("t10.jar");
         {

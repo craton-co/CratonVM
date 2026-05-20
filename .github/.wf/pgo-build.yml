@@ -73,10 +73,10 @@ jobs:
       - name: Upload PGO-optimized binary
         uses: actions/upload-artifact@v4
         with:
-          name: rustjvm-pgo
+          name: cratonvm-pgo
           path: |
-            target/release/rustjvm
-            target/release/rustjvm-cli
+            target/release/cratonvm
+            target/release/cratonvm-cli
           if-no-files-found: warn
           retention-days: 30
 
@@ -84,7 +84,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rustjvm-pgo-profdata
+          name: cratonvm-pgo-profdata
           # scripts/pgo.sh leaves the merged .profdata under
           # $PROFILE_DIR (default: /tmp/cratonvm-pgo). Upload for later
           # inspection / replay against newer source revisions.

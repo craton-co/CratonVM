@@ -2,7 +2,7 @@ import java.util.ArrayList;
 
 public class Demo {
     public static void main(String[] args) {
-        System.out.println("=== RustJVM Multi-Class Demo ===");
+        System.out.println("=== CratonVM Multi-Class Demo ===");
         System.out.println();
 
         // --- Point class ---

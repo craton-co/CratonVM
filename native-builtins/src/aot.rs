@@ -7,9 +7,9 @@
 //!   - Training run profile collection
 //!   - Native method stubs for jdk/internal/misc/Leyden and related classes
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -1338,7 +1338,7 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod aot_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // Serialize tests that mutate AOT global state
     // (AOT_CACHE_GLOBAL, AOT_TRAINING_RECORDER, AOT_PRELINKER_CACHE, AOT_ENABLED,
@@ -1929,7 +1929,7 @@ mod aot_tests {
         // Use a per-test tempdir so parallel tests or leftover files from
         // prior runs cannot cross-contaminate.
         let tmp = tempfile::TempDir::new().expect("create per-test tempdir");
-        let path = tmp.path().join("rustjvm_aot_test_flush.bin");
+        let path = tmp.path().join("cratonvm_aot_test_flush.bin");
         let path_str = path.to_string_lossy().to_string();
 
         init_aot_runtime(true, false, None, Some(&path_str));
@@ -1949,9 +1949,9 @@ mod aot_tests {
         let _guard = aot_test_lock();
         reset_aot_globals();
         // Per-test tempdir: RAII cleanup on drop, avoids sharing
-        // "rustjvm_aot_test_load.bin" in $TMP with parallel runs.
+        // "cratonvm_aot_test_load.bin" in $TMP with parallel runs.
         let tmp = tempfile::TempDir::new().expect("create per-test tempdir");
-        let path = tmp.path().join("rustjvm_aot_test_load.bin");
+        let path = tmp.path().join("cratonvm_aot_test_load.bin");
         let path_str = path.to_string_lossy().to_string();
 
         // Create a valid cache file

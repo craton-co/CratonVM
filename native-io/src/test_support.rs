@@ -10,12 +10,12 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 
-use rustjvm_native_api::{
+use cratonvm_native_api::{
     AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, NativeContext,
     StackTraceEntry,
 };
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 /// A recorded `invoke_virtual` call.
 #[derive(Debug, Clone)]
@@ -244,10 +244,10 @@ impl NativeContext for MockNativeContext {
     fn get_static_field(&self, _c: ClassId, _i: usize) -> Value { Value::Int(0) }
     fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
     fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef { self.alloc_object(0) }
-    fn fd_table(&self) -> &rustjvm_native_api::fd_table::FileDescriptorTable {
+    fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
         use std::sync::OnceLock;
-        static FD: OnceLock<rustjvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
-        FD.get_or_init(rustjvm_native_api::fd_table::FileDescriptorTable::new)
+        static FD: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
+        FD.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
     }
     fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value { self.get_field(o, i) }
     fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) { self.set_field(o, i, v) }
@@ -281,7 +281,7 @@ impl NativeContext for MockNativeContext {
     fn free_native_memory(&mut self, _a: i64) {}
     fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> { Ok(0) }
     fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> { None }
-    fn register_upcall(&mut self, _e: rustjvm_native_api::ffi::UpcallEntry) -> usize { 0 }
+    fn register_upcall(&mut self, _e: cratonvm_native_api::ffi::UpcallEntry) -> usize { 0 }
     fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> { None }
     fn module_name_of_class(&self, _c: ClassId) -> Option<String> { None }
     fn find_resource(&self, _n: &str) -> Option<Vec<u8>> { None }

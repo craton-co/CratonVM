@@ -21,7 +21,7 @@
 use crate::analyzer::ParamKind;
 use crate::emitter::{LoweringError, PtxKernel, PtxModule, PtxParam, PtxParamKind, RegDecl, RegKind};
 use crate::signature::KernelSignature;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::method::ClassFileMethod;
 
 mod emit;
 mod loop_recog;

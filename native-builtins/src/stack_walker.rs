@@ -30,9 +30,9 @@
 //! registered by `phases_late::register_p59_stackwalker`; we do **not**
 //! re-register those here.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -190,7 +190,7 @@ pub(crate) fn native_get_instance_set_depth(
 
 /// `StackWalker.getCallerClass()` — walk the interpreter stack and return
 /// the first Class mirror that is neither StackWalker itself nor the
-/// rustjvm internal reflection / invoke wrappers.
+/// cratonvm internal reflection / invoke wrappers.
 ///
 /// Boot-path consumers (JBoss Modules' JDKSpecific, etc.) accept a
 /// `java.lang.Object` fallback when no caller-like frame is available
@@ -269,7 +269,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
     // WP1.9 — `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z`.
     //
     // In OpenJDK this is a private Java method that validates the walker's
-    // stored `mode` bitmask against the set of legal mode bits. rust-jvm's
+    // stored `mode` bitmask against the set of legal mode bits. cratonvm's
     // bootstrap dispatches it through the native registry (the Java
     // implementation reaches into `jdk.internal.reflect.Reflection` and
     // `MemberName`-resolution paths that aren't yet wired during early
@@ -410,7 +410,7 @@ mod check_modes_tests {
 
     #[test]
     fn register_includes_check_stack_walk_modes() {
-        use rustjvm_native_api::NativeMethodRegistry;
+        use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         register_stack_walker_boot(&mut r);
         // Sanity: the registry now contains both the StackWalker entries
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn register_stack_walker_boot_adds_getinstance_variants() {
-        use rustjvm_native_api::NativeMethodRegistry;
+        use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         let before = r.len();
         register_stack_walker_boot(&mut r);

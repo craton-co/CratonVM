@@ -7,9 +7,9 @@
 //!   - VectorShuffle — lane reordering
 //!   - VectorOperators — operation code constants
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 use crate::{obj_arg, alloc_concurrent_synthetic};
 
 // ---------------------------------------------------------------------------
@@ -432,7 +432,7 @@ fn iv_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // In a full SIMD impl each lane would be stored separately; here we
     // replicate the summary hash across lanes for consistency.
     let lane_count = (lc as usize).max(1);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, lane_count);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, lane_count);
     for i in 0..lane_count {
         ctx.set_array_element(arr, i, Value::Int(hash.wrapping_add(i as i32)));
     }
@@ -1560,7 +1560,7 @@ fn register_vector_operators(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod vector_api_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

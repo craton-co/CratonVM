@@ -28,9 +28,9 @@
 //! can be reviewed on its own and so the file-disjoint policy keeps Wave 2
 //! owners from stomping on each other.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ClassId, ObjectRef, Value};
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
 
 use crate::lang_class::{
     annotation_element_to_java, box_value,
@@ -44,7 +44,7 @@ use crate::obj_arg;
 
 use std::sync::OnceLock;
 
-/// Cached `RUSTJVM_DBG_METHOD_INVOKE_BOX` lookup. `Method.invoke`'s
+/// Cached `CRATONVM_DBG_METHOD_INVOKE_BOX` lookup. `Method.invoke`'s
 /// defensive-box wrap-up runs on every reflective call (and ByteBuddy /
 /// CGLIB / Jackson hit this thousands of times during JDK boot). Reading
 /// `env::var_os` per call goes through the platform environ lock —
@@ -56,7 +56,7 @@ static DBG_METHOD_INVOKE_BOX: OnceLock<bool> = OnceLock::new();
 #[inline]
 fn dbg_method_invoke_box_enabled() -> bool {
     *DBG_METHOD_INVOKE_BOX
-        .get_or_init(|| std::env::var_os("RUSTJVM_DBG_METHOD_INVOKE_BOX").is_some())
+        .get_or_init(|| std::env::var_os("CRATONVM_DBG_METHOD_INVOKE_BOX").is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ const ACC_MANDATED: i32 = 0x8000;
 // ---------------------------------------------------------------------------
 //
 // Per spec, returns true iff the override flag could be set (we always
-// return true since RustJVM doesn't enforce module-level deep-reflection
+// return true since CratonVM doesn't enforce module-level deep-reflection
 // gates beyond what `check_reflection_module_access` already does), AND
 // writes the flag through to the appropriate extra slot.
 
@@ -1001,7 +1001,7 @@ fn native_method_invoke_boxed(
     if prev_depth > 100 {
         // Roll back the increment so the next top-level call starts fresh.
         INVOKE_DEPTH.with(|d| d.set(prev_depth));
-        return Err(rustjvm_types::error::RuntimeError::StackOverflowError.into());
+        return Err(cratonvm_types::error::RuntimeError::StackOverflowError.into());
     }
 
     // RAII-style depth restore: any early return (including `?`) must still
@@ -1349,7 +1349,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     // Real-JDK Field.getGenericType is a Java method that delegates to
     // sun.reflect.generics.repository.FieldRepository, which we don't
     // implement. This native parses the JVMS §4.7.9 Signature attribute
-    // on the field directly via rustjvm_reader::signature and builds a
+    // on the field directly via cratonvm_reader::signature and builds a
     // ParameterizedType / TypeVariable / GenericArrayType / WildcardType
     // runtime object via crate::generics::type_sig_to_java. Promoted from
     // synthetic-only registration so real-JDK mode also returns
@@ -1442,7 +1442,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             let ata = ctx.get_field_by_name(this, "actualTypeArguments");
             if let Value::Object(Some(arr)) = ata {
                 let len = ctx.array_length(arr);
-                let clone = ctx.new_ref_array(rustjvm_types::ClassId::new(0), len);
+                let clone = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
                 for i in 0..len {
                     let el = ctx.get_array_element(arr, i);
                     ctx.set_array_element(clone, i, el);

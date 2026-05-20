@@ -68,9 +68,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -326,7 +326,7 @@ impl std::fmt::Debug for IoFutureInner {
 // We store `Arc<OptionMapInner>`, `Arc<BuilderInner>`, and
 // `Arc<IoFutureInner>` in process-global registries keyed by an i64
 // handle that we drop into the JVM object's slot-0 long field. This is
-// the standard `rust-jvm` pattern for bridging JVM-land object identity
+// the standard `cratonvm` pattern for bridging JVM-land object identity
 // with Rust-owned state (see `wildfly_undertow::undertow_instances`).
 //
 // Handles are never reused within a single process run.

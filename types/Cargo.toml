@@ -1,10 +1,11 @@
 [package]
-name = "rustjvm-types"
+name = "cratonvm-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Shared types for the RustJVM project"
+description = "Shared types for the CratonVM project"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true

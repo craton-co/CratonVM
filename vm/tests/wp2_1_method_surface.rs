@@ -30,12 +30,12 @@
 //!    single VM invocation — the load-bearing hard-pass acceptance.
 //! 4. A fixture-staging guard logs a clear WARN when javac is missing.
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp21MethodSurface";
+const FIXTURE_CLASS: &str = "cratonvm/Wp21MethodSurface";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -44,7 +44,7 @@ fn test_resources_dir() -> String {
 
 fn fixture_compiled() -> bool {
     let path = format!(
-        "{}/rustjvm/Wp21MethodSurface.class",
+        "{}/cratonvm/Wp21MethodSurface.class",
         test_resources_dir()
     );
     std::path::Path::new(&path).exists()
@@ -71,7 +71,7 @@ fn run_probe(method: &str) -> Result<i32, String> {
 #[test]
 fn method_get_exception_types_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Method",
@@ -86,7 +86,7 @@ fn method_get_exception_types_native_registered() {
 #[test]
 fn method_to_string_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Method",
@@ -101,7 +101,7 @@ fn method_to_string_native_registered() {
 #[test]
 fn method_get_generic_exception_types_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Method",
@@ -122,7 +122,7 @@ fn method_existing_natives_still_registered() {
     // synthetic-jdk mode), so this anchor catches a registration
     // regression cheaply.
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     let probes = [
         ("getName", "()Ljava/lang/String;"),
         ("getReturnType", "()Ljava/lang/Class;"),
@@ -270,11 +270,11 @@ fn closes_method_surface() {
 #[test]
 fn fixture_class_file_is_staged() {
     let java = format!(
-        "{}/rustjvm/Wp21MethodSurface.java",
+        "{}/cratonvm/Wp21MethodSurface.java",
         test_resources_dir()
     );
     let class = format!(
-        "{}/rustjvm/Wp21MethodSurface.class",
+        "{}/cratonvm/Wp21MethodSurface.class",
         test_resources_dir()
     );
     assert!(

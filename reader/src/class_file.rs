@@ -11,7 +11,7 @@ use crate::method::ClassFileMethod;
 ///
 /// `this_class`, `super_class`, and `interfaces` are stored as `Arc<str>`
 /// rather than `String`. Backing storage is the pool-interned name from
-/// the constant pool's Utf8 entries (see `rustjvm_types::intern_arc`), so
+/// the constant pool's Utf8 entries (see `cratonvm_types::intern_arc`), so
 /// constructing a `ClassFile` no longer allocates a fresh `String` for
 /// each of these names — every clone is a refcount bump on the shared
 /// pool allocation. Downstream `String`-flavoured consumers can still

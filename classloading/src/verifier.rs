@@ -52,18 +52,18 @@
 #[cfg(test)]
 use std::sync::Arc;
 
-use rustjvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
-use rustjvm_reader::class_file_version::ClassFileVersion;
-use rustjvm_reader::constant_pool::ConstantPool;
-use rustjvm_reader::instruction::Instruction;
-use rustjvm_reader::method::ClassFileMethod;
-use rustjvm_reader::stack_map::StackMapTable;
+use cratonvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
+use cratonvm_reader::class_file_version::ClassFileVersion;
+use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::instruction::Instruction;
+use cratonvm_reader::method::ClassFileMethod;
+use cratonvm_reader::stack_map::StackMapTable;
 
 use super::class::{find_method_recursive, Class, ClassStore};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{ClassHierarchy, VType};
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 /// Verify a class: structural (Pass 2) + bytecode (Pass 3).
 ///
@@ -204,7 +204,7 @@ fn verify_method_typestate(
     // `entries: &Arc<[u8]>` (round 4 reader) — deref to a `&[u8]` slice
     // that lives as long as the attribute does.
     let stack_map_raw = code_attr.attributes.iter().find_map(|a| match a {
-        rustjvm_reader::attribute::Attribute::StackMapTable { entries } => Some(&entries[..]),
+        cratonvm_reader::attribute::Attribute::StackMapTable { entries } => Some(&entries[..]),
         _ => None,
     });
 
@@ -1183,11 +1183,11 @@ mod tests {
     use super::*;
     use crate::class::{ClassId, ClassLoaderId, ClassState};
 
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
-    use rustjvm_reader::class_access_flags::ClassAccessFlags;
-    use rustjvm_reader::class_file_version::ClassFileVersion;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-    use rustjvm_reader::method::ClassFileMethod;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_reader::class_file_version::ClassFileVersion;
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::method::ClassFileMethod;
 
     fn empty_cp() -> ConstantPool {
         ConstantPool::new(vec![ConstantPoolEntry::Tombstone])
@@ -1246,7 +1246,7 @@ mod tests {
             vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))]
@@ -1633,7 +1633,7 @@ mod tests {
         max_stack: u16,
         max_locals: u16,
         code: Vec<u8>,
-        exception_table: Vec<rustjvm_reader::attribute::ExceptionTableEntry>,
+        exception_table: Vec<cratonvm_reader::attribute::ExceptionTableEntry>,
     ) -> Class {
         Class {
             id: ClassId::new(0),
@@ -1657,7 +1657,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack,
                     max_locals,
-                    code: rustjvm_reader::ByteView::from_vec(code),
+                    code: cratonvm_reader::ByteView::from_vec(code),
                     exception_table,
                     attributes: vec![],
                 }))],
@@ -1788,13 +1788,13 @@ mod tests {
             0xb1,             // 28: return
         ];
         let exc = vec![
-            rustjvm_reader::attribute::ExceptionTableEntry {
+            cratonvm_reader::attribute::ExceptionTableEntry {
                 start_pc: 0,
                 end_pc: 15,
                 handler_pc: 15,
                 catch_type: 0, // any
             },
-            rustjvm_reader::attribute::ExceptionTableEntry {
+            cratonvm_reader::attribute::ExceptionTableEntry {
                 start_pc: 15,
                 end_pc: 19,
                 handler_pc: 15,
@@ -1896,7 +1896,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xac]), // ireturn on empty stack
+                code: cratonvm_reader::ByteView::from_vec(vec![0xac]), // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1940,7 +1940,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xac]), // ireturn on empty stack
+                code: cratonvm_reader::ByteView::from_vec(vec![0xac]), // ireturn on empty stack
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1984,7 +1984,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xb2, 0x00]), // getstatic with truncated index
+                code: cratonvm_reader::ByteView::from_vec(vec![0xb2, 0x00]), // getstatic with truncated index
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -2043,7 +2043,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![],
             }))],

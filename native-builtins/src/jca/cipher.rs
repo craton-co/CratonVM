@@ -71,9 +71,9 @@
 //! End-to-end the probe must print `OK` on stdout and exit 0 with the
 //! shim registered.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 // Round-9 MED-2: migrated `CIPHER_TABLE` from `std::sync::RwLock` to
 // `parking_lot::RwLock` — removes the per-access `unwrap_or_else(into_inner)`
@@ -396,7 +396,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
 
     match result_bytes {
         Ok(bytes) => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -722,7 +722,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 }
             });
         }
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(empty))))
     });
 
@@ -804,7 +804,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         if iv_bytes.is_empty() {
             return Ok(Some(Value::Object(None)));
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, iv_bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, iv_bytes.len());
         for (i, &b) in iv_bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -823,7 +823,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let iv_arr = obj_arg(args, 1)?;
         let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
         for i in 0..len {
             if let Value::Int(b) = ctx.get_array_element(iv_arr, i) {
                 ctx.set_array_element(copy, i, Value::Int(b));
@@ -844,7 +844,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
         let t_len = args[1].as_int().unwrap_or(128);
         let iv_arr = obj_arg(args, 2)?;
         let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
         for i in 0..len {
             if let Value::Int(b) = ctx.get_array_element(iv_arr, i) {
                 ctx.set_array_element(copy, i, Value::Int(b));
@@ -890,7 +890,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     #[test]
     fn shim_registers_all_clinits() {

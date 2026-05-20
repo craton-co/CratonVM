@@ -21,12 +21,12 @@
 //! on the same JDK 25 ConcurrentHashMap.
 //!
 //! See `apps/chm_basic/ChmBasic.java` for the standalone CLI variant of the
-//! same probe (used as a smoke test for the rustjvm.exe binary).
+//! same probe (used as a smoke test for the cratonvm.exe binary).
 //! See `apps/chm_stress/ChmStress.java` for the contention stress probe.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 /// Path to the test resources directory (matches interpreter_tests.rs).
 fn test_resources_dir() -> String {
@@ -37,7 +37,7 @@ fn test_resources_dir() -> String {
 /// Check whether the build.rs has compiled the JDK21+ test fixtures.
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    let class_path = format!("{dir}/rustjvm/ChmBasicProbe.class");
+    let class_path = format!("{dir}/cratonvm/ChmBasicProbe.class");
     std::path::Path::new(&class_path).exists()
 }
 
@@ -63,7 +63,7 @@ fn test_chm_pre_resize_put_get() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ChmBasicProbe",
+        "cratonvm/ChmBasicProbe",
         "testChmPreResizePutGet",
         "()I",
         &[],
@@ -83,13 +83,13 @@ fn test_chm_pre_resize_put_get() {
 /// vm test suite stays green.
 ///
 /// To unignore once the fix lands: remove `#[ignore]` and run with
-/// `cargo test --release -p rustjvm-vm --test wp4_6_chm_basic`.
+/// `cargo test --release -p cratonvm-vm --test wp4_6_chm_basic`.
 #[test]
 #[ignore = "WP4.6-FOLLOWUP-A: CHM transfer() data-loss after resize past 16 buckets"]
 fn test_chm_basic_put_get() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ChmBasicProbe", "testChmBasicPutGet", "()I", &[]);
+    let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmBasicPutGet", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("ChmBasicProbe.testChmBasicPutGet expected Ok(Some(Int(1))), got: {other:?}"),
@@ -103,7 +103,7 @@ fn test_chm_basic_put_get() {
 fn test_chm_resize_path() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ChmBasicProbe", "testChmResizePath", "()I", &[]);
+    let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmResizePath", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("ChmBasicProbe.testChmResizePath expected Ok(Some(Int(1))), got: {other:?}"),
@@ -116,7 +116,7 @@ fn test_chm_resize_path() {
 fn test_chm_mutation_cycle() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ChmBasicProbe", "testChmMutationCycle", "()I", &[]);
+    let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmMutationCycle", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("ChmBasicProbe.testChmMutationCycle expected Ok(Some(Int(1))), got: {other:?}"),
@@ -131,7 +131,7 @@ fn test_chm_mutation_cycle() {
 fn test_chm_clear_empty() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ChmBasicProbe", "testChmClearEmpty", "()I", &[]);
+    let result = vm.invoke("cratonvm/ChmBasicProbe", "testChmClearEmpty", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("ChmBasicProbe.testChmClearEmpty expected Ok(Some(Int(1))), got: {other:?}"),

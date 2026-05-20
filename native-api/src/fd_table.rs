@@ -1230,7 +1230,7 @@ mod tests {
     fn temp_file_with(content: &str) -> String {
         let id = TEST_COUNTER.fetch_add(1, AtomOrd::Relaxed);
         let dir = std::env::temp_dir();
-        let name = format!("rustjvm_fdtest_{}_{}.txt", std::process::id(), id);
+        let name = format!("cratonvm_fdtest_{}_{}.txt", std::process::id(), id);
         let path = dir.join(name);
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
     fn temp_path(suffix: &str) -> String {
         let id = TEST_COUNTER.fetch_add(1, AtomOrd::Relaxed);
         let dir = std::env::temp_dir();
-        let name = format!("rustjvm_fdtest_{}_{}_{}.txt", std::process::id(), id, suffix);
+        let name = format!("cratonvm_fdtest_{}_{}_{}.txt", std::process::id(), id, suffix);
         dir.join(name).to_string_lossy().into_owned()
     }
 
@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn open_read_nonexistent_file_errors() {
         let table = FileDescriptorTable::new();
-        let result = table.open_read("/tmp/rustjvm_fdtest_nonexistent_xyzzy.txt");
+        let result = table.open_read("/tmp/cratonvm_fdtest_nonexistent_xyzzy.txt");
         assert!(result.is_err());
     }
 

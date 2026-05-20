@@ -1,4 +1,4 @@
-//! Java bytecode → PTX lowering for RustJVM GPU offload.
+//! Java bytecode → PTX lowering for CratonVM GPU offload.
 //!
 //! This crate is consumed by the VM to decide whether a static method
 //! is GPU-eligible (see [`analyzer`]) and, if so, to emit a PTX text

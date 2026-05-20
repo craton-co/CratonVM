@@ -46,9 +46,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -1701,7 +1701,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
 /// Returns `Value::Object(None)` on any failure.
 fn native_construct_message_logger(
     ctx: &mut dyn NativeContext,
-    intf_mirror: rustjvm_types::ObjectRef,
+    intf_mirror: cratonvm_types::ObjectRef,
     category: &str,
 ) -> Value {
     // 1. Resolve the interface name.

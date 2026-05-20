@@ -6,9 +6,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectKind, ObjectRef, Value};
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectKind, ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
 
 use crate::{obj_arg, alloc_concurrent_synthetic};
 use crate::lang_class::{mirror_class_name, mirror_class_id, box_value};
@@ -418,7 +418,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             // Empty params — allocate a 0-length Class[] so `parameterCount()`
             // and the form-builder both see a non-null array.
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(obj, 1, Value::Object(Some(empty)));
             populate_method_type_form(ctx, obj);
             Ok(Some(Value::Object(Some(obj))))
@@ -431,7 +431,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
             let param = obj_arg(args, 1)?;
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(param)));
             let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
@@ -454,7 +454,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let total = 1 + more_len;
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, total);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, total);
             ctx.set_array_element(arr, 0, Value::Object(Some(ptype0)));
             if let Some(Value::Object(Some(more))) = args.get(2) {
                 for i in 0..more_len {
@@ -496,7 +496,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(_)) = params {
             Ok(Some(params))
         } else {
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(empty))))
         }
     });
@@ -746,7 +746,7 @@ pub(crate) fn alloc_instance_var_handle(
     field_name: &str,
     field_desc: &str,
     field_index: usize,
-    class_id: rustjvm_types::ClassId,
+    class_id: cratonvm_types::ClassId,
 ) -> ObjectRef {
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
     ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_INSTANCE));
@@ -1450,7 +1450,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                 let class_name = frame.class_name.replace('.', "/");
                 let cid = ctx
                     .ensure_class_initialized(&class_name)
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 Value::Object(Some(ctx.get_class_mirror(cid)))
             } else {
                 Value::Object(None)
@@ -1485,7 +1485,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // package-private members (we don't enforce modes anyway).
             let object_cid = ctx
                 .ensure_class_initialized("java/lang/Object")
-                .unwrap_or(rustjvm_types::ClassId::new(0));
+                .unwrap_or(cratonvm_types::ClassId::new(0));
             let object_mirror = ctx.get_class_mirror(object_cid);
             let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 2);
             ctx.set_field(obj, 0, Value::Object(Some(object_mirror)));
@@ -1721,18 +1721,18 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 /// Create a NoSuchMethodException error.
-fn no_such_method_error(class: &str, method: &str, desc: &str) -> rustjvm_types::error::MethodCallFailed {
-    rustjvm_types::error::MethodCallFailed::InternalError(
-        rustjvm_types::error::VmError::Internal {
+fn no_such_method_error(class: &str, method: &str, desc: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::Internal {
             message: format!("NoSuchMethodException: {class}.{method}{desc}"),
         },
     )
 }
 
 /// Create a NoSuchFieldException error.
-fn no_such_field_error(class: &str, field: &str) -> rustjvm_types::error::MethodCallFailed {
-    rustjvm_types::error::MethodCallFailed::InternalError(
-        rustjvm_types::error::VmError::Internal {
+fn no_such_field_error(class: &str, field: &str) -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::Internal {
             message: format!("NoSuchFieldException: {class}.{field}"),
         },
     )
@@ -2613,7 +2613,7 @@ pub(crate) fn alloc_method_handle(
     name: &str,
     desc: &str,
     kind: i32,
-) -> rustjvm_types::ObjectRef {
+) -> cratonvm_types::ObjectRef {
     // C15: Allocate MH_BOUND+1 slots so our synthetic fields (at slots 16-20)
     // live PAST the real JDK's instance-field count (6). This prevents
     // `set_field_by_name(mh, "type", ...)` — which resolves to slot 0 — from
@@ -2698,8 +2698,8 @@ pub(crate) fn string_concat_render_value(
 pub(crate) fn alloc_string_concat_method_handle(
     ctx: &mut dyn NativeContext,
     recipe: &str,
-    constants: Option<rustjvm_types::ObjectRef>,
-) -> rustjvm_types::ObjectRef {
+    constants: Option<cratonvm_types::ObjectRef>,
+) -> cratonvm_types::ObjectRef {
     // Reuse the MethodHandle synthetic skeleton — same field layout as
     // alloc_method_handle, but the class slot carries the recipe string
     // instead of a class name.
@@ -2728,7 +2728,7 @@ pub(crate) fn alloc_string_concat_method_handle(
 }
 
 /// Read the class name string from a MethodHandle (field MH_CLASS).
-pub(crate) fn mh_read_class(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mh_read_class(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
     match ctx.get_field(mh, MH_CLASS) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -2736,7 +2736,7 @@ pub(crate) fn mh_read_class(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRe
 }
 
 /// Read the method name string from a MethodHandle (field MH_NAME).
-pub(crate) fn mh_read_name(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mh_read_name(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
     match ctx.get_field(mh, MH_NAME) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -2744,7 +2744,7 @@ pub(crate) fn mh_read_name(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef
 }
 
 /// Read the descriptor string from a MethodHandle (field MH_DESC).
-pub(crate) fn mh_read_desc(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mh_read_desc(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
     match ctx.get_field(mh, MH_DESC) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -2755,7 +2755,7 @@ pub(crate) fn mh_read_desc(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef
 /// `extra_args` are the args passed to invoke() after `this` (the MH itself).
 pub(crate) fn mh_dispatch(
     ctx: &mut dyn NativeContext,
-    mh: rustjvm_types::ObjectRef,
+    mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
     let class = match mh_read_class(ctx, mh) {
@@ -2955,7 +2955,7 @@ pub(crate) fn mh_dispatch(
             // the recipe char-by-char, interpolating dynamic args
             // (`\u{0001}`) and pre-baked constants (`\u{0002}`).
             let recipe = mh_read_class(ctx, mh).unwrap_or_default();
-            let constants_arr: Option<rustjvm_types::ObjectRef> = match bound {
+            let constants_arr: Option<cratonvm_types::ObjectRef> = match bound {
                 Value::Object(Some(holder)) => match ctx.get_field(holder, 0) {
                     Value::Object(Some(a)) => Some(a),
                     _ => None,
@@ -3038,7 +3038,7 @@ pub(crate) fn mh_dispatch(
 fn widen_descriptor(
     ctx: &dyn NativeContext,
     inner_desc: &str,
-    extra_classes: rustjvm_types::ObjectRef,
+    extra_classes: cratonvm_types::ObjectRef,
     pos: usize,
 ) -> String {
     if !inner_desc.starts_with('(') {
@@ -3213,8 +3213,8 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             let final_expected = if has_bound && needs_receiver { expected_count - 1 } else { expected_count };
             if extra.len() != final_expected {
                 // WrongMethodTypeException — arity mismatch
-                return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                    rustjvm_types::error::VmError::Internal {
+                return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Internal {
                         message: format!("WrongMethodTypeException: expected {} args, got {}", final_expected, extra.len()),
                     },
                 ));
@@ -3336,7 +3336,7 @@ pub(crate) fn build_method_type_from_descriptor(
     };
 
     // Create params array
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, param_names.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, param_names.len());
     for (i, pname) in param_names.iter().enumerate() {
         let mirror = if let Some(cid) = ctx.class_id_by_name(pname) {
             ctx.get_class_mirror(cid)
@@ -3374,7 +3374,7 @@ pub(crate) fn build_method_type_from_descriptor(
 /// so downstream `form.erasedType()` returns a non-null MethodType.
 pub(crate) fn populate_method_type_form(
     ctx: &mut dyn NativeContext,
-    mt: rustjvm_types::ObjectRef,
+    mt: cratonvm_types::ObjectRef,
 ) {
     let mut slot_count: i32 = 0;
     let mut primitive_count: i32 = 0;
@@ -3563,7 +3563,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(orig_ptypes)) = ctx.get_field(mt, 1) {
                     let orig_n = ctx.array_length(orig_ptypes);
                     let new_n = orig_n + extra_n;
-                    let new_ptypes = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_n);
+                    let new_ptypes = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_n);
                     let pos_c = pos.min(orig_n);
                     for i in 0..pos_c {
                         let v = ctx.get_array_element(orig_ptypes, i);
@@ -3691,8 +3691,8 @@ fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
         _ => {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Internal {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Internal {
                     message: "Lookup.unreflect: method argument is null".to_string(),
                 },
             ));
@@ -3700,7 +3700,7 @@ fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     // C6: Method uses real-JDK field layout. Read JDK fields by name;
-    // descriptor lives in our RustJVM extra slot.
+    // descriptor lives in our CratonVM extra slot.
     let class_name = match ctx.get_field_by_name(method_obj, "clazz") {
         Value::Object(Some(class_mirror)) => {
             mirror_class_name(ctx, class_mirror).unwrap_or_default()
@@ -3729,8 +3729,8 @@ fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let method_obj = match args.get(1) {
         Some(Value::Object(Some(m))) => *m,
         _ => {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Internal {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Internal {
                     message: "Lookup.unreflectSpecial: method argument is null".to_string(),
                 },
             ));
@@ -3755,10 +3755,10 @@ fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 /// Read the descriptor string for a Field reflection object. Prefers the
-/// RustJVM extra-slot descriptor (matches `create_field_object` in
+/// CratonVM extra-slot descriptor (matches `create_field_object` in
 /// `lang_class.rs`), and falls back to deriving it from the `type` Class
 /// mirror if needed.
-fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: rustjvm_types::ObjectRef) -> Cow<'static, str> {
+fn read_field_descriptor_string(ctx: &dyn NativeContext, field_obj: cratonvm_types::ObjectRef) -> Cow<'static, str> {
     // The `type` field is a Class mirror — derive the descriptor from it
     // as a safe fallback (e.g. "J" for primitive long, "Ljava/lang/String;"
     // for references). This is the authoritative source in real JDK mode.
@@ -4284,7 +4284,7 @@ pub(crate) fn native_mhn_get_member_vm_info(
         Value::Int(i) => i,
         _ => 0,
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 2);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
     // Box vmindex as Integer
     let boxed = crate::lang_class::box_value(ctx, Value::Int(vmindex), "I");
     ctx.set_array_element(arr, 0, boxed);

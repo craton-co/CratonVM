@@ -9,7 +9,7 @@
 //!     at sun.awt.PlatformGraphicsInfo.<clinit>(...)
 //!     at java.awt.Component.<clinit>(...)
 //!     at installer.Install.main(Install.java)
-//! [rustjvm] process rc=1
+//! [cratonvm] process rc=1
 //! ```
 //!
 //! The jEdit installer is a Swing UI that can't initialize on our headless
@@ -28,7 +28,7 @@
 //!    reference in unrelated code) doesn't throw `HeadlessException`. The
 //!    `Component.<clinit>` shim is the riskiest one — it can affect other
 //!    Swing-based workloads — so it's gated behind the same env-flag
-//!    convention as `jboss_extras::RUSTJVM_WILDFLY_SHORTCIRCUIT`. Other
+//!    convention as `jboss_extras::CRATONVM_WILDFLY_SHORTCIRCUIT`. Other
 //!    shims (`LocalGE`, `PlatformGraphicsInfo`, `Win32GraphicsEnvironment`)
 //!    are always-on because their only effect is "headless mode works".
 //!
@@ -45,7 +45,7 @@
 //! headless CratonVM (loading them in non-headless mode would already
 //! throw `HeadlessException`, so a no-op clinit is strictly more useful
 //! than the status-quo throw). The `java/awt/Component.<clinit>` stub is
-//! gated behind `RUSTJVM_JEDIT_SHORTCIRCUIT=1` because `Component` is a
+//! gated behind `CRATONVM_JEDIT_SHORTCIRCUIT=1` because `Component` is a
 //! superclass of every Swing widget — silently no-oping its clinit could
 //! break a future non-jEdit Swing workload.
 //
@@ -53,9 +53,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_INSTALL: &str = "installer/Install";
 const CN_JEDIT: &str = "org/gjt/sp/jedit/jEdit";
@@ -106,12 +106,12 @@ fn awt_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_jedit_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_JEDIT_REAL=1, skip all short-circuits so
+    // Diagnostic gate: when CRATONVM_JEDIT_REAL=1, skip all short-circuits so
     // the real jEdit installer / editor entry classes execute under CratonVM.
     // Used to measure how far the real boot path gets without our shims
     // masking failures.
-    if std::env::var("RUSTJVM_JEDIT_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[jedit-shim] RUSTJVM_JEDIT_REAL=1 — skipping shim registration, running real jEdit");
+    if std::env::var("CRATONVM_JEDIT_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[jedit-shim] CRATONVM_JEDIT_REAL=1 — skipping shim registration, running real jEdit");
         return;
     }
     // installer.Install.main([Ljava/lang/String;)V — primary short-circuit.
@@ -154,9 +154,9 @@ pub fn register_jedit_stubs(registry: &mut NativeMethodRegistry) {
     // java.awt.Component.<clinit>()V — gated. Component is the superclass
     // of every Swing widget, so a global no-op clinit risks breaking
     // future non-jEdit Swing workloads. Only install when the operator
-    // explicitly opts in via `RUSTJVM_JEDIT_SHORTCIRCUIT=1`.
+    // explicitly opts in via `CRATONVM_JEDIT_SHORTCIRCUIT=1`.
     // ------------------------------------------------------------------
-    if std::env::var("RUSTJVM_JEDIT_SHORTCIRCUIT").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_JEDIT_SHORTCIRCUIT").as_deref() == Ok("1") {
         registry.register(CN_COMPONENT, "<clinit>", "()V", awt_clinit_noop);
     }
 }

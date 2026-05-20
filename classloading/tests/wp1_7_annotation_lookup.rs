@@ -9,12 +9,12 @@
 //! compiled `AnnotationProbe.class` with one class-level annotation, one
 //! method-level annotation (`m()`), and one field-level annotation (`f`).
 
-use rustjvm_classloading::annotations::{
+use cratonvm_classloading::annotations::{
     annotation_descriptor_to_class_name, annotation_type_matches,
     class_name_to_annotation_descriptor, field_annotations, method_annotations, AnnotationsView,
 };
-use rustjvm_reader::class_file::ClassFile;
-use rustjvm_reader::read_class;
+use cratonvm_reader::class_file::ClassFile;
+use cratonvm_reader::read_class;
 use std::path::PathBuf;
 
 fn load_probe_class(short_name: &str) -> Option<ClassFile> {
@@ -148,7 +148,7 @@ fn annotation_default_surfaces_through_view() {
     // Don't re-validate element_value shape here (reader/tests/wp1_7_attrs.rs
     // already covers that); just make sure the view exposes it.
     match default {
-        rustjvm_reader::attribute::ElementValue::Const { tag, .. } => {
+        cratonvm_reader::attribute::ElementValue::Const { tag, .. } => {
             assert_eq!(*tag, b's');
         }
         other => panic!("expected Const('s'), got {other:?}"),

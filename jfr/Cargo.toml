@@ -1,10 +1,11 @@
 [package]
-name = "rustjvm-jfr"
+name = "cratonvm-jfr"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Java Flight Recorder support for RustJVM"
+description = "Java Flight Recorder support for CratonVM"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true

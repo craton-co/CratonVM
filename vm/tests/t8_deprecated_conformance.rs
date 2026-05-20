@@ -1,18 +1,18 @@
 //! T8 — Deprecated API conformance test suite.
 //!
-//! Verifies that RustJVM correctly implements all deprecated JDK 25 APIs
+//! Verifies that CratonVM correctly implements all deprecated JDK 25 APIs
 //! per roadmap T8.1–T8.6. Each test exercises a specific sub-section.
 //!
-//!     cargo test -p rustjvm-vm --test t8_deprecated_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test t8_deprecated_conformance -- --nocapture
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 // ---------------------------------------------------------------------------
 // Helper: build a full registry with all natives (essential + deprecated)
 // ---------------------------------------------------------------------------
 fn full_registry() -> NativeMethodRegistry {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     r
 }
 
@@ -170,7 +170,7 @@ fn t8_2_6_class_new_instance() {
 /// reverse map.
 ///
 /// The full behavioural test runs under
-/// `C:/craton/rust-jvm/apps/bc_probe/BcProbe.java` (compiled into
+/// `C:/craton/cratonvm/apps/bc_probe/BcProbe.java` (compiled into
 /// `C:/craton/ejbca-test-run/classes/`); this unit test is a registration
 /// smoke check so the regression at least surfaces fast in CI.
 #[test]

@@ -1,24 +1,24 @@
 # Default owners for all files
-* @craton-co/rustjvm-maintainers
+* @craton-co/cratonvm-maintainers
 
 # Crate-specific ownership
-/reader/ @craton-co/rustjvm-maintainers
-/types/ @craton-co/rustjvm-maintainers
-/native-api/ @craton-co/rustjvm-maintainers
-/native-builtins/ @craton-co/rustjvm-maintainers
-/native-collections/ @craton-co/rustjvm-maintainers
-/native-io/ @craton-co/rustjvm-maintainers
-/jit-api/ @craton-co/rustjvm-maintainers
-/jit/ @craton-co/rustjvm-maintainers
-/classloading/ @craton-co/rustjvm-maintainers
-/gc/ @craton-co/rustjvm-maintainers
-/jfr/ @craton-co/rustjvm-maintainers
-/vm/ @craton-co/rustjvm-maintainers
-/vm-cli/ @craton-co/rustjvm-maintainers
+/reader/ @craton-co/cratonvm-maintainers
+/types/ @craton-co/cratonvm-maintainers
+/native-api/ @craton-co/cratonvm-maintainers
+/native-builtins/ @craton-co/cratonvm-maintainers
+/native-collections/ @craton-co/cratonvm-maintainers
+/native-io/ @craton-co/cratonvm-maintainers
+/jit-api/ @craton-co/cratonvm-maintainers
+/jit/ @craton-co/cratonvm-maintainers
+/classloading/ @craton-co/cratonvm-maintainers
+/gc/ @craton-co/cratonvm-maintainers
+/jfr/ @craton-co/cratonvm-maintainers
+/vm/ @craton-co/cratonvm-maintainers
+/vm-cli/ @craton-co/cratonvm-maintainers
 
 # Documentation
-/docs/ @craton-co/rustjvm-maintainers
+/docs/ @craton-co/cratonvm-maintainers
 
 # CI and infrastructure
-/.github/ @craton-co/rustjvm-maintainers
-/justfile @craton-co/rustjvm-maintainers
+/.github/ @craton-co/cratonvm-maintainers
+/justfile @craton-co/cratonvm-maintainers

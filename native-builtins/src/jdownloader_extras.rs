@@ -41,9 +41,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_JD_LAUNCHER: &str = "org/jdownloader/update/launcher/JDLauncher";
 const CN_JD_INIT: &str = "jd/Main";
@@ -51,11 +51,11 @@ const CN_JD_CONTROLLER: &str = "jd/controlling/JDController";
 
 /// Returns `true` when CratonVM should attempt the REAL JDownloader code
 /// path instead of the boot-test no-op shim. Diagnostic gate: set
-/// `RUSTJVM_JDOWNLOADER_REAL=1` to skip shim registration so the real
+/// `CRATONVM_JDOWNLOADER_REAL=1` to skip shim registration so the real
 /// bytecode `main` / `<clinit>` runs under CratonVM, and observe how far
 /// the partial bootstrap can drive AppWork's launcher.
 fn jdownloader_real_mode() -> bool {
-    std::env::var("RUSTJVM_JDOWNLOADER_REAL")
+    std::env::var("CRATONVM_JDOWNLOADER_REAL")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
@@ -85,7 +85,7 @@ fn jdownloader_clinit_noop(
 pub fn register_jdownloader_stubs(registry: &mut NativeMethodRegistry) {
     if jdownloader_real_mode() {
         tracing::warn!(
-            "[jdownloader-shim] RUSTJVM_JDOWNLOADER_REAL=1 — shim DISABLED, running real bytecode"
+            "[jdownloader-shim] CRATONVM_JDOWNLOADER_REAL=1 — shim DISABLED, running real bytecode"
         );
         return;
     }

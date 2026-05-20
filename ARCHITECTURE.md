@@ -1,31 +1,30 @@
 # Architecture
 
-This document describes the high-level architecture of RustJVM.
+This document describes the high-level architecture of CratonVM.
 If you want to contribute, this is the place to start.
 
 ## Crate Layout
 
 ```
-rustjvm/
-  reader/              rustjvm-reader              .class file parser
-  types/               rustjvm-types               Shared types (Value, ClassId, ObjectRef)
-  native-api/          rustjvm-native-api          NativeContext trait & FD table
-  native-builtins/     rustjvm-native-builtins     java.lang.* native methods
-  native-collections/  rustjvm-native-collections  java.util.* native methods
-  native-io/           rustjvm-native-io           java.io/nio native methods
-  native-sql/          rustjvm-native-sql          java.sql native methods
-  jit-api/             rustjvm-jit-api             JIT compiler API types
-  jit/                 rustjvm-jit                 x86-64 / AArch64 JIT compiler
-  classloading/        rustjvm-classloading        Class loading & bytecode verification
-  gc/                  rustjvm-gc                  Garbage collectors (semi-space, G1, ZGC)
-  jfr/                 rustjvm-jfr                 Java Flight Recorder
-  vm/                  rustjvm-vm                  VM runtime engine
-  vm-cli/              rustjvm-cli                 CLI entry point
+cratonvm/
+  reader/              cratonvm-reader              .class file parser
+  types/               cratonvm-types               Shared types (Value, ClassId, ObjectRef)
+  native-api/          cratonvm-native-api          NativeContext trait & FD table
+  native-builtins/     cratonvm-native-builtins     java.lang.* native methods
+  native-collections/  cratonvm-native-collections  java.util.* native methods
+  native-io/           cratonvm-native-io           java.io/nio native methods
+  jit-api/             cratonvm-jit-api             JIT compiler API types
+  jit/                 cratonvm-jit                 x86-64 / AArch64 JIT compiler
+  classloading/        cratonvm-classloading        Class loading & bytecode verification
+  gc/                  cratonvm-gc                  Garbage collectors (semi-space, G1, ZGC)
+  jfr/                 cratonvm-jfr                 Java Flight Recorder
+  vm/                  cratonvm-vm                  VM runtime engine
+  vm-cli/              cratonvm-cli                 CLI entry point
 ```
 
 **Dependency flow:**
 ```
-vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections, native-io, native-sql, jfr}
+vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections, native-io, jfr}
                  -> {reader, types, native-api, jit-api}
 ```
 
@@ -52,7 +51,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~323,000+ LoC across 14 crates). It contains six
+The VM is the core of the project (~323,000+ LoC across 16 crates). It contains six
 major subsystems (several now extracted into their own crates):
 
 ### Runtime (`vm/src/runtime/`)
@@ -72,7 +71,7 @@ The bytecode execution engine.
 ### Class Loading (`classloading/` crate)
 
 Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
-`rustjvm-classloading` crate.
+`cratonvm-classloading` crate.
 
 - **`class_manager.rs`** — Central class cache and loading coordinator.
 - **`loaders.rs`** — Bootstrap, extension, and application class loaders.
@@ -86,7 +85,7 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors (semi-space, G1, ZGC). Extracted into the `rustjvm-gc` crate.
+Garbage collectors (semi-space, G1, ZGC). Extracted into the `cratonvm-gc` crate.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.
@@ -106,8 +105,8 @@ Arrays use compact element sizes (1/2/4/8 bytes per element depending on type).
 
 ### JIT Compiler (`jit/` crate)
 
-Custom x86-64 / AArch64 JIT compiler (~7,200 LoC). Extracted into the `rustjvm-jit`
-crate, with shared API types in `rustjvm-jit-api`.
+Custom x86-64 / AArch64 JIT compiler (~7,200 LoC). Extracted into the `cratonvm-jit`
+crate, with shared API types in `cratonvm-jit-api`.
 
 - **`mod.rs`** — JIT infrastructure: compiled code cache, OSR entry points.
 - **`x64.rs`** — x86-64 machine code emitter with 26 optimization rounds.
@@ -121,17 +120,16 @@ Methods are compiled after 100 invocations (configurable). Two calling
 conventions: **pure** methods (direct call) and **context** methods
 (receive `SharedVm` pointer as hidden first argument).
 
-### Native Methods (`native-builtins/`, `native-collections/`, `native-io/`, `native-sql/` crates)
+### Native Methods (`native-builtins/`, `native-collections/`, `native-io/` crates)
 
 3,100+ synthetic implementations of Java standard library methods, split across
-four domain-specific crates. The `NativeContext` trait lives in `native-api/`.
+domain-specific crates. The `NativeContext` trait lives in `native-api/`.
 
 - **`native-builtins/`** — java.lang.* native methods.
 - **`native-collections/`** — java.util.* native methods.
 - **`native-io/`** — java.io/nio native methods.
-- **`native-sql/`** — java.sql native methods.
 
-Instead of loading `rt.jar`, RustJVM provides native Rust implementations
+Instead of loading `rt.jar`, CratonVM provides native Rust implementations
 of JDK classes. The `NativeContext` trait (in `native-api/`) provides a
 VM-agnostic interface for native methods to access the heap, class manager,
 and thread state.
@@ -199,4 +197,4 @@ Thin wrapper (~200 LoC) using `clap` for argument parsing. Constructs a
   the full VM pipeline.
 - **Java test classes** in `test_classes/` and `vm/tests/resources/` are
   compiled by `build.rs` if `javac` is available.
-- **CI** runs clippy, fmt, tests, 60% coverage floor, Miri, and cargo-audit.
+- **CI** runs clippy, fmt, tests, 65% coverage floor, Miri, and cargo-audit.

@@ -30,8 +30,8 @@ fn probe_dir() -> PathBuf {
     manifest.parent().unwrap().join("apps").join("string_decode_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -39,7 +39,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -50,7 +50,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn jdk_home() -> Option<PathBuf> {
-    for var in &["RUSTJVM_TEST_JDK", "JAVA_HOME"] {
+    for var in &["CRATONVM_TEST_JDK", "JAVA_HOME"] {
         if let Ok(j) = std::env::var(var) {
             let p = PathBuf::from(&j);
             if p.exists() {
@@ -84,7 +84,7 @@ fn run_probe(name: &str) -> Option<(String, String, std::process::ExitStatus)> {
         eprintln!("[wave2_string_decode] probe {name}.class unavailable; skipping");
         return None;
     }
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let jdk = jdk_home()?;
     let classes = probe_dir();
     let mut child = Command::new(&bin)

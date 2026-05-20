@@ -1,7 +1,7 @@
 {
   "$schema_version": 1,
   "generated_at": "2026-04-29T00:00:00Z",
-  "rustjvm_version": "unknown",
+  "cratonvm_version": "unknown",
   "wp": "WP8.11",
   "fixture": {
     "mode": "real",
@@ -43,7 +43,7 @@
   },
   "wp6_5_finish_session_102": {
     "summary": "WP6.5 finish landed — Provider.put / parseLegacyPut / getService natives populate a per-provider serviceMap so Cipher.getInstance(algo, providerName) and Signature.getInstance(algo, providerName) can resolve registered services. See native-builtins/src/jca/provider_chain.rs (parse_legacy_key, apply_legacy_put, ServiceMap, provider_put_native, provider_parse_legacy_put_native, provider_get_service_native, provider_service_get_class_name) + tests in vm/tests/wp6_5_finish_provider_chain_resolution.rs (4/4) and the new unit pins in jca::provider_chain::tests (12 added → 20/20 total).",
-    "scope_decision": "Full BC <clinit> integration end-to-end (loading bcprov-jdk18on.jar and exercising real BC AES-GCM through the chain) requires the BC jar at runtime, which the rust-jvm fixture deliberately doesn't ship as a build dependency. The mechanics of the chain (population by put/parseLegacyPut, resolution by getService, Service object construction via the session-101 <init> shim) are pinned at the unit level. Closure of the actual BC bytecode boot is tracked as WP6.5b — see known_blockers below.",
+    "scope_decision": "Full BC <clinit> integration end-to-end (loading bcprov-jdk18on.jar and exercising real BC AES-GCM through the chain) requires the BC jar at runtime, which the cratonvm fixture deliberately doesn't ship as a build dependency. The mechanics of the chain (population by put/parseLegacyPut, resolution by getService, Service object construction via the session-101 <init> shim) are pinned at the unit level. Closure of the actual BC bytecode boot is tracked as WP6.5b — see known_blockers below.",
     "next_failure_surface": "When BC's actual <clinit> runs against the populated serviceMap, the next surface is likely either (a) a class-loading gap in BC's reflective SPI instantiation pathway (`Class.forName(svc.getClassName()).newInstance()`), or (b) a real-bytecode interaction between Hashtable.put and our Provider.put native that the unit tests don't exercise (mock heap doesn't run inherited bytecode). Watch for NoClassDefFoundError on org.bouncycastle.* in the bcprobe stderr."
   },
   "expected_stderr_forbidden": [
@@ -68,7 +68,7 @@
     "notes": "Flip to this block once the EJBCA EAR deploys cleanly. Keep the original baseline in `history[]` for regression tracking."
   },
   "known_blockers": [
-    {"id": "WP8.10", "summary": "WildFly itself does not boot under rust-jvm yet."},
+    {"id": "WP8.10", "summary": "WildFly itself does not boot under cratonvm yet."},
     {"id": "WP6.5",  "summary": "BouncyCastle compatibility — Provider$Service.<init> NPE chain CLOSED in session 101 (constructor shim) AND Provider serviceMap population/resolution natives LANDED in session 102 (Provider.put / parseLegacyPut / getService + Provider$Service.getClassName, see native-builtins/src/jca/provider_chain.rs + vm/tests/wp6_5_finish_provider_chain_resolution.rs 4/4 + jca::provider_chain::tests 20/20). REMAINING (tracked as WP6.5b): full BC <clinit> end-to-end through the populated serviceMap requires loading the actual bcprov-jdk18on.jar at runtime — the chain mechanics are pinned, but exercising them through real BC bytecode is gated on classpath fixture work."},
     {"id": "WP6.5b", "summary": "BouncyCastle end-to-end smoke against the WP6.5-finish serviceMap. Stage bcprov-jdk18on.jar in apps/bcprobe, drive Security.addProvider(new BouncyCastleProvider()) → Cipher.getInstance(\"AES/GCM/NoPadding\", \"BC\") → encrypt/decrypt round-trip. Estimated 0.5-1d once the bcprov fixture is in place."},
     {"id": "WP1.6",  "summary": "java.lang.invoke complete — Hibernate proxies + Weld CDI exercise corners not yet probed."},

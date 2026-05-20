@@ -47,7 +47,7 @@
 //! 6. `X500Principal` round-trip works — required for every
 //!    `CertTools.getSubjectDN(cert)` call EJBCA makes.
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 /// 1. Provider chain — Hibernate's `BeanContainerInitiator` and
 /// Liquibase's `DatabaseFactory.findCorrectDatabaseImplementation` both
@@ -57,7 +57,7 @@ use rustjvm_native_api::NativeMethodRegistry;
 #[test]
 fn wp8_11_provider_chain_seed_has_jdk25_defaults() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     // Spot-check the four providers EJBCA queries by name during init.
     for cls in [
@@ -102,7 +102,7 @@ fn wp8_11_provider_chain_seed_has_jdk25_defaults() {
 #[test]
 fn wp8_11_file_channel_map0_registered_for_h2() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_io::register_io_natives(&mut r);
+    cratonvm_native_io::register_io_natives(&mut r);
 
     // JDK 25 dispatches via FileDispatcherImpl on Windows-style boot;
     // legacy FileChannelImpl path is the fallback.
@@ -137,7 +137,7 @@ fn wp8_11_file_channel_map0_registered_for_h2() {
 #[test]
 fn wp8_11_service_loader_iterator_registered_for_resteasy() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
+    cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
 
     assert!(
         r.find("java/util/ServiceLoader", "load", "(Ljava/lang/Class;)Ljava/util/ServiceLoader;")
@@ -159,7 +159,7 @@ fn wp8_11_service_loader_iterator_registered_for_resteasy() {
 #[test]
 fn wp8_11_proxy_natives_registered_for_hibernate_and_weld() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_reflect_proxy_natives(&mut r);
+    cratonvm_native_builtins::register_reflect_proxy_natives(&mut r);
 
     assert!(
         r.find(
@@ -192,7 +192,7 @@ fn wp8_11_proxy_natives_registered_for_hibernate_and_weld() {
 #[test]
 fn wp8_11_jca_keypair_signature_keyfactory_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     assert!(
         r.find(
@@ -231,7 +231,7 @@ fn wp8_11_jca_keypair_signature_keyfactory_registered() {
 #[test]
 fn wp8_11_x500_principal_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     assert!(
         r.find(
@@ -256,7 +256,7 @@ fn wp8_11_x500_principal_natives_registered() {
 /// `IOException("DER length encoding")` deep inside BC's `X509v3CertificateBuilder`.
 #[test]
 fn wp8_11_asn1_der_primitives_present() {
-    use rustjvm_native_builtins::jca::asn1;
+    use cratonvm_native_builtins::jca::asn1;
 
     // OID round-trip — used by every X.509 algorithm-identifier write.
     let der = asn1::encode_oid("1.2.840.113549.1.1.11").unwrap(); // sha256WithRSAEncryption
@@ -278,7 +278,7 @@ fn wp8_11_asn1_der_primitives_present() {
 /// hook. This costs ~1ns to call so we run it cold.
 #[test]
 fn wp8_11_proxy_instances_counter_reachable() {
-    let n = rustjvm_native_builtins::proxy_instances_created();
+    let n = cratonvm_native_builtins::proxy_instances_created();
     // The counter starts at zero in a fresh process and never decreases.
     // We can't assert == 0 because the test framework may have created
     // proxies in earlier suites running in the same harness; just touch

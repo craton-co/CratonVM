@@ -14,7 +14,7 @@ cat > "$FIX_DIR/hello.groovy" <<'GROOVY'
 println "GROOVY_SMOKE_OK"
 GROOVY
 
-SMOKE_TIMEOUT=120 smoke_run_rustjvm \
+SMOKE_TIMEOUT=120 smoke_run_cratonvm \
     --classpath "$GROOVY_JAR" \
     -- groovy.ui.GroovyMain "$FIX_DIR/hello.groovy"
 

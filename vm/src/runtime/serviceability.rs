@@ -191,7 +191,7 @@ pub struct JcmdProcessor {
 
 impl JcmdProcessor {
     pub fn new() -> Self {
-        let mut listener = AttachListener::new("/tmp/rustjvm_attach");
+        let mut listener = AttachListener::new("/tmp/cratonvm_attach");
         listener.start_listening();
 
         // Register all standard commands
@@ -202,7 +202,7 @@ impl JcmdProcessor {
 
     /// Create a JcmdProcessor backed by live VM state.
     pub fn new_with_vm_state(vm_state: Arc<dyn VmDiagnosticState>) -> Self {
-        let mut listener = AttachListener::new("/tmp/rustjvm_attach");
+        let mut listener = AttachListener::new("/tmp/cratonvm_attach");
         listener.start_listening();
         Self::register_live_commands(&mut listener, vm_state);
         Self { attach_listener: listener }
@@ -305,7 +305,7 @@ impl JcmdProcessor {
             vec![],
             Box::new(|_args| {
                 CommandResult::ok(
-                    "RustJVM 1.0.0 (JDK 25 compatible)".to_string(),
+                    "CratonVM 1.0.0 (JDK 25 compatible)".to_string(),
                     0,
                 )
             }),
@@ -350,8 +350,8 @@ impl JcmdProcessor {
             Box::new(|_args| {
                 let props = vec![
                     "java.version=25",
-                    "java.vendor=RustJVM",
-                    "java.home=/usr/lib/jvm/rustjvm",
+                    "java.vendor=CratonVM",
+                    "java.home=/usr/lib/jvm/cratonvm",
                     "os.name=Linux",
                     "os.arch=amd64",
                     "file.separator=/",
@@ -385,7 +385,7 @@ impl JcmdProcessor {
             vec![],
             Box::new(|_args| {
                 let info = vec![
-                    "RustJVM 1.0.0 (JDK 25 compatible)",
+                    "CratonVM 1.0.0 (JDK 25 compatible)",
                     "Runtime: Rust-based JVM implementation",
                     "Heap: 384 MB capacity, 155 MB used",
                     "GC: G1 Garbage Collector",
@@ -622,7 +622,7 @@ impl JcmdProcessor {
             CommandPermission::ReadOnly,
             vec![],
             Box::new(|_args| {
-                CommandResult::ok("RustJVM 1.0.0 (JDK 25 compatible)".to_string(), 0)
+                CommandResult::ok("CratonVM 1.0.0 (JDK 25 compatible)".to_string(), 0)
             }),
         ));
 
@@ -795,7 +795,7 @@ impl JstackProcessor {
     /// Generate a HotSpot-style thread dump string.
     pub fn generate_thread_dump(threads: &[ThreadSnapshot]) -> String {
         let mut output = String::new();
-        output.push_str("Full thread dump RustJVM 1.0.0 (JDK 25 compatible):\n\n");
+        output.push_str("Full thread dump CratonVM 1.0.0 (JDK 25 compatible):\n\n");
 
         for thread in threads {
             // Header line
@@ -1379,7 +1379,7 @@ impl HprofWriter {
         class_info: &HprofClassInfo,
         all_classes: &std::collections::HashMap<u32, HprofClassInfo>,
     ) {
-        use rustjvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
 
         buf.push(Self::GC_INSTANCE_DUMP);
         buf.extend_from_slice(&obj.object_id.to_be_bytes());
@@ -1497,7 +1497,7 @@ impl HprofWriter {
     /// Format: tag(1) + array_obj_id(8) + stack_serial(4) + num_elements(4)
     ///       + array_class_obj_id(8) + elements[num_elements × 8]
     pub fn write_gc_obj_array_dump(buf: &mut Vec<u8>, obj: &HprofObjectInfo) {
-        use rustjvm_gc::heap::{HEADER_SIZE, REF_ELEMENT_SIZE};
+        use cratonvm_gc::heap::{HEADER_SIZE, REF_ELEMENT_SIZE};
 
         buf.push(Self::GC_OBJ_ARRAY_DUMP);
         buf.extend_from_slice(&obj.object_id.to_be_bytes());
@@ -1527,7 +1527,7 @@ impl HprofWriter {
     /// Format: tag(1) + array_obj_id(8) + stack_serial(4) + num_elements(4)
     ///       + element_type(1) + elements[num_elements × element_size]
     pub fn write_gc_prim_array_dump(buf: &mut Vec<u8>, obj: &HprofObjectInfo) {
-        use rustjvm_gc::heap::HEADER_SIZE;
+        use cratonvm_gc::heap::HEADER_SIZE;
 
         buf.push(Self::GC_PRIM_ARRAY_DUMP);
         buf.extend_from_slice(&obj.object_id.to_be_bytes());
@@ -1841,13 +1841,13 @@ fn sample_class_histogram() -> Vec<ClassHistogramEntry> {
 //                            u64 tid + u16 name_len + name bytes + u8 state
 //
 // The protocol number in VERSION is 1. A connect-probe client sends VERSION
-// first; we reply with "RustJVM HSDB v1.0".
+// first; we reply with "CratonVM HSDB v1.0".
 
 /// HSDB protocol magic handshake ("HSDB" in ASCII).
 pub const HSDB_MAGIC: u32 = 0x4853_4442;
 
 /// HSDB protocol version string returned in response to VERSION command.
-pub const HSDB_VERSION_STRING: &str = "RustJVM HSDB v1.0";
+pub const HSDB_VERSION_STRING: &str = "CratonVM HSDB v1.0";
 
 /// HSDB command opcodes.
 #[repr(u8)]
@@ -2307,7 +2307,7 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("VM.version");
         assert!(result.success);
-        assert_eq!(result.output, "RustJVM 1.0.0 (JDK 25 compatible)");
+        assert_eq!(result.output, "CratonVM 1.0.0 (JDK 25 compatible)");
     }
 
     #[test]
@@ -2325,7 +2325,7 @@ mod tests {
         let result = jcmd.process_command("VM.system_properties");
         assert!(result.success);
         assert!(result.output.contains("java.version=25"));
-        assert!(result.output.contains("java.vendor=RustJVM"));
+        assert!(result.output.contains("java.vendor=CratonVM"));
     }
 
     #[test]
@@ -2341,7 +2341,7 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("VM.info");
         assert!(result.success);
-        assert!(result.output.contains("RustJVM"));
+        assert!(result.output.contains("CratonVM"));
         assert!(result.output.contains("Heap"));
     }
 
@@ -2585,7 +2585,7 @@ mod tests {
     #[test]
     fn test_jstack_empty_threads() {
         let dump = JstackProcessor::generate_thread_dump(&[]);
-        assert!(dump.contains("Full thread dump RustJVM"));
+        assert!(dump.contains("Full thread dump CratonVM"));
     }
 
     #[test]
@@ -3018,7 +3018,7 @@ mod tests {
 
     #[test]
     fn test_hprof_gc_prim_array_dump() {
-        use rustjvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
         // Simulate a small int[3] array in memory
         let array_length: u32 = 3;
         let elem_size = 4usize; // int = 4 bytes
@@ -3028,7 +3028,7 @@ mod tests {
 
         // Write header
         let header = ObjectHeader::new(
-            rustjvm_types::ClassId::new(99),
+            cratonvm_types::ClassId::new(99),
             ObjectKind::Array,
             ArrayElementType::Int,
             42,
@@ -3077,7 +3077,7 @@ mod tests {
 
     #[test]
     fn test_hprof_gc_obj_array_dump() {
-        use rustjvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType, REF_ELEMENT_SIZE};
+        use cratonvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, ArrayElementType, REF_ELEMENT_SIZE};
         // Simulate an Object[2] array
         let array_length: u32 = 2;
         let data_size = array_length as usize * REF_ELEMENT_SIZE;
@@ -3085,7 +3085,7 @@ mod tests {
         let mut mem = vec![0u8; total_size];
 
         let header = ObjectHeader::new(
-            rustjvm_types::ClassId::new(50),
+            cratonvm_types::ClassId::new(50),
             ObjectKind::Array,
             ArrayElementType::Reference,
             0,
@@ -3158,7 +3158,7 @@ mod tests {
 
     #[test]
     fn test_hprof_full_dump_with_class_and_objects() {
-        use rustjvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
 
         let classes = vec![HprofClassInfo {
             class_id: 1,
@@ -3174,7 +3174,7 @@ mod tests {
         let total_size = HEADER_SIZE + SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
         let header = ObjectHeader::new(
-            rustjvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(1),
             ObjectKind::Object,
             ArrayElementType::Boolean,
             123,
@@ -3287,7 +3287,7 @@ mod tests {
 
     #[test]
     fn test_hprof_full_dump_class_hierarchy() {
-        use rustjvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
 
         let classes = vec![
             HprofClassInfo {
@@ -3314,7 +3314,7 @@ mod tests {
         let total_size = HEADER_SIZE + 2 * SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
         let header = ObjectHeader::new(
-            rustjvm_types::ClassId::new(2),
+            cratonvm_types::ClassId::new(2),
             ObjectKind::Object,
             ArrayElementType::Boolean,
             0,
@@ -3389,7 +3389,7 @@ mod tests {
 
     #[test]
     fn test_hprof_instance_dump_reads_field_values() {
-        use rustjvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE, ObjectHeader, ObjectKind, ArrayElementType};
 
         let classes_map: std::collections::HashMap<u32, HprofClassInfo> = [(
             1u32,
@@ -3407,7 +3407,7 @@ mod tests {
         let total_size = HEADER_SIZE + SLOT_SIZE;
         let mut mem = vec![0u8; total_size];
         let header = ObjectHeader::new(
-            rustjvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(1),
             ObjectKind::Object,
             ArrayElementType::Boolean,
             0,
@@ -3629,7 +3629,7 @@ mod tests {
         let (status, payload) = hsdb_handle_request(cmd, &[], None);
         let wire = hsdb_encode_response(status, &payload);
 
-        // Expected wire bytes: [0][0][0][0][19][0][17]"RustJVM HSDB v1.0"
+        // Expected wire bytes: [0][0][0][0][19][0][17]"CratonVM HSDB v1.0"
         // status(1) + payload_len(4) + str_len(2) + 17 ascii bytes = 24 bytes
         assert_eq!(wire.len(), 1 + 4 + 2 + HSDB_VERSION_STRING.len());
         assert_eq!(wire[0], 0); // OK

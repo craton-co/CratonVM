@@ -36,9 +36,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_HELLO_WORLD_SERVER: &str = "io/grpc/examples/helloworld/HelloWorldServer";
 const CN_HELLO_WORLD_CLIENT: &str = "io/grpc/examples/helloworld/HelloWorldClient";
@@ -64,11 +64,11 @@ fn grpc_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_grpc_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_GRPC_REAL=1, skip the short-circuit
+    // Diagnostic gate: when CRATONVM_GRPC_REAL=1, skip the short-circuit
     // so the real HelloWorldServer/Client main runs (lets us measure
     // how far CratonVM gets through Netty's static-init chain).
-    if std::env::var("RUSTJVM_GRPC_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[grpc-shim] RUSTJVM_GRPC_REAL=1 — skipping shim registration, running real gRPC");
+    if std::env::var("CRATONVM_GRPC_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[grpc-shim] CRATONVM_GRPC_REAL=1 — skipping shim registration, running real gRPC");
         return;
     }
     // HelloWorldServer.main — canonical gRPC Java boot-test entry point.

@@ -9,7 +9,7 @@
 //!     `MyLm-init` is printed by the subclass ctor and the same
 //!     `getClass().getName()` returns `LmSubclass$MyLm`.
 //!
-//! The probe is run as a subprocess against the rustjvm CLI binary.
+//! The probe is run as a subprocess against the cratonvm CLI binary.
 //! Skips cleanly with a diagnostic if the binary, the compiled class
 //! files, or the real JDK are unavailable so CI doesn't hard-fail when
 //! the worktree hasn't been built or when JDK 25 isn't installed at the
@@ -24,8 +24,8 @@ fn probe_dir() -> PathBuf {
     manifest.parent().unwrap().join("apps").join("lm_subclass")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -33,7 +33,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -67,7 +67,7 @@ fn ensure_probe_compiled() -> bool {
 }
 
 fn jdk_home() -> Option<PathBuf> {
-    if let Ok(j) = std::env::var("RUSTJVM_TEST_JDK") {
+    if let Ok(j) = std::env::var("CRATONVM_TEST_JDK") {
         let p = PathBuf::from(&j);
         if p.exists() {
             return Some(p);
@@ -95,12 +95,12 @@ fn run_probe(extra_args: &[&str]) -> Option<(String, String, bool)> {
         eprintln!("[block_2b] LmSubclass.class unavailable; skipping");
         return None;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[block_2b] rustjvm binary not found; build with \
-                 `cargo build --release -p rustjvm-cli`"
+                "[block_2b] cratonvm binary not found; build with \
+                 `cargo build --release -p cratonvm-cli`"
             );
             return None;
         }
@@ -109,7 +109,7 @@ fn run_probe(extra_args: &[&str]) -> Option<(String, String, bool)> {
         Some(j) => j,
         None => {
             eprintln!(
-                "[block_2b] no JDK home (set RUSTJVM_TEST_JDK or JAVA_HOME); skipping"
+                "[block_2b] no JDK home (set CRATONVM_TEST_JDK or JAVA_HOME); skipping"
             );
             return None;
         }
@@ -129,7 +129,7 @@ fn run_probe(extra_args: &[&str]) -> Option<(String, String, bool)> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[block_2b] failed to spawn rustjvm: {e}");
+            eprintln!("[block_2b] failed to spawn cratonvm: {e}");
             return None;
         }
     };

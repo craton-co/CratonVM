@@ -16,11 +16,11 @@
 //! | `<clinit>`                      | targeted ban — A1.4 narrowing pending |
 //! | `<init>`                        | targeted ban — A1.4 narrowing pending |
 //! | interface default methods       | targeted ban — A1.4 (regalloc param mapping) |
-//! | `java/util/*`                   | conservative-only — overridable via `RUSTJVM_JIT_ALLOW_PACKAGES` |
-//! | `rustjvm/*` (legacy fixtures)   | conservative-only — overridable via `RUSTJVM_JIT_ALLOW_PACKAGES` |
+//! | `java/util/*`                   | conservative-only — overridable via `CRATONVM_JIT_ALLOW_PACKAGES` |
+//! | `cratonvm/*` (legacy fixtures)   | conservative-only — overridable via `CRATONVM_JIT_ALLOW_PACKAGES` |
 //! | `java/lang/*`                   | **REMOVED** (NEW-1.2 fixed JIT instanceof) |
-//! | `rustjvm/Tck*`                  | **REMOVED** (NEW-1.2 fixed JIT instanceof) |
-//! | `rustjvm/*FinalizerTest*`       | **REMOVED** (NEW-1.5 conservative JIT root scan) |
+//! | `cratonvm/Tck*`                  | **REMOVED** (NEW-1.2 fixed JIT instanceof) |
+//! | `cratonvm/*FinalizerTest*`       | **REMOVED** (NEW-1.5 conservative JIT root scan) |
 //! | unnamed-thread methods          | targeted — thread-local JIT state pre-init guard |
 //!
 //! ## NEW-1 progress (2026-04-14)
@@ -29,7 +29,7 @@
 //!   [`crate::jit::helpers::jit_instanceof`] / [`crate::jit::helpers::jit_checkcast`]
 //!   now load the target class on demand and walk the lambda-proxy and
 //!   synthetic-implements fallbacks, exactly like the interpreter. Result:
-//!   the `java/lang/*` and `rustjvm/Tck*` blanket bans are gone — they were
+//!   the `java/lang/*` and `cratonvm/Tck*` blanket bans are gone — they were
 //!   masking this bug, not protecting against an unrelated one.
 //! - **NEW-1.5 (conservative JIT root scan)** — closed. The GC root walker now
 //!   scans every active JIT spill area and pins any qword that lies inside the
@@ -37,15 +37,15 @@
 //!   precise JIT oop maps; it removes the `FinalizerTest` ban without risking
 //!   collected pointers in JIT frames. Precise oop maps remain a future item.
 //! - **NEW-1.3 / NEW-1.4** — `<init>`, `<clinit>`, interface defaults, and the
-//!   `java/util/*` / `rustjvm/*` package bans remain because they correspond to
+//!   `java/util/*` / `cratonvm/*` package bans remain because they correspond to
 //!   distinct, not-yet-fixed JIT correctness gaps (regalloc parameter mapping
 //!   for interface defaults; `<clinit>` re-entrancy during constant-pool
 //!   resolution; hash-table loop regalloc miscompile). They can be lifted
-//!   per-package via the `RUSTJVM_JIT_ALLOW_PACKAGES` environment variable for
+//!   per-package via the `CRATONVM_JIT_ALLOW_PACKAGES` environment variable for
 //!   development / benchmarking.
 //!
 //! When [`SkipPolicy::Aggressive`] is selected, the package bans
-//! (`java/util/`, `rustjvm/`) are lifted. This is intended for development to
+//! (`java/util/`, `cratonvm/`) are lifted. This is intended for development to
 //! surface latent JIT bugs and for benchmarking the maximal reachable code
 //! path. Production builds default to [`SkipPolicy::Conservative`].
 
@@ -56,8 +56,8 @@
 /// (`Aggressive`). Mapped from `VmConfig::jit_aggressive_compilation`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SkipPolicy {
-    /// Apply all blanket bans (`java/util/`, `java/lang/`, `rustjvm/Tck`,
-    /// `rustjvm/`). Default for production.
+    /// Apply all blanket bans (`java/util/`, `java/lang/`, `cratonvm/Tck`,
+    /// `cratonvm/`). Default for production.
     #[default]
     Conservative,
     /// Lift the blanket package bans; only keep targeted bans that correspond
@@ -88,7 +88,7 @@ pub enum SkipReason {
     /// TCK class — exercises the `instanceof` JIT bug. (A1.2)
     /// REMOVED in NEW-1.2 — never produced. Kept for ABI/parser compatibility.
     TckClass,
-    /// `rustjvm/*` test fixture — broad ban for legacy reasons. (A1.4)
+    /// `cratonvm/*` test fixture — broad ban for legacy reasons. (A1.4)
     RustJvmTestFixture,
     /// Finalizer-bearing class — JIT frames lacked GC stack maps. (A1.1)
     /// REMOVED in NEW-1.5 (conservative JIT root scan replaces precise maps).
@@ -258,8 +258,8 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
 /// failed at runtime" case.
 ///
 /// The `allow_packages` slice carries per-package overrides parsed from the
-/// `RUSTJVM_JIT_ALLOW_PACKAGES` environment variable (comma-separated package
-/// prefixes such as `java/util,rustjvm/`). Any conservative-only blanket ban
+/// `CRATONVM_JIT_ALLOW_PACKAGES` environment variable (comma-separated package
+/// prefixes such as `java/util,cratonvm/`). Any conservative-only blanket ban
 /// whose prefix appears in this list is suppressed. Callers that don't need
 /// the override should pass `&[]`.
 ///
@@ -343,7 +343,7 @@ fn should_skip_jit_internal(
     }
 
     // T1.1.g — the historical blanket bans for `java/util/*` and
-    // `rustjvm/*` have been narrowed to targeted per-method
+    // `cratonvm/*` have been narrowed to targeted per-method
     // exclusions covering only the specific reproducible miscompiles
     // that NEW-1.3/1.4 have not yet closed. Every other method in
     // those packages is now JIT-eligible under both policies, which
@@ -352,12 +352,12 @@ fn should_skip_jit_internal(
     //
     // The conservative policy still applies the targeted list; the
     // aggressive policy (set via `jit_aggressive_compilation` or
-    // `RUSTJVM_JIT_ALLOW_PACKAGES`) lifts even the targeted list so
+    // `CRATONVM_JIT_ALLOW_PACKAGES`) lifts even the targeted list so
     // developers can surface new miscompiles.
     if policy == SkipPolicy::Conservative {
         if is_known_miscompile(class_name, method_name)
             && !package_allowed("java/util/", allow_packages)
-            && !package_allowed("rustjvm/", allow_packages)
+            && !package_allowed("cratonvm/", allow_packages)
             && !package_allowed("java/lang/", allow_packages)
             && !package_allowed("java/security/", allow_packages)
         {
@@ -384,7 +384,7 @@ fn should_skip_jit_internal(
         // every BC client, but it is the only available mechanism that
         // gives BcProbe a green path to the first println without a
         // proper Windows-debugger backtrace of the failing JIT codegen.
-        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`.
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`.
         // Track for a real fix once the underlying allocate-then-putfield
         // miscompile is root-caused (see `is_known_miscompile` doc).
         if class_name.starts_with("org/bouncycastle/")
@@ -399,7 +399,7 @@ fn should_skip_jit_internal(
         // primitive / wrapper / collection / common-types groups, putting
         // ~100 entries into a fresh HashMap. With JIT enabled the run
         // segfaults right after the log4j-api StatusLogger warning; with
-        // `RUSTJVM_DISABLE_JIT=1` the segfault disappears (a different
+        // `CRATONVM_DISABLE_JIT=1` the segfault disappears (a different
         // downstream gap surfaces in PropertiesUtil.<clinit>). The frame
         // trace shows the very last frame popping is
         // `ClassUtils.registerCommonClasses` after a long sequence of
@@ -418,7 +418,7 @@ fn should_skip_jit_internal(
         // Like the BouncyCastle ban above, this is a coarse-grained
         // safety net so SportMe boot can progress past `ClassUtils.
         // <clinit>`. Lifted by
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/util/`. Track
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/util/`. Track
         // for a real fix once the underlying allocate-then-putfield
         // miscompile is root-caused.
         if class_name.starts_with("org/springframework/util/")
@@ -436,13 +436,13 @@ fn should_skip_jit_internal(
         // initialisation in SerializableTypeWrapper.<clinit> (16 segments
         // x 10 maps = 160 segment ctor entries). With JIT enabled the
         // SAM dispatch into the lambda body never returns; with
-        // `RUSTJVM_DISABLE_JIT=1` boot proceeds past the lambda (and a
+        // `CRATONVM_DISABLE_JIT=1` boot proceeds past the lambda (and a
         // different downstream gap surfaces in log4j PropertiesUtil
         // <clinit>). The same allocate-then-putfield-vs-OSR pattern that
         // bites Integer.valueOf / String.toLowerCase applies here:
         // ConcurrentReferenceHashMap.Reference / Node allocation paths
         // store fields immediately after `new`. Lifted by
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/core/`.
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/core/`.
         if class_name.starts_with("org/springframework/core/")
             && !package_allowed("org/springframework/core/", allow_packages)
         {
@@ -454,7 +454,7 @@ fn should_skip_jit_internal(
         // `admin-service` SIGSEGVs (rc=139) deep inside the property bind
         // path: `JavaBeanBinder$Bean.<init>` -> `BeanProperties.<init>`
         // -> `BeanProperties.addProperties` -> `getSorted`. The
-        // `RUSTJVM_FRAME_TRACE=1` capture shows the very last frames
+        // `CRATONVM_FRAME_TRACE=1` capture shows the very last frames
         // before the crash are `Banner$Mode.<clinit>` returning into
         // `Class$ReflectionData.<init>` then `Reflection.filter` —
         // i.e. the JavaBeanBinder is reflectively scanning a class for
@@ -471,11 +471,11 @@ fn should_skip_jit_internal(
         // reference; the SAM `BiPredicate.lambda$or$0` captured by the
         // tight `ConfigurationPropertyName.isAncestorOf` loop allocates
         // a fresh `lambda$or$0` capture object on each invocation. With
-        // `RUSTJVM_DISABLE_JIT=1` the SIGSEGV is replaced by a clean
+        // `CRATONVM_DISABLE_JIT=1` the SIGSEGV is replaced by a clean
         // `NullPointerException` in `PathMatchingResourcePatternResolver.
         // <clinit>` (a different downstream gap, not a JIT issue).
         //
-        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/
         // context/properties/bind/`. The narrow per-method entries
         // (SPB.3) for `SpringIterableConfigurationPropertySource` cover
         // the upstream cache-key build path; this blanket ban covers the
@@ -503,7 +503,7 @@ fn should_skip_jit_internal(
         // the JIT cannot promote any method on the bind path. The
         // SportMe agent's SPB.3 narrow pins remain in effect; this
         // broader ban is additive, not replacing those entries. Lifted
-        // by `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/context/`.
+        // by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/context/`.
         if class_name.starts_with("org/springframework/boot/context/")
             && !package_allowed(
                 "org/springframework/boot/context/",
@@ -520,7 +520,7 @@ fn should_skip_jit_internal(
         // ms-course-youtube admin-service frame trace. Those classes
         // execute exactly once at boot but do thousand+ allocations
         // each, putting them above the JIT thresholds. Lifted by
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/`. (This
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/`. (This
         // is the umbrella ban; subpackages like `boot/loader/` are
         // already past their ctor by the time the binder runs, so the
         // throughput loss is bounded to startup.)
@@ -541,7 +541,7 @@ fn should_skip_jit_internal(
         // / `LinkedHashMap` containers. The ban is pre-emptive: it
         // costs throughput on every Spring Cloud boot path but avoids
         // a second iteration if the next downstream gap surfaces there.
-        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/cloud/`.
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/cloud/`.
         if class_name.starts_with("org/springframework/cloud/")
             && !package_allowed("org/springframework/cloud/", allow_packages)
         {
@@ -558,7 +558,7 @@ fn should_skip_jit_internal(
         // is the same `LinkedBlockingQueue.offer` / `enqueue` pair
         // already covered by EXEC.1; this per-package ban covers the
         // Eureka-specific allocations. Lifted by
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=com/netflix/discovery/`.
+        // `CRATONVM_JIT_ALLOW_PACKAGES=com/netflix/discovery/`.
         if class_name.starts_with("com/netflix/discovery/")
             && !package_allowed("com/netflix/discovery/", allow_packages)
         {
@@ -570,7 +570,7 @@ fn should_skip_jit_internal(
         // builds a `feign.Feign$Builder` that allocates per-method
         // `MethodMetadata` and `RequestTemplate` objects, each storing
         // `template` / `headers` / `body` slots immediately after `new`.
-        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=feign/`.
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=feign/`.
         if class_name.starts_with("feign/")
             && !package_allowed("feign/", allow_packages)
         {
@@ -582,13 +582,13 @@ fn should_skip_jit_internal(
         // `apps/wildfly-39.0.1.Final` boot SIGSEGVs (rc=139) right after the
         // BigInteger ZERO/ONE/TWO post-clinit fixup and the two upstream
         // `<clinit>` swallows (`SimpleLoggerContext`, `ConcurrentClassLoader`)
-        // handled by parallel agents. With `RUSTJVM_DISABLE_JIT=1` the
+        // handled by parallel agents. With `CRATONVM_DISABLE_JIT=1` the
         // SIGSEGV is replaced by a clean `NoSuchMethodError` for
         // `Object.loadClass(...)` followed by an orderly `System.exit(1)`
         // — i.e. boot proceeds far past the JIT-on crash point. This
         // confirms a JIT miscompile, not a native gap.
         //
-        // The `RUSTJVM_DBG_JIT_DISPATCH=1` capture shows the very last
+        // The `CRATONVM_DBG_JIT_DISPATCH=1` capture shows the very last
         // dispatched method before the SIGSEGV is
         // `java/lang/Long.parseLong(Ljava/lang/String;I)J` invoked with a
         // corrupted reference arg0 (`0xfffd_026d_7b3e_5570` — the high
@@ -603,7 +603,7 @@ fn should_skip_jit_internal(
         // that allocate a fresh `ResourceLoaderSpec` / `Resource` per visit.
         // This matches the W2-CHM / RBC.1 / SPB.1-7 archetype.
         //
-        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/jboss/modules/`. The
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/modules/`. The
         // companion `org/jboss/as/` ban below covers the WildFly server
         // boot path that consumes the module graph.
         if class_name.starts_with("org/jboss/modules/")
@@ -624,7 +624,7 @@ fn should_skip_jit_internal(
         // of `-Djboss.*` properties via `Long.parseLong` /
         // `Boolean.parseBoolean`. Pre-emptive to avoid a second iteration
         // if the next gap surfaces in this layer. Lifted by
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/jboss/as/`.
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/`.
         if class_name.starts_with("org/jboss/as/")
             && !package_allowed("org/jboss/as/", allow_packages)
         {
@@ -633,7 +633,7 @@ fn should_skip_jit_internal(
 
         // SPB.8c (Session 113 r2) — companion blanket ban for the WildFly
         // security-manager package (`org/wildfly/`). The
-        // `RUSTJVM_DBG_JIT_DISPATCH=1` capture shows the very last JIT
+        // `CRATONVM_DBG_JIT_DISPATCH=1` capture shows the very last JIT
         // dispatches before the SIGSEGV are
         // `org/wildfly/security/manager/WildFlySecurityManager.<init>` and
         // `WildFlySecurityManager$2.run`, plus
@@ -648,7 +648,7 @@ fn should_skip_jit_internal(
         // `ReadPropertyAction.run` and miscompiles the field load that
         // returns the property value, OR-ing the high tag bits into the
         // String reference before it is forwarded to `Long.parseLong`.
-        // Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=org/wildfly/`.
+        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/wildfly/`.
         // WildFly 39 / session-15 progression: boot now advances past the
         // `org/wildfly/` ban and the same rc=139 SIGSEGV surfaces in the
         // JBoss MSC service container (`ServiceName.equals`) plus the
@@ -678,9 +678,9 @@ fn should_skip_jit_internal(
         // `expected object reference, got int(1)` while
         // `SpringApplication.prepareEnvironment` walks the
         // `SystemEnvironmentPropertyMapper.processElementValue` chain (frame
-        // depth 18). With `RUSTJVM_DISABLE_JIT=1` the same int(1) crash
+        // depth 18). With `CRATONVM_DISABLE_JIT=1` the same int(1) crash
         // surfaces — but the very last methods JIT-dispatched before the
-        // failure (`RUSTJVM_DBG_JIT_DISPATCH=1` capture) are an extremely
+        // failure (`CRATONVM_DBG_JIT_DISPATCH=1` capture) are an extremely
         // tight loop of `LogAdapter$Slf4jLog.<init>`,
         // `LogAdapter$Slf4jLocationAwareLog.<init>`,
         // `LoggerFactory.getLogger`, `LoggerFactory.getProvider`,
@@ -701,7 +701,7 @@ fn should_skip_jit_internal(
         // default backend), and `org/apache/commons/logging/` (the
         // bridge Spring uses internally). Banning all three together
         // covers the full per-class logger wiring path. Lifted by
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/slf4j/,ch/qos/logback/,
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/slf4j/,ch/qos/logback/,
         // org/apache/commons/logging/`.
         if class_name.starts_with("org/slf4j/")
             && !package_allowed("org/slf4j/", allow_packages)
@@ -726,7 +726,7 @@ fn should_skip_jit_internal(
         // "Unknown callback type" error is gone, but the run now SEGFAULTs
         // (rc=139) immediately after `<clinit>` of the generated proxy class
         // (`CglibProbe$Greeter$$EnhancerByCGLIB$$<hash>`). With
-        // `RUSTJVM_DISABLE_JIT=1` the SEGFAULT disappears and the run
+        // `CRATONVM_DISABLE_JIT=1` the SEGFAULT disappears and the run
         // surfaces a clean `IllegalStateException` (a separate downstream
         // gap in proxy-class wiring, not a JIT issue) — i.e. classic
         // JIT-miscompile signature.
@@ -749,7 +749,7 @@ fn should_skip_jit_internal(
         // miscompile poisons one of the stored references.
         //
         // Coarse-grained safety net so cglib_probe can progress past the
-        // SEGV. Lifted by `RUSTJVM_JIT_ALLOW_PACKAGES=net/sf/cglib/`.
+        // SEGV. Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=net/sf/cglib/`.
         // Track for a real fix once the underlying allocate-then-putfield
         // miscompile is root-caused.
         if class_name.starts_with("net/sf/cglib/")
@@ -783,7 +783,7 @@ fn should_skip_jit_internal(
         //     copies ~15 fields (factoryClass, factoryMethod, scope,
         //     ctorArgs, ...) via putfield — exact W2-CHM archetype.
         // Lifted per-package via
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/boot/loader/,
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/loader/,
         // org/springframework/web/reactive/,
         // org/springframework/boot/web/reactive/,
         // org/springframework/beans/factory/support/`.
@@ -828,7 +828,7 @@ fn should_skip_jit_internal(
         // Same W2-CHM / RBC.1 / SPB.1-9 archetype.
         //
         // Lifted per-package via
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=org/springframework/context/annotation/,
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/context/annotation/,
         // org/springframework/context/support/,
         // org/springframework/core/io/support/,
         // org/springframework/beans/factory/`.
@@ -852,7 +852,7 @@ fn should_skip_jit_internal(
         // introspects every bean class via `java/beans/Introspector`,
         // which delegates into `com/sun/beans/introspect/MethodInfo`
         // and `ClassInfo` and sorts methods/properties via
-        // comparators. Frame trace + RUSTJVM_DBG_JIT_DISPATCH=1 show
+        // comparators. Frame trace + CRATONVM_DBG_JIT_DISPATCH=1 show
         // the very last hot JIT-compiled callees on the crash path are
         // `MethodInfo$MethodOrder.compare`, `String.compareTo`,
         // `Method.getName`, `Arrays.hashCode`, `Method.toString`,
@@ -867,7 +867,7 @@ fn should_skip_jit_internal(
         //
         // Blanket-ban the JDK BeanInfo introspection package and the
         // `java/beans/` reflection-driven sort callers. Liftable via
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=com/sun/beans/,java/beans/`
+        // `CRATONVM_JIT_ALLOW_PACKAGES=com/sun/beans/,java/beans/`
         // when the underlying allocate-then-putfield miscompile is
         // root-caused.
         if class_name.starts_with("com/sun/beans/")
@@ -893,7 +893,7 @@ fn should_skip_jit_internal(
 
 /// T1.1.g — targeted list of (class, method) pairs known to miscompile
 /// under the current JIT. Every other method — including the vast
-/// majority of `java/util/*` and `rustjvm/*` methods — is now
+/// majority of `java/util/*` and `cratonvm/*` methods — is now
 /// JIT-eligible. Each entry here corresponds to a tracked NEW-1.3 or
 /// NEW-1.4 follow-up.
 fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
@@ -901,7 +901,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         (class_name, method_name),
         // NEW-1.3 — hash-table hot loop miscompile, surfaces under
         // HashMap.put/get/resize. These three are the observed
-        // failing methods from the `RUSTJVM_JIT_ALLOW_PACKAGES=java/util`
+        // failing methods from the `CRATONVM_JIT_ALLOW_PACKAGES=java/util`
         // test run; narrow other HashMap methods stay JIT-eligible.
         ("java/util/HashMap", "put")
         | ("java/util/HashMap", "get")
@@ -912,9 +912,9 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // to-back `HashMap.put` calls into a freshly allocated
         // `commonClassCache` map. With JIT enabled the run terminates
         // with rc=139 (STATUS_ACCESS_VIOLATION) right after the log4j-api
-        // StatusLogger "no log4j-core" warning; with `RUSTJVM_DISABLE_JIT=1`
+        // StatusLogger "no log4j-core" warning; with `CRATONVM_DISABLE_JIT=1`
         // the segfault disappears (and a different downstream gap surfaces
-        // in PropertiesUtil.<clinit>). The `RUSTJVM_FRAME_TRACE=1` capture
+        // in PropertiesUtil.<clinit>). The `CRATONVM_FRAME_TRACE=1` capture
         // shows the very last frame is `ClassUtils.registerCommonClasses`
         // popping after a long sequence of `put -> putVal -> newNode ->
         // Node.<init> -> afterNodeInsertion` cycles, with `putVal` and
@@ -953,12 +953,12 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/LinkedHashMap", "afterNodeRemoval")
         // NETTY.1 (current session) — JIT'd `java/util/Arrays.fill(byte[], byte)`
         // never returns. Reproducer: `apps/netty/NettyEchoTest` (rc=124 after
-        // 30s) hangs during the netty bootstrap cascade. `RUSTJVM_FRAME_TRACE=1`
+        // 30s) hangs during the netty bootstrap cascade. `CRATONVM_FRAME_TRACE=1`
         // capture shows the very last frame pushed before the freeze is
         // `java/util/Arrays.fill([BB)V`, called from
         // `io/netty/util/internal/StringUtil.<clinit>` at bci 121 to zero-fill
         // the 65536-element `HEX2B` byte array with -1. With
-        // `RUSTJVM_DISABLE_JIT=1` the hang vanishes and surfaces a clean
+        // `CRATONVM_DISABLE_JIT=1` the hang vanishes and surfaces a clean
         // `PlatformDependent0.<clinit>` NPE (a separate downstream gap, not a
         // JIT issue) — classic JIT-miscompile signature.
         //
@@ -978,7 +978,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
         // Tracked by the committed reproducer in
         // `vm/tests/tier1_tests.rs::t1_known_regalloc_miscompile_exc_hierarchy_reproducer`.
-        | ("rustjvm/TckLang", "exc_hierarchy")
+        | ("cratonvm/TckLang", "exc_hierarchy")
         // W2-CHM (Cluster B-CHM, Session 108) — JIT miscompiles
         // `Integer.valueOf(int)` / `Integer.<init>(int)` such that the
         // returned `Integer` has `value=0` instead of the requested int
@@ -1062,7 +1062,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // tasks that each call `AtomicInteger.incrementAndGet()` and
         // `CountDownLatch.countDown()`. With JIT enabled the run
         // segfaults (rc=139, STATUS_ACCESS_VIOLATION on Windows) right
-        // after `test1=42`; with `RUSTJVM_DISABLE_JIT=1` the entire test
+        // after `test1=42`; with `CRATONVM_DISABLE_JIT=1` the entire test
         // suite passes (test2/test3/test4 all OK).
         //
         // The j.u.c. concurrency primitives are dominated by the same
@@ -1158,14 +1158,14 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // SPB.3 (Session 111 r14) — `apps/SportMe-master`'s Spring Boot
         // bootstrap segfaults (rc=139) deep in Spring's
         // `ConfigurationPropertySources` cache-key build path. Per r13
-        // SportMe agent's `RUSTJVM_FRAME_TRACE=1` capture, the very last
+        // SportMe agent's `CRATONVM_FRAME_TRACE=1` capture, the very last
         // frames before the crash are
         // `MapPropertySource.getPropertyNames` -> `StringUtils.
         // toStringArray(Collection)` -> `HashMap.keysToArray(Object[])`
         // and `SpringIterableConfigurationPropertySource$CacheKey.<init>`
         // / `HashSet.<init>(Collection)` -> `HashMap$KeySet.iterator()`
         // -> `HashMap$KeyIterator.<init>` -> `HashMap$HashIterator.<init>`
-        // -> `HashMap$HashIterator.hasNext()`. With `RUSTJVM_DISABLE_JIT=1`
+        // -> `HashMap$HashIterator.hasNext()`. With `CRATONVM_DISABLE_JIT=1`
         // the seg vanishes (a clean SLF4J `NoSuchMethodError` surfaces
         // instead — the boot reaches a much later phase). The signature
         // matches W2-CHM / RBC.1 / SPB.1 / SPB.2: every one of these
@@ -1201,13 +1201,13 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // `com/sun/beans/introspect/MethodInfo$MethodOrder.compare` and
         // sorts properties using
         // `org/springframework/beans/ExtendedBeanInfo$PropertyDescriptorComparator.compare`.
-        // RUSTJVM_DBG_JIT_DISPATCH=1 (run 117a) shows the hot JIT-callees
+        // CRATONVM_DBG_JIT_DISPATCH=1 (run 117a) shows the hot JIT-callees
         // before the segfault are: `MethodInfo$MethodOrder.compare` (149x),
         // `PropertyDescriptorComparator.compare` (17x),
         // `Method.getName()` (360x), `String.compareTo(String)` (167x),
         // and `StringJoiner.<init>(LCS;LCS;LCS;)V` (24x), all called
         // from a JIT-compiled sort comparator chain. With
-        // `RUSTJVM_DISABLE_JIT=1` the run terminates earlier with the
+        // `CRATONVM_DISABLE_JIT=1` the run terminates earlier with the
         // parallel agent's `IllegalArgumentException: Attribute 'type'
         // not found` (rc=1, no segfault); with JIT enabled the
         // miscompiled comparator returns inconsistent ordering, causing
@@ -1219,7 +1219,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // Conservative skip: ban the two comparator entry points plus
         // `StringJoiner.<init>` (the immediate downstream alloc that
         // exhibits the bad pointer). Liftable via
-        // `RUSTJVM_JIT_ALLOW_PACKAGES=java/util/,com/sun/beans/`.
+        // `CRATONVM_JIT_ALLOW_PACKAGES=java/util/,com/sun/beans/`.
         | ("java/util/StringJoiner", "<init>")
         | ("com/sun/beans/introspect/MethodInfo$MethodOrder", "compare")
         | (
@@ -1311,7 +1311,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("org/springframework/util/ObjectUtils", "nullSafeHashCode")
         // SPB.4 cont. (Session 113 r1) — `apps/ms-course-youtube/admin-
         // service` segfaults inside the Spring Boot bind path. The
-        // `RUSTJVM_FRAME_TRACE=1` capture shows the most-called methods
+        // `CRATONVM_FRAME_TRACE=1` capture shows the most-called methods
         // (12k+ / 10k+ invocations) are
         // `java/io/BufferedInputStream.read` / `getBufIfOpen` — those
         // are well past the per-callee threshold (2000) and they
@@ -1393,7 +1393,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
             "org/springframework/boot/context/properties/source/ConfigurationPropertyName$ElementsParser",
             "add",
         )
-        // SPB.4 cont. (Session 113 r1) — `RUSTJVM_DBG_JIT_COMPILE` shows
+        // SPB.4 cont. (Session 113 r1) — `CRATONVM_DBG_JIT_COMPILE` shows
         // the LAST JIT compile before the SIGSEGV is `java/lang/Class.
         // copyFields([Ljava/lang/reflect/Field;)[Ljava/lang/reflect/Field;`,
         // which allocates a fresh Field[] and iterates the input,
@@ -1455,7 +1455,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // canonical pattern that miscompiles under the per-callee
         // threshold (W2-CHM / RBC.1 archetype, but applied to a virtual
         // dispatch site instead of an allocate-then-putfield). With
-        // `RUSTJVM_DISABLE_JIT=1` the bootstrap advances ~16 lines further
+        // `CRATONVM_DISABLE_JIT=1` the bootstrap advances ~16 lines further
         // and surfaces a clean Java-level
         // `MissingWebServerFactoryBeanException` — proof the segfault is
         // JIT-only. Skip-list the entire `Objects.hash` / `Arrays.hashCode`
@@ -1468,9 +1468,9 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/Objects", "hash")
         | ("java/util/Objects", "hashCode")
         // FELIX.1 (Session continues 2026-05-16) — `apps/felix-framework-7.0.5/
-        // bin/felix.jar` with `RUSTJVM_FELIX_REAL=1` SEGVs (rc=139) on
+        // bin/felix.jar` with `CRATONVM_FELIX_REAL=1` SEGVs (rc=139) on
         // Windows during the OSGi `FrameworkFactory` bootstrap. The
-        // `RUSTJVM_DBG_JIT_ENTRY=1` trace shows the last JIT entry before
+        // `CRATONVM_DBG_JIT_ENTRY=1` trace shows the last JIT entry before
         // the crash is
         // `java/lang/reflect/AccessibleObject.setAccessible([Ljava/lang/reflect/AccessibleObject;Z)V`,
         // invoked from the JIT-compiled
@@ -1484,14 +1484,14 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // per-subclass `setAccessible0` native). Under Felix's bulk
         // reflection setup the loop crosses the per-callee threshold and
         // the next field deref faults inside one of the polymorphic
-        // `setAccessible0` callees. With `RUSTJVM_DISABLE_JIT=1` the rc
+        // `setAccessible0` callees. With `CRATONVM_DISABLE_JIT=1` the rc
         // changes from 139 to 0 and a clean
         // `java.lang.NullPointerException: Cannot invoke length on null`
         // surfaces at `Main.java:287` (config-properties path; an unrelated
         // Felix data gap). Skip-list the bulk overload plus the
         // SecureAction lambda that drives it; the per-instance
         // `setAccessible(boolean)` overloads stay JIT-eligible. Liftable
-        // via `RUSTJVM_JIT_ALLOW_PACKAGES=java/lang/reflect/`.
+        // via `CRATONVM_JIT_ALLOW_PACKAGES=java/lang/reflect/`.
         | ("java/lang/reflect/AccessibleObject", "setAccessible")
         | (
             "org/apache/felix/framework/util/SecureAction",
@@ -1501,7 +1501,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
 }
 
 /// True if `prefix` matches any entry in `allow_packages`. An entry matches if
-/// `prefix` starts with the entry, so `RUSTJVM_JIT_ALLOW_PACKAGES=java/util`
+/// `prefix` starts with the entry, so `CRATONVM_JIT_ALLOW_PACKAGES=java/util`
 /// lifts the `java/util/` ban.
 fn package_allowed(prefix: &str, allow_packages: &[&str]) -> bool {
     allow_packages
@@ -1509,19 +1509,19 @@ fn package_allowed(prefix: &str, allow_packages: &[&str]) -> bool {
         .any(|entry| !entry.is_empty() && prefix.starts_with(entry))
 }
 
-/// Parse the `RUSTJVM_JIT_ALLOW_PACKAGES` env var into a list of allowed
+/// Parse the `CRATONVM_JIT_ALLOW_PACKAGES` env var into a list of allowed
 /// package prefixes. The result is cached at first call so repeated
 /// `should_skip_jit` invocations do not re-parse.
 ///
 /// The leading-edge use case is benchmarking: a developer running
-/// `RUSTJVM_JIT_ALLOW_PACKAGES=java/util cargo test` lifts the `java/util/`
+/// `CRATONVM_JIT_ALLOW_PACKAGES=java/util cargo test` lifts the `java/util/`
 /// ban for that one run without editing source.
 pub fn allow_packages_from_env() -> &'static [&'static str] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            std::env::var("RUSTJVM_JIT_ALLOW_PACKAGES")
+            std::env::var("CRATONVM_JIT_ALLOW_PACKAGES")
                 .ok()
                 .map(|s| {
                     // Leak each entry so the borrow lives for 'static. The
@@ -1643,11 +1643,11 @@ mod tests {
     }
 
     #[test]
-    fn rustjvm_targeted_miscompile_only_skipped() {
+    fn cratonvm_targeted_miscompile_only_skipped() {
         // T1.1.g — exc_hierarchy is the NEW-1.4 reproducer.
         assert_eq!(
             check(
-                "rustjvm/TckLang",
+                "cratonvm/TckLang",
                 "exc_hierarchy",
                 false,
                 true,
@@ -1658,30 +1658,30 @@ mod tests {
     }
 
     #[test]
-    fn rustjvm_unrelated_methods_now_jit_eligible_under_conservative() {
-        // T1.1.g — the blanket ban on `rustjvm/*` is gone.
+    fn cratonvm_unrelated_methods_now_jit_eligible_under_conservative() {
+        // T1.1.g — the blanket ban on `cratonvm/*` is gone.
         assert_eq!(
-            check("rustjvm/Other", "m", false, true, SkipPolicy::Conservative),
+            check("cratonvm/Other", "m", false, true, SkipPolicy::Conservative),
             None,
-            "unrelated rustjvm/* methods must be JIT-eligible after T1.1.g"
+            "unrelated cratonvm/* methods must be JIT-eligible after T1.1.g"
         );
         assert_eq!(
-            check("rustjvm/TckLang", "str_length", false, true, SkipPolicy::Conservative),
+            check("cratonvm/TckLang", "str_length", false, true, SkipPolicy::Conservative),
             None,
             "non-miscompile TckLang methods must be JIT-eligible"
         );
     }
 
     #[test]
-    fn rustjvm_targeted_overridable_via_allow_packages() {
+    fn cratonvm_targeted_overridable_via_allow_packages() {
         assert_eq!(
             check_with(
-                "rustjvm/TckLang",
+                "cratonvm/TckLang",
                 "exc_hierarchy",
                 false,
                 true,
                 SkipPolicy::Conservative,
-                &["rustjvm/"],
+                &["cratonvm/"],
             ),
             None
         );
@@ -1743,11 +1743,11 @@ mod tests {
         }
     }
 
-    /// NEW-1.2 CI gate: rustjvm/Tck* is no longer blanket-banned.
+    /// NEW-1.2 CI gate: cratonvm/Tck* is no longer blanket-banned.
     #[test]
     fn tck_class_is_jit_eligible_after_new_1_2() {
         assert_eq!(
-            check("rustjvm/TckLang", "test1", false, true, SkipPolicy::Aggressive),
+            check("cratonvm/TckLang", "test1", false, true, SkipPolicy::Aggressive),
             None,
             "TCK classes must be JIT-eligible after NEW-1.2 (instanceof fix); \
              package-prefix RustJvmTestFixture ban only applies under Conservative"
@@ -1893,7 +1893,7 @@ mod tests {
     // T1.1.38 — CI gate: blanket package bans must never return.
     //
     // These tests fail the build if anyone reintroduces a blanket
-    // `starts_with("java/util/")` or `starts_with("rustjvm/")` ban
+    // `starts_with("java/util/")` or `starts_with("cratonvm/")` ban
     // that covers methods NOT in the `is_known_miscompile` targeted
     // list. The targeted list is the only permitted mechanism for
     // banning specific methods going forward.
@@ -1933,20 +1933,20 @@ mod tests {
     }
 
     #[test]
-    fn tier1_skip_list_no_blanket_rustjvm_ban() {
-        // Representative rustjvm/* methods NOT in the targeted list.
+    fn tier1_skip_list_no_blanket_cratonvm_ban() {
+        // Representative cratonvm/* methods NOT in the targeted list.
         let methods = [
-            ("rustjvm/TckLang", "str_length"),
-            ("rustjvm/TckLang", "obj_hashCode_consistent"),
-            ("rustjvm/TckIo", "readLine"),
-            ("rustjvm/Other", "anything"),
+            ("cratonvm/TckLang", "str_length"),
+            ("cratonvm/TckLang", "obj_hashCode_consistent"),
+            ("cratonvm/TckIo", "readLine"),
+            ("cratonvm/Other", "anything"),
         ];
         for (cls, meth) in &methods {
             assert_eq!(
                 check(cls, meth, false, true, SkipPolicy::Conservative),
                 None,
                 "T1.1.38 GATE: {cls}.{meth} must be JIT-eligible — \
-                 a blanket rustjvm/* ban was reintroduced"
+                 a blanket cratonvm/* ban was reintroduced"
             );
         }
     }
@@ -1959,11 +1959,11 @@ mod tests {
         assert!(is_known_miscompile("java/util/HashMap", "put"));
         assert!(is_known_miscompile("java/util/HashMap", "get"));
         assert!(is_known_miscompile("java/util/HashMap", "resize"));
-        assert!(is_known_miscompile("rustjvm/TckLang", "exc_hierarchy"));
+        assert!(is_known_miscompile("cratonvm/TckLang", "exc_hierarchy"));
         // Everything else must NOT be in the list.
         assert!(!is_known_miscompile("java/util/HashMap", "size"));
         assert!(!is_known_miscompile("java/util/ArrayList", "add"));
-        assert!(!is_known_miscompile("rustjvm/TckLang", "str_length"));
+        assert!(!is_known_miscompile("cratonvm/TckLang", "str_length"));
         assert!(!is_known_miscompile("com/example/Foo", "bar"));
     }
 }

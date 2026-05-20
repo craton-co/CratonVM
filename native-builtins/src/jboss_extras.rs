@@ -45,7 +45,7 @@
 //! The shared `org/jboss/modules/Main` shim used by both WildFly and
 //! Keycloak-16 is registered by `wildfly_method_synth.rs`; this module
 //! only references `CN_MAIN` for the env-gated
-//! `RUSTJVM_WILDFLY_SHORTCIRCUIT` no-op fallback.
+//! `CRATONVM_WILDFLY_SHORTCIRCUIT` no-op fallback.
 //!
 //! # Safety / scope
 //!
@@ -61,9 +61,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 use crate::jboss_module_loader::build_local_module_loader;
 
@@ -289,7 +289,7 @@ fn native_module_get_dependencies(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -321,7 +321,7 @@ fn native_module_get_resource_loaders(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -357,7 +357,7 @@ fn native_module_spec_get_dependencies(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -372,7 +372,7 @@ fn native_module_spec_get_dependencies(
 // `loadClassFromCallerModuleLoader` static helpers, which would otherwise be
 // the next NPE source.
 //
-// As a final fallback, an env-gated short-circuit (`RUSTJVM_WILDFLY_SHORTCIRCUIT=1`)
+// As a final fallback, an env-gated short-circuit (`CRATONVM_WILDFLY_SHORTCIRCUIT=1`)
 // makes `Main.main` itself a no-op so WildFly exits with rc=0.
 // ---------------------------------------------------------------------------
 
@@ -425,11 +425,11 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     // to return non-null and for the reflective Module-graph walk to
     // terminate. They are NOT main()-short-circuit stubs.
     //
-    // Opt out via `RUSTJVM_SKIP_JBOSS_PLUMBING=1` if you suspect these
+    // Opt out via `CRATONVM_SKIP_JBOSS_PLUMBING=1` if you suspect these
     // overrides shadow real Java bytecode for a different app.
-    if std::env::var("RUSTJVM_SKIP_JBOSS_PLUMBING").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_SKIP_JBOSS_PLUMBING").as_deref() == Ok("1") {
         tracing::warn!(
-            "[jboss-extras] RUSTJVM_SKIP_JBOSS_PLUMBING=1 — skipping jboss-modules plumbing"
+            "[jboss-extras] CRATONVM_SKIP_JBOSS_PLUMBING=1 — skipping jboss-modules plumbing"
         );
         return;
     }
@@ -646,7 +646,7 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // ------------------------------------------------------------------
-    // Real-bytecode audit: `RUSTJVM_WILDFLY_SHORTCIRCUIT=1` previously
+    // Real-bytecode audit: `CRATONVM_WILDFLY_SHORTCIRCUIT=1` previously
     // replaced `org/jboss/modules/Main.main` with a no-op. That fake-out
     // has been REMOVED so real WildFly bytecode runs. Suppress an
     // unused-const warning since CN_MAIN is no longer referenced here.
@@ -661,7 +661,7 @@ mod tests {
     /// Smoke test: the registration function exists, takes a
     /// `&mut NativeMethodRegistry`, and registers a non-zero number of
     /// entries. We can't easily count entries through the public API
-    /// without depending on `rustjvm-native-api` internals, so the
+    /// without depending on `cratonvm-native-api` internals, so the
     /// assertion is just "doesn't panic".
     #[test]
     fn register_jboss_wildfly_stubs_is_callable() {

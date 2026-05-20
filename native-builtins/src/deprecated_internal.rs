@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -474,7 +474,7 @@ fn native_unsafe_define_class(
         _ => 0,
     };
 
-    let opts = rustjvm_native_api::DefineClassFull::default();
+    let opts = cratonvm_native_api::DefineClassFull::default();
     let effective_name = if class_name.is_empty() {
         // No name supplied — backend will pull `this_class` from the
         // class file. We pass empty so the name-match check is a
@@ -710,7 +710,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 // Return Reflection.class itself
                 let cid = ctx
                     .ensure_class_initialized("sun/reflect/Reflection")
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 let mirror = ctx.get_class_mirror(cid);
                 return Ok(Some(Value::Object(Some(mirror))));
             }
@@ -723,7 +723,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 let class_name = frame.class_name.replace('.', "/");
                 let cid = ctx
                     .ensure_class_initialized(&class_name)
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -747,7 +747,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 let class_name = frame.class_name.replace('.', "/");
                 let cid = ctx
                     .ensure_class_initialized(&class_name)
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -776,7 +776,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             if depth == 0 {
                 let cid = ctx
                     .ensure_class_initialized("jdk/internal/reflect/Reflection")
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 let mirror = ctx.get_class_mirror(cid);
                 return Ok(Some(Value::Object(Some(mirror))));
             }
@@ -790,7 +790,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 let class_name = frame.class_name.replace('.', "/");
                 let cid = ctx
                     .ensure_class_initialized(&class_name)
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -828,7 +828,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 let class_name = frame.class_name.replace('.', "/");
                 let cid = ctx
                     .ensure_class_initialized(&class_name)
-                    .unwrap_or(rustjvm_types::ClassId::new(0));
+                    .unwrap_or(cratonvm_types::ClassId::new(0));
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -915,7 +915,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // directory is missing.
     //
     // When invoked during DefaultBootModuleLoaderHolder.<clinit> under
-    // RustJVM, one of those File.exists() checks returns false for a
+    // CratonVM, one of those File.exists() checks returns false for a
     // directory that exists on disk (observed with Keycloak 16 where
     // modules/system/layers/keycloak is clearly present). The throw
     // unwinds into <clinit> of both DefaultBootModuleLoaderHolder and —
@@ -1472,7 +1472,7 @@ mod tests {
         let class_bytes: Vec<u8> = vec![
             0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x34,
         ];
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, class_bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
         for (i, b) in class_bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(*b as i32));
         }
@@ -1505,7 +1505,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let bad_bytes: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00];
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bad_bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bad_bytes.len());
         for (i, b) in bad_bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(*b as i32));
         }

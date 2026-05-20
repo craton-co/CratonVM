@@ -33,8 +33,8 @@ fn probe_dir() -> PathBuf {
         .join("collection_tostring_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -42,7 +42,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -73,7 +73,7 @@ fn ensure_probe_compiled() -> bool {
 }
 
 fn jdk_home() -> Option<PathBuf> {
-    for var in &["RUSTJVM_TEST_JDK", "JAVA_HOME"] {
+    for var in &["CRATONVM_TEST_JDK", "JAVA_HOME"] {
         if let Ok(j) = std::env::var(var) {
             let p = PathBuf::from(&j);
             if p.exists() {
@@ -94,12 +94,12 @@ fn collection_tostring_matches_hotspot_format() {
         eprintln!("[cluster_b_collection_tostring] CollProbe.class unavailable; skipping");
         return;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[cluster_b_collection_tostring] rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[cluster_b_collection_tostring] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return;
         }
@@ -109,7 +109,7 @@ fn collection_tostring_matches_hotspot_format() {
         None => {
             eprintln!(
                 "[cluster_b_collection_tostring] no JDK home \
-                 (set RUSTJVM_TEST_JDK or JAVA_HOME); skipping"
+                 (set CRATONVM_TEST_JDK or JAVA_HOME); skipping"
             );
             return;
         }
@@ -127,7 +127,7 @@ fn collection_tostring_matches_hotspot_format() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[cluster_b_collection_tostring] failed to spawn rustjvm: {e}");
+            eprintln!("[cluster_b_collection_tostring] failed to spawn cratonvm: {e}");
             return;
         }
     };

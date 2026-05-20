@@ -4,8 +4,8 @@
 // Usage on a CUDA-equipped machine:
 //   javac -d test_classes/gpu test_classes/gpu/Benchmark.java
 //                                      test_classes/gpu/EligibleVectorAdd.java
-//   rustjvm --classpath test_classes/gpu Benchmark 16777216           # CPU baseline
-//   rustjvm --gpu --classpath test_classes/gpu Benchmark 16777216     # GPU
+//   cratonvm --classpath test_classes/gpu Benchmark 16777216           # CPU baseline
+//   cratonvm --gpu --classpath test_classes/gpu Benchmark 16777216     # GPU
 //
 // Output format (machine-parseable):
 //   mode=cpu|gpu n=<N> elapsed_ns=<ELAPSED> out[0]=<V0> out[n-1]=<VN1>

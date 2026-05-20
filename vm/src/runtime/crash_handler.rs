@@ -109,7 +109,7 @@ impl<'a> CrashReport<'a> {
         let sig_hex = format!("{:#x}", self.info.signal);
 
         let _ = writeln!(buf,
-            "# A fatal error has been detected by the RustJVM Runtime Environment:");
+            "# A fatal error has been detected by the CratonVM Runtime Environment:");
         let _ = writeln!(buf, "#");
         if self.info.signal == 0 {
             // Rust panic
@@ -125,7 +125,7 @@ impl<'a> CrashReport<'a> {
                 self.info.signal_name, sig_hex, self.info.pid, self.info.tid);
         }
         let _ = writeln!(buf, "#");
-        let _ = writeln!(buf, "# JRE version: RustJVM 25.0");
+        let _ = writeln!(buf, "# JRE version: CratonVM 25.0");
 
         // Rust compiler version (baked in at build time).
         let _ = writeln!(buf, "# Rust version: {}", rust_version());
@@ -242,7 +242,7 @@ pub fn install_crash_handler() {
         match write_crash_report(&crash, &path) {
             Ok(()) => {
                 eprintln!("#");
-                eprintln!("# A fatal error has been detected by the RustJVM Runtime Environment:");
+                eprintln!("# A fatal error has been detected by the CratonVM Runtime Environment:");
                 eprintln!("#");
                 if let Some(ref msg) = crash.panic_message {
                     eprintln!("#  {}", msg);
@@ -253,7 +253,7 @@ pub fn install_crash_handler() {
                 eprintln!("#");
             }
             Err(e) => {
-                eprintln!("# RustJVM crash handler: failed to write {}: {}", filename, e);
+                eprintln!("# CratonVM crash handler: failed to write {}: {}", filename, e);
             }
         }
 
@@ -309,7 +309,7 @@ fn install_signal_handlers() {
 
         // Minimal stderr output (write(2) is async-signal-safe).
         let msg = format!(
-            "\n#\n# A fatal error has been detected by the RustJVM Runtime Environment:\n\
+            "\n#\n# A fatal error has been detected by the CratonVM Runtime Environment:\n\
              #  Signal {} ({})\n\
              #  Error report saved to: {}\n#\n",
             crash.signal_name, sig, filename
@@ -681,7 +681,7 @@ fn get_memory_info_windows() -> String {
 pub fn get_vm_state() -> String {
     // We do not have a static reference to the VM here (crash handlers
     // must be self-contained), so report what we can.
-    format!("RustJVM 25.0 (crash state — detailed VM info unavailable)")
+    format!("CratonVM 25.0 (crash state — detailed VM info unavailable)")
 }
 
 /// Get heap information if available.
@@ -747,7 +747,7 @@ mod tests {
     fn crash_report_contains_header() {
         let info = sample_crash_info();
         let report = generate_crash_report(&info);
-        assert!(report.contains("A fatal error has been detected by the RustJVM Runtime Environment"));
+        assert!(report.contains("A fatal error has been detected by the CratonVM Runtime Environment"));
         assert!(report.contains("SIGSEGV"));
         assert!(report.contains("pid=12345"));
         assert!(report.contains("tid=67890"));
@@ -785,7 +785,7 @@ mod tests {
     fn crash_report_contains_jre_version() {
         let info = sample_crash_info();
         let report = generate_crash_report(&info);
-        assert!(report.contains("JRE version: RustJVM 25.0"));
+        assert!(report.contains("JRE version: CratonVM 25.0"));
     }
 
     #[test]
@@ -849,7 +849,7 @@ mod tests {
     fn vm_state_non_empty() {
         let state = get_vm_state();
         assert!(!state.is_empty());
-        assert!(state.contains("RustJVM"));
+        assert!(state.contains("CratonVM"));
     }
 
     #[test]

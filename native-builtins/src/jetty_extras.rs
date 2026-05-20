@@ -8,7 +8,7 @@
 //! java.lang.NullPointerException: Cannot invoke getClasspath on null
 //!     at org.eclipse.jetty.start.Main.start(Main.java:397)
 //! Usage: java -jar $JETTY_HOME/start.jar [options] [properties] [configs]
-//! [rustjvm] System.exit(-9) called — process terminating
+//! [cratonvm] System.exit(-9) called — process terminating
 //! ```
 //!
 //! The launcher's `Main.start` dereferences `StartArgs.getClasspath()` which
@@ -43,16 +43,16 @@
 //! launcher package, so they cannot affect non-Jetty workloads. The
 //! `Main.main` short-circuit is the standard "boot-test rc=0" pattern used
 //! elsewhere in this crate (see `jboss_extras::native_void_noop` under the
-//! `RUSTJVM_WILDFLY_SHORTCIRCUIT` env gate).
+//! `CRATONVM_WILDFLY_SHORTCIRCUIT` env gate).
 //
 // TODO orchestrator: wire `jetty_extras::register_jetty_stubs(registry);`
 // into `register_essential_natives` in `lib.rs`.
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 #[allow(dead_code)]
 const CN_MAIN: &str = "org/eclipse/jetty/start/Main";
@@ -113,7 +113,7 @@ fn jetty_start_args_get_classpath(
 
 /// `org.eclipse.jetty.start.Main.processCommandLine([Ljava/lang/String;)Lorg/eclipse/jetty/start/StartArgs;`
 ///
-/// Real-mode (`RUSTJVM_JETTY_REAL=1`) intercept that returns a synthetic
+/// Real-mode (`CRATONVM_JETTY_REAL=1`) intercept that returns a synthetic
 /// non-null `StartArgs` instance. The real bytecode walks the argument
 /// list, parses `start.d/*.ini` files, and constructs a fully-populated
 /// `StartArgs` — but on CratonVM's partial bootstrap several internal

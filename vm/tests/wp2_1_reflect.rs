@@ -6,22 +6,22 @@
 //! contract for the `apps/reflect_probe/` Java fixture.
 //!
 //! End-to-end execution of the probe (12 assertions) goes through
-//! `apps/reflect_probe/ReflectProbe.java` driven by the `rustjvm` CLI binary.
+//! `apps/reflect_probe/ReflectProbe.java` driven by the `cratonvm` CLI binary.
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::native::register_builtins;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::native::register_builtins;
 
 #[test]
 fn wp2_1_natives_register_without_panic() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(r.len() > 100, "essential natives < 100, got {}", r.len());
 }
 
 #[test]
 fn try_set_accessible_registered_on_method_field_constructor_and_accessibleobject() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     for klass in &[
         "java/lang/reflect/Method",
         "java/lang/reflect/Field",
@@ -38,7 +38,7 @@ fn try_set_accessible_registered_on_method_field_constructor_and_accessibleobjec
 #[test]
 fn can_access_registered_on_method_field_constructor() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     for klass in &[
         "java/lang/reflect/Method",
         "java/lang/reflect/Field",
@@ -54,7 +54,7 @@ fn can_access_registered_on_method_field_constructor() {
 #[test]
 fn class_get_enclosing_class_typed_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find("java/lang/Class", "getEnclosingClass", "()Ljava/lang/Class;").is_some(),
         "Class.getEnclosingClass must be registered"
@@ -64,7 +64,7 @@ fn class_get_enclosing_class_typed_register() {
 #[test]
 fn class_get_enclosing_method_and_constructor_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -88,7 +88,7 @@ fn class_get_enclosing_method_and_constructor_register() {
 #[test]
 fn parameter_is_implicit_and_synthetic_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find("java/lang/reflect/Parameter", "isImplicit", "()Z").is_some(),
         "Parameter.isImplicit must be registered"
@@ -102,7 +102,7 @@ fn parameter_is_implicit_and_synthetic_register() {
 #[test]
 fn method_is_var_args_bridge_synthetic_default_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     let m = "java/lang/reflect/Method";
     for fn_name in &["isVarArgs", "isBridge", "isSynthetic", "isDefault"] {
         assert!(
@@ -115,7 +115,7 @@ fn method_is_var_args_bridge_synthetic_default_register() {
 #[test]
 fn class_get_record_components_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -156,7 +156,7 @@ fn record_component_natives_register() {
 #[test]
 fn class_get_permitted_subclasses_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -171,7 +171,7 @@ fn class_get_permitted_subclasses_register() {
 #[test]
 fn class_is_record_and_is_sealed_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find("java/lang/Class", "isRecord0", "()Z").is_some()
             || r.find("java/lang/Class", "isRecord", "()Z").is_some(),
@@ -184,7 +184,7 @@ fn class_is_record_and_is_sealed_register() {
 #[test]
 fn method_get_parameters_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Method",
@@ -217,7 +217,7 @@ fn method_get_parameters_register() {
 #[test]
 fn method_get_default_value_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Method",
@@ -232,7 +232,7 @@ fn method_get_default_value_register() {
 #[test]
 fn field_is_synthetic_and_enum_constant_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     let f = "java/lang/reflect/Field";
     assert!(
         r.find(f, "isSynthetic", "()Z").is_some(),
@@ -247,7 +247,7 @@ fn field_is_synthetic_and_enum_constant_register() {
 #[test]
 fn constructor_is_synthetic_var_args_get_name_register() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     let c = "java/lang/reflect/Constructor";
     assert!(
         r.find(c, "isSynthetic", "()Z").is_some(),

@@ -29,9 +29,9 @@
 //! - `Snapshot.capture()` records actual binding count
 //! - Forked tasks inherit scoped value bindings from parent
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{obj_arg, alloc_concurrent_synthetic};
 
@@ -174,9 +174,9 @@ fn native_sv_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => 0,
     };
     if bound == 0 {
-        return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-            rustjvm_types::error::VmError::Runtime(
-                rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::Runtime(
+                cratonvm_types::error::RuntimeError::NoSuchElementException {
                     message: "ScopedValue is not bound".to_string(),
                 },
             ),
@@ -228,17 +228,17 @@ fn native_sv_or_else_throw(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 );
                 match exc_result {
                     Ok(Some(Value::Object(Some(exc_obj)))) => {
-                        Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_obj))
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_obj))
                     }
                     _ => {
                         // Supplier returned null or failed — throw NoSuchElementException
-                        Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                        Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                             message: "ScopedValue is not bound".to_string(),
                         }.into())
                     }
                 }
             } else {
-                Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                     message: "ScopedValue is not bound".to_string(),
                 }.into())
             }
@@ -472,7 +472,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
     // Closed scope: throw IllegalStateException
     if state == STS_STATE_CLOSED {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "StructuredTaskScope is closed".to_string(),
         }.into());
     }
@@ -537,7 +537,7 @@ fn native_sts_fork(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Err(err) => {
             // Callable failed — extract exception ObjectRef if possible
             let exc_ref = match &err {
-                rustjvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) => {
                     Value::Object(Some(*obj))
                 }
                 _ => Value::Object(None),
@@ -590,7 +590,7 @@ fn native_sts_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = obj_arg(args, 0)?;
     let state = sts_get_int(ctx, this, STS_FIELD_STATE);
     if state == STS_STATE_CLOSED {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "StructuredTaskScope is closed".to_string(),
         }.into());
     }
@@ -620,7 +620,7 @@ fn native_sts_join_until(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         if now_millis > deadline_secs {
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "java.util.concurrent.TimeoutException: deadline exceeded".to_string(),
             }.into());
         }
@@ -644,7 +644,7 @@ fn native_sts_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if joined == 0 {
         let total = sts_get_int(ctx, this, STS_FIELD_TASK_COUNT);
         if total > 0 {
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "StructuredTaskScope has not been joined".to_string(),
             }.into());
         }
@@ -697,13 +697,13 @@ fn native_subtask_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Ok(Some(result))
         }
         SUBTASK_STATE_FAILED => {
-            Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "Subtask failed".to_string(),
             }.into())
         }
         _ => {
             // UNAVAILABLE
-            Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "Subtask has not completed".to_string(),
             }.into())
         }
@@ -731,7 +731,7 @@ fn native_subtask_exception(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => SUBTASK_STATE_UNAVAILABLE,
     };
     if state != SUBTASK_STATE_FAILED {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "Subtask did not fail".to_string(),
         }.into());
     }
@@ -784,7 +784,7 @@ fn native_sof_throw_if_failed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     match exc {
         Value::Object(Some(exc_ref)) => {
             // Re-throw the actual stored exception
-            Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref))
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref))
         }
         _ => Ok(None),
     }
@@ -811,16 +811,16 @@ fn native_sof_throw_if_failed_fn(
                 )?;
                 match mapped {
                     Some(Value::Object(Some(mapped_exc))) => {
-                        Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(mapped_exc))
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(mapped_exc))
                     }
                     _ => {
                         // Mapper returned null — throw the original
-                        Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref))
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref))
                     }
                 }
             } else {
                 // No function provided — throw original
-                Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref))
+                Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref))
             }
         }
         _ => Ok(None),
@@ -882,7 +882,7 @@ fn native_sos_result(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = obj_arg(args, 0)?;
     let state = sts_get_int(ctx, this, STS_FIELD_STATE);
     if state < STS_STATE_SHUTDOWN {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "scope has not been shut down".to_string(),
         }.into());
     }
@@ -891,7 +891,7 @@ fn native_sos_result(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     match result {
         Value::Object(None) => {
             // No result stored — all tasks failed
-            Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "no successful result".to_string(),
             }.into())
         }
@@ -907,7 +907,7 @@ fn native_sos_result_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = obj_arg(args, 0)?;
     let state = sts_get_int(ctx, this, STS_FIELD_STATE);
     if state < STS_STATE_SHUTDOWN {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "scope has not been shut down".to_string(),
         }.into());
     }
@@ -924,16 +924,16 @@ fn native_sos_result_fn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 )?;
                 match mapped {
                     Some(Value::Object(Some(exc))) => {
-                        Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
                     }
                     _ => {
-                        Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                        Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                             message: "no successful result".to_string(),
                         }.into())
                     }
                 }
             } else {
-                Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                     message: "no successful result".to_string(),
                 }.into())
             }
@@ -1162,7 +1162,7 @@ fn native_joiner_result(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             // If any failure occurred, throw the stored exception
             if let Value::Object(Some(exc)) = exception {
                 return Err(
-                    rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc),
+                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
                 );
             }
             if policy == JOINER_POLICY_AWAIT_ALL_SUCCESSFUL {
@@ -1180,10 +1180,10 @@ fn native_joiner_result(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 // No successful result — throw
                 if let Value::Object(Some(exc)) = exception {
                     return Err(
-                        rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc),
+                        cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
                     );
                 }
-                return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                     message: "no successful result".to_string(),
                 }
                 .into());
@@ -1341,7 +1341,7 @@ fn native_sts_open_owned(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 fn native_sts_join_owned(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if !check_scope_owner(this) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "join() called from non-owner thread".to_string(),
         }
         .into());
@@ -1354,7 +1354,7 @@ fn native_sts_join_owned(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn native_sts_close_owned(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if !check_scope_owner(this) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "close() called from non-owner thread".to_string(),
         }
         .into());
@@ -1443,7 +1443,7 @@ fn native_sts_fork_with_joiner(
 fn native_sts_close_joiner(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if !check_scope_owner(this) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "close() called from non-owner thread".to_string(),
         }
         .into());
@@ -1800,7 +1800,7 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod jdk25_concurrency_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // -----------------------------------------------------------------------
     // Constant sanity checks
@@ -3112,7 +3112,7 @@ mod jdk25_concurrency_tests {
         let result = native_sof_throw_if_failed(&mut ctx, &[Value::Object(Some(scope))]);
         assert!(result.is_err());
         // Should be ExceptionThrown, not InternalError
-        if let Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) = result {
+        if let Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) = result {
             assert_eq!(thrown, exc);
         } else {
             panic!("Expected ExceptionThrown");
@@ -3584,7 +3584,7 @@ mod jdk25_concurrency_tests {
 
         let result = native_joiner_result(&mut ctx, &[Value::Object(Some(joiner))]);
         assert!(result.is_err());
-        if let Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) = result {
+        if let Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown)) = result {
             assert_eq!(thrown, exc);
         } else {
             panic!("Expected ExceptionThrown");

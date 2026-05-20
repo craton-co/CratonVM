@@ -51,9 +51,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::jboss_msc::{global_container, Mode, ServiceName};
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -625,7 +625,7 @@ fn native_context_list_bindings(
     // NamingEnumeration backing.
     let binding_cid = match ctx.ensure_class_initialized("javax/naming/Binding") {
         Ok(cid) => cid,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let arr = ctx.new_ref_array(binding_cid, children.len());
     for (i, (k, v)) in children.iter().enumerate() {

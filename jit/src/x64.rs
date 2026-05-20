@@ -58,9 +58,9 @@
 //! ```
 
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
-use rustjvm_jit_api::JitRuntimeHelpers;
+use cratonvm_jit_api::JitRuntimeHelpers;
 #[allow(unused_imports)]
-use rustjvm_types::{ARRAY_LENGTH_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{ARRAY_LENGTH_OFFSET, HEADER_SIZE, SLOT_SIZE};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 
@@ -11517,7 +11517,7 @@ impl Compiler {
                                 .pic_slots_idx
                                 .get(&pc)
                                 .map(|&i| self.pic_slots[i].1);
-                            if std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
+                            if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
                                 eprintln!(
                                     "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
                                     pc, op, info_ref.invoke_kind, mic_ptr.is_some(), pic_ptr.is_some(),
@@ -12826,7 +12826,7 @@ pub fn compile(
     let num_hoists = hoist_info.len();
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
     let empty_non_escaping = std::collections::HashSet::new();
-    let non_escaping_for_sr = if std::env::var_os("RUSTJVM_DISABLE_SCALAR_REPLACEMENT").is_some() {
+    let non_escaping_for_sr = if std::env::var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some() {
         &empty_non_escaping
     } else {
         &non_escaping_new
@@ -12857,7 +12857,7 @@ pub fn compile(
     compiler.anewarray_info = anewarray_info;
     compiler.invoke_info = invoke_info;
     compiler.direct_calls = direct_calls;
-    if std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
+    if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!("[JIT_GEN_INSTALL] mic_slots count={} pcs={:?}",
             mic_slots.len(),
             mic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
@@ -12875,7 +12875,7 @@ pub fn compile(
     // so the CMP cascade falls straight through to the helper on
     // first invocation; once the runtime helper populates a slot,
     // subsequent dispatches take the inline fast path.
-    if std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
+    if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
         eprintln!("[JIT_GEN_INSTALL] pic_slots count={} pcs={:?}",
             pic_slots.len(),
             pic_slots.iter().map(|(pc, _)| pc).collect::<Vec<_>>(),
@@ -13113,7 +13113,7 @@ fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::JitInvokeInfo;
-    use rustjvm_types::{ObjectRef, Value};
+    use cratonvm_types::{ObjectRef, Value};
 
     // ---- Test stub helpers for getfield/putfield ----
     // These mirror the real helpers in vm/src/jit/helpers.rs but live in the
@@ -13126,7 +13126,7 @@ mod tests {
     /// # Safety
     /// `obj_ptr` must point to a valid, properly aligned `ObjectHeader` that has not been freed.
     unsafe fn read_num_slots(obj_ptr: *const u8) -> u32 {
-        let num_slots_offset = std::mem::offset_of!(rustjvm_types::ObjectHeader, num_slots);
+        let num_slots_offset = std::mem::offset_of!(cratonvm_types::ObjectHeader, num_slots);
         std::ptr::read(obj_ptr.add(num_slots_offset) as *const u32) // Cast: address arithmetic
     }
 
@@ -15713,8 +15713,8 @@ mod tests {
         .unwrap();
 
         // Create a heap object with one Int field
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(42));
@@ -15771,8 +15771,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
         heap.set_field(obj, 1, Value::Long(9_999_999_999i64));
@@ -15820,8 +15820,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Float(3.5f32));
@@ -15872,8 +15872,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(0));
@@ -15932,8 +15932,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
 
@@ -15984,8 +15984,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         let ref_obj = heap.alloc_object(ClassId::new(0), 1);
@@ -16063,8 +16063,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(10));
@@ -16121,8 +16121,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Double(2.719));
@@ -16171,8 +16171,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         let ref_obj = heap.alloc_object(ClassId::new(0), 1);
@@ -16230,8 +16230,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
 
@@ -16280,8 +16280,8 @@ mod tests {
         )
         .unwrap();
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 4);
         heap.set_field(obj, 0, Value::Int(100));
@@ -16462,9 +16462,9 @@ mod tests {
         assert!(is_jit_compatible(&code, code_len, "([[III)I"));
 
         // Create arrays: a = int[3][4], a[1] = {10, 20, 30, 40}
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::heap::ArrayElementType;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
 
         let heap = GenerationalHeap::new();
 
@@ -17038,9 +17038,9 @@ mod tests {
         // Bytecode: aload_0, iload_1, iaload, ireturn
         // needs_heap = false for inline array access, but we pass needs_heap=true
         // to test the bounds check with a real array.
-        use rustjvm_types::ClassId;
+        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use rustjvm_gc::heap::ArrayElementType;
+        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
         use std::sync::Arc;
 
@@ -17108,9 +17108,9 @@ mod tests {
     fn test_bounds_check_bastore_in_bounds() {
         // Method: void f(byte[] arr, int idx, int val) { arr[idx] = (byte)val; }
         // Bytecode: aload_0, iload_1, iload_2, bastore, return
-        use rustjvm_types::ClassId;
+        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use rustjvm_gc::heap::ArrayElementType;
+        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
         use std::sync::Arc;
 
@@ -17292,9 +17292,9 @@ mod tests {
         //  18: goto -14         ; back to 4
         //  21: iload_2          ; load s
         //  22: ireturn
-        use rustjvm_types::ClassId;
+        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use rustjvm_gc::heap::ArrayElementType;
+        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
         use std::sync::Arc;
 
@@ -18355,9 +18355,9 @@ mod tests {
             return;
         }
 
-        use rustjvm_types::ClassId;
+        use cratonvm_types::ClassId;
         use crate::config::VmConfig;
-        use rustjvm_gc::heap::ArrayElementType;
+        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
         use std::sync::Arc;
 
@@ -18805,8 +18805,8 @@ mod tests {
         );
         assert!(compiled.is_some(), "Constructor with putfield should be JIT-compilable");
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(0));
@@ -18864,8 +18864,8 @@ mod tests {
         );
         assert!(compiled.is_some(), "Multi-field constructor should compile");
 
-        use rustjvm_types::ClassId;
-        use rustjvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        use cratonvm_gc::gen_heap::GenerationalHeap;
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 3);
         heap.set_field(obj, 0, Value::Int(0));

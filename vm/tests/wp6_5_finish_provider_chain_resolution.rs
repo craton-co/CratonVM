@@ -13,7 +13,7 @@
 //! The full BouncyCastle integration end-to-end (loading the actual
 //! `bcprov-jdk18on.jar`, running its `<clinit>` to completion, then
 //! exercising `Cipher.getInstance(..., "BC")` against a real BC AES-GCM
-//! impl) requires the BC jar at runtime, which the rust-jvm fixture
+//! impl) requires the BC jar at runtime, which the cratonvm fixture
 //! deliberately doesn't ship as a build dependency. Instead, this
 //! integration suite proves the **mechanics** of the chain by treating
 //! `register_jca_natives` as the surface under test:
@@ -38,14 +38,14 @@
 //! - All four pins below pass.
 //! - Existing `wp6_5_provider_service_init` 4/4 tests still pass.
 //! - Existing `jca::provider_chain::tests` 20/20 still pass.
-//! - `cargo test --release -p rustjvm-vm --test wp2_5_proxy` still 21/21.
+//! - `cargo test --release -p cratonvm-vm --test wp2_5_proxy` still 21/21.
 //!
 //! Run:
 //! ```
-//! cargo test --release -p rustjvm-vm --test wp6_5_finish_provider_chain_resolution
+//! cargo test --release -p cratonvm-vm --test wp6_5_finish_provider_chain_resolution
 //! ```
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 /// Pin 1: `Provider.put`, `parseLegacyPut`, and `getService` are all
 /// registered with the right descriptors. These are the three shims
@@ -64,7 +64,7 @@ use rustjvm_native_api::NativeMethodRegistry;
 #[allow(non_snake_case)]
 fn wp6_5_finish_put_parseLegacyPut_getService_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     assert!(
         r.find(
@@ -120,7 +120,7 @@ fn wp6_5_finish_put_parseLegacyPut_getService_registered() {
 #[test]
 fn wp6_5_finish_construction_population_resolution_pins_coexist() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     // Construction (WP6.5 partial — session 101).
     let init_descriptor = "(Ljava/security/Provider;Ljava/lang/String;Ljava/lang/String;\
@@ -174,9 +174,9 @@ fn wp6_5_finish_construction_population_resolution_pins_coexist() {
 #[test]
 fn wp6_5_finish_double_registration_is_idempotent() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
     let first_count = r.len();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
     assert_eq!(
         r.len(),
         first_count,
@@ -226,7 +226,7 @@ fn wp6_5_finish_double_registration_is_idempotent() {
 #[test]
 fn wp6_5_finish_full_chain_natives_are_registered_together() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     // Step 1: addProvider — provider goes onto the chain.
     assert!(

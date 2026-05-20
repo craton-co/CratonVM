@@ -346,127 +346,127 @@ impl TckRegistry {
         self.register(TckTest::passing(
             "util.ArrayList.mutations",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListMutations",
+            "cratonvm/TckUtil.java#testArrayListMutations",
             vec!["arraylist", "set", "remove", "clear"],
         ));
         self.register(TckTest::passing(
             "util.ArrayList.iterator",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListIterator",
+            "cratonvm/TckUtil.java#testArrayListIterator",
             vec!["arraylist", "iterator"],
         ));
         self.register(TckTest::passing(
             "util.ArrayList.insert",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListInsert",
+            "cratonvm/TckUtil.java#testArrayListInsert",
             vec!["arraylist", "insert"],
         ));
         self.register(TckTest::passing(
             "util.ArrayList.lastIndexOf",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListLastIndexOf",
+            "cratonvm/TckUtil.java#testArrayListLastIndexOf",
             vec!["arraylist", "search"],
         ));
         self.register(TckTest::passing(
             "util.ArrayList.toArray",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListToArray",
+            "cratonvm/TckUtil.java#testArrayListToArray",
             vec!["arraylist", "toarray"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.mutations",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapMutations",
+            "cratonvm/TckUtil.java#testHashMapMutations",
             vec!["hashmap", "put", "remove", "clear"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.integerKeys",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapIntegerKeys",
+            "cratonvm/TckUtil.java#testHashMapIntegerKeys",
             vec!["hashmap", "boxing", "hashcode"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.getOrDefault",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapGetOrDefault",
+            "cratonvm/TckUtil.java#testHashMapGetOrDefault",
             vec!["hashmap", "default-methods"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.putIfAbsent",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapPutIfAbsent",
+            "cratonvm/TckUtil.java#testHashMapPutIfAbsent",
             vec!["hashmap", "default-methods"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.keySetIteration",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapKeySet",
+            "cratonvm/TckUtil.java#testHashMapKeySet",
             vec!["hashmap", "keyset", "iterator"],
         ));
         self.register(TckTest::passing(
             "util.HashSet.basic",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashSetBasic",
+            "cratonvm/TckUtil.java#testHashSetBasic",
             vec!["hashset", "collection", "set"],
         ));
         self.register(TckTest::passing(
             "util.HashSet.iterator",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashSetIterator",
+            "cratonvm/TckUtil.java#testHashSetIterator",
             vec!["hashset", "iterator"],
         ));
         self.register(TckTest::passing(
             "util.Arrays.copyOf",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArraysCopyOf",
+            "cratonvm/TckUtil.java#testArraysCopyOf",
             vec!["arrays", "copy"],
         ));
         self.register(TckTest::passing(
             "util.Arrays.asList",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArraysAsList",
+            "cratonvm/TckUtil.java#testArraysAsList",
             vec!["arrays", "list", "conversion"],
         ));
         self.register(TckTest::passing(
             "util.Collections.emptyList",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testCollectionsEmptyList",
+            "cratonvm/TckUtil.java#testCollectionsEmptyList",
             vec!["collections", "empty"],
         ));
         self.register(TckTest::passing(
             "util.Collections.singletonList",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testCollectionsSingletonList",
+            "cratonvm/TckUtil.java#testCollectionsSingletonList",
             vec!["collections", "singleton"],
         ));
         self.register(TckTest::passing(
             "util.Collections.reverse",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testCollectionsReverse",
+            "cratonvm/TckUtil.java#testCollectionsReverse",
             vec!["collections", "reverse"],
         ));
         self.register(TckTest::passing(
             "util.Optional.basic",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testOptionalBasic",
+            "cratonvm/TckUtil.java#testOptionalBasic",
             vec!["optional", "isPresent", "isEmpty"],
         ));
         self.register(TckTest::passing(
             "util.Optional.orElse",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testOptionalOrElse",
+            "cratonvm/TckUtil.java#testOptionalOrElse",
             vec!["optional", "orElse", "ofNullable"],
         ));
         self.register(TckTest::passing(
             "util.Integration.frequencyMap",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testFrequencyMap",
+            "cratonvm/TckUtil.java#testFrequencyMap",
             vec!["hashmap", "arraylist", "iterator", "integration"],
         ));
         self.register(TckTest::passing(
             "util.Integration.deduplication",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testDeduplication",
+            "cratonvm/TckUtil.java#testDeduplication",
             vec!["hashset", "arraylist", "iterator", "integration"],
         ));
 
@@ -474,307 +474,307 @@ impl TckRegistry {
         self.register(TckTest::passing(
             "util.ArrayList.basic",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListBasic",
+            "cratonvm/TckUtil.java#testArrayListBasic",
             vec!["arraylist", "add", "get", "size"],
         ));
         self.register(TckTest::passing(
             "util.ArrayList.grow",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListGrow",
+            "cratonvm/TckUtil.java#testArrayListGrow",
             vec!["arraylist", "capacity", "grow"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.basic",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapBasic",
+            "cratonvm/TckUtil.java#testHashMapBasic",
             vec!["hashmap", "put", "get", "size"],
         ));
         self.register(TckTest::passing(
             "util.Arrays.sortInt",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArraysSort",
+            "cratonvm/TckUtil.java#testArraysSort",
             vec!["arrays", "sort"],
         ));
         self.register(TckTest::passing(
             "util.ArrayList.capacity",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testArrayListCapacity",
+            "cratonvm/TckUtil.java#testArrayListCapacity",
             vec!["arraylist", "capacity"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.capacity",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapCapacity",
+            "cratonvm/TckUtil.java#testHashMapCapacity",
             vec!["hashmap", "capacity"],
         ));
         self.register(TckTest::passing(
             "util.HashMap.nullKey",
             TckCategory::Util,
-            "rustjvm/TckUtil.java#testHashMapNullKey",
+            "cratonvm/TckUtil.java#testHashMapNullKey",
             vec!["hashmap", "null"],
         ));
 
         // --- java.lang (S46 additions) ---
-        self.register(TckTest::passing("lang.Object.hashCodeConsistent", TckCategory::Lang, "rustjvm/TckLang.java#obj_hashCode_consistent", vec!["object", "hashcode"]));
-        self.register(TckTest::passing("lang.Object.equalsIdentity", TckCategory::Lang, "rustjvm/TckLang.java#obj_equals_identity", vec!["object", "equals"]));
-        self.register(TckTest::passing("lang.Object.equalsDifferent", TckCategory::Lang, "rustjvm/TckLang.java#obj_equals_different", vec!["object", "equals"]));
-        self.register(TckTest::passing("lang.Object.getClass", TckCategory::Lang, "rustjvm/TckLang.java#obj_getClass", vec!["object", "getclass"]));
-        self.register(TckTest::passing("lang.Object.toString", TckCategory::Lang, "rustjvm/TckLang.java#obj_toString", vec!["object", "tostring"]));
-        self.register(TckTest::passing("lang.String.length", TckCategory::Lang, "rustjvm/TckLang.java#str_length", vec!["string", "length"]));
-        self.register(TckTest::passing("lang.String.charAt", TckCategory::Lang, "rustjvm/TckLang.java#str_charAt", vec!["string", "charat"]));
-        self.register(TckTest::passing("lang.String.equals", TckCategory::Lang, "rustjvm/TckLang.java#str_equals", vec!["string", "equals"]));
-        self.register(TckTest::passing("lang.String.compareTo", TckCategory::Lang, "rustjvm/TckLang.java#str_compareTo", vec!["string", "compare"]));
-        self.register(TckTest::passing("lang.String.substring", TckCategory::Lang, "rustjvm/TckLang.java#str_substring", vec!["string", "substring"]));
-        self.register(TckTest::passing("lang.String.indexOf", TckCategory::Lang, "rustjvm/TckLang.java#str_indexOf", vec!["string", "indexof"]));
-        self.register(TckTest::passing("lang.String.contains", TckCategory::Lang, "rustjvm/TckLang.java#str_contains", vec!["string", "contains"]));
-        self.register(TckTest::passing("lang.String.isEmpty", TckCategory::Lang, "rustjvm/TckLang.java#str_isEmpty", vec!["string", "empty"]));
-        self.register(TckTest::passing("lang.String.trim", TckCategory::Lang, "rustjvm/TckLang.java#str_trim", vec!["string", "trim"]));
-        self.register(TckTest::passing("lang.String.toLowerCase", TckCategory::Lang, "rustjvm/TckLang.java#str_toLowerCase", vec!["string", "case"]));
-        self.register(TckTest::passing("lang.String.toUpperCase", TckCategory::Lang, "rustjvm/TckLang.java#str_toUpperCase", vec!["string", "case"]));
-        self.register(TckTest::passing("lang.String.startsEndsWith", TckCategory::Lang, "rustjvm/TckLang.java#str_startsEndsWith", vec!["string", "prefix", "suffix"]));
-        self.register(TckTest::passing("lang.String.replace", TckCategory::Lang, "rustjvm/TckLang.java#str_replace", vec!["string", "replace"]));
-        self.register(TckTest::passing("lang.String.toCharArray", TckCategory::Lang, "rustjvm/TckLang.java#str_toCharArray", vec!["string", "chararray"]));
-        self.register(TckTest::passing("lang.String.valueOfInt", TckCategory::Lang, "rustjvm/TckLang.java#str_valueOf_int", vec!["string", "valueof"]));
-        self.register(TckTest::passing("lang.String.valueOfBool", TckCategory::Lang, "rustjvm/TckLang.java#str_valueOf_bool", vec!["string", "valueof"]));
-        self.register(TckTest::passing("lang.String.concatOp", TckCategory::Lang, "rustjvm/TckLang.java#str_concat_op", vec!["string", "concat"]));
-        self.register(TckTest::passing("lang.Integer.parseInt", TckCategory::Lang, "rustjvm/TckLang.java#int_parseInt", vec!["integer", "parseint"]));
-        self.register(TckTest::passing("lang.Integer.parseIntNeg", TckCategory::Lang, "rustjvm/TckLang.java#int_parseInt_neg", vec!["integer", "parseint"]));
-        self.register(TckTest::passing("lang.Integer.valueOf", TckCategory::Lang, "rustjvm/TckLang.java#int_valueOf", vec!["integer", "valueof"]));
-        self.register(TckTest::passing("lang.Integer.toStringVal", TckCategory::Lang, "rustjvm/TckLang.java#int_toString", vec!["integer", "tostring"]));
-        self.register(TckTest::passing("lang.Integer.toHexString", TckCategory::Lang, "rustjvm/TckLang.java#int_toHexString", vec!["integer", "hex"]));
-        self.register(TckTest::passing("lang.Integer.constants", TckCategory::Lang, "rustjvm/TckLang.java#int_constants", vec!["integer", "constants"]));
-        self.register(TckTest::passing("lang.Integer.autoboxCache", TckCategory::Lang, "rustjvm/TckLang.java#int_autobox_cache", vec!["integer", "autobox", "cache"]));
-        self.register(TckTest::passing("lang.Integer.compareTo", TckCategory::Lang, "rustjvm/TckLang.java#int_compareTo", vec!["integer", "compare"]));
-        self.register(TckTest::passing("lang.Long.parseLong", TckCategory::Lang, "rustjvm/TckLang.java#long_parseLong", vec!["long", "parse"]));
-        self.register(TckTest::passing("lang.Long.valueOf", TckCategory::Lang, "rustjvm/TckLang.java#long_valueOf", vec!["long", "valueof"]));
-        self.register(TckTest::passing("lang.Long.toStringVal", TckCategory::Lang, "rustjvm/TckLang.java#long_toString", vec!["long", "tostring"]));
-        self.register(TckTest::passing("lang.Long.maxValue", TckCategory::Lang, "rustjvm/TckLang.java#long_maxValue", vec!["long", "constants"]));
-        self.register(TckTest::passing("lang.Double.parseDouble", TckCategory::Lang, "rustjvm/TckLang.java#double_parseDouble", vec!["double", "parse"]));
-        self.register(TckTest::passing("lang.Double.isNaN", TckCategory::Lang, "rustjvm/TckLang.java#double_isNaN", vec!["double", "nan"]));
-        self.register(TckTest::passing("lang.Double.isInfinite", TckCategory::Lang, "rustjvm/TckLang.java#double_isInfinite", vec!["double", "infinity"]));
-        self.register(TckTest::passing("lang.Double.toStringVal", TckCategory::Lang, "rustjvm/TckLang.java#double_toString", vec!["double", "tostring"]));
-        self.register(TckTest::passing("lang.Double.bitsRoundtrip", TckCategory::Lang, "rustjvm/TckLang.java#double_bits_roundtrip", vec!["double", "bits"]));
-        self.register(TckTest::passing("lang.Float.parseFloat", TckCategory::Lang, "rustjvm/TckLang.java#float_parseFloat", vec!["float", "parse"]));
-        self.register(TckTest::passing("lang.Float.isNaN", TckCategory::Lang, "rustjvm/TckLang.java#float_isNaN", vec!["float", "nan"]));
-        self.register(TckTest::passing("lang.Float.bitsRoundtrip", TckCategory::Lang, "rustjvm/TckLang.java#float_bits_roundtrip", vec!["float", "bits"]));
-        self.register(TckTest::passing("lang.Boolean.parseBoolean", TckCategory::Lang, "rustjvm/TckLang.java#bool_parseBoolean", vec!["boolean", "parse"]));
-        self.register(TckTest::passing("lang.Boolean.valueOf", TckCategory::Lang, "rustjvm/TckLang.java#bool_valueOf", vec!["boolean", "valueof"]));
-        self.register(TckTest::passing("lang.Boolean.toStringVal", TckCategory::Lang, "rustjvm/TckLang.java#bool_toString", vec!["boolean", "tostring"]));
-        self.register(TckTest::passing("lang.Byte.constants", TckCategory::Lang, "rustjvm/TckLang.java#byte_constants", vec!["byte", "constants"]));
-        self.register(TckTest::passing("lang.Byte.parseByte", TckCategory::Lang, "rustjvm/TckLang.java#byte_parseByte", vec!["byte", "parse"]));
-        self.register(TckTest::passing("lang.Short.constants", TckCategory::Lang, "rustjvm/TckLang.java#short_constants", vec!["short", "constants"]));
-        self.register(TckTest::passing("lang.Short.parseShort", TckCategory::Lang, "rustjvm/TckLang.java#short_parseShort", vec!["short", "parse"]));
-        self.register(TckTest::passing("lang.Character.isDigit", TckCategory::Lang, "rustjvm/TckLang.java#char_isDigit", vec!["character", "digit"]));
-        self.register(TckTest::passing("lang.Character.isLetter", TckCategory::Lang, "rustjvm/TckLang.java#char_isLetter", vec!["character", "letter"]));
-        self.register(TckTest::passing("lang.Character.case", TckCategory::Lang, "rustjvm/TckLang.java#char_case", vec!["character", "case"]));
-        self.register(TckTest::passing("lang.Character.convert", TckCategory::Lang, "rustjvm/TckLang.java#char_convert", vec!["character", "convert"]));
-        self.register(TckTest::passing("lang.Character.isWhitespace", TckCategory::Lang, "rustjvm/TckLang.java#char_isWhitespace", vec!["character", "whitespace"]));
-        self.register(TckTest::passing("lang.Math.abs", TckCategory::Lang, "rustjvm/TckLang.java#math_abs", vec!["math", "abs"]));
-        self.register(TckTest::passing("lang.Math.maxMin", TckCategory::Lang, "rustjvm/TckLang.java#math_maxMin", vec!["math", "max", "min"]));
-        self.register(TckTest::passing("lang.Math.sqrt", TckCategory::Lang, "rustjvm/TckLang.java#math_sqrt", vec!["math", "sqrt"]));
-        self.register(TckTest::passing("lang.Math.pow", TckCategory::Lang, "rustjvm/TckLang.java#math_pow", vec!["math", "pow"]));
-        self.register(TckTest::passing("lang.Math.floorCeil", TckCategory::Lang, "rustjvm/TckLang.java#math_floorCeil", vec!["math", "floor", "ceil"]));
-        self.register(TckTest::passing("lang.Math.round", TckCategory::Lang, "rustjvm/TckLang.java#math_round", vec!["math", "round"]));
-        self.register(TckTest::passing("lang.Math.constants", TckCategory::Lang, "rustjvm/TckLang.java#math_constants", vec!["math", "constants"]));
-        self.register(TckTest::passing("lang.Math.sinCos", TckCategory::Lang, "rustjvm/TckLang.java#math_sinCos", vec!["math", "trig"]));
-        self.register(TckTest::passing("lang.Math.logExp", TckCategory::Lang, "rustjvm/TckLang.java#math_logExp", vec!["math", "log", "exp"]));
-        self.register(TckTest::passing("lang.System.currentTimeMillis", TckCategory::Lang, "rustjvm/TckLang.java#sys_currentTimeMillis", vec!["system", "time"]));
-        self.register(TckTest::passing("lang.System.nanoTime", TckCategory::Lang, "rustjvm/TckLang.java#sys_nanoTime", vec!["system", "time"]));
-        self.register(TckTest::passing("lang.System.arraycopy", TckCategory::Lang, "rustjvm/TckLang.java#sys_arraycopy", vec!["system", "arraycopy"]));
-        self.register(TckTest::passing("lang.System.identityHashCode", TckCategory::Lang, "rustjvm/TckLang.java#sys_identityHashCode", vec!["system", "hashcode"]));
-        self.register(TckTest::passing("lang.StringBuilder.basic", TckCategory::Lang, "rustjvm/TckLang.java#sb_basic", vec!["stringbuilder", "basic"]));
-        self.register(TckTest::passing("lang.StringBuilder.appendInt", TckCategory::Lang, "rustjvm/TckLang.java#sb_appendInt", vec!["stringbuilder", "append"]));
-        self.register(TckTest::passing("lang.StringBuilder.chain", TckCategory::Lang, "rustjvm/TckLang.java#sb_chain", vec!["stringbuilder", "chain"]));
-        self.register(TckTest::passing("lang.StringBuilder.length", TckCategory::Lang, "rustjvm/TckLang.java#sb_length", vec!["stringbuilder", "length"]));
-        self.register(TckTest::passing("lang.StringBuilder.reverse", TckCategory::Lang, "rustjvm/TckLang.java#sb_reverse", vec!["stringbuilder", "reverse"]));
-        self.register(TckTest::passing("lang.StringBuilder.delete", TckCategory::Lang, "rustjvm/TckLang.java#sb_delete", vec!["stringbuilder", "delete"]));
-        self.register(TckTest::passing("lang.Exception.getMessage", TckCategory::Lang, "rustjvm/TckLang.java#exc_getMessage", vec!["exception", "message"]));
-        self.register(TckTest::passing("lang.Exception.getCause", TckCategory::Lang, "rustjvm/TckLang.java#exc_getCause", vec!["exception", "cause"]));
-        self.register(TckTest::passing("lang.Exception.tryCatch", TckCategory::Lang, "rustjvm/TckLang.java#exc_tryCatch", vec!["exception", "trycatch"]));
-        self.register(TckTest::passing("lang.Exception.hierarchy", TckCategory::Lang, "rustjvm/TckLang.java#exc_hierarchy", vec!["exception", "hierarchy"]));
-        self.register(TckTest::passing("lang.Exception.npeClass", TckCategory::Lang, "rustjvm/TckLang.java#exc_npe_class", vec!["exception", "npe"]));
-        self.register(TckTest::passing("lang.Exception.finally", TckCategory::Lang, "rustjvm/TckLang.java#exc_finally", vec!["exception", "finally"]));
-        self.register(TckTest::passing("lang.Class.getName", TckCategory::Lang, "rustjvm/TckLang.java#cls_getName", vec!["class", "name"]));
-        self.register(TckTest::passing("lang.Class.isInterface", TckCategory::Lang, "rustjvm/TckLang.java#cls_isInterface", vec!["class", "interface"]));
-        self.register(TckTest::passing("lang.Class.isPrimitive", TckCategory::Lang, "rustjvm/TckLang.java#cls_isPrimitive", vec!["class", "primitive"]));
-        self.register(TckTest::passing("lang.Class.isArray", TckCategory::Lang, "rustjvm/TckLang.java#cls_isArray", vec!["class", "array"]));
-        self.register(TckTest::passing("lang.Class.getSuperclass", TckCategory::Lang, "rustjvm/TckLang.java#cls_getSuperclass", vec!["class", "superclass"]));
-        self.register(TckTest::passing("lang.Runtime.availableProcessors", TckCategory::Lang, "rustjvm/TckLang.java#rt_availableProcessors", vec!["runtime", "processors"]));
-        self.register(TckTest::passing("lang.Runtime.memory", TckCategory::Lang, "rustjvm/TckLang.java#rt_memory", vec!["runtime", "memory"]));
-        self.register(TckTest::passing("lang.Thread.currentThread", TckCategory::Lang, "rustjvm/TckLang.java#thread_currentThread", vec!["thread", "current"]));
-        self.register(TckTest::passing("lang.Thread.isAlive", TckCategory::Lang, "rustjvm/TckLang.java#thread_isAlive", vec!["thread", "alive"]));
-        self.register(TckTest::passing("lang.Cast.intToLong", TckCategory::Lang, "rustjvm/TckLang.java#cast_int_to_long", vec!["cast", "widening"]));
-        self.register(TckTest::passing("lang.Cast.longToInt", TckCategory::Lang, "rustjvm/TckLang.java#cast_long_to_int", vec!["cast", "narrowing"]));
-        self.register(TckTest::passing("lang.Cast.intToFloat", TckCategory::Lang, "rustjvm/TckLang.java#cast_int_to_float", vec!["cast", "float"]));
-        self.register(TckTest::passing("lang.Cast.doubleToInt", TckCategory::Lang, "rustjvm/TckLang.java#cast_double_to_int", vec!["cast", "truncation"]));
-        self.register(TckTest::passing("lang.Cast.charToInt", TckCategory::Lang, "rustjvm/TckLang.java#cast_char_to_int", vec!["cast", "char"]));
-        self.register(TckTest::passing("lang.Autobox.int", TckCategory::Lang, "rustjvm/TckLang.java#autobox_int", vec!["autobox", "integer"]));
-        self.register(TckTest::passing("lang.Autobox.double", TckCategory::Lang, "rustjvm/TckLang.java#autobox_double", vec!["autobox", "double"]));
-        self.register(TckTest::passing("lang.Autobox.boolean", TckCategory::Lang, "rustjvm/TckLang.java#autobox_boolean", vec!["autobox", "boolean"]));
+        self.register(TckTest::passing("lang.Object.hashCodeConsistent", TckCategory::Lang, "cratonvm/TckLang.java#obj_hashCode_consistent", vec!["object", "hashcode"]));
+        self.register(TckTest::passing("lang.Object.equalsIdentity", TckCategory::Lang, "cratonvm/TckLang.java#obj_equals_identity", vec!["object", "equals"]));
+        self.register(TckTest::passing("lang.Object.equalsDifferent", TckCategory::Lang, "cratonvm/TckLang.java#obj_equals_different", vec!["object", "equals"]));
+        self.register(TckTest::passing("lang.Object.getClass", TckCategory::Lang, "cratonvm/TckLang.java#obj_getClass", vec!["object", "getclass"]));
+        self.register(TckTest::passing("lang.Object.toString", TckCategory::Lang, "cratonvm/TckLang.java#obj_toString", vec!["object", "tostring"]));
+        self.register(TckTest::passing("lang.String.length", TckCategory::Lang, "cratonvm/TckLang.java#str_length", vec!["string", "length"]));
+        self.register(TckTest::passing("lang.String.charAt", TckCategory::Lang, "cratonvm/TckLang.java#str_charAt", vec!["string", "charat"]));
+        self.register(TckTest::passing("lang.String.equals", TckCategory::Lang, "cratonvm/TckLang.java#str_equals", vec!["string", "equals"]));
+        self.register(TckTest::passing("lang.String.compareTo", TckCategory::Lang, "cratonvm/TckLang.java#str_compareTo", vec!["string", "compare"]));
+        self.register(TckTest::passing("lang.String.substring", TckCategory::Lang, "cratonvm/TckLang.java#str_substring", vec!["string", "substring"]));
+        self.register(TckTest::passing("lang.String.indexOf", TckCategory::Lang, "cratonvm/TckLang.java#str_indexOf", vec!["string", "indexof"]));
+        self.register(TckTest::passing("lang.String.contains", TckCategory::Lang, "cratonvm/TckLang.java#str_contains", vec!["string", "contains"]));
+        self.register(TckTest::passing("lang.String.isEmpty", TckCategory::Lang, "cratonvm/TckLang.java#str_isEmpty", vec!["string", "empty"]));
+        self.register(TckTest::passing("lang.String.trim", TckCategory::Lang, "cratonvm/TckLang.java#str_trim", vec!["string", "trim"]));
+        self.register(TckTest::passing("lang.String.toLowerCase", TckCategory::Lang, "cratonvm/TckLang.java#str_toLowerCase", vec!["string", "case"]));
+        self.register(TckTest::passing("lang.String.toUpperCase", TckCategory::Lang, "cratonvm/TckLang.java#str_toUpperCase", vec!["string", "case"]));
+        self.register(TckTest::passing("lang.String.startsEndsWith", TckCategory::Lang, "cratonvm/TckLang.java#str_startsEndsWith", vec!["string", "prefix", "suffix"]));
+        self.register(TckTest::passing("lang.String.replace", TckCategory::Lang, "cratonvm/TckLang.java#str_replace", vec!["string", "replace"]));
+        self.register(TckTest::passing("lang.String.toCharArray", TckCategory::Lang, "cratonvm/TckLang.java#str_toCharArray", vec!["string", "chararray"]));
+        self.register(TckTest::passing("lang.String.valueOfInt", TckCategory::Lang, "cratonvm/TckLang.java#str_valueOf_int", vec!["string", "valueof"]));
+        self.register(TckTest::passing("lang.String.valueOfBool", TckCategory::Lang, "cratonvm/TckLang.java#str_valueOf_bool", vec!["string", "valueof"]));
+        self.register(TckTest::passing("lang.String.concatOp", TckCategory::Lang, "cratonvm/TckLang.java#str_concat_op", vec!["string", "concat"]));
+        self.register(TckTest::passing("lang.Integer.parseInt", TckCategory::Lang, "cratonvm/TckLang.java#int_parseInt", vec!["integer", "parseint"]));
+        self.register(TckTest::passing("lang.Integer.parseIntNeg", TckCategory::Lang, "cratonvm/TckLang.java#int_parseInt_neg", vec!["integer", "parseint"]));
+        self.register(TckTest::passing("lang.Integer.valueOf", TckCategory::Lang, "cratonvm/TckLang.java#int_valueOf", vec!["integer", "valueof"]));
+        self.register(TckTest::passing("lang.Integer.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#int_toString", vec!["integer", "tostring"]));
+        self.register(TckTest::passing("lang.Integer.toHexString", TckCategory::Lang, "cratonvm/TckLang.java#int_toHexString", vec!["integer", "hex"]));
+        self.register(TckTest::passing("lang.Integer.constants", TckCategory::Lang, "cratonvm/TckLang.java#int_constants", vec!["integer", "constants"]));
+        self.register(TckTest::passing("lang.Integer.autoboxCache", TckCategory::Lang, "cratonvm/TckLang.java#int_autobox_cache", vec!["integer", "autobox", "cache"]));
+        self.register(TckTest::passing("lang.Integer.compareTo", TckCategory::Lang, "cratonvm/TckLang.java#int_compareTo", vec!["integer", "compare"]));
+        self.register(TckTest::passing("lang.Long.parseLong", TckCategory::Lang, "cratonvm/TckLang.java#long_parseLong", vec!["long", "parse"]));
+        self.register(TckTest::passing("lang.Long.valueOf", TckCategory::Lang, "cratonvm/TckLang.java#long_valueOf", vec!["long", "valueof"]));
+        self.register(TckTest::passing("lang.Long.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#long_toString", vec!["long", "tostring"]));
+        self.register(TckTest::passing("lang.Long.maxValue", TckCategory::Lang, "cratonvm/TckLang.java#long_maxValue", vec!["long", "constants"]));
+        self.register(TckTest::passing("lang.Double.parseDouble", TckCategory::Lang, "cratonvm/TckLang.java#double_parseDouble", vec!["double", "parse"]));
+        self.register(TckTest::passing("lang.Double.isNaN", TckCategory::Lang, "cratonvm/TckLang.java#double_isNaN", vec!["double", "nan"]));
+        self.register(TckTest::passing("lang.Double.isInfinite", TckCategory::Lang, "cratonvm/TckLang.java#double_isInfinite", vec!["double", "infinity"]));
+        self.register(TckTest::passing("lang.Double.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#double_toString", vec!["double", "tostring"]));
+        self.register(TckTest::passing("lang.Double.bitsRoundtrip", TckCategory::Lang, "cratonvm/TckLang.java#double_bits_roundtrip", vec!["double", "bits"]));
+        self.register(TckTest::passing("lang.Float.parseFloat", TckCategory::Lang, "cratonvm/TckLang.java#float_parseFloat", vec!["float", "parse"]));
+        self.register(TckTest::passing("lang.Float.isNaN", TckCategory::Lang, "cratonvm/TckLang.java#float_isNaN", vec!["float", "nan"]));
+        self.register(TckTest::passing("lang.Float.bitsRoundtrip", TckCategory::Lang, "cratonvm/TckLang.java#float_bits_roundtrip", vec!["float", "bits"]));
+        self.register(TckTest::passing("lang.Boolean.parseBoolean", TckCategory::Lang, "cratonvm/TckLang.java#bool_parseBoolean", vec!["boolean", "parse"]));
+        self.register(TckTest::passing("lang.Boolean.valueOf", TckCategory::Lang, "cratonvm/TckLang.java#bool_valueOf", vec!["boolean", "valueof"]));
+        self.register(TckTest::passing("lang.Boolean.toStringVal", TckCategory::Lang, "cratonvm/TckLang.java#bool_toString", vec!["boolean", "tostring"]));
+        self.register(TckTest::passing("lang.Byte.constants", TckCategory::Lang, "cratonvm/TckLang.java#byte_constants", vec!["byte", "constants"]));
+        self.register(TckTest::passing("lang.Byte.parseByte", TckCategory::Lang, "cratonvm/TckLang.java#byte_parseByte", vec!["byte", "parse"]));
+        self.register(TckTest::passing("lang.Short.constants", TckCategory::Lang, "cratonvm/TckLang.java#short_constants", vec!["short", "constants"]));
+        self.register(TckTest::passing("lang.Short.parseShort", TckCategory::Lang, "cratonvm/TckLang.java#short_parseShort", vec!["short", "parse"]));
+        self.register(TckTest::passing("lang.Character.isDigit", TckCategory::Lang, "cratonvm/TckLang.java#char_isDigit", vec!["character", "digit"]));
+        self.register(TckTest::passing("lang.Character.isLetter", TckCategory::Lang, "cratonvm/TckLang.java#char_isLetter", vec!["character", "letter"]));
+        self.register(TckTest::passing("lang.Character.case", TckCategory::Lang, "cratonvm/TckLang.java#char_case", vec!["character", "case"]));
+        self.register(TckTest::passing("lang.Character.convert", TckCategory::Lang, "cratonvm/TckLang.java#char_convert", vec!["character", "convert"]));
+        self.register(TckTest::passing("lang.Character.isWhitespace", TckCategory::Lang, "cratonvm/TckLang.java#char_isWhitespace", vec!["character", "whitespace"]));
+        self.register(TckTest::passing("lang.Math.abs", TckCategory::Lang, "cratonvm/TckLang.java#math_abs", vec!["math", "abs"]));
+        self.register(TckTest::passing("lang.Math.maxMin", TckCategory::Lang, "cratonvm/TckLang.java#math_maxMin", vec!["math", "max", "min"]));
+        self.register(TckTest::passing("lang.Math.sqrt", TckCategory::Lang, "cratonvm/TckLang.java#math_sqrt", vec!["math", "sqrt"]));
+        self.register(TckTest::passing("lang.Math.pow", TckCategory::Lang, "cratonvm/TckLang.java#math_pow", vec!["math", "pow"]));
+        self.register(TckTest::passing("lang.Math.floorCeil", TckCategory::Lang, "cratonvm/TckLang.java#math_floorCeil", vec!["math", "floor", "ceil"]));
+        self.register(TckTest::passing("lang.Math.round", TckCategory::Lang, "cratonvm/TckLang.java#math_round", vec!["math", "round"]));
+        self.register(TckTest::passing("lang.Math.constants", TckCategory::Lang, "cratonvm/TckLang.java#math_constants", vec!["math", "constants"]));
+        self.register(TckTest::passing("lang.Math.sinCos", TckCategory::Lang, "cratonvm/TckLang.java#math_sinCos", vec!["math", "trig"]));
+        self.register(TckTest::passing("lang.Math.logExp", TckCategory::Lang, "cratonvm/TckLang.java#math_logExp", vec!["math", "log", "exp"]));
+        self.register(TckTest::passing("lang.System.currentTimeMillis", TckCategory::Lang, "cratonvm/TckLang.java#sys_currentTimeMillis", vec!["system", "time"]));
+        self.register(TckTest::passing("lang.System.nanoTime", TckCategory::Lang, "cratonvm/TckLang.java#sys_nanoTime", vec!["system", "time"]));
+        self.register(TckTest::passing("lang.System.arraycopy", TckCategory::Lang, "cratonvm/TckLang.java#sys_arraycopy", vec!["system", "arraycopy"]));
+        self.register(TckTest::passing("lang.System.identityHashCode", TckCategory::Lang, "cratonvm/TckLang.java#sys_identityHashCode", vec!["system", "hashcode"]));
+        self.register(TckTest::passing("lang.StringBuilder.basic", TckCategory::Lang, "cratonvm/TckLang.java#sb_basic", vec!["stringbuilder", "basic"]));
+        self.register(TckTest::passing("lang.StringBuilder.appendInt", TckCategory::Lang, "cratonvm/TckLang.java#sb_appendInt", vec!["stringbuilder", "append"]));
+        self.register(TckTest::passing("lang.StringBuilder.chain", TckCategory::Lang, "cratonvm/TckLang.java#sb_chain", vec!["stringbuilder", "chain"]));
+        self.register(TckTest::passing("lang.StringBuilder.length", TckCategory::Lang, "cratonvm/TckLang.java#sb_length", vec!["stringbuilder", "length"]));
+        self.register(TckTest::passing("lang.StringBuilder.reverse", TckCategory::Lang, "cratonvm/TckLang.java#sb_reverse", vec!["stringbuilder", "reverse"]));
+        self.register(TckTest::passing("lang.StringBuilder.delete", TckCategory::Lang, "cratonvm/TckLang.java#sb_delete", vec!["stringbuilder", "delete"]));
+        self.register(TckTest::passing("lang.Exception.getMessage", TckCategory::Lang, "cratonvm/TckLang.java#exc_getMessage", vec!["exception", "message"]));
+        self.register(TckTest::passing("lang.Exception.getCause", TckCategory::Lang, "cratonvm/TckLang.java#exc_getCause", vec!["exception", "cause"]));
+        self.register(TckTest::passing("lang.Exception.tryCatch", TckCategory::Lang, "cratonvm/TckLang.java#exc_tryCatch", vec!["exception", "trycatch"]));
+        self.register(TckTest::passing("lang.Exception.hierarchy", TckCategory::Lang, "cratonvm/TckLang.java#exc_hierarchy", vec!["exception", "hierarchy"]));
+        self.register(TckTest::passing("lang.Exception.npeClass", TckCategory::Lang, "cratonvm/TckLang.java#exc_npe_class", vec!["exception", "npe"]));
+        self.register(TckTest::passing("lang.Exception.finally", TckCategory::Lang, "cratonvm/TckLang.java#exc_finally", vec!["exception", "finally"]));
+        self.register(TckTest::passing("lang.Class.getName", TckCategory::Lang, "cratonvm/TckLang.java#cls_getName", vec!["class", "name"]));
+        self.register(TckTest::passing("lang.Class.isInterface", TckCategory::Lang, "cratonvm/TckLang.java#cls_isInterface", vec!["class", "interface"]));
+        self.register(TckTest::passing("lang.Class.isPrimitive", TckCategory::Lang, "cratonvm/TckLang.java#cls_isPrimitive", vec!["class", "primitive"]));
+        self.register(TckTest::passing("lang.Class.isArray", TckCategory::Lang, "cratonvm/TckLang.java#cls_isArray", vec!["class", "array"]));
+        self.register(TckTest::passing("lang.Class.getSuperclass", TckCategory::Lang, "cratonvm/TckLang.java#cls_getSuperclass", vec!["class", "superclass"]));
+        self.register(TckTest::passing("lang.Runtime.availableProcessors", TckCategory::Lang, "cratonvm/TckLang.java#rt_availableProcessors", vec!["runtime", "processors"]));
+        self.register(TckTest::passing("lang.Runtime.memory", TckCategory::Lang, "cratonvm/TckLang.java#rt_memory", vec!["runtime", "memory"]));
+        self.register(TckTest::passing("lang.Thread.currentThread", TckCategory::Lang, "cratonvm/TckLang.java#thread_currentThread", vec!["thread", "current"]));
+        self.register(TckTest::passing("lang.Thread.isAlive", TckCategory::Lang, "cratonvm/TckLang.java#thread_isAlive", vec!["thread", "alive"]));
+        self.register(TckTest::passing("lang.Cast.intToLong", TckCategory::Lang, "cratonvm/TckLang.java#cast_int_to_long", vec!["cast", "widening"]));
+        self.register(TckTest::passing("lang.Cast.longToInt", TckCategory::Lang, "cratonvm/TckLang.java#cast_long_to_int", vec!["cast", "narrowing"]));
+        self.register(TckTest::passing("lang.Cast.intToFloat", TckCategory::Lang, "cratonvm/TckLang.java#cast_int_to_float", vec!["cast", "float"]));
+        self.register(TckTest::passing("lang.Cast.doubleToInt", TckCategory::Lang, "cratonvm/TckLang.java#cast_double_to_int", vec!["cast", "truncation"]));
+        self.register(TckTest::passing("lang.Cast.charToInt", TckCategory::Lang, "cratonvm/TckLang.java#cast_char_to_int", vec!["cast", "char"]));
+        self.register(TckTest::passing("lang.Autobox.int", TckCategory::Lang, "cratonvm/TckLang.java#autobox_int", vec!["autobox", "integer"]));
+        self.register(TckTest::passing("lang.Autobox.double", TckCategory::Lang, "cratonvm/TckLang.java#autobox_double", vec!["autobox", "double"]));
+        self.register(TckTest::passing("lang.Autobox.boolean", TckCategory::Lang, "cratonvm/TckLang.java#autobox_boolean", vec!["autobox", "boolean"]));
 
         // --- java.util.concurrent (S49 additions) ---
-        self.register(TckTest::passing("concurrent.AtomicInt.cas", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntCas", vec!["atomic", "cas"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.incrDecr", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntIncrDecr", vec!["atomic", "increment"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.preIncrDecr", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntPreIncrDecr", vec!["atomic", "increment"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.addOps", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntAddOps", vec!["atomic", "add"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.getAndSet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntGetAndSet", vec!["atomic", "getandset"]));
-        self.register(TckTest::passing("concurrent.AtomicLong.basic", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicLongBasic", vec!["atomic", "long"]));
-        self.register(TckTest::passing("concurrent.AtomicBoolean.cas", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicBooleanCas", vec!["atomic", "boolean"]));
-        self.register(TckTest::passing("concurrent.AtomicBoolean.getAndSet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicBooleanGetAndSet", vec!["atomic", "boolean"]));
-        self.register(TckTest::passing("concurrent.AtomicRef.cas", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicRefCas", vec!["atomic", "reference"]));
-        self.register(TckTest::passing("concurrent.AtomicRef.getAndSet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicRefGetAndSet", vec!["atomic", "reference"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.concurrentIncr", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntConcurrentIncr", vec!["atomic", "threaded"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.basic", TckCategory::Concurrent, "rustjvm/JucComplete.java#testReentrantLockBasic", vec!["lock", "reentrant"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.tryLock", TckCategory::Concurrent, "rustjvm/JucComplete.java#testReentrantLockTryLock", vec!["lock", "trylock"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.reentrant", TckCategory::Concurrent, "rustjvm/JucComplete.java#testReentrantLockReentrant", vec!["lock", "reentrant"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.condition", TckCategory::Concurrent, "rustjvm/JucComplete.java#testReentrantLockCondition", vec!["lock", "condition"]));
-        self.register(TckTest::passing("concurrent.ReadWriteLock.basic", TckCategory::Concurrent, "rustjvm/JucComplete.java#testReadWriteLockBasic", vec!["lock", "readwrite"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.basic", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCountDownLatchBasic", vec!["latch", "countdown"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.getCount", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCountDownLatchGetCount", vec!["latch", "count"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.extraCountDown", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCountDownLatchExtraCountDown", vec!["latch", "extra"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.toString", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCountDownLatchToString", vec!["latch", "tostring"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.awaitTimeout", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCountDownLatchAwaitTimeout", vec!["latch", "timeout"]));
-        self.register(TckTest::passing("concurrent.Semaphore.basic", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreBasic", vec!["semaphore", "basic"]));
-        self.register(TckTest::passing("concurrent.Semaphore.tryAcquire", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreTryAcquire", vec!["semaphore", "tryacquire"]));
-        self.register(TckTest::passing("concurrent.Semaphore.drain", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreDrain", vec!["semaphore", "drain"]));
-        self.register(TckTest::passing("concurrent.Semaphore.releaseAboveInit", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreReleaseAboveInit", vec!["semaphore", "release"]));
-        self.register(TckTest::passing("concurrent.Semaphore.acquireN", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreAcquireN", vec!["semaphore", "acquiren"]));
-        self.register(TckTest::passing("concurrent.Semaphore.isFair", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreIsFair", vec!["semaphore", "fairness"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.getParties", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCyclicBarrierGetParties", vec!["barrier", "parties"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.isBroken", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCyclicBarrierIsBroken", vec!["barrier", "broken"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.getNumberWaiting", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCyclicBarrierGetNumberWaiting", vec!["barrier", "waiting"]));
-        self.register(TckTest::passing("concurrent.CyclicBarrier.reset", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCyclicBarrierReset", vec!["barrier", "reset"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.putGet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapPutGet", vec!["chm", "putget"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.containsKey", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapContainsKey", vec!["chm", "contains"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.remove", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapRemove", vec!["chm", "remove"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.putIfAbsent", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapPutIfAbsent", vec!["chm", "putifabsent"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.isEmpty", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapIsEmpty", vec!["chm", "empty"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.getOrDefault", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapGetOrDefault", vec!["chm", "default"]));
-        self.register(TckTest::passing("concurrent.COWAL.addGet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCOWALAddGet", vec!["cowal", "addget"]));
-        self.register(TckTest::passing("concurrent.COWAL.contains", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCOWALContains", vec!["cowal", "contains"]));
-        self.register(TckTest::passing("concurrent.COWAL.remove", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCOWALRemove", vec!["cowal", "remove"]));
-        self.register(TckTest::passing("concurrent.COWAL.isEmpty", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCOWALIsEmpty", vec!["cowal", "empty"]));
-        self.register(TckTest::passing("concurrent.LBQ.offerPoll", TckCategory::Concurrent, "rustjvm/JucComplete.java#testLinkedBlockingQueueOfferPoll", vec!["lbq", "offerpoll"]));
-        self.register(TckTest::passing("concurrent.LBQ.putTake", TckCategory::Concurrent, "rustjvm/JucComplete.java#testLinkedBlockingQueuePutTake", vec!["lbq", "puttake"]));
-        self.register(TckTest::passing("concurrent.LBQ.peek", TckCategory::Concurrent, "rustjvm/JucComplete.java#testLinkedBlockingQueuePeek", vec!["lbq", "peek"]));
-        self.register(TckTest::passing("concurrent.LBQ.isEmptySize", TckCategory::Concurrent, "rustjvm/JucComplete.java#testLinkedBlockingQueueIsEmptySize", vec!["lbq", "size"]));
-        self.register(TckTest::passing("concurrent.LBQ.capacity", TckCategory::Concurrent, "rustjvm/JucComplete.java#testLinkedBlockingQueueCapacity", vec!["lbq", "capacity"]));
-        self.register(TckTest::passing("concurrent.ABQ.offerPoll", TckCategory::Concurrent, "rustjvm/JucComplete.java#testArrayBlockingQueueOfferPoll", vec!["abq", "offerpoll"]));
-        self.register(TckTest::passing("concurrent.ABQ.capacity", TckCategory::Concurrent, "rustjvm/JucComplete.java#testArrayBlockingQueueCapacity", vec!["abq", "capacity"]));
-        self.register(TckTest::passing("concurrent.ABQ.remainingCapacity", TckCategory::Concurrent, "rustjvm/JucComplete.java#testArrayBlockingQueueRemainingCapacity", vec!["abq", "remaining"]));
-        self.register(TckTest::passing("concurrent.CF.complete", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureComplete", vec!["cf", "complete"]));
-        self.register(TckTest::passing("concurrent.CF.completedFuture", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureCompletedFuture", vec!["cf", "factory"]));
-        self.register(TckTest::passing("concurrent.CF.thenApply", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureThenApply", vec!["cf", "thenapply"]));
-        self.register(TckTest::passing("concurrent.CF.thenAccept", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureThenAccept", vec!["cf", "thenaccept"]));
-        self.register(TckTest::passing("concurrent.CF.state", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureState", vec!["cf", "state"]));
-        self.register(TckTest::passing("concurrent.CF.cancel", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureCancel", vec!["cf", "cancel"]));
-        self.register(TckTest::passing("concurrent.CF.exceptionally", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureExceptionally", vec!["cf", "exceptionally"]));
-        self.register(TckTest::passing("concurrent.CF.isCompletedExceptionally", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCompletableFutureIsCompletedExceptionally", vec!["cf", "exceptional"]));
-        self.register(TckTest::passing("concurrent.CountDownLatch.threaded", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCountDownLatchThreaded", vec!["latch", "threaded"]));
-        self.register(TckTest::passing("concurrent.Semaphore.threaded", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSemaphoreThreaded", vec!["semaphore", "threaded"]));
-        self.register(TckTest::passing("concurrent.ReentrantLock.threaded", TckCategory::Concurrent, "rustjvm/JucComplete.java#testReentrantLockThreaded", vec!["lock", "threaded"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.threaded", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapThreaded", vec!["chm", "threaded"]));
-        self.register(TckTest::passing("concurrent.LBQ.producerConsumer", TckCategory::Concurrent, "rustjvm/JucComplete.java#testBlockingQueueProducerConsumer", vec!["lbq", "threaded"]));
-        self.register(TckTest::passing("concurrent.COWAL.threaded", TckCategory::Concurrent, "rustjvm/JucComplete.java#testCOWALThreaded", vec!["cowal", "threaded"]));
-        self.register(TckTest::passing("concurrent.AtomicInt.lazySet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicIntLazySet", vec!["atomic", "lazyset"]));
-        self.register(TckTest::passing("concurrent.AtomicLong.lazySet", TckCategory::Concurrent, "rustjvm/JucComplete.java#testAtomicLongLazySet", vec!["atomic", "lazyset"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.replace", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapReplace", vec!["chm", "replace"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.containsValue", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapContainsValue", vec!["chm", "containsvalue"]));
-        self.register(TckTest::passing("concurrent.Synchronizer.composition", TckCategory::Concurrent, "rustjvm/JucComplete.java#testSynchronizerComposition", vec!["synchronizer", "integration"]));
-        self.register(TckTest::passing("concurrent.LBQ.clear", TckCategory::Concurrent, "rustjvm/JucComplete.java#testLinkedBlockingQueueClear", vec!["lbq", "clear"]));
-        self.register(TckTest::passing("concurrent.ConcurrentHashMap.clear", TckCategory::Concurrent, "rustjvm/JucComplete.java#testConcurrentHashMapClear", vec!["chm", "clear"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.cas", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntCas", vec!["atomic", "cas"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.incrDecr", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntIncrDecr", vec!["atomic", "increment"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.preIncrDecr", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntPreIncrDecr", vec!["atomic", "increment"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.addOps", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntAddOps", vec!["atomic", "add"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.getAndSet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntGetAndSet", vec!["atomic", "getandset"]));
+        self.register(TckTest::passing("concurrent.AtomicLong.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicLongBasic", vec!["atomic", "long"]));
+        self.register(TckTest::passing("concurrent.AtomicBoolean.cas", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicBooleanCas", vec!["atomic", "boolean"]));
+        self.register(TckTest::passing("concurrent.AtomicBoolean.getAndSet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicBooleanGetAndSet", vec!["atomic", "boolean"]));
+        self.register(TckTest::passing("concurrent.AtomicRef.cas", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicRefCas", vec!["atomic", "reference"]));
+        self.register(TckTest::passing("concurrent.AtomicRef.getAndSet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicRefGetAndSet", vec!["atomic", "reference"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.concurrentIncr", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntConcurrentIncr", vec!["atomic", "threaded"]));
+        self.register(TckTest::passing("concurrent.ReentrantLock.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockBasic", vec!["lock", "reentrant"]));
+        self.register(TckTest::passing("concurrent.ReentrantLock.tryLock", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockTryLock", vec!["lock", "trylock"]));
+        self.register(TckTest::passing("concurrent.ReentrantLock.reentrant", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockReentrant", vec!["lock", "reentrant"]));
+        self.register(TckTest::passing("concurrent.ReentrantLock.condition", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockCondition", vec!["lock", "condition"]));
+        self.register(TckTest::passing("concurrent.ReadWriteLock.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReadWriteLockBasic", vec!["lock", "readwrite"]));
+        self.register(TckTest::passing("concurrent.CountDownLatch.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchBasic", vec!["latch", "countdown"]));
+        self.register(TckTest::passing("concurrent.CountDownLatch.getCount", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchGetCount", vec!["latch", "count"]));
+        self.register(TckTest::passing("concurrent.CountDownLatch.extraCountDown", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchExtraCountDown", vec!["latch", "extra"]));
+        self.register(TckTest::passing("concurrent.CountDownLatch.toString", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchToString", vec!["latch", "tostring"]));
+        self.register(TckTest::passing("concurrent.CountDownLatch.awaitTimeout", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchAwaitTimeout", vec!["latch", "timeout"]));
+        self.register(TckTest::passing("concurrent.Semaphore.basic", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreBasic", vec!["semaphore", "basic"]));
+        self.register(TckTest::passing("concurrent.Semaphore.tryAcquire", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreTryAcquire", vec!["semaphore", "tryacquire"]));
+        self.register(TckTest::passing("concurrent.Semaphore.drain", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreDrain", vec!["semaphore", "drain"]));
+        self.register(TckTest::passing("concurrent.Semaphore.releaseAboveInit", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreReleaseAboveInit", vec!["semaphore", "release"]));
+        self.register(TckTest::passing("concurrent.Semaphore.acquireN", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreAcquireN", vec!["semaphore", "acquiren"]));
+        self.register(TckTest::passing("concurrent.Semaphore.isFair", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreIsFair", vec!["semaphore", "fairness"]));
+        self.register(TckTest::passing("concurrent.CyclicBarrier.getParties", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierGetParties", vec!["barrier", "parties"]));
+        self.register(TckTest::passing("concurrent.CyclicBarrier.isBroken", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierIsBroken", vec!["barrier", "broken"]));
+        self.register(TckTest::passing("concurrent.CyclicBarrier.getNumberWaiting", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierGetNumberWaiting", vec!["barrier", "waiting"]));
+        self.register(TckTest::passing("concurrent.CyclicBarrier.reset", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCyclicBarrierReset", vec!["barrier", "reset"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.putGet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapPutGet", vec!["chm", "putget"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.containsKey", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapContainsKey", vec!["chm", "contains"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.remove", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapRemove", vec!["chm", "remove"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.putIfAbsent", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapPutIfAbsent", vec!["chm", "putifabsent"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.isEmpty", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapIsEmpty", vec!["chm", "empty"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.getOrDefault", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapGetOrDefault", vec!["chm", "default"]));
+        self.register(TckTest::passing("concurrent.COWAL.addGet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALAddGet", vec!["cowal", "addget"]));
+        self.register(TckTest::passing("concurrent.COWAL.contains", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALContains", vec!["cowal", "contains"]));
+        self.register(TckTest::passing("concurrent.COWAL.remove", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALRemove", vec!["cowal", "remove"]));
+        self.register(TckTest::passing("concurrent.COWAL.isEmpty", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALIsEmpty", vec!["cowal", "empty"]));
+        self.register(TckTest::passing("concurrent.LBQ.offerPoll", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueOfferPoll", vec!["lbq", "offerpoll"]));
+        self.register(TckTest::passing("concurrent.LBQ.putTake", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueuePutTake", vec!["lbq", "puttake"]));
+        self.register(TckTest::passing("concurrent.LBQ.peek", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueuePeek", vec!["lbq", "peek"]));
+        self.register(TckTest::passing("concurrent.LBQ.isEmptySize", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueIsEmptySize", vec!["lbq", "size"]));
+        self.register(TckTest::passing("concurrent.LBQ.capacity", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueCapacity", vec!["lbq", "capacity"]));
+        self.register(TckTest::passing("concurrent.ABQ.offerPoll", TckCategory::Concurrent, "cratonvm/JucComplete.java#testArrayBlockingQueueOfferPoll", vec!["abq", "offerpoll"]));
+        self.register(TckTest::passing("concurrent.ABQ.capacity", TckCategory::Concurrent, "cratonvm/JucComplete.java#testArrayBlockingQueueCapacity", vec!["abq", "capacity"]));
+        self.register(TckTest::passing("concurrent.ABQ.remainingCapacity", TckCategory::Concurrent, "cratonvm/JucComplete.java#testArrayBlockingQueueRemainingCapacity", vec!["abq", "remaining"]));
+        self.register(TckTest::passing("concurrent.CF.complete", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureComplete", vec!["cf", "complete"]));
+        self.register(TckTest::passing("concurrent.CF.completedFuture", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureCompletedFuture", vec!["cf", "factory"]));
+        self.register(TckTest::passing("concurrent.CF.thenApply", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureThenApply", vec!["cf", "thenapply"]));
+        self.register(TckTest::passing("concurrent.CF.thenAccept", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureThenAccept", vec!["cf", "thenaccept"]));
+        self.register(TckTest::passing("concurrent.CF.state", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureState", vec!["cf", "state"]));
+        self.register(TckTest::passing("concurrent.CF.cancel", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureCancel", vec!["cf", "cancel"]));
+        self.register(TckTest::passing("concurrent.CF.exceptionally", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureExceptionally", vec!["cf", "exceptionally"]));
+        self.register(TckTest::passing("concurrent.CF.isCompletedExceptionally", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCompletableFutureIsCompletedExceptionally", vec!["cf", "exceptional"]));
+        self.register(TckTest::passing("concurrent.CountDownLatch.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCountDownLatchThreaded", vec!["latch", "threaded"]));
+        self.register(TckTest::passing("concurrent.Semaphore.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSemaphoreThreaded", vec!["semaphore", "threaded"]));
+        self.register(TckTest::passing("concurrent.ReentrantLock.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testReentrantLockThreaded", vec!["lock", "threaded"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapThreaded", vec!["chm", "threaded"]));
+        self.register(TckTest::passing("concurrent.LBQ.producerConsumer", TckCategory::Concurrent, "cratonvm/JucComplete.java#testBlockingQueueProducerConsumer", vec!["lbq", "threaded"]));
+        self.register(TckTest::passing("concurrent.COWAL.threaded", TckCategory::Concurrent, "cratonvm/JucComplete.java#testCOWALThreaded", vec!["cowal", "threaded"]));
+        self.register(TckTest::passing("concurrent.AtomicInt.lazySet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicIntLazySet", vec!["atomic", "lazyset"]));
+        self.register(TckTest::passing("concurrent.AtomicLong.lazySet", TckCategory::Concurrent, "cratonvm/JucComplete.java#testAtomicLongLazySet", vec!["atomic", "lazyset"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.replace", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapReplace", vec!["chm", "replace"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.containsValue", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapContainsValue", vec!["chm", "containsvalue"]));
+        self.register(TckTest::passing("concurrent.Synchronizer.composition", TckCategory::Concurrent, "cratonvm/JucComplete.java#testSynchronizerComposition", vec!["synchronizer", "integration"]));
+        self.register(TckTest::passing("concurrent.LBQ.clear", TckCategory::Concurrent, "cratonvm/JucComplete.java#testLinkedBlockingQueueClear", vec!["lbq", "clear"]));
+        self.register(TckTest::passing("concurrent.ConcurrentHashMap.clear", TckCategory::Concurrent, "cratonvm/JucComplete.java#testConcurrentHashMapClear", vec!["chm", "clear"]));
 
         // --- java.lang.reflect (S50 additions) ---
-        self.register(TckTest::passing("reflect.Class.forName", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_forName", vec!["class", "forname"]));
-        self.register(TckTest::passing("reflect.Class.getName", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_getName", vec!["class", "name"]));
-        self.register(TckTest::passing("reflect.Class.getSimpleName", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_getSimpleName", vec!["class", "simplename"]));
-        self.register(TckTest::passing("reflect.Class.getSuperclass", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_getSuperclass", vec!["class", "superclass"]));
-        self.register(TckTest::passing("reflect.Class.objectSuperclassNull", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_objectSuperclassNull", vec!["class", "superclass"]));
-        self.register(TckTest::passing("reflect.Class.isInterface", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isInterface", vec!["class", "interface"]));
-        self.register(TckTest::passing("reflect.Class.isPrimitive", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isPrimitive", vec!["class", "primitive"]));
-        self.register(TckTest::passing("reflect.Class.isArray", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isArray", vec!["class", "array"]));
-        self.register(TckTest::passing("reflect.Class.isEnum", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isEnum", vec!["class", "enum"]));
-        self.register(TckTest::passing("reflect.Class.isAnnotation", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isAnnotation", vec!["class", "annotation"]));
-        self.register(TckTest::passing("reflect.Class.getModifiers", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_getModifiers", vec!["class", "modifiers"]));
-        self.register(TckTest::passing("reflect.Class.isAssignableFrom", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isAssignableFrom", vec!["class", "assignable"]));
-        self.register(TckTest::passing("reflect.Class.isInstance", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_isInstance", vec!["class", "isinstance"]));
-        self.register(TckTest::passing("reflect.Class.getInterfaces", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_getInterfaces", vec!["class", "interfaces"]));
-        self.register(TckTest::passing("reflect.Class.getComponentType", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_getComponentType", vec!["class", "component"]));
-        self.register(TckTest::passing("reflect.Class.cast", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_cast", vec!["class", "cast"]));
-        self.register(TckTest::passing("reflect.Class.newInstance", TckCategory::Reflect, "rustjvm/TckReflect.java#cls_newInstance", vec!["class", "newinstance"]));
-        self.register(TckTest::passing("reflect.Method.getDeclaredMethod", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getDeclaredMethod", vec!["method", "lookup"]));
-        self.register(TckTest::passing("reflect.Method.invokeInstance", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_invokeInstance", vec!["method", "invoke"]));
-        self.register(TckTest::passing("reflect.Method.invokeStatic", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_invokeStatic", vec!["method", "invoke"]));
-        self.register(TckTest::passing("reflect.Method.invokePrivate", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_invokePrivate", vec!["method", "invoke", "private"]));
-        self.register(TckTest::passing("reflect.Method.getReturnType", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getReturnType", vec!["method", "returntype"]));
-        self.register(TckTest::passing("reflect.Method.getParameterTypes", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getParameterTypes", vec!["method", "params"]));
-        self.register(TckTest::passing("reflect.Method.getParameterCount", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getParameterCount", vec!["method", "params"]));
-        self.register(TckTest::passing("reflect.Method.getModifiers", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getModifiers", vec!["method", "modifiers"]));
-        self.register(TckTest::passing("reflect.Method.getDeclaringClass", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getDeclaringClass", vec!["method", "declaring"]));
-        self.register(TckTest::passing("reflect.Method.getDeclaredMethods", TckCategory::Reflect, "rustjvm/TckReflect.java#meth_getDeclaredMethods", vec!["method", "list"]));
-        self.register(TckTest::passing("reflect.Field.getDeclaredField", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getDeclaredField", vec!["field", "lookup"]));
-        self.register(TckTest::passing("reflect.Field.get", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_get", vec!["field", "get"]));
-        self.register(TckTest::passing("reflect.Field.set", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_set", vec!["field", "set"]));
-        self.register(TckTest::passing("reflect.Field.getPrivate", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getPrivate", vec!["field", "private"]));
-        self.register(TckTest::passing("reflect.Field.getInt", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getInt", vec!["field", "int"]));
-        self.register(TckTest::passing("reflect.Field.setInt", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_setInt", vec!["field", "int"]));
-        self.register(TckTest::passing("reflect.Field.getType", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getType", vec!["field", "type"]));
-        self.register(TckTest::passing("reflect.Field.getModifiers", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getModifiers", vec!["field", "modifiers"]));
-        self.register(TckTest::passing("reflect.Field.getDeclaringClass", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getDeclaringClass", vec!["field", "declaring"]));
-        self.register(TckTest::passing("reflect.Field.getDeclaredFields", TckCategory::Reflect, "rustjvm/TckReflect.java#fld_getDeclaredFields", vec!["field", "list"]));
-        self.register(TckTest::passing("reflect.Constructor.getDeclaredConstructor", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_getDeclaredConstructor", vec!["constructor", "lookup"]));
-        self.register(TckTest::passing("reflect.Constructor.newInstanceNoArgs", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_newInstanceNoArgs", vec!["constructor", "newinstance"]));
-        self.register(TckTest::passing("reflect.Constructor.newInstanceWithArgs", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_newInstanceWithArgs", vec!["constructor", "newinstance"]));
-        self.register(TckTest::passing("reflect.Constructor.newInstancePrivate", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_newInstancePrivate", vec!["constructor", "private"]));
-        self.register(TckTest::passing("reflect.Constructor.getParameterTypes", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_getParameterTypes", vec!["constructor", "params"]));
-        self.register(TckTest::passing("reflect.Constructor.getModifiers", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_getModifiers", vec!["constructor", "modifiers"]));
-        self.register(TckTest::passing("reflect.Constructor.getDeclaringClass", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_getDeclaringClass", vec!["constructor", "declaring"]));
-        self.register(TckTest::passing("reflect.Constructor.getDeclaredConstructors", TckCategory::Reflect, "rustjvm/TckReflect.java#ctor_getDeclaredConstructors", vec!["constructor", "list"]));
-        self.register(TckTest::passing("reflect.Annotation.classPresent", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_classPresent", vec!["annotation", "class"]));
-        self.register(TckTest::passing("reflect.Annotation.classAbsent", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_classAbsent", vec!["annotation", "class"]));
-        self.register(TckTest::passing("reflect.Annotation.classValue", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_classValue", vec!["annotation", "value"]));
-        self.register(TckTest::passing("reflect.Annotation.inherited", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_inherited", vec!["annotation", "inherited"]));
-        self.register(TckTest::passing("reflect.Annotation.inheritedValue", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_inheritedValue", vec!["annotation", "inherited"]));
-        self.register(TckTest::passing("reflect.Annotation.declaredExcludesInherited", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_declaredExcludesInherited", vec!["annotation", "declared"]));
-        self.register(TckTest::passing("reflect.Annotation.getAnnotationsIncludesInherited", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_getAnnotationsIncludesInherited", vec!["annotation", "inherited"]));
-        self.register(TckTest::passing("reflect.Annotation.methodPresent", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_methodPresent", vec!["annotation", "method"]));
-        self.register(TckTest::passing("reflect.Annotation.methodValue", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_methodValue", vec!["annotation", "method"]));
-        self.register(TckTest::passing("reflect.Annotation.methodDefault", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_methodDefault", vec!["annotation", "default"]));
-        self.register(TckTest::passing("reflect.Annotation.methodAbsent", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_methodAbsent", vec!["annotation", "method"]));
-        self.register(TckTest::passing("reflect.Annotation.fieldPresent", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_fieldPresent", vec!["annotation", "field"]));
-        self.register(TckTest::passing("reflect.Annotation.fieldValue", TckCategory::Reflect, "rustjvm/TckReflect.java#ann_fieldValue", vec!["annotation", "field"]));
-        self.register(TckTest::passing("reflect.Array.newInstance", TckCategory::Reflect, "rustjvm/TckReflect.java#arr_newInstance", vec!["array", "reflect"]));
-        self.register(TckTest::passing("reflect.Array.getLength", TckCategory::Reflect, "rustjvm/TckReflect.java#arr_getLength", vec!["array", "length"]));
-        self.register(TckTest::passing("reflect.Array.getSet", TckCategory::Reflect, "rustjvm/TckReflect.java#arr_getSet", vec!["array", "access"]));
-        self.register(TckTest::passing("reflect.Array.getObject", TckCategory::Reflect, "rustjvm/TckReflect.java#arr_getObject", vec!["array", "object"]));
-        self.register(TckTest::passing("reflect.Array.setObject", TckCategory::Reflect, "rustjvm/TckReflect.java#arr_setObject", vec!["array", "object"]));
-        self.register(TckTest::passing("reflect.Array.newInstanceRef", TckCategory::Reflect, "rustjvm/TckReflect.java#arr_newInstanceRef", vec!["array", "reference"]));
-        self.register(TckTest::passing("reflect.Proxy.create", TckCategory::Reflect, "rustjvm/TckReflect.java#proxy_create", vec!["proxy", "create"]));
-        self.register(TckTest::passing("reflect.Proxy.isProxyClass", TckCategory::Reflect, "rustjvm/TckReflect.java#proxy_isProxyClass", vec!["proxy", "check"]));
-        self.register(TckTest::passing("reflect.Proxy.getHandler", TckCategory::Reflect, "rustjvm/TckReflect.java#proxy_getHandler", vec!["proxy", "handler"]));
-        self.register(TckTest::passing("reflect.Proxy.objectMethods", TckCategory::Reflect, "rustjvm/TckReflect.java#proxy_objectMethods", vec!["proxy", "object"]));
-        self.register(TckTest::passing("reflect.Modifier.isPublic", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_isPublic", vec!["modifier", "public"]));
-        self.register(TckTest::passing("reflect.Modifier.isStatic", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_isStatic", vec!["modifier", "static"]));
-        self.register(TckTest::passing("reflect.Modifier.isFinal", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_isFinal", vec!["modifier", "final"]));
-        self.register(TckTest::passing("reflect.Modifier.isAbstract", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_isAbstract", vec!["modifier", "abstract"]));
-        self.register(TckTest::passing("reflect.Modifier.isInterface", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_isInterface", vec!["modifier", "interface"]));
-        self.register(TckTest::passing("reflect.Modifier.isPrivate", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_isPrivate", vec!["modifier", "private"]));
-        self.register(TckTest::passing("reflect.Modifier.toString", TckCategory::Reflect, "rustjvm/TckReflect.java#mod_toString", vec!["modifier", "tostring"]));
-        self.register(TckTest::passing("reflect.Hierarchy.isInstance", TckCategory::Reflect, "rustjvm/TckReflect.java#hier_isInstance", vec!["hierarchy", "isinstance"]));
-        self.register(TckTest::passing("reflect.Hierarchy.isAssignableFromInterface", TckCategory::Reflect, "rustjvm/TckReflect.java#hier_isAssignableFromInterface", vec!["hierarchy", "assignable"]));
-        self.register(TckTest::passing("reflect.Hierarchy.superclassChain", TckCategory::Reflect, "rustjvm/TckReflect.java#hier_superclassChain", vec!["hierarchy", "chain"]));
-        self.register(TckTest::passing("reflect.Misc.invokeReturnBoxed", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_invokeReturnBoxed", vec!["method", "boxing"]));
-        self.register(TckTest::passing("reflect.Misc.multiFieldRead", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_multiFieldRead", vec!["field", "multiple"]));
-        self.register(TckTest::passing("reflect.Misc.ctorThenInvoke", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_ctorThenInvoke", vec!["constructor", "invoke"]));
-        self.register(TckTest::passing("reflect.Misc.getMethodInherited", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_getMethodInherited", vec!["method", "inherited"]));
-        self.register(TckTest::passing("reflect.Misc.noSuchField", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_noSuchField", vec!["field", "exception"]));
-        self.register(TckTest::passing("reflect.Misc.noSuchMethod", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_noSuchMethod", vec!["method", "exception"]));
-        self.register(TckTest::passing("reflect.Misc.invocationTargetException", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_invocationTargetException", vec!["method", "exception"]));
-        self.register(TckTest::passing("reflect.Misc.getPublicFields", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_getPublicFields", vec!["field", "public"]));
-        self.register(TckTest::passing("reflect.Misc.getPublicMethods", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_getPublicMethods", vec!["method", "public"]));
-        self.register(TckTest::passing("reflect.Misc.getPublicConstructors", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_getPublicConstructors", vec!["constructor", "public"]));
-        self.register(TckTest::passing("reflect.Misc.primitiveClass", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_primitiveClass", vec!["class", "primitive"]));
-        self.register(TckTest::passing("reflect.Misc.voidClass", TckCategory::Reflect, "rustjvm/TckReflect.java#misc_voidClass", vec!["class", "void"]));
+        self.register(TckTest::passing("reflect.Class.forName", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_forName", vec!["class", "forname"]));
+        self.register(TckTest::passing("reflect.Class.getName", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getName", vec!["class", "name"]));
+        self.register(TckTest::passing("reflect.Class.getSimpleName", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getSimpleName", vec!["class", "simplename"]));
+        self.register(TckTest::passing("reflect.Class.getSuperclass", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getSuperclass", vec!["class", "superclass"]));
+        self.register(TckTest::passing("reflect.Class.objectSuperclassNull", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_objectSuperclassNull", vec!["class", "superclass"]));
+        self.register(TckTest::passing("reflect.Class.isInterface", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isInterface", vec!["class", "interface"]));
+        self.register(TckTest::passing("reflect.Class.isPrimitive", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isPrimitive", vec!["class", "primitive"]));
+        self.register(TckTest::passing("reflect.Class.isArray", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isArray", vec!["class", "array"]));
+        self.register(TckTest::passing("reflect.Class.isEnum", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isEnum", vec!["class", "enum"]));
+        self.register(TckTest::passing("reflect.Class.isAnnotation", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isAnnotation", vec!["class", "annotation"]));
+        self.register(TckTest::passing("reflect.Class.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getModifiers", vec!["class", "modifiers"]));
+        self.register(TckTest::passing("reflect.Class.isAssignableFrom", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isAssignableFrom", vec!["class", "assignable"]));
+        self.register(TckTest::passing("reflect.Class.isInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_isInstance", vec!["class", "isinstance"]));
+        self.register(TckTest::passing("reflect.Class.getInterfaces", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getInterfaces", vec!["class", "interfaces"]));
+        self.register(TckTest::passing("reflect.Class.getComponentType", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_getComponentType", vec!["class", "component"]));
+        self.register(TckTest::passing("reflect.Class.cast", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_cast", vec!["class", "cast"]));
+        self.register(TckTest::passing("reflect.Class.newInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#cls_newInstance", vec!["class", "newinstance"]));
+        self.register(TckTest::passing("reflect.Method.getDeclaredMethod", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getDeclaredMethod", vec!["method", "lookup"]));
+        self.register(TckTest::passing("reflect.Method.invokeInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_invokeInstance", vec!["method", "invoke"]));
+        self.register(TckTest::passing("reflect.Method.invokeStatic", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_invokeStatic", vec!["method", "invoke"]));
+        self.register(TckTest::passing("reflect.Method.invokePrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_invokePrivate", vec!["method", "invoke", "private"]));
+        self.register(TckTest::passing("reflect.Method.getReturnType", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getReturnType", vec!["method", "returntype"]));
+        self.register(TckTest::passing("reflect.Method.getParameterTypes", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getParameterTypes", vec!["method", "params"]));
+        self.register(TckTest::passing("reflect.Method.getParameterCount", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getParameterCount", vec!["method", "params"]));
+        self.register(TckTest::passing("reflect.Method.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getModifiers", vec!["method", "modifiers"]));
+        self.register(TckTest::passing("reflect.Method.getDeclaringClass", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getDeclaringClass", vec!["method", "declaring"]));
+        self.register(TckTest::passing("reflect.Method.getDeclaredMethods", TckCategory::Reflect, "cratonvm/TckReflect.java#meth_getDeclaredMethods", vec!["method", "list"]));
+        self.register(TckTest::passing("reflect.Field.getDeclaredField", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getDeclaredField", vec!["field", "lookup"]));
+        self.register(TckTest::passing("reflect.Field.get", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_get", vec!["field", "get"]));
+        self.register(TckTest::passing("reflect.Field.set", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_set", vec!["field", "set"]));
+        self.register(TckTest::passing("reflect.Field.getPrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getPrivate", vec!["field", "private"]));
+        self.register(TckTest::passing("reflect.Field.getInt", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getInt", vec!["field", "int"]));
+        self.register(TckTest::passing("reflect.Field.setInt", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_setInt", vec!["field", "int"]));
+        self.register(TckTest::passing("reflect.Field.getType", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getType", vec!["field", "type"]));
+        self.register(TckTest::passing("reflect.Field.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getModifiers", vec!["field", "modifiers"]));
+        self.register(TckTest::passing("reflect.Field.getDeclaringClass", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getDeclaringClass", vec!["field", "declaring"]));
+        self.register(TckTest::passing("reflect.Field.getDeclaredFields", TckCategory::Reflect, "cratonvm/TckReflect.java#fld_getDeclaredFields", vec!["field", "list"]));
+        self.register(TckTest::passing("reflect.Constructor.getDeclaredConstructor", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getDeclaredConstructor", vec!["constructor", "lookup"]));
+        self.register(TckTest::passing("reflect.Constructor.newInstanceNoArgs", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_newInstanceNoArgs", vec!["constructor", "newinstance"]));
+        self.register(TckTest::passing("reflect.Constructor.newInstanceWithArgs", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_newInstanceWithArgs", vec!["constructor", "newinstance"]));
+        self.register(TckTest::passing("reflect.Constructor.newInstancePrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_newInstancePrivate", vec!["constructor", "private"]));
+        self.register(TckTest::passing("reflect.Constructor.getParameterTypes", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getParameterTypes", vec!["constructor", "params"]));
+        self.register(TckTest::passing("reflect.Constructor.getModifiers", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getModifiers", vec!["constructor", "modifiers"]));
+        self.register(TckTest::passing("reflect.Constructor.getDeclaringClass", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getDeclaringClass", vec!["constructor", "declaring"]));
+        self.register(TckTest::passing("reflect.Constructor.getDeclaredConstructors", TckCategory::Reflect, "cratonvm/TckReflect.java#ctor_getDeclaredConstructors", vec!["constructor", "list"]));
+        self.register(TckTest::passing("reflect.Annotation.classPresent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_classPresent", vec!["annotation", "class"]));
+        self.register(TckTest::passing("reflect.Annotation.classAbsent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_classAbsent", vec!["annotation", "class"]));
+        self.register(TckTest::passing("reflect.Annotation.classValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_classValue", vec!["annotation", "value"]));
+        self.register(TckTest::passing("reflect.Annotation.inherited", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_inherited", vec!["annotation", "inherited"]));
+        self.register(TckTest::passing("reflect.Annotation.inheritedValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_inheritedValue", vec!["annotation", "inherited"]));
+        self.register(TckTest::passing("reflect.Annotation.declaredExcludesInherited", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_declaredExcludesInherited", vec!["annotation", "declared"]));
+        self.register(TckTest::passing("reflect.Annotation.getAnnotationsIncludesInherited", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_getAnnotationsIncludesInherited", vec!["annotation", "inherited"]));
+        self.register(TckTest::passing("reflect.Annotation.methodPresent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodPresent", vec!["annotation", "method"]));
+        self.register(TckTest::passing("reflect.Annotation.methodValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodValue", vec!["annotation", "method"]));
+        self.register(TckTest::passing("reflect.Annotation.methodDefault", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodDefault", vec!["annotation", "default"]));
+        self.register(TckTest::passing("reflect.Annotation.methodAbsent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_methodAbsent", vec!["annotation", "method"]));
+        self.register(TckTest::passing("reflect.Annotation.fieldPresent", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_fieldPresent", vec!["annotation", "field"]));
+        self.register(TckTest::passing("reflect.Annotation.fieldValue", TckCategory::Reflect, "cratonvm/TckReflect.java#ann_fieldValue", vec!["annotation", "field"]));
+        self.register(TckTest::passing("reflect.Array.newInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_newInstance", vec!["array", "reflect"]));
+        self.register(TckTest::passing("reflect.Array.getLength", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_getLength", vec!["array", "length"]));
+        self.register(TckTest::passing("reflect.Array.getSet", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_getSet", vec!["array", "access"]));
+        self.register(TckTest::passing("reflect.Array.getObject", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_getObject", vec!["array", "object"]));
+        self.register(TckTest::passing("reflect.Array.setObject", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_setObject", vec!["array", "object"]));
+        self.register(TckTest::passing("reflect.Array.newInstanceRef", TckCategory::Reflect, "cratonvm/TckReflect.java#arr_newInstanceRef", vec!["array", "reference"]));
+        self.register(TckTest::passing("reflect.Proxy.create", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_create", vec!["proxy", "create"]));
+        self.register(TckTest::passing("reflect.Proxy.isProxyClass", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_isProxyClass", vec!["proxy", "check"]));
+        self.register(TckTest::passing("reflect.Proxy.getHandler", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_getHandler", vec!["proxy", "handler"]));
+        self.register(TckTest::passing("reflect.Proxy.objectMethods", TckCategory::Reflect, "cratonvm/TckReflect.java#proxy_objectMethods", vec!["proxy", "object"]));
+        self.register(TckTest::passing("reflect.Modifier.isPublic", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isPublic", vec!["modifier", "public"]));
+        self.register(TckTest::passing("reflect.Modifier.isStatic", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isStatic", vec!["modifier", "static"]));
+        self.register(TckTest::passing("reflect.Modifier.isFinal", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isFinal", vec!["modifier", "final"]));
+        self.register(TckTest::passing("reflect.Modifier.isAbstract", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isAbstract", vec!["modifier", "abstract"]));
+        self.register(TckTest::passing("reflect.Modifier.isInterface", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isInterface", vec!["modifier", "interface"]));
+        self.register(TckTest::passing("reflect.Modifier.isPrivate", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_isPrivate", vec!["modifier", "private"]));
+        self.register(TckTest::passing("reflect.Modifier.toString", TckCategory::Reflect, "cratonvm/TckReflect.java#mod_toString", vec!["modifier", "tostring"]));
+        self.register(TckTest::passing("reflect.Hierarchy.isInstance", TckCategory::Reflect, "cratonvm/TckReflect.java#hier_isInstance", vec!["hierarchy", "isinstance"]));
+        self.register(TckTest::passing("reflect.Hierarchy.isAssignableFromInterface", TckCategory::Reflect, "cratonvm/TckReflect.java#hier_isAssignableFromInterface", vec!["hierarchy", "assignable"]));
+        self.register(TckTest::passing("reflect.Hierarchy.superclassChain", TckCategory::Reflect, "cratonvm/TckReflect.java#hier_superclassChain", vec!["hierarchy", "chain"]));
+        self.register(TckTest::passing("reflect.Misc.invokeReturnBoxed", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_invokeReturnBoxed", vec!["method", "boxing"]));
+        self.register(TckTest::passing("reflect.Misc.multiFieldRead", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_multiFieldRead", vec!["field", "multiple"]));
+        self.register(TckTest::passing("reflect.Misc.ctorThenInvoke", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_ctorThenInvoke", vec!["constructor", "invoke"]));
+        self.register(TckTest::passing("reflect.Misc.getMethodInherited", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getMethodInherited", vec!["method", "inherited"]));
+        self.register(TckTest::passing("reflect.Misc.noSuchField", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_noSuchField", vec!["field", "exception"]));
+        self.register(TckTest::passing("reflect.Misc.noSuchMethod", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_noSuchMethod", vec!["method", "exception"]));
+        self.register(TckTest::passing("reflect.Misc.invocationTargetException", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_invocationTargetException", vec!["method", "exception"]));
+        self.register(TckTest::passing("reflect.Misc.getPublicFields", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getPublicFields", vec!["field", "public"]));
+        self.register(TckTest::passing("reflect.Misc.getPublicMethods", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getPublicMethods", vec!["method", "public"]));
+        self.register(TckTest::passing("reflect.Misc.getPublicConstructors", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_getPublicConstructors", vec!["constructor", "public"]));
+        self.register(TckTest::passing("reflect.Misc.primitiveClass", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_primitiveClass", vec!["class", "primitive"]));
+        self.register(TckTest::passing("reflect.Misc.voidClass", TckCategory::Reflect, "cratonvm/TckReflect.java#misc_voidClass", vec!["class", "void"]));
 
         // --- java.io ---
         self.register(TckTest::passing(
@@ -1222,133 +1222,133 @@ impl TckRegistry {
         self.register(TckTest::passing(
             "vm.pattern.stringPattern",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testStringPattern",
+            "cratonvm/PatternComplete.java#testStringPattern",
             vec!["pattern", "type-pattern", "switch"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.supertypeMatch",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testSupertypeMatch",
+            "cratonvm/PatternComplete.java#testSupertypeMatch",
             vec!["pattern", "type-pattern", "supertype"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.defaultCase",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testDefaultCase",
+            "cratonvm/PatternComplete.java#testDefaultCase",
             vec!["pattern", "switch", "default"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.nullVsDefault",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testNullVsDefault",
+            "cratonvm/PatternComplete.java#testNullVsDefault",
             vec!["pattern", "null", "switch"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.nullInMiddle",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testNullInMiddle",
+            "cratonvm/PatternComplete.java#testNullInMiddle",
             vec!["pattern", "null", "switch"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.guardPass",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testGuardPass",
+            "cratonvm/PatternComplete.java#testGuardPass",
             vec!["pattern", "guard", "when"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.guardFail",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testGuardFail",
+            "cratonvm/PatternComplete.java#testGuardFail",
             vec!["pattern", "guard", "when"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.multipleGuards",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testMultipleGuards",
+            "cratonvm/PatternComplete.java#testMultipleGuards",
             vec!["pattern", "guard", "when"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.recordDecon",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testRecordDecon",
+            "cratonvm/PatternComplete.java#testRecordDecon",
             vec!["pattern", "record", "deconstruction"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.recordGuard",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testRecordGuard",
+            "cratonvm/PatternComplete.java#testRecordGuard",
             vec!["pattern", "record", "guard"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.recordObjectComponent",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testRecordObjectComponent",
+            "cratonvm/PatternComplete.java#testRecordObjectComponent",
             vec!["pattern", "record", "component"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.nestedRecords",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testNestedRecords",
+            "cratonvm/PatternComplete.java#testNestedRecords",
             vec!["pattern", "record", "nested"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.recordNull",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testRecordNull",
+            "cratonvm/PatternComplete.java#testRecordNull",
             vec!["pattern", "record", "null"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.sealedSwitch",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testSealedSwitch",
+            "cratonvm/PatternComplete.java#testSealedSwitch",
             vec!["pattern", "sealed", "switch"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.sealedRect",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testSealedRect",
+            "cratonvm/PatternComplete.java#testSealedRect",
             vec!["pattern", "sealed", "switch"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.sealedDecon",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testSealedDecon",
+            "cratonvm/PatternComplete.java#testSealedDecon",
             vec!["pattern", "sealed", "deconstruction"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.instanceofPattern",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testInstanceofPattern",
+            "cratonvm/PatternComplete.java#testInstanceofPattern",
             vec!["pattern", "instanceof"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.instanceofNoMatch",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testInstanceofNoMatch",
+            "cratonvm/PatternComplete.java#testInstanceofNoMatch",
             vec!["pattern", "instanceof"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.instanceofNull",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testInstanceofNull",
+            "cratonvm/PatternComplete.java#testInstanceofNull",
             vec!["pattern", "instanceof", "null"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.instanceofChain",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testInstanceofChain",
+            "cratonvm/PatternComplete.java#testInstanceofChain",
             vec!["pattern", "instanceof", "guard"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.mixedDispatch",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testMixedDispatch",
+            "cratonvm/PatternComplete.java#testMixedDispatch",
             vec!["pattern", "switch", "integration"],
         ));
         self.register(TckTest::passing(
             "vm.pattern.areaCalc",
             TckCategory::Vm,
-            "rustjvm/PatternComplete.java#testAreaCalc",
+            "cratonvm/PatternComplete.java#testAreaCalc",
             vec!["pattern", "sealed", "record", "integration"],
         ));
     }
@@ -1639,7 +1639,7 @@ impl CompatibilityChecker {
 
     /// Null reference dereference must throw NullPointerException.
     pub fn check_null_pointer_semantics(&self) -> CheckResult {
-        // RustJVM raises a NullPointerException for null object field access
+        // CratonVM raises a NullPointerException for null object field access
         // via the exception creation infrastructure in runtime/exceptions.rs.
         CheckResult::Pass
     }
@@ -1970,7 +1970,7 @@ impl JepComplianceMatrix {
     /// Generate a human-readable compliance report table.
     pub fn generate_report(&self) -> String {
         let mut lines = Vec::new();
-        lines.push("JEP Compliance Matrix — RustJVM (JDK 25)".to_string());
+        lines.push("JEP Compliance Matrix — CratonVM (JDK 25)".to_string());
         lines.push("=".repeat(60));
         lines.push(format!(
             "{:<6} {:<40} {:<14} {}",
@@ -2287,12 +2287,12 @@ pub fn compare_output(actual: &[String], expected: &[String]) -> bool {
     })
 }
 
-/// JTReg-style test runner that uses the RustJVM to execute tests.
+/// JTReg-style test runner that uses the CratonVM to execute tests.
 ///
 /// This runner:
 /// 1. Parses JTReg directives from Java source files
 /// 2. Compiles them with javac (if available)
-/// 3. Executes the main class on RustJVM
+/// 3. Executes the main class on CratonVM
 /// 4. Compares output to expected values
 pub struct JtregRunner {
     /// Base directory for test sources
@@ -2347,7 +2347,7 @@ impl JtregRunner {
         }
     }
 
-    /// Execute a compiled test on RustJVM and capture output.
+    /// Execute a compiled test on CratonVM and capture output.
     /// Returns (success, output_lines, error_message).
     pub fn execute_test(
         &self,
@@ -2617,7 +2617,7 @@ impl CoreLanguageTck {
         let start = std::time::Instant::now();
 
         // Chapter 4: Class File Format — test via our existing test classes
-        self.run_class_tests("rustjvm/TckClassFile", &[
+        self.run_class_tests("cratonvm/TckClassFile", &[
             ("testMagicNumber", 1),
             ("testClassVersion", 1),
             ("testConstantPool", 1),
@@ -2626,7 +2626,7 @@ impl CoreLanguageTck {
         ]);
 
         // Chapter 5: Loading, Linking, Initialization
-        self.run_class_tests("rustjvm/TckLoading", &[
+        self.run_class_tests("cratonvm/TckLoading", &[
             ("testClassLoading", 1),
             ("testStaticInit", 1),
             ("testInterfaceInit", 1),
@@ -2635,7 +2635,7 @@ impl CoreLanguageTck {
         ]);
 
         // Chapter 6: Instruction Set
-        self.run_class_tests("rustjvm/TckInstructions", &[
+        self.run_class_tests("cratonvm/TckInstructions", &[
             ("testIntArithmetic", 1),
             ("testLongArithmetic", 1),
             ("testFloatArithmetic", 1),
@@ -2652,7 +2652,7 @@ impl CoreLanguageTck {
         ]);
 
         // Session 46: java.lang — TckLang (96 tests)
-        self.run_class_tests("rustjvm/TckLang", &[
+        self.run_class_tests("cratonvm/TckLang", &[
             ("obj_hashCode_consistent", 1), ("obj_equals_identity", 1),
             ("obj_equals_different", 1), ("obj_getClass", 1), ("obj_toString", 1),
             ("str_length", 1), ("str_charAt", 1), ("str_equals", 1),
@@ -2694,7 +2694,7 @@ impl CoreLanguageTck {
         ]);
 
         // Session 47: java.util — TckUtil (28 tests)
-        self.run_class_tests("rustjvm/TckUtil", &[
+        self.run_class_tests("cratonvm/TckUtil", &[
             ("testArrayListBasic", 1), ("testArrayListMutations", 1),
             ("testArrayListGrow", 1), ("testArrayListIterator", 1),
             ("testArrayListInsert", 1), ("testArrayListLastIndexOf", 1),
@@ -2712,7 +2712,7 @@ impl CoreLanguageTck {
         ]);
 
         // Session 49: java.util.concurrent — JucComplete (70 tests)
-        self.run_class_tests("rustjvm/JucComplete", &[
+        self.run_class_tests("cratonvm/JucComplete", &[
             ("testAtomicIntCas", 1), ("testAtomicIntIncrDecr", 1),
             ("testAtomicIntPreIncrDecr", 1), ("testAtomicIntAddOps", 1),
             ("testAtomicIntGetAndSet", 1), ("testAtomicLongBasic", 1),
@@ -2755,7 +2755,7 @@ impl CoreLanguageTck {
         ]);
 
         // Session 50: java.lang.reflect — TckReflect (93 tests)
-        self.run_class_tests("rustjvm/TckReflect", &[
+        self.run_class_tests("cratonvm/TckReflect", &[
             ("cls_forName", 1), ("cls_getName", 1), ("cls_getSimpleName", 1),
             ("cls_getSuperclass", 1), ("cls_objectSuperclassNull", 1),
             ("cls_isInterface", 1), ("cls_isPrimitive", 1), ("cls_isArray", 1),
@@ -2800,7 +2800,7 @@ impl CoreLanguageTck {
         ]);
 
         // Session 48: java.io / java.nio — TckIo (48 tests)
-        self.run_class_tests("rustjvm/TckIo", &[
+        self.run_class_tests("cratonvm/TckIo", &[
             // File operations
             ("file_createDeleteExists", 1), ("file_isFileIsDirectory", 1),
             ("file_mkdir", 1), ("file_length", 1),
@@ -3009,7 +3009,7 @@ impl IoNioConformanceSuite {
     }
 
     fn check_file_operations(&mut self) {
-        let unique = format!("rustjvm_s48_conformance_{:?}.tmp", std::thread::current().id());
+        let unique = format!("cratonvm_s48_conformance_{:?}.tmp", std::thread::current().id());
         let tmp = std::env::temp_dir().join(unique);
         let _ = std::fs::remove_file(&tmp); // clean up any leftover from a prior run
         let write_ok = std::fs::write(&tmp, b"hello").is_ok();
@@ -3051,7 +3051,7 @@ impl IoNioConformanceSuite {
             if !tmp.exists() { IoConformanceResult::Pass }
             else { IoConformanceResult::Fail("still exists".to_string()) });
 
-        let tmpdir = std::env::temp_dir().join(format!("rustjvm_s48_dir_{:?}", std::thread::current().id()));
+        let tmpdir = std::env::temp_dir().join(format!("cratonvm_s48_dir_{:?}", std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&tmpdir);
         let mkdir_ok = std::fs::create_dir(&tmpdir).is_ok();
         self.record("io.file.mkdir",
@@ -3152,7 +3152,7 @@ impl IoNioConformanceSuite {
 
     fn check_channel_operations(&mut self) {
         self.record("nio.channel.initial_position_zero", IoConformanceResult::Pass);
-        let tmp = std::env::temp_dir().join(format!("rustjvm_s48_chan_{:?}.tmp", std::thread::current().id()));
+        let tmp = std::env::temp_dir().join(format!("cratonvm_s48_chan_{:?}.tmp", std::thread::current().id()));
         let _ = std::fs::write(&tmp, b"abcdef");
         let len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         self.record("nio.channel.size_matches_file_length",

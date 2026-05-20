@@ -19,8 +19,8 @@
 //!     MANIFEST.MF on JDK 25. We use the FileSystemProvider service file as
 //!     a positive control for the jimage path.
 //!
-//! Subprocess pattern: spawn the `rustjvm` binary from
-//! `target/{release,debug}` (or `RUSTJVM_BIN` if set) with the EnumTest
+//! Subprocess pattern: spawn the `cratonvm` binary from
+//! `target/{release,debug}` (or `CRATONVM_BIN` if set) with the EnumTest
 //! fixture and assert on stdout. Skips when the binary or `javac` is
 //! unavailable so the test can run hermetically in CI.
 
@@ -51,8 +51,8 @@ public class EnumTest {
 const SVCTEST_MANIFEST_MF: &str = "Manifest-Version: 1.0\r\n";
 const SVCTEST_SERVICE_FILE: &str = "x\n";
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -60,7 +60,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -115,7 +115,7 @@ fn build_svctest_jar(workdir: &Path) -> Option<PathBuf> {
     Some(jar_path)
 }
 
-/// Run rustjvm with the given classpath and resource arg. Returns the
+/// Run cratonvm with the given classpath and resource arg. Returns the
 /// (stdout, stderr) on successful spawn.
 fn run_enumtest(
     bin: &Path,
@@ -176,12 +176,12 @@ fn parse_total(stdout: &str) -> i64 {
 /// Sessions 96 and 103 wired up.
 #[test]
 fn wave1_b2_classpath_jar_manifest_enumerated() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[wave1_b2_bootloader_resources] skip: rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[wave1_b2_bootloader_resources] skip: cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return;
         }
@@ -210,7 +210,7 @@ fn wave1_b2_classpath_jar_manifest_enumerated() {
     let cp = format!("{}{sep}{}", classes.display(), jar.display());
 
     let (stdout, stderr) =
-        run_enumtest(&bin, &cp, None, Duration::from_secs(60)).expect("spawn rustjvm");
+        run_enumtest(&bin, &cp, None, Duration::from_secs(60)).expect("spawn cratonvm");
 
     assert!(
         stdout.contains("OK"),
@@ -233,11 +233,11 @@ fn wave1_b2_classpath_jar_manifest_enumerated() {
 /// boot loader has no jimage entries and we cannot validate the contract).
 #[test]
 fn wave1_b2_jimage_service_descriptor_enumerated() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[wave1_b2_bootloader_resources] skip: rustjvm binary not found"
+                "[wave1_b2_bootloader_resources] skip: cratonvm binary not found"
             );
             return;
         }
@@ -258,7 +258,7 @@ fn wave1_b2_jimage_service_descriptor_enumerated() {
     let res = "META-INF/services/java.nio.file.spi.FileSystemProvider";
 
     let (stdout, stderr) = run_enumtest(&bin, &cp, Some(res), Duration::from_secs(60))
-        .expect("spawn rustjvm");
+        .expect("spawn cratonvm");
 
     assert!(
         stdout.contains("OK"),
@@ -291,11 +291,11 @@ fn wave1_b2_jimage_service_descriptor_enumerated() {
 /// empty enumeration" contract.
 #[test]
 fn wave1_b2_missing_jimage_resource_returns_zero() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[wave1_b2_bootloader_resources] skip: rustjvm binary not found"
+                "[wave1_b2_bootloader_resources] skip: cratonvm binary not found"
             );
             return;
         }
@@ -318,7 +318,7 @@ fn wave1_b2_missing_jimage_resource_returns_zero() {
     let res = "META-INF/this/does/not/exist/anywhere.txt";
 
     let (stdout, _stderr) = run_enumtest(&bin, &cp, Some(res), Duration::from_secs(60))
-        .expect("spawn rustjvm");
+        .expect("spawn cratonvm");
 
     assert!(stdout.contains("OK"), "[wave1_b2] expected OK in stdout: {stdout}");
     let total = parse_total(&stdout);

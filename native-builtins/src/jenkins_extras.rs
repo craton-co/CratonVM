@@ -5,9 +5,9 @@
 //! Short-circuit Main.main directly so the JVM exits rc=0 — boot-test
 //! success.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn jenkins_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[jenkins-shim] Main.main short-circuited (Java-25 bypass)");
@@ -15,9 +15,9 @@ fn jenkins_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 }
 
 pub fn register_jenkins_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_JENKINS_REAL=1, skip the short-circuit so
+    // Diagnostic gate: when CRATONVM_JENKINS_REAL=1, skip the short-circuit so
     // the real Winstone launcher runs end-to-end (used for `--version`).
-    if std::env::var("RUSTJVM_JENKINS_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_JENKINS_REAL").as_deref() == Ok("1") {
         return;
     }
     registry.register(

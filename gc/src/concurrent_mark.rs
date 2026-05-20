@@ -28,7 +28,7 @@ use crate::heap::{
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
-use rustjvm_types::Value;
+use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
 // Concurrent GC phase tracking
@@ -563,7 +563,7 @@ impl std::fmt::Debug for ConcurrentMarker {
 mod tests {
     use super::*;
     use crate::heap::{ObjectHeader, ObjectKind, ArrayElementType, HEADER_SIZE, SLOT_SIZE};
-    use rustjvm_types::{ClassId, ObjectRef, Value};
+    use cratonvm_types::{ClassId, ObjectRef, Value};
 
     fn make_old_gen_with_object(num_slots: u32) -> (OldGen, *mut u8) {
         let mut og = OldGen::new(65536);

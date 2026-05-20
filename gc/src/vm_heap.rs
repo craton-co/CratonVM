@@ -11,7 +11,7 @@ use crate::gen_heap::GenerationalHeap;
 use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::sync::Arc;
 
 /// Which GC backend to use.
@@ -644,7 +644,7 @@ impl VmHeap {
     }
 
     /// Mark roots into G1's mark bitmap.
-    pub fn g1_mark_roots(&self, roots: &[rustjvm_types::ObjectRef]) {
+    pub fn g1_mark_roots(&self, roots: &[cratonvm_types::ObjectRef]) {
         if let VmHeap::G1(g1) = self {
             g1.remark(roots); // remark marks roots + drains SATB
         }

@@ -8,7 +8,7 @@
 //! containing class's `<clinit>` — `java.lang.System$1` for
 //! `JavaLangAccess`, `java.lang.invoke.MethodHandleImpl$1` for
 //! `JavaLangInvokeAccess`, etc.  When the installation never runs
-//! (because rustjvm's synthetic boot doesn't execute every
+//! (because cratonvm's synthetic boot doesn't execute every
 //! clinit end-to-end) `SharedSecrets.getJavaLangAccess()` returns
 //! `null`, and a downstream `jla.<method>` invokevirtual throws
 //! NullPointerException — most famously "Cannot invoke
@@ -22,7 +22,7 @@
 //! 2. Registering an opinionated Rust implementation of every
 //!    interface method on that concrete class, so invokeinterface
 //!    (which dispatches through the receiver's concrete class)
-//!    resolves to a rustjvm native rather than the (null) Java
+//!    resolves to a cratonvm native rather than the (null) Java
 //!    field read.
 //!
 //! The native-side dispatch lives in
@@ -37,7 +37,7 @@
 //! semantics where the real JDK path pulls in subsystems we
 //! don't implement.  For example,
 //! `JavaLangRefAccess.waitForReferenceProcessing()` is a no-op in
-//! our impl — rustjvm's generational GC doesn't pipeline
+//! our impl — cratonvm's generational GC doesn't pipeline
 //! reference processing — but the method is reachable and returns
 //! the expected boolean (`false` = nothing pending).
 //!
@@ -50,7 +50,7 @@
 //! * `native-builtins/src/shared_secrets_bridge.rs` — per-method
 //!   registration.
 
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ObjectRef;
 
 /// WP1.4 — tag for each `Java*Access` interface we bridge.
 ///
@@ -143,11 +143,11 @@ impl SharedSecretsInterface {
     /// Concrete synthetic-class name that implements the
     /// interface — these match the HotSpot anonymous inner-class
     /// singletons so invokeinterface resolving a receiver of this
-    /// class hits the matching rustjvm native.
+    /// class hits the matching cratonvm native.
     ///
     /// For interfaces without a canonical `$N` owner (the newer
     /// Access split-outs), we pick a stable synthetic name prefixed
-    /// with `rustjvm/internal/ss/` so it can never collide with a
+    /// with `cratonvm/internal/ss/` so it can never collide with a
     /// real JDK class.
     pub fn owner_class(&self) -> &'static str {
         match self {
@@ -157,15 +157,15 @@ impl SharedSecretsInterface {
             Self::JavaLangReflect => "java/lang/reflect/ReflectAccess",
             Self::JavaIO => "java/io/Console$1",
             Self::JavaIORandomAccessFile => {
-                "rustjvm/internal/ss/JavaIORandomAccessFileAccess$1"
+                "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1"
             }
             Self::JavaNetInetAddress => "java/net/InetAddress$1",
-            Self::JavaNetUri => "rustjvm/internal/ss/JavaNetUriAccess$1",
+            Self::JavaNetUri => "cratonvm/internal/ss/JavaNetUriAccess$1",
             Self::JavaNio => "java/nio/Buffer$1",
             Self::JavaSecurity => "java/security/AccessController$1",
-            Self::JavaUtilJar => "rustjvm/internal/ss/JavaUtilJarAccess$1",
+            Self::JavaUtilJar => "cratonvm/internal/ss/JavaUtilJarAccess$1",
             Self::JavaUtilZipFile => "java/util/zip/ZipFile$1",
-            Self::JavaNetHttpCookie => "rustjvm/internal/ss/JavaNetHttpCookieAccess$1",
+            Self::JavaNetHttpCookie => "cratonvm/internal/ss/JavaNetHttpCookieAccess$1",
             Self::JavaObjectInputStream => "java/io/ObjectInputStream$1",
             Self::JavaUtilResourceBundle => "java/util/ResourceBundle$1",
         }

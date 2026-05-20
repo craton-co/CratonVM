@@ -11,13 +11,13 @@ On a CUDA-12.x Windows x64 box with an NVIDIA GPU:
 
 ```powershell
 # Build with the real driver bindings.
-cargo build --release -p rustjvm-cli --bin rustjvm --features gpu-driver
+cargo build --release -p cratonvm-cli --bin cratonvm --features gpu-driver
 
 # CPU baseline.
-./target/release/rustjvm.exe --classpath test_classes/gpu Benchmark 16777216
+./target/release/cratonvm.exe --classpath test_classes/gpu Benchmark 16777216
 
 # GPU run.
-./target/release/rustjvm.exe --gpu --classpath test_classes/gpu Benchmark 16777216
+./target/release/cratonvm.exe --gpu --classpath test_classes/gpu Benchmark 16777216
 ```
 
 Both invocations emit a single line of the form:
@@ -37,7 +37,7 @@ mode=auto n=16777216 elapsed_ns=<NS> out[0]=<V0> out[n-1]=<VN1>
    Smaller speedups are *not* a fail — file a follow-up to look at
    marshalling overhead, but do not falsify the number.
 3. **No regression:** `cargo test --workspace` (no features) still
-   passes; `cargo test --workspace --features rustjvm-cli/gpu` builds
+   passes; `cargo test --workspace --features cratonvm-cli/gpu` builds
    cleanly even on the GPU box (some tests will be `#[ignore]` until
    the runtime is wired).
 

@@ -37,8 +37,8 @@
 
 #![cfg(not(feature = "synthetic-jdk"))]
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::Vm;
 
 /// Real JDK 25 install — only run when JAVA_HOME points at a real JDK.
 fn java_home() -> Option<std::path::PathBuf> {
@@ -96,7 +96,7 @@ fn management_factory_clinit_no_swallow() {
         "swallow_counter incremented during ManagementFactory class init \
          (baseline={baseline}, after={after}). The most likely cause is a \
          missing or wrong-descriptor native on sun/management/VMManagementImpl. \
-         Re-run with RUSTJVM_STRICT_SWALLOWS=1 for a backtrace pinpointing \
+         Re-run with CRATONVM_STRICT_SWALLOWS=1 for a backtrace pinpointing \
          the exact native."
     );
 }

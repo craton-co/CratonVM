@@ -42,7 +42,7 @@ use crate::heap::{
 };
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -639,7 +639,7 @@ impl GenerationalHeap {
         let num_slots = header.num_slots as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 obj = ?obj_ref.as_ptr(),
                 index,
                 num_slots,
@@ -686,7 +686,7 @@ impl GenerationalHeap {
         let num_slots = header.num_slots as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 obj = ?obj_ref.as_ptr(),
                 index,
                 num_slots,
@@ -817,7 +817,7 @@ impl GenerationalHeap {
             // can hit this path tens of thousands of times. Emitting a full
             // `Backtrace::force_capture` each time produces hundreds of MB
             // of stderr and exhausts disk. Keep the first few one-line
-            // warnings (with backtrace gated by `RUSTJVM_GC_ARRAY_GUARD_BT`)
+            // warnings (with backtrace gated by `CRATONVM_GC_ARRAY_GUARD_BT`)
             // and silently return 0 thereafter.
             static GUARD_COUNT: AtomicUsize = AtomicUsize::new(0);
             const GUARD_LIMIT: usize = 5;
@@ -857,7 +857,7 @@ impl GenerationalHeap {
                     let stored_len = (obj_ptr.add(12) as *const u32).read_unaligned();
                     (kind_byte, elem_byte, class_id_raw, stored_len)
                 };
-                let msg = if std::env::var_os("RUSTJVM_GC_ARRAY_GUARD_BT").is_some() {
+                let msg = if std::env::var_os("CRATONVM_GC_ARRAY_GUARD_BT").is_some() {
                     let bt = Backtrace::force_capture();
                     format!(
                         "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{})\nbacktrace:\n{}\n",
@@ -872,7 +872,7 @@ impl GenerationalHeap {
                     )
                 } else {
                     format!(
-                        "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{}; set RUSTJVM_GC_ARRAY_GUARD_BT=1 for backtrace)\n",
+                        "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{}; set CRATONVM_GC_ARRAY_GUARD_BT=1 for backtrace)\n",
                         kind_byte,
                         class_id_raw,
                         elem_byte,
@@ -2107,7 +2107,7 @@ impl GenerationalHeap {
         let node = self.numa_slow_path_hint();
         if self.numa_num_nodes > 1 && node != self.numa_node_hint {
             tracing::trace!(
-                target: "rustjvm::gc::numa",
+                target: "cratonvm::gc::numa",
                 node, primary = self.numa_node_hint, size,
                 "try_alloc_young: cross-node slow path (single-arena fallback)",
             );
@@ -2150,7 +2150,7 @@ impl GenerationalHeap {
         let node = self.numa_slow_path_hint();
         if self.numa_num_nodes > 1 && node != self.numa_node_hint {
             tracing::trace!(
-                target: "rustjvm::gc::numa",
+                target: "cratonvm::gc::numa",
                 node, primary = self.numa_node_hint, requested_size,
                 "refill_tlab: cross-node refill (single-arena fallback)",
             );
@@ -2229,7 +2229,7 @@ impl GenerationalHeap {
             || header.array_length > (1 << 27)
         {
             tracing::debug!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 old_ptr = ?old_ptr,
                 kind_byte,
                 num_slots = header.num_slots,
@@ -2254,7 +2254,7 @@ impl GenerationalHeap {
             // callers to freed memory.
             if fwd.is_null() || (fwd as usize) % 8 != 0 {
                 tracing::debug!(
-                    target: "rustjvm::gc::guard",
+                    target: "cratonvm::gc::guard",
                     fwd = ?fwd,
                     old_ptr = ?old_ptr,
                     class_id = ?header.class_id,

@@ -1,7 +1,7 @@
 //! cglib_probe boot-test shims — comprehensive coverage.
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn cglib_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[cglib-shim] short-circuited (SEGV avoidance)");
@@ -9,12 +9,12 @@ fn cglib_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
 }
 
 pub fn register_cglib_stubs(registry: &mut NativeMethodRegistry) {
-    // Real-mode gate: when RUSTJVM_CGLIB_REAL is set (any value),
+    // Real-mode gate: when CRATONVM_CGLIB_REAL is set (any value),
     // skip every boot-test short-circuit so the real cglib code path
     // runs. Used by diag harnesses to measure how far CratonVM gets on
     // the actual cglib probe before failure.
-    if std::env::var_os("RUSTJVM_CGLIB_REAL").is_some() {
-        tracing::warn!("[cglib-shim] RUSTJVM_CGLIB_REAL set - skipping cglib boot-test shims");
+    if std::env::var_os("CRATONVM_CGLIB_REAL").is_some() {
+        tracing::warn!("[cglib-shim] CRATONVM_CGLIB_REAL set - skipping cglib boot-test shims");
         return;
     }
     // Comprehensive ASM + cglib clinit no-ops to prevent SEGV.

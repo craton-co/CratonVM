@@ -6,11 +6,11 @@
 //! underlying I/O contract: bytes written via the fd round-trip
 //! through the file system identically.
 
-use rustjvm_native_api::fd_table::FileDescriptorTable;
+use cratonvm_native_api::fd_table::FileDescriptorTable;
 
 fn tmp_path(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("rustjvm_phase_b_{}_{}.txt", name, std::process::id()));
+    p.push(format!("cratonvm_phase_b_{}_{}.txt", name, std::process::id()));
     p
 }
 

@@ -732,8 +732,8 @@ mod tests {
 
     // -- T10.4 promoted invoke cache --------------------------------------
 
-    fn sample_bytecode_method(class_id: u32) -> std::sync::Arc<rustjvm_jit_api::CachedBytecodeMethod> {
-        std::sync::Arc::new(rustjvm_jit_api::CachedBytecodeMethod {
+    fn sample_bytecode_method(class_id: u32) -> std::sync::Arc<cratonvm_jit_api::CachedBytecodeMethod> {
+        std::sync::Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
             declaring_class_id: ClassId::new(class_id),
             class_name: std::sync::Arc::from("A"),
             method_name: std::sync::Arc::from("m"),

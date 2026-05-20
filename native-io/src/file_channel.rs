@@ -25,10 +25,10 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::fd_table::FdId;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::fd_table::FdId;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // IOStatus constants — mirror the JDK's sun.nio.ch.IOStatus values so the
@@ -772,7 +772,7 @@ fn native_fc_map0_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_native_api::fd_table::FileDescriptorTable;
+    use cratonvm_native_api::fd_table::FileDescriptorTable;
     use std::io::Write;
 
     /// Round-trip: mmap a real file RW, mutate via the mapping,

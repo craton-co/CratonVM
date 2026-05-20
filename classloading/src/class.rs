@@ -8,11 +8,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
-use rustjvm_reader::class_access_flags::ClassAccessFlags;
-use rustjvm_reader::class_file_version::ClassFileVersion;
-use rustjvm_reader::constant_pool::ConstantPool;
-use rustjvm_reader::field::ClassFileField;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::class_access_flags::ClassAccessFlags;
+use cratonvm_reader::class_file_version::ClassFileVersion;
+use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::field::ClassFileField;
+use cratonvm_reader::method::ClassFileMethod;
 
 // ---------------------------------------------------------------------------
 // ClassState — the class lifecycle state machine (JVM spec 5.5)
@@ -65,7 +65,7 @@ impl fmt::Display for ClassState {
 }
 
 // Re-export ClassId and ClassLoaderId from the shared types crate.
-pub use rustjvm_types::{ClassId, ClassLoaderId};
+pub use cratonvm_types::{ClassId, ClassLoaderId};
 
 // ---------------------------------------------------------------------------
 // CodeSource — per-class protection-domain location + signer certificates
@@ -236,7 +236,7 @@ pub struct Class {
     /// Stored as a shared `Arc<str>` so classes that reference the same
     /// name (e.g. 100s of `.class` files mentioning `"java/lang/Object"`)
     /// share a single backing allocation. The backing storage originates
-    /// from [`rustjvm_types::intern_arc`] at parse time in the reader's
+    /// from [`cratonvm_types::intern_arc`] at parse time in the reader's
     /// constant-pool path. Cloning this field is a single refcount bump.
     pub name: Arc<str>,
 
@@ -285,13 +285,13 @@ pub struct Class {
 
     /// Bootstrap methods from the `BootstrapMethods` class attribute (JVM spec 4.7.23).
     /// Used by `invokedynamic` instructions to resolve call sites.
-    pub bootstrap_methods: Vec<rustjvm_reader::attribute::BootstrapMethod>,
+    pub bootstrap_methods: Vec<cratonvm_reader::attribute::BootstrapMethod>,
 
     /// Generic signature string from the Signature attribute (JVMS §4.7.9).
     pub signature: Option<String>,
 
     /// Annotations on this class (from RuntimeVisibleAnnotations and RuntimeInvisibleAnnotations).
-    pub annotations: Vec<rustjvm_reader::attribute::Annotation>,
+    pub annotations: Vec<cratonvm_reader::attribute::Annotation>,
 
     /// Nest host class name (from NestHost attribute, JEP 181).
     /// If `None`, this class is its own nest host (or has NestMembers).
@@ -451,7 +451,7 @@ impl Class {
     // without binding to the `&str` lifetime of the enclosing borrow.
     //
     // Backing storage originates in the reader's constant-pool path
-    // (`rustjvm_types::intern_arc` at parse time), so identical names
+    // (`cratonvm_types::intern_arc` at parse time), so identical names
     // loaded across many classes share a single allocation. Two `Arc<str>`
     // returned from these methods for the same content compare equal via
     // `Arc::ptr_eq`.
@@ -927,10 +927,10 @@ pub fn find_method_recursive<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_reader::class_access_flags::{
+    use cratonvm_reader::class_access_flags::{
         ClassAccessFlags, FieldAccessFlags, MethodAccessFlags,
     };
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     /// Create a minimal constant pool (just a tombstone).
     fn empty_constant_pool() -> ConstantPool {
@@ -952,7 +952,7 @@ mod tests {
         Class {
             id,
             loader_id: ClassLoaderId::Application,
-            name: rustjvm_types::intern_arc(name),
+            name: cratonvm_types::intern_arc(name),
             source_file: None,
             version: ClassFileVersion::JAVA_8,
             state: ClassState::Loaded, initializing_thread: None,
@@ -986,8 +986,8 @@ mod tests {
     fn make_field(name: &str) -> ClassFileField {
         ClassFileField {
             access_flags: FieldAccessFlags::empty(),
-            name: rustjvm_types::intern_arc(name),
-            descriptor: rustjvm_types::intern_arc("I"),
+            name: cratonvm_types::intern_arc(name),
+            descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
     }
@@ -995,8 +995,8 @@ mod tests {
     fn make_method(name: &str, descriptor: &str) -> ClassFileMethod {
         ClassFileMethod {
             access_flags: MethodAccessFlags::empty(),
-            name: rustjvm_types::intern_arc(name),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(name),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         }
     }
@@ -1569,8 +1569,8 @@ mod tests {
     fn make_abstract_method(name: &str, descriptor: &str) -> ClassFileMethod {
         ClassFileMethod {
             access_flags: MethodAccessFlags::ABSTRACT | MethodAccessFlags::PUBLIC,
-            name: rustjvm_types::intern_arc(name),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(name),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         }
     }
@@ -1579,8 +1579,8 @@ mod tests {
         // Default method = non-abstract on an interface (has code).
         ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC,
-            name: rustjvm_types::intern_arc(name),
-            descriptor: rustjvm_types::intern_arc(descriptor),
+            name: cratonvm_types::intern_arc(name),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         }
     }
@@ -1894,11 +1894,11 @@ mod tests {
         );
 
         // Simulate the `class_manager` construction path that interns the
-        // name via `rustjvm_types::intern_arc`. `make_class` constructs via
+        // name via `cratonvm_types::intern_arc`. `make_class` constructs via
         // `Arc::from(name)` directly in tests; reset both sides through the
         // global pool to verify the interning semantics hold end-to-end.
-        let name1: Arc<str> = rustjvm_types::intern_arc(&class_a.name);
-        let name2: Arc<str> = rustjvm_types::intern_arc(&class_b.name);
+        let name1: Arc<str> = cratonvm_types::intern_arc(&class_a.name);
+        let name2: Arc<str> = cratonvm_types::intern_arc(&class_b.name);
 
         assert_eq!(&*name1, "java/lang/String");
         assert_eq!(&*name2, "java/lang/String");
@@ -1914,8 +1914,8 @@ mod tests {
         // We verify this holds when names are funneled through the intern
         // pool, which is the path `class_manager::define_class_with_options`
         // takes at load time.
-        let pooled1 = rustjvm_types::intern_arc(&field1);
-        let pooled2 = rustjvm_types::intern_arc(&field2);
+        let pooled1 = cratonvm_types::intern_arc(&field1);
+        let pooled2 = cratonvm_types::intern_arc(&field2);
         assert!(Arc::ptr_eq(&pooled1, &pooled2));
     }
 }

@@ -19,7 +19,7 @@
 //! See `bench/ejbca-deploy/diagnostic.md` §"BC ASN.1 PKCS#10" for the
 //! audit that motivates this work.
 
-use rustjvm_native_builtins::jca::asn1;
+use cratonvm_native_builtins::jca::asn1;
 
 /// Test 1 — AlgorithmIdentifier with NULL parameters (RSA shape).
 ///

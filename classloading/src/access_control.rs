@@ -3,13 +3,13 @@
 //! Checks whether a class, field, or method is accessible from a given context.
 //! Returns `IllegalAccessError` when access is denied.
 
-use rustjvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
+use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
 #[cfg(test)]
 use std::sync::Arc;
 
 use super::class::{Class, ClassStore};
 use crate::module::{package_of as module_pkg_of, ModuleRegistry, UNNAMED_MODULE};
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 /// Check whether `accessor` can access `target` class.
 ///
@@ -297,9 +297,9 @@ pub fn check_module_access_by_id(
 mod tests {
     use super::*;
     use crate::class::{Class, ClassId, ClassLoaderId, ClassState, ClassStore};
-    use rustjvm_reader::class_access_flags::ClassAccessFlags;
-    use rustjvm_reader::class_file_version::ClassFileVersion;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_reader::class_file_version::ClassFileVersion;
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     fn empty_cp() -> ConstantPool {
         ConstantPool::new(vec![ConstantPoolEntry::Tombstone])

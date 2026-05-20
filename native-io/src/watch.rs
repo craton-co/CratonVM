@@ -84,9 +84,9 @@ use notify::{
     Config, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
 };
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, Value};
 
 // ---------------------------------------------------------------------------
 // Event kind bits — kept in sync with `lib.rs` constants so a Java-side
@@ -546,7 +546,7 @@ fn ws_init_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 /// Helper: pull the ws_id out of the receiver's first int field.
-fn ws_id_of(ctx: &mut dyn NativeContext, this: rustjvm_types::ObjectRef) -> i32 {
+fn ws_id_of(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef) -> i32 {
     if ctx.object_num_fields(this) == 0 {
         return 0;
     }

@@ -1,13 +1,13 @@
 //! VM-specific GC helpers.
 //!
-//! The core GC algorithm lives in the `rustjvm-gc` crate. This module
+//! The core GC algorithm lives in the `cratonvm-gc` crate. This module
 //! provides the VM-specific `update_all_roots` function and re-exports
 //! the gc crate's types for backward compatibility.
 
 use std::collections::HashMap;
 
 // Re-export everything from the gc crate's gc module.
-pub use rustjvm_gc::gc::*;
+pub use cratonvm_gc::gc::*;
 
 use crate::types::ObjectRef;
 #[cfg(test)]
@@ -226,12 +226,12 @@ pub fn update_all_roots(
     //     under a moving collector their addresses change and we must
     //     remap them here, otherwise the next cache lookup returns a
     //     stale pointer.
-    rustjvm_native_builtins::lang_math::gc_update_value_of_cache_refs(pointer_map);
+    cratonvm_native_builtins::lang_math::gc_update_value_of_cache_refs(pointer_map);
 
     // 16. Round-9 perf + GC fix: re-point the process-global LambdaMetafactory
     //     CallSite cache living in `native-builtins/src/lang_invoke.rs`.
     //     Same scan/update contract as the Integer.valueOf cache.
-    rustjvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
+    cratonvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);

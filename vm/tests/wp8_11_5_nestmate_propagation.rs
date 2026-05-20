@@ -37,8 +37,8 @@
 //! `MockNativeContext` is `pub(crate)`. This file therefore pins the
 //! contract surface that crosses crate boundaries.
 
-use rustjvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions};
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions};
+use cratonvm_native_api::NativeMethodRegistry;
 
 const LK_CLASS: &str = "java/lang/invoke/MethodHandles$Lookup";
 const HIDDEN_DESC: &str = "([BZ[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)\
@@ -54,7 +54,7 @@ const HIDDEN_WITH_DATA_DESC: &str =
 #[test]
 fn lookup_define_hidden_class_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::lookup_define::register_lookup_define_class(&mut r);
+    cratonvm_native_builtins::lookup_define::register_lookup_define_class(&mut r);
 
     assert!(
         r.find(LK_CLASS, "defineHiddenClass", HIDDEN_DESC).is_some(),
@@ -70,7 +70,7 @@ fn lookup_define_hidden_class_native_registered() {
 #[test]
 fn lookup_define_hidden_class_with_class_data_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::lookup_define::register_lookup_define_class(&mut r);
+    cratonvm_native_builtins::lookup_define::register_lookup_define_class(&mut r);
 
     assert!(
         r.find(LK_CLASS, "defineHiddenClassWithClassData", HIDDEN_WITH_DATA_DESC)

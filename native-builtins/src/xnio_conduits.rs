@@ -74,9 +74,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -1141,7 +1141,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     fn make_byte_buffer(
         ctx: &mut crate::test_utils::MockNativeContext,
@@ -1360,7 +1360,7 @@ mod tests {
         // SAFETY: single-threaded test context.
         unsafe {
             *slot = Some(Err(MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Internal {
+                cratonvm_types::error::VmError::Internal {
                     message: "synthetic panic in listener".into(),
                 },
             )));
@@ -1551,7 +1551,7 @@ mod tests {
 
         let b1 = make_byte_buffer(&mut ctx, 5);
         let b2 = make_byte_buffer(&mut ctx, 8);
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 2);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
         ctx.set_array_element(arr, 0, Value::Object(Some(b1)));
         ctx.set_array_element(arr, 1, Value::Object(Some(b2)));
 

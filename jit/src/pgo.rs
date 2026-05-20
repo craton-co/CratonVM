@@ -1,4 +1,4 @@
-//! Profile-Guided Optimization (PGO) pipeline for the RustJVM JIT compiler.
+//! Profile-Guided Optimization (PGO) pipeline for the CratonVM JIT compiler.
 //!
 //! Collects and analyses runtime profiling data to drive:
 //! - Branch prediction hints

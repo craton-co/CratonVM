@@ -27,7 +27,7 @@
 //! Entries live as long as the `SharedVm`. Because `ObjectStreamClass`
 //! descriptors themselves hold references back into the VM heap (the
 //! constructor, method, and field mirrors), we do *not* use a soft
-//! reference — in rustjvm's current GC we don't have softref semantics,
+//! reference — in cratonvm's current GC we don't have softref semantics,
 //! and clearing the cache would re-open the NPE this module exists to
 //! fix.
 //!
@@ -41,7 +41,7 @@
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-use rustjvm_types::{ClassId, ObjectRef};
+use cratonvm_types::{ClassId, ObjectRef};
 
 /// A per-VM cache of `ObjectStreamClass` mirror objects keyed by
 /// `ClassId`.

@@ -11,7 +11,7 @@
 > Until then, each section tracks two numbers:
 >
 > * **Pass %** — ratio of in-repo tests (`cargo test --workspace` +
->   `rustjvm-vm` integration tests + Phase-I smoke runners) that
+>   `cratonvm-vm` integration tests + Phase-I smoke runners) that
 >   exercise the section's API surface, weighted by rough surface area.
 > * **Open bugs** — count of unresolved items in
 >   `docs/roadmap-any-java-app.md` + `docs/roadmap.md` that affect
@@ -45,7 +45,7 @@
 | `api/java_lang/invoke` | `MethodHandle`, `VarHandle`, `LambdaMetafactory`, `StringConcatFactory` | **78%** | 2 | RC.8, RG.12 | `findStatic/findVirtual/findSpecial` pass the RC.8 matrix test. `invokedynamic` capture works for lambdas but dynamic-proxy-style indy chains still trip `tracing::warn!` about unresolved bootstrap methods. |
 | `api/java_lang/reflect` | `Field`, `Method`, `Constructor`, `AccessibleObject`, `Proxy` | **85%** | 2 | RC.1..RC.7 | Javadoc-accurate argument coercion via `lang_class::coerce_arg_strict`. Known gap: `Proxy.newProxyInstance` does not currently synthesise a new class-file; interface-method dispatch works by name lookup. |
 | `api/java_lang/ref` | `Weak/Soft/PhantomReference`, `Cleaner`, `ReferenceQueue` | **70%** | 3 | RH.2, RH.3 | Weak/Soft enqueue correctly after GC; Phantom enqueue wiring is present in `gc/src/reference.rs` but Cleaner executor integration has one outstanding flake on Windows. |
-| `api/java_util` | Collections, `Optional`, `StringTokenizer`, `Random`, `Scanner` | **88%** | 0 | — | `HashMap`, `LinkedHashMap`, `TreeMap`, `ArrayDeque`, `PriorityQueue` all exercised by `rustjvm-native-collections` tests + the `TckIo` integration fixture. |
+| `api/java_util` | Collections, `Optional`, `StringTokenizer`, `Random`, `Scanner` | **88%** | 0 | — | `HashMap`, `LinkedHashMap`, `TreeMap`, `ArrayDeque`, `PriorityQueue` all exercised by `cratonvm-native-collections` tests + the `TckIo` integration fixture. |
 | `api/java_util/concurrent` | `AtomicInteger/Long/Reference`, `CHM`, `ReentrantLock`, `ThreadPoolExecutor`, `CompletableFuture` | **82%** | 1 | RD.1..RD.10 | Phase-D pass (session 77) tightened CAS loops and added `compareAndExchange`, `weakCompareAndSet*`, `getAndUpdate`. `ForkJoinPool.commonPool()` is live. One flaky test in `m18_stamped_init_creates_state` (pre-existing, passes in isolation). |
 | `api/java_util/concurrent/atomic` | `AtomicInteger/Long/Boolean/Reference`, `LongAdder`, `DoubleAdder` | **95%** | 0 | RD.1, RD.2 | 8-thread contention CAS test hits the expected 800 000 increments. |
 | `api/java_util/concurrent/locks` | `ReentrantLock`, `Condition`, `StampedLock`, `LockSupport` | **90%** | 0 | RD.4, RD.5 | CAS-based owner claim; `Condition.awaitNanos` honours timeouts within 1 ms tolerance. |

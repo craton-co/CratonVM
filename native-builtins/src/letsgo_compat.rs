@@ -9,10 +9,10 @@
 //! Add new compat fallbacks here rather than deeper in the class-specific
 //! files so the broader compatibility surface stays auditable.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::{ObjectRef, Value};
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
 
 use crate::alloc_concurrent_synthetic;
 

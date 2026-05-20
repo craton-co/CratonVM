@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -99,11 +99,11 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // Errors / helpers
 // ---------------------------------------------------------------------------
 
-fn ioex<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IOException { message: message.into() }.into()
 }
 
-fn iae<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IllegalArgumentException { message: message.into() }.into()
 }
 
@@ -388,7 +388,7 @@ fn build_http1_request(
         let _ = write!(&mut out, "{k}: {v}\r\n");
     }
     if !has_user_agent {
-        out.extend_from_slice(b"User-Agent: rustjvm-httpclient/1.0\r\n");
+        out.extend_from_slice(b"User-Agent: cratonvm-httpclient/1.0\r\n");
     }
     if !has_accept {
         out.extend_from_slice(b"Accept: */*\r\n");
@@ -1139,7 +1139,7 @@ fn alloc_error_response(ctx: &mut dyn NativeContext, request: ObjectRef, uri: &s
     let resp = WireResponse {
         status: 0,
         version_h2: false,
-        headers: vec![("x-rustjvm-error".to_string(), msg.to_string())],
+        headers: vec![("x-cratonvm-error".to_string(), msg.to_string())],
         body: msg.as_bytes().to_vec(),
         keep_alive: false,
     };
@@ -1707,7 +1707,7 @@ mod http_client_tests {
         let s = String::from_utf8(req).unwrap();
         assert!(s.starts_with("GET / HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
-        assert!(s.contains("User-Agent: rustjvm-httpclient/1.0"));
+        assert!(s.contains("User-Agent: cratonvm-httpclient/1.0"));
     }
 
     #[test]

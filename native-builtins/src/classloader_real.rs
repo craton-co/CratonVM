@@ -9,8 +9,8 @@
 
 use std::sync::Mutex;
 
-use rustjvm_native_api::registry::NativeMethodRegistry;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::registry::NativeMethodRegistry;
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -241,7 +241,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
                     let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
                     let msg = ctx.create_string(&class_name);
                     ctx.set_field(exc, 0, Value::Object(Some(msg)));
-                    Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
                 }
             }
         },
@@ -250,7 +250,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
 
 /// Get or create the system (app) class loader singleton.
 pub fn get_or_create_system_cl(
-    ctx: &mut dyn rustjvm_native_api::registry::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
 ) -> Option<ObjectRef> {
     let existing = *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(obj) = existing {
@@ -272,7 +272,7 @@ pub fn get_or_create_system_cl(
 
 /// Get or create the platform class loader singleton.
 fn get_or_create_platform_cl(
-    ctx: &mut dyn rustjvm_native_api::registry::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
 ) -> Option<ObjectRef> {
     let existing = *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(obj) = existing {

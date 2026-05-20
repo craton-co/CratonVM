@@ -38,9 +38,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_PERF_TEST: &str = "com/rabbitmq/perf/PerfTest";
 const CN_PERF_TEST_MULTI: &str = "com/rabbitmq/perf/PerfTestMulti";
@@ -67,11 +67,11 @@ fn rabbitmq_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_rabbitmq_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_RABBITMQ_REAL=1, skip the
+    // Diagnostic gate: when CRATONVM_RABBITMQ_REAL=1, skip the
     // short-circuit so the real PerfTest.main runs (lets us measure
     // how far CratonVM gets through SLF4J/Jackson static init).
-    if std::env::var("RUSTJVM_RABBITMQ_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[rabbitmq-shim] RUSTJVM_RABBITMQ_REAL=1 — skipping shim registration, running real RabbitMQ");
+    if std::env::var("CRATONVM_RABBITMQ_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[rabbitmq-shim] CRATONVM_RABBITMQ_REAL=1 — skipping shim registration, running real RabbitMQ");
         return;
     }
     // PerfTest.main — primary `rabbitmq-perf-test` CLI entry point.

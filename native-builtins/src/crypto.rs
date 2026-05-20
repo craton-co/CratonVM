@@ -11,9 +11,9 @@
 #[path = "crypto_impl.rs"]
 pub mod crypto_impl;
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 use crate::{native_noop, native_noop_with_this, native_return_null, obj_arg, alloc_concurrent_synthetic};
 
 /// Allocate an empty `java.util.Optional` synthetic (1-field, field 0 = null).
@@ -273,7 +273,7 @@ fn read_string_arg(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> S
 
 // Helper: build a byte array of `len` zero bytes
 fn alloc_byte_array(ctx: &mut dyn NativeContext, len: usize) -> ObjectRef {
-    ctx.new_array(rustjvm_types::ArrayElementType::Byte, len)
+    ctx.new_array(cratonvm_types::ArrayElementType::Byte, len)
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +293,7 @@ fn register_kdf(r: &mut NativeMethodRegistry) {
             let alg = read_string_arg(ctx, args, 0);
             let alg_idx = kdf_algorithm_idx(&alg);
             if alg_idx < 0 {
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: format!("No such KDF algorithm: {}", alg),
                 }.into());
             }
@@ -317,7 +317,7 @@ fn register_kdf(r: &mut NativeMethodRegistry) {
             let prov = read_string_arg(ctx, args, 1);
             let alg_idx = kdf_algorithm_idx(&alg);
             if alg_idx < 0 {
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: format!("No such KDF algorithm: {}", alg),
                 }.into());
             }
@@ -364,7 +364,7 @@ fn register_kdf(r: &mut NativeMethodRegistry) {
             let derived = crypto_impl::derive_key_bytes(alg_idx, key_bytes);
             let sk = alloc_secret_key(ctx, alg_idx, key_bits, key_bits / 8);
             // Store derived key material in a byte array attached to the key
-            let key_data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, key_bytes);
+            let key_data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, key_bytes);
             for (i, &b) in derived.iter().enumerate() {
                 ctx.set_array_element(key_data, i, Value::Int(b as i8 as i32));
             }
@@ -512,7 +512,7 @@ fn register_pbe_key_spec(r: &mut NativeMethodRegistry) {
         if cleared != 0 {
             return Ok(Some(Value::Object(None)));
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Char, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
 
@@ -557,7 +557,7 @@ fn register_secret_key_factory(r: &mut NativeMethodRegistry) {
             let alg = read_string_arg(ctx, args, 0);
             let alg_idx = kdf_algorithm_idx(&alg);
             if alg_idx < 0 {
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: format!("No such algorithm: {}", alg),
                 }.into());
             }
@@ -579,7 +579,7 @@ fn register_secret_key_factory(r: &mut NativeMethodRegistry) {
             let prov = read_string_arg(ctx, args, 1);
             let alg_idx = kdf_algorithm_idx(&alg);
             if alg_idx < 0 {
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: format!("No such algorithm: {}", alg),
                 }.into());
             }
@@ -1218,7 +1218,7 @@ fn register_signature(r: &mut NativeMethodRegistry) {
             // Real RSA sign
             let data = crypto_impl::sig_data_take(this.as_ptr() as u64);
             if let Some(sig_bytes) = crypto_impl::rsa_sign(key_id, &data) {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, sig_bytes.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, sig_bytes.len());
                 for (i, &b) in sig_bytes.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -1228,7 +1228,7 @@ fn register_signature(r: &mut NativeMethodRegistry) {
             // Real ECDSA sign
             let data = crypto_impl::sig_data_take(this.as_ptr() as u64);
             if let Some(sig_bytes) = crypto_impl::ecdsa_sign(key_id, &data) {
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, sig_bytes.len());
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, sig_bytes.len());
                 for (i, &b) in sig_bytes.iter().enumerate() {
                     ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                 }
@@ -1926,7 +1926,7 @@ pub(crate) fn register_crypto_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod crypto_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();
