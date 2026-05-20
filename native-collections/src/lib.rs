@@ -1237,14 +1237,34 @@ const NODE_NUM_FIELDS: usize = 4;
 
 /// Extract HashMap state: (buckets, size, capacity).
 fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
+    // See through CratonVM's unmodifiable wrapper views. When a generic
+    // `java/util/Map` interface native (registered to `native_map_*`) is
+    // dispatched on a `rustjvm/internal/UnmodifiableMap` receiver — which
+    // happens when the wrapper class does not itself register the invoked
+    // method — slot 0 of the wrapper is the *backing map* ObjectRef, not a
+    // bucket array. Without this unwrap, `map_state` reads a non-array
+    // Object at slot 0, fires `[MAP-STATE-GUARD]`, and (in `native_map_put`)
+    // `map_resize` would clobber the wrapper's backing pointer; the warning
+    // floods because Keycloak 26's config code repeatedly calls `get` /
+    // `containsKey` / `size` on `Map.of(...)` / `Collections.unmodifiableMap`
+    // results. Reading map state from the backing is always correct because
+    // every wrapper mutator throws — these are read-only callers.
+    let this = unwrap_unmod(ctx, this);
     let buckets_slot0 = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => {
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
                 Some(arr)
             } else {
+                let map_cls = ctx
+                    .class_name_of_id(ctx.class_id_of_object(this))
+                    .unwrap_or_default();
+                let slot0_cls = ctx
+                    .class_name_of_id(ctx.class_id_of_object(arr))
+                    .unwrap_or_default();
                 eprintln!(
-                    "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
-                    this, arr
+                    "[MAP-STATE-GUARD] non-array buckets slot0: map={:?}({}) slot0={:?}({}) \
+                     — receiver was not a bucket-backed HashMap; treating buckets as absent",
+                    this, map_cls, arr, slot0_cls
                 );
                 None
             }
@@ -2240,11 +2260,29 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
+/// True when `obj` is one of CratonVM's unmodifiable wrapper views.
+fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(obj);
+    matches!(
+        ctx.class_name_of_id(cid).as_deref(),
+        Some(UNMOD_MAP_CLASS)
+            | Some(UNMOD_LIST_CLASS)
+            | Some(UNMOD_SET_CLASS)
+            | Some(UNMOD_COLLECTION_CLASS)
+    )
+}
+
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // If a generic `java/util/Map.put` interface native is dispatched on an
+    // unmodifiable wrapper receiver, honour the JDK contract and throw rather
+    // than mutating (or, worse, `map_resize`-clobbering) the private backing.
+    if is_unmod_wrapper(ctx, this) {
+        return Err(unsupported_op());
+    }
     // S111r34: when the receiver is a LinkedHashMap (or subclass like
     // `org/springframework/core/annotation/AnnotationAttributes`),
     // delegate to `native_lhm_put` so that subsequent `LinkedHashMap.get`
@@ -2456,6 +2494,9 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_unmod_wrapper(ctx, this) {
+        return Err(unsupported_op());
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -2590,6 +2631,9 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if is_unmod_wrapper(ctx, this) {
+        return Err(unsupported_op());
+    }
     let (buckets, _, cap) = map_state(ctx, this);
     if let Some(b) = buckets {
         for i in 0..(cap as usize) {
