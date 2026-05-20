@@ -17182,8 +17182,18 @@ fn native_collections_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut modified = false;
     for i in 0..len {
         let elem = ctx.get_array_element(elements, i);
-        native_al_add(ctx, &[Value::Object(Some(coll)), elem])?;
-        modified = true;
+        // Dispatch to the target collection's real `add` instead of
+        // hard-coding `native_al_add` (the ArrayList `elementData`/`size`
+        // layout). `Collections.addAll` accepts any `Collection` — a
+        // HashSet, LinkedList, TreeSet, etc. store elements nothing like
+        // ArrayList, so `native_al_add` would write the wrong fields and
+        // silently drop every element. JVMS/JDK spec is `result |=
+        // c.add(element)`; honour that via virtual dispatch.
+        if let Some(Value::Int(1)) =
+            ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?
+        {
+            modified = true;
+        }
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
