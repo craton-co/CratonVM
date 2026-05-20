@@ -1100,6 +1100,103 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         null_ok()
     });
     registry.register("java/awt/image/BufferedImage", "flush", "()V", |_ctx, _args| void_ok());
+
+    // Bulk getRGB: copy an w*h block of ARGB pixels into an int[].
+    // Signature: getRGB(int startX, int startY, int w, int h,
+    //                   int[] rgbArray, int offset, int scansize)
+    registry.register(
+        "java/awt/image/BufferedImage",
+        "getRGB",
+        "(IIII[III)[I",
+        |ctx, args| {
+            let this = get_obj(args, 0)
+                .ok_or_else(|| RuntimeError::NullPointerException {
+                    message: Some("BufferedImage.getRGB on null".into()),
+                })?;
+            let (start_x, start_y) = (get_int(args, 1), get_int(args, 2));
+            let (w, h) = (get_int(args, 3), get_int(args, 4));
+            let offset = get_int(args, 6);
+            let scansize = get_int(args, 7);
+            if w < 0 || h < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("getRGB: negative dimension {w}x{h}"),
+                }
+                .into());
+            }
+            let Value::Long(id) = ctx.get_field_by_name(this, "imageId") else {
+                return null_ok();
+            };
+            let reg = image::image_registry();
+            let Some(img) = reg.get(image::ImageId(id as u64)) else {
+                return null_ok();
+            };
+            let (iw, ih) = (img.width() as i32, img.height() as i32);
+            if start_x < 0
+                || start_y < 0
+                || start_x.checked_add(w).map_or(true, |e| e > iw)
+                || start_y.checked_add(h).map_or(true, |e| e > ih)
+            {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: start_x,
+                }
+                .into());
+            }
+            // Allocate the result array if the caller passed null.
+            let needed = if h == 0 {
+                0i64
+            } else {
+                offset as i64 + (h as i64 - 1) * scansize as i64 + w as i64
+            };
+            let arr = match get_obj(args, 5) {
+                Some(a) => a,
+                None => {
+                    let len = needed.max(0).min(i32::MAX as i64) as usize;
+                    ctx.new_array(rustjvm_types::ArrayElementType::Int, len)
+                }
+            };
+            let arr_len = ctx.array_length(arr) as i64;
+            // Snapshot the pixels before touching the array so a bounds
+            // failure leaves the destination untouched.
+            for row in 0..h {
+                for col in 0..w {
+                    let argb = img
+                        .get_rgb((start_x + col) as u32, (start_y + row) as u32)
+                        as i32;
+                    let idx = offset as i64 + row as i64 * scansize as i64 + col as i64;
+                    if idx < 0 || idx >= arr_len {
+                        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                            index: idx.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        }
+                        .into());
+                    }
+                    ctx.set_array_element(arr, idx as usize, Value::Int(argb));
+                }
+            }
+            obj_ok(arr)
+        },
+    );
+
+    // `initIDs` natives cache JNI field/method IDs for the real JDK image
+    // classes. RustJVM resolves fields by name, so no IDs need caching —
+    // register these as no-ops so the real-JDK `<clinit>` of each class can
+    // complete (it would otherwise throw UnsatisfiedLinkError).
+    for class in [
+        "java/awt/image/BufferedImage",
+        "java/awt/image/ColorModel",
+        "java/awt/image/IndexColorModel",
+        "java/awt/image/Raster",
+        "java/awt/image/SampleModel",
+        "java/awt/image/SinglePixelPackedSampleModel",
+        "java/awt/image/ComponentSampleModel",
+        "java/awt/image/Kernel",
+        "sun/awt/image/IntegerComponentRaster",
+        "sun/awt/image/ByteComponentRaster",
+        "sun/awt/image/ShortComponentRaster",
+        "sun/awt/image/BytePackedRaster",
+        "sun/awt/image/GifImageDecoder",
+    ] {
+        registry.register(class, "initIDs", "()V", |_ctx, _args| void_ok());
+    }
 }
 
 // ---------------------------------------------------------------------------
