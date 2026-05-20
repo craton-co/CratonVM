@@ -378,9 +378,19 @@ fn array_is_assignable(
             // RVERIF.2: same JDK-interface relaxation as the scalar
             // ObjectRef arm (covers e.g. `[List` -> `[Collection` when
             // both element types are loaded as flag-less stubs).
+            //
+            // Jetty / Spring fix: also apply the "unresolved → defer to
+            // runtime" leniency from the scalar arm. The verifier sees
+            // array element types (e.g. `[TaskOption` vs the declared
+            // `[Enum` in Spring's `ConcurrentReferenceHashMap$Task.<init>`)
+            // before the element classes are loaded; rejecting here raised
+            // spurious `VerifyError`s. The runtime `aastore` / `checkcast`
+            // enforces the real element type.
             hierarchy.is_subclass(child_class, parent_class)
                 || hierarchy.is_interface(parent_class)
                 || is_known_jdk_interface(parent_class)
+                || !hierarchy.is_resolvable(parent_class)
+                || !hierarchy.is_resolvable(child_class)
         }
         // Both nested arrays
         (Some(b'['), Some(b'[')) => array_is_assignable(child_elem, parent_elem, hierarchy),

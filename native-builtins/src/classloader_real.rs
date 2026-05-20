@@ -85,6 +85,75 @@ fn register_url_array(ctx: &mut dyn NativeContext, urls: Value) {
 static SYSTEM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 static PLATFORM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 
+/// Populate the instance fields that the real JDK `ClassLoader.<init>`
+/// field-initialisers / constructor body would set, but which our
+/// simplified real-JDK `<init>` natives previously skipped.
+///
+/// The real JDK `ClassLoader(Void, String, ClassLoader)` private
+/// constructor assigns several `final` fields inline — most importantly
+/// `defaultDomain = new ProtectionDomain(new CodeSource(null, null),
+/// null, this, null)`. When a custom loader (e.g. a `ClassLoader`
+/// subclass that calls `super(parent)`) is constructed through one of
+/// our `<init>` natives, that field initialiser never runs, so
+/// `defaultDomain` stays null.
+///
+/// `ClassLoader.defineClass(...)` → `preDefineClass` then does
+/// `pd = defaultDomain; checkCerts(name, pd.getCodeSource())` and NPEs
+/// with "Cannot invoke getCodeSource on null" — the exact failure that
+/// blocked the cglib probe (a `ClassLoader` subclass calling
+/// `defineClass`). Build the same non-null `defaultDomain` shape here
+/// so the real JDK `defineClass` bytecode path runs cleanly.
+fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // defaultDomain → ProtectionDomain(CodeSource(null URL, null certs),
+    // null perms, this loader, null principals). Build CodeSource first.
+    let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
+    ctx.set_field_by_name(cs, "location", Value::Object(None));
+    ctx.set_field_by_name(cs, "certs", Value::Object(None));
+
+    let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4);
+    ctx.set_field_by_name(pd, "codesource", Value::Object(Some(cs)));
+    ctx.set_field_by_name(pd, "permissions", Value::Object(None));
+    ctx.set_field_by_name(pd, "classloader", Value::Object(Some(this)));
+    ctx.set_field_by_name(pd, "principals", Value::Object(None));
+    // `hasAllPerm`/`staticPermissions` are booleans; default 0 is fine.
+    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
+
+    // `classes` — ArrayList the JDK uses to pin loaded classes. JDK code
+    // (`addClass`) does `synchronized (classes) { classes.add(c); }`; a
+    // null here would NPE on monitorenter.
+    let classes = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 4);
+    ctx.set_field_by_name(this, "classes", Value::Object(Some(classes)));
+
+    // `packages` — ConcurrentHashMap; `ClassLoader.packages()` does
+    // `getfield packages → values()` and would NPE on null.
+    let packages = alloc_concurrent_synthetic(
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap",
+        16,
+    );
+    ctx.set_field_by_name(this, "packages", Value::Object(Some(packages)));
+
+    // `package2certs` — ConcurrentHashMap consulted by `checkCerts`.
+    let pkg2certs = alloc_concurrent_synthetic(
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap",
+        16,
+    );
+    ctx.set_field_by_name(this, "package2certs", Value::Object(Some(pkg2certs)));
+
+    // `parallelLockMap` — used by `getClassLoadingLock`.
+    let lock_map = alloc_concurrent_synthetic(
+        ctx,
+        "java/util/concurrent/ConcurrentHashMap",
+        16,
+    );
+    ctx.set_field_by_name(this, "parallelLockMap", Value::Object(Some(lock_map)));
+
+    // `assertionLock` — `setDefaultAssertionStatus` synchronizes on it.
+    let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    ctx.set_field_by_name(this, "assertionLock", Value::Object(Some(lock)));
+}
+
 /// Register ClassLoader natives needed in real-JDK mode.
 ///
 /// These override the complex real-JDK constructors with minimal versions
@@ -102,6 +171,11 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         };
         let sys = get_or_create_system_cl(ctx);
         ctx.set_field_by_name(this, "parent", Value::Object(sys));
+        // Initialise defaultDomain / classes / packages etc. — see
+        // `init_classloader_common_fields`. Without this a subclass that
+        // calls `defineClass` NPEs in `preDefineClass` on a null
+        // `defaultDomain`.
+        init_classloader_common_fields(ctx, this);
         Ok(None)
     });
 
@@ -113,6 +187,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         };
         let parent = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field_by_name(this, "parent", parent);
+        init_classloader_common_fields(ctx, this);
         Ok(None)
     });
 
@@ -130,6 +205,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
+            init_classloader_common_fields(ctx, this);
             Ok(None)
         },
     );
@@ -231,6 +307,10 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         // Best-effort: stash URL array into known field name when present.
         let urls = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field_by_name(this, "ucp", urls);
+        // URLClassLoader extends SecureClassLoader extends ClassLoader;
+        // the inherited `defaultDomain` / `classes` / `packages` fields
+        // still need initialising (see `init_classloader_common_fields`).
+        init_classloader_common_fields(ctx, this);
         // Register the URLs with the application classpath so classes inside
         // the jars/dirs are actually loadable — without this a custom
         // URLClassLoader (Tomcat's CommonClassLoader, ActiveMQ's launcher)
@@ -251,6 +331,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "parent", parent);
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "ucp", urls);
+            init_classloader_common_fields(ctx, this);
             register_url_array(ctx, urls);
             Ok(None)
         },

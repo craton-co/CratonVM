@@ -381,9 +381,6 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
-    eprintln!("[DIAG] cl_init_parent: defaultDomain idx={:?} readback={:?}",
-        ctx.resolve_field_index("java/lang/ClassLoader", "defaultDomain"),
-        ctx.get_field_by_name(this, "defaultDomain"));
     // S111r17: see alloc_classloader.
     let packages_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));

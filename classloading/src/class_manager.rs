@@ -118,22 +118,38 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         if child == parent || parent == "java/lang/Object" {
             return true;
         }
-        // Audit fix (HIGH #2): a missing class must NOT be reported as a
-        // subtype. Returning `true` for unresolved references silently
-        // bypassed Pass-3 type-assignability checks for untrusted classes.
-        // `java/lang/Object` is already short-circuited above, so a
-        // genuine supertype check still resolves correctly; for every
-        // other unresolved reference we return the conservative answer
-        // (`false` — "not proven a subtype"). The verifier's interface
-        // relaxation (`is_interface` / `is_known_jdk_interface` in
-        // `vtype.rs`) still handles legitimate interface targets.
-        let (Some(child_id), Some(parent_id)) = (self.lookup(child), self.lookup(parent)) else {
-            return false;
-        };
-        match self.class_for(child_id) {
-            Some(c) => c.is_subclass_of(parent_id, self.class_store),
-            None => false,
+        // Audit fix (HIGH #2): a missing class must NOT be unconditionally
+        // reported as a subtype. Returning `true` for *every* unresolved
+        // reference silently bypassed Pass-3 type-assignability checks for
+        // untrusted classes.
+        //
+        // Regression fix: the blanket-`false` replacement was too strict —
+        // it rejected valid bytecode where a not-yet-loaded JDK class (e.g.
+        // `java/security/NoSuchAlgorithmException`) appears where a
+        // supertype (`java/lang/Throwable`) is expected. The verifier runs
+        // at class-define time and exception-table catch types do not
+        // trigger class loading, so the child class is frequently absent
+        // from `class_store` at verify time.
+        //
+        // The JDK's own class hierarchy is fixed and known, so when a
+        // store-backed walk is not possible we fall back to walking the
+        // static `jdk_superclass` table. That walk terminates at
+        // `java/lang/Object` and only returns `true` for a *genuine*
+        // ancestor relationship — an unrelated pair (e.g. `String` /
+        // `Integer`) still resolves to `false`. This restores correct
+        // JVMS §4.10.1.2 assignability without re-opening the audit hole.
+        let (child_id, parent_id) = (self.lookup(child), self.lookup(parent));
+        if let (Some(child_id), Some(parent_id)) = (child_id, parent_id) {
+            if let Some(c) = self.class_for(child_id) {
+                if c.is_subclass_of(parent_id, self.class_store) {
+                    return true;
+                }
+            }
         }
+        // Fallback: walk the static JDK superclass chain. Used when either
+        // class is not yet loaded (so the store walk above could not run or
+        // could not prove the relationship through unloaded ancestors).
+        jdk_name_is_subclass(child, parent)
     }
 
     fn common_superclass(&self, a: &str, b: &str) -> String {
@@ -4565,6 +4581,43 @@ pub fn jdk_superclass_lookup(name: &str) -> &'static str {
     jdk_superclass(name)
 }
 
+/// Verifier fallback: is `child` a subclass of `parent` according to the
+/// static JDK superclass table?
+///
+/// Walks the `jdk_superclass` chain from `child` upward. Every chain
+/// terminates at `java/lang/Object` (the table's `_` default), so the walk
+/// always finishes. This is spec-correct for bytecode verification: the JDK
+/// class hierarchy is fixed, and the walk only reports `true` for a genuine
+/// ancestor — it does NOT blanket-accept unrelated reference types.
+///
+/// Interfaces are intentionally not modelled here (the verifier handles
+/// interface targets via the `is_interface` / `is_known_jdk_interface`
+/// relaxation), so this only proves class-to-superclass relationships.
+fn jdk_name_is_subclass(child: &str, parent: &str) -> bool {
+    if child == parent {
+        return true;
+    }
+    let mut current = child;
+    // The deepest JDK hierarchy chains are well under 32 links; the bound
+    // is a belt-and-braces guard against a malformed table entry.
+    for _ in 0..64 {
+        if current == "java/lang/Object" {
+            return parent == "java/lang/Object";
+        }
+        let next = jdk_superclass(current);
+        if next == parent {
+            return true;
+        }
+        if next == current {
+            // No progress (only possible for `Object`, handled above) —
+            // stop to avoid an infinite loop.
+            return false;
+        }
+        current = next;
+    }
+    false
+}
+
 fn jdk_superclass(name: &str) -> &'static str {
     match name {
         // Throwable hierarchy
@@ -4627,6 +4680,37 @@ fn jdk_superclass(name: &str) -> &'static str {
         // java.lang.reflect (JDK hierarchy for reflective wrappers)
         "java/lang/reflect/ReflectiveOperationException" => "java/lang/Exception",
         "java/lang/reflect/InvocationTargetException" => "java/lang/reflect/ReflectiveOperationException",
+
+        // java.security exception hierarchy. These classes appear in
+        // exception tables / `athrow` sites of `jrt:`-resident classes
+        // (e.g. `SecureRandom.getDefaultPRNG`) and the verifier must be
+        // able to prove they are assignable to `Throwable` even before
+        // the concrete class file has been loaded.
+        "java/security/GeneralSecurityException" => "java/lang/Exception",
+        "java/security/NoSuchAlgorithmException"
+        | "java/security/NoSuchProviderException"
+        | "java/security/KeyException"
+        | "java/security/KeyStoreException"
+        | "java/security/DigestException"
+        | "java/security/SignatureException"
+        | "java/security/InvalidAlgorithmParameterException"
+        | "java/security/UnrecoverableKeyException"
+        | "java/security/UnrecoverableEntryException"
+        | "java/security/cert/CertificateException" => "java/security/GeneralSecurityException",
+        "java/security/InvalidKeyException"
+        | "java/security/InvalidKeySpecException" => "java/security/KeyException",
+        "java/security/AccessControlException"
+        | "java/security/ProviderException" => "java/lang/RuntimeException",
+        "java/security/PrivilegedActionException" => "java/lang/Exception",
+
+        // java.nio.charset exception hierarchy.
+        "java/nio/charset/CharacterCodingException" => "java/io/IOException",
+        "java/nio/charset/MalformedInputException"
+        | "java/nio/charset/UnmappableCharacterException" =>
+            "java/nio/charset/CharacterCodingException",
+        "java/nio/charset/IllegalCharsetNameException"
+        | "java/nio/charset/UnsupportedCharsetException" =>
+            "java/lang/IllegalArgumentException",
 
         // java.nio.file.attribute — enum PosixFilePermission extends Enum
         "java/nio/file/attribute/PosixFilePermission" => "java/lang/Enum",
