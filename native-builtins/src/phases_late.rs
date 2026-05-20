@@ -5692,21 +5692,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             |ctx, args| {
                 let path_ref = obj_arg(args, 1)?;
                 let p = ctx.read_string(path_ref).unwrap_or_default();
-                let canonical = std::fs::canonicalize(&p)
-                    .map(|c| {
-                        // Strip the Windows `\\?\` extended-length prefix —
-                        // the real JDK's canonicalize0 never returns it, and
-                        // it corrupts any subsequent `File.toURI()`.
-                        let s = c.to_string_lossy().into_owned();
-                        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-                            format!(r"\\{rest}")
-                        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-                            rest.to_string()
-                        } else {
-                            s
-                        }
-                    })
-                    .unwrap_or(p);
+                // Normalize even for non-existent paths: make absolute and
+                // collapse `.`/`..` so containment checks behave like the
+                // real JDK. Strips the `\\?\` extended-length prefix too.
+                let canonical = file_canonicalize_path(&p);
                 let s = ctx.create_string(&canonical);
                 Ok(Some(Value::Object(Some(s))))
             },
@@ -7148,6 +7137,68 @@ fn file_normalise_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Strip the Windows `\\?\` / `\\?\UNC\` extended-length prefix that
+/// `std::fs::canonicalize` prepends. The real JDK's `getCanonicalPath`
+/// never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
+/// makes a later `File.toURI()` produce `file://?/C:/...`, an invalid URL.
+fn strip_unc(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        p.to_string()
+    }
+}
+
+/// Canonicalize a `java.io.File` path the way `File.getCanonicalPath()` does.
+///
+/// `std::fs::canonicalize` only works for paths that *exist* on disk; the real
+/// JDK's `getCanonicalPath` also normalizes non-existent paths — it makes them
+/// absolute, collapses `.`/`..` segments, and normalizes separators. The old
+/// fallback returned a raw absolute path with `..` segments intact, so a
+/// containment check (`child.startsWith(parentDir)`) — as Felix's
+/// `getDataFile` does — would spuriously fail.
+fn file_canonicalize_path(path: &str) -> String {
+    // First try the real filesystem call (resolves symlinks for existing paths).
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return strip_unc(&c.to_string_lossy());
+    }
+    // Path doesn't exist — normalize lexically. Make absolute against CWD.
+    let norm = file_normalise_path(path);
+    let p = std::path::Path::new(&norm);
+    let abs: std::path::PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    // Collapse `.` and `..` segments lexically (the prefix/root are preserved).
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop the last normal segment, but never past the root/prefix.
+                match out.last() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    _ => out.push(comp),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut result = std::path::PathBuf::new();
+    for comp in out {
+        result.push(comp.as_os_str());
+    }
+    strip_unc(&result.to_string_lossy())
+}
+
 /// Allocate a new File synthetic with the given path.
 fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
@@ -7380,44 +7431,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
     // makes a later `File.toURI()` produce `file://?/C:/...`, an invalid
     // URL that breaks Tomcat's `ClassLoaderFactory.buildClassLoaderUrl`.
-    fn strip_unc(p: &str) -> String {
-        if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = p.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            p.to_string()
-        }
-    }
     r.register(file, "getCanonicalPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        match std::fs::canonicalize(&path) {
-            Ok(canonical) => {
-                let s = ctx.create_string(&strip_unc(&canonical.to_string_lossy()));
-                Ok(Some(Value::Object(Some(s))))
-            }
-            Err(_) => {
-                // Fall back to absolute path if canonicalize fails (file may not exist)
-                let p = std::path::Path::new(&path);
-                let abs = if p.is_absolute() {
-                    path
-                } else {
-                    std::env::current_dir()
-                        .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                        .unwrap_or(path)
-                };
-                let s = ctx.create_string(&abs);
-                Ok(Some(Value::Object(Some(s))))
-            }
-        }
+        let canonical = file_canonicalize_path(&path);
+        let s = ctx.create_string(&canonical);
+        Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "getCanonicalFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let canonical = std::fs::canonicalize(&path)
-            .map(|p| strip_unc(&p.to_string_lossy()))
-            .unwrap_or(path);
+        let canonical = file_canonicalize_path(&path);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &canonical)))))
     });
     r.register(file, "isAbsolute", "()Z", |ctx, args| {
