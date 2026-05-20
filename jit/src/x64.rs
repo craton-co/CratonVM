@@ -1067,10 +1067,21 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 field_ops.push((pc, cp_idx));
                 pc += 3;
             }
-            // putfield — object field write (may need heap for write barrier)
+            // putfield — object field write. A reference-typed putfield
+            // lowers to a `jit_putfield_object(vm_ptr, ...)` helper call
+            // (write barrier + SATB barrier), so the compiled method MUST
+            // carry the hidden VM pointer. Without `needs_heap` the
+            // codegen loads `vm_ptr` from `heap_local_offset == 0`, i.e.
+            // `[rbp-0]` — the saved RBP — and hands that stack address to
+            // `jit_putfield_object`, which then dereferences it as a
+            // `SharedVm`: silent heap corruption that surfaced as a
+            // delayed SIGSEGV (Tomcat's `Catalina.setParentClassLoader`,
+            // a bare `aload_0; aload_1; putfield; return` with no other
+            // heap op to set the flag).
             0xb5 => {
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
+                needs_heap = true;
                 pc += 3;
             }
             // newarray — needs heap for allocation
@@ -8241,6 +8252,41 @@ impl Compiler {
         self.emit_null_check_array_load();
     }
 
+    /// Emit an inline null check on the `arraylength` receiver (assumed
+    /// already in RAX). `arraylength` previously emitted a raw
+    /// `MOV EAX, [RAX + ARRAY_LENGTH_OFFSET]` with no guard — a null
+    /// receiver dereferenced low memory and SIGSEGV'd the VM (the crash
+    /// handler re-raises rather than throwing NPE). This reuses the
+    /// shared null-check stub (sets `JIT_PENDING_NPE`, deopts out) that
+    /// array loads/stores already branch to.
+    ///
+    /// Unlike the load/store `_at` helpers, the dataflow elision keys on
+    /// the directly-preceding `aload`/`aload_<n>` of the array receiver:
+    /// for `arraylength` there is no index push between the `aload` and
+    /// the opcode, so the load/store `array_receiver_local` parser (which
+    /// expects an index push) would mis-decode the bytecode. We instead
+    /// inspect the single instruction before `bc_pc`.
+    fn emit_null_check_arraylength(&mut self, code: &[u8], bc_pc: usize) {
+        if bc_pc >= 1 {
+            let prev = code[bc_pc - 1];
+            // aload_0..aload_3 (0x2A..0x2D) — single-byte, receiver local n.
+            if (0x2A..=0x2D).contains(&prev) {
+                let local = (prev - 0x2A) as usize;
+                if self.is_local_nonnull(bc_pc, local) {
+                    return;
+                }
+            } else if bc_pc >= 2 && code[bc_pc - 2] == 0x19 {
+                // aload <u8> — two-byte, receiver local code[bc_pc-1].
+                let local = code[bc_pc - 1] as usize;
+                if self.is_local_nonnull(bc_pc, local) {
+                    return;
+                }
+            }
+        }
+        // Reuse the shared stub used by array loads/stores.
+        self.emit_null_check_array_load();
+    }
+
     /// Emit an array bounds check. RAX=array ptr, RCX=index (as i64).
     ///
     /// Loads array length from header offset 12, compares index (unsigned) against length.
@@ -12176,6 +12222,26 @@ impl Compiler {
                                 // The debug_assert below is therefore
                                 // checking the right register; verified.
                                 let recv_reg = ARG_REGS[1];
+                                // NPE guard: a null receiver must not be
+                                // dereferenced by the class_id load below
+                                // (`MOV EAX, [recv_reg]`) — that faults at
+                                // address 0 and SIGSEGVs the VM (observed
+                                // in Tomcat: JIT-compiled `Locale.hashCode`
+                                // dispatching `BaseLocale.hashCode` on a
+                                // null receiver). Route a null receiver to
+                                // the `.miss` slow path, which decodes args
+                                // and bails to the interpreter where the
+                                // invokevirtual receiver null check raises
+                                // a proper NullPointerException.
+                                //   TEST recv_reg, recv_reg
+                                if recv_reg >= 8 {
+                                    self.buf.emit(&[0x4D, 0x85, 0xC0 | ((recv_reg & 7) << 3) | (recv_reg & 7)]);
+                                } else {
+                                    self.buf.emit(&[0x48, 0x85, 0xC0 | ((recv_reg & 7) << 3) | (recv_reg & 7)]);
+                                }
+                                //   JZ rel32 → .miss (patched at miss_off)
+                                self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                let pic_null_miss_patch = self.buf.pos() - 4;
                                 // MED (round-5 review): mod=00 encoding
                                 // reuses the low-3 bits of the register as
                                 // r/m, where r/m==4 (RSP/R12) means
@@ -12226,7 +12292,11 @@ impl Compiler {
                                 // stores the byte offset of the 4-byte
                                 // displacement immediate, patched at the
                                 // shared `.miss` label below.
-                                let mut miss_patches_rel32: Vec<usize> = Vec::new();
+                                // Seeded with the receiver-null-check JZ
+                                // emitted above the cascade so it is patched
+                                // to the same shared `.miss` target.
+                                let mut miss_patches_rel32: Vec<usize> =
+                                    vec![pic_null_miss_patch];
 
                                 for i in 0..3usize {
                                     slot_starts[i] = self.buf.pos();
@@ -12363,6 +12433,18 @@ impl Compiler {
                                 // (lowest address) in the args buffer.
                                 let receiver_spill = args_base_offset + ((n as i32) - 1) * 8; // Cast: x86-64 immediate encoding
                                 self.emit_load_local(RAX, receiver_spill);
+
+                                // NPE guard: a null receiver must not reach
+                                // the `MOV EAX,[RAX]` class_id load below —
+                                // dereferencing address 0 SIGSEGVs the VM.
+                                // Route null to `.miss` (slow helper →
+                                // interpreter), which raises a proper
+                                // NullPointerException per JVMS invokevirtual.
+                                //   TEST RAX, RAX  (48 85 C0)
+                                self.buf.emit(&[0x48, 0x85, 0xC0]);
+                                //   JZ rel8 → .miss  (2 bytes, patched)
+                                self.buf.emit(&[0x74, 0x00]);
+                                miss_patches.push(self.buf.pos() - 1);
 
                                 // MOV EAX, dword [RAX]  — load class_id (ObjectHeader+0).
                                 // 2 bytes: 8B 00
@@ -12704,6 +12786,20 @@ impl Compiler {
                 0xbe => {
                     let arr_slot = self.pop_stack();
                     self.load_slot_to_reg(RAX, arr_slot);
+                    // NPE on null array (JVMS §arraylength). Without this
+                    // guard `emit_arraylength_regs` does a raw
+                    // `MOV EAX, [RAX + ARRAY_LENGTH_OFFSET]` which faults on
+                    // a null receiver. Observed in Tomcat: a JIT-compiled
+                    // `String.length()` invoked with a null `this` reads its
+                    // `value` byte[] field (helper safely yields 0), then
+                    // `arraylength` on the null array SIGSEGV'd the VM
+                    // instead of throwing NPE. Mirrors the round-9 inline
+                    // null check that loads/stores already carry; the
+                    // dedicated `emit_null_check_arraylength` always emits
+                    // the TEST/JZ since the `_at` dataflow-elision helper
+                    // parses a load/store bytecode shape that arraylength
+                    // (no index push) does not match.
+                    self.emit_null_check_arraylength(code, pc);
                     self.emit_arraylength_regs();
                     self.push_from_rax();
                     pc += 1;
