@@ -1227,15 +1227,25 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let this_raw = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let other = match args.get(1) {
+    let other_raw = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // Identity check
+    // Identity check (on the original references, before unwrapping).
+    if std::ptr::eq(this_raw.as_ptr(), other_raw.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    // See through unmodifiable wrappers on either side so an ArrayList can be
+    // compared element-by-element against a `List.of(...)` /
+    // `Collections.unmodifiableList(...)` view. `al_state` reads the backing
+    // array directly and would otherwise see the wrapper's slot-0 backing
+    // pointer (a non-array), reporting size 0 and a spurious inequality.
+    let this = unwrap_unmod(ctx, this_raw);
+    let other = unwrap_unmod(ctx, other_raw);
     if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
         return Ok(Some(Value::Int(1)));
     }
@@ -17640,7 +17650,38 @@ fn native_unmod_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn native_unmod_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    unmod_delegate(ctx, args, "equals", "(Ljava/lang/Object;)Z")
+    // `this.equals(other)` forwards to `backing.equals(other)`. If `other` is
+    // itself an unmodifiable wrapper, it must be unwrapped to its backing
+    // collection first — otherwise the backing list's `AbstractList.equals`
+    // tries to iterate the *wrapper* (e.g. via `listIterator()`, which the
+    // wrapper does not expose) and the comparison spuriously fails. This is
+    // the JDK behaviour: `List.of(a,b).equals(List.of(a,b))` is `true`, and
+    // crucially `ResourceBundle$Control.FORMAT_DEFAULT.equals(itself)` must
+    // be `true` or `getNoFallbackControl` throws IllegalArgumentException.
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let backing = match unmod_backing(ctx, this) {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    // Unwrap the argument: walk down any chain of unmodifiable wrappers so
+    // the backing's `equals` sees a concrete ArrayList / HashSet / HashMap.
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => {
+            let mut cur = *o;
+            while is_unmod_wrapper(ctx, cur) {
+                match unmod_backing(ctx, cur) {
+                    Some(b) => cur = b,
+                    None => break,
+                }
+            }
+            Value::Object(Some(cur))
+        }
+        v => v.cloned().unwrap_or(Value::Object(None)),
+    };
+    ctx.invoke_virtual(backing, "equals", "(Ljava/lang/Object;)Z", &[other])
 }
 
 fn native_unmod_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

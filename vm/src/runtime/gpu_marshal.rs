@@ -44,7 +44,7 @@ use cratonvm_gc::safepoint::SafepointToken;
 use cratonvm_gc::VmHeap;
 use cratonvm_types::{ArrayElementType, ObjectKind, ObjectRef, Value};
 
-pub use cuda_bridge::{DeviceBuffer, DeviceContext, DeviceError, Result as DeviceResult};
+pub use cuda_bridge::{DeviceBuffer, DeviceContext, DeviceElem, DeviceError, Result as DeviceResult};
 
 // ── Host views (heap → packed Vec<T>) ────────────────────────────────────
 
@@ -431,7 +431,7 @@ pub fn write_back_i8(
 /// without the `cuda` feature), this returns `Err(DeviceError::NoDriver)`.
 pub fn upload<T>(ctx: &DeviceContext, host: &[T]) -> DeviceResult<DeviceBuffer<T>>
 where
-    T: cuda_bridge::bytemuck::Pod + Send + Sync + 'static,
+    T: DeviceElem,
 {
     DeviceBuffer::from_host(ctx, host)
 }
@@ -440,7 +440,7 @@ where
 /// `buf.len()`; `cuda-bridge` enforces this at the driver layer.
 pub fn download_into<T>(buf: &DeviceBuffer<T>, dst: &mut [T]) -> DeviceResult<()>
 where
-    T: cuda_bridge::bytemuck::Pod + Send + Sync + 'static,
+    T: DeviceElem,
 {
     buf.to_host(dst)
 }

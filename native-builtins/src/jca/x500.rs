@@ -19,19 +19,21 @@
 //!
 //! ## Layout
 //!
-//! `X500Principal` is allocated with `alloc_concurrent_synthetic` — the
-//! widening rule promotes the synthetic 2-field shape to whatever the
-//! real-JDK class needs at instance level (the JDK 25 `X500Principal`
-//! has a single `X500Name thisX500Name` reference that we never read
-//! directly, plus the inherited `Principal` interface which has no fields).
+//! `X500Principal` instances are allocated by the VM's `new` bytecode from
+//! the *real* JDK 25 class, which declares exactly one instance field —
+//! `transient X500Name thisX500Name` (the three `RFC*` constants are
+//! `static`).  The object therefore has a single slot (index 0).
 //!
-//! | Slot | Field             |
-//! |------|-------------------|
-//! |  0   | RFC-4514 string  |
-//! |  1   | DER byte array   |
+//! | Slot | Field                       |
+//! |------|-----------------------------|
+//! |  0   | canonical RFC-4514 string  |
 //!
-//! Both slots are populated in both construction paths so accessors don't
-//! have to round-trip through the other format.
+//! We repurpose that one slot to hold the canonical DN string.  The DER
+//! form is *not* stored as a field — there is nowhere to put it — and is
+//! re-derived on demand by re-encoding the canonical string (the canonical
+//! `Name` encoding is byte-stable, so this round-trips exactly).  Writing a
+//! second slot (the old layout) was an out-of-bounds field write that the
+//! heap guard silently dropped.
 //!
 //! ## DN ↔ DER
 //!
@@ -58,11 +60,13 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
-use crate::alloc_concurrent_synthetic;
 use super::asn1;
 
+/// The single declared instance slot of `X500Principal` (`thisX500Name`).
+/// We repurpose it to hold the canonical RFC-4514 DN string; the DER form
+/// is re-derived from it on demand (see `get_der`) since the real JDK
+/// class has no second field to store it in.
 const FIELD_CANONICAL: usize = 0;
-const FIELD_DER: usize = 1;
 
 // ---------------------------------------------------------------------------
 // Known attribute OIDs (RFC 4519 + extras)
@@ -314,23 +318,22 @@ fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 
 /// Populate an X500Principal instance from an RFC-4514 string and DER.
 ///
-/// Both fields go through `set_field_by_name` first so the real-JDK class
-/// layout (single `thisX500Name` slot at index 0) is honoured: writing the
-/// canonical string to that named slot keeps `getName()` and `equals` happy
-/// even when our auxiliary DER slot can't be widened beyond the JDK's field
-/// count.  The slot-based fallback (slot 0/1) covers the synthetic-mode path
-/// where the class isn't loaded and `set_field_by_name` is a no-op.
-fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, der: &[u8]) {
+/// The real-JDK `javax.security.auth.x500.X500Principal` declares exactly
+/// one instance field — `transient X500Name thisX500Name` — so the object
+/// is allocated with a single slot (index 0).  Writing anything to index 1
+/// is an out-of-bounds field write that the heap guard drops.  We therefore
+/// store *only* the canonical RFC-4514 string in that single slot; the DER
+/// is never persisted as a field — `get_der` re-derives it on demand by
+/// re-encoding the canonical string, which is byte-stable for the canonical
+/// `Name` form.
+fn populate(ctx: &mut dyn NativeContext, this: ObjectRef, canonical: &str, _der: &[u8]) {
     let s = ctx.create_string(canonical);
-    let arr = alloc_byte_array(ctx, der);
-    // Real-JDK route: populate the only declared field first so getName /
-    // toString reflect the input even if the slot-based fallback below is
-    // unable to grow the object beyond JDK's 1-slot layout.
+    // Write the canonical string into the one declared instance slot.
+    // `set_field_by_name` resolves `thisX500Name` to slot 0; the explicit
+    // `set_field(.., FIELD_CANONICAL, ..)` is the same slot and keeps the
+    // slot-based readers (`get_canonical`) working without a name lookup.
     ctx.set_field_by_name(this, "thisX500Name", Value::Object(Some(s)));
-    // Synthetic / fallback layout — keeps existing slot-based readers
-    // (`getEncoded`, `equals`, `hashCode`) working.
     ctx.set_field(this, FIELD_CANONICAL, Value::Object(Some(s)));
-    ctx.set_field(this, FIELD_DER, Value::Object(Some(arr)));
 }
 
 /// Populate from a string DN.
@@ -374,27 +377,14 @@ fn get_canonical(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String>
     None
 }
 
-/// Read the DER byte array field from an instance, copying it out as a Vec.
+/// Read the DER encoding of an instance.
 ///
-/// When the slot-based DER field is missing or empty (real-JDK class layout
-/// only has 1 slot, so our DER write at slot 1 is a no-op on that backend),
-/// fall back to re-deriving the DER from the canonical name field that
-/// `populate` writes via `set_field_by_name` — guarantees `getEncoded` and
-/// the equality / hashCode codepaths never silently see 0-length DER.
+/// The real JDK `X500Principal` has only one instance field, so there is no
+/// slot to persist the DER bytes in — `populate` stores just the canonical
+/// RFC-4514 string.  The DER is re-derived here by re-encoding that string;
+/// the canonical `Name` form is byte-stable, so this round-trips exactly.
 fn get_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
-    if let Value::Object(Some(arr)) = ctx.get_field(this, FIELD_DER) {
-        let len = ctx.array_length(arr);
-        if len > 0 {
-            let mut out = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Value::Int(b) = ctx.get_array_element(arr, i) {
-                    out.push(b as u8);
-                }
-            }
-            return out;
-        }
-    }
-    // Fallback: re-encode from the canonical string preserved by populate.
+    // Re-encode from the canonical string preserved by `populate`.
     if let Some(canon) = get_canonical(ctx, this) {
         let rdns = parse_dn_string(&canon);
         if !rdns.is_empty() {
