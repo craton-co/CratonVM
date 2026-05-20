@@ -9646,6 +9646,15 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
+    // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
+    // node-iterating bytecode runs against our overlay structure (where the
+    // JDK `first` field is always null) and returns an array full of nulls.
+    registry.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_ll_to_array_typed,
+    );
     registry.register(c, "toString", "()Ljava/lang/String;", native_ll_to_string);
     registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ll_iterator);
     // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
@@ -10343,6 +10352,58 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         };
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `LinkedList.toArray(T[])` — typed-array overload.
+///
+/// CratonVM's `LinkedList` is an overlay-backed structure (head/next nodes
+/// live in our own fields, NOT the JDK's `first`/`last`/`size`). The real
+/// JDK's `LinkedList.toArray(T[])` bytecode iterates the JDK `first` node,
+/// which is always null in our representation — so without this override the
+/// call returns a correctly-sized array full of `null`s. That bug surfaced as
+/// ActiveMQ's `--version` NPE: `console.Main.runTaskClass` does
+/// `list.toArray(new String[list.size()])` on a `LinkedList`, then
+/// `AbstractCommand.parseOptions` calls `.startsWith("-")` on the (null)
+/// first element.
+fn native_ll_to_array_typed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let template = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = ll_size(ctx, this) as usize;
+    // Reuse the supplied array when it is large enough; otherwise allocate.
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        _ => alloc_ref_array(ctx, size),
+    };
+    let mut cur_opt = match ll_get(this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let mut i = 0;
+    while let Some(cur) = cur_opt {
+        if i >= size {
+            break;
+        }
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        ctx.set_array_element(target, i, elem);
+        i += 1;
+        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    // JDK contract: if the supplied array is longer than the list, the
+    // element immediately after the copied range is set to null.
+    let target_len = ctx.array_length(target);
+    if target_len > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    Ok(Some(Value::Object(Some(target))))
 }
 
 fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
