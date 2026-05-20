@@ -321,26 +321,29 @@ pub fn verify_instruction(
         // Stack manipulation
         // =====================================================================
         Instruction::Pop => {
+            // Operates on a single slot. The top slot must be a complete
+            // category-1 value — `Top` sitting above a `Long`/`Double` base
+            // is the upper half of a category-2 value and may not be split.
             let val = frame.pop()?;
-            if val.is_category2() {
+            if is_cat2_upper_half(frame, &val) {
                 return Err(verify_err("pop: cannot pop category-2 value with pop"));
             }
             ok_through()
         }
 
         Instruction::Pop2 => {
-            let top = frame.pop()?;
-            if !top.is_category2() {
-                // Form 1: pop two category-1 values
-                frame.pop()?;
-            }
-            // Form 2: top was category-2, already popped
+            // Pops the top two slots: either two category-1 values, or one
+            // category-2 value (`Long`/`Double` base + `Top`).
+            let slots = pop_n_slots(frame, 2, "pop2")?;
+            check_no_split(&slots, "pop2")?;
             ok_through()
         }
 
         Instruction::Dup => {
+            // Duplicate the top single slot. The top slot must be a complete
+            // category-1 value.
             let val = frame.pop()?;
-            if val.is_category2() {
+            if is_cat2_upper_half(frame, &val) {
                 return Err(verify_err("dup: cannot dup category-2 value"));
             }
             frame.push(val.clone())?;
@@ -349,9 +352,10 @@ pub fn verify_instruction(
         }
 
         Instruction::DupX1 => {
+            // ..., v2, v1 -> ..., v1, v2, v1   (both single category-1 slots)
             let val1 = frame.pop()?;
             let val2 = frame.pop()?;
-            if val1.is_category2() || val2.is_category2() {
+            if is_cat2_upper_half(frame, &val2) || val1 == VType::Top || val2 == VType::Top {
                 return Err(verify_err("dup_x1: category-2 value not allowed"));
             }
             frame.push(val1.clone())?;
@@ -361,91 +365,72 @@ pub fn verify_instruction(
         }
 
         Instruction::DupX2 => {
+            // ..., {v3,v2}, v1 -> ..., v1, {v3,v2}, v1
+            // v1 is a single category-1 slot; {v3,v2} is the next two slots
+            // (either two category-1, or one category-2).
             let val1 = frame.pop()?;
-            if val1.is_category2() {
+            if is_cat2_upper_half(frame, &val1) || val1 == VType::Top {
                 return Err(verify_err("dup_x2: val1 must be category-1"));
             }
-            let val2 = frame.pop()?;
-            if val2.is_category2() {
-                // Form 2: val1, val2(cat2)
-                frame.push(val1.clone())?;
-                frame.push(val2)?;
-                frame.push(val1)?;
-            } else {
-                let val3 = frame.pop()?;
-                frame.push(val1.clone())?;
-                frame.push(val3)?;
-                frame.push(val2)?;
-                frame.push(val1)?;
+            let lower = pop_n_slots(frame, 2, "dup_x2")?;
+            check_no_split(&lower, "dup_x2")?;
+            frame.push(val1.clone())?;
+            for v in &lower {
+                frame.push(v.clone())?;
             }
+            frame.push(val1)?;
             ok_through()
         }
 
         Instruction::Dup2 => {
-            let val1 = frame.pop()?;
-            if val1.is_category2() {
-                // Form 2: duplicate one category-2 value
-                frame.push(val1.clone())?;
-                frame.push(val1)?;
-            } else {
-                let val2 = frame.pop()?;
-                frame.push(val2.clone())?;
-                frame.push(val1.clone())?;
-                frame.push(val2)?;
-                frame.push(val1)?;
+            // Duplicate the top two slots (either two category-1 values, or
+            // one category-2 value).
+            let slots = pop_n_slots(frame, 2, "dup2")?;
+            check_no_split(&slots, "dup2")?;
+            for v in &slots {
+                frame.push(v.clone())?;
+            }
+            for v in &slots {
+                frame.push(v.clone())?;
             }
             ok_through()
         }
 
         Instruction::Dup2X1 => {
-            let val1 = frame.pop()?;
-            let val2 = frame.pop()?;
-            if val1.is_category2() {
-                // Form 2: val1(cat2), val2(cat1)
-                frame.push(val1.clone())?;
-                frame.push(val2)?;
-                frame.push(val1)?;
-            } else {
-                let val3 = frame.pop()?;
-                frame.push(val2.clone())?;
-                frame.push(val1.clone())?;
-                frame.push(val3)?;
-                frame.push(val2)?;
-                frame.push(val1)?;
+            // ..., v3, {v2,v1} -> ..., {v2,v1}, v3, {v2,v1}
+            // top two slots ({v2,v1}) followed by one category-1 slot (v3).
+            let top = pop_n_slots(frame, 2, "dup2_x1")?;
+            check_no_split(&top, "dup2_x1")?;
+            let val3 = frame.pop()?;
+            if is_cat2_upper_half(frame, &val3) || val3 == VType::Top {
+                return Err(verify_err("dup2_x1: third value must be category-1"));
+            }
+            for v in &top {
+                frame.push(v.clone())?;
+            }
+            frame.push(val3)?;
+            for v in &top {
+                frame.push(v.clone())?;
             }
             ok_through()
         }
 
         Instruction::Dup2X2 => {
-            let val1 = frame.pop()?;
-            let val2 = frame.pop()?;
-            if val1.is_category2() && val2.is_category2() {
-                // Form 4: val1(cat2), val2(cat2)
-                frame.push(val1.clone())?;
-                frame.push(val2)?;
-                frame.push(val1)?;
-            } else if val1.is_category2() {
-                // Form 3: val1(cat2), val2(cat1), val3(cat1)
-                let val3 = frame.pop()?;
-                frame.push(val1.clone())?;
-                frame.push(val3)?;
-                frame.push(val2)?;
-                frame.push(val1)?;
-            } else if val2.is_category2() {
-                // Form 2: val1(cat1), val2(cat2) — treated like dup2_x1 form 2
-                frame.push(val1.clone())?;
-                frame.push(val2)?;
-                frame.push(val1)?;
-            } else {
-                // Form 1: val1(cat1), val2(cat1), val3(cat1), val4(cat1)
-                let val3 = frame.pop()?;
-                let val4 = frame.pop()?;
-                frame.push(val2.clone())?;
-                frame.push(val1.clone())?;
-                frame.push(val4)?;
-                frame.push(val3)?;
-                frame.push(val2)?;
-                frame.push(val1)?;
+            // ..., {v4,v3}, {v2,v1} -> ..., {v2,v1}, {v4,v3}, {v2,v1}
+            // top two slots followed by next two slots; neither pair may be
+            // split across a category-2 boundary.
+            let top = pop_n_slots(frame, 2, "dup2_x2")?;
+            check_no_split(&top, "dup2_x2")?;
+            let lower = pop_n_slots(frame, 2, "dup2_x2")?;
+            check_no_split(&lower, "dup2_x2")?;
+            for v in &top {
+                frame.push(v.clone())?;
+            }
+            for v in &lower {
+                frame.push(v.clone())?;
+            }
+            for v in &top {
+                frame.push(v.clone())?;
             }
             ok_through()
         }
@@ -453,7 +438,10 @@ pub fn verify_instruction(
         Instruction::Swap => {
             let val1 = frame.pop()?;
             let val2 = frame.pop()?;
-            if val1.is_category2() || val2.is_category2() {
+            if val1 == VType::Top
+                || val2 == VType::Top
+                || is_cat2_upper_half(frame, &val2)
+            {
                 return Err(verify_err("swap: cannot swap category-2 values"));
             }
             frame.push(val1)?;
@@ -1249,6 +1237,66 @@ fn pop_array_ref(
 }
 
 /// Push a VType onto the stack, handling category-2 types (push + Top).
+/// True if `popped` is the upper (`Top`) half of a category-2 value whose
+/// `Long`/`Double` base is now exposed at the top of `frame`'s stack.
+///
+/// The verifier represents `long`/`double` as two slots — a `Long`/`Double`
+/// base followed by a `Top`. Stack-manipulation instructions (`pop`, `dup`,
+/// `swap`, …) operate on slots and must never split such a pair. After
+/// `popped` has been removed from the stack, this checks whether `popped`
+/// was that upper half.
+fn is_cat2_upper_half(frame: &VerificationFrame, popped: &VType) -> bool {
+    *popped == VType::Top
+        && matches!(
+            frame.stack.last(),
+            Some(VType::Long) | Some(VType::Double)
+        )
+}
+
+/// Pop exactly `n` slots off the operand stack, returning them in
+/// bottom-to-top order (`result[n-1]` was the top of stack).
+fn pop_n_slots(
+    frame: &mut VerificationFrame,
+    n: usize,
+    op: &str,
+) -> Result<Vec<VType>, LinkageError> {
+    if frame.stack.len() < n {
+        return Err(verify_err(&format!(
+            "{op}: stack underflow (need {n} slots, have {})",
+            frame.stack.len()
+        )));
+    }
+    let mut slots = Vec::with_capacity(n);
+    for _ in 0..n {
+        slots.push(frame.pop()?);
+    }
+    slots.reverse();
+    Ok(slots)
+}
+
+/// Verify a slice of popped slots (bottom-to-top order) does not split a
+/// category-2 value across its lower boundary. A category-2 base
+/// (`Long`/`Double`) must always be immediately followed by its `Top`
+/// upper half; the first slot must not be a dangling `Top`.
+fn check_no_split(slots: &[VType], op: &str) -> Result<(), LinkageError> {
+    // The first (lowest) slot may not be a `Top`: that would mean its
+    // `Long`/`Double` base is still on the stack below — i.e. the pair was
+    // split.
+    if slots.first() == Some(&VType::Top) {
+        return Err(verify_err(&format!(
+            "{op}: operand splits a category-2 value"
+        )));
+    }
+    // A `Long`/`Double` base as the last (highest) slot would mean its
+    // `Top` upper half is above it and was not included — also a split.
+    if matches!(slots.last(), Some(VType::Long) | Some(VType::Double)) {
+        return Err(verify_err(&format!(
+            "{op}: operand splits a category-2 value"
+        )));
+    }
+    Ok(())
+}
+
 fn push_typed(frame: &mut VerificationFrame, vtype: &VType) -> Result<(), LinkageError> {
     frame.push(vtype.clone())?;
     if vtype.is_category2() {
