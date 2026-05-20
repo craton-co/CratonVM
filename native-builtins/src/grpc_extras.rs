@@ -40,12 +40,17 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_HELLO_WORLD_SERVER: &str = "io/grpc/examples/helloworld/HelloWorldServer";
+#[allow(dead_code)]
 const CN_HELLO_WORLD_CLIENT: &str = "io/grpc/examples/helloworld/HelloWorldClient";
+#[allow(dead_code)]
 const CN_ROUTE_GUIDE_SERVER: &str = "io/grpc/examples/routeguide/RouteGuideServer";
+#[allow(dead_code)]
 const CN_ROUTE_GUIDE_CLIENT: &str = "io/grpc/examples/routeguide/RouteGuideClient";
 
 /// Generic `main([Ljava/lang/String;)V` no-op for gRPC example entry points.
+#[allow(dead_code)]
 fn grpc_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[grpc-shim] main short-circuited (boot-test mode)");
     Ok(None)
@@ -54,58 +59,23 @@ fn grpc_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 /// Generic `<clinit>()V` no-op for gRPC example classes. The real clinit
 /// pulls in Netty's static initializer chain which probes for
 /// `sun.misc.Unsafe` and epoll native transport.
+#[allow(dead_code)]
 fn grpc_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// Install every gRPC boot-test short-circuit this module owns.
 ///
-/// **NOT WIRED YET.** The orchestrator owns `lib.rs` and is responsible
-/// for adding the call to this function from
-/// `register_essential_natives`.
+/// Disabled per "no synthetic stubs" policy (matches the round-8 batch shim
+/// disable in commit 8071d25). All registrations were pure fake-out returning
+/// `Ok(None)` without doing real work; they have been removed so gRPC runs
+/// against real bytecode.
 pub fn register_grpc_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_GRPC_REAL=1, skip the short-circuit
-    // so the real HelloWorldServer/Client main runs (lets us measure
-    // how far CratonVM gets through Netty's static-init chain).
-    if std::env::var("RUSTJVM_GRPC_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[grpc-shim] RUSTJVM_GRPC_REAL=1 — skipping shim registration, running real gRPC");
-        return;
-    }
-    // HelloWorldServer.main — canonical gRPC Java boot-test entry point.
-    registry.register(
-        CN_HELLO_WORLD_SERVER,
-        "main",
-        "([Ljava/lang/String;)V",
-        grpc_main_noop,
-    );
-    registry.register(CN_HELLO_WORLD_SERVER, "<clinit>", "()V", grpc_clinit_noop);
-
-    // HelloWorldClient.main — companion client entry point.
-    registry.register(
-        CN_HELLO_WORLD_CLIENT,
-        "main",
-        "([Ljava/lang/String;)V",
-        grpc_main_noop,
-    );
-    registry.register(CN_HELLO_WORLD_CLIENT, "<clinit>", "()V", grpc_clinit_noop);
-
-    // RouteGuideServer.main — secondary example entry point.
-    registry.register(
-        CN_ROUTE_GUIDE_SERVER,
-        "main",
-        "([Ljava/lang/String;)V",
-        grpc_main_noop,
-    );
-    registry.register(CN_ROUTE_GUIDE_SERVER, "<clinit>", "()V", grpc_clinit_noop);
-
-    // RouteGuideClient.main — companion route-guide client.
-    registry.register(
-        CN_ROUTE_GUIDE_CLIENT,
-        "main",
-        "([Ljava/lang/String;)V",
-        grpc_main_noop,
-    );
-    registry.register(CN_ROUTE_GUIDE_CLIENT, "<clinit>", "()V", grpc_clinit_noop);
+    let _ = registry;
+    let _ = CN_HELLO_WORLD_SERVER;
+    let _ = CN_HELLO_WORLD_CLIENT;
+    let _ = CN_ROUTE_GUIDE_SERVER;
+    let _ = CN_ROUTE_GUIDE_CLIENT;
 }
 
 #[cfg(test)]
