@@ -494,21 +494,20 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // ------------------------------------------------------------------
-    // Round-17: deeper bootstrap shims to break the reflective Module-
-    // graph walk seen in the WildFly 39 watchdog dispatch_trace.
-    // ------------------------------------------------------------------
-
-    // Module.<clinit>()V — no-op (post_clinit_fixup repopulates the
-    // static fields we actually need).
-    registry.register(CN_MODULE, "<clinit>", "()V", native_module_clinit);
-
-    // ModuleLoader.<clinit>()V — no-op.
-    registry.register(
-        CN_MODULE_LOADER,
-        "<clinit>",
-        "()V",
-        native_module_loader_clinit,
-    );
+    // Round-20 (real-bytecode audit): the `Module.<clinit>` /
+    // `ModuleLoader.<clinit>` no-op stubs were REMOVED. They were the
+    // direct cause of the `initBootModuleLoader` NPE: `Module.<clinit>`
+    // is what constructs and stores the static `BOOT_MODULE_LOADER`
+    // `AtomicReference` (bytecode offset 41). No-op'ing the clinit left
+    // that field null, so `initBootModuleLoader`'s
+    // `BOOT_MODULE_LOADER.set(loader)` threw "Cannot invoke set on
+    // null". The real clinit only constructs `AtomicReference`s,
+    // `RuntimePermission`s, a `PropertyReadAction` via `AccessController`,
+    // and a `StackWalker` — all of which CratonVM supports — so it must
+    // run normally. The `native_module_clinit` / `native_module_loader_clinit`
+    // helpers are kept (dead) only to avoid churn; see `let _` below.
+    let _ = native_module_clinit;
+    let _ = native_module_loader_clinit;
 
     // Module.getDependencies()[LModule$Dependency; — empty array.
     registry.register(
