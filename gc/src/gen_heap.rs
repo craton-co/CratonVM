@@ -3236,6 +3236,36 @@ mod tests {
     }
 
     #[test]
+    fn large_array_survives_gc() {
+        // Regression: `forward_object`'s false-root guard rejected any
+        // object whose computed size exceeded a hardcoded 64 MiB cap.
+        // A genuine `int[16777216]` is 67_108_904 bytes (16M*4 + 40-byte
+        // header) — 40 bytes over the cap — so the collector skipped it
+        // as a "suspected false root" and freed a still-live array.
+        // The guard now bounds-checks against the from-space arena, so a
+        // real object of any size that fits the arena survives.
+        let heap = GenerationalHeap::with_sizes(80 * 1024 * 1024, 8 * 1024 * 1024);
+        let monitors = NoOpMonitors;
+
+        let n: usize = 16_777_216; // 67_108_904-byte int[] — over the old 64 MiB cap
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        heap.set_array_element(arr, 0, Value::Int(7)).unwrap();
+        heap.set_array_element(arr, n - 1, Value::Int(12345)).unwrap();
+
+        let mut roots = vec![arr];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        // The array must be forwarded, not skipped as a false root.
+        assert_eq!(result.stats.objects_copied, 1, "large array must survive GC");
+
+        let new_arr = roots[0];
+        assert_ne!(new_arr.as_ptr(), arr.as_ptr(), "array should have been moved");
+        assert_eq!(heap.array_length(new_arr), n);
+        assert_eq!(heap.get_array_element(new_arr, 0), Ok(Value::Int(7)));
+        assert_eq!(heap.get_array_element(new_arr, n - 1), Ok(Value::Int(12345)));
+    }
+
+    #[test]
     fn minor_gc_unreachable_freed() {
         let heap = small_gen_heap();
         let monitors = NoOpMonitors;
