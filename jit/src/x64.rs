@@ -2256,6 +2256,258 @@ fn find_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]) -> V
     hoists
 }
 
+// ---------------------------------------------------------------------------
+// Integer-arithmetic LICM
+// ---------------------------------------------------------------------------
+//
+// Hoists a *straight-line, side-effect-free, non-faulting* integer expression
+// out of a loop body into the loop pre-header. The classic target is an
+// arithmetic expression on loop-invariant locals/constants, e.g.
+//
+//     for (int i = 0; i < N; i++) {
+//         int inv = base * 3 + 11;   // <-- recomputed every iteration
+//         sum += inv + (i & 1);
+//     }
+//
+// where `base` is never written inside the loop. The expression
+// `iload base; iconst_3; imul; bipush 11; iadd` produces exactly one int and
+// can never throw: every opcode below is a register/immediate ALU op (integer
+// add/sub/mul/shift/bitwise). No memory access, no division (idiv can throw
+// ArithmeticException), no calls. Therefore the value is identical on every
+// iteration and hoisting it is observationally equivalent.
+//
+// Safety contract enforced by `match_invariant_iarith` / `find_arith_loop_hoists`:
+//   * Every operand is either an integer constant or an `iload` of a local
+//     that is NOT in the loop's `modified` bitmask (provably loop-invariant).
+//   * Only the whitelisted non-faulting opcodes appear (see `ArithStep`).
+//   * The matched run is stack-balanced to a net effect of exactly +1, i.e.
+//     it leaves a single value behind, with the simulated mini-stack never
+//     going negative (well-formed expression).
+//   * `idiv`/`irem`/`ldiv`/`lrem` and any long/float/double op are excluded —
+//     so the only opcodes present cannot fault.
+
+/// One step of a replayable loop-invariant integer expression. The steps form
+/// a postfix (RPN) program: pushes put a value on a value stack, binary ops
+/// consume the top two and push the result.
+#[derive(Debug, Clone, Copy)]
+enum ArithStep {
+    /// Push an integer constant.
+    PushConst(i32),
+    /// Push the current value of a loop-invariant local (read once at the
+    /// pre-header — the local is provably unmodified inside the loop).
+    PushLocal(usize),
+    /// Pop b, pop a, push `a OP b`. The byte is the JVM opcode (iadd, isub,
+    /// imul, ishl, ishr, iushr, iand, ior, ixor) — all non-faulting.
+    BinOp(u8),
+}
+
+/// A loop-invariant integer-arithmetic sequence eligible for hoisting.
+struct ArithLoopHoist {
+    /// Bytecode PC of the loop header (back-edge target).
+    loop_header: usize,
+    /// First bytecode PC of the invariant run.
+    seq_start: usize,
+    /// Bytecode PC just past the invariant run.
+    seq_end: usize,
+    /// RPN program that recomputes the (single) result value.
+    steps: Vec<ArithStep>,
+}
+
+/// Decode the int-pushing instruction at `pc`. Returns `(ArithStep, next_pc)`
+/// if it is a constant push or an `iload` of a *loop-invariant* local.
+fn match_iarith_push(code: &[u8], pc: usize, modified: u64, code_len: usize)
+    -> Option<(ArithStep, usize)>
+{
+    match code[pc] {
+        // iconst_m1..iconst_5
+        0x02..=0x08 => Some((ArithStep::PushConst(code[pc] as i32 - 3), pc + 1)),
+        // bipush
+        0x10 if pc + 1 < code_len => {
+            Some((ArithStep::PushConst(code[pc + 1] as i8 as i32), pc + 2))
+        }
+        // sipush
+        0x11 if pc + 2 < code_len => {
+            let v = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+            Some((ArithStep::PushConst(v), pc + 3))
+        }
+        // iload_0..iload_3
+        0x1a..=0x1d => {
+            let l = (code[pc] - 0x1a) as usize;
+            if l < 64 && (modified & (1u64 << l)) == 0 {
+                Some((ArithStep::PushLocal(l), pc + 1))
+            } else {
+                None
+            }
+        }
+        // iload (wide index)
+        0x15 if pc + 1 < code_len => {
+            let l = code[pc + 1] as usize;
+            if l < 64 && (modified & (1u64 << l)) == 0 {
+                Some((ArithStep::PushLocal(l), pc + 1 + 1))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `true` if `op` is a non-faulting binary integer ALU opcode safe to hoist.
+/// Deliberately EXCLUDES idiv (0x6c) and irem (0x70), which throw
+/// ArithmeticException on divide-by-zero, and all long/float/double ops.
+fn is_hoistable_iarith_binop(op: u8) -> bool {
+    matches!(op,
+        0x60 | // iadd
+        0x64 | // isub
+        0x68 | // imul
+        0x78 | // ishl
+        0x7a | // ishr
+        0x7c | // iushr
+        0x7e | // iand
+        0x80 | // ior
+        0x82   // ixor
+    )
+}
+
+/// Try to match a maximal loop-invariant integer-arithmetic run starting at
+/// `pc`. Returns the RPN program and the PC just past the run. The run must
+/// leave exactly one value on the (simulated) value stack and consist solely
+/// of constant pushes, invariant `iload`s and the whitelisted non-faulting
+/// binary ALU ops.
+fn match_invariant_iarith(code: &[u8], pc: usize, modified: u64, code_len: usize)
+    -> Option<(Vec<ArithStep>, usize)>
+{
+    // The run must START with a push (constant or invariant load). Anything
+    // else means the first value comes from elsewhere on the operand stack
+    // and the run is not self-contained.
+    let (first, mut cur) = match_iarith_push(code, pc, modified, code_len)?;
+
+    let mut steps: Vec<ArithStep> = vec![first];
+    let mut depth: i32 = 1; // simulated value-stack depth
+    let mut best_end: Option<usize> = None;
+    let mut best_len = steps.len();
+
+    // Greedily extend the run. After each instruction, if depth == 1 the run
+    // is a well-formed single-value expression and is a valid stopping point;
+    // remember the longest such prefix.
+    loop {
+        if depth == 1 {
+            best_end = Some(cur);
+            best_len = steps.len();
+        }
+        if cur >= code_len {
+            break;
+        }
+        let op = code[cur];
+        if let Some((step, next)) = match_iarith_push(code, cur, modified, code_len) {
+            steps.push(step);
+            depth += 1;
+            cur = next;
+        } else if is_hoistable_iarith_binop(op) {
+            // A binary op needs two operands available.
+            if depth < 2 {
+                break;
+            }
+            steps.push(ArithStep::BinOp(op));
+            depth -= 1;
+            cur = cur + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Need at least one operation (a lone push is not worth a slot, and a
+    // single invariant load is already cheap / handled elsewhere).
+    let end = best_end?;
+    steps.truncate(best_len);
+    if steps.iter().filter(|s| matches!(s, ArithStep::BinOp(_))).count() == 0 {
+        return None;
+    }
+    Some((steps, end))
+}
+
+/// Maximum simulated value-stack depth reached while evaluating an RPN
+/// arithmetic program. Used to size the shared scratch slot pool.
+fn arith_expr_max_depth(steps: &[ArithStep]) -> usize {
+    let mut depth: usize = 0;
+    let mut max: usize = 0;
+    for s in steps {
+        match s {
+            ArithStep::PushConst(_) | ArithStep::PushLocal(_) => {
+                depth += 1;
+                if depth > max {
+                    max = depth;
+                }
+            }
+            ArithStep::BinOp(_) => {
+                // Two operands consumed, one result pushed: net -1.
+                depth = depth.saturating_sub(1);
+            }
+        }
+    }
+    max
+}
+
+/// Find loop-invariant integer-arithmetic runs that can be hoisted to a loop
+/// pre-header. For nested loops, a run is attributed to the OUTERMOST loop in
+/// which all its operands are invariant (largest span first), so it is
+/// computed as few times as possible. A run already claimed by an outer loop
+/// is not re-hoisted by an inner one.
+fn find_arith_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)])
+    -> Vec<ArithLoopHoist>
+{
+    if loops.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hoists: Vec<ArithLoopHoist> = Vec::new();
+    let mut claimed: FxHashSet<usize> = FxHashSet::default();
+
+    let mut sorted_loops = loops.to_vec();
+    sorted_loops.sort_by_key(|&(h, b)| std::cmp::Reverse(b.saturating_sub(h)));
+
+    for &(header, back_edge) in &sorted_loops {
+        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        if loop_end > code_len {
+            continue;
+        }
+        let modified = find_modified_locals(code, header, loop_end);
+
+        let mut pc = header;
+        while pc < loop_end && pc < code_len {
+            if claimed.contains(&pc) {
+                pc += bytecode_len_at(code, pc);
+                continue;
+            }
+            if let Some((steps, seq_end)) =
+                match_invariant_iarith(code, pc, modified, code_len)
+            {
+                // The whole run must lie inside this loop body.
+                if seq_end <= loop_end && seq_end > pc {
+                    // Mark every PC of the run as claimed so neither this nor
+                    // an inner loop hoists an overlapping sub-run.
+                    let mut q = pc;
+                    while q < seq_end {
+                        claimed.insert(q);
+                        q += bytecode_len_at(code, q);
+                    }
+                    hoists.push(ArithLoopHoist {
+                        loop_header: header,
+                        seq_start: pc,
+                        seq_end,
+                        steps,
+                    });
+                    pc = seq_end;
+                    continue;
+                }
+            }
+            pc += bytecode_len_at(code, pc);
+        }
+    }
+
+    hoists
+}
+
 /// Find loop-invariant FP loads (dload/fload of locals not modified in the loop).
 /// These can be hoisted to a frame slot before the loop, avoiding redundant
 /// loads on every iteration when the local is not XMM-allocated.
@@ -2962,6 +3214,13 @@ struct Compiler {
     hoist_info: Vec<LoopHoist>,
     /// LICM: frame offsets for hoisted values (one per LoopHoist entry).
     hoist_offsets: Vec<i32>,
+    /// LICM: loop-invariant integer-arithmetic hoisting info.
+    arith_hoist_info: Vec<ArithLoopHoist>,
+    /// LICM: frame offsets for hoisted arithmetic values (one per
+    /// `arith_hoist_info` entry).
+    arith_hoist_offsets: Vec<i32>,
+    /// LICM: frame offset of the first shared arith-LICM scratch slot.
+    arith_scratch_base: i32,
     /// Frame offset of the first callee-saved register slot (from RBP).
     callee_saved_base: i32,
     /// SIMD: vectorizable loops detected during analysis.
@@ -3170,6 +3429,7 @@ impl Compiler {
         typecheck_info: Vec<(usize, *const u8, usize)>,
         static_field_info: Vec<(usize, u32, usize, u8, bool)>,
         hoist_info: Vec<LoopHoist>,
+        arith_hoist_info: Vec<ArithLoopHoist>,
         alloc_result: super::regalloc::RegAllocResult,
         helpers: JitRuntimeHelpers,
         num_scalar_slots: usize,
@@ -3180,7 +3440,21 @@ impl Compiler {
         // If LICM hoisting is active, reserve extra slots for hoisted values.
         // If scalar replacement is active, reserve extra slots for replaced object fields.
         let num_hoists = hoist_info.len();
-        let extra_slots = (if needs_heap { 1 } else { 0 }) + num_hoists + num_scalar_slots;
+        let num_arith_hoists = arith_hoist_info.len();
+        // LICM arithmetic: besides one result slot per hoist, reserve a small
+        // shared scratch pool sized to the deepest hoisted expression. The
+        // pool is shared because hoists execute serially (one per loop entry),
+        // never nested — see `emit_arith_hoist`.
+        let arith_scratch_depth: usize = arith_hoist_info
+            .iter()
+            .map(|h| arith_expr_max_depth(&h.steps))
+            .max()
+            .unwrap_or(0);
+        let extra_slots = (if needs_heap { 1 } else { 0 })
+            + num_hoists
+            + num_arith_hoists
+            + arith_scratch_depth
+            + num_scalar_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
@@ -3228,6 +3502,15 @@ impl Compiler {
             .map(|k| ((hoist_base + k) as i32 + 1) * 8) // Cast: x86-64 immediate encoding
             .collect();
 
+        // LICM: integer-arithmetic hoist slots follow the aaload hoist slots.
+        let arith_hoist_base = hoist_base + num_hoists;
+        let arith_hoist_offsets: Vec<i32> = (0..num_arith_hoists)
+            .map(|k| ((arith_hoist_base + k) as i32 + 1) * 8) // Cast: x86-64 immediate encoding
+            .collect();
+        // Frame offset of the first arith-LICM scratch slot (shared eval stack).
+        let arith_scratch_local = arith_hoist_base + num_arith_hoists;
+        let arith_scratch_base: i32 = ((arith_scratch_local as i32) + 1) * 8; // Cast: x86-64 immediate encoding
+
         Self {
             buf,
             stack: Vec::with_capacity(max_stack),
@@ -3254,6 +3537,9 @@ impl Compiler {
             static_field_info,
             hoist_info,
             hoist_offsets,
+            arith_hoist_info,
+            arith_hoist_offsets,
+            arith_scratch_base,
             callee_saved_base,
             simd_loops: Vec::new(),
             bounds_safe_pcs: FxHashSet::default(),
@@ -3974,6 +4260,113 @@ impl Compiler {
         }
         self.buf.emit_byte(0x31); // XOR r/m32, r32
         self.modrm_reg(reg, reg);
+    }
+
+    /// LICM: emit a hoisted loop-invariant integer-arithmetic expression.
+    ///
+    /// The RPN `steps` program is evaluated using the dedicated arith-LICM
+    /// scratch slot pool as a value stack; the final (single) result is left
+    /// in RAX. Machine-code sequences for each binary op match the main
+    /// emitter byte-for-byte (32-bit ALU op + `movsxd rax,eax` for the
+    /// sign-extending ops, plain 32-bit for `iushr`), so the hoisted value is
+    /// bit-identical to recomputing the expression in place.
+    ///
+    /// `PushLocal` reads the local via its register assignment if it has one,
+    /// otherwise from its frame slot — the local is loop-invariant so its
+    /// value is the same here (pre-header) as on every iteration.
+    fn emit_arith_hoist_into_rax(&mut self, steps: &[ArithStep]) {
+        let scratch_base = self.arith_scratch_base;
+        let slot = |k: usize| scratch_base + (k as i32) * 8; // Cast: x86-64 immediate encoding
+        let mut depth: usize = 0;
+        for step in steps {
+            match *step {
+                ArithStep::PushConst(v) => {
+                    self.emit_mov_imm32_sx(RAX, v);
+                    let off = slot(depth);
+                    self.emit_store_local(off, RAX);
+                    depth += 1;
+                }
+                ArithStep::PushLocal(l) => {
+                    if let Some(reg) = self.reg_for_local(l) {
+                        self.emit_mov_reg_reg(RAX, reg);
+                    } else {
+                        self.emit_load_local(RAX, self.local_offset(l));
+                    }
+                    let off = slot(depth);
+                    self.emit_store_local(off, RAX);
+                    depth += 1;
+                }
+                ArithStep::BinOp(op) => {
+                    // depth >= 2 guaranteed by `match_invariant_iarith`.
+                    depth -= 1;
+                    let off_b = slot(depth);
+                    depth -= 1;
+                    let off_a = slot(depth);
+                    self.emit_load_local(RCX, off_b); // b → RCX
+                    self.emit_load_local(RAX, off_a); // a → RAX
+                    match op {
+                        0x60 => {
+                            // iadd: ADD eax,ecx ; movsxd rax,eax
+                            self.buf.emit(&[0x01, 0xC8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x64 => {
+                            // isub: SUB eax,ecx ; movsxd
+                            self.buf.emit(&[0x29, 0xC8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x68 => {
+                            // imul: IMUL eax,ecx ; movsxd
+                            self.buf.emit(&[0x0F, 0xAF, 0xC1]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x78 => {
+                            // ishl: SHL eax,cl ; movsxd
+                            self.buf.emit(&[0xD3, 0xE0]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x7a => {
+                            // ishr: SAR eax,cl ; movsxd
+                            self.buf.emit(&[0xD3, 0xF8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x7c => {
+                            // iushr: SHR eax,cl (32-bit zero-extends)
+                            self.buf.emit(&[0xD3, 0xE8]);
+                        }
+                        0x7e => {
+                            // iand: AND eax,ecx ; movsxd
+                            self.buf.emit(&[0x21, 0xC8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x80 => {
+                            // ior: OR eax,ecx ; movsxd
+                            self.buf.emit(&[0x09, 0xC8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        0x82 => {
+                            // ixor: XOR eax,ecx ; movsxd
+                            self.buf.emit(&[0x31, 0xC8]);
+                            self.rex_w();
+                            self.buf.emit(&[0x63, 0xC0]);
+                        }
+                        _ => unreachable!("non-hoistable binop reached emit"),
+                    }
+                    let off_res = slot(depth);
+                    self.emit_store_local(off_res, RAX);
+                    depth += 1;
+                }
+            }
+        }
+        // Result is the single value left in scratch slot 0.
+        self.emit_load_local(RAX, slot(0));
     }
 
     /// MOV reg, [rbp - offset]
@@ -8579,6 +8972,26 @@ impl Compiler {
                 }
             }
 
+            // === LICM: Emit hoisted integer-arithmetic at loop headers ===
+            // Same placement contract as the aaload hoist: emitted BEFORE
+            // pc_to_native[pc] is set, so the back-edge skips it. The pure,
+            // non-faulting expression is computed once and its result cached
+            // in a dedicated frame slot; in-loop occurrences become a load.
+            {
+                let arith_hoists: Vec<(Vec<ArithStep>, i32)> = self
+                    .arith_hoist_info
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| h.loop_header == pc)
+                    .map(|(idx, h)| (h.steps.clone(), self.arith_hoist_offsets[idx]))
+                    .collect();
+
+                for (steps, result_offset) in arith_hoists {
+                    self.emit_arith_hoist_into_rax(&steps);
+                    self.emit_store_local(result_offset, RAX);
+                }
+            }
+
             // === SIMD: Emit vectorized preheader for int-array-sum loops ===
             // Runs once on initial loop entry; back-edges skip to scalar loop.
             {
@@ -8846,6 +9259,48 @@ impl Compiler {
                     }
                     pc = seq_end;
                     continue;
+                }
+            }
+
+            // === LICM: Replace hoisted integer-arithmetic runs with a load ===
+            // At the start of an invariant run, replace the whole expression
+            // with a single load of its cached result. The matched run is
+            // straight-line (only constant/iload pushes + ALU ops), so no
+            // bytecode inside it is a branch target — but guard anyway: if
+            // any interior PC is a branch target, fall through to the normal
+            // per-opcode path (the arithmetic is still correct, just not
+            // hoisted).
+            {
+                let arith_replace = self
+                    .arith_hoist_info
+                    .iter()
+                    .enumerate()
+                    .find(|(_, h)| h.seq_start == pc)
+                    .map(|(idx, h)| (h.seq_end, self.arith_hoist_offsets[idx]));
+
+                if let Some((seq_end, result_offset)) = arith_replace {
+                    // Safety: no interior PC may be a branch target.
+                    let mut interior_safe = true;
+                    let mut q = pc + bytecode_len_at(code, pc);
+                    while q < seq_end {
+                        if branch_targets[q] {
+                            interior_safe = false;
+                            break;
+                        }
+                        q += bytecode_len_at(code, q);
+                    }
+                    if interior_safe {
+                        self.emit_load_local(RAX, result_offset);
+                        self.push_from_rax();
+                        let native_pos = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                        let mut skip_pc = pc + bytecode_len_at(code, pc);
+                        while skip_pc < seq_end {
+                            self.pc_to_native[skip_pc] = native_pos;
+                            skip_pc += bytecode_len_at(code, skip_pc);
+                        }
+                        pc = seq_end;
+                        continue;
+                    }
                 }
             }
 
@@ -12727,6 +13182,25 @@ pub fn compile(
     let loops = detect_loops(code, code_len);
     let hoist_info = find_loop_hoists(code, code_len, &loops);
 
+    // LICM: find loop-invariant integer-arithmetic runs to hoist into the
+    // loop pre-header. These are pure, non-faulting ALU expressions on
+    // loop-invariant locals/constants — see `find_arith_loop_hoists`.
+    let arith_hoist_info = if std::env::var_os("RUSTJVM_DISABLE_ARITH_LICM").is_some() {
+        Vec::new()
+    } else {
+        find_arith_loop_hoists(code, code_len, &loops)
+    };
+    if !arith_hoist_info.is_empty() && std::env::var_os("RUSTJVM_DBG_JIT_GEN").is_some() {
+        eprintln!(
+            "[JIT_GEN] arith-LICM hoists={} runs={:?}",
+            arith_hoist_info.len(),
+            arith_hoist_info
+                .iter()
+                .map(|h| (h.seq_start, h.seq_end, h.steps.len()))
+                .collect::<Vec<_>>(),
+        );
+    }
+
     // Round-8 wave-3 HIGH fix (Fix 3): generic LICM scaffold for
     // getfield/getstatic loads. The analysis is invoked here so the
     // pipeline links against the new `loop_analysis` module and
@@ -12896,6 +13370,7 @@ pub fn compile(
         typecheck_info,
         static_field_info,
         hoist_info,
+        arith_hoist_info,
         alloc_result,
         *helpers,
         num_scalar_slots,
@@ -16669,6 +17144,113 @@ mod tests {
         assert_eq!(hoists[0].seq_start, 12);
         assert_eq!(hoists[0].array_local, 0);
         assert_eq!(hoists[0].index_local, 4);
+    }
+
+    #[test]
+    fn test_arith_licm_invariant_expr() {
+        // Counted loop where `base*3 + 11` (base = local 0, never stored in
+        // the loop) is loop-invariant and should be hoisted.
+        //
+        //   PC 0: iload 4 (i)           — loop header / cond
+        //   PC 2: iload_1 (n)
+        //   PC 3: if_icmpge +N          — loop exit
+        //   PC 6: iload_0 (base)        ← invariant run START
+        //   PC 7: iconst_3
+        //   PC 8: imul
+        //   PC 9: bipush 11
+        //   PC 11: iadd                 ← invariant run END (seq_end = 12)
+        //   PC 12: istore 5
+        //   PC 14: iinc 4, 1
+        //   PC 17: goto -17 → 0
+        let code: Vec<u8> = vec![
+            0x15, 0x04, // 0: iload 4
+            0x1b, // 2: iload_1
+            0xa2, 0x00, 0x11, // 3: if_icmpge +17 → 20
+            0x1a, // 6: iload_0 (base)   ← invariant
+            0x06, // 7: iconst_3
+            0x68, // 8: imul
+            0x10, 0x0b, // 9: bipush 11
+            0x60, // 11: iadd
+            0x36, 0x05, // 12: istore 5
+            0x84, 0x04, 0x01, // 14: iinc 4, 1
+            0xa7, 0xff, 0xef, // 17: goto -17 → 0
+            0, 0,
+        ];
+        let code_len = 20;
+
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops.len(), 1);
+
+        let hoists = find_arith_loop_hoists(&code, code_len, &loops);
+        assert_eq!(hoists.len(), 1, "base*3+11 must be hoisted");
+        assert_eq!(hoists[0].loop_header, 0);
+        assert_eq!(hoists[0].seq_start, 6);
+        assert_eq!(hoists[0].seq_end, 12);
+        // Expression: iload_0, iconst_3, imul, bipush 11, iadd → 5 steps.
+        assert_eq!(hoists[0].steps.len(), 5);
+        assert!(matches!(hoists[0].steps[0], ArithStep::PushLocal(0)));
+        assert!(matches!(hoists[0].steps[1], ArithStep::PushConst(3)));
+        assert!(matches!(hoists[0].steps[2], ArithStep::BinOp(0x68)));
+        assert!(matches!(hoists[0].steps[3], ArithStep::PushConst(11)));
+        assert!(matches!(hoists[0].steps[4], ArithStep::BinOp(0x60)));
+        assert_eq!(arith_expr_max_depth(&hoists[0].steps), 2);
+    }
+
+    #[test]
+    fn test_arith_licm_no_hoist_when_operand_modified() {
+        // Same shape, but `base` (local 0) IS stored inside the loop, so the
+        // expression is NOT loop-invariant and must not be hoisted.
+        //
+        //   PC 0: iload 4              — header
+        //   PC 2: iload_1
+        //   PC 3: if_icmpge +N
+        //   PC 6: iload_0 (base)
+        //   PC 7: iconst_3
+        //   PC 8: imul
+        //   PC 9: istore_0 (base)      ← base modified → not invariant
+        //   PC 10: iinc 4, 1
+        //   PC 13: goto -13 → 0
+        let code: Vec<u8> = vec![
+            0x15, 0x04, // 0: iload 4
+            0x1b, // 2: iload_1
+            0xa2, 0x00, 0x0d, // 3: if_icmpge +13 → 16
+            0x1a, // 6: iload_0
+            0x06, // 7: iconst_3
+            0x68, // 8: imul
+            0x3b, // 9: istore_0  ← modifies base
+            0x84, 0x04, 0x01, // 10: iinc 4, 1
+            0xa7, 0xff, 0xf3, // 13: goto -13 → 0
+            0, 0,
+        ];
+        let code_len = 16;
+        let loops = detect_loops(&code, code_len);
+        let hoists = find_arith_loop_hoists(&code, code_len, &loops);
+        assert!(hoists.is_empty(), "expr on a loop-modified local must not hoist");
+    }
+
+    #[test]
+    fn test_arith_licm_excludes_idiv() {
+        // idiv (0x6c) can throw ArithmeticException — it must never be part
+        // of a hoisted run. `base / 3` here should yield no hoist.
+        //   PC 0..5: header + cond (as above)
+        //   PC 6: iload_0; PC 7: iconst_3; PC 8: idiv
+        //   PC 9: istore 5 ...
+        let code: Vec<u8> = vec![
+            0x15, 0x04, // 0: iload 4
+            0x1b, // 2: iload_1
+            0xa2, 0x00, 0x0e, // 3: if_icmpge → 17
+            0x1a, // 6: iload_0
+            0x06, // 7: iconst_3
+            0x6c, // 8: idiv  ← faulting, not hoistable
+            0x36, 0x05, // 9: istore 5
+            0x84, 0x04, 0x01, // 11: iinc 4, 1
+            0xa7, 0xff, 0xf2, // 14: goto -14 → 0
+            0, 0,
+        ];
+        let code_len = 17;
+        let loops = detect_loops(&code, code_len);
+        let hoists = find_arith_loop_hoists(&code, code_len, &loops);
+        assert!(hoists.is_empty(), "idiv must not be hoisted (can fault)");
     }
 
     #[test]

@@ -270,6 +270,7 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 
 pub fn register_all(registry: &mut NativeMethodRegistry) {
     register_toolkit_natives(registry);
+    register_headless_natives(registry);
     register_component_natives(registry);
     register_frame_natives(registry);
     register_graphics_natives(registry);
@@ -342,10 +343,42 @@ fn ensure_peer(ctx: &mut dyn NativeContext, obj: ObjectRef, ctype: ComponentType
 // Toolkit natives
 // ---------------------------------------------------------------------------
 
+/// Build a real `sun.awt.HeadlessToolkit` instance.
+///
+/// This mirrors the JDK's own headless code path: `Toolkit.getDefaultToolkit`
+/// wraps the platform toolkit in a `HeadlessToolkit` when `java.awt.headless`
+/// is true. On CratonVM the Windows platform toolkit (`sun.awt.windows.WToolkit`)
+/// cannot be constructed — its `<init>` starts a native AWT message-pump thread
+/// and blocks in `Object.wait()` for that thread to flip an `inited` flag, which
+/// never happens without the native `awt.dll` event loop. So we construct the
+/// `HeadlessToolkit` directly with a `null` underlying toolkit. `HeadlessToolkit`
+/// is a real JDK class whose non-graphical methods are self-contained or throw
+/// `HeadlessException`; the underlying-toolkit field is only consulted by the
+/// handful of methods that legitimately delegate, and a `null` there matches
+/// what a headless host without a display would expose.
+fn build_headless_toolkit(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let tk = ctx.new_object("sun/awt/HeadlessToolkit")?;
+    if let Some(Value::Object(Some(obj))) = &tk {
+        // HeadlessToolkit(Toolkit) — store a null underlying toolkit. The
+        // ctor's `instanceof ComponentFactory` check is null-safe.
+        ctx.invoke(
+            "sun/awt/HeadlessToolkit",
+            "<init>",
+            "(Ljava/awt/Toolkit;)V",
+            &[Value::Object(Some(*obj)), Value::Object(None)],
+        )?;
+    }
+    Ok(tk)
+}
+
 fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
+    // java.awt.Toolkit.getDefaultToolkit — return a real HeadlessToolkit.
+    // The previous implementation returned `new java/awt/Toolkit`, but
+    // `java.awt.Toolkit` is abstract; instances of it have no concrete
+    // method bodies and any virtual call would mis-dispatch.
     registry.register(
         "java/awt/Toolkit", "getDefaultToolkit", "()Ljava/awt/Toolkit;",
-        |ctx, _args| ctx.new_object("java/awt/Toolkit"),
+        |ctx, _args| build_headless_toolkit(ctx),
     );
     registry.register(
         "java/awt/Toolkit", "getScreenSize", "()Ljava/awt/Dimension;",
@@ -362,7 +395,122 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/Toolkit", "sync", "()V", |_ctx, _args| void_ok());
     registry.register("java/awt/Toolkit", "beep", "()V", |_ctx, _args| void_ok());
     registry.register("sun/awt/SunToolkit", "getDefaultToolkit", "()Ljava/awt/Toolkit;",
-        |ctx, _args| ctx.new_object("java/awt/Toolkit"));
+        |ctx, _args| build_headless_toolkit(ctx));
+    // sun.awt.PlatformGraphicsInfo.createToolkit — the seam Toolkit.getDefaultToolkit
+    // uses to obtain the platform toolkit. The real Windows path returns a
+    // `WToolkit`, which cannot be constructed headlessly on CratonVM (see
+    // `build_headless_toolkit`). Returning a `HeadlessToolkit` here means the
+    // `instanceof HeadlessToolkit` guard further down `getDefaultToolkit`
+    // short-circuits the wrap, which is exactly the headless contract.
+    registry.register("sun/awt/PlatformGraphicsInfo", "createToolkit", "()Ljava/awt/Toolkit;",
+        |ctx, _args| build_headless_toolkit(ctx));
+}
+
+// ---------------------------------------------------------------------------
+// Headless GraphicsEnvironment natives
+// ---------------------------------------------------------------------------
+
+/// Register headless `java.awt.GraphicsEnvironment` / `sun.awt.PlatformGraphicsInfo`
+/// natives.
+///
+/// Swing/AWT apps started with `-Djava.awt.headless=true` reach
+/// `GraphicsEnvironment.getLocalGraphicsEnvironment()` early during AWT init.
+/// In the stock JDK that returns `GraphicsEnvironment$LocalGE.INSTANCE`, built
+/// by `LocalGE.createGE()`:
+///
+/// ```text
+/// GraphicsEnvironment ge = PlatformGraphicsInfo.createGE();   // Win32GraphicsEnvironment
+/// if (GraphicsEnvironment.isHeadless())
+///     ge = new HeadlessGraphicsEnvironment(ge);               // headless wrapper
+/// ```
+///
+/// CratonVM can already construct `Win32GraphicsEnvironment` and
+/// `HeadlessGraphicsEnvironment`, but the `LocalGE.<clinit>` that wires them
+/// together does not run cleanly under the partial bootstrap. Registering
+/// `getLocalGraphicsEnvironment` as a native lets us reproduce the exact JDK
+/// headless wiring without depending on the `LocalGE` static initializer.
+fn register_headless_natives(registry: &mut NativeMethodRegistry) {
+    // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessProperty()Z — the JDK
+    // consults this when `java.awt.headless` is unset. On a host with no
+    // displays it returns true. CratonVM has no native display, so the
+    // headless default is `true`, matching `hasDisplays == false`.
+    registry.register(
+        "sun/awt/PlatformGraphicsInfo", "getDefaultHeadlessProperty", "()Z",
+        |_ctx, _args| bool_ok(true),
+    );
+    // sun.awt.PlatformGraphicsInfo.hasDisplays0()Z — native display probe.
+    // No native display backend → no displays.
+    registry.register(
+        "sun/awt/PlatformGraphicsInfo", "hasDisplays0", "()Z",
+        |_ctx, _args| bool_ok(false),
+    );
+    // sun.awt.PlatformGraphicsInfo.getDefaultHeadlessMessage — diagnostic
+    // text shown when a headless app touches a graphics-only API.
+    registry.register(
+        "sun/awt/PlatformGraphicsInfo", "getDefaultHeadlessMessage", "()Ljava/lang/String;",
+        |ctx, _args| obj_ok(ctx.create_string(
+            "\nThis machine does not have a display; running in headless mode.")),
+    );
+
+    // java.awt.GraphicsEnvironment.isHeadless()Z / .isHeadlessInstance()Z —
+    // honour the `java.awt.headless` system property, defaulting to headless.
+    registry.register(
+        "java/awt/GraphicsEnvironment", "isHeadless", "()Z",
+        |ctx, _args| bool_ok(headless_property(ctx)),
+    );
+    registry.register(
+        "java/awt/GraphicsEnvironment", "isHeadlessInstance", "()Z",
+        |ctx, _args| bool_ok(headless_property(ctx)),
+    );
+
+    // java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment — reproduce
+    // LocalGE.createGE(): build the platform GE, then wrap it for headless.
+    registry.register(
+        "java/awt/GraphicsEnvironment", "getLocalGraphicsEnvironment",
+        "()Ljava/awt/GraphicsEnvironment;",
+        |ctx, _args| build_local_graphics_environment(ctx),
+    );
+}
+
+/// Read the effective `java.awt.headless` value. Unset → default headless
+/// (CratonVM has no native display).
+fn headless_property(ctx: &dyn NativeContext) -> bool {
+    match ctx.get_system_property("java.awt.headless") {
+        Some(v) => !v.eq_ignore_ascii_case("false"),
+        None => true,
+    }
+}
+
+/// Build the local `GraphicsEnvironment`, mirroring `LocalGE.createGE()`.
+fn build_local_graphics_environment(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    // PlatformGraphicsInfo.createGE() — the platform GraphicsEnvironment.
+    // On Windows this is `sun.awt.Win32GraphicsEnvironment`, which CratonVM
+    // can construct (its native chain is satisfied). Fall back to the
+    // headless GE with no delegate if the platform GE cannot be built.
+    let platform_ge = match ctx.invoke(
+        "sun/awt/PlatformGraphicsInfo", "createGE", "()Ljava/awt/GraphicsEnvironment;", &[],
+    ) {
+        Ok(Some(Value::Object(Some(obj)))) => Some(obj),
+        _ => None,
+    };
+
+    if headless_property(ctx) {
+        // new HeadlessGraphicsEnvironment(platformGE)
+        let hge = ctx.new_object("sun/java2d/HeadlessGraphicsEnvironment")?;
+        if let Some(Value::Object(Some(obj))) = &hge {
+            ctx.invoke(
+                "sun/java2d/HeadlessGraphicsEnvironment", "<init>",
+                "(Ljava/awt/GraphicsEnvironment;)V",
+                &[Value::Object(Some(*obj)), Value::Object(platform_ge)],
+            )?;
+        }
+        return Ok(hge);
+    }
+
+    match platform_ge {
+        Some(obj) => obj_ok(obj),
+        None => null_ok(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1266,103 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         null_ok()
     });
     registry.register("java/awt/image/BufferedImage", "flush", "()V", |_ctx, _args| void_ok());
+
+    // Bulk getRGB: copy an w*h block of ARGB pixels into an int[].
+    // Signature: getRGB(int startX, int startY, int w, int h,
+    //                   int[] rgbArray, int offset, int scansize)
+    registry.register(
+        "java/awt/image/BufferedImage",
+        "getRGB",
+        "(IIII[III)[I",
+        |ctx, args| {
+            let this = get_obj(args, 0)
+                .ok_or_else(|| RuntimeError::NullPointerException {
+                    message: Some("BufferedImage.getRGB on null".into()),
+                })?;
+            let (start_x, start_y) = (get_int(args, 1), get_int(args, 2));
+            let (w, h) = (get_int(args, 3), get_int(args, 4));
+            let offset = get_int(args, 6);
+            let scansize = get_int(args, 7);
+            if w < 0 || h < 0 {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("getRGB: negative dimension {w}x{h}"),
+                }
+                .into());
+            }
+            let Value::Long(id) = ctx.get_field_by_name(this, "imageId") else {
+                return null_ok();
+            };
+            let reg = image::image_registry();
+            let Some(img) = reg.get(image::ImageId(id as u64)) else {
+                return null_ok();
+            };
+            let (iw, ih) = (img.width() as i32, img.height() as i32);
+            if start_x < 0
+                || start_y < 0
+                || start_x.checked_add(w).map_or(true, |e| e > iw)
+                || start_y.checked_add(h).map_or(true, |e| e > ih)
+            {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: start_x,
+                }
+                .into());
+            }
+            // Allocate the result array if the caller passed null.
+            let needed = if h == 0 {
+                0i64
+            } else {
+                offset as i64 + (h as i64 - 1) * scansize as i64 + w as i64
+            };
+            let arr = match get_obj(args, 5) {
+                Some(a) => a,
+                None => {
+                    let len = needed.max(0).min(i32::MAX as i64) as usize;
+                    ctx.new_array(rustjvm_types::ArrayElementType::Int, len)
+                }
+            };
+            let arr_len = ctx.array_length(arr) as i64;
+            // Snapshot the pixels before touching the array so a bounds
+            // failure leaves the destination untouched.
+            for row in 0..h {
+                for col in 0..w {
+                    let argb = img
+                        .get_rgb((start_x + col) as u32, (start_y + row) as u32)
+                        as i32;
+                    let idx = offset as i64 + row as i64 * scansize as i64 + col as i64;
+                    if idx < 0 || idx >= arr_len {
+                        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                            index: idx.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                        }
+                        .into());
+                    }
+                    ctx.set_array_element(arr, idx as usize, Value::Int(argb));
+                }
+            }
+            obj_ok(arr)
+        },
+    );
+
+    // `initIDs` natives cache JNI field/method IDs for the real JDK image
+    // classes. RustJVM resolves fields by name, so no IDs need caching —
+    // register these as no-ops so the real-JDK `<clinit>` of each class can
+    // complete (it would otherwise throw UnsatisfiedLinkError).
+    for class in [
+        "java/awt/image/BufferedImage",
+        "java/awt/image/ColorModel",
+        "java/awt/image/IndexColorModel",
+        "java/awt/image/Raster",
+        "java/awt/image/SampleModel",
+        "java/awt/image/SinglePixelPackedSampleModel",
+        "java/awt/image/ComponentSampleModel",
+        "java/awt/image/Kernel",
+        "sun/awt/image/IntegerComponentRaster",
+        "sun/awt/image/ByteComponentRaster",
+        "sun/awt/image/ShortComponentRaster",
+        "sun/awt/image/BytePackedRaster",
+        "sun/awt/image/GifImageDecoder",
+    ] {
+        registry.register(class, "initIDs", "()V", |_ctx, _args| void_ok());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,6 +1482,31 @@ fn register_font_natives(registry: &mut NativeMethodRegistry) {
         }
         null_ok()
     });
+    // Font.getFontName()/getFontName(Locale) — return the font's face name.
+    //
+    // The stock JDK resolves these through `getFont2D()` -> `sun.font.Font2D`,
+    // which on Windows pulls in `sun.awt.Win32FontManager` and its native EUDC
+    // font-file lookup. CratonVM has no Win32 font manager, so a headless app
+    // that calls `Font.getFontName()` (common during AWT init) trips an
+    // `UnsatisfiedLinkError`. Resolve the name from the Font's own `name`
+    // field instead — for the logical fonts (Dialog, SansSerif, …) used in
+    // headless mode this is the correct face name, mirroring `getFamily`.
+    fn font_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        if let Some(this) = get_obj(args, 0) {
+            if let Value::Object(Some(n)) = ctx.get_field_by_name(this, "name") {
+                if let Some(name) = ctx.read_string(n) {
+                    return obj_ok(ctx.create_string(&name));
+                }
+            }
+            let fallback = ctx.read_string(this).unwrap_or_else(|| "Dialog".to_string());
+            return obj_ok(ctx.create_string(&fallback));
+        }
+        null_ok()
+    }
+    registry.register("java/awt/Font", "getFontName", "()Ljava/lang/String;", font_name);
+    registry.register(
+        "java/awt/Font", "getFontName", "(Ljava/util/Locale;)Ljava/lang/String;", font_name,
+    );
     registry.register("java/awt/Font", "getSize", "()I", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
             if let Value::Int(s) = ctx.get_field_by_name(this, "size") { return int_ok(s); }

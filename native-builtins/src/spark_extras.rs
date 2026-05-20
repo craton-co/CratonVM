@@ -41,10 +41,13 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_SPARK_SUBMIT: &str = "org/apache/spark/deploy/SparkSubmit";
+#[allow(dead_code)]
 const CN_LAUNCHER_MAIN: &str = "org/apache/spark/launcher/Main";
 
 /// Generic `main([Ljava/lang/String;)V` no-op for Spark entry points.
+#[allow(dead_code)]
 fn spark_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[spark-shim] main short-circuited (boot-test mode)");
     Ok(None)
@@ -53,39 +56,21 @@ fn spark_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 /// Generic `<clinit>()V` no-op for Spark entry-point classes. The real
 /// clinit triggers Scala static initializers which depend on
 /// `sun.misc.Unsafe` offsets CratonVM cannot populate.
+#[allow(dead_code)]
 fn spark_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// Install every Spark boot-test short-circuit this module owns.
 ///
-/// **NOT WIRED YET.** The orchestrator owns `lib.rs` and is responsible
-/// for adding the call to this function from
-/// `register_essential_natives`.
+/// Disabled per "no synthetic stubs" policy (matches the round-8 batch shim
+/// disable in commit 8071d25). All registrations were pure fake-out returning
+/// `Ok(None)` without doing real work; they have been removed so Spark runs
+/// against real bytecode.
 pub fn register_spark_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when set to "1", skip installing the boot-test
-    // short-circuits so the real Spark main runs (used by the
-    // orchestrator's real-app diagnostics).
-    if std::env::var("RUSTJVM_SPARK_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    // SparkSubmit.main — in-JVM `spark-submit` driver entry point.
-    registry.register(
-        CN_SPARK_SUBMIT,
-        "main",
-        "([Ljava/lang/String;)V",
-        spark_main_noop,
-    );
-    registry.register(CN_SPARK_SUBMIT, "<clinit>", "()V", spark_clinit_noop);
-
-    // launcher.Main.main — cross-platform launcher entry point.
-    registry.register(
-        CN_LAUNCHER_MAIN,
-        "main",
-        "([Ljava/lang/String;)V",
-        spark_main_noop,
-    );
-    registry.register(CN_LAUNCHER_MAIN, "<clinit>", "()V", spark_clinit_noop);
+    let _ = registry;
+    let _ = CN_SPARK_SUBMIT;
+    let _ = CN_LAUNCHER_MAIN;
 }
 
 #[cfg(test)]

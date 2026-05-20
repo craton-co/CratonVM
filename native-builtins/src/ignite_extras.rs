@@ -41,10 +41,13 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_CMDLINE_STARTUP: &str = "org/apache/ignite/startup/cmdline/CommandLineStartup";
+#[allow(dead_code)]
 const CN_IGNITION: &str = "org/apache/ignite/Ignition";
 
 /// Generic `main([Ljava/lang/String;)V` no-op for Ignite entry points.
+#[allow(dead_code)]
 fn ignite_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[ignite-shim] main short-circuited (boot-test mode)");
     Ok(None)
@@ -53,36 +56,21 @@ fn ignite_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
 /// Generic `<clinit>()V` no-op for Ignite entry-point classes. The real
 /// clinit walks JMX / Unsafe / classloader machinery that NPEs under
 /// CratonVM's partial bootstrap.
+#[allow(dead_code)]
 fn ignite_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// Install every Ignite boot-test short-circuit this module owns.
 ///
-/// **NOT WIRED YET.** The orchestrator owns `lib.rs` and is responsible
-/// for adding the call to this function from
-/// `register_essential_natives`.
+/// Disabled per "no synthetic stubs" policy (matches the round-8 batch shim
+/// disable in commit 8071d25). All registrations were pure fake-out returning
+/// `Ok(None)` without doing real work; they have been removed so Ignite runs
+/// against real bytecode.
 pub fn register_ignite_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_IGNITE_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    // CommandLineStartup.main — primary `bin/ignite.sh` entry point.
-    registry.register(
-        CN_CMDLINE_STARTUP,
-        "main",
-        "([Ljava/lang/String;)V",
-        ignite_main_noop,
-    );
-    registry.register(CN_CMDLINE_STARTUP, "<clinit>", "()V", ignite_clinit_noop);
-
-    // Ignition.main — defensive: some launchers invoke Ignition directly.
-    registry.register(
-        CN_IGNITION,
-        "main",
-        "([Ljava/lang/String;)V",
-        ignite_main_noop,
-    );
-    registry.register(CN_IGNITION, "<clinit>", "()V", ignite_clinit_noop);
+    let _ = registry;
+    let _ = CN_CMDLINE_STARTUP;
+    let _ = CN_IGNITION;
 }
 
 #[cfg(test)]
