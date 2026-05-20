@@ -15576,7 +15576,7 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
     while i < bytes.len() {
         // Translate `\Q...\E` Java "quoted literal" blocks: content between
         // `\Q` and `\E` is treated as a literal string by Java's regex engine,
-        // but neither the `regex` crate nor `fancy-regex` 0.13 accepts the
+        // but neither the `regex` crate nor `fancy-regex` accepts the
         // `\Q` escape. Rewrite each block by emitting `\x` for every
         // regex-metacharacter byte inside, preserving everything else. Used by
         // Keycloak's `DeclarativeUserProfileProviderFactory.getRegexPatternString`
@@ -36081,6 +36081,70 @@ mod t2_6_crypto_acceptance_tests {
         let ok3 = ed25519_verify(key_id, message, &bad_sig)
             .expect("ed25519_verify must return a decision on tampered sig");
         assert!(!ok3, "Ed25519 must reject tampered signature");
+    }
+}
+
+// ===========================================================================
+// java.util.regex — variable-length look-behind regression tests
+//
+// `java.util.regex` accepts variable-length look-behind; the fast `regex`
+// crate has no look-around at all, so such patterns fall through to the
+// `fancy-regex` backend. `fancy-regex` 0.13 only supported *constant-size*
+// look-behind and rejected anything else with "Look-behind assertion without
+// constant size" — surfacing as a `PatternSyntaxException` that aborted
+// Hazelcast 5.4.0 boot inside `AbstractXmlConfigHelper.schemaValidation`.
+//
+// These tests pin the actual Hazelcast pattern (`(?<!\G\S+)\s`, used by
+// `String.split`) and assert the split output matches the reference JDK 25
+// (`java.exe T`) byte-for-byte.
+// ===========================================================================
+#[cfg(test)]
+mod regex_lookbehind_tests {
+    use super::*;
+
+    /// The exact pattern Hazelcast's `AbstractXmlConfigHelper.schemaValidation`
+    /// passes to `String.split` — a negative look-behind whose `\G\S+` body is
+    /// variable length. Must compile (via the `fancy-regex` fallback) and split
+    /// identically to JDK 25.
+    #[test]
+    fn hazelcast_variable_lookbehind_pattern_compiles_and_splits() {
+        let pat = r"(?<!\G\S+)\s";
+        let re = compile_java_regex(pat, 0)
+            .expect("Hazelcast variable-length look-behind pattern must compile");
+        // Must have fallen through to the fancy-regex backend (no look-around
+        // in the `regex` crate).
+        assert!(
+            matches!(re, JavaRegex::Fancy(_)),
+            "look-behind pattern should use the fancy-regex backend"
+        );
+
+        // Reference values produced by JDK 25 `String.split("(?<!\\G\\S+)\\s")`:
+        //   "hello world\tfoo  bar" -> ["hello world", "foo ", "bar"]
+        let got = re.split("hello world\tfoo  bar");
+        assert_eq!(
+            got,
+            vec!["hello world", "foo ", "bar"],
+            "split must match JDK 25 reference output"
+        );
+
+        //   "<root>\n  <child a=\"1\"/>\n</root>"
+        //     -> ["<root>\n", "", "<child a=\"1\"/>", "</root>"]
+        let got2 = re.split("<root>\n  <child a=\"1\"/>\n</root>");
+        assert_eq!(
+            got2,
+            vec!["<root>\n", "", "<child a=\"1\"/>", "</root>"],
+            "split must match JDK 25 reference output"
+        );
+    }
+
+    /// A plain variable-length positive look-behind must also compile now.
+    #[test]
+    fn variable_length_positive_lookbehind_compiles() {
+        let re = compile_java_regex(r"(?<=\d+)x", 0)
+            .expect("variable-length positive look-behind must compile");
+        // "abc123x" -> the `x` is preceded by digits, so it matches.
+        assert!(re.is_match("abc123x"));
+        assert!(!re.is_match("abcx"));
     }
 }
 
