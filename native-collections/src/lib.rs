@@ -17328,6 +17328,7 @@ const UNMOD_SET_CLASS: &str = "cratonvm/internal/UnmodifiableSet";
 const UNMOD_MAP_CLASS: &str = "cratonvm/internal/UnmodifiableMap";
 const UNMOD_COLLECTION_CLASS: &str = "cratonvm/internal/UnmodifiableCollection";
 const UNMOD_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableItr";
+const UNMOD_LIST_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableListItr";
 
 /// Slot 0 of every wrapper holds the backing collection / iterator.
 const UNMOD_FIELD_BACKING: usize = 0;
@@ -17447,6 +17448,18 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             native_unmod_last_index_of,
         );
         r.register(c, "subList", "(II)Ljava/util/List;", native_unmod_sub_list);
+        r.register(
+            c,
+            "listIterator",
+            "()Ljava/util/ListIterator;",
+            native_unmod_list_iterator,
+        );
+        r.register(
+            c,
+            "listIterator",
+            "(I)Ljava/util/ListIterator;",
+            native_unmod_list_iterator_idx,
+        );
         // List mutators.
         r.register(
             c,
@@ -17583,6 +17596,38 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         r.register(c, "next", "()Ljava/lang/Object;", native_unmod_itr_next);
         r.register(c, "remove", "()V", native_unmod_throw);
     }
+
+    // ---- UnmodifiableListItr — read-only ListIterator ---------------------
+    // A self-contained `ListIterator` over a snapshot of the backing list:
+    //   field 0 = Object[] snapshot of the list elements
+    //   field 1 = Int cursor (the `nextIndex`)
+    // Read operations walk the snapshot; the mutators (`set`/`add`/`remove`)
+    // throw `UnsupportedOperationException`, consistent with an unmodifiable
+    // list and the JDK's `Collections$UnmodifiableList$1` list-iterator view.
+    {
+        let c = UNMOD_LIST_ITR_CLASS;
+        r.register(c, "hasNext", "()Z", native_unmod_listitr_has_next);
+        r.register(c, "next", "()Ljava/lang/Object;", native_unmod_listitr_next);
+        r.register(c, "hasPrevious", "()Z", native_unmod_listitr_has_previous);
+        r.register(
+            c,
+            "previous",
+            "()Ljava/lang/Object;",
+            native_unmod_listitr_previous,
+        );
+        r.register(c, "nextIndex", "()I", native_unmod_listitr_next_index);
+        r.register(c, "previousIndex", "()I", native_unmod_listitr_previous_index);
+        r.register(
+            c,
+            "forEachRemaining",
+            "(Ljava/util/function/Consumer;)V",
+            native_unmod_listitr_for_each_remaining,
+        );
+        // Mutators — all throw UnsupportedOperationException.
+        r.register(c, "set", "(Ljava/lang/Object;)V", native_unmod_throw);
+        r.register(c, "add", "(Ljava/lang/Object;)V", native_unmod_throw);
+        r.register(c, "remove", "()V", native_unmod_throw);
+    }
 }
 
 /// Universal mutator: throws `UnsupportedOperationException`.
@@ -17681,6 +17726,186 @@ fn native_unmod_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 fn native_unmod_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     unmod_delegate(ctx, args, "next", "()Ljava/lang/Object;")
+}
+
+/// Slot layout of a `UnmodifiableListItr`.
+const UNMOD_LIST_ITR_SNAPSHOT: usize = 0;
+const UNMOD_LIST_ITR_CURSOR: usize = 1;
+
+/// Snapshot the elements of an unmodifiable-list wrapper into an `Object[]`,
+/// by delegating to the backing collection's `toArray()`.
+fn unmod_list_snapshot(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    match unmod_delegate(ctx, args, "toArray", "()[Ljava/lang/Object;") {
+        Ok(Some(Value::Object(Some(arr)))) => Some(arr),
+        _ => None,
+    }
+}
+
+/// Allocate a read-only `ListIterator` over `snapshot`, positioned at `cursor`.
+fn alloc_unmod_list_itr(
+    ctx: &mut dyn NativeContext,
+    snapshot: ObjectRef,
+    cursor: i32,
+) -> ObjectRef {
+    let it = alloc_synthetic(ctx, UNMOD_LIST_ITR_CLASS, 2);
+    ctx.set_field(it, UNMOD_LIST_ITR_SNAPSHOT, Value::Object(Some(snapshot)));
+    ctx.set_field(it, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
+    it
+}
+
+/// `listIterator()` returns a read-only `ListIterator` over the backing list.
+fn native_unmod_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let snapshot = match unmod_list_snapshot(ctx, args) {
+        Some(a) => a,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(Value::Object(Some(alloc_unmod_list_itr(ctx, snapshot, 0)))))
+}
+
+/// `listIterator(int)` returns a read-only `ListIterator` positioned at `index`.
+fn native_unmod_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let snapshot = match unmod_list_snapshot(ctx, args) {
+        Some(a) => a,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let len = ctx.array_length(snapshot) as i32;
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    if index < 0 || index > len {
+        // JDK throws IndexOutOfBoundsException; ArrayIndexOutOfBoundsException
+        // is a subclass, so `catch (IndexOutOfBoundsException)` still catches.
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+    }
+    Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
+        ctx, snapshot, index,
+    )))))
+}
+
+/// Read the (snapshot, cursor) state out of a list-iterator wrapper.
+fn unmod_list_itr_state(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<(ObjectRef, i32, i32)> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let snapshot = match ctx.get_field(this, UNMOD_LIST_ITR_SNAPSHOT) {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    let cursor = match ctx.get_field(this, UNMOD_LIST_ITR_CURSOR) {
+        Value::Int(c) => c,
+        _ => 0,
+    };
+    let len = ctx.array_length(snapshot) as i32;
+    Some((snapshot, cursor, len))
+}
+
+fn native_unmod_listitr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match unmod_list_itr_state(ctx, args) {
+        Some((_, cursor, len)) => Ok(Some(Value::Int(if cursor < len { 1 } else { 0 }))),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_unmod_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (this, snapshot, cursor, len) = match (args.first(), unmod_list_itr_state(ctx, args)) {
+        (Some(Value::Object(Some(o))), Some((s, c, l))) => (*o, s, c, l),
+        _ => {
+            return Err(RuntimeError::NoSuchElementException {
+                message: String::new(),
+            }
+            .into());
+        }
+    };
+    if cursor >= len {
+        return Err(RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let elem = ctx.get_array_element(snapshot, cursor as usize);
+    ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor + 1));
+    Ok(Some(elem))
+}
+
+fn native_unmod_listitr_has_previous(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match unmod_list_itr_state(ctx, args) {
+        Some((_, cursor, _)) => Ok(Some(Value::Int(if cursor > 0 { 1 } else { 0 }))),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_unmod_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (this, snapshot, cursor, _) = match (args.first(), unmod_list_itr_state(ctx, args)) {
+        (Some(Value::Object(Some(o))), Some((s, c, l))) => (*o, s, c, l),
+        _ => {
+            return Err(RuntimeError::NoSuchElementException {
+                message: String::new(),
+            }
+            .into());
+        }
+    };
+    if cursor <= 0 {
+        return Err(RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let idx = cursor - 1;
+    let elem = ctx.get_array_element(snapshot, idx as usize);
+    ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(idx));
+    Ok(Some(elem))
+}
+
+fn native_unmod_listitr_next_index(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match unmod_list_itr_state(ctx, args) {
+        Some((_, cursor, _)) => Ok(Some(Value::Int(cursor))),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_unmod_listitr_previous_index(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match unmod_list_itr_state(ctx, args) {
+        Some((_, cursor, _)) => Ok(Some(Value::Int(cursor - 1))),
+        None => Ok(Some(Value::Int(-1))),
+    }
+}
+
+fn native_unmod_listitr_for_each_remaining(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let (this, snapshot, mut cursor, len) =
+        match (args.first(), unmod_list_itr_state(ctx, args)) {
+            (Some(Value::Object(Some(o))), Some((s, c, l))) => (*o, s, c, l),
+            _ => return Ok(None),
+        };
+    let consumer = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return Ok(None),
+    };
+    while cursor < len {
+        let elem = ctx.get_array_element(snapshot, cursor as usize);
+        cursor += 1;
+        ctx.set_field(this, UNMOD_LIST_ITR_CURSOR, Value::Int(cursor));
+        ctx.invoke_virtual(
+            consumer,
+            "accept",
+            "(Ljava/lang/Object;)V",
+            &[elem],
+        )?;
+    }
+    Ok(None)
 }
 
 // ---- Map delegations ------------------------------------------------------

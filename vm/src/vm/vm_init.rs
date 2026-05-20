@@ -830,13 +830,20 @@ impl SharedVm {
             let map_id = class_manager
                 .load_class("java/util/Map")
                 .expect("java/util/Map must be loadable");
+            let list_iterator_id = class_manager
+                .load_class("java/util/ListIterator")
+                .expect("java/util/ListIterator must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
-            let unmod_specs: [(&str, &[ClassId]); 5] = [
+            let unmod_specs: [(&str, &[ClassId]); 6] = [
                 ("cratonvm/internal/UnmodifiableCollection", &[collection_id]),
                 ("cratonvm/internal/UnmodifiableList", &[list_id, collection_id]),
                 ("cratonvm/internal/UnmodifiableSet", &[set_id, collection_id]),
                 ("cratonvm/internal/UnmodifiableMap", &[map_id]),
                 ("cratonvm/internal/UnmodifiableItr", &[iterator_id]),
+                (
+                    "cratonvm/internal/UnmodifiableListItr",
+                    &[list_iterator_id, iterator_id],
+                ),
             ];
             for (name, ifaces) in unmod_specs {
                 let cid = class_manager.ensure_synthetic_class(name, 1);
