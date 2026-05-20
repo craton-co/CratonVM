@@ -50,9 +50,15 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
     let attr = |a| dev.attribute(a).map_err(map_err("device attribute"));
     let major = attr(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let minor = attr(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-    let total_mem = dev
-        .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_TOTAL_MEMORY)
-        .map_err(map_err("total memory"))?;
+    // cudarc 0.13 / the CUDA driver API has no
+    // `CU_DEVICE_ATTRIBUTE_TOTAL_MEMORY` device attribute — total
+    // global memory is queried with `cuDeviceTotalMem` instead. The
+    // safe wrapper is `result::device::total_mem`, which takes the raw
+    // `CUdevice` handle exposed by `CudaDevice::cu_device()`.
+    let total_mem = unsafe {
+        cudarc::driver::result::device::total_mem(*dev.cu_device())
+            .map_err(map_err("total memory"))?
+    };
     Ok(DeviceCaps {
         ordinal: 0,
         name,
@@ -140,7 +146,11 @@ impl DeviceModuleInner {
         ctx: &DeviceContextInner,
         ptx: &str,
         module_name: &str,
-        kernel_names: &[&str],
+        // cudarc 0.13's `CudaDevice::load_ptx` stores the kernel-name
+        // slice for the lifetime of the loaded module, so it requires
+        // `&[&'static str]`. The public `DeviceModule::from_ptx` entry
+        // point keeps a `&[&str]` surface and bridges via leaking.
+        kernel_names: &[&'static str],
     ) -> Result<Self> {
         let ptx_owned = cudarc::nvrtc::Ptx::from_src(ptx);
         ctx.dev
@@ -277,7 +287,7 @@ impl DeviceModuleInner {
         // device address: `ptr_h` provides that storage and is kept live
         // (not moved or dropped) until after `launch_on_stream` returns.
         let mut ip = 0usize;
-        let launch_args: Vec<*mut std::ffi::c_void> = args.raw.iter().map(|a| {
+        let mut launch_args: Vec<*mut std::ffi::c_void> = args.raw.iter().map(|a| {
             match a {
                 KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
                 KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
@@ -293,8 +303,14 @@ impl DeviceModuleInner {
             }
         }).collect();
 
+        // cudarc 0.13's `LaunchAsync::launch_on_stream` consumes the
+        // `CudaFunction` by value (`self`). `CudaFunction` is not
+        // `Copy`, and `self.functions` only lends a `&CudaFunction`, so
+        // we clone it for the launch — the clone is cheap (it wraps an
+        // `Arc<CudaModule>` plus a raw `CUfunction` handle).
         let launch_result = unsafe {
-            func.launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
+            func.clone()
+                .launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
                 .map_err(map_err("kernel launch"))
         };
         // Restore the scratch vec into the thread-local with its
@@ -447,7 +463,15 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
     pub(crate) fn len(&self) -> usize {
         DeviceSlice::len(&self.slice)
     }
+}
 
+// `device_ptr_arg` only needs `DevicePtr<T>`, which cudarc implements
+// for `CudaSlice<T>` for *every* `T`. Keeping it in a separate,
+// unbounded `impl` block lets `KernelArgs::push_device_ptr<T>` (which
+// is generic with no trait bounds on `T`) call it — the heavyweight
+// `Pod + DeviceRepr + ValidAsZeroBits + …` bounds on the allocation
+// methods above must not leak onto this accessor.
+impl<T> DeviceBufferInner<T> {
     /// Return the raw device address.
     ///
     /// AUDIT 2026-05-16 (CRIT-1 fix): In cudarc 0.13, SyncRecord was removed.
