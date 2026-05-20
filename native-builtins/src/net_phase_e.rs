@@ -916,9 +916,49 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         if raw.is_empty() {
             return Ok(Some(Value::Object(None)));
         }
+        // Scheme = text before the first ':' (RFC 3986 §3.1). The real
+        // `java.net.URI.toURL()` rejects two cases that callers RELY on
+        // throwing:
+        //   * a URI with no scheme  -> IllegalArgumentException("URI is not
+        //     absolute"),
+        //   * an absolute URI whose scheme has no registered URL stream
+        //     handler -> MalformedURLException("unknown protocol: <s>").
+        // Tomcat's `Bootstrap.createClassLoader` depends on the SECOND case:
+        // it does `new URI("C:/.../lib/*.jar").toURL()` and EXPECTS the
+        // `MalformedURLException` (caught at the `catch`) so it falls into
+        // the `*.jar` GLOB-expansion branch. A `URI.toURL()` that always
+        // succeeds makes Tomcat treat the literal `C:/.../lib/*.jar` glob
+        // as a URL repository — the glob is never expanded, `catalina.jar`
+        // never lands on the common loader, and boot dies with
+        // `ClassNotFoundException: org.apache.catalina.startup.Catalina`.
+        let proto = raw.find(':').map(|i| &raw[..i]).unwrap_or("");
+        // Mirror the real JDK's `URL` protocol set. Anything else — most
+        // importantly a single-letter Windows drive scheme like `C` — has
+        // no stream handler and must raise `MalformedURLException`.
+        const KNOWN_PROTOCOLS: &[&str] = &[
+            "file", "jar", "http", "https", "ftp", "jrt", "jmod", "mailto",
+            "news", "jndi",
+        ];
+        let proto_lc = proto.to_ascii_lowercase();
+        if proto.is_empty() {
+            // No scheme: the real `URI.toURL()` throws IllegalArgumentException
+            // ("URI is not absolute"); Tomcat's catch handles that too.
+            return Err(iae("URI is not absolute"));
+        }
+        if !KNOWN_PROTOCOLS.contains(&proto_lc.as_str()) {
+            let exc = alloc_concurrent_synthetic(
+                ctx,
+                "java/net/MalformedURLException",
+                4,
+            );
+            let msg = ctx.create_string(&format!("unknown protocol: {proto_lc}"));
+            ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
+            return Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc,
+            ));
+        }
         // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
         let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
-        let proto = raw.find(':').map(|i| &raw[..i]).unwrap_or("");
         let file = if proto.is_empty() { &raw[..] } else { &raw[proto.len() + 1..] };
         let full_s = ctx.create_string(&raw);
         let proto_s = ctx.create_string(proto);
