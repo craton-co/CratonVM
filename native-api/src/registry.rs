@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use rustjvm_types::ClassId;
-use rustjvm_types::error::MethodCallResult;
+use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_types::{ArrayElementType, ObjectKind};
 use rustjvm_types::{ObjectRef, Value};
 
@@ -848,33 +848,50 @@ pub trait NativeContext {
     /// field. Returns the *previous* value (matching `AtomicInteger.getAndAdd`
     /// / `AtomicI32::fetch_add` semantics).
     ///
-    /// Default implementation is a `compare_and_swap_field` retry loop —
-    /// existing trait implementors keep working unchanged. The VM override
-    /// should map this to a single `LOCK XADD` (one trait dispatch, no
-    /// CAS spin under contention).
-    fn atomic_fetch_add_int(&mut self, obj: ObjectRef, index: usize, delta: i32) -> i32 {
+    /// Default implementation is a `compare_and_swap_field` retry loop. The
+    /// VM override should map this to a single `LOCK XADD` (one trait
+    /// dispatch, no CAS spin under contention).
+    ///
+    /// On a field-type mismatch this returns `Err(MethodCallFailed)` wrapping
+    /// an `IllegalArgumentException` rather than panicking: a panic crossing
+    /// the native/Java boundary is unsound (it may unwind through JIT-compiled
+    /// frames that are not unwind-safe).
+    fn atomic_fetch_add_int(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i32,
+    ) -> Result<i32, MethodCallFailed> {
         loop {
             let current = self.get_field_volatile(obj, index);
             // Bug 3 (CRIT type corruption): the previous default impl
             // silently fell back to old=0 for non-Int slots, then
             // CAS-wrote `Value::Int(delta)` over the existing slot —
             // corrupting both the numeric value and the field's type
-            // tag (a Long field would become Int). Panic on type
-            // mismatch so the caller's mis-dispatch surfaces
-            // immediately. The Long → atomic_fetch_add_long delegation
-            // is intentionally NOT done here because the int-variant's
-            // i32 return type cannot losslessly carry a Long previous
-            // value; callers must route via the correct accessor.
+            // tag (a Long field would become Int). Surface the
+            // caller's mis-dispatch as a catchable Java exception
+            // instead of panicking across the native boundary. The
+            // Long → atomic_fetch_add_long delegation is intentionally
+            // NOT done here because the int-variant's i32 return type
+            // cannot losslessly carry a Long previous value; callers
+            // must route via the correct accessor.
             let old = match current {
                 Value::Int(v) => v,
-                other => panic!(
-                    "atomic_fetch_add_int: field {} on object is not Int: {:?}",
-                    index, other
-                ),
+                other => {
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_int: field {} on object is not Int: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
             };
             let new_val = Value::Int(old.wrapping_add(delta));
             if self.compare_and_swap_field(obj, index, current, new_val) {
-                return old;
+                return Ok(old);
             }
         }
     }
@@ -882,7 +899,16 @@ pub trait NativeContext {
     /// audit-round5 fix #9 (HIGH): atomic `fetch_add` on a `long` instance
     /// field — `AtomicLong.getAndAdd` / `AtomicI64::fetch_add` analogue.
     /// See `atomic_fetch_add_int` for the default-impl rationale.
-    fn atomic_fetch_add_long(&mut self, obj: ObjectRef, index: usize, delta: i64) -> i64 {
+    ///
+    /// As with `atomic_fetch_add_int`, a field-type mismatch yields
+    /// `Err(MethodCallFailed)` (`IllegalArgumentException`) instead of a
+    /// panic that could unwind through JIT frames.
+    fn atomic_fetch_add_long(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i64,
+    ) -> Result<i64, MethodCallFailed> {
         loop {
             let current = self.get_field_volatile(obj, index);
             // Bug 3 (CRIT type corruption): refuse to silently rewrite a
@@ -892,14 +918,21 @@ pub trait NativeContext {
             // type tag.
             let old = match current {
                 Value::Long(v) => v,
-                other => panic!(
-                    "atomic_fetch_add_long: field {} on object is not Long: {:?}",
-                    index, other
-                ),
+                other => {
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_long: field {} on object is not Long: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
+                }
             };
             let new_val = Value::Long(old.wrapping_add(delta));
             if self.compare_and_swap_field(obj, index, current, new_val) {
-                return old;
+                return Ok(old);
             }
         }
     }
@@ -1693,9 +1726,14 @@ impl NativeMethodRegistry {
         self.by_method_desc.insert(md_key, callback);
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
-        // method names. Cheap one-time write per registration.
-        let triple = format!("{class_name}.{method_name}{descriptor}");
-        crate::native_ring::register_name(callback as usize, &triple);
+        // method names. Native-ring recording is off by default; the
+        // pointer→name map is only ever consulted on the enabled path,
+        // so skip the per-registration `format!` (~3,100 String
+        // allocations at boot) unless recording is enabled.
+        if crate::native_ring::is_enabled() {
+            let triple = format!("{class_name}.{method_name}{descriptor}");
+            crate::native_ring::register_name(callback as usize, &triple);
+        }
     }
 
     /// Look up a native method implementation (zero allocation on the

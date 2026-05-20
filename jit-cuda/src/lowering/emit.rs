@@ -19,6 +19,7 @@ use crate::analyzer::ParamKind;
 use crate::emitter::{LoweringError, RegKind};
 use crate::lowering::loop_recog::{instr_size, CountedLoop};
 use crate::signature::KernelSignature;
+use std::collections::HashMap;
 use std::fmt::Write;
 
 /// One slot of typed JVM state.
@@ -146,6 +147,22 @@ pub(crate) struct Emitter<'a> {
     /// Local slot used for the kernel result return (scalar return only).
     /// Populated by the post-loop walker when it sees the matching `*return`.
     pub ret_value_reg: Option<Reg>,
+    /// Per-parameter-index cache of the `pN_len` array-length register.
+    /// `ld.param.s32 [pN_len]` loads a kernel-invariant value, so the
+    /// first bounds check against parameter N loads it once and every
+    /// later bounds check reuses the cached register instead of
+    /// re-emitting an identical `ld.param`.
+    pub len_reg: Vec<Option<Reg>>,
+    /// Cache of the `mov.s32 zero, 0` constant used by bounds checks.
+    /// The constant `0` is loop/usage-invariant, so it is materialised
+    /// once and reused by every subsequent bounds check.
+    pub zero_reg: Option<Reg>,
+    /// Cache mapping a source index register *name* to its widened
+    /// (`cvt.s64.s32`) s64 register. Every PTX register produced by the
+    /// emitter is in SSA form — a register name is assigned exactly once
+    /// and never rewritten — so a widened value stays valid for the
+    /// whole kernel and no invalidation is ever required.
+    pub widened_index: HashMap<String, Reg>,
 }
 
 impl<'a> Emitter<'a> {
@@ -165,6 +182,9 @@ impl<'a> Emitter<'a> {
             used_bounds_label: false,
             hit_back_branch: false,
             ret_value_reg: None,
+            len_reg: vec![None; sig.param_kinds.len()],
+            zero_reg: None,
+            widened_index: HashMap::new(),
         }
     }
 
@@ -253,6 +273,27 @@ impl<'a> Emitter<'a> {
         writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
     }
 
+    /// Emit `if (tid != 0) ret;` for straight-line (scalar) kernels.
+    ///
+    /// A straight-line kernel has no induction variable, so the body is
+    /// identical on every CUDA thread. Without this guard every thread
+    /// in the grid executes the body — and any array store has every
+    /// thread writing the same element, which is a data race even if
+    /// the value written is identical. Restricting execution to thread
+    /// 0 makes the kernel deterministic regardless of the launch
+    /// geometry chosen by the marshalling layer.
+    pub fn emit_straight_line_guard(&mut self) {
+        let tid = self.tid_reg.clone().expect("emit_tid was called");
+        let p = self.regs.fresh_reg(RegKind::Pred);
+        writeln!(
+            self.body,
+            "    setp.ne.s32 {}, {}, 0;",
+            p.name, tid.name
+        )
+        .unwrap();
+        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
+    }
+
     /// Append the bounds-check failure block and the kernel epilogue
     /// label. The kernel always ends with an unconditional `ret;`.
     pub fn finalize_epilogue(&mut self) {
@@ -283,22 +324,52 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Emit a bounds check: if `index >= len` jump to failure label.
-    /// `len_param` is the kernel-parameter name (e.g., `p0_len`).
-    fn emit_bounds_check(&mut self, index: &Reg, len_param: &str) {
-        self.used_bounds_label = true;
+    /// Return the s32 register holding `pN_len` for parameter `param_idx`,
+    /// loading it lazily on first use and caching it thereafter.
+    ///
+    /// `ld.param.s32 [pN_len]` reads a kernel parameter, which is
+    /// invariant for the kernel's lifetime, so loading it once and
+    /// reusing the register is PTX-equivalent to re-loading it.
+    fn array_len_reg(&mut self, param_idx: usize) -> Reg {
+        if let Some(r) = &self.len_reg[param_idx] {
+            return r.clone();
+        }
         let len = self.regs.fresh_reg(RegKind::S32);
-        let p_neg = self.regs.fresh_reg(RegKind::Pred);
-        let p_ge = self.regs.fresh_reg(RegKind::Pred);
         writeln!(
             self.body,
-            "    ld.param.s32 {}, [{}];",
-            len.name, len_param
+            "    ld.param.s32 {}, [p{param_idx}_len];",
+            len.name
         )
         .unwrap();
-        // index < 0 also fails — Java semantics.
+        self.len_reg[param_idx] = Some(len.clone());
+        len
+    }
+
+    /// Return an s32 register holding the constant `0`, materialising it
+    /// lazily on first use and caching it. The constant is
+    /// usage-invariant, so reuse is PTX-equivalent to re-materialising.
+    fn zero_s32_reg(&mut self) -> Reg {
+        if let Some(r) = &self.zero_reg {
+            return r.clone();
+        }
         let zero = self.regs.fresh_reg(RegKind::S32);
         writeln!(self.body, "    mov.s32 {}, 0;", zero.name).unwrap();
+        self.zero_reg = Some(zero.clone());
+        zero
+    }
+
+    /// Emit a bounds check: if `index >= len` (or `index < 0`) jump to
+    /// the failure label. `param_idx` selects the array parameter whose
+    /// `pN_len` bounds the access; the length register and the `0`
+    /// constant are loaded once and cached (see [`array_len_reg`] /
+    /// [`zero_s32_reg`]) so repeated checks do not re-emit them.
+    fn emit_bounds_check(&mut self, index: &Reg, param_idx: usize) {
+        self.used_bounds_label = true;
+        let len = self.array_len_reg(param_idx);
+        // index < 0 also fails — Java semantics.
+        let zero = self.zero_s32_reg();
+        let p_neg = self.regs.fresh_reg(RegKind::Pred);
+        let p_ge = self.regs.fresh_reg(RegKind::Pred);
         writeln!(
             self.body,
             "    setp.lt.s32 {}, {}, {};",
@@ -323,6 +394,26 @@ impl<'a> Emitter<'a> {
             p_ge.name, self.bounds_fail_label
         )
         .unwrap();
+    }
+
+    /// Widen an s32 index register to s64 with `cvt.s64.s32`, caching
+    /// the result keyed on the source register name. Because every
+    /// emitter register is single-assignment, a cached widened value is
+    /// valid for the rest of the kernel; a repeated index is widened
+    /// once instead of per array op.
+    fn widen_index(&mut self, index: &Reg) -> Reg {
+        if let Some(r) = self.widened_index.get(&index.name) {
+            return r.clone();
+        }
+        let byte_idx = self.regs.fresh_reg(RegKind::U64);
+        writeln!(
+            self.body,
+            "    cvt.s64.s32 {}, {};",
+            byte_idx.name, index.name
+        )
+        .unwrap();
+        self.widened_index.insert(index.name.clone(), byte_idx.clone());
+        byte_idx
     }
 
     /// Walk a region of bytecode from `start` to `end` (exclusive),
@@ -566,15 +657,15 @@ impl<'a> Emitter<'a> {
             0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
-            0x91 => self.conv_truncate_i32(8)?,                                // i2b
-            0x92 => self.conv_truncate_i32(16)?,                               // i2c (unsigned 16)
-            0x93 => self.conv_truncate_i32(16)?,                               // i2s
+            0x91 => self.conv_truncate_i32(8, true)?,                          // i2b (signed)
+            0x92 => self.conv_truncate_i32(16, false)?,                        // i2c (unsigned 16)
+            0x93 => self.conv_truncate_i32(16, true)?,                         // i2s (signed)
             // ── compares (push int -1/0/1) ──────────────────────────
-            // AUDIT 2026-05-16: only `lcmp` is wired; the four float/double
-            // compares (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`) were routed to
-            // `cmp_long_or_float` which always errors out — pure dead code.
-            // Let them fall through to the default `UnsupportedNode` arm.
-            0x94 => self.cmp_long_or_float(RegKind::S64, false)?,
+            // AUDIT 2026-05-19: `lcmp` is now implemented in PTX via
+            // `cmp_long` (setp + selp). The four float/double compares
+            // (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`) remain unimplemented and
+            // fall through to the default `UnsupportedNode` arm.
+            0x94 => self.cmp_long()?,                                          // lcmp
             // ── branches ────────────────────────────────────────────
             0x99..=0xA4 => {
                 // if* / if_icmp* — we accept these only at the loop
@@ -593,19 +684,28 @@ impl<'a> Emitter<'a> {
                 // goto / goto_w — if it targets the loop header, it's
                 // the back branch; mark and stop. Anything else is
                 // non-canonical.
-                let target = if op == 0xA7 {
-                    let off =
-                        i16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]) as i32;
-                    (pc as i32 + off) as usize
+                let off = if op == 0xA7 {
+                    i16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]) as i64
                 } else {
-                    let off = i32::from_be_bytes([
+                    i32::from_be_bytes([
                         self.bytes[pc + 1],
                         self.bytes[pc + 2],
                         self.bytes[pc + 3],
                         self.bytes[pc + 4],
-                    ]);
-                    (pc as i32 + off) as usize
+                    ]) as i64
                 };
+                // Compute the branch target with signed arithmetic so a
+                // negative offset cannot wrap into a huge `usize`, then
+                // bounds-check it before it flows into comparisons.
+                let signed_target = pc as i64 + off;
+                if signed_target < 0 || signed_target >= self.bytes.len() as i64 {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "unconditional branch at pc={pc} has out-of-range target \
+                         {signed_target} (offset {off}, code length {})",
+                        self.bytes.len()
+                    )));
+                }
+                let target = signed_target as usize;
                 if let Some(li) = loop_info {
                     if target == li.header_pc {
                         self.hit_back_branch = true;
@@ -1049,31 +1149,79 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn conv_truncate_i32(&mut self, bits: u32) -> Result<(), LoweringError> {
+    /// Narrowing int conversion (`i2b`/`i2s`/`i2c`).
+    ///
+    /// `signed` selects the extension applied back to s32:
+    ///  * `i2b` (int→byte) and `i2s` (int→short) keep the JVM's signed
+    ///    semantics — the low N bits are SIGN-extended.
+    ///  * `i2c` (int→char) is UNSIGNED: `char` is a 16-bit unsigned
+    ///    type, so the low 16 bits are ZERO-extended.
+    fn conv_truncate_i32(&mut self, bits: u32, signed: bool) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S32);
-        // Sign-extend an N-bit value back to s32 by emitting:
-        //   shl  tmp, a, (32 - N)
-        //   shr  r,   tmp, (32 - N)
-        let amt = 32 - bits;
-        let tmp = self.regs.fresh_reg(RegKind::S32);
-        writeln!(self.body, "    shl.b32 {}, {}, {};", tmp.name, a.name, amt).unwrap();
-        writeln!(self.body, "    shr.s32 {}, {}, {};", r.name, tmp.name, amt).unwrap();
+        if signed {
+            // Sign-extend an N-bit value back to s32 by emitting:
+            //   shl  tmp, a, (32 - N)
+            //   shr  r,   tmp, (32 - N)
+            let amt = 32 - bits;
+            let tmp = self.regs.fresh_reg(RegKind::S32);
+            writeln!(self.body, "    shl.b32 {}, {}, {};", tmp.name, a.name, amt).unwrap();
+            writeln!(self.body, "    shr.s32 {}, {}, {};", r.name, tmp.name, amt).unwrap();
+        } else {
+            // Zero-extend: mask off everything above the low N bits.
+            let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            writeln!(
+                self.body,
+                "    and.b32 {}, {}, 0x{mask:X};",
+                r.name, a.name
+            )
+            .unwrap();
+        }
         self.stack.push(r);
         Ok(())
     }
 
-    fn cmp_long_or_float(
-        &mut self,
-        _kind: RegKind,
-        _is_float: bool,
-    ) -> Result<(), LoweringError> {
-        // JVM `*cmp*` pushes -1/0/+1 on the int stack. We never expect
-        // these inside the canonical-loop subset (they appear with the
-        // following if*); reject so the caller falls back.
-        Err(LoweringError::UnsupportedNode(
-            "*cmp* opcodes are not supported in the element-wise lowering".into(),
-        ))
+    /// `lcmp` (opcode 0x94): compare two 64-bit signed longs, pushing
+    /// `-1` if `a < b`, `0` if `a == b`, `+1` if `a > b` onto the int
+    /// stack. Implemented with two `setp` predicates and two `selp`s:
+    ///   gt = (a > b) ? 1 : 0
+    ///   r  = (a < b) ? -1 : gt
+    fn cmp_long(&mut self) -> Result<(), LoweringError> {
+        // JVM stack order: ..., a, b → b is on top.
+        let b = self.stack.pop()?;
+        let a = self.stack.pop()?;
+        let p_gt = self.regs.fresh_reg(RegKind::Pred);
+        let p_lt = self.regs.fresh_reg(RegKind::Pred);
+        let gt = self.regs.fresh_reg(RegKind::S32);
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(
+            self.body,
+            "    setp.gt.s64 {}, {}, {};",
+            p_gt.name, a.name, b.name
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    setp.lt.s64 {}, {}, {};",
+            p_lt.name, a.name, b.name
+        )
+        .unwrap();
+        // gt = a > b ? 1 : 0
+        writeln!(
+            self.body,
+            "    selp.s32 {}, 1, 0, {};",
+            gt.name, p_gt.name
+        )
+        .unwrap();
+        // r = a < b ? -1 : gt
+        writeln!(
+            self.body,
+            "    selp.s32 {}, -1, {}, {};",
+            r.name, gt.name, p_lt.name
+        )
+        .unwrap();
+        self.stack.push(r);
+        Ok(())
     }
 
     // ─────────────────── array ops ──────────────────────────────────
@@ -1111,18 +1259,11 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
+        let byte_idx = self.widen_index(&index);
         let offset = self.regs.fresh_reg(RegKind::U64);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
         let result = self.regs.fresh_reg(elem_kind);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    mul.lo.s64 {}, {}, {};",
@@ -1149,18 +1290,11 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
+        self.emit_bounds_check(&index, param_idx);
+        let byte_idx = self.widen_index(&index);
         let addr = self.regs.fresh_reg(RegKind::U64);
         let raw = self.regs.fresh_reg(RegKind::S32);
         let result = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    add.u64 {}, {}, {};",
@@ -1196,19 +1330,12 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
+        self.emit_bounds_check(&index, param_idx);
+        let byte_idx = self.widen_index(&index);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
         let raw = self.regs.fresh_reg(RegKind::S32);
         let result = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    mul.lo.s64 {}, {}, 2;",
@@ -1244,17 +1371,10 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
+        let byte_idx = self.widen_index(&index);
         let offset = self.regs.fresh_reg(RegKind::U64);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    mul.lo.s64 {}, {}, {};",
@@ -1281,16 +1401,9 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
+        self.emit_bounds_check(&index, param_idx);
+        let byte_idx = self.widen_index(&index);
         let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    add.u64 {}, {}, {};",
@@ -1312,17 +1425,10 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
+        self.emit_bounds_check(&index, param_idx);
+        let byte_idx = self.widen_index(&index);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
-        writeln!(
-            self.body,
-            "    cvt.s64.s32 {}, {};",
-            byte_idx.name, index.name
-        )
-        .unwrap();
         writeln!(
             self.body,
             "    mul.lo.s64 {}, {}, {};",

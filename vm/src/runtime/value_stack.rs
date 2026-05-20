@@ -531,7 +531,12 @@ impl ValueStack {
     pub fn pop_int(&mut self) -> Result<i32, RuntimeError> {
         match self.pop()? {
             Value::Int(v) => Ok(v),
-            Value::Long(v) => Ok(v as i32),
+            // A Long where an int is expected indicates a verifier/codegen
+            // bug.  Silently truncating to i32 masks the real defect, so
+            // surface it as an error instead of coercing.
+            Value::Long(_) => Err(RuntimeError::NotImplemented {
+                feature: "expected int on stack, got Long".to_string(),
+            }),
             // Coerce a null reference to zero.  Null is the only safe
             // conversion — an actual object pointer must NOT be treated as
             // an int, since downstream code often branches on bitwise

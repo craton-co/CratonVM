@@ -865,20 +865,24 @@ pub(crate) fn native_class_get_resource_as_stream(
 }
 
 /// T14/T15 + T19.H10: `Class.getResource(String)` — returns a URL pointing
-/// at the resource, or null if absent. Now synthesises a real
-/// `java.net.URL` whose `protocol="resource"`, `host=""`, `port=-1`, and
-/// `file = "/<resolved-name>"`. Real-JDK code that does
-/// `getResource(...).toString()` or `.openStream()` therefore sees a stable
-/// non-null URL whose external form round-trips through `new URL(s)`.
+/// at the resource, or null if absent.
 ///
-/// The resource scheme is bespoke; we do not pretend to be `jrt:`,
-/// `file:`, or `jar:` because (a) we don't have a URLStreamHandler
-/// registry that handles those schemes natively yet, and (b) downstream
-/// code that key-on-URL semantics (Resource leaks tracker, ProtectionDomain
-/// caching) is happier with a stable identity than with a synthesised
-/// `file:` URL that points to nowhere on disk. Callers that need the bytes
-/// should round-trip through `getResourceAsStream`, which this native
-/// shares the validation helper with — keeping the two halves consistent.
+/// This builds a REAL, parseable URL (`jar:file:...!/...` or `file:...` or
+/// `jrt:/...`) the same way `ClassLoader.getResource` does, instead of a
+/// bespoke `resource:` scheme. The old `resource:` scheme broke apps that
+/// locate their install root via
+/// `SomeClass.class.getResource(...)` → `new File(url.toURI())` →
+/// `getParentFile()`: `getPath()` produced a non-existent path and
+/// `getParentFile()` eventually returned null → NPE.
+///
+/// We resolve the resource name (absolute names with a leading `/` are used
+/// verbatim minus the slash; class-package-relative names are prefixed with
+/// the declaring class's package) via the shared `t19_h10_resolve_resource_name`
+/// helper, then ask the classpath for the structured URL list with
+/// `find_all_resource_urls` and build the `java.net.URL` from the first hit
+/// via `build_synthetic_url` — keeping `Class.getResource` and
+/// `ClassLoader.getResource` returning the same URL form for the same name.
+/// If the resource does not exist we return null, as before.
 pub(crate) fn native_class_get_resource(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -896,27 +900,30 @@ pub(crate) fn native_class_get_resource(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ctx.find_resource(&resource_name) {
-        None => Ok(Some(Value::Object(None))),
-        Some(_bytes) => {
-            // Synthesise a `java.net.URL` with scheme=`resource`, file=`/<name>`.
-            // Field layout matches the real JDK: protocol/host/file/authority/
-            // ref/userInfo as String, port as int. Slot indices are taken
-            // from the `essential-natives`-loaded URL stub; for real-JDK
-            // mode we additionally write by name so any layout drift is
-            // forgiving.
-            let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 8);
-            let proto_s = ctx.create_string("resource");
-            let host_s = ctx.create_string("");
-            let file_s = ctx.create_string(&format!("/{}", resource_name));
-            ctx.set_field_by_name(url, "protocol", Value::Object(Some(proto_s)));
-            ctx.set_field_by_name(url, "host", Value::Object(Some(host_s)));
-            ctx.set_field_by_name(url, "port", Value::Int(-1));
-            ctx.set_field_by_name(url, "file", Value::Object(Some(file_s)));
-            ctx.set_field_by_name(url, "path", Value::Object(Some(file_s)));
-            Ok(Some(Value::Object(Some(url))))
-        }
-    }
+
+    // Prefer the structured URL (jar:file:/... or jrt:/... or file:/...) so
+    // getResource returns a URL whose `toURI()`/`new File(...)` round-trip
+    // resolves to a real on-disk location. Fall back to `classpath:<name>`
+    // only when the structured walk finds nothing but raw bytes still exist
+    // (covers synthetic loaders that override `find_resource` directly).
+    let urls = ctx.find_all_resource_urls(&resource_name);
+    let url_str = if let Some(first) = urls.first() {
+        first.clone()
+    } else if ctx.find_resource(&resource_name).is_some() {
+        format!("classpath:{resource_name}")
+    } else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    tracing::debug!(
+        target: "rustjvm_vm::runtime::resources",
+        resource = %resource_name,
+        url = %url_str,
+        "Class.getResource resolved"
+    );
+
+    let url = crate::jboss_module_loader::build_synthetic_url(ctx, &url_str);
+    Ok(Some(Value::Object(Some(url))))
 }
 
 /// RKC16r23 — detect jboss-logging's i18n localized-logger fallback names.

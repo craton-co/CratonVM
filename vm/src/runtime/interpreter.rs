@@ -1310,12 +1310,19 @@ pub fn execute(
                   class_id, method_name, method_descriptor, args.len());
     }
     // RUSTJVM_IAE_TRACE: log args when executing AnnotationScopeMetadataResolver.<init>
-    if crate::runtime::env_cache::iae_trace_os() {
+    //
+    // Perf: the eprintln! only ever fires for `<init>` methods, so gate the
+    // env-flag check + `class_manager.read()` RwLock acquire + `to_string()`
+    // allocation behind the cheap `method_name == "<init>"` predicate first.
+    // For every non-`<init>` call (the overwhelming majority) this path now
+    // does zero work even when RUSTJVM_IAE_TRACE is set. Behaviour is
+    // identical — `method_name == "<init>"` was already a required conjunct.
+    if method_name == "<init>" && crate::runtime::env_cache::iae_trace_os() {
         let class_name_for_trace = shared.class_manager.read()
             .get_class(class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        if class_name_for_trace.contains("AnnotationScopeMetadataResolver") && method_name == "<init>" {
+        if class_name_for_trace.contains("AnnotationScopeMetadataResolver") {
             eprintln!("[execute] {}.{}{} args={:?}", class_name_for_trace, method_name, method_descriptor, args);
         }
     }
@@ -2780,15 +2787,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     exc_pc =
                                         thread.frames[frame_idx].last_instr_pc;
                                 } else {
-                                    let exc_class = shared.class_manager.read()
-                                        .get_class(shared.heap.class_id_of(current_exc))
-                                        .map(|c| c.name.to_string())
-                                        .unwrap_or_default();
-                                    let caller = shared.class_manager.read()
-                                        .get_class(thread.frames[frame_idx].class_id)
-                                        .map(|c| c.name.to_string())
-                                        .unwrap_or_default();
-                                    let mname = thread.frames[frame_idx].method_name().to_string();
+                                    // Perf: the previous `exc_class` / `caller` /
+                                    // `mname` bindings here each took a
+                                    // `class_manager.read()` RwLock + `to_string()`
+                                    // allocation on every top-frame exception
+                                    // unwind, but their values were never used
+                                    // (no trace site consumed them). Dropped —
+                                    // behaviour is identical (pure, discarded
+                                    // computations).
                                     return Err(MethodCallFailed::ExceptionThrown(
                                         current_exc,
                                     ));
@@ -4746,19 +4752,12 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         current_exc,
                     ) {
                         Some((handler_pc, exc_ref)) => {
-                            // Trace when QuarkusEntryPoint catches an exception
-                            {
-                                let caller_name = shared.class_manager.read()
-                                    .get_class(thread.frames[frame_idx].class_id)
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_default();
-                                if caller_name.contains("uarkus") {
-                                    let exc_class = shared.class_manager.read()
-                                        .get_class(shared.heap.class_id_of(current_exc))
-                                        .map(|c| c.name.to_string())
-                                        .unwrap_or_default();
-                                }
-                            }
+                            // Perf: a leftover Quarkus trace block here took a
+                            // `class_manager.read()` RwLock + `to_string()` on
+                            // every exception caught by a handler, plus a second
+                            // RwLock + alloc for the (also-unused) `exc_class`.
+                            // The trace site was empty, so all of it was dead
+                            // computation. Dropped — behaviour is identical.
                             thread.frames[frame_idx].stack.clear();
                             thread.frames[frame_idx]
                                 .stack
@@ -4785,16 +4784,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 // it is current at any throw site reachable from this path.
                                 exc_pc = thread.frames[frame_idx].last_instr_pc;
                             } else {
-                                // Trace exception propagation out of top frame
-                                let exc_class = shared.class_manager.read()
-                                    .get_class(shared.heap.class_id_of(current_exc))
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_default();
-                                let caller = shared.class_manager.read()
-                                    .get_class(thread.frames[frame_idx].class_id)
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_default();
-                                let mname = thread.frames[frame_idx].method_name().to_string();
+                                // Perf: the previous `exc_class` / `caller` /
+                                // `mname` bindings here each took a
+                                // `class_manager.read()` RwLock + `to_string()`
+                                // allocation on every top-frame exception
+                                // propagation, but their values were never used
+                                // (no trace site consumed them). Dropped —
+                                // behaviour is identical (pure, discarded
+                                // computations).
                                 return Err(MethodCallFailed::ExceptionThrown(current_exc));
                             }
                         }
@@ -6605,11 +6602,13 @@ fn execute_instruction(
             maybe_gc(shared, thread);
         }
         Instruction::Arraylength => {
-            let class_id = thread.frames[frame_idx].class_id;
             let pc = thread.frames[frame_idx].pc;
-            let current_class_name = shared.class_manager.read()
-                .get_class(class_id)
-                .map(|c| c.name.to_string()).unwrap_or_default();
+            // Perf: the class name is already cached on the Frame as an
+            // `Arc<str>` (see `Frame::class_name`), so read it from there
+            // instead of re-acquiring the `class_manager` RwLock on every
+            // `arraylength` opcode. `frame.class_name()` returns exactly the
+            // same value as `class_manager.get_class(class_id).name`.
+            let current_class_name = thread.frames[frame_idx].class_name().to_string();
             let mname = thread.frames[frame_idx].method_name().to_string();
             let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
             // S111r14 diag: print full Java stack trace on arraylength failure
@@ -9281,12 +9280,20 @@ fn coerce_arg(
     }
     // SAM = reference (e.g. Object), impl = primitive — unbox.
     if is_reference_desc(sam_tok) && is_primitive_desc(impl_tok) {
-        let ch = impl_tok.chars().next().unwrap();
+        let ch = impl_tok.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_arg".to_string(),
+            })
+        })?;
         return Ok(unbox_wrapper(shared, ch, v));
     }
     // SAM = primitive, impl = reference — box.
     if is_primitive_desc(sam_tok) && is_reference_desc(impl_tok) {
-        let ch = sam_tok.chars().next().unwrap();
+        let ch = sam_tok.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_arg".to_string(),
+            })
+        })?;
         return box_primitive(shared, thread, ch, v);
     }
     // Primitive widening (e.g. I -> J) — best-effort.
@@ -9348,13 +9355,21 @@ pub fn coerce_return(
     }
     // SAM expects reference (Object/Integer/etc), impl returned primitive — box.
     if is_reference_desc(sam_ret) && is_primitive_desc(impl_ret) {
-        let ch = impl_ret.chars().next().unwrap();
+        let ch = impl_ret.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_return".to_string(),
+            })
+        })?;
         let boxed = box_primitive(shared, thread, ch, raw)?;
         return Ok(Some(boxed));
     }
     // SAM expects primitive, impl returned reference — unbox.
     if is_primitive_desc(sam_ret) && is_reference_desc(impl_ret) {
-        let ch = sam_ret.chars().next().unwrap();
+        let ch = sam_ret.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_return".to_string(),
+            })
+        })?;
         return Ok(Some(unbox_wrapper(shared, ch, raw)));
     }
     // Both primitive: maybe widen.

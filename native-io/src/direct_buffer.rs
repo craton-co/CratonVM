@@ -181,6 +181,12 @@ fn pool_take(size: usize) -> Option<(usize, *mut u8)> {
         // construction somehow fails we leak the address rather than
         // panic (defensive: we put real allocs here, but avoid a
         // production panic on unexpected input).
+        //
+        // Accounting note: pooled blocks are NOT counted in
+        // `Bits.reserved` — `dbb_free` releases the reservation before
+        // the block enters the pool, and `dbb_allocate` re-reserves it
+        // on the way back out. So evicting a stale pooled block to the
+        // OS here needs no accounting change.
         unsafe {
             if let Ok(layout) = Layout::from_size_align(entry.size, 8) {
                 dealloc(entry.addr as *mut u8, layout);
@@ -221,6 +227,17 @@ fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
         // mirror that to avoid alloc(0) UB with the system allocator.
         return Ok(0);
     }
+    // Bug 1: balance `Bits.reserveMemory` / `unreserveMemory` accounting.
+    //
+    // Reservation tracks *live* direct memory: a block is reserved while
+    // it is handed out to Java and unreserved the moment it is freed
+    // (`dbb_free`), regardless of whether the bytes are physically
+    // returned to the OS or parked in the pool. Pooled (free-listed)
+    // blocks therefore carry NO reservation. Whichever way `dbb_allocate`
+    // sources the bytes — fresh `alloc` or a pool hit — the block becomes
+    // live and must be reserved exactly once here. We reserve up front so
+    // the soft cap is honoured before we commit any memory; on any later
+    // failure path we `release` to refund it.
     try_reserve(size)?;
     let usize_size = size as usize;
     let addr: *mut u8 = match pool_take(usize_size) {
@@ -264,6 +281,12 @@ fn dbb_free(addr: u64, size: i64) {
     }
     let usize_size = size as usize;
     let p = addr as *mut u8;
+    // Bug 1: a freed block is no longer live, so its reservation is
+    // refunded here unconditionally — whether the bytes go back to the
+    // OS or are parked in the pool. Pooled blocks carry no reservation;
+    // `dbb_allocate` re-reserves on the pool hit that hands the block
+    // back out. This keeps `try_reserve`/`release` calls strictly
+    // paired (one reserve per live block, one release per free).
     if !pool_put(usize_size, p) {
         // Pool full or unbucketable — return to OS.
         unsafe {
@@ -342,6 +365,33 @@ fn fire_cleaner(id: i32) -> bool {
     } else {
         false
     }
+}
+
+/// Bug 1: `Unsafe.freeMemory(addr)` carries no size, so the only way to
+/// reclaim a DirectByteBuffer's backing store (and, crucially, refund its
+/// `Bits` reservation) is to recover the size recorded at allocation time.
+///
+/// `Unsafe.allocateMemory` records sizes in `unsafe_allocs`, but the
+/// `ByteBuffer.allocateDirect` path (`dbb_allocate_direct0`) does NOT —
+/// it records the (addr, size) in the Cleaner registry instead. Without
+/// this lookup, a `freeMemory(addr)` on a DirectByteBuffer address found
+/// no recorded size, skipped `dbb_free` entirely, and so never called
+/// `release` — leaking `Bits.reserved` until a spurious `OutOfMemoryError`.
+///
+/// This consumes the matching un-cleaned Cleaner entry (marking it cleaned
+/// so a later finalizer-driven `fire_cleaner` is an idempotent no-op) and
+/// returns the recorded size so the caller can `dbb_free` it exactly once.
+fn take_cleaner_size_for_addr(addr: u64) -> Option<i64> {
+    let mut g = cleaners().lock().ok()?;
+    let id = g
+        .iter()
+        .find(|(_, e)| e.addr == addr && !e.cleaned)
+        .map(|(id, _)| *id)?;
+    let size = g.get(&id).map(|e| e.size)?;
+    // Remove the entry: this addr is being reclaimed now, and a stale
+    // entry would let a later `fire_cleaner` double-free it.
+    g.remove(&id);
+    Some(size)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,20 +598,44 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if addr == 0 {
         return Ok(None);
     }
-    // Without a size we cannot return to the pool. The safer choice
-    // is to leak rather than dealloc a wrong layout (which is UB).
-    // Real-JDK Unsafe.freeMemory tracks size in `AllocationTable`;
-    // mimic that with a global map.
-    if let Some(size) = take_unsafe_alloc(addr) {
-        // Bug 2 (CRIT): refuse to double-free the same address. Pair
-        // with `dbb_free_explicit` which checks the same set.
-        if mark_freed_or_check(addr) {
-            eprintln!(
-                "[direct_buffer] Unsafe.freeMemory({:#x}) called on already-freed address — skipping",
-                addr
-            );
-            return Ok(None);
-        }
+    // Bug 2 (CRIT): make freeing idempotent. The double-free guard must
+    // run *first* — before `take_unsafe_alloc` — so a second free is a
+    // no-op regardless of whether the address carries an Unsafe size
+    // record. Otherwise a `freeMemory` + `freeMemoryExplicit` race (or two
+    // racing `freeMemory` calls) could both pass the recorded-size check
+    // and call `dbb_free` twice, double-`pool_put`ing the address and
+    // corrupting the bucketed free-list. `mark_freed_or_check` atomically
+    // claims the address under a single lock: exactly one caller wins.
+    if mark_freed_or_check(addr) {
+        eprintln!(
+            "[direct_buffer] Unsafe.freeMemory({:#x}) called on already-freed address — skipping",
+            addr
+        );
+        return Ok(None);
+    }
+    // Real-JDK Unsafe.freeMemory tracks size in `AllocationTable`; we
+    // mimic that with `unsafe_allocs`. `dbb_free` deallocates with the
+    // same `(size, align=8)` layout `dbb_allocate` used, so the dealloc
+    // is layout-correct, and (crucially) it calls `release(size)` so the
+    // `Bits.reserved` accounting is decremented.
+    //
+    // Bug 1: `Unsafe.freeMemory` takes only an address, so we recover
+    // the original size from one of two registries:
+    //   * `unsafe_allocs` — populated by `Unsafe.allocateMemory`.
+    //   * the Cleaner registry — populated by `dbb_allocate_direct0`
+    //     for the `ByteBuffer.allocateDirect` path, which never touches
+    //     `unsafe_allocs`.
+    // Previously only the first was consulted, so `freeMemory(addr)` on
+    // a DirectByteBuffer address found no size, skipped `dbb_free`
+    // entirely, and never called `release` — leaking `Bits.reserved`
+    // monotonically until a spurious `OutOfMemoryError`. We now fall
+    // back to the Cleaner registry so every freeable address has its
+    // reservation refunded exactly once. Only if neither registry knows
+    // the size do we leak (a wrong-layout `dealloc` would be UB) — but
+    // such an address was never minted by our allocator, so there is no
+    // reservation to refund either, and accounting stays balanced.
+    let size = take_unsafe_alloc(addr).or_else(|| take_cleaner_size_for_addr(addr));
+    if let Some(size) = size {
         dbb_free(addr, size);
     }
     Ok(None)
@@ -670,13 +744,12 @@ fn dbb_free_explicit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if addr == 0 || size <= 0 {
         return Ok(None);
     }
-    // Also drop any Unsafe.allocateMemory record so we don't double-free.
-    let _ = take_unsafe_alloc(addr);
-    // Bug 2 (CRIT): refuse to double-free if a prior `Unsafe.freeMemory`
-    // (or another `dbb_free_explicit`) already pool-put this address.
-    // Without this check, both `freeMemory(addr)` and
-    // `freeMemoryExplicit(addr, size)` on the same address would call
-    // `dbb_free` twice, corrupting the bucketed pool free-list.
+    // Bug 2 (CRIT): claim the address *first* (atomic, single-lock) so a
+    // racing `freeMemory(addr)` / `dbb_free_explicit` on the same address
+    // can never both reach `dbb_free` — that would double-`pool_put` the
+    // address and corrupt the bucketed free-list. Without this ordering,
+    // both `freeMemory(addr)` and `freeMemoryExplicit(addr, size)` on the
+    // same address could call `dbb_free` twice.
     if mark_freed_or_check(addr) {
         eprintln!(
             "[direct_buffer] dbb_free_explicit({:#x}, {}) called on already-freed address — skipping",
@@ -684,6 +757,12 @@ fn dbb_free_explicit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         );
         return Ok(None);
     }
+    // Drop any Unsafe.allocateMemory record so a later `freeMemory(addr)`
+    // path doesn't also attempt a free (it would be caught by the
+    // freed-set above anyway, but this keeps the table tidy).
+    let _ = take_unsafe_alloc(addr);
+    // `size` is caller-supplied capacity captured at allocation time;
+    // `dbb_free` deallocates with the same `(size, align=8)` layout.
     dbb_free(addr, size);
     Ok(None)
 }

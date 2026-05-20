@@ -49,7 +49,13 @@ use std::hash::Hasher;
 /// callers should use `validate_code_ptr` to confirm it points within a known
 /// JIT region.
 pub struct JitCodeRegion {
-    /// (start_addr, end_addr_exclusive)
+    /// (start_addr, end_addr_exclusive), kept sorted ascending by start_addr.
+    ///
+    /// Regions are non-overlapping (each is a distinct executable allocation),
+    /// so sorting by start address also sorts by end address. This lets
+    /// `contains` run a binary search instead of an O(n) linear scan — the
+    /// list grows with every compiled method and `contains` is hit on every
+    /// JIT call via `validate_code_ptr`.
     regions: Vec<(usize, usize)>,
 }
 
@@ -61,17 +67,32 @@ impl JitCodeRegion {
     fn register(&mut self, ptr: *const u8, size: usize) {
         let start = ptr as usize;
         let end = start + size;
-        self.regions.push((start, end));
+        // Insert maintaining the sorted-by-start invariant.
+        let idx = self.regions.partition_point(|&(s, _)| s < start);
+        self.regions.insert(idx, (start, end));
     }
 
     fn deregister(&mut self, ptr: *const u8) {
         let addr = ptr as usize;
-        self.regions.retain(|&(start, _)| start != addr);
+        // Find the (unique) region with this start address and remove it,
+        // preserving the sorted order.
+        let lo = self.regions.partition_point(|&(s, _)| s < addr);
+        if lo < self.regions.len() && self.regions[lo].0 == addr {
+            self.regions.remove(lo);
+        }
     }
 
     fn contains(&self, ptr: *const u8) -> bool {
         let addr = ptr as usize;
-        self.regions.iter().any(|&(start, end)| addr >= start && addr < end)
+        // Binary search: find the last region whose start <= addr, then check
+        // it covers `addr`. Non-overlapping + sorted means this is the only
+        // candidate region.
+        let idx = self.regions.partition_point(|&(s, _)| s <= addr);
+        if idx == 0 {
+            return false;
+        }
+        let (start, end) = self.regions[idx - 1];
+        addr >= start && addr < end
     }
 }
 

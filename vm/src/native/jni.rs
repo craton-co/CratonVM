@@ -2390,6 +2390,8 @@ extern "C" fn jni_get_java_vm(_env: JNIEnv, vm: *mut JavaVM) -> JInt {
         return JNI_ERR;
     }
     init_jni_table();
+    // `AtomicPtr<usize>` has the same layout as `*mut usize`, so the address of
+    // the atomic itself is a valid pointer to the invoke-table pointer.
     unsafe {
         *vm = std::ptr::addr_of!(JNI_INVOKE_TABLE_PTR).cast();
     }
@@ -4145,9 +4147,10 @@ extern "C" fn jni_attach_current_thread(
     if has_context {
         // Already attached — just return the existing env pointer
         if !penv.is_null() {
+            init_jni_table();
+            let table = JNI_TABLE_PTR.load(std::sync::atomic::Ordering::Acquire);
             unsafe {
-                init_jni_table();
-                *penv = JNI_TABLE_PTR as *mut std::ffi::c_void;
+                *penv = table as *mut std::ffi::c_void;
             }
         }
         tracing::trace!("JNI AttachCurrentThread: thread already attached");
@@ -4157,9 +4160,10 @@ extern "C" fn jni_attach_current_thread(
     // Note: full thread registration with the VM's ThreadRegistry requires
     // access to SharedVm which is obtained from the JavaVM* pointer.
     if !penv.is_null() {
+        init_jni_table();
+        let table = JNI_TABLE_PTR.load(std::sync::atomic::Ordering::Acquire);
         unsafe {
-            init_jni_table();
-            *penv = JNI_TABLE_PTR as *mut std::ffi::c_void;
+            *penv = table as *mut std::ffi::c_void;
         }
     }
     tracing::debug!("JNI AttachCurrentThread: thread attached");
@@ -4194,20 +4198,26 @@ fn build_invoke_table() -> Box<[usize; JNI_INVOKE_FUNCTION_COUNT]> {
 // Global table storage
 // ---------------------------------------------------------------------------
 
-static mut JNI_TABLE_PTR: *const usize = std::ptr::null();
-static mut JNI_INVOKE_TABLE_PTR: *const usize = std::ptr::null();
+// The two JNI function tables are leaked, process-lifetime singletons. They are
+// stored in `AtomicPtr`s rather than `static mut` so that reads/writes are
+// well-defined under concurrent access (raw `static mut` access is UB-adjacent
+// on the 2024 edition). `JNI_TABLE_INIT` (a `Once`) still guarantees the values
+// are written exactly once; the atomics only make the publication well-defined.
+static JNI_TABLE_PTR: std::sync::atomic::AtomicPtr<usize> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static JNI_INVOKE_TABLE_PTR: std::sync::atomic::AtomicPtr<usize> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static JNI_TABLE_INIT: std::sync::Once = std::sync::Once::new();
 
 fn init_jni_table() {
+    use std::sync::atomic::Ordering;
     JNI_TABLE_INIT.call_once(|| {
         let table = build_function_table();
-        let raw = Box::into_raw(table) as *const usize; // OWNERSHIP: transferred to JNI_TABLE_PTR static; intentionally leaked (process-lifetime singleton)
+        let raw = Box::into_raw(table) as *mut usize; // OWNERSHIP: transferred to JNI_TABLE_PTR static; intentionally leaked (process-lifetime singleton)
         let invoke_table = build_invoke_table();
-        let invoke_raw = Box::into_raw(invoke_table) as *const usize; // OWNERSHIP: transferred to JNI_INVOKE_TABLE_PTR static; intentionally leaked (process-lifetime singleton)
-        unsafe {
-            JNI_TABLE_PTR = raw;
-            JNI_INVOKE_TABLE_PTR = invoke_raw;
-        }
+        let invoke_raw = Box::into_raw(invoke_table) as *mut usize; // OWNERSHIP: transferred to JNI_INVOKE_TABLE_PTR static; intentionally leaked (process-lifetime singleton)
+        JNI_TABLE_PTR.store(raw, Ordering::Release);
+        JNI_INVOKE_TABLE_PTR.store(invoke_raw, Ordering::Release);
     });
 }
 
@@ -4215,6 +4225,9 @@ fn init_jni_table() {
 /// JNIEnv = `*const *const usize` — a pointer to a pointer to the function table.
 pub fn get_jni_env() -> JNIEnv {
     init_jni_table();
+    // `AtomicPtr<usize>` has the same layout as `*mut usize`, so the address of
+    // the atomic itself is a valid `*const *const usize` pointing at the table
+    // pointer published by `init_jni_table`.
     std::ptr::addr_of!(JNI_TABLE_PTR).cast()
 }
 

@@ -624,21 +624,50 @@ impl Heap {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
-        // The autobox check reads the header of the pointed-to object, which is
-        // also a valid heap allocation (it was created by `set_array_element`).
-        unsafe {
+        let value = unsafe {
             let base = obj_ref.as_ptr().add(HEADER_SIZE);
-            let value = read_prim_element(base, index, header.element_type);
-            if header.element_type == ArrayElementType::Reference {
-                if let Value::Object(Some(obj)) = value {
-                    let obj_header = &*(obj.as_ptr() as *const ObjectHeader);
+            read_prim_element(base, index, header.element_type)
+        };
+        if header.element_type == ArrayElementType::Reference {
+            if let Value::Object(Some(obj)) = value {
+                // The stored word is treated as an `ObjectRef`, but a stale or
+                // garbage non-zero element could point anywhere. Validate it
+                // against this heap's semi-space arenas before dereferencing
+                // it as an `ObjectHeader`; otherwise a wild read can crash or
+                // mis-classify garbage. If the pointer does not look like a
+                // live heap object, skip the unboxing and return the value.
+                if self.is_valid_heap_object(obj) {
+                    // SAFETY: `is_valid_heap_object` confirmed `obj` points to
+                    // an 8-byte-aligned address inside one of this heap's
+                    // arenas, so reading its `ObjectHeader` is valid memory.
+                    let obj_header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
                     if obj_header.class_id == AUTOBOX_CLASS_ID {
                         return Ok(self.get_field(obj, 0));
                     }
                 }
             }
-            Ok(value)
         }
+        Ok(value)
+    }
+
+    /// Conservative validity check for a heap object pointer.
+    ///
+    /// Returns `true` only if `obj` is 8-byte aligned and falls within one of
+    /// this heap's semi-space arenas (`from_space` or `to_space`). Mirrors the
+    /// `GenerationalHeap::is_object_address` check used by `gen_heap.rs`.
+    ///
+    /// This is a structural guard: it lets callers reject a stale or garbage
+    /// stored pointer before dereferencing it as an `ObjectHeader`.
+    fn is_valid_heap_object(&self, obj: ObjectRef) -> bool {
+        let addr = obj.as_ptr() as usize;
+        // Object headers are always 8-byte aligned; a real object pointer
+        // never has its low 3 bits set.
+        if addr == 0 || addr & 0x7 != 0 {
+            return false;
+        }
+        let raw = obj.as_ptr() as *const u8;
+        // Region check: must land inside one of the two semi-spaces.
+        self.from_space.lock().contains(raw) || self.to_space.lock().contains(raw)
     }
 
     /// Set an array element at the given index.

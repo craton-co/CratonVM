@@ -1413,15 +1413,32 @@ fn decode_code_body(
     }))
 }
 
+/// Maximum nesting depth for annotation `element_value` structures.
+/// Annotation arrays (`[`) and nested annotations (`@`) recurse on
+/// attacker-controlled class data; this cap (matching the JVMS
+/// array-dimension limit) stops a malicious .class file from blowing
+/// the native stack via unbounded recursion.
+const MAX_ELEMENT_VALUE_DEPTH: u32 = 255;
+
 /// Decode a single annotation structure (JVM spec 4.7.16).
 fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassReaderError> {
+    decode_annotation_depth(buf, 0)
+}
+
+/// Depth-tracking implementation of [`decode_annotation`]. `depth` counts
+/// the annotation/array nesting so far; it is checked against
+/// [`MAX_ELEMENT_VALUE_DEPTH`] inside [`decode_element_value_depth`].
+fn decode_annotation_depth(
+    buf: &mut ClassFileBuffer<'_>,
+    depth: u32,
+) -> Result<Annotation, ClassReaderError> {
     let type_index = buf.read_u16()?;
     let num_element_value_pairs = buf.read_u16()?;
     let mut element_value_pairs =
         Vec::with_capacity((num_element_value_pairs as usize).min(PREALLOC_CAP));
     for _ in 0..num_element_value_pairs {
         let element_name_index = buf.read_u16()?;
-        let value = decode_element_value(buf)?;
+        let value = decode_element_value_depth(buf, depth)?;
         element_value_pairs.push(ElementValuePair {
             element_name_index,
             value,
@@ -1437,6 +1454,24 @@ fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassR
 fn decode_element_value(
     buf: &mut ClassFileBuffer<'_>,
 ) -> Result<ElementValue, ClassReaderError> {
+    decode_element_value_depth(buf, 0)
+}
+
+/// Depth-tracking implementation of [`decode_element_value`]. The `[`
+/// (array) and `@` (nested annotation) tags recurse; each recursion
+/// increments `depth`, and exceeding [`MAX_ELEMENT_VALUE_DEPTH`] returns
+/// an error instead of descending further.
+fn decode_element_value_depth(
+    buf: &mut ClassFileBuffer<'_>,
+    depth: u32,
+) -> Result<ElementValue, ClassReaderError> {
+    if depth >= MAX_ELEMENT_VALUE_DEPTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "annotation element_value nesting exceeds {MAX_ELEMENT_VALUE_DEPTH}"
+            ),
+        });
+    }
     let tag = buf.read_u8()?;
     match tag {
         b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
@@ -1459,14 +1494,14 @@ fn decode_element_value(
             Ok(ElementValue::Class { class_info_index })
         }
         b'@' => {
-            let annotation = decode_annotation(buf)?;
+            let annotation = decode_annotation_depth(buf, depth + 1)?;
             Ok(ElementValue::AnnotationValue(annotation))
         }
         b'[' => {
             let num_values = buf.read_u16()?;
             let mut values = Vec::with_capacity((num_values as usize).min(PREALLOC_CAP));
             for _ in 0..num_values {
-                values.push(decode_element_value(buf)?);
+                values.push(decode_element_value_depth(buf, depth + 1)?);
             }
             Ok(ElementValue::Array(values))
         }
@@ -1714,6 +1749,25 @@ mod tests {
             }
             other => panic!("Expected LineNumberTable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deeply_nested_element_value_array_is_rejected() {
+        // Build an element_value that is a 300-deep stack of `[` arrays
+        // (each array tag followed by a u16 count of 1). This exceeds the
+        // MAX_ELEMENT_VALUE_DEPTH cap and must return an error rather than
+        // recursing into a native stack overflow.
+        let mut data = Vec::new();
+        for _ in 0..300 {
+            data.push(b'[');
+            data.extend_from_slice(&1u16.to_be_bytes());
+        }
+        // Innermost value: a constant int (`I`) + u16 const index.
+        data.push(b'I');
+        data.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut buf = ClassFileBuffer::new(&data);
+        assert!(decode_element_value(&mut buf).is_err());
     }
 
     #[test]

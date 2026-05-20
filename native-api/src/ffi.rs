@@ -21,6 +21,10 @@ use rustc_hash::FxHashMap;
 pub struct NativeMemoryTable {
     allocations: FxHashMap<i64, NativeAllocation>,
     next_id: i64,
+    /// Running sum of `layout.size()` over all live allocations. Kept in
+    /// sync by `allocate`/`free` so `live_bytes()` is O(1) instead of
+    /// re-summing the whole map on every call.
+    live_bytes: usize,
 }
 
 struct NativeAllocation {
@@ -38,6 +42,7 @@ impl NativeMemoryTable {
         Self {
             allocations: FxHashMap::default(),
             next_id: 1,
+            live_bytes: 0,
         }
     }
 
@@ -60,12 +65,17 @@ impl NativeMemoryTable {
         };
         self.allocations
             .insert(id, NativeAllocation { ptr, layout });
+        // Keep the running `live_bytes` total in sync. `id` is a fresh
+        // monotonic counter, so this `insert` never replaces an entry.
+        self.live_bytes += layout.size();
         Some((id, ptr))
     }
 
     /// Free a single allocation by ID. Returns true if found and freed.
     pub fn free(&mut self, id: i64) -> bool {
         if let Some(alloc) = self.allocations.remove(&id) {
+            // Keep the running `live_bytes` total in sync.
+            self.live_bytes -= alloc.layout.size();
             // Safety: ptr was allocated with alloc::alloc_zeroed with this layout.
             unsafe { alloc::dealloc(alloc.ptr, alloc.layout) };
             true
@@ -98,8 +108,11 @@ impl NativeMemoryTable {
     }
 
     /// Sum of sizes of all currently live allocations, in bytes.
+    ///
+    /// O(1): returns the running total maintained by `allocate`/`free`
+    /// rather than re-summing the allocation map on every call.
     pub fn live_bytes(&self) -> usize {
-        self.allocations.values().map(|a| a.layout.size()).sum()
+        self.live_bytes
     }
 }
 

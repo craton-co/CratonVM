@@ -226,7 +226,7 @@ fn detect_int_array_sum(
     iv_local: usize,
 ) -> Option<SimdIntArraySum> {
     // back_edge should be a goto instruction
-    if code[back_edge] != 0xa7 {
+    if code.get(back_edge).copied() != Some(0xa7) {
         return None;
     }
     let back_edge_end = back_edge + 3;
@@ -334,48 +334,48 @@ fn detect_int_array_sum(
 
 /// Extract local index from an lload instruction at pc.
 fn extract_lload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x1e => Some(0),                     // lload_0
-        0x1f => Some(1),                     // lload_1
-        0x20 => Some(2),                     // lload_2
-        0x21 => Some(3),                     // lload_3
-        0x16 => Some(code[pc + 1] as usize), // lload // Widening: always safe
+    match *code.get(pc)? {
+        0x1e => Some(0),                                  // lload_0
+        0x1f => Some(1),                                  // lload_1
+        0x20 => Some(2),                                  // lload_2
+        0x21 => Some(3),                                  // lload_3
+        0x16 => code.get(pc + 1).map(|&b| b as usize),    // lload
         _ => None,
     }
 }
 
 /// Extract local index from an lstore instruction at pc.
 fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x3f => Some(0),                     // lstore_0
-        0x40 => Some(1),                     // lstore_1
-        0x41 => Some(2),                     // lstore_2
-        0x42 => Some(3),                     // lstore_3
-        0x37 => Some(code[pc + 1] as usize), // lstore // Widening: always safe
+    match *code.get(pc)? {
+        0x3f => Some(0),                                  // lstore_0
+        0x40 => Some(1),                                  // lstore_1
+        0x41 => Some(2),                                  // lstore_2
+        0x42 => Some(3),                                  // lstore_3
+        0x37 => code.get(pc + 1).map(|&b| b as usize),    // lstore
         _ => None,
     }
 }
 
 /// Extract local index from a dload instruction at pc.
 fn extract_dload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x26 => Some(0),                     // dload_0
-        0x27 => Some(1),                     // dload_1
-        0x28 => Some(2),                     // dload_2
-        0x29 => Some(3),                     // dload_3
-        0x18 => Some(code[pc + 1] as usize), // dload // Widening: always safe
+    match *code.get(pc)? {
+        0x26 => Some(0),                                  // dload_0
+        0x27 => Some(1),                                  // dload_1
+        0x28 => Some(2),                                  // dload_2
+        0x29 => Some(3),                                  // dload_3
+        0x18 => code.get(pc + 1).map(|&b| b as usize),    // dload
         _ => None,
     }
 }
 
 /// Extract local index from a dstore instruction at pc.
 fn extract_dstore_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x47 => Some(0),                     // dstore_0
-        0x48 => Some(1),                     // dstore_1
-        0x49 => Some(2),                     // dstore_2
-        0x4a => Some(3),                     // dstore_3
-        0x39 => Some(code[pc + 1] as usize), // dstore // Widening: always safe
+    match *code.get(pc)? {
+        0x47 => Some(0),                                  // dstore_0
+        0x48 => Some(1),                                  // dstore_1
+        0x49 => Some(2),                                  // dstore_2
+        0x4a => Some(3),                                  // dstore_3
+        0x39 => code.get(pc + 1).map(|&b| b as usize),    // dstore
         _ => None,
     }
 }
@@ -390,7 +390,7 @@ fn detect_fp_array_sum(
     iv_local: usize,
 ) -> Option<SimdFpArraySum> {
     // back_edge should be a goto instruction
-    if code[back_edge] != 0xa7 {
+    if code.get(back_edge).copied() != Some(0xa7) {
         return None;
     }
     let back_edge_end = back_edge + 3;
@@ -2711,24 +2711,24 @@ fn find_store_index_pc(code: &[u8], start: usize, store_pc: usize) -> Option<usi
 
 /// Extract the local variable index from an iload instruction at `pc`.
 fn extract_iload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
+    match *code.get(pc)? {
         0x1a => Some(0),
         0x1b => Some(1),
         0x1c => Some(2),
         0x1d => Some(3),
-        0x15 => Some(code[pc + 1] as usize), // Widening: always safe
+        0x15 => code.get(pc + 1).map(|&b| b as usize), // iload
         _ => None,
     }
 }
 
 /// Extract the local variable index from an aload instruction at `pc`.
 fn extract_aload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
+    match *code.get(pc)? {
         0x2a => Some(0),
         0x2b => Some(1),
         0x2c => Some(2),
         0x2d => Some(3),
-        0x19 => Some(code[pc + 1] as usize), // Widening: always safe
+        0x19 => code.get(pc + 1).map(|&b| b as usize), // aload
         _ => None,
     }
 }
@@ -3147,6 +3147,14 @@ struct Compiler {
     typecheck_info_idx: FxHashMap<usize, usize>,
     ldc_info_idx: FxHashMap<usize, usize>,
     ldc2w_info_idx: FxHashMap<usize, usize>,
+
+    /// Memo for `magic_signed_div32`: constant divisor → computed
+    /// `(magic, shift)` pair. The magic-number derivation runs a Newton-style
+    /// iteration; a loop body with a repeated `/ k` or `% k` on the same
+    /// constant `k` would otherwise recompute it at every occurrence. The
+    /// result is a pure function of the divisor, so caching is behavior-
+    /// preserving.
+    magic_div_memo: FxHashMap<i32, (i64, u32)>,
 }
 
 impl Compiler {
@@ -3294,6 +3302,7 @@ impl Compiler {
             typecheck_info_idx: FxHashMap::default(),
             ldc_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
+            magic_div_memo: FxHashMap::default(),
         }
     }
 
@@ -4360,7 +4369,7 @@ impl Compiler {
             }
             // idiv: left / const_val — non-power-of-2 (magic number method)
             0x6c if const_val >= 2 => {
-                let (magic, shift) = Self::magic_signed_div32(const_val);
+                let (magic, shift) = self.magic_div_cached(const_val);
                 self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                 self.pop_to_rax();
                 self.emit_idiv_magic(magic, shift);
@@ -4369,7 +4378,7 @@ impl Compiler {
             }
             // irem: left % const_val — non-power-of-2 (magic number method)
             0x70 if const_val >= 2 => {
-                let (magic, shift) = Self::magic_signed_div32(const_val);
+                let (magic, shift) = self.magic_div_cached(const_val);
                 self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                 self.pop_to_rax();
                 self.emit_irem_magic(magic, shift, const_val);
@@ -4848,6 +4857,20 @@ impl Compiler {
         self.buf.emit(&[0x89, 0xC8]); // MOV EAX, ECX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]); // MOVSXD RAX, EAX
+    }
+
+    /// Memoized wrapper around [`Self::magic_signed_div32`]. The magic-number
+    /// derivation is a pure function of the divisor; caching it per constant
+    /// avoids recomputing the Newton iteration for repeated `/ k` / `% k` in
+    /// a loop body. The cached `(magic, shift)` is bit-identical to a fresh
+    /// computation, so generated machine code is unchanged.
+    fn magic_div_cached(&mut self, d: i32) -> (i64, u32) {
+        if let Some(&pair) = self.magic_div_memo.get(&d) {
+            return pair;
+        }
+        let pair = Self::magic_signed_div32(d);
+        self.magic_div_memo.insert(d, pair);
+        pair
     }
 
     /// Compute magic number for signed 32-bit division by constant d (d >= 2).
@@ -7983,8 +8006,19 @@ impl Compiler {
         let do_div_off = self.buf.pos();
         let rel1 = (do_div_off as i64) - (jne1_patch as i64 + 1);
         let rel2 = (do_div_off as i64) - (jne2_patch as i64 + 1);
-        debug_assert!((-128..=127).contains(&rel1));
-        debug_assert!((-128..=127).contains(&rel2));
+        // Hard runtime checks: a rel8 displacement that does not fit in an i8
+        // would silently miscompile in release builds. `emit_safe_idiv` cannot
+        // signal a failure (it returns `()`), so assert rather than emit a
+        // broken branch. The intervening block is fixed-size and small, so
+        // this can only fire on a genuine codegen bug.
+        assert!(
+            (-128..=127).contains(&rel1),
+            "emit_safe_idiv: JNE1 rel8 displacement {rel1} out of i8 range",
+        );
+        assert!(
+            (-128..=127).contains(&rel2),
+            "emit_safe_idiv: JNE2 rel8 displacement {rel2} out of i8 range",
+        );
         self.buf.patch_byte(jne1_patch, rel1 as u8);
         self.buf.patch_byte(jne2_patch, rel2 as u8);
 
@@ -8019,7 +8053,12 @@ impl Compiler {
         // :after_div — patch the JMP from the overflow path.
         let after_off = self.buf.pos();
         let rel_jmp = (after_off as i64) - (jmp_after_patch as i64 + 1);
-        debug_assert!((-128..=127).contains(&rel_jmp));
+        // Hard runtime check (see JNE patch checks above): a rel8 that does not
+        // fit in an i8 would silently miscompile in release builds.
+        assert!(
+            (-128..=127).contains(&rel_jmp),
+            "emit_safe_idiv: JMP rel8 displacement {rel_jmp} out of i8 range",
+        );
         self.buf.patch_byte(jmp_after_patch, rel_jmp as u8);
     }
 

@@ -3515,15 +3515,19 @@ fn i64_to_radix_string(val: i64, radix: u32) -> String {
     if val == 0 {
         return "0".to_string();
     }
+    // Radix digits are always ASCII, so build the byte buffer directly and
+    // construct the String once (avoids the intermediate Vec<char> + collect).
     let mut v = val as u64;
-    let mut digits = Vec::new();
+    let mut digits: Vec<u8> = Vec::new();
     while v > 0 {
         let d = (v % radix as u64) as u32;
-        digits.push(char::from_digit(d, radix).unwrap_or('?'));
+        digits.push(char::from_digit(d, radix).unwrap_or('?') as u8);
         v /= radix as u64;
     }
     digits.reverse();
-    digits.into_iter().collect()
+    // Every byte pushed is an ASCII digit/letter from `char::from_digit`
+    // (or the ASCII `?` fallback), so the buffer is guaranteed valid UTF-8.
+    String::from_utf8(digits).unwrap_or_else(|_| "0".to_string())
 }
 
 // --- Float ---

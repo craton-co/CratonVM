@@ -36,6 +36,7 @@
 //! consumers (JFR file writer vs constant-pool tables). No
 //! unification opportunity — flagged for closure.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -263,6 +264,43 @@ pub struct LambdaCallSite {
 /// Cache key: (referring class, constant pool index).
 type ResolutionKey = (ClassId, u16);
 
+/// Per-map FIFO cap for [`ResolutionCache`].
+///
+/// The cache is keyed on `(referring class, cp index)` so its natural
+/// size is bounded by the total CP-reference count of the loaded
+/// program — but a long-running JVM that loads and unloads many
+/// classes (agents, redefine churn, fileless classloaders) can grow
+/// each map without bound. Mirrors the FIFO cap on `class_bytes_cache`
+/// (`class_manager.rs`) and `CanonicalizeCache` (`class_path.rs`).
+/// Generous enough that real programs never evict — eviction only
+/// kicks in for pathological reference sets.
+const RESOLUTION_CACHE_CAP: usize = 1 << 16;
+
+/// Insert `(key, value)` into `map` honouring the FIFO `order` tracker
+/// and `RESOLUTION_CACHE_CAP`. If `key` already exists the value is
+/// overwritten in place and the FIFO position is left unchanged
+/// (avoiding a linear `VecDeque` scan — resolution is idempotent, so a
+/// repeat insert writes an identical value). Mirrors
+/// [`CanonicalizeCache::insert`] in `class_path.rs`.
+fn resolution_cache_insert<V>(
+    map: &mut FxHashMap<ResolutionKey, V>,
+    order: &mut VecDeque<ResolutionKey>,
+    key: ResolutionKey,
+    value: V,
+) {
+    if map.contains_key(&key) {
+        map.insert(key, value);
+        return;
+    }
+    if map.len() >= RESOLUTION_CACHE_CAP {
+        if let Some(oldest) = order.pop_front() {
+            map.remove(&oldest);
+        }
+    }
+    order.push_back(key);
+    map.insert(key, value);
+}
+
 /// Caches resolved symbolic references from the constant pool.
 ///
 /// Avoids re-resolving the same field/method/call-site reference every time the
@@ -275,6 +313,14 @@ pub struct ResolutionCache {
     call_sites: FxHashMap<ResolutionKey, ResolvedCallSite>,
     /// Cached CONSTANT_Dynamic values (condy, JEP 309).
     condy: FxHashMap<ResolutionKey, Value>,
+    /// Insertion-order trackers for FIFO eviction, one per map. The
+    /// front is the oldest entry; the back is the most recent. Kept in
+    /// sync with each map: every fresh insert pushes to the back; every
+    /// eviction pops from the front. Bounded by `RESOLUTION_CACHE_CAP`.
+    fields_order: VecDeque<ResolutionKey>,
+    methods_order: VecDeque<ResolutionKey>,
+    call_sites_order: VecDeque<ResolutionKey>,
+    condy_order: VecDeque<ResolutionKey>,
 }
 
 impl ResolutionCache {
@@ -285,6 +331,10 @@ impl ResolutionCache {
             methods: fx_hashmap_with_capacity(64),
             call_sites: fx_hashmap_with_capacity(16),
             condy: fx_hashmap_with_capacity(16),
+            fields_order: VecDeque::with_capacity(64),
+            methods_order: VecDeque::with_capacity(64),
+            call_sites_order: VecDeque::with_capacity(16),
+            condy_order: VecDeque::with_capacity(16),
         }
     }
 
@@ -295,7 +345,12 @@ impl ResolutionCache {
 
     /// Cache a resolved field.
     pub fn put_field(&mut self, class_id: ClassId, cp_index: u16, resolved: ResolvedField) {
-        self.fields.insert((class_id, cp_index), resolved);
+        resolution_cache_insert(
+            &mut self.fields,
+            &mut self.fields_order,
+            (class_id, cp_index),
+            resolved,
+        );
     }
 
     /// Look up a cached method resolution.
@@ -305,7 +360,12 @@ impl ResolutionCache {
 
     /// Cache a resolved method.
     pub fn put_method(&mut self, class_id: ClassId, cp_index: u16, resolved: ResolvedMethod) {
-        self.methods.insert((class_id, cp_index), resolved);
+        resolution_cache_insert(
+            &mut self.methods,
+            &mut self.methods_order,
+            (class_id, cp_index),
+            resolved,
+        );
     }
 
     /// Look up a cached call site (invokedynamic).
@@ -315,7 +375,12 @@ impl ResolutionCache {
 
     /// Cache a resolved call site.
     pub fn put_call_site(&mut self, class_id: ClassId, cp_index: u16, resolved: ResolvedCallSite) {
-        self.call_sites.insert((class_id, cp_index), resolved);
+        resolution_cache_insert(
+            &mut self.call_sites,
+            &mut self.call_sites_order,
+            (class_id, cp_index),
+            resolved,
+        );
     }
 
     /// The number of cached field resolutions.
@@ -340,7 +405,12 @@ impl ResolutionCache {
 
     /// Cache a resolved CONSTANT_Dynamic value.
     pub fn put_condy(&mut self, class_id: ClassId, cp_index: u16, value: Value) {
-        self.condy.insert((class_id, cp_index), value);
+        resolution_cache_insert(
+            &mut self.condy,
+            &mut self.condy_order,
+            (class_id, cp_index),
+            value,
+        );
     }
 
     /// Scan cached CONSTANT_Dynamic values for GC roots.
@@ -372,6 +442,11 @@ impl ResolutionCache {
         self.methods.clear();
         self.call_sites.clear();
         self.condy.clear();
+        // Keep the FIFO trackers in sync with their maps.
+        self.fields_order.clear();
+        self.methods_order.clear();
+        self.call_sites_order.clear();
+        self.condy_order.clear();
     }
 
     /// Round 4 audit fix (CRIT): drop every cached resolution that
@@ -413,6 +488,13 @@ impl ResolutionCache {
         // carry no reachable declaring-class link.)
         self.call_sites.retain(|(key_class, _), _| *key_class != class_id);
         self.condy.retain(|(key_class, _), _| *key_class != class_id);
+        // Rebuild the FIFO trackers so they stay in sync with the maps:
+        // keep only keys still present, preserving insertion order.
+        self.fields_order.retain(|key| self.fields.contains_key(key));
+        self.methods_order.retain(|key| self.methods.contains_key(key));
+        self.call_sites_order
+            .retain(|key| self.call_sites.contains_key(key));
+        self.condy_order.retain(|key| self.condy.contains_key(key));
     }
 }
 

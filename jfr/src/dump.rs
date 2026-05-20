@@ -115,23 +115,42 @@ pub fn encode_compressed_long(value: i64) -> Vec<u8> {
     buf
 }
 
-/// J2 (round-2): append a JFR compressed-int encoding of `value` to `buf`
-/// without allocating. Saves the per-call `Vec` allocation that
-/// [`encode_compressed_int`] incurs.
+/// Shared core of the JFR compressed-int (LEB128-variant) encoder: writes the
+/// encoding of `value` into the fixed-size stack buffer `out` and returns the
+/// number of bytes written. A compressed u64 is at most 10 bytes, so a
+/// `[u8; 10]` buffer can never overflow.
+///
+/// This is the single source of truth for the byte-level encoding; both
+/// [`write_compressed_int_into`] (Vec-append) and [`write_size_prefixed`]
+/// (stack-buffer-then-`write_all`) build on it so the encoding logic is not
+/// duplicated.
 #[inline]
-pub fn write_compressed_int_into(buf: &mut Vec<u8>, value: u64) {
+fn encode_compressed_int_to_buf(out: &mut [u8; 10], value: u64) -> usize {
     let mut v = value;
+    let mut len = 0usize;
     loop {
         let mut byte = (v & 0x7F) as u8;
         v >>= 7;
         if v != 0 {
             byte |= 0x80;
         }
-        buf.push(byte);
+        out[len] = byte;
+        len += 1;
         if v == 0 {
             break;
         }
     }
+    len
+}
+
+/// J2 (round-2): append a JFR compressed-int encoding of `value` to `buf`
+/// without allocating. Saves the per-call `Vec` allocation that
+/// [`encode_compressed_int`] incurs.
+#[inline]
+pub fn write_compressed_int_into(buf: &mut Vec<u8>, value: u64) {
+    let mut tmp = [0u8; 10];
+    let len = encode_compressed_int_to_buf(&mut tmp, value);
+    buf.extend_from_slice(&tmp[..len]);
 }
 
 /// J2 (round-2): append a JFR compressed-long (zigzag + LEB128) encoding of
@@ -160,14 +179,18 @@ pub fn decode_compressed_int(data: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0u32;
     for (i, &byte) in data.iter().enumerate() {
+        // Reject a varint that encodes more than 64 bits: once `shift` has
+        // reached 64 there is no room left for any payload bits, so a
+        // 10th continuation byte (or any byte at `shift >= 64`) is a
+        // malformed encoding that would otherwise wrap/garble the u64.
+        if shift >= 64 {
+            return None; // overflow: varint encodes more than 64 bits
+        }
         result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
             return Some((result, i + 1));
         }
         shift += 7;
-        if shift >= 70 {
-            return None; // overflow
-        }
     }
     None // ran out of bytes
 }
@@ -357,22 +380,11 @@ fn write_size_prefixed<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> 
         size_prefix_len = actual;
     };
     // Write the size prefix straight to the writer — small (<= 10 bytes) so
-    // a stack array is fine and avoids touching the heap.
+    // a stack array is fine and avoids touching the heap. Encoding goes
+    // through the shared `encode_compressed_int_to_buf` helper so the
+    // LEB128 byte logic is not duplicated against `write_compressed_int_into`.
     let mut prefix = [0u8; 10];
-    let mut len = 0usize;
-    let mut v = total as u64;
-    loop {
-        let mut byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v != 0 {
-            byte |= 0x80;
-        }
-        prefix[len] = byte;
-        len += 1;
-        if v == 0 {
-            break;
-        }
-    }
+    let len = encode_compressed_int_to_buf(&mut prefix, total as u64);
     writer.write_all(&prefix[..len])?;
     writer.write_all(body)?;
     Ok(())
@@ -1005,6 +1017,22 @@ fn parse_checkpoint_pool(
         pos += nec;
 
         if pool_type == STRING_POOL_TYPE_ID {
+            // `n_entries` is decoded straight from the (untrusted) file. A
+            // crafted small file can encode a huge count and trigger a
+            // multi-GB `reserve` / OOM. Each entry needs at least one byte
+            // on the wire (its index varint), so a count larger than the
+            // bytes remaining in the record is structurally impossible —
+            // reject it instead of trusting it.
+            let remaining = record_end.saturating_sub(pos);
+            if n_entries as u64 > remaining as u64 {
+                return Err(JfrDumpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "pool entry count {} exceeds {} bytes remaining in record",
+                        n_entries, remaining
+                    ),
+                )));
+            }
             strings.reserve(n_entries as usize);
             for _ in 0..n_entries {
                 let (_idx, ic) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
@@ -1311,6 +1339,43 @@ mod tests {
     fn test_decode_compressed_int_truncated() {
         // 0x80 means "more bytes follow" but there are none
         assert!(decode_compressed_int(&[0x80]).is_none());
+    }
+
+    /// A crafted checkpoint section that declares a huge `n_entries` while
+    /// carrying only a few bytes must be rejected, not trigger a multi-GB
+    /// `reserve`. `parse_checkpoint_pool` bounds `n_entries` against the
+    /// bytes remaining in the record.
+    #[test]
+    fn test_checkpoint_pool_rejects_oversized_entry_count() {
+        let mut body: Vec<u8> = Vec::new();
+        // 5 checkpoint header longs: type_id, timestamp, duration, delta, mask.
+        for _ in 0..5 {
+            body.extend_from_slice(&encode_compressed_long(0));
+        }
+        // n_pools = 1
+        body.extend_from_slice(&encode_compressed_int(1));
+        // pool_type = STRING_POOL_TYPE_ID
+        body.extend_from_slice(&encode_compressed_int(STRING_POOL_TYPE_ID));
+        // n_entries = absurdly large, far beyond the bytes that follow.
+        body.extend_from_slice(&encode_compressed_int(1_000_000_000));
+        // No entry bytes follow at all.
+
+        // Prepend the record-size prefix. The size field counts itself, so
+        // for a body this small a single-byte prefix suffices.
+        let mut record: Vec<u8> = Vec::new();
+        let total = body.len() + 1;
+        assert!(total < 0x80, "fixture small enough for 1-byte size prefix");
+        record.extend_from_slice(&encode_compressed_int(total as u64));
+        record.extend_from_slice(&body);
+
+        let err = parse_checkpoint_pool(&record, 0)
+            .expect_err("oversized n_entries must be rejected");
+        match err {
+            JfrDumpError::Io(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected Io(InvalidData) parse error, got {:?}", other),
+        }
     }
 
     // --- dump_to_file and header reading ---

@@ -163,6 +163,31 @@ fn fnf(path: &str) -> MethodCallFailed {
     }))
 }
 
+/// Validate caller-supplied `(off, len)` against a byte array of length
+/// `arr_len`, matching the JDK's `Objects.checkFromIndexSize` contract
+/// used by `RandomAccessFile.readBytes`/`writeBytes`.
+///
+/// Returns `Err(IndexOutOfBoundsException)` if `off` or `len` is negative
+/// or if `off + len` exceeds `arr_len`. Uses checked arithmetic so a
+/// caller-supplied `off + len` cannot overflow `usize`.
+fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
+    if off < 0 || len < 0 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { len },
+            },
+        )));
+    }
+    match (off as usize).checked_add(len as usize) {
+        Some(end) if end <= arr_len => Ok(()),
+        _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: off.saturating_add(len),
+            },
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Field helpers
 // ---------------------------------------------------------------------------
@@ -311,14 +336,19 @@ fn native_readBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // Bounds-check caller-supplied off/len against the array before
+    // handing them to the bulk-write intrinsic (mirrors JDK RAF.readBytes).
+    check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
     if len == 0 {
         return Ok(Some(Value::Int(0)));
     }
@@ -376,14 +406,19 @@ fn native_writeBytes0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // Bounds-check caller-supplied off/len against the array before
+    // handing them to the bulk-read intrinsic (mirrors JDK RAF.writeBytes).
+    check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
     if len == 0 {
         return Ok(None);
     }

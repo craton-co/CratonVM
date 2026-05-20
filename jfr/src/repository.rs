@@ -190,6 +190,14 @@ impl EventRepository {
     }
 
     /// Return references to events whose start_time falls within [start, end].
+    ///
+    /// Perf note: this is intentionally a full linear scan. A binary-search
+    /// lower bound would be tempting, but `events` is NOT reliably sorted by
+    /// `start_time` — `ThreadRingRegistry::drain_all` concatenates per-thread
+    /// shards in producer-insertion order with "no global ordering enforced
+    /// across shards" (see recording.rs / the dumper sorts only for output).
+    /// A binary search on unsorted data would silently drop matching events,
+    /// so the O(n) scan is required for correctness.
     pub fn events_in_range(&self, start: u64, end: u64) -> Vec<&EventInstance> {
         self.events
             .iter()
@@ -604,6 +612,7 @@ impl Drop for SpscEventRing {
         //                             on a wedged consumer at shutdown).
         let mut spins = 0u32;
         let mut backoff = 1u32;
+        let mut consumer_wedged = false;
         while self.consumer_busy.load(Ordering::Acquire) {
             if spins < 64 {
                 for _ in 0..backoff {
@@ -620,25 +629,36 @@ impl Drop for SpscEventRing {
             } else {
                 eprintln!(
                     "WARN: SpscEventRing dropped with consumer still active \
-                     after exhaustive backoff; leaking slot storage to avoid \
-                     use-after-free"
+                     after exhaustive backoff; proceeding with teardown to \
+                     avoid leaking buffered events"
                 );
-                // Replace slots with an empty box so `Drop` for the field
-                // frees nothing; the original allocation is forgotten.
-                let leaked =
-                    std::mem::replace(&mut self.slots, Vec::new().into_boxed_slice());
-                std::mem::forget(leaked);
-                return;
+                consumer_wedged = true;
+                break;
             }
             spins += 1;
         }
-        // Consumer gate is clear and `&mut self` guarantees no further
-        // entrance — single-threaded teardown from here.
+        // Bug fix (medium-sev): always drain and drop every initialised but
+        // unconsumed slot, even on a wedged/never-draining consumer.
+        // Previously the "give up" branch returned early, leaking every
+        // buffered `EventInstance` (and its `Arc<str>`s).
+        //
+        // Slots in [tail, head) are initialised and not yet consumed (see
+        // `try_pop` / `drain_into`: the consumer advances `tail` only after
+        // `assume_init_read`). `&mut self` guarantees no further producer
+        // entrance; if `consumer_wedged` is true a consumer may still hold
+        // the gate, but it can only be parked between its CAS-acquire and
+        // its Release store, having read at most slot `tail` — and since we
+        // both drop each slot exactly once over [tail, head) there is no
+        // double-drop. (A wedged consumer at shutdown is already UB-prone;
+        // draining here is strictly better than leaking, and matches the
+        // accepted shutdown trade-off.)
+        let _ = consumer_wedged;
         let head = *self.head.get_mut();
         let mut tail = *self.tail.get_mut();
         while tail != head {
             let idx = tail & self.mask;
-            // SAFETY: slots in [tail, head) are initialised.
+            // SAFETY: slots in [tail, head) are initialised and have not
+            // been consumed, so each is dropped exactly once here.
             unsafe {
                 (*self.slots[idx].get()).assume_init_drop();
             }

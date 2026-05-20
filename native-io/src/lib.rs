@@ -104,29 +104,119 @@ fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
         return Ok(path.to_string());
     }
 
-    // Reject path traversal sequences — only reject `..` as a path
-    // segment, not as a substring. `foo..bar.txt` is a perfectly legal
-    // filename.
-    if Path::new(path)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // AUDIT 2026-05-19: TOCTOU / canonicalize-after-check fix.
+    //
+    // The previous implementation rejected `..` only as a literal path
+    // *component* and then canonicalized AFTER the traversal check. That
+    // is unsound: a symlink whose target escapes the sandbox contains no
+    // `..` component, so it passed the textual check, and the canonical
+    // (symlink-resolved) result was never re-validated. An attacker could
+    // therefore reach any file the host process can see.
+    //
+    // The sound order is: canonicalize FIRST (resolving every symlink and
+    // `..`/`.` segment against the real filesystem), THEN check that the
+    // fully-resolved path is contained within the sandbox root. The
+    // sandbox root is the process current working directory — the same
+    // boundary the old `..` check was implicitly trying to enforce.
+    let sandbox_root = match fs::canonicalize(std::env::current_dir().unwrap_or_default()) {
+        Ok(r) => r,
+        Err(_) => {
+            // Can't establish a sandbox root — fall back to the textual
+            // `..`-component rejection so we never silently accept a
+            // traversal.
+            if Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::SecurityException {
+                        message: format!("Path traversal detected: {}", path),
+                    },
+                )));
+            }
+            return Ok(path.to_string());
+        }
+    };
+
+    // Resolve the path against the real filesystem. If the path itself
+    // exists, canonicalize it directly. If it does not yet exist (e.g.
+    // `createNewFile`, `FileOutputStream` of a new file), canonicalize the
+    // deepest existing ancestor — typically the parent directory — and
+    // re-attach the not-yet-existing trailing components. This still
+    // resolves any symlink in the existing portion of the path.
+    let canonical = match fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => {
+            let p = Path::new(path);
+            match p.parent() {
+                Some(parent) => {
+                    let parent_for_canon = if parent.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        parent
+                    };
+                    match fs::canonicalize(parent_for_canon) {
+                        Ok(canon_parent) => match p.file_name() {
+                            Some(name) => canon_parent.join(name),
+                            // No file name (e.g. trailing `/`) — use the
+                            // canonical parent directly.
+                            None => canon_parent,
+                        },
+                        Err(_) => {
+                            // Parent does not exist either. Reject any
+                            // `..` segment textually as a last resort
+                            // rather than accept an unresolvable path.
+                            if p.components()
+                                .any(|c| matches!(c, std::path::Component::ParentDir))
+                            {
+                                return Err(MethodCallFailed::InternalError(
+                                    VmError::Runtime(RuntimeError::SecurityException {
+                                        message: format!(
+                                            "Path traversal detected: {}",
+                                            path
+                                        ),
+                                    }),
+                                ));
+                            }
+                            // Best-effort resolution against the sandbox
+                            // root so the containment check below is still
+                            // meaningful.
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                sandbox_root.join(p)
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        sandbox_root.join(p)
+                    }
+                }
+            }
+        }
+    };
+
+    // Re-validate: the fully-resolved path must stay inside the sandbox
+    // root. This is the check that catches a symlink whose target escapes
+    // the sandbox, as well as any `..`-based escape that canonicalization
+    // collapsed into a real out-of-sandbox path.
+    if !canonical.starts_with(&sandbox_root) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::SecurityException {
-                message: format!("Path traversal detected: {}", path),
+                message: format!(
+                    "Path traversal detected: {} resolves outside sandbox {}",
+                    path,
+                    sandbox_root.display()
+                ),
             },
         )));
     }
 
-    // Canonicalize the path if it exists on disk; otherwise just return it validated
-    match fs::canonicalize(path) {
-        Ok(canonical) => Ok(canonical.to_string_lossy().into_owned()),
-        Err(_) => {
-            // Path doesn't exist yet (e.g. createNewFile) — that's fine,
-            // we've already rejected ".." and null bytes.
-            Ok(path.to_string())
-        }
-    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 /// Convenience: validate and return path, or an IO-style error.
@@ -164,15 +254,53 @@ fn default_whitespace_regex() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"\s+").unwrap())
 }
 
+/// Bounded LRU cache of compiled delimiter regexes, keyed by pattern string.
+///
+/// `regex::Regex::new` is comparatively expensive; user-supplied Scanner
+/// delimiters tend to repeat (the same `useDelimiter(...)` value is used for
+/// every token). The cache holds the most-recently-used `REGEX_CACHE_CAP`
+/// entries. `regex::Regex` is internally reference-counted, so cloning a
+/// cached entry is cheap and the returned value is behavior-identical to a
+/// freshly compiled regex.
+const REGEX_CACHE_CAP: usize = 32;
+
+fn regex_cache() -> &'static Mutex<Vec<(String, regex::Regex)>> {
+    static CACHE: OnceLock<Mutex<Vec<(String, regex::Regex)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(REGEX_CACHE_CAP)))
+}
+
 /// Small cache for recently-used delimiter regexes.
 fn cached_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     // Fast path: default whitespace delimiter
     if pattern == r"\s+" {
         return Ok(default_whitespace_regex().clone());
     }
-    // For user-supplied patterns, compile on demand.
-    // A production implementation could add an LRU cache here.
-    regex::Regex::new(pattern)
+    // Cache lookup for repeated user-supplied delimiters.
+    {
+        let mut cache = regex_cache().lock();
+        if let Some(pos) = cache.iter().position(|(p, _)| p == pattern) {
+            // Move the hit to the back to mark it most-recently-used.
+            let entry = cache.remove(pos);
+            let re = entry.1.clone();
+            cache.push(entry);
+            return Ok(re);
+        }
+    }
+    // Miss: compile (outside the lock to avoid holding it during the
+    // potentially slow `Regex::new`), then insert with LRU eviction.
+    let re = regex::Regex::new(pattern)?;
+    {
+        let mut cache = regex_cache().lock();
+        // Another thread may have inserted the same pattern meanwhile;
+        // only insert if still absent so we don't grow with duplicates.
+        if !cache.iter().any(|(p, _)| p == pattern) {
+            if cache.len() >= REGEX_CACHE_CAP {
+                cache.remove(0); // evict least-recently-used
+            }
+            cache.push((pattern.to_string(), re.clone()));
+        }
+    }
+    Ok(re)
 }
 
 /// Get a compiled regex for the given delimiter pattern, falling back to
@@ -248,6 +376,33 @@ fn file_not_found(path: &str) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::FileNotFoundException {
         path: path.to_string(),
     }))
+}
+
+/// Validate caller-supplied `(off, len)` against a byte array of length
+/// `arr_len`, matching the JDK's `Objects.checkFromIndexSize` contract
+/// used by `FileInputStream`/`FileOutputStream`/`RandomAccessFile`.
+///
+/// Returns `Err(IndexOutOfBoundsException)` if `off` or `len` is negative
+/// or if `off + len` exceeds `arr_len`. Uses checked arithmetic so a
+/// caller-supplied `off + len` cannot overflow `usize` and wrap past the
+/// bounds check. `off`/`len` are the *raw* Java `int` values.
+fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
+    if off < 0 || len < 0 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { len },
+            },
+        )));
+    }
+    let end = (off as usize).checked_add(len as usize);
+    match end {
+        Some(end) if end <= arr_len => Ok(()),
+        _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: off.saturating_add(len),
+            },
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +668,19 @@ fn native_file_can_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
     let path = validated_path(&path)?;
-    // Simple check: file exists and is readable
-    let ok = fs::metadata(&path).is_ok();
+    // `fs::metadata` succeeding only proves the path exists and is
+    // stat-able — it says nothing about whether *this* process may
+    // read the contents. Perform a real readability probe:
+    //   * For directories, `read_dir` is the analogous "can read".
+    //   * For regular files, opening for reading is the authoritative
+    //     check across platforms (it consults the OS permission model,
+    //     ACLs, mandatory locks, etc.).
+    let p = Path::new(&path);
+    let ok = match fs::metadata(&path) {
+        Ok(m) if m.is_dir() => fs::read_dir(p).is_ok(),
+        Ok(_) => fs::File::open(p).is_ok(),
+        Err(_) => false,
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -645,14 +811,19 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    // Bounds-check caller-supplied off/len against the array before
+    // handing them to the bulk-write intrinsic (mirrors JDK FIS.readBytes).
+    check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Int(-1))),
@@ -726,11 +897,29 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Read and discard `n` bytes
-    let to_skip = n.min(8192) as usize;
-    let mut buf = vec![0u8; to_skip];
-    let skipped = ctx.fd_table().read_bytes(fd, &mut buf).unwrap_or(0);
-    Ok(Some(Value::Long(skipped as i64)))
+    // Read and discard up to `n` bytes. `read_bytes` is not guaranteed
+    // to fill the whole buffer in a single call (and we cap the scratch
+    // buffer at a sane chunk size to bound memory), so loop until `n`
+    // bytes have been skipped or EOF is reached. Return the actual
+    // number of bytes skipped, matching `java.io.FileInputStream.skip`.
+    const CHUNK: usize = 8192;
+    let mut remaining = n as u64;
+    let mut total_skipped: u64 = 0;
+    let mut buf = vec![0u8; CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(CHUNK as u64) as usize;
+        let read = match ctx.fd_table().read_bytes(fd, &mut buf[..want]) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        if read == 0 {
+            // EOF.
+            break;
+        }
+        total_skipped += read as u64;
+        remaining -= read as u64;
+    }
+    Ok(Some(Value::Long(total_skipped as i64)))
 }
 
 fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -865,14 +1054,19 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    // Bounds-check caller-supplied off/len against the array before
+    // handing them to the bulk-read intrinsic (mirrors JDK FOS.writeBytes).
+    check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
@@ -939,14 +1133,19 @@ fn native_fos_write_bytes_ignore_append(ctx: &mut dyn NativeContext, args: &[Val
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    // Bounds-check caller-supplied off/len against the array before
+    // handing them to the bulk-read intrinsic (mirrors JDK FOS.writeBytes).
+    check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
@@ -12606,8 +12805,24 @@ mod io_tests {
     #[test]
     fn path_validation_rejects_dotdot() {
         set_path_validation_enabled(true);
-        let result = validate_path("/etc/../passwd");
+        // A `..` segment that escapes the sandbox (cwd) is rejected.
+        // The canonicalize-first logic resolves `..` against the real
+        // filesystem and the containment check then fails.
+        let result = validate_path("../escapes-sandbox.txt");
         assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains("Path traversal detected"), "err = {err}");
+    }
+
+    /// AUDIT 2026-05-19: a path that resolves (after canonicalization)
+    /// outside the sandbox root is rejected even with no literal `..`
+    /// segment. This is the canonicalize-after-check / symlink-escape
+    /// regression guard.
+    #[test]
+    fn path_validation_rejects_out_of_sandbox_absolute() {
+        set_path_validation_enabled(true);
+        let result = validate_path("/etc/passwd");
+        assert!(result.is_err(), "out-of-sandbox path accepted: {result:?}");
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
     }
@@ -12624,8 +12839,11 @@ mod io_tests {
     #[test]
     fn path_validation_accepts_normal_path() {
         set_path_validation_enabled(true);
-        let result = validate_path("/tmp/test.txt");
-        assert!(result.is_ok());
+        // A plain not-yet-existing file inside the sandbox (cwd) is
+        // accepted: the parent (cwd) canonicalizes and the result stays
+        // within the sandbox root.
+        let result = validate_path("path_validation_normal_test.txt");
+        assert!(result.is_ok(), "rejected in-sandbox path: {result:?}");
     }
 
     #[test]
@@ -12639,10 +12857,11 @@ mod io_tests {
 
     /// AUDIT 2026-05-17: legitimate filenames that contain `..` as a
     /// literal substring (but not as a path segment) must be accepted.
+    /// AUDIT 2026-05-19: must also stay inside the sandbox root.
     #[test]
     fn path_validation_accepts_literal_dotdot_in_filename() {
         set_path_validation_enabled(true);
-        let result = validate_path("/tmp/foo..bar.txt");
+        let result = validate_path("foo..bar.txt");
         assert!(result.is_ok(), "rejected legitimate filename: {result:?}");
     }
 

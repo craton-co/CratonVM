@@ -14213,7 +14213,7 @@ fn native_atomic_int_get_and_increment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let old = ctx.atomic_fetch_add_int(this, 0, 1);
+    let old = ctx.atomic_fetch_add_int(this, 0, 1)?;
     Ok(Some(Value::Int(old)))
 }
 
@@ -14222,7 +14222,7 @@ fn native_atomic_int_get_and_decrement(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let old = ctx.atomic_fetch_add_int(this, 0, -1);
+    let old = ctx.atomic_fetch_add_int(this, 0, -1)?;
     Ok(Some(Value::Int(old)))
 }
 
@@ -14232,7 +14232,7 @@ fn native_atomic_int_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(d)) => *d,
         _ => 0,
     };
-    let old = ctx.atomic_fetch_add_int(this, 0, delta);
+    let old = ctx.atomic_fetch_add_int(this, 0, delta)?;
     Ok(Some(Value::Int(old)))
 }
 
@@ -14241,7 +14241,7 @@ fn native_atomic_int_increment_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let old = ctx.atomic_fetch_add_int(this, 0, 1);
+    let old = ctx.atomic_fetch_add_int(this, 0, 1)?;
     Ok(Some(Value::Int(old.wrapping_add(1))))
 }
 
@@ -14250,7 +14250,7 @@ fn native_atomic_int_decrement_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let old = ctx.atomic_fetch_add_int(this, 0, -1);
+    let old = ctx.atomic_fetch_add_int(this, 0, -1)?;
     Ok(Some(Value::Int(old.wrapping_sub(1))))
 }
 
@@ -14260,7 +14260,7 @@ fn native_atomic_int_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(d)) => *d,
         _ => 0,
     };
-    let old = ctx.atomic_fetch_add_int(this, 0, delta);
+    let old = ctx.atomic_fetch_add_int(this, 0, delta)?;
     Ok(Some(Value::Int(old.wrapping_add(delta))))
 }
 
@@ -14409,7 +14409,7 @@ fn native_atomic_long_get_and_increment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    let old = ctx.atomic_fetch_add_long(this, 0, 1);
+    let old = ctx.atomic_fetch_add_long(this, 0, 1)?;
     Ok(Some(Value::Long(old)))
 }
 
@@ -14418,7 +14418,7 @@ fn native_atomic_long_get_and_decrement(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    let old = ctx.atomic_fetch_add_long(this, 0, -1);
+    let old = ctx.atomic_fetch_add_long(this, 0, -1)?;
     Ok(Some(Value::Long(old)))
 }
 
@@ -14428,7 +14428,7 @@ fn native_atomic_long_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Long(d)) => *d,
         _ => 0,
     };
-    let old = ctx.atomic_fetch_add_long(this, 0, delta);
+    let old = ctx.atomic_fetch_add_long(this, 0, delta)?;
     Ok(Some(Value::Long(old)))
 }
 
@@ -14437,7 +14437,7 @@ fn native_atomic_long_increment_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    let old = ctx.atomic_fetch_add_long(this, 0, 1);
+    let old = ctx.atomic_fetch_add_long(this, 0, 1)?;
     Ok(Some(Value::Long(old.wrapping_add(1))))
 }
 
@@ -14446,7 +14446,7 @@ fn native_atomic_long_decrement_and_get(
     args: &[Value],
 ) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    let old = ctx.atomic_fetch_add_long(this, 0, -1);
+    let old = ctx.atomic_fetch_add_long(this, 0, -1)?;
     Ok(Some(Value::Long(old.wrapping_sub(1))))
 }
 
@@ -14456,7 +14456,7 @@ fn native_atomic_long_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Long(d)) => *d,
         _ => 0,
     };
-    let old = ctx.atomic_fetch_add_long(this, 0, delta);
+    let old = ctx.atomic_fetch_add_long(this, 0, delta)?;
     Ok(Some(Value::Long(old.wrapping_add(delta))))
 }
 
@@ -14953,6 +14953,7 @@ const JAVA_REGEX_UNICODE_CHARACTER_CLASS: i32 = 256;
 /// with `look-around, including look-ahead and look-behind, is not supported`.
 /// Without `fancy-regex` the resulting `IllegalArgumentException` escapes
 /// `<clinit>` and aborts WildFly boot.
+#[derive(Clone)]
 pub(crate) enum JavaRegex {
     Std(regex::Regex),
     Fancy(Box<fancy_regex::Regex>),
@@ -15163,7 +15164,48 @@ fn fancy_splitn(r: &fancy_regex::Regex, text: &str, limit: usize) -> Vec<String>
 
 /// Convert a Java regex pattern string + flags into a `JavaRegex` engine
 /// wrapper. Returns the compiled engine or a PatternSyntaxException error.
+///
+/// Java workloads recompile the same pattern repeatedly — `String.matches`,
+/// `String.split`, `String.replaceAll` each call `Pattern.compile` internally
+/// on every invocation, and regex compilation (especially the `fancy-regex`
+/// fallback) is expensive relative to the match itself. We memoise successful
+/// compilations in a bounded cache keyed by `(pattern, flags)`. Both
+/// `regex::Regex` and `fancy_regex::Regex` are cheap-ish to clone (the `regex`
+/// crate clones share an `Arc` internally), so returning a clone preserves the
+/// existing by-value API while avoiding the recompile. Compile *failures* are
+/// not cached — they are rare and re-deriving the error message is harmless.
 pub(crate) fn compile_java_regex(
+    pattern: &str,
+    flags: i32,
+) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
+    // Bounded cache of compiled regexes. The capacity guard prevents unbounded
+    // growth from programs that generate distinct patterns; when full we drop
+    // the whole map and start over (simple, allocation-free eviction that keeps
+    // the common steady-state — a small fixed working set — fully cached).
+    const REGEX_CACHE_CAP: usize = 512;
+    type RegexCache = std::collections::HashMap<(String, i32), JavaRegex>;
+    static CACHE: OnceLock<Mutex<RegexCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(re) = guard.get(&(pattern.to_string(), flags)) {
+            return Ok(re.clone());
+        }
+    }
+
+    let compiled = compile_java_regex_uncached(pattern, flags)?;
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= REGEX_CACHE_CAP {
+            guard.clear();
+        }
+        guard.insert((pattern.to_string(), flags), compiled.clone());
+    }
+    Ok(compiled)
+}
+
+/// Compile a Java regex without consulting the cache. See `compile_java_regex`.
+fn compile_java_regex_uncached(
     pattern: &str,
     flags: i32,
 ) -> Result<JavaRegex, rustjvm_types::error::RuntimeError> {
@@ -15209,6 +15251,44 @@ pub(crate) fn compile_java_regex(
             message: format!("PatternSyntaxException: {e}"),
         }),
     }
+}
+
+/// Compile an already-translated regex pattern string straight into a
+/// `JavaRegex`, trying the `regex` crate first and falling back to
+/// `fancy-regex`. Unlike `compile_java_regex` this does NOT run
+/// `translate_java_regex` or apply flag prefixes — the input is expected to be
+/// a final pattern (e.g. an anchored `^(?:...)$` variant built from an
+/// already-compiled `JavaRegex::as_str()`).
+///
+/// Results are memoised in a bounded cache; `Matcher.matches` / `lookingAt`
+/// rebuild the same anchored pattern on every call, so caching avoids a
+/// recompile per invocation. Returns `None` if neither engine accepts it.
+pub(crate) fn compile_anchored_cached(full: &str) -> Option<JavaRegex> {
+    const ANCHORED_CACHE_CAP: usize = 512;
+    type AnchoredCache = std::collections::HashMap<String, Option<JavaRegex>>;
+    static CACHE: OnceLock<Mutex<AnchoredCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(re) = guard.get(full) {
+            return re.clone();
+        }
+    }
+
+    let compiled = match regex::Regex::new(full) {
+        Ok(r) => Some(JavaRegex::Std(r)),
+        Err(_) => fancy_regex::Regex::new(full)
+            .ok()
+            .map(|r| JavaRegex::Fancy(Box::new(r))),
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= ANCHORED_CACHE_CAP {
+            guard.clear();
+        }
+        guard.insert(full.to_string(), compiled.clone());
+    }
+    compiled
 }
 
 /// Translate Java regex constructs that aren't directly supported by the Rust
@@ -15659,12 +15739,9 @@ fn native_pattern_matches_static(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let re = compile_java_regex(&pattern_str, 0)?;
     let anchored = format!("^(?:{})$", re.as_str());
-    let matched = match regex::Regex::new(&anchored) {
-        Ok(full) => full.is_match(&input_str),
-        Err(_) => match fancy_regex::Regex::new(&anchored) {
-            Ok(full) => full.is_match(&input_str).unwrap_or(false),
-            Err(_) => re.is_match(&input_str),
-        },
+    let matched = match compile_anchored_cached(&anchored) {
+        Some(full) => full.is_match(&input_str),
+        None => re.is_match(&input_str),
     };
     Ok(Some(Value::Int(if matched { 1 } else { 0 })))
 }
@@ -15854,13 +15931,7 @@ fn native_matcher_matches(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let re = read_pattern_regex(ctx, pat_obj)?;
     // Full match: anchor with ^ and $
     let anchored = format!("^(?:{})$", re.as_str());
-    let full_re = match regex::Regex::new(&anchored) {
-        Ok(r) => JavaRegex::Std(r),
-        Err(_) => match fancy_regex::Regex::new(&anchored) {
-            Ok(r) => JavaRegex::Fancy(Box::new(r)),
-            Err(_) => re,
-        },
-    };
+    let full_re = compile_anchored_cached(&anchored).unwrap_or(re);
     if full_re.is_match(&input) {
         if let Some(m) = full_re.find(&input) {
             ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(m.start as i32));
@@ -16031,10 +16102,7 @@ fn native_matcher_looking_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let re = read_pattern_regex(ctx, pat_obj)?;
     // lookingAt: match at the beginning of the input
     let anchored = format!("^(?:{})", re.as_str());
-    let start_re = match regex::Regex::new(&anchored) {
-        Ok(r) => Some(JavaRegex::Std(r)),
-        Err(_) => fancy_regex::Regex::new(&anchored).ok().map(|r| JavaRegex::Fancy(Box::new(r))),
-    };
+    let start_re = compile_anchored_cached(&anchored);
     if let Some(start_re) = start_re {
         if let Some(m) = start_re.find(&input) {
             ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(0));
