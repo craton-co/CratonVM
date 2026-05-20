@@ -73,7 +73,12 @@ impl Arena {
                 let block_addr = base + block.offset;
                 let aligned_addr = (block_addr + align - 1) & !(align - 1);
                 let padding = aligned_addr - block_addr;
-                let total_needed = padding.checked_add(size)?;
+                // Overflow here means this block can't satisfy the request;
+                // skip it rather than aborting the whole `alloc` (the bump
+                // path below may still succeed).
+                let Some(total_needed) = padding.checked_add(size) else {
+                    continue;
+                };
                 if total_needed <= block.size {
                     // swap_remove keeps this O(1).
                     let block = self.free_list.swap_remove(i);

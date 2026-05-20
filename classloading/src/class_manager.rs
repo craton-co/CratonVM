@@ -171,6 +171,19 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             None => false,
         }
     }
+
+    fn is_resolvable(&self, name: &str) -> bool {
+        // A reference type is "resolvable" for verification purposes when
+        // it is already loaded (present in the store / in-flight) — only
+        // then can `is_subclass` / `is_interface` give a definitive
+        // answer. Array types are always considered resolvable (their
+        // element resolution is handled elsewhere) so array assignability
+        // is not loosened by this hook.
+        if name.starts_with('[') {
+            return true;
+        }
+        self.lookup(name).is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------

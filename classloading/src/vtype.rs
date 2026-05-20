@@ -34,6 +34,25 @@ pub trait ClassHierarchy {
 
     /// Is the named class an interface?
     fn is_interface(&self, name: &str) -> bool;
+
+    /// Is the named class currently resolvable — i.e. already loaded so
+    /// that hierarchy queries about it can return a definitive answer?
+    ///
+    /// The verifier runs at class-define time and only sees classes that
+    /// the bootstrap loader has already pulled in. When a referenced type
+    /// is *not* yet loaded the verifier cannot prove (or disprove) a
+    /// subtype relationship; per JVMS §4.10.1.2 the runtime `checkcast` /
+    /// `invoke*` resolution then enforces the actual type. Callers use
+    /// this hook to stay lenient for genuinely-unresolved reference types
+    /// instead of raising a spurious `VerifyError`.
+    ///
+    /// The default returns `true` ("assume resolvable") so mock
+    /// hierarchies used in unit tests keep their existing strict
+    /// behaviour; the real `ClassStore`-backed implementation reports
+    /// actual load state.
+    fn is_resolvable(&self, _name: &str) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +242,34 @@ impl VType {
                 hierarchy.is_subclass(child, parent)
                     || hierarchy.is_interface(parent)
                     || is_known_jdk_interface(parent)
+                    // Jetty / ByteBuddy fix: the verifier runs at
+                    // class-define time and can only see classes the
+                    // bootstrap loader has already pulled in. A subtype
+                    // relationship between two reference types can only be
+                    // proven once BOTH are loaded — `is_subclass` walks the
+                    // child's superclass/interface chain, and that walk
+                    // needs the child loaded; the interface relaxation
+                    // needs the parent loaded. When EITHER side is not yet
+                    // resolvable the verifier can neither prove the
+                    // relationship nor prove a mismatch. Per JVMS §4.10.1.2
+                    // it then defers to the runtime `checkcast` / `invoke*`
+                    // / `putfield` resolution, which performs the real
+                    // assignability check once the types are loaded.
+                    //
+                    // Rejecting here produced spurious `VerifyError`s on
+                    // real bytecode:
+                    //   * ByteBuddy `ByteBuddy.<init>` — `ElementMatcher$Junction`
+                    //     where the not-yet-loaded interface `ElementMatcher`
+                    //     is declared (unresolved parent);
+                    //   * Jetty `Main.start` — a `new Main$2` (an anonymous
+                    //     `Thread` subclass) passed where `java/lang/Thread`
+                    //     is declared (unresolved child).
+                    //
+                    // `Null` / primitive mismatches are handled by earlier
+                    // arms, so this only loosens reference-vs-reference
+                    // checks where genuine resolution is pending.
+                    || !hierarchy.is_resolvable(parent)
+                    || !hierarchy.is_resolvable(child)
             }
 
             // Array to Object: all arrays are subclasses of java/lang/Object.
