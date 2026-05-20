@@ -1,13 +1,13 @@
 //! TLS 1.3 Handshake Implementation.
 //!
 //! Provides a real TLS 1.3 handshake state machine, record layer, key schedule,
-//! session resumption, OCSP stapling, and alert handling for the RustJVM native layer.
-//! Phase 19.1 of the RustJVM project.
+//! session resumption, OCSP stapling, and alert handling for the CratonVM native layer.
+//! Phase 19.1 of the CratonVM project.
 
 use std::collections::HashMap;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
 use crate::alloc_concurrent_synthetic;
 
 // ===========================================================================
@@ -1142,7 +1142,7 @@ fn tls_engines() -> &'static Mutex<TlsHashMap<usize, Tls13StateMachine>> {
 fn native_ssl_engine_do_handshake(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let addr = match args.first() {
         Some(Value::Object(Some(obj))) => obj.as_ptr() as usize,
         _ => return Ok(Some(Value::Int(0))),
@@ -1175,7 +1175,7 @@ fn native_ssl_engine_do_handshake(
 fn native_ssl_engine_get_handshake_status(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let addr = match args.first() {
         Some(Value::Object(Some(obj))) => obj.as_ptr() as usize,
         _ => return Ok(Some(Value::Int(0))),
@@ -1193,7 +1193,7 @@ fn native_ssl_engine_get_handshake_status(
 fn native_ssl_engine_get_selected_protocol(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let addr = match args.first() {
         Some(Value::Object(Some(obj))) => obj.as_ptr() as usize,
         _ => return Ok(Some(Value::Object(None))),
@@ -1234,7 +1234,7 @@ pub fn is_mti_cipher_suite(s: CipherSuite) -> bool {
 fn native_ssl_engine_get_selected_cipher(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let addr = match args.first() {
         Some(Value::Object(Some(obj))) => obj.as_ptr() as usize,
         _ => return Ok(Some(Value::Object(None))),
@@ -1256,7 +1256,7 @@ fn native_ssl_engine_get_selected_cipher(
 fn native_ssl_context_create_engine(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 3);
     // Register a fresh TLS state machine for this engine
     let addr = obj.as_ptr() as usize;
@@ -1268,7 +1268,7 @@ fn native_ssl_context_create_engine(
 fn native_ssl_context_create_engine_with_host(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 3);
     let addr = obj.as_ptr() as usize;
     let hostname = match args.get(1) {
@@ -1288,7 +1288,7 @@ fn native_ssl_context_create_engine_with_host(
 fn native_http_client_tls_version(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let s = ctx.create_string("TLSv1.3");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2621,7 +2621,7 @@ mod tests {
         // (phases_late is canonical). This is the counterpart to
         // `tls::tls_tests::t19_9_tls_orphan_registrations_removed` but
         // scoped to the tls_impl module to prove it at this layer too.
-        use rustjvm_native_api::NativeMethodRegistry;
+        use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         super::register_tls_impl_natives(&mut r);
         assert!(r.find("javax/net/ssl/SSLContext", "createSSLEngine", "()Ljavax/net/ssl/SSLEngine;").is_none());
@@ -2634,7 +2634,7 @@ mod tests {
         // getSelectedProtocol, getSelectedCipher) must remain registered — these
         // are what Keycloak's ServerConnectionManager calls to drive the
         // handshake forward one record at a time.
-        use rustjvm_native_api::NativeMethodRegistry;
+        use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         super::register_tls_impl_natives(&mut r);
         assert!(r.find("javax/net/ssl/SSLEngine", "doHandshake", "()I").is_some());

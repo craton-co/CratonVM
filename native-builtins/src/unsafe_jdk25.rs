@@ -10,9 +10,9 @@
 //! - `storeStoreFence()V` — release fence
 //! - `copySwapMemory0(...)V` — copy with byte-order swap per element
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{unsafe_obj, unsafe_offset};
 
@@ -194,7 +194,7 @@ mod tests {
         native_unsafe_fence,
         native_unsafe_array_base_offset, native_unsafe_array_index_scale,
     };
-    use rustjvm_types::{ClassId, ObjectRef, Value};
+    use cratonvm_types::{ClassId, ObjectRef, Value};
 
     /// Create a test object with `num_fields` fields pre-filled with Int(0).
     fn make_test_obj(ctx: &mut MockNativeContext, num_fields: usize) -> ObjectRef {
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn p58_charset_coder_includes_new_decoder() {
-        use rustjvm_native_api::NativeMethodRegistry;
+        use cratonvm_native_api::NativeMethodRegistry;
         let mut r = NativeMethodRegistry::new();
         crate::phases_late::register_p58_charset_coder(&mut r);
         let total = r.len();

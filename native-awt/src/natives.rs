@@ -8,9 +8,9 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::edt;
 use crate::edt::InvokeAndWaitError;
@@ -1317,7 +1317,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                 Some(a) => a,
                 None => {
                     let len = needed.max(0).min(i32::MAX as i64) as usize;
-                    ctx.new_array(rustjvm_types::ArrayElementType::Int, len)
+                    ctx.new_array(cratonvm_types::ArrayElementType::Int, len)
                 }
             };
             let arr_len = ctx.array_length(arr) as i64;
@@ -1343,7 +1343,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // `initIDs` natives cache JNI field/method IDs for the real JDK image
-    // classes. RustJVM resolves fields by name, so no IDs need caching —
+    // classes. CratonVM resolves fields by name, so no IDs need caching —
     // register these as no-ops so the real-JDK `<clinit>` of each class can
     // complete (it would otherwise throw UnsatisfiedLinkError).
     for class in [

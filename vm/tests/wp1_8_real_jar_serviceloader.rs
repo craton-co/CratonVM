@@ -33,11 +33,11 @@
 
 use std::io::Write;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp18ServiceLoaderE2E";
+const FIXTURE_CLASS: &str = "cratonvm/Wp18ServiceLoaderE2E";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -46,11 +46,11 @@ fn test_resources_dir() -> String {
 
 fn fixture_class_bytes() -> Option<(Vec<u8>, Vec<u8>)> {
     let outer = format!(
-        "{}/rustjvm/Wp18ServiceLoaderE2E.class",
+        "{}/cratonvm/Wp18ServiceLoaderE2E.class",
         test_resources_dir()
     );
     let inner = format!(
-        "{}/rustjvm/Wp18ServiceLoaderE2E$FakeDriver.class",
+        "{}/cratonvm/Wp18ServiceLoaderE2E$FakeDriver.class",
         test_resources_dir()
     );
     let outer_bytes = std::fs::read(&outer).ok()?;
@@ -84,19 +84,19 @@ fn make_spi_classpath_jar(
     // 1. The SPI descriptor — load-bearing for ServiceLoader discovery.
     zip.start_file("META-INF/services/java.sql.Driver", opts)
         .expect("start META-INF/services/java.sql.Driver");
-    zip.write_all(b"rustjvm.Wp18ServiceLoaderE2E$FakeDriver\n")
+    zip.write_all(b"cratonvm.Wp18ServiceLoaderE2E$FakeDriver\n")
         .expect("write SPI descriptor");
 
     // 2. The fixture's outer class — needed so vm.invoke can resolve
-    //    `rustjvm/Wp18ServiceLoaderE2E` purely from the JAR classpath.
-    zip.start_file("rustjvm/Wp18ServiceLoaderE2E.class", opts)
+    //    `cratonvm/Wp18ServiceLoaderE2E` purely from the JAR classpath.
+    zip.start_file("cratonvm/Wp18ServiceLoaderE2E.class", opts)
         .expect("start outer class");
     zip.write_all(outer_class).expect("write outer class");
 
     // 3. The FakeDriver inner class — needed so the iterator's
-    //    Class.forName("rustjvm.Wp18ServiceLoaderE2E$FakeDriver")
+    //    Class.forName("cratonvm.Wp18ServiceLoaderE2E$FakeDriver")
     //    resolves from JAR bytes.
-    zip.start_file("rustjvm/Wp18ServiceLoaderE2E$FakeDriver.class", opts)
+    zip.start_file("cratonvm/Wp18ServiceLoaderE2E$FakeDriver.class", opts)
         .expect("start inner class");
     zip.write_all(inner_class).expect("write inner class");
 
@@ -211,7 +211,7 @@ fn synthesised_jar_contains_spi_descriptor() {
         .read_to_string(&mut content)
         .expect("read SPI descriptor entry");
     assert!(
-        content.contains("rustjvm.Wp18ServiceLoaderE2E$FakeDriver"),
+        content.contains("cratonvm.Wp18ServiceLoaderE2E$FakeDriver"),
         "SPI descriptor missing FakeDriver FQN, got: {content:?}",
     );
 }

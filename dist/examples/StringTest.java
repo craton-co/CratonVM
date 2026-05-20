@@ -1,6 +1,6 @@
 public class StringTest {
     public static void main(String[] args) {
-        String s = "Hello, RustJVM!";
+        String s = "Hello, CratonVM!";
         System.out.println("Length: " + s.length());
         System.out.println("Upper: " + s.toUpperCase());
         System.out.println("Sub: " + s.substring(0, 5));

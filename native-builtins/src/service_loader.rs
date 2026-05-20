@@ -8,9 +8,9 @@
 //! feature that depends on service-provider lookup (Charset providers,
 //! java.util.spi.* services, etc.).
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use cratonvm_types::Value;
 
 /// `ServiceLoader.load(Class)` — use the thread context class loader.
 fn native_sl_load_class(
@@ -79,7 +79,7 @@ fn build_service_loader(
             let real = ctx.class_num_total_fields(cid);
             ctx.alloc_object(cid, real.max(2))
         }
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     // Synthetic slots: [0]=serviceClass, [1]=loader.
     ctx.set_field(obj, 0, service);
@@ -119,7 +119,7 @@ fn build_service_loader(
 /// from every classpath match); strictly more robust when it doesn't.
 fn discover_providers(
     ctx: &mut dyn NativeContext,
-    sl: rustjvm_types::ObjectRef,
+    sl: cratonvm_types::ObjectRef,
 ) -> Result<Vec<String>, MethodCallFailed> {
     let service_class = match ctx.get_field_by_name(sl, "service") {
         Value::Object(Some(c)) => c,
@@ -173,7 +173,7 @@ fn discover_providers(
     providers.sort();
     providers.dedup();
     if matches!(
-        std::env::var("RUSTJVM_DIAG_SERVICELOADER").as_deref(),
+        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     ) {
         eprintln!(
@@ -238,7 +238,7 @@ fn native_sl_iterator(
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
 
     let diag = matches!(
-        std::env::var("RUSTJVM_DIAG_SERVICELOADER").as_deref(),
+        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     );
     if diag {
@@ -279,7 +279,7 @@ fn native_sl_iterator(
         // newInstance via Class.getDeclaredConstructor() + Constructor.newInstance().
         let empty_types = ctx.new_ref_array(
             ctx.class_id_by_name("java/lang/Class")
-                .unwrap_or(rustjvm_types::ClassId::new(0)),
+                .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
         let ctor = ctx
@@ -309,7 +309,7 @@ fn native_sl_iterator(
         );
         let empty_args = ctx.new_ref_array(
             ctx.class_id_by_name("java/lang/Object")
-                .unwrap_or(rustjvm_types::ClassId::new(0)),
+                .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
         let inst = ctx
@@ -406,7 +406,7 @@ fn native_sl_stream(
         }
     }
     if matches!(
-        std::env::var("RUSTJVM_DIAG_SERVICELOADER").as_deref(),
+        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     ) {
         eprintln!(
@@ -490,9 +490,9 @@ fn native_sl_spliterator(
     let iter = match iter_val {
         Some(Value::Object(Some(o))) => o,
         _ => {
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let cid = ctx.ensure_class_initialized("java/util/Spliterator")
-                .unwrap_or(rustjvm_types::ClassId::new(0));
+                .unwrap_or(cratonvm_types::ClassId::new(0));
             let n = ctx.class_num_total_fields(cid).max(3);
             let obj = ctx.alloc_object(cid, n);
             ctx.set_field(obj, 0, Value::Object(Some(empty)));
@@ -519,12 +519,12 @@ fn native_sl_spliterator(
             break;
         }
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, collected.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, collected.len());
     for (i, v) in collected.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
     let cid = ctx.ensure_class_initialized("java/util/Spliterator")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let n = ctx.class_num_total_fields(cid).max(3);
     let obj = ctx.alloc_object(cid, n);
     ctx.set_field(obj, 0, Value::Object(Some(arr)));
@@ -538,7 +538,7 @@ fn native_sl_spliterator(
 /// Background — the prior `phases_late.rs::register_p69_spliterator`
 /// registration of the same triple is, for reasons specific to this binary
 /// (very large source file, incremental-compile interaction) not making it
-/// into the final `rustjvm.exe`: stress-checking the binary with `grep -ao`
+/// into the final `cratonvm.exe`: stress-checking the binary with `grep -ao`
 /// over the literal string `"[STREAM-SUPPORT-DBG]"` shows it absent, and
 /// runtime traces of `ServiceLoader.load(...).spliterator().stream()
 /// .filter(...)` from Elasticsearch's `CliToolProvider.load` never trigger
@@ -573,7 +573,7 @@ fn native_stream_support_stream_from_spliterator(
     let field0 = ctx.get_field(spliterator, 0);
     let arr = match field0 {
         Value::Object(Some(a))
-            if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+            if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
         _ => return drain_spliterator_to_stream(ctx, spliterator),
     };
     let pos = match ctx.get_field(spliterator, 1) {
@@ -587,13 +587,13 @@ fn native_stream_support_stream_from_spliterator(
     // Snapshot the slice [pos, fence) into a fresh array so the resulting
     // Stream's lifetime is independent of the spliterator's cursor.
     let n = fence.saturating_sub(pos);
-    let snapshot = ctx.new_array(rustjvm_types::ArrayElementType::Reference, n);
+    let snapshot = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
     for i in 0..n {
         let v = ctx.get_array_element(arr, pos + i);
         ctx.set_array_element(snapshot, i, v);
     }
     let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
     ctx.set_field(stream, 0, Value::Object(Some(snapshot)));
@@ -604,12 +604,12 @@ fn alloc_synthetic_stream(
     ctx: &mut dyn NativeContext,
     elems: &[Value],
 ) -> MethodCallResult {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, elems.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
     for (i, v) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *v);
     }
     let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -618,7 +618,7 @@ fn alloc_synthetic_stream(
 
 fn drain_spliterator_to_stream(
     ctx: &mut dyn NativeContext,
-    spliterator: rustjvm_types::ObjectRef,
+    spliterator: cratonvm_types::ObjectRef,
 ) -> MethodCallResult {
     // Best-effort drain via `tryAdvance(Consumer)` — bounded.
     let mut collected: Vec<Value> = Vec::new();

@@ -13,14 +13,14 @@
 //!     synthetic-JDK mode has its own getResources stubs and a
 //!     `java/util/Enumeration$Impl` shape that diverges from the real
 //!     JDK's `Enumeration<URL>` interface dispatch.
-//!   * Therefore the test spawns the freshly-built `rustjvm.exe` as a
+//!   * Therefore the test spawns the freshly-built `cratonvm.exe` as a
 //!     subprocess. Skips when neither the binary nor a JDK 25
 //!     `java-home` is available.
 //!
 //! Reproducer parity:
 //!   1. Build a synthetic `.jar` (via the `zip` crate, no `jar` on PATH
 //!      required) containing **only** an SPI descriptor entry —
-//!      `META-INF/services/rustjvm.foo.svc`.
+//!      `META-INF/services/cratonvm.foo.svc`.
 //!   2. Stage a tiny `EnumLookup` class on a separate dir classpath
 //!      entry whose `main` enumerates the resource via
 //!      `getSystemClassLoader().getResources(...)` and prints
@@ -30,7 +30,7 @@
 //!
 //! Equivalent to the manual reproducer:
 //! ```sh
-//! target/release/rustjvm.exe --java-home "C:/Program Files/Eclipse \
+//! target/release/cratonvm.exe --java-home "C:/Program Files/Eclipse \
 //!     Adoptium/jdk-25.0.2.10-hotspot" \
 //!     -c "<dir>;<jar>" EnumLookup
 //! ```
@@ -39,14 +39,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const RESOURCE_NAME: &str = "META-INF/services/rustjvm.foo.svc";
+const RESOURCE_NAME: &str = "META-INF/services/cratonvm.foo.svc";
 
 /// Path to the freshly-built CLI binary the harness should exercise.
-/// Honors `RUSTJVM_BIN` for callers that want to point at a custom
+/// Honors `CRATONVM_BIN` for callers that want to point at a custom
 /// build; otherwise resolves to the workspace's
-/// `target/release/rustjvm.exe`.
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RUSTJVM_BIN") {
+/// `target/release/cratonvm.exe`.
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CRATONVM_BIN") {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Some(pb);
@@ -54,10 +54,10 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     // vm/Cargo.toml lives at <repo>/vm; binary lands at
-    // <repo>/target/release/rustjvm.exe.
+    // <repo>/target/release/cratonvm.exe.
     let candidate = PathBuf::from(manifest_dir)
         .parent()
-        .map(|p| p.join("target").join("release").join("rustjvm.exe"))?;
+        .map(|p| p.join("target").join("release").join("cratonvm.exe"))?;
     if candidate.exists() {
         Some(candidate)
     } else {
@@ -144,14 +144,14 @@ public class EnumLookup {{
     let opts: SimpleFileOptions = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored);
     zip.start_file(RESOURCE_NAME, opts).ok()?;
-    zip.write_all(b"rustjvm.foo.svc.DummyProvider\n").ok()?;
+    zip.write_all(b"cratonvm.foo.svc.DummyProvider\n").ok()?;
     zip.finish().ok()?;
 
     std::mem::forget(dir);
     Some((fixture_dir, jar_path))
 }
 
-/// Format the classpath the way the rustjvm CLI's `-c` flag expects on
+/// Format the classpath the way the cratonvm CLI's `-c` flag expects on
 /// Windows — semicolon-separated absolute paths.
 fn format_classpath(parts: &[&Path]) -> String {
     parts
@@ -161,19 +161,19 @@ fn format_classpath(parts: &[&Path]) -> String {
         .join(";")
 }
 
-/// RSLF4J.1 acceptance: spawn the freshly-built rustjvm in real-JDK
+/// RSLF4J.1 acceptance: spawn the freshly-built cratonvm in real-JDK
 /// mode, point it at a JAR containing only `META-INF/services/...`,
 /// and assert `getSystemClassLoader().getResources(...)` returns at
 /// least one URL.
 #[test]
 fn system_classloader_get_resources_walks_jar_in_real_jdk_mode() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "Skipping: rustjvm release binary not available at \
-                 target/release/rustjvm.exe (build with `cargo build \
-                 --release -p rustjvm-cli`)"
+                "Skipping: cratonvm release binary not available at \
+                 target/release/cratonvm.exe (build with `cargo build \
+                 --release -p cratonvm-cli`)"
             );
             return;
         }
@@ -199,14 +199,14 @@ fn system_classloader_get_resources_walks_jar_in_real_jdk_mode() {
     let output = Command::new(&bin)
         .args(["--java-home", &java_home, "-c", &cp, "EnumLookup"])
         .output()
-        .expect("must spawn rustjvm.exe");
+        .expect("must spawn cratonvm.exe");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "rustjvm exited non-zero. stdout: {stdout}\nstderr: {stderr}"
+        "cratonvm exited non-zero. stdout: {stdout}\nstderr: {stderr}"
     );
 
     // Parse `total=N` from stdout — the fixture prints it on its own line.

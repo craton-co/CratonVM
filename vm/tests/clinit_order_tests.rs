@@ -4,8 +4,8 @@
 //! diamond dependencies, ExceptionInInitializerError / NoClassDefFoundError,
 //! initialization chains, and constant-field interface init skipping.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -14,7 +14,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!("{dir}/rustjvm/ClinitOrder.class")).exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/ClinitOrder.class")).exists()
 }
 
 fn test_vm() -> Vm {
@@ -45,7 +45,7 @@ fn clinit_super_before_sub() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ClinitOrder",
+        "cratonvm/ClinitOrder",
         "testSuperBeforeSub",
         "()V",
         &[],
@@ -60,7 +60,7 @@ fn clinit_reentrant_noop() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ClinitOrder",
+        "cratonvm/ClinitOrder",
         "testReentrantClinit",
         "()V",
         &[],
@@ -75,7 +75,7 @@ fn clinit_diamond_init() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ClinitOrder",
+        "cratonvm/ClinitOrder",
         "testDiamondInit",
         "()V",
         &[],
@@ -93,7 +93,7 @@ fn clinit_error_marks_unusable() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ClinitOrder",
+        "cratonvm/ClinitOrder",
         "testClinitErrorMarksUnusable",
         "()V",
         &[],
@@ -116,7 +116,7 @@ fn clinit_init_chain() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ClinitOrder",
+        "cratonvm/ClinitOrder",
         "testInitChain",
         "()V",
         &[],
@@ -133,11 +133,11 @@ fn clinit_concurrent_init() {
     require_class_files!();
 
     use std::sync::Arc;
-    use rustjvm_vm::threading::ThreadId;
-    use rustjvm_vm::vm::invoke_shared;
+    use cratonvm_vm::threading::ThreadId;
+    use cratonvm_vm::vm::invoke_shared;
 
     let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
-    let shared = Arc::new(rustjvm_vm::vm::SharedVm::new(config));
+    let shared = Arc::new(cratonvm_vm::vm::SharedVm::new(config));
 
     // Initialize self_arc so the VM is fully functional
     *shared.self_arc.write() = Some(Arc::downgrade(&shared));
@@ -150,24 +150,24 @@ fn clinit_concurrent_init() {
     let b2 = Arc::clone(&barrier);
 
     let t1 = std::thread::spawn(move || {
-        let mut thread = rustjvm_vm::threading::JvmThread::new(ThreadId(1), "thread-1");
+        let mut thread = cratonvm_vm::threading::JvmThread::new(ThreadId(1), "thread-1");
         shared1.thread_registry.register(ThreadId(1), "thread-1", None);
         b1.wait(); // sync start
         let result = invoke_shared(
             &shared1, &mut thread,
-            "rustjvm/ClinitOrder", "testConcurrentInit", "()V", &[],
+            "cratonvm/ClinitOrder", "testConcurrentInit", "()V", &[],
         );
         assert!(result.is_ok(), "thread-1 failed: {result:?}");
         thread.printed.iter().filter_map(|v| v.as_int()).collect::<Vec<_>>()
     });
 
     let t2 = std::thread::spawn(move || {
-        let mut thread = rustjvm_vm::threading::JvmThread::new(ThreadId(2), "thread-2");
+        let mut thread = cratonvm_vm::threading::JvmThread::new(ThreadId(2), "thread-2");
         shared2.thread_registry.register(ThreadId(2), "thread-2", None);
         b2.wait(); // sync start
         let result = invoke_shared(
             &shared2, &mut thread,
-            "rustjvm/ClinitOrder", "testConcurrentInit", "()V", &[],
+            "cratonvm/ClinitOrder", "testConcurrentInit", "()V", &[],
         );
         assert!(result.is_ok(), "thread-2 failed: {result:?}");
         thread.printed.iter().filter_map(|v| v.as_int()).collect::<Vec<_>>()
@@ -196,7 +196,7 @@ fn clinit_constant_field_skips_init() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ClinitOrder",
+        "cratonvm/ClinitOrder",
         "testConstantFieldSkipsInit",
         "()V",
         &[],

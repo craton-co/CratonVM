@@ -6,11 +6,11 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use rustjvm_native_api::{
+use cratonvm_native_api::{
     AnnotationData, FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
 };
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 #[cfg(target_os = "windows")]
 extern "system" {
@@ -102,7 +102,7 @@ pub(crate) struct MockNativeContext {
     native_allocs: UnsafeCell<HashMap<i64, (*mut u8, std::alloc::Layout)>>,
     next_alloc_id: UnsafeCell<i64>,
     /// Upcall table for Panama tests
-    upcall_entries: UnsafeCell<Vec<rustjvm_native_api::ffi::UpcallEntry>>,
+    upcall_entries: UnsafeCell<Vec<cratonvm_native_api::ffi::UpcallEntry>>,
     /// invoke_virtual callback result (set by test to control upcall behavior)
     pub(crate) invoke_virtual_result: UnsafeCell<Option<MethodCallResult>>,
     /// NEW-8: tracks class IDs that have been marked as hidden via
@@ -191,7 +191,7 @@ pub(crate) struct MockNativeContext {
     /// tests to assert exactly which `nest_host_class_name` reached the
     /// backend.
     pub(crate) last_define_full_opts:
-        UnsafeCell<Option<rustjvm_native_api::DefineClassFull>>,
+        UnsafeCell<Option<cratonvm_native_api::DefineClassFull>>,
     /// CGLIB-η: snapshot of the most recent `define_class_full` call's
     /// `loader_id` argument, so loader-inheritance tests can assert the
     /// new class lands in the lookup class's loader namespace rather
@@ -281,7 +281,7 @@ impl MockNativeContext {
     #[allow(dead_code)]
     pub(crate) fn last_define_full_opts(
         &self,
-    ) -> Option<rustjvm_native_api::DefineClassFull> {
+    ) -> Option<cratonvm_native_api::DefineClassFull> {
         // SAFETY: single-threaded test code.
         unsafe { (*self.last_define_full_opts.get()).clone() }
     }
@@ -945,12 +945,12 @@ impl NativeContext for MockNativeContext {
         })
     }
 
-    fn fd_table(&self) -> &rustjvm_native_api::fd_table::FileDescriptorTable {
+    fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
         // Leak a static table for testing — tests won't actually use file I/O
         use std::sync::OnceLock;
-        static FD_TABLE: OnceLock<rustjvm_native_api::fd_table::FileDescriptorTable> =
+        static FD_TABLE: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> =
             OnceLock::new();
-        FD_TABLE.get_or_init(rustjvm_native_api::fd_table::FileDescriptorTable::new)
+        FD_TABLE.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
     }
 
     // -- WP0.2 ObjectStreamClass cache overrides --
@@ -1101,7 +1101,7 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn register_upcall(&mut self, entry: rustjvm_native_api::ffi::UpcallEntry) -> usize {
+    fn register_upcall(&mut self, entry: cratonvm_native_api::ffi::UpcallEntry) -> usize {
         let entries = unsafe { &mut *self.upcall_entries.get() };
         let slot = entries.len();
         entries.push(entry);
@@ -1183,7 +1183,7 @@ impl NativeContext for MockNativeContext {
         name: &str,
         bytes: &[u8],
         loader_id: u32,
-        opts: rustjvm_native_api::DefineClassFull,
+        opts: cratonvm_native_api::DefineClassFull,
     ) -> Result<ClassId, String> {
         // SAFETY: single-threaded test code.
         unsafe {
@@ -1265,11 +1265,11 @@ impl NativeContext for MockNativeContext {
 
     fn force_gc(&mut self) {}
 
-    fn method_parameter_annotations(&self, _: ClassId, _: &str, _: &str) -> Vec<Vec<rustjvm_native_api::AnnotationData>> {
+    fn method_parameter_annotations(&self, _: ClassId, _: &str, _: &str) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
         Vec::new()
     }
 
-    fn method_annotation_default(&self, _: ClassId, _: &str, _: &str) -> Option<rustjvm_native_api::AnnotationElementValue> {
+    fn method_annotation_default(&self, _: ClassId, _: &str, _: &str) -> Option<cratonvm_native_api::AnnotationElementValue> {
         None
     }
 
@@ -1297,6 +1297,40 @@ impl NativeContext for MockNativeContext {
     fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
         let overrides = unsafe { &*self.code_source_certs_override.get() };
         overrides.get(&class_id.as_u32()).cloned().unwrap_or_default()
+    }
+
+    fn is_package_exported_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
+        true
+    }
+
+    fn is_package_exported_to(
+        &self,
+        _module_name: &str,
+        _pkg: &str,
+        _to_module: &str,
+    ) -> bool {
+        true
+    }
+
+    fn is_package_open_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
+        true
+    }
+
+    fn is_package_open_to(
+        &self,
+        _module_name: &str,
+        _pkg: &str,
+        _to_module: &str,
+    ) -> bool {
+        true
+    }
+
+    fn check_deep_reflection_access(
+        &self,
+        _accessor_class_id: ClassId,
+        _target_class_id: ClassId,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 

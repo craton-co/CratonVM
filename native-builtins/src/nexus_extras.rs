@@ -37,15 +37,15 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
-/// Diagnostic gate — `RUSTJVM_NEXUS_REAL=1` skips shim registration so
+/// Diagnostic gate — `CRATONVM_NEXUS_REAL=1` skips shim registration so
 /// the real bytecode runs under CratonVM (used to measure how far the
 /// partial bootstrap can drive Karaf/Felix OSGi initialization).
 fn nexus_real_mode() -> bool {
-    std::env::var("RUSTJVM_NEXUS_REAL")
+    std::env::var("CRATONVM_NEXUS_REAL")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
@@ -76,7 +76,7 @@ fn nexus_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 pub fn register_nexus_stubs(registry: &mut NativeMethodRegistry) {
     if nexus_real_mode() {
         tracing::warn!(
-            "[nexus-shim] RUSTJVM_NEXUS_REAL=1 — shim DISABLED, running real bytecode"
+            "[nexus-shim] CRATONVM_NEXUS_REAL=1 — shim DISABLED, running real bytecode"
         );
         return;
     }

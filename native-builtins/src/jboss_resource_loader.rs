@@ -21,9 +21,9 @@
 
 use std::path::Path;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use cratonvm_types::Value;
 
 /// Static method signature:
 /// ```text
@@ -159,7 +159,7 @@ fn path_from_string(
     // Paths.get(String, String...) — pass empty String[] for varargs.
     let empty = ctx.new_ref_array(
         ctx.class_id_by_name("java/lang/String")
-            .unwrap_or(rustjvm_types::ClassId::new(0)),
+            .unwrap_or(cratonvm_types::ClassId::new(0)),
         0,
     );
     let v = ctx.invoke(

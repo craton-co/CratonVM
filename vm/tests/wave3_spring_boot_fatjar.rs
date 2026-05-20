@@ -43,8 +43,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::SharedVm;
 
 fn shared() -> Arc<SharedVm> {
     Arc::new(SharedVm::new(VmConfig::default()))
@@ -114,15 +114,15 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = workspace_root().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -148,7 +148,7 @@ fn java_home() -> Option<PathBuf> {
 
 fn fat_jar_path() -> Option<PathBuf> {
     // Honour an explicit override first.
-    if let Ok(p) = std::env::var("RUSTJVM_SPRING_BOOT_FATJAR") {
+    if let Ok(p) = std::env::var("CRATONVM_SPRING_BOOT_FATJAR") {
         let p = PathBuf::from(&p);
         if p.exists() {
             return Some(p);
@@ -163,7 +163,7 @@ fn fat_jar_path() -> Option<PathBuf> {
 }
 
 fn run_fat_jar(timeout: Duration) -> Option<(String, String, Option<i32>)> {
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let jh = java_home()?;
     let jar = fat_jar_path()?;
 
@@ -217,7 +217,7 @@ fn spring_boot_fatjar_launcher_bypasses_archive_npe() {
     let Some((stdout, stderr, _code)) = run_fat_jar(Duration::from_secs(45)) else {
         eprintln!(
             "wave3_spring_boot_fatjar: fat-jar fixture missing; skipping. \
-             Set RUSTJVM_SPRING_BOOT_FATJAR or copy a Spring Boot 3.2 \
+             Set CRATONVM_SPRING_BOOT_FATJAR or copy a Spring Boot 3.2 \
              executable jar to C:/Users/Admin/AppData/Local/Temp/\
              insurance-backend.jar to enable the run-time pin."
         );

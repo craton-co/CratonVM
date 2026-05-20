@@ -78,9 +78,9 @@
 //!   trigger arbitrary-code-execution.
 
 use crate::alloc_concurrent_synthetic;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::cell::RefCell;
 
 /// Internal name of `java.lang.Object`.
@@ -332,7 +332,7 @@ fn alloc_array_list_from(
     elements: &[ObjectRef],
 ) -> ObjectRef {
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let backing = ctx.new_ref_array(rustjvm_types::ClassId::new(0), elements.len());
+    let backing = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
     for (i, &el) in elements.iter().enumerate() {
         ctx.set_array_element(backing, i, Value::Object(Some(el)));
     }
@@ -416,7 +416,7 @@ fn native_introspector_get_methods(
     let mut seen: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
-    let mut work: Vec<rustjvm_types::ClassId> = vec![cid];
+    let mut work: Vec<cratonvm_types::ClassId> = vec![cid];
     while let Some(current) = work.pop() {
         if !visited_classes.insert(current.as_u32()) {
             continue;
@@ -494,14 +494,14 @@ pub(crate) fn build_method_mirror(
     modifiers: u16,
 ) -> ObjectRef {
     // SPB.11: Delegate to the canonical `create_method_object` so that the
-    // RustJVM extra metadata slots (raw descriptor, parameter count,
+    // CratonVM extra metadata slots (raw descriptor, parameter count,
     // accessible flag) are populated. Without those, `Method.invoke`
     // reads `param_descs.len() == 0` from a missing descriptor and throws
     // "wrong number of arguments". `create_method_object` also populates
     // `exceptionTypes`, annotation byte arrays, and other JDK-named
     // fields the reflective code relies on.
     if let Some(declaring_class_id) = crate::lang_class::mirror_class_id(ctx, declaring_class_mirror) {
-        let meta = rustjvm_native_api::registry::MethodMetadata {
+        let meta = cratonvm_native_api::registry::MethodMetadata {
             name: name.to_string(),
             descriptor: descriptor.to_string(),
             access_flags: modifiers,
@@ -519,7 +519,7 @@ pub(crate) fn build_method_mirror(
     ctx.set_field_by_name(method_obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(method_obj, "modifiers", Value::Int(modifiers as i32));
     let (params, ret) = parse_method_descriptor(descriptor);
-    let param_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), params.len());
+    let param_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), params.len());
     for (i, p) in params.iter().enumerate() {
         let m = type_descriptor_to_class_mirror(ctx, p);
         ctx.set_array_element(param_arr, i, Value::Object(Some(m)));
@@ -641,7 +641,7 @@ fn type_descriptor_to_class_mirror(
                         Ok(cid) => ctx.get_class_mirror(cid),
                         Err(_) => {
                             // Last-resort placeholder.
-                            ctx.alloc_object(rustjvm_types::ClassId::new(0), 0)
+                            ctx.alloc_object(cratonvm_types::ClassId::new(0), 0)
                         }
                     }
                 }
@@ -654,13 +654,13 @@ fn type_descriptor_to_class_mirror(
                 Ok(cid) => ctx.get_class_mirror(cid),
                 Err(_) => match ctx.ensure_class_initialized(OBJECT_INTERNAL) {
                     Ok(cid) => ctx.get_class_mirror(cid),
-                    Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 0),
+                    Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 0),
                 },
             }
         }
         _ => match ctx.ensure_class_initialized(OBJECT_INTERNAL) {
             Ok(cid) => ctx.get_class_mirror(cid),
-            Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 0),
+            Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 0),
         },
     }
 }
@@ -715,7 +715,7 @@ fn native_converting_method_from(
     // Field 2: paramMappings — empty MXBeanMapping[].
     let mapping_class_id = ctx
         .ensure_class_initialized("com/sun/jmx/mbeanserver/MXBeanMapping")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let empty_params = ctx.new_ref_array(mapping_class_id, 0);
     ctx.set_field(cvt, 2, Value::Object(Some(empty_params)));
     // Field 3: paramConversionIsIdentity = true
@@ -739,7 +739,7 @@ fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(m, 1, Value::Object(Some(st)));
     let string_cid = ctx
         .ensure_class_initialized("java/lang/String")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let string_mirror = ctx.get_class_mirror(string_cid);
     ctx.set_field(m, 2, Value::Object(Some(string_mirror)));
     m
@@ -1256,8 +1256,8 @@ fn alloc_mapped_mxbean_type(
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::NativeMethodRegistry;
-    use rustjvm_types::Value;
+    use cratonvm_native_api::NativeMethodRegistry;
+    use cratonvm_types::Value;
 
     #[test]
     fn test_register_natives_count() {

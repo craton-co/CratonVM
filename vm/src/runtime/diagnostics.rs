@@ -251,7 +251,7 @@ pub fn check_health(summary: &DiagnosticSummary, heap_usage_percent: f64, live_t
 ///     exit caused by accumulated swallows.
 ///   - Emits a `tracing::warn!` with the site, category, and detail so users
 ///     setting `RUST_LOG=warn` or above see why something failed.
-///   - Honors `RUSTJVM_STRICT_SWALLOWS=1` — when set, escalates the swallow
+///   - Honors `CRATONVM_STRICT_SWALLOWS=1` — when set, escalates the swallow
 ///     to a panic so the culprit is impossible to miss during debugging.
 pub fn record_swallow(
     shared: &crate::vm::SharedVm,
@@ -270,7 +270,7 @@ pub fn record_swallow(
     );
     if crate::runtime::env_cache::strict_swallows() {
         panic!(
-            "RUSTJVM_STRICT_SWALLOWS=1: swallow at {site} [{category}]: {detail}"
+            "CRATONVM_STRICT_SWALLOWS=1: swallow at {site} [{category}]: {detail}"
         );
     }
 }

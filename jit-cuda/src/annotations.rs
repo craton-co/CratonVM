@@ -11,7 +11,7 @@
 //!   dispatch with an optional warmup count.
 //!
 //! The reader walks the already-decoded
-//! [`rustjvm_reader::attribute::Attribute::RuntimeInvisibleAnnotations`]
+//! [`cratonvm_reader::attribute::Attribute::RuntimeInvisibleAnnotations`]
 //! / `RuntimeVisibleAnnotations` slices — the class reader has already
 //! split the JVMS §4.7.16 byte stream into structured `Annotation` +
 //! `ElementValue` values, so this layer does no raw-byte parsing.
@@ -20,8 +20,8 @@
 //! default value" (per §2.1). Unknown annotation descriptors are
 //! silently ignored.
 
-use rustjvm_reader::attribute::{Annotation, Attribute, ElementValue};
-use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use cratonvm_reader::attribute::{Annotation, Attribute, ElementValue};
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 // ---------------------------------------------------------------------
 // Public leaf enums
@@ -358,7 +358,7 @@ fn parse_enable_gpu_async(ann: &Annotation, cp: &ConstantPool) -> EnableAsyncAtt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_reader::attribute::ElementValuePair;
+    use cratonvm_reader::attribute::ElementValuePair;
 
     /// Tiny builder that hands out fresh constant-pool indices and
     /// produces a `ConstantPool` at the end. Tests use this instead of

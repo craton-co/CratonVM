@@ -21,7 +21,7 @@
 use crate::analyzer::ParamKind;
 use crate::emitter::{LoweringError, PtxKernel, PtxModule, PtxParam, PtxParamKind, RegDecl, RegKind};
 use crate::signature::KernelSignature;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::method::ClassFileMethod;
 
 mod emit;
 mod loop_recog;
@@ -700,6 +700,7 @@ mod tests {
             ],
             return_kind: ParamKind::Void,
             estimated_work: 1 << 20,
+            this_field_cps: Vec::new(),
             needs_d2h_sync: false,
         };
         let err = lower_method("EligibleVectorAdd", &method, &bad_sig, 7, 5)
@@ -746,6 +747,7 @@ mod tests {
             ],
             return_kind: ParamKind::Void,
             estimated_work: 1 << 20,
+            this_field_cps: Vec::new(),
             needs_d2h_sync: false,
         };
         let err = lower_method("EligibleSaxpy", &method, &bad_sig, 7, 5)

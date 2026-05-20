@@ -2,7 +2,7 @@
 # bench/wave2-3/stage-bytebuddy-probe.sh
 # WP2.3-D — stage the ByteBuddy acceptance probes (real DSL +
 # legacy synthetic placeholder) for end-to-end execution under
-# rust-jvm. Mirrors the shape of bench/wildfly/stage-ejbca-min.sh.
+# cratonvm. Mirrors the shape of bench/wildfly/stage-ejbca-min.sh.
 #
 # Behaviour mirrors stage-cglib-probe.sh:
 #   * Locate byte-buddy-X.Y.Z.jar from local maven repo, vendor lib,

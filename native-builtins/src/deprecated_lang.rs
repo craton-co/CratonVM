@@ -11,11 +11,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{
     LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
 };
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 

@@ -5,7 +5,7 @@
 //!
 //! # Round 7 audit fix (LOW #13): `ClassFile` parse is parallelizable
 //!
-//! `rustjvm_reader::read_class` is pure and stateless — it takes a
+//! `cratonvm_reader::read_class` is pure and stateless — it takes a
 //! `&[u8]` and returns a fully-owned `ClassFile`. The cold-start JDK
 //! bootstrap parses ~6 000 classes serially and `read_class` is
 //! ~40-60 µs per class on a modern x86 core, so the serial cost adds
@@ -22,14 +22,14 @@
 //!
 //! **TODO:** if `rayon` becomes a workspace dep for another reason,
 //! revisit: add `pub fn parallel_parse(inputs: &[(Arc<str>, &[u8])])
-//! -> Vec<Result<ClassFile, ClassFileError>>` in `rustjvm_reader`
+//! -> Vec<Result<ClassFile, ClassFileError>>` in `cratonvm_reader`
 //! and call it from the bootstrap-scan path in `class_manager`.
 //!
 //! # Round 7 audit fix (LOW #14): JFR `StringPool` vs `intern_arc` are intentionally distinct
 //!
-//! `rustjvm_jfr::dump::StringPool` assigns `u16` IDs for the JFR
+//! `cratonvm_jfr::dump::StringPool` assigns `u16` IDs for the JFR
 //! binary wire format (one ID per unique string per JFR chunk; the
-//! pool resets between chunks). `rustjvm_types::intern_arc` returns
+//! pool resets between chunks). `cratonvm_types::intern_arc` returns
 //! a process-lifetime `Arc<str>` for runtime sharing across the
 //! VM. Different lifetimes (chunk-scoped vs process-scoped),
 //! different keying (`u16` wire ID vs identity-by-arc), different
@@ -44,7 +44,7 @@ use std::sync::Arc;
 use crate::fx_hash::{fx_hashmap_with_capacity, FxHashMap};
 
 use super::ClassId;
-use rustjvm_types::Value;
+use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
 // Resolved field / method references
@@ -414,7 +414,7 @@ impl ResolutionCache {
     }
 
     /// Scan cached CONSTANT_Dynamic values for GC roots.
-    pub fn scan_condy_roots(&self, roots: &mut Vec<rustjvm_types::ObjectRef>) {
+    pub fn scan_condy_roots(&self, roots: &mut Vec<cratonvm_types::ObjectRef>) {
         for val in self.condy.values() {
             if let Value::Object(Some(obj_ref)) = val {
                 roots.push(*obj_ref);
@@ -429,7 +429,7 @@ impl ResolutionCache {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
                     debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { rustjvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
         }
@@ -524,7 +524,7 @@ impl Default for ResolutionCache {
 pub enum ResolvedMember {
     /// A method was found at `declaring_class_id`, position `index`
     /// inside its `methods` vec. Callers re-fetch the
-    /// [`rustjvm_reader::ClassFileMethod`] via the class store so the
+    /// [`cratonvm_reader::ClassFileMethod`] via the class store so the
     /// cache stays small (no full snapshot).
     Method {
         declaring_class_id: ClassId,
@@ -772,8 +772,8 @@ impl LinkResolver {
                 None => ResolvedMember::NotFound,
             };
             (
-                rustjvm_types::intern_arc(name),
-                rustjvm_types::intern_arc(descriptor),
+                cratonvm_types::intern_arc(name),
+                cratonvm_types::intern_arc(descriptor),
                 resolved,
             )
         })
@@ -798,14 +798,14 @@ impl LinkResolver {
                     declaring_class_id: declaring,
                     absolute_index: field_index as u32,
                     is_static: field.access_flags.contains(
-                        rustjvm_reader::class_access_flags::FieldAccessFlags::STATIC,
+                        cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC,
                     ),
                 },
                 None => ResolvedMember::NotFound,
             };
             (
-                rustjvm_types::intern_arc(name),
-                rustjvm_types::intern_arc(""),
+                cratonvm_types::intern_arc(name),
+                cratonvm_types::intern_arc(""),
                 resolved,
             )
         })
@@ -868,10 +868,10 @@ impl std::fmt::Debug for LinkResolver {
 // Invoke cache — stores everything needed to create a Frame directly
 // ---------------------------------------------------------------------------
 
-use rustjvm_native_api::NativeCallback;
+use cratonvm_native_api::NativeCallback;
 
 // Re-export from jit-api crate — the canonical definition lives there now.
-pub use rustjvm_jit_api::CachedBytecodeMethod;
+pub use cratonvm_jit_api::CachedBytecodeMethod;
 
 /// WP2.4-F1 — JEP 109 redefinition staleness gate for an invoke-cache entry.
 ///
@@ -979,7 +979,7 @@ pub enum CachedInvokeTarget {
     },
     /// JIT-compiled method: call native code directly, no frame push needed.
     Jit {
-        compiled: Arc<rustjvm_jit::CompiledMethod>,
+        compiled: Arc<cratonvm_jit::CompiledMethod>,
         num_params: u16,
         return_type: u8, // b'I', b'J', b'V'
         needs_heap: bool,

@@ -48,7 +48,7 @@ jobs:
   # Stage 0 — build the JVM once, share the binary across all smokes
   # ---------------------------------------------------------------
   build:
-    name: Build rustjvm.exe (release)
+    name: Build cratonvm.exe (release)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -63,13 +63,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo build --release
-        run: cargo build --release -p rustjvm-cli
+        run: cargo build --release -p cratonvm-cli
 
-      - name: Archive rustjvm binary
+      - name: Archive cratonvm binary
         uses: actions/upload-artifact@v4
         with:
-          name: rustjvm-binary
-          path: target/release/rustjvm
+          name: cratonvm-binary
+          path: target/release/cratonvm
           retention-days: 7
           if-no-files-found: error
 
@@ -147,15 +147,15 @@ jobs:
           distribution: 'oracle'
           java-version: '25'
 
-      - name: Download rustjvm binary
+      - name: Download cratonvm binary
         uses: actions/download-artifact@v4
         with:
-          name: rustjvm-binary
+          name: cratonvm-binary
           path: target/release
 
       - name: Make runner executable
         run: |
-          chmod +x target/release/rustjvm
+          chmod +x target/release/cratonvm
           chmod +x ${{ matrix.runner }}
 
       # Per-item fixture cache — each runner drops its fixtures into
@@ -168,7 +168,7 @@ jobs:
 
       - name: Run ${{ matrix.item }} reproducer
         env:
-          RUSTJVM: ${{ github.workspace }}/target/release/rustjvm
+          CRATONVM: ${{ github.workspace }}/target/release/cratonvm
           FIXTURE_CACHE: ${{ github.workspace }}/.smoke-cache/${{ matrix.item }}
           JAVA_HOME_FOR_SMOKE: ${{ env.JAVA_HOME }}
         run: ${{ matrix.runner }} 2>&1 | tee smoke-stdout.log

@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env bash
 # bench/kafka/diff-baseline.sh
-# WP8.7 — compare the last rust-jvm run for kafka against bench-baseline.json.
+# WP8.7 — compare the last cratonvm run for kafka against bench-baseline.json.
 # Schema-v1 contract identical to bench/wildfly/diff-baseline.sh.
 set -euo pipefail
 
@@ -16,7 +16,7 @@ if [[ ! -f "$BASELINE" ]]; then
 fi
 for f in "$STDOUT_LOG" "$STDERR_LOG" "$RC_FILE"; do
     if [[ ! -f "$f" ]]; then
-        echo "diff-baseline(kafka): ERROR $f missing; run run-under-rustjvm.sh first" >&2
+        echo "diff-baseline(kafka): ERROR $f missing; run run-under-cratonvm.sh first" >&2
         exit 2
     fi
 done

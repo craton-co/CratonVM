@@ -188,7 +188,7 @@ pub fn align_up(offset: usize, align: usize) -> usize {
 // Upcall table — maps trampoline indices to Java callback info
 // ---------------------------------------------------------------------------
 
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ObjectRef;
 
 /// Entry in the upcall table — describes a Java callback for C to call.
 pub struct UpcallEntry {

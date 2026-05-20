@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
 
-use rustjvm_types::{ClassId, ObjectRef, ArrayElementType, ObjectKind};
+use cratonvm_types::{ClassId, ObjectRef, ArrayElementType, ObjectKind};
 
 use crate::runtime::serviceability::HprofWriter;
 use crate::vm::SharedVm;
@@ -364,7 +364,7 @@ impl<'a> HprofDumper<'a> {
                 let val = static_vals
                     .and_then(|v| v.get(i))
                     .cloned()
-                    .unwrap_or(rustjvm_types::Value::Int(0));
+                    .unwrap_or(cratonvm_types::Value::Int(0));
                 write_value_for_type(seg, htype, &val);
             }
 
@@ -393,9 +393,9 @@ impl<'a> HprofDumper<'a> {
         seg.push_u64(class_obj_id_for(class_id));    // array class object ID
 
         for i in 0..length {
-            let val = self.vm.heap.get_array_element(obj, i).unwrap_or(rustjvm_types::Value::Object(None));
+            let val = self.vm.heap.get_array_element(obj, i).unwrap_or(cratonvm_types::Value::Object(None));
             match val {
-                rustjvm_types::Value::Object(Some(r)) => seg.push_u64(r.as_ptr() as u64),
+                cratonvm_types::Value::Object(Some(r)) => seg.push_u64(r.as_ptr() as u64),
                 _ => seg.push_u64(0),
             }
         }
@@ -417,7 +417,7 @@ impl<'a> HprofDumper<'a> {
 
         for i in 0..length {
             let val = self.vm.heap.get_array_element(obj, i)
-                .unwrap_or(rustjvm_types::Value::Int(0));
+                .unwrap_or(cratonvm_types::Value::Int(0));
             match elem_type {
                 ArrayElementType::Boolean | ArrayElementType::Byte => {
                     seg.push_u8(val.as_int().unwrap_or(0) as u8);
@@ -550,7 +550,7 @@ fn hprof_type_size(t: u8) -> usize {
 }
 
 /// Write a Value to the segment according to the HPROF type.
-fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &rustjvm_types::Value) {
+fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &cratonvm_types::Value) {
     match htype {
         HPROF_BOOLEAN | HPROF_BYTE => {
             seg.push_u8(val.as_int().unwrap_or(0) as u8);
@@ -583,7 +583,7 @@ fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &rustjvm_types
 /// Compute total instance byte size for a class (all inherited + own fields).
 /// This is the sum of hprof_type_size for each instance field walking up
 /// the hierarchy.
-fn compute_instance_byte_size(class_id: ClassId, store: &rustjvm_classloading::ClassStore) -> usize {
+fn compute_instance_byte_size(class_id: ClassId, store: &cratonvm_classloading::ClassStore) -> usize {
     let chain = class_hierarchy_chain(class_id, store);
     let mut size = 0usize;
     for cid in &chain {
@@ -599,7 +599,7 @@ fn compute_instance_byte_size(class_id: ClassId, store: &rustjvm_classloading::C
 }
 
 /// Build class hierarchy chain from leaf class up to java/lang/Object, then reverse.
-fn class_hierarchy_chain(class_id: ClassId, store: &rustjvm_classloading::ClassStore) -> Vec<ClassId> {
+fn class_hierarchy_chain(class_id: ClassId, store: &cratonvm_classloading::ClassStore) -> Vec<ClassId> {
     let mut chain = Vec::new();
     let mut current = Some(class_id);
     while let Some(cid) = current {
@@ -638,7 +638,7 @@ impl<'a> HprofDumper<'a> {
                     let val = if slot_idx < num_fields {
                         self.vm.heap.get_field(obj, slot_idx)
                     } else {
-                        rustjvm_types::Value::Int(0)
+                        cratonvm_types::Value::Int(0)
                     };
                     write_value_to_vec(&mut field_data, htype, &val);
                     slot_idx += 1;
@@ -656,7 +656,7 @@ impl<'a> HprofDumper<'a> {
 }
 
 /// Write a value to a Vec<u8> according to the HPROF type.
-fn write_value_to_vec(buf: &mut Vec<u8>, htype: u8, val: &rustjvm_types::Value) {
+fn write_value_to_vec(buf: &mut Vec<u8>, htype: u8, val: &cratonvm_types::Value) {
     match htype {
         HPROF_BOOLEAN | HPROF_BYTE => {
             buf.push(val.as_int().unwrap_or(0) as u8);
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_int() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_INT, &rustjvm_types::Value::Int(0x12345678));
+        write_value_for_type(&mut seg, HPROF_INT, &cratonvm_types::Value::Int(0x12345678));
         assert_eq!(seg.len(), 4);
         assert_eq!(&seg.buf, &0x12345678u32.to_be_bytes());
     }
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_long() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_LONG, &rustjvm_types::Value::Long(123456789012345));
+        write_value_for_type(&mut seg, HPROF_LONG, &cratonvm_types::Value::Long(123456789012345));
         assert_eq!(seg.len(), 8);
         assert_eq!(&seg.buf, &(123456789012345u64).to_be_bytes());
     }
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_object_null() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_OBJECT, &rustjvm_types::Value::Object(None));
+        write_value_for_type(&mut seg, HPROF_OBJECT, &cratonvm_types::Value::Object(None));
         assert_eq!(seg.len(), 8);
         assert_eq!(&seg.buf, &0u64.to_be_bytes());
     }
@@ -805,7 +805,7 @@ mod tests {
     fn s42_write_value_for_type_float() {
         let mut seg = SegmentBuilder::new();
         let f: f32 = 3.14;
-        write_value_for_type(&mut seg, HPROF_FLOAT, &rustjvm_types::Value::Float(f));
+        write_value_for_type(&mut seg, HPROF_FLOAT, &cratonvm_types::Value::Float(f));
         assert_eq!(seg.len(), 4);
         assert_eq!(&seg.buf, &f.to_bits().to_be_bytes());
     }
@@ -814,7 +814,7 @@ mod tests {
     fn s42_write_value_for_type_double() {
         let mut seg = SegmentBuilder::new();
         let d: f64 = 2.71828;
-        write_value_for_type(&mut seg, HPROF_DOUBLE, &rustjvm_types::Value::Double(d));
+        write_value_for_type(&mut seg, HPROF_DOUBLE, &cratonvm_types::Value::Double(d));
         assert_eq!(seg.len(), 8);
         assert_eq!(&seg.buf, &d.to_bits().to_be_bytes());
     }
@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_byte() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_BYTE, &rustjvm_types::Value::Int(42));
+        write_value_for_type(&mut seg, HPROF_BYTE, &cratonvm_types::Value::Int(42));
         assert_eq!(seg.len(), 1);
         assert_eq!(seg.buf[0], 42);
     }
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_short() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_SHORT, &rustjvm_types::Value::Int(0x7FFF));
+        write_value_for_type(&mut seg, HPROF_SHORT, &cratonvm_types::Value::Int(0x7FFF));
         assert_eq!(seg.len(), 2);
         assert_eq!(&seg.buf, &0x7FFFu16.to_be_bytes());
     }
@@ -838,7 +838,7 @@ mod tests {
     #[test]
     fn s42_write_value_for_type_boolean() {
         let mut seg = SegmentBuilder::new();
-        write_value_for_type(&mut seg, HPROF_BOOLEAN, &rustjvm_types::Value::Int(1));
+        write_value_for_type(&mut seg, HPROF_BOOLEAN, &cratonvm_types::Value::Int(1));
         assert_eq!(seg.len(), 1);
         assert_eq!(seg.buf[0], 1);
     }
@@ -847,15 +847,15 @@ mod tests {
     fn s42_write_value_to_vec_all_types() {
         // Verify write_value_to_vec produces the same result as write_value_for_type
         for (htype, val, expected_size) in [
-            (HPROF_BYTE, rustjvm_types::Value::Int(99), 1),
-            (HPROF_BOOLEAN, rustjvm_types::Value::Int(1), 1),
-            (HPROF_SHORT, rustjvm_types::Value::Int(1000), 2),
-            (HPROF_CHAR, rustjvm_types::Value::Int(65), 2),
-            (HPROF_INT, rustjvm_types::Value::Int(42), 4),
-            (HPROF_FLOAT, rustjvm_types::Value::Float(1.0), 4),
-            (HPROF_LONG, rustjvm_types::Value::Long(999), 8),
-            (HPROF_DOUBLE, rustjvm_types::Value::Double(1.0), 8),
-            (HPROF_OBJECT, rustjvm_types::Value::Object(None), 8),
+            (HPROF_BYTE, cratonvm_types::Value::Int(99), 1),
+            (HPROF_BOOLEAN, cratonvm_types::Value::Int(1), 1),
+            (HPROF_SHORT, cratonvm_types::Value::Int(1000), 2),
+            (HPROF_CHAR, cratonvm_types::Value::Int(65), 2),
+            (HPROF_INT, cratonvm_types::Value::Int(42), 4),
+            (HPROF_FLOAT, cratonvm_types::Value::Float(1.0), 4),
+            (HPROF_LONG, cratonvm_types::Value::Long(999), 8),
+            (HPROF_DOUBLE, cratonvm_types::Value::Double(1.0), 8),
+            (HPROF_OBJECT, cratonvm_types::Value::Object(None), 8),
         ] {
             let mut buf = Vec::new();
             write_value_to_vec(&mut buf, htype, &val);
@@ -1058,7 +1058,7 @@ mod tests {
     fn s42_dump_to_file_succeeds() {
         let vm = make_test_vm();
 
-        let tmp = std::env::temp_dir().join("rustjvm_s42_test.hprof");
+        let tmp = std::env::temp_dir().join("cratonvm_s42_test.hprof");
         let path = tmp.to_str().unwrap();
         let size = dump_heap(&vm, path).expect("dump_heap should succeed");
         assert!(size > 0, "Dump file should be non-empty");

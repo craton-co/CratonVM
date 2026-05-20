@@ -6,7 +6,7 @@ package org.jboss.modules;
  * The static INSTANCE field is populated at runtime by the
  * post-clinit fixup hook in vm/src/vm/vm_util.rs:1022.  At compile
  * time we just declare it null so javac can resolve the field
- * reference; the rust-jvm clinit-fixup writes a real
+ * reference; the cratonvm clinit-fixup writes a real
  * LocalModuleLoader after the synthetic clinit completes.
  */
 public final class DefaultBootModuleLoaderHolder {

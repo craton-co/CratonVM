@@ -1,7 +1,7 @@
 ﻿{
     "generated_at":  "2026-05-15T13:31:29Z",
-    "rustjvm_bin":  "c:\\craton\\CratonVM\\target\\wf-build2\\release\\rustjvm.exe",
-    "rustjvm_rev":  "74007a8",
+    "cratonvm_bin":  "c:\\craton\\CratonVM\\target\\wf-build2\\release\\cratonvm.exe",
+    "cratonvm_rev":  "74007a8",
     "wildfly_home":  "C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly",
     "jboss_modules":  "C:/craton/CratonVM/bench/wildfly-boot/staged/wildfly/jboss-modules.jar",
     "server_config":  "standalone.xml",

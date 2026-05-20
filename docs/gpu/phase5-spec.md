@@ -76,8 +76,8 @@ separate large piece of work.
 ## Acceptance
 
 - `cargo check --workspace` (default) clean
-- `cargo check --workspace --features rustjvm-vm/gpu-offload` clean
+- `cargo check --workspace --features cratonvm-vm/gpu-offload` clean
 - `cargo check -p cuda-bridge --features cuda` clean
-- `cargo test -p rustjvm-vm --features gpu-offload --test gpu_submit_method` passes
+- `cargo test -p cratonvm-vm --features gpu-offload --test gpu_submit_method` passes
 - Existing Phase 3 / 3.5 / 4 tests still green
 - `docs/gpu/async-api.md` documents the new explicit-method pattern

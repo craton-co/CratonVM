@@ -13,7 +13,7 @@ Brief description of what this PR does.
 - [ ] `cargo fmt --all --check` passes
 - [ ] `cargo test --all` passes (6,000+ tests)
 - [ ] New tests added for new functionality (if applicable)
-- [ ] Benchmarks checked with `cargo run --release -p rustjvm-cli -- --classpath bench QuickBench` (if performance-related)
+- [ ] Benchmarks checked with `cargo run --release -p cratonvm-cli -- --classpath bench QuickBench` (if performance-related)
 
 ## Related Issues
 

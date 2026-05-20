@@ -14,7 +14,7 @@ pub mod virtual_threads;
 // T19.6 — Vert.x / Netty NioEventLoop affinity scheduler.
 pub mod event_loop;
 // WP4.7 — `StampedLock` + `ReentrantReadWriteLock` integration shim
-// (state actually lives in `rustjvm-native-builtins::stamped_lock`).
+// (state actually lives in `cratonvm-native-builtins::stamped_lock`).
 pub mod stamped;
 // WP4.3 / WP4.5 — ForkJoinPool common-pool singleton + ScheduledExecutorService
 // task registry. Native overrides in `native-builtins/{phases_early,phases_late,

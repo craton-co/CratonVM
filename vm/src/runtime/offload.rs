@@ -1,7 +1,7 @@
 //! Part E — GPU offload cache and lookup.
 //!
 //! The whole module is gated behind the `gpu-offload` Cargo feature on
-//! `rustjvm-vm`. With the feature off, this file is not compiled and no
+//! `cratonvm-vm`. With the feature off, this file is not compiled and no
 //! GPU-related symbols leak into the default build.
 //!
 //! # What lives here
@@ -43,8 +43,8 @@ use std::sync::Arc;
 
 use crate::classloading::ClassId;
 use crate::config::VmConfig;
-use rustjvm_reader::constant_pool::ConstantPool;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::method::ClassFileMethod;
 
 use cuda_bridge::{DeviceContext, DeviceModule};
 use jit_cuda::annotations::read_method_annotations;
@@ -59,9 +59,9 @@ use jit_cuda::emitter::PtxModule;
 /// (cloning so the shared `&method` borrow stays immutable) and drop
 /// any that fail to decode — annotation reading is best-effort.
 fn decode_method_attrs(
-    attrs: &[rustjvm_reader::attribute::LazyAttribute],
+    attrs: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &ConstantPool,
-) -> Vec<rustjvm_reader::attribute::Attribute> {
+) -> Vec<cratonvm_reader::attribute::Attribute> {
     attrs
         .iter()
         .filter_map(|la| {
@@ -181,7 +181,7 @@ impl OffloadCache {
     ///
     /// The split into `(class_id, class_name, method, cp)` rather than
     /// taking a `&Class` lets unit tests bypass the full
-    /// `rustjvm_classloading::Class` construction (which has ~30
+    /// `cratonvm_classloading::Class` construction (which has ~30
     /// fields of unrelated bookkeeping) and exercise the cache against
     /// real bytecode loaded directly from disk. The constant pool is
     /// threaded through explicitly because annotation parsing
@@ -421,7 +421,7 @@ pub fn try_dispatch(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
-    _args: &[rustjvm_types::Value],
+    _args: &[cratonvm_types::Value],
 ) -> Result<DispatchOutcome, crate::error::MethodCallFailed> {
     // Resolve the class. Cheap when already loaded; the interpreter
     // path always pre-loads + initializes static-target classes
@@ -485,7 +485,7 @@ pub fn try_dispatch(
 mod tests {
     use super::*;
     use crate::config::VmConfig;
-    use rustjvm_reader::class_reader::read_class;
+    use cratonvm_reader::class_reader::read_class;
     use std::path::PathBuf;
 
     fn fixture_path(class_name: &str) -> PathBuf {
@@ -502,7 +502,7 @@ mod tests {
 
     /// Load a real `.class` file and return its parsed methods, its
     /// `this_class` name, and its constant pool. We avoid constructing
-    /// the heavy `rustjvm_classloading::Class` — the cache API only
+    /// the heavy `cratonvm_classloading::Class` — the cache API only
     /// needs `(class_id, class_name, method_index, &ClassFileMethod,
     /// &ConstantPool)`.
     fn load_methods(class_name: &str) -> (Vec<ClassFileMethod>, String, ConstantPool) {
@@ -967,7 +967,7 @@ pub struct GcCriticalGuard;
 impl GcCriticalGuard {
     /// Increment the GC-critical counter and return the guard.
     pub fn acquire() -> Self {
-        rustjvm_gc::vm_heap::GPU_CRITICAL_COUNT
+        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self
     }
@@ -976,7 +976,7 @@ impl GcCriticalGuard {
 #[cfg(feature = "gpu-offload")]
 impl Drop for GcCriticalGuard {
     fn drop(&mut self) {
-        rustjvm_gc::vm_heap::GPU_CRITICAL_COUNT
+        cratonvm_gc::vm_heap::GPU_CRITICAL_COUNT
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -1274,10 +1274,10 @@ pub fn dispatch_method_from_native(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
-    java_args: &[rustjvm_types::Value],
+    java_args: &[cratonvm_types::Value],
 ) -> u64 {
     use cuda_bridge::{KernelArgs, Stream as CudaStream};
-    use rustjvm_types::{ArrayElementType, Value};
+    use cratonvm_types::{ArrayElementType, Value};
     use std::sync::Arc;
 
     // 1. Resolve the cache.
@@ -1367,7 +1367,7 @@ pub fn dispatch_method_from_native(
                     }
                     seen.push(cp);
                     // Field cp_index → NameAndType → Utf8 field name.
-                    let Some(rustjvm_reader::constant_pool::ConstantPoolEntry::FieldReference {
+                    let Some(cratonvm_reader::constant_pool::ConstantPoolEntry::FieldReference {
                         name_and_type_index, ..
                     }) = class.constant_pool.get(cp)
                     else {
@@ -1468,7 +1468,7 @@ pub fn dispatch_method_from_native(
     // through to the regular per-arg marshalling starting at
     // `java_args[1..]` (the receiver itself is never a kernel arg —
     // only its named fields are).
-    let java_args_to_marshal: &[rustjvm_types::Value] = if !is_static {
+    let java_args_to_marshal: &[cratonvm_types::Value] = if !is_static {
         // 7a. Pull the receiver from `java_args[0]`.
         let receiver = match java_args.first() {
             Some(Value::Object(Some(r))) => *r,
@@ -1810,7 +1810,7 @@ pub fn finalize_submission(
         //    a local counter satisfies the borrow without affecting
         //    the real GC gate.
         let local_counter = std::sync::atomic::AtomicU32::new(0);
-        let local_token = rustjvm_gc::safepoint::SafepointToken::new(&local_counter);
+        let local_token = cratonvm_gc::safepoint::SafepointToken::new(&local_counter);
 
         // 3. Drain writebacks. First failure marks the submission
         //    Failed and stops further writebacks.
@@ -1981,7 +1981,7 @@ pub(crate) mod device_cache {
     /// The caller (`Native.arrayToHost` shim, via the
     /// `gpu_array_download_if_dirty` escape hatch) then passes the
     /// bytes back to
-    /// [`rustjvm_native_builtins::craton_gpu::array_replace_bytes`]
+    /// [`cratonvm_native_builtins::craton_gpu::array_replace_bytes`]
     /// to refresh the resident store, after which the existing
     /// read path returns the up-to-date Java array.
     pub fn download_into_bytes_if_dirty(handle: u64) -> Option<Vec<u8>> {
@@ -2057,10 +2057,10 @@ pub(crate) mod device_cache {
 #[cfg(feature = "gpu-offload")]
 pub enum MarshalWriteback {
     // Plain JVM primitive arrays (Phase 5).
-    I32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
-    I64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
-    F32 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
-    F64 { obj: rustjvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
+    I32 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
+    I64 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
+    F32 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
+    F64 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
     // Phase 6 #3 / Phase 7 #2 — GpuArray-backed args. The
     // `DeviceBuffer<T>` is shared with `device_cache` so the next
     // kernel using the same `handle` reuses it instead of
@@ -2086,7 +2086,7 @@ impl MarshalWriteback {
     fn writeback(
         &self,
         shared: &crate::vm::SharedVm,
-        token: &rustjvm_gc::safepoint::SafepointToken<'_>,
+        token: &cratonvm_gc::safepoint::SafepointToken<'_>,
     ) -> Result<(), String> {
         use crate::runtime::gpu_marshal;
         match self {
@@ -2202,8 +2202,8 @@ impl MarshalWriteback {
 #[cfg(feature = "gpu-offload")]
 fn try_gpu_array_snapshot(
     shared: &crate::vm::SharedVm,
-    obj_ref: rustjvm_types::ObjectRef,
-) -> Option<(rustjvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
+    obj_ref: cratonvm_types::ObjectRef,
+) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
     let cid = shared.heap.class_id_of(obj_ref);
     let cm = shared.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
@@ -2213,11 +2213,11 @@ fn try_gpu_array_snapshot(
     }
     // field 0 holds the long `handle`.
     let handle = match shared.heap.get_field(obj_ref, 0) {
-        rustjvm_types::Value::Long(h) => h as u64,
+        cratonvm_types::Value::Long(h) => h as u64,
         _ => return None,
     };
     let (etype, len, bytes) =
-        rustjvm_native_builtins::craton_gpu::array_snapshot(handle)?;
+        cratonvm_native_builtins::craton_gpu::array_snapshot(handle)?;
     Some((etype, len, bytes, handle))
 }
 
@@ -2229,7 +2229,7 @@ fn try_gpu_array_snapshot(
 #[cfg(feature = "gpu-offload")]
 fn marshal_resident_array_arg(
     ctx: &cuda_bridge::DeviceContext,
-    element_type: rustjvm_types::ArrayElementType,
+    element_type: cratonvm_types::ArrayElementType,
     len: usize,
     host_bytes: Vec<u8>,
     arr_handle: u64,
@@ -2241,7 +2241,7 @@ fn marshal_resident_array_arg(
     String,
 > {
     use crate::runtime::gpu_marshal;
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     // Macro to keep the four type-specialized arms readable. Each
     // arm: (a) consult device_cache, (b) on miss upload + cache,
@@ -2346,8 +2346,8 @@ fn marshal_resident_array_arg(
 #[cfg(feature = "gpu-offload")]
 fn try_unbox_primitive(
     shared: &crate::vm::SharedVm,
-    obj_ref: rustjvm_types::ObjectRef,
-) -> Option<rustjvm_types::Value> {
+    obj_ref: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::Value> {
     let cid = shared.heap.class_id_of(obj_ref);
     let cm = shared.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
@@ -2359,26 +2359,26 @@ fn try_unbox_primitive(
         | "java/lang/Short"
         | "java/lang/Boolean"
         | "java/lang/Character" => match inner {
-            rustjvm_types::Value::Int(_) => Some(inner),
+            cratonvm_types::Value::Int(_) => Some(inner),
             _ => None,
         },
         "java/lang/Long" => match inner {
-            rustjvm_types::Value::Long(_) => Some(inner),
+            cratonvm_types::Value::Long(_) => Some(inner),
             // Some MethodHandle paths store the long as Int — coerce.
-            rustjvm_types::Value::Int(v) => Some(rustjvm_types::Value::Long(v as i64)),
+            cratonvm_types::Value::Int(v) => Some(cratonvm_types::Value::Long(v as i64)),
             _ => None,
         },
         "java/lang/Float" => match inner {
-            rustjvm_types::Value::Float(_) => Some(inner),
-            rustjvm_types::Value::Int(v) => {
-                Some(rustjvm_types::Value::Float(f32::from_bits(v as u32)))
+            cratonvm_types::Value::Float(_) => Some(inner),
+            cratonvm_types::Value::Int(v) => {
+                Some(cratonvm_types::Value::Float(f32::from_bits(v as u32)))
             }
             _ => None,
         },
         "java/lang/Double" => match inner {
-            rustjvm_types::Value::Double(_) => Some(inner),
-            rustjvm_types::Value::Long(v) => {
-                Some(rustjvm_types::Value::Double(f64::from_bits(v as u64)))
+            cratonvm_types::Value::Double(_) => Some(inner),
+            cratonvm_types::Value::Long(v) => {
+                Some(cratonvm_types::Value::Double(f64::from_bits(v as u64)))
             }
             _ => None,
         },
@@ -2396,9 +2396,9 @@ fn try_unbox_primitive(
 fn marshal_array_arg(
     shared: &crate::vm::SharedVm,
     ctx: &cuda_bridge::DeviceContext,
-    obj_ref: rustjvm_types::ObjectRef,
-    element_type: rustjvm_types::ArrayElementType,
-    token: &rustjvm_gc::safepoint::SafepointToken<'_>,
+    obj_ref: cratonvm_types::ObjectRef,
+    element_type: cratonvm_types::ArrayElementType,
+    token: &cratonvm_gc::safepoint::SafepointToken<'_>,
 ) -> Result<
     (
         Box<dyn FnOnce(cuda_bridge::KernelArgs) -> cuda_bridge::KernelArgs>,
@@ -2407,7 +2407,7 @@ fn marshal_array_arg(
     String,
 > {
     use crate::runtime::gpu_marshal;
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     match element_type {
         ArrayElementType::Int => {

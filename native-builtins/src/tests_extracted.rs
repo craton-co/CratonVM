@@ -4,7 +4,7 @@
 mod tests {
     use super::*;
     use crate::config::VmConfig;
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     use crate::vm::{read_java_string, NativeContextImpl, Vm};
 
     fn test_vm() -> Vm {
@@ -1225,8 +1225,8 @@ fn pe_struct_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let count = ctx.array_length(members_arr);
 
-    let offsets_arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, count);
-    let names_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+    let offsets_arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, count);
+    let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
 
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
@@ -1531,7 +1531,7 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 }
 
 fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     // -------------------------------------------------------------------------
     // java.lang.Class.getResourceAsStream(String) → InputStream
@@ -1780,9 +1780,9 @@ fn s1_url_to_fs_path(url_str: &str) -> Option<String> {
 /// in ServiceLoader field 1 for subsequent calls.
 fn s1_service_loader_ensure_loaded(
     ctx: &mut dyn NativeContext,
-    sl: rustjvm_types::ObjectRef,
-) -> rustjvm_types::ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    sl: cratonvm_types::ObjectRef,
+) -> cratonvm_types::ObjectRef {
+    use cratonvm_types::ArrayElementType;
 
     // If already loaded, return cached array
     if let Value::Object(Some(arr)) = ctx.get_field(sl, 1) {
@@ -1812,7 +1812,7 @@ fn s1_service_loader_ensure_loaded(
             return empty;
         }
     };
-    let class_id = rustjvm_types::ClassId::new(class_id_val);
+    let class_id = cratonvm_types::ClassId::new(class_id_val);
     let iface_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n.replace('/', "."),
         None => {
@@ -1866,7 +1866,7 @@ fn s1_service_loader_ensure_loaded(
 }
 
 fn register_s1_classloading(r: &mut NativeMethodRegistry) {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     // =========================================================================
     // java.net.URLClassLoader
@@ -2375,7 +2375,7 @@ const S2SEL_NKEYS: usize = 2;
 // ---- ByteBuffer helpers ----------------------------------------------------
 
 fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let arr = ctx.new_array(ArrayElementType::Byte, cap);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
     ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
@@ -2650,7 +2650,7 @@ s2_view_buf_fn!(s2_bb_as_double_buffer, "java/nio/DoubleBuffer", 8);
 s2_view_buf_fn!(s2_bb_as_char_buffer,   "java/nio/CharBuffer",   2);
 
 fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let bb = "java/nio/ByteBuffer";
 
     r.register(bb, "allocate", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -3618,7 +3618,7 @@ fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Value::Object(Some(sel)) = selector {
         let n       = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
         let new_cap = (n + 1).max(8);
-        let new_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), new_cap);
+        let new_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
         if let Value::Object(Some(old_arr)) = ctx.get_field(sel, S2SEL_KEYS) {
             for i in 0..n {
                 let k = ctx.get_array_element(old_arr, i);
@@ -3644,14 +3644,14 @@ fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bo
                 if !selected_only || rops != 0 { ready.push(k); }
             }
         }
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), ready.len());
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ready.len());
         for (i, k) in ready.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(*k)));
         }
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(ready.len() as i32));
     } else {
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(0));
     }
@@ -3749,7 +3749,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
 mod tests_s2 {
     use super::*;
     use crate::config::VmConfig;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
     use crate::vm::{NativeContextImpl, Vm};
 
     fn test_vm() -> Vm { Vm::new(VmConfig::default()) }
@@ -4022,7 +4022,7 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
 
     let mut request_str = format!(
-        "{method} {request_target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: RustJVM/1.0\r\nAccept: */*\r\n"
+        "{method} {request_target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: CratonVM/1.0\r\nAccept: */*\r\n"
     );
     if !body_bytes.is_empty() {
         request_str.push_str(&format!(
@@ -4365,7 +4365,7 @@ fn s4_alloc_response(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(resp, S4_RESP_CTYPE, Value::Object(Some(ct)));
     // ByteArrayOutputStream for body
     let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 256);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 256);
     ctx.set_field(baos, S4_BAOS_DATA, Value::Object(Some(buf)));
     ctx.set_field(baos, S4_BAOS_SIZE, Value::Int(0));
     ctx.set_field(resp, S4_RESP_BODY, Value::Object(Some(baos)));
@@ -4421,7 +4421,7 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::{native_map_get_pub};
+            use cratonvm_native_collections::{native_map_get_pub};
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "setAttribute", "(Ljava/lang/String;Ljava/lang/Object;)V", |ctx, args| {
@@ -4432,7 +4432,7 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]);
             Ok(None)
         });
@@ -4443,7 +4443,7 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_remove_pub;
+            use cratonvm_native_collections::native_map_remove_pub;
             let _ = native_map_remove_pub(ctx, &[Value::Object(Some(map)), key]);
             Ok(None)
         });
@@ -4454,7 +4454,7 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_get_pub;
+            use cratonvm_native_collections::native_map_get_pub;
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "setInitParameter", "(Ljava/lang/String;Ljava/lang/String;)Z", |ctx, args| {
@@ -4465,12 +4465,12 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]);
             Ok(Some(Value::Int(1)))
         });
         r.register(cls, "getServerInfo", "()Ljava/lang/String;", |ctx, _args| {
-            let s = ctx.create_string("RustJVM/1.0");
+            let s = ctx.create_string("CratonVM/1.0");
             Ok(Some(Value::Object(Some(s))))
         });
         r.register(cls, "getMajorVersion", "()I", |_ctx, _args| Ok(Some(Value::Int(5))));
@@ -4488,7 +4488,7 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_key_set_pub;
+            use cratonvm_native_collections::native_map_key_set_pub;
             native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
         });
         r.register(cls, "getInitParameterNames", "()Ljava/util/Enumeration;", |ctx, args| {
@@ -4497,7 +4497,7 @@ fn register_s4_servlet_context(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_key_set_pub;
+            use cratonvm_native_collections::native_map_key_set_pub;
             native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
         });
         r.register(cls, "getRequestDispatcher",
@@ -4557,7 +4557,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_get_pub;
+            use cratonvm_native_collections::native_map_get_pub;
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "getParameter", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
@@ -4567,7 +4567,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_get_pub;
+            use cratonvm_native_collections::native_map_get_pub;
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "getAttribute", "(Ljava/lang/String;)Ljava/lang/Object;", |ctx, args| {
@@ -4577,7 +4577,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_get_pub;
+            use cratonvm_native_collections::native_map_get_pub;
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "setAttribute", "(Ljava/lang/String;Ljava/lang/Object;)V", |ctx, args| {
@@ -4588,7 +4588,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]);
             Ok(None)
         });
@@ -4599,7 +4599,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_remove_pub;
+            use cratonvm_native_collections::native_map_remove_pub;
             let _ = native_map_remove_pub(ctx, &[Value::Object(Some(map)), key]);
             Ok(None)
         });
@@ -4684,7 +4684,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_key_set_pub;
+            use cratonvm_native_collections::native_map_key_set_pub;
             native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
         });
         r.register(cls, "getParameterNames", "()Ljava/util/Enumeration;", |ctx, args| {
@@ -4693,7 +4693,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_key_set_pub;
+            use cratonvm_native_collections::native_map_key_set_pub;
             native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
         });
         r.register(cls, "getParameterMap", "()Ljava/util/Map;", |ctx, args| {
@@ -4701,7 +4701,7 @@ fn register_s4_http_servlet_request(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, S4_REQ_PARAMS)))
         });
         r.register(cls, "getCookies", "()[Ljavax/servlet/http/Cookie;", |ctx, _args| {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             Ok(Some(Value::Object(Some(arr))))
         });
         r.register(cls, "getInputStream",
@@ -4760,7 +4760,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]);
             Ok(None)
         });
@@ -4772,7 +4772,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]);
             Ok(None)
         });
@@ -4783,7 +4783,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            use rustjvm_native_collections::native_map_contains_key_pub;
+            use cratonvm_native_collections::native_map_contains_key_pub;
             native_map_contains_key_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "getWriter", "()Ljava/io/PrintWriter;", |ctx, args| {
@@ -4864,7 +4864,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let loc_key = ctx.create_string("Location");
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(loc_key)), location]);
             ctx.set_field(this, S4_RESP_COMMITTED, Value::Int(1));
             Ok(None)
@@ -4882,7 +4882,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_key_set_pub;
+            use cratonvm_native_collections::native_map_key_set_pub;
             native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
         });
         r.register(cls, "getHeader", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
@@ -4892,7 +4892,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_get_pub;
+            use cratonvm_native_collections::native_map_get_pub;
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
     }
@@ -4977,7 +4977,7 @@ fn register_s4_servlet_config(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         });
         r.register(cls, "getInitParameterNames", "()Ljava/util/Enumeration;", |ctx, _args| {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             Ok(Some(Value::Object(Some(arr))))
         });
     }
@@ -5011,7 +5011,7 @@ fn register_s4_session(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_get_pub;
+            use cratonvm_native_collections::native_map_get_pub;
             native_map_get_pub(ctx, &[Value::Object(Some(map)), Value::Object(Some(key))])
         });
         r.register(cls, "setAttribute", "(Ljava/lang/String;Ljava/lang/Object;)V", |ctx, args| {
@@ -5022,7 +5022,7 @@ fn register_s4_session(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_put_pub;
+            use cratonvm_native_collections::native_map_put_pub;
             let _ = native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]);
             Ok(None)
         });
@@ -5033,7 +5033,7 @@ fn register_s4_session(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(None),
             };
-            use rustjvm_native_collections::native_map_remove_pub;
+            use cratonvm_native_collections::native_map_remove_pub;
             let _ = native_map_remove_pub(ctx, &[Value::Object(Some(map)), key]);
             Ok(None)
         });
@@ -5053,7 +5053,7 @@ fn register_s4_session(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            use rustjvm_native_collections::native_map_key_set_pub;
+            use cratonvm_native_collections::native_map_key_set_pub;
             native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
         });
     }
@@ -5222,7 +5222,7 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
         let arr = match ctx.get_field(this, S4_BAOS_DATA) {
             Value::Object(Some(a)) => a,
             _ => {
-                let a = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 256);
+                let a = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 256);
                 ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(a)));
                 a
             }
@@ -5230,7 +5230,7 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
         let cap = ctx.array_length(arr);
         if size >= cap {
             // Grow: allocate 2x
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, cap * 2);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap * 2);
             for i in 0..size {
                 let v = ctx.get_array_element(arr, i);
                 ctx.set_array_element(new_arr, i, v);
@@ -5282,9 +5282,9 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
         let size = ctx.get_field(this, S4_BAOS_SIZE).as_int().unwrap_or(0) as usize;
         let src = match ctx.get_field(this, S4_BAOS_DATA) {
             Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(Some(ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0))))),
+            _ => return Ok(Some(Value::Object(Some(ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0))))),
         };
-        let result = ctx.new_array(rustjvm_types::ArrayElementType::Byte, size);
+        let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, size);
         for i in 0..size {
             ctx.set_array_element(result, i, ctx.get_array_element(src, i));
         }
@@ -5303,7 +5303,7 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 32);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(buf)));
         ctx.set_field(this, S4_BAOS_SIZE, Value::Int(0));
         Ok(None)
@@ -5311,7 +5311,7 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let cap = args.get(1).and_then(|v| v.as_int()).unwrap_or(32) as usize;
-        let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, cap.max(1));
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap.max(1));
         ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(buf)));
         ctx.set_field(this, S4_BAOS_SIZE, Value::Int(0));
         Ok(None)
@@ -5356,7 +5356,7 @@ fn alloc_method_handle(
     name: &str,
     desc: &str,
     kind: i32,
-) -> rustjvm_types::ObjectRef {
+) -> cratonvm_types::ObjectRef {
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 5);
     let cls = ctx.create_string(class);
     let nm  = ctx.create_string(name);
@@ -5370,7 +5370,7 @@ fn alloc_method_handle(
 }
 
 /// Read the class name string from a MethodHandle (field MH_CLASS).
-fn mh_read_class(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option<String> {
+fn mh_read_class(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
     match ctx.get_field(mh, MH_CLASS) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -5378,7 +5378,7 @@ fn mh_read_class(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Optio
 }
 
 /// Read the method name string from a MethodHandle (field MH_NAME).
-fn mh_read_name(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option<String> {
+fn mh_read_name(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
     match ctx.get_field(mh, MH_NAME) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -5386,7 +5386,7 @@ fn mh_read_name(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option
 }
 
 /// Read the descriptor string from a MethodHandle (field MH_DESC).
-fn mh_read_desc(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option<String> {
+fn mh_read_desc(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRef) -> Option<String> {
     match ctx.get_field(mh, MH_DESC) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
@@ -5397,7 +5397,7 @@ fn mh_read_desc(ctx: &dyn NativeContext, mh: rustjvm_types::ObjectRef) -> Option
 /// `extra_args` are the args passed to invoke() after `this` (the MH itself).
 fn mh_dispatch(
     ctx: &mut dyn NativeContext,
-    mh: rustjvm_types::ObjectRef,
+    mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
     let class = match mh_read_class(ctx, mh) {
@@ -5596,7 +5596,7 @@ mod tests_t4_method_handle {
         register_t4_method_handle_invoke(&mut r);
 
         let mh = alloc_method_handle(&mut ctx, "java/lang/String", "length", "()I", MH_KIND_VIRTUAL);
-        let recv = ctx.alloc_object(rustjvm_types::ClassId::new(0), 1);
+        let recv = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
 
         let bind = r.find("java/lang/invoke/MethodHandle", "bindTo", "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;").unwrap();
         let bound_mh_val = bind(&mut ctx, &[Value::Object(Some(mh)), Value::Object(Some(recv))]).unwrap().unwrap();

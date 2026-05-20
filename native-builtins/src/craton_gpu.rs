@@ -42,7 +42,7 @@
 
 #![cfg_attr(not(feature = "gpu-offload"), allow(dead_code))]
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 #[cfg(feature = "gpu-offload")]
 use std::collections::HashMap;
@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "gpu-offload")]
-use rustjvm_types::{ArrayElementType, Value};
+use cratonvm_types::{ArrayElementType, Value};
 
 // ---------------------------------------------------------------------------
 // Public entry point: stub when feature is off, real registration when on
@@ -136,7 +136,7 @@ mod state {
     #[derive(Debug)]
     pub(super) enum FutureState {
         Pending,
-        Done { result_obj: Option<rustjvm_types::ObjectRef> },
+        Done { result_obj: Option<cratonvm_types::ObjectRef> },
         Failed { message: String },
     }
 
@@ -172,7 +172,7 @@ mod state {
 // The `state` module is intentionally private (the native-handler
 // implementation is the only thing meant to touch the synthetic
 // store directly). But the GPU dispatch code in
-// `rustjvm_vm::runtime::offload` needs to read array bytes back
+// `cratonvm_vm::runtime::offload` needs to read array bytes back
 // when it sees a `craton.gpu.GpuArray` Java argument to a kernel —
 // it gets the long handle from the GpuArray's `handle` field and
 // looks up the bytes here.
@@ -188,7 +188,7 @@ mod state {
 #[cfg(feature = "gpu-offload")]
 pub fn array_snapshot(
     handle: u64,
-) -> Option<(rustjvm_types::ArrayElementType, usize, Vec<u8>)> {
+) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>)> {
     state::with(|s| {
         s.arrays
             .get(&handle)
@@ -236,7 +236,7 @@ fn arg_int(args: &[Value], idx: usize) -> i32 {
 }
 
 #[cfg(feature = "gpu-offload")]
-fn arg_object(args: &[Value], idx: usize) -> Option<rustjvm_types::ObjectRef> {
+fn arg_object(args: &[Value], idx: usize) -> Option<cratonvm_types::ObjectRef> {
     match args.get(idx) {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -250,11 +250,11 @@ fn arg_object(args: &[Value], idx: usize) -> Option<rustjvm_types::ObjectRef> {
 /// `arrayWrap*` upload path below).
 #[cfg(feature = "gpu-offload")]
 fn rebuild_java_array(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     element_type: ArrayElementType,
     element_count: usize,
     bytes: &[u8],
-) -> rustjvm_types::ObjectRef {
+) -> cratonvm_types::ObjectRef {
     let obj = ctx.new_array(element_type, element_count);
     match element_type {
         ArrayElementType::Int => {
@@ -302,8 +302,8 @@ fn rebuild_java_array(
 /// Returns `(element_type, element_count, bytes)`.
 #[cfg(feature = "gpu-offload")]
 fn snapshot_java_array(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
-    array: rustjvm_types::ObjectRef,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    array: cratonvm_types::ObjectRef,
 ) -> (ArrayElementType, usize, Vec<u8>) {
     let element_type = ctx.heap_element_type_of(array);
     let length = ctx.array_length(array);
@@ -371,10 +371,10 @@ fn snapshot_java_array(
 /// rather than poke `handle` via `set_field_by_name`.
 #[cfg(feature = "gpu-offload")]
 fn instantiate_handle_wrapper(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     class_name: &str,
     handle: u64,
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let allocated = ctx.new_object(class_name)?;
     match allocated {
         Some(Value::Object(Some(obj))) => {
@@ -397,9 +397,9 @@ fn instantiate_handle_wrapper(
 /// `GpuExecutorImpl` wrapping the handle.
 #[cfg(feature = "gpu-offload")]
 fn builtin_open_executor(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let device = arg_int(args, 0);
     let handle = state::with(|s| {
         let h = s.fresh_handle();
@@ -412,9 +412,9 @@ fn builtin_open_executor(
 /// `Native.releaseExecutor(long handle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_executor(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.executors.remove(&handle);
@@ -449,9 +449,9 @@ fn record_failed_future() -> u64 {
 /// side surfaces a clear error message.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
     let callable = match arg_object(args, 1) {
         Some(o) => o,
@@ -499,9 +499,9 @@ fn builtin_submit(
 /// Failed future; the Java caller can fall back to CPU evaluation.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit_with_arg(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
     let lambda = match arg_object(args, 1) {
         Some(o) => o,
@@ -551,9 +551,9 @@ fn builtin_submit_with_arg(
 /// zero-arg behavior of `submit`).
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit_with_args(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
     let lambda = match arg_object(args, 1) {
         Some(o) => o,
@@ -600,9 +600,9 @@ fn builtin_submit_with_args(
 /// returned future's parametric type is `Void`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_launch(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
     let runnable = match arg_object(args, 1) {
         Some(o) => o,
@@ -650,9 +650,9 @@ fn builtin_launch(
 /// `GpuException` via `futureGetErrorMessage`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_submit_method(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let _exec = arg_long(args, 0) as u64;
 
     // Read the three string params. If any is null/unreadable, fail
@@ -743,10 +743,10 @@ fn builtin_submit_method(
 /// always name the function regardless of feature.
 #[cfg(not(feature = "gpu-offload"))]
 fn builtin_submit_method(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
-    _args: &[rustjvm_types::Value],
-) -> rustjvm_types::error::MethodCallResult {
-    Ok(Some(rustjvm_types::Value::Object(None)))
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    _args: &[cratonvm_types::Value],
+) -> cratonvm_types::error::MethodCallResult {
+    Ok(Some(cratonvm_types::Value::Object(None)))
 }
 
 #[cfg(feature = "gpu-offload")]
@@ -771,9 +771,9 @@ fn record_failed_future_with_message(message: &str) -> u64 {
 /// new handle in a `GpuStreamImpl`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_new_stream(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let exec = arg_long(args, 0) as u64;
     let handle = state::with(|s| {
         let h = s.fresh_handle();
@@ -786,9 +786,9 @@ fn builtin_new_stream(
 /// `Native.closeStream(long streamHandle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_close_stream(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.streams.remove(&handle);
@@ -807,9 +807,9 @@ fn builtin_close_stream(
 ///   `0` = PENDING, `1` = DONE, `2` = FAILED, `3` = UNKNOWN
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_status(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     // Phase 6 #4 — prefer the real submission registry. The
     // synthetic state is the fallback for stub-only fixtures
@@ -833,9 +833,9 @@ fn builtin_future_status(
 /// is a no-op. With a real device we would `cuStreamSynchronize` here.
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_synchronize(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     // Phase 6 #4 — if the handle is a real submission, block on
     // its event. Otherwise no-op (synthetic Failed futures are
@@ -853,9 +853,9 @@ fn builtin_future_synchronize(
 /// freshly-built primitive-array `ObjectRef`.
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_get_result(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     let result = state::with(|s| match s.futures.get(&handle) {
         Some(state::FutureState::Done { result_obj }) => *result_obj,
@@ -867,9 +867,9 @@ fn builtin_future_get_result(
 /// `Native.futureGetErrorMessage(long futureHandle) -> String`
 #[cfg(feature = "gpu-offload")]
 fn builtin_future_get_error_message(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     let msg = state::with(|s| match s.futures.get(&handle) {
         Some(state::FutureState::Failed { message }) => Some(message.clone()),
@@ -888,9 +888,9 @@ fn builtin_future_get_error_message(
 /// `Native.releaseFuture(long futureHandle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_future(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.futures.remove(&handle);
@@ -907,9 +907,9 @@ fn builtin_release_future(
 
 #[cfg(feature = "gpu-offload")]
 fn wrap_primitive_array(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let array = match arg_object(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
@@ -934,36 +934,36 @@ fn wrap_primitive_array(
 /// `Native.arrayWrapInt(int[]) -> long`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_wrap_int(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     wrap_primitive_array(ctx, args)
 }
 
 /// `Native.arrayWrapLong(long[]) -> long`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_wrap_long(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     wrap_primitive_array(ctx, args)
 }
 
 /// `Native.arrayWrapFloat(float[]) -> long`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_wrap_float(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     wrap_primitive_array(ctx, args)
 }
 
 /// `Native.arrayWrapDouble(double[]) -> long`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_wrap_double(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     wrap_primitive_array(ctx, args)
 }
 
@@ -973,9 +973,9 @@ fn builtin_array_wrap_double(
 /// array of the same shape from the stored bytes.
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_to_host(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     // Phase 9 #1 — pull any pending device-side writes into the
     // resident store BEFORE we read it. The Resident writebacks
@@ -1003,9 +1003,9 @@ fn builtin_array_to_host(
 /// `Native.arrayIsResident(long arrayHandle) -> boolean`
 #[cfg(feature = "gpu-offload")]
 fn builtin_array_is_resident(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     let resident = state::with(|s| {
         s.arrays.get(&handle).map(|e| e.resident).unwrap_or(false)
@@ -1016,9 +1016,9 @@ fn builtin_array_is_resident(
 /// `Native.releaseArray(long arrayHandle)`
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_array(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     // Phase 8 #1 — drop both the host-side resident entry AND any
     // cached device buffer keyed by the same handle. Without the

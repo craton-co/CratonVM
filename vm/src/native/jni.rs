@@ -1040,7 +1040,7 @@ extern "C" fn jni_get_method_id(
     // per cold start. Cache hits avoid the full `find_method_recursive`
     // walk + the per-class linear `methods` position scan.
     with_shared_vm(|shared| {
-        use rustjvm_classloading::resolution::ResolvedMember;
+        use cratonvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
         let resolved = {
             let cm = shared.class_manager.read();
@@ -1067,8 +1067,8 @@ extern "C" fn jni_get_method_id(
                         None => ResolvedMember::NotFound,
                     };
                     (
-                        rustjvm_types::intern_arc(name_str),
-                        rustjvm_types::intern_arc(sig_str),
+                        cratonvm_types::intern_arc(name_str),
+                        cratonvm_types::intern_arc(sig_str),
                         resolved,
                     )
                 },
@@ -1499,7 +1499,7 @@ extern "C" fn jni_get_field_id(
     }
     // Round 8 audit fix (CRIT #2): probe the per-VM `LinkResolver`.
     with_shared_vm(|shared| {
-        use rustjvm_classloading::resolution::ResolvedMember;
+        use cratonvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
         let resolved = {
             let cm = shared.class_manager.read();
@@ -1519,15 +1519,15 @@ extern "C" fn jni_get_field_id(
                                 is_static: field
                                     .access_flags
                                     .contains(
-                                        rustjvm_reader::class_access_flags::FieldAccessFlags::STATIC,
+                                        cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC,
                                     ),
                             }
                         }
                         None => ResolvedMember::NotFound,
                     };
                     (
-                        rustjvm_types::intern_arc(name_str),
-                        rustjvm_types::intern_arc(sig_str),
+                        cratonvm_types::intern_arc(name_str),
+                        cratonvm_types::intern_arc(sig_str),
                         resolved,
                     )
                 },

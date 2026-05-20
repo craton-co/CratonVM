@@ -20,9 +20,9 @@
 //! * `PhantomReference.get()` always returns null per the JDK contract
 //!   (JDK 1.2+). The other ref subclasses return the referent field.
 
-use rustjvm_types::Value;
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
 use crate::{REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
 
@@ -440,7 +440,7 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     #[test]
     fn register_reference_natives_registers_all_expected_entries() {

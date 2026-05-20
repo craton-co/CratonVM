@@ -1,6 +1,6 @@
 //! T4.9 -- Real-Application Conformance Test Suite
 //!
-//! These tests verify that RustJVM can boot and partially execute real-world
+//! These tests verify that CratonVM can boot and partially execute real-world
 //! Java applications end-to-end.  Each test targets a specific open-source
 //! Java project and exercises the full class loading pipeline (jimage reader,
 //! classpath scanner, fat JAR extraction, native method dispatch, module
@@ -11,7 +11,7 @@
 //! All tests are marked `#[ignore]` because they require external JAR files,
 //! application installations, or network ports.  Run them with:
 //!
-//!     cargo test -p rustjvm-vm --test t4_9_real_app_conformance -- --ignored
+//!     cargo test -p cratonvm-vm --test t4_9_real_app_conformance -- --ignored
 //!
 //! Environment variables (set whichever tests you want to run):
 //!
@@ -30,7 +30,7 @@
 //! | `IDEA_HOME`      | IntelliJ IDEA installation directory                     |
 //! | `JAVA_HOME`      | JDK installation (for javac/jshell self-host tests)      |
 //! | `LIBERTY_HOME`   | Open Liberty installation directory                      |
-//! | `RUSTJVM_BIN`    | Path to the RustJVM CLI binary (for process-based tests) |
+//! | `CRATONVM_BIN`    | Path to the CratonVM CLI binary (for process-based tests) |
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -39,10 +39,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::SharedVm;
-use rustjvm_vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::SharedVm;
+use cratonvm_vm::Vm;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,12 +92,12 @@ fn check_prereq_env(var_name: &str) -> Option<String> {
     }
 }
 
-/// Resolve the RustJVM CLI binary path.  Checks `RUSTJVM_BIN` env var first,
+/// Resolve the CratonVM CLI binary path.  Checks `CRATONVM_BIN` env var first,
 /// then falls back to the cargo build output.
-fn rustjvm_binary() -> PathBuf {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> PathBuf {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
-        assert!(p.exists(), "RUSTJVM_BIN={bin} does not exist");
+        assert!(p.exists(), "CRATONVM_BIN={bin} does not exist");
         return p;
     }
     // Fall back to the default cargo build location.
@@ -107,13 +107,13 @@ fn rustjvm_binary() -> PathBuf {
         .join("target")
         .join("debug")
         .join(if cfg!(windows) {
-            "rustjvm.exe"
+            "cratonvm.exe"
         } else {
-            "rustjvm"
+            "cratonvm"
         });
     assert!(
         candidate.exists(),
-        "RustJVM binary not found at {:?}. Set RUSTJVM_BIN or build with `cargo build`.",
+        "CratonVM binary not found at {:?}. Set CRATONVM_BIN or build with `cargo build`.",
         candidate
     );
     candidate
@@ -254,16 +254,16 @@ fn wait_for_port(host: &str, port: u16, timeout: Duration) -> Result<(), String>
     ))
 }
 
-/// Spawn a RustJVM process with the given arguments.  Returns the child
+/// Spawn a CratonVM process with the given arguments.  Returns the child
 /// process handle.
-fn spawn_rustjvm(args: &[&str]) -> Child {
-    let bin = rustjvm_binary();
+fn spawn_cratonvm(args: &[&str]) -> Child {
+    let bin = cratonvm_binary();
     Command::new(&bin)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("failed to spawn RustJVM at {:?}: {e}", bin))
+        .unwrap_or_else(|e| panic!("failed to spawn CratonVM at {:?}: {e}", bin))
 }
 
 /// Wait for a line matching the predicate in the process's stdout, with timeout.
@@ -296,7 +296,7 @@ fn wait_for_stdout_line<F: Fn(&str) -> bool>(
 // T4.9.1 -- Spring Boot Petclinic
 // ---------------------------------------------------------------------------
 
-/// T4.9.1: Boot the Spring Boot Petclinic application under RustJVM, send
+/// T4.9.1: Boot the Spring Boot Petclinic application under CratonVM, send
 /// an HTTP GET to /owners, and verify the response contains HTML content.
 ///
 /// Setup:
@@ -334,9 +334,9 @@ fn t4_9_1_spring_boot_petclinic() {
     );
 
     // Phase 3: If we can spawn the process, perform an HTTP smoke test.
-    // (This requires RUSTJVM_BIN and a working network stack.)
-    if std::env::var("RUSTJVM_BIN").is_ok() {
-        let mut child = spawn_rustjvm(&["-jar", &jar]);
+    // (This requires CRATONVM_BIN and a working network stack.)
+    if std::env::var("CRATONVM_BIN").is_ok() {
+        let mut child = spawn_cratonvm(&["-jar", &jar]);
 
         // Wait for the embedded Tomcat to start.
         let port = 8080u16;
@@ -410,7 +410,7 @@ fn t4_9_2_hibernate_orm_h2() {
 // T4.9.3 -- Apache Tomcat static page
 // ---------------------------------------------------------------------------
 
-/// T4.9.3: Boot Apache Tomcat under RustJVM, send HTTP GET /, and check
+/// T4.9.3: Boot Apache Tomcat under CratonVM, send HTTP GET /, and check
 /// that the response contains the Tomcat default page content.
 ///
 /// Setup:
@@ -450,9 +450,9 @@ fn t4_9_3_tomcat_static_page() {
     );
 
     // Phase 3: HTTP smoke test (if process-based execution is available).
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let mut child = spawn_rustjvm(&[
+        let mut child = spawn_cratonvm(&[
             "-cp",
             &cp_str,
             &format!("-Dcatalina.home={home}"),
@@ -508,14 +508,14 @@ fn t4_9_4_netty_echo_server() {
         result.unwrap_err()
     );
 
-    // Phase 3: If a Netty echo server main class is available and the RustJVM
+    // Phase 3: If a Netty echo server main class is available and the CratonVM
     // binary exists, spawn the server, connect a client, send "hello", and
     // verify the echoed response.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         // A typical Netty echo server main class; the user must ensure it
         // exists on the classpath.
         let echo_port = 9999u16;
-        let mut child = spawn_rustjvm(&[
+        let mut child = spawn_cratonvm(&[
             "-cp",
             &jar,
             "io.netty.example.echo.EchoServer",
@@ -525,7 +525,7 @@ fn t4_9_4_netty_echo_server() {
         if wait_for_port("127.0.0.1", echo_port, APP_BOOT_TIMEOUT).is_ok() {
             if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", echo_port)) {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let msg = b"hello from rustjvm";
+                let msg = b"hello from cratonvm";
                 let _ = stream.write_all(msg);
                 let _ = stream.flush();
 
@@ -588,9 +588,9 @@ fn t4_9_5_cassandra_smoke() {
 
     // Phase 3: Process-based smoke test. Boot Cassandra, wait for CQL port
     // (9042), send a simple native protocol OPTIONS frame.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let mut child = spawn_rustjvm(&[
+        let mut child = spawn_cratonvm(&[
             "-cp",
             &cp_str,
             &format!("-Dcassandra.config=file://{}/conf/cassandra.yaml", home),
@@ -670,9 +670,9 @@ fn t4_9_6_elasticsearch_index() {
 
     // Phase 2: Process-based smoke test. Boot ES, wait for HTTP port (9200),
     // PUT a test document, GET it back.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let mut child = spawn_rustjvm(&[
+        let mut child = spawn_cratonvm(&[
             "-cp",
             &cp_str,
             &format!("-Des.path.home={home}"),
@@ -684,7 +684,7 @@ fn t4_9_6_elasticsearch_index() {
             // PUT a test document.
             if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
                 let _ = stream.set_read_timeout(Some(HTTP_TIMEOUT));
-                let body = r#"{"title":"RustJVM Test","value":42}"#;
+                let body = r#"{"title":"CratonVM Test","value":42}"#;
                 let request = format!(
                     "PUT /test-index/_doc/1 HTTP/1.1\r\n\
                      Host: 127.0.0.1:{port}\r\n\
@@ -707,7 +707,7 @@ fn t4_9_6_elasticsearch_index() {
             // GET the document back.
             if let Ok(body) = http_get("127.0.0.1", port, "/test-index/_doc/1") {
                 assert!(
-                    body.contains("RustJVM Test"),
+                    body.contains("CratonVM Test"),
                     "GET document must contain our test data"
                 );
             }
@@ -765,14 +765,14 @@ fn t4_9_7_kafka_produce_consume() {
     );
 
     // Phase 3: Process-based smoke test using KRaft mode (no ZooKeeper).
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
         let config_file = home_path
             .join("config")
             .join("kraft")
             .join("server.properties");
         if config_file.exists() {
-            let mut child = spawn_rustjvm(&[
+            let mut child = spawn_cratonvm(&[
                 "-cp",
                 &cp_str,
                 "kafka.Kafka",
@@ -825,8 +825,8 @@ fn t4_9_8_jenkins_freestyle() {
     );
 
     // Phase 2: Process-based smoke test.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
-        let mut child = spawn_rustjvm(&["-jar", &war, "--httpPort=8081"]);
+    if std::env::var("CRATONVM_BIN").is_ok() {
+        let mut child = spawn_cratonvm(&["-jar", &war, "--httpPort=8081"]);
 
         let port = 8081u16;
         if wait_for_port("127.0.0.1", port, APP_BOOT_TIMEOUT).is_ok() {
@@ -880,8 +880,8 @@ fn t4_9_9_maven_build() {
     );
 
     // Phase 2: Create a minimal Maven project and run `mvn validate`.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
-        let tmp_dir = std::env::temp_dir().join("rustjvm_t4_9_9_maven");
+    if std::env::var("CRATONVM_BIN").is_ok() {
+        let tmp_dir = std::env::temp_dir().join("cratonvm_t4_9_9_maven");
         let _ = std::fs::create_dir_all(&tmp_dir);
 
         // Write a minimal pom.xml.
@@ -891,14 +891,14 @@ fn t4_9_9_maven_build() {
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
          http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-    <groupId>com.rustjvm.test</groupId>
+    <groupId>com.cratonvm.test</groupId>
     <artifactId>t4-9-9</artifactId>
     <version>1.0</version>
 </project>"#;
         std::fs::write(tmp_dir.join("pom.xml"), pom).expect("must write pom.xml");
 
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let output = Command::new(rustjvm_binary())
+        let output = Command::new(cratonvm_binary())
             .args(&[
                 "-cp",
                 &cp_str,
@@ -954,8 +954,8 @@ fn t4_9_10_gradle_build() {
     );
 
     // Phase 2: Create a minimal Gradle project and run `gradle help`.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
-        let tmp_dir = std::env::temp_dir().join("rustjvm_t4_9_10_gradle");
+    if std::env::var("CRATONVM_BIN").is_ok() {
+        let tmp_dir = std::env::temp_dir().join("cratonvm_t4_9_10_gradle");
         let _ = std::fs::create_dir_all(&tmp_dir);
 
         std::fs::write(
@@ -965,7 +965,7 @@ fn t4_9_10_gradle_build() {
         .expect("must write build.gradle");
 
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let output = Command::new(rustjvm_binary())
+        let output = Command::new(cratonvm_binary())
             .args(&[
                 "-cp",
                 &cp_str,
@@ -1020,9 +1020,9 @@ fn t4_9_11_intellij_headless() {
     );
 
     // Phase 2: Process-based headless startup check.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let mut child = Command::new(rustjvm_binary())
+        let mut child = Command::new(cratonvm_binary())
             .args(&[
                 "-cp",
                 &cp_str,
@@ -1055,7 +1055,7 @@ fn t4_9_11_intellij_headless() {
 // T4.9.12 -- javac self-host
 // ---------------------------------------------------------------------------
 
-/// T4.9.12: Compile Java test sources using javac running under RustJVM.
+/// T4.9.12: Compile Java test sources using javac running under CratonVM.
 /// This is the ultimate self-hosting test.
 ///
 /// Setup:
@@ -1081,14 +1081,14 @@ fn t4_9_12_javac_self_host() {
     );
 
     // Phase 2: Write a minimal HelloWorld.java and attempt to compile it.
-    let tmp_dir = std::env::temp_dir().join("rustjvm_t4_9_12");
+    let tmp_dir = std::env::temp_dir().join("cratonvm_t4_9_12");
     let _ = std::fs::create_dir_all(&tmp_dir);
     let source_file = tmp_dir.join("HelloWorld.java");
     std::fs::write(
         &source_file,
         "public class HelloWorld {\n\
          \x20   public static void main(String[] args) {\n\
-         \x20       System.out.println(\"Hello from RustJVM!\");\n\
+         \x20       System.out.println(\"Hello from CratonVM!\");\n\
          \x20   }\n\
          }\n",
     )
@@ -1113,8 +1113,8 @@ fn t4_9_12_javac_self_host() {
 
     // Phase 4: If process-based execution is available, run javac as a
     // subprocess and verify the .class file is produced.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
-        let output = Command::new(rustjvm_binary())
+    if std::env::var("CRATONVM_BIN").is_ok() {
+        let output = Command::new(cratonvm_binary())
             .args(&[
                 &format!("-Djava.home={java_home}"),
                 "-m",
@@ -1153,7 +1153,7 @@ fn t4_9_12_javac_self_host() {
 // T4.9.13 -- JShell self-host
 // ---------------------------------------------------------------------------
 
-/// T4.9.13: Run a JShell expression under RustJVM and check the output.
+/// T4.9.13: Run a JShell expression under CratonVM and check the output.
 ///
 /// Setup:
 /// ```sh
@@ -1182,8 +1182,8 @@ fn t4_9_13_jshell_self_host() {
 
     // Phase 2: If process-based execution is available, pipe a simple
     // expression to JShell and verify the output.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
-        let mut child = Command::new(rustjvm_binary())
+    if std::env::var("CRATONVM_BIN").is_ok() {
+        let mut child = Command::new(cratonvm_binary())
             .args(&[
                 &format!("-Djava.home={java_home}"),
                 "-m",
@@ -1259,9 +1259,9 @@ fn t4_9_14_openliberty_javaee() {
     );
 
     // Phase 3: Process-based smoke test.
-    if std::env::var("RUSTJVM_BIN").is_ok() {
+    if std::env::var("CRATONVM_BIN").is_ok() {
         let cp_str = cp.join(if cfg!(windows) { ";" } else { ":" });
-        let mut child = spawn_rustjvm(&[
+        let mut child = spawn_cratonvm(&[
             "-cp",
             &cp_str,
             &format!("-Dwlp.install.dir={home}"),

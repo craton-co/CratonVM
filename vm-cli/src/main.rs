@@ -1,21 +1,21 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use rustjvm_vm::error::MethodCallFailed;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{
+use cratonvm_vm::error::MethodCallFailed;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{
     create_java_string, invoke_on_class_shared, invoke_on_class_shared_no_retarget, Vm,
 };
-use rustjvm_vm::{ClassPath, VmConfig};
+use cratonvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
-/// RustJVM Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ A Java Virtual Machine implemented in Rust.
+/// CratonVM - A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
 ///
-/// Usage: rustjvm [OPTIONS] <CLASS_NAME> [ARGS]...
-///        rustjvm [OPTIONS] --jar <FILE.jar> [ARGS]...
+/// Usage: cratonvm [OPTIONS] <CLASS_NAME> [ARGS]...
+///        cratonvm [OPTIONS] --jar <FILE.jar> [ARGS]...
 #[derive(Parser, Debug)]
-#[command(name = "rustjvm", version, about)]
+#[command(name = "cratonvm", version, about)]
 struct Args {
     /// The fully qualified class name to execute (e.g., com.example.Main).
     class_name: Option<String>,
@@ -567,7 +567,7 @@ fn run() -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!(
-                        "[rustjvm-cli] --gpu requested but no CUDA driver available ({e}); \
+                        "[cratonvm-cli] --gpu requested but no CUDA driver available ({e}); \
                          running on CPU"
                     );
                     args.gpu = false;
@@ -590,7 +590,7 @@ fn run() -> Result<()> {
 
     // Validate: exactly one of class_name or --jar must be provided
     if args.class_name.is_none() && args.jar.is_none() {
-        bail!("No class name or --jar specified. Usage: rustjvm <class> or rustjvm --jar <file.jar>");
+        bail!("No class name or --jar specified. Usage: cratonvm <class> or cratonvm --jar <file.jar>");
     }
     // When both --jar and positional arguments are given, treat the
     // positionals as program args (Java-style).  This matches the stock
@@ -653,7 +653,7 @@ fn run() -> Result<()> {
                 // vector). On collision, retry with a fresh counter suffix
                 // so concurrent VMs don't fail spuriously.
                 let dir = std::env::temp_dir();
-                let mut tmp = dir.join(format!("rustjvm-{pid}-{now_ms}-{stem}.jar"));
+                let mut tmp = dir.join(format!("cratonvm-{pid}-{now_ms}-{stem}.jar"));
                 let mut dst_file = None;
                 for attempt in 0..16 {
                     match std::fs::OpenOptions::new()
@@ -667,7 +667,7 @@ fn run() -> Result<()> {
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                             tmp = dir.join(format!(
-                                "rustjvm-{pid}-{now_ms}-{attempt}-{stem}.jar"
+                                "cratonvm-{pid}-{now_ms}-{attempt}-{stem}.jar"
                             ));
                         }
                         Err(e) => {
@@ -782,7 +782,7 @@ fn run() -> Result<()> {
     // -Xverify:* takes precedence over --noverify when both are present
     // (matches HotSpot, where the more specific flag wins).
     let xverify_mode = if let Some(spec) = args.xverify.as_deref() {
-        match rustjvm_vm::config::XverifyMode::parse(spec) {
+        match cratonvm_vm::config::XverifyMode::parse(spec) {
             Some(m) => Some(m),
             None => {
                 eprintln!(
@@ -846,16 +846,16 @@ fn run() -> Result<()> {
         config.shared_archive_file = Some(archive_path.clone());
     }
     config.cds_mode = match args.xshare.as_str() {
-        "on" => rustjvm_vm::config::CdsMode::On,
-        "auto" => rustjvm_vm::config::CdsMode::Auto,
-        "dump" => rustjvm_vm::config::CdsMode::Dump,
-        "off" => rustjvm_vm::config::CdsMode::Off,
+        "on" => cratonvm_vm::config::CdsMode::On,
+        "auto" => cratonvm_vm::config::CdsMode::Auto,
+        "dump" => cratonvm_vm::config::CdsMode::Dump,
+        "off" => cratonvm_vm::config::CdsMode::Off,
         other => {
             // Warn on a typo rather than silently defaulting to Off.
             eprintln!(
                 "Warning: ignoring unknown -Xshare mode {other:?}; expected on|auto|dump|off"
             );
-            rustjvm_vm::config::CdsMode::Off
+            cratonvm_vm::config::CdsMode::Off
         }
     };
 
@@ -867,32 +867,32 @@ fn run() -> Result<()> {
         config.use_synthetic_jdk = false;
     } else {
         // Auto-detect: if a JDK is available via env or PATH, use real JDK
-        if rustjvm_vm::config::resolve_java_home_public(None).is_some() {
+        if cratonvm_vm::config::resolve_java_home_public(None).is_some() {
             config.use_synthetic_jdk = false;
         }
     }
 
     // AOT configuration
     config.aot_mode = match args.aot_mode.as_str() {
-        "training" => rustjvm_vm::config::AotMode::Training,
-        "production" => rustjvm_vm::config::AotMode::Production,
-        "off" => rustjvm_vm::config::AotMode::Off,
+        "training" => cratonvm_vm::config::AotMode::Training,
+        "production" => cratonvm_vm::config::AotMode::Production,
+        "off" => cratonvm_vm::config::AotMode::Off,
         other => {
             // Warn on a typo rather than silently defaulting to Off.
             eprintln!(
                 "Warning: ignoring unknown -XX:AOTMode value {other:?}; \
                  expected off|training|production"
             );
-            rustjvm_vm::config::AotMode::Off
+            cratonvm_vm::config::AotMode::Off
         }
     };
     if let Some(cache_path) = &args.aot_cache {
         // AOTCache serves as input in production mode and output in training mode
         match config.aot_mode {
-            rustjvm_vm::config::AotMode::Production => {
+            cratonvm_vm::config::AotMode::Production => {
                 config.aot_cache_input = Some(cache_path.clone());
             }
-            rustjvm_vm::config::AotMode::Training => {
+            cratonvm_vm::config::AotMode::Training => {
                 if config.aot_cache_output.is_none() {
                     config.aot_cache_output = Some(cache_path.clone());
                 }
@@ -976,12 +976,12 @@ fn run() -> Result<()> {
     // points at a JAR + `Premain-Class` manifest attribute, while
     // `-agentlib:` / `-agentpath:` point at native libraries with a
     // C `Agent_OnLoad` entry point) so we can route them independently.
-    let mut java_agents: Vec<rustjvm_vm::runtime::agent_loader::LoadedAgent> = Vec::new();
+    let mut java_agents: Vec<cratonvm_vm::runtime::agent_loader::LoadedAgent> = Vec::new();
     if !hotspot_flags.agent_options.is_empty() {
         let mut native_agent_opts: Vec<String> = Vec::new();
         for opt in &hotspot_flags.agent_options {
             if opt.starts_with("-javaagent:") {
-                match rustjvm_vm::runtime::agent_loader::parse_javaagent_spec(opt) {
+                match cratonvm_vm::runtime::agent_loader::parse_javaagent_spec(opt) {
                     Ok(agent) => java_agents.push(agent),
                     Err(e) => {
                         // Per the `java.lang.instrument` package spec, a
@@ -1002,7 +1002,7 @@ fn run() -> Result<()> {
     // Validate the class name before proceeding
     validate_class_name(&class_name)?;
 
-    info!("Starting RustJVM");
+    info!("Starting CratonVM");
     info!("Class: {class_name}");
     info!("Classpath: {:?}", config.classpath);
 
@@ -1017,7 +1017,7 @@ fn run() -> Result<()> {
     // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ make hangs visible by default.
     //
     // When neither `--stack-dump-on-timeout` is supplied nor the
-    // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG` env var is set, install a
+    // `CRATONVM_DISABLE_DEFAULT_WATCHDOG` env var is set, install a
     // conservative 45-second default. This guarantees a hung VM emits
     // **something** to stderr before the surrounding harness kills the
     // process Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the previous default of "no watchdog" produced empty
@@ -1032,19 +1032,19 @@ fn run() -> Result<()> {
     // every existing probe runner's 60s `TIMEOUT_SEC`. Long-running
     // services (Keycloak, Quarkus, WildFly) should pass an explicit
     // `--stack-dump-on-timeout=N` (with N suitably large) or set
-    // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the same way they pass
+    // `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the same way they pass
     // explicit `-Xmx` instead of relying on heap defaults.
     let effective_watchdog = match args.stack_dump_on_timeout {
         Some(s) if s > 0 => Some(s),
         Some(_) => None, // explicit `--stack-dump-on-timeout=0` disables
         None => {
-            if std::env::var("RUSTJVM_DISABLE_DEFAULT_WATCHDOG").ok().as_deref()
+            if std::env::var("CRATONVM_DISABLE_DEFAULT_WATCHDOG").ok().as_deref()
                 == Some("1")
             {
                 None
             } else {
                 Some(
-                    std::env::var("RUSTJVM_DEFAULT_WATCHDOG_SEC")
+                    std::env::var("CRATONVM_DEFAULT_WATCHDOG_SEC")
                         .ok()
                         .and_then(|s| s.parse().ok())
                         // Bumped from 45 → 120: WildFly bootstrap was making
@@ -1068,7 +1068,7 @@ fn run() -> Result<()> {
         // Recording cost (single relaxed AtomicBool load on entry, plus
         // a parking_lot::Mutex when set) is negligible compared to the
         // value of identifying the hang site on intermittent hangs.
-        rustjvm_native_api::native_ring::enable(true);
+        cratonvm_native_api::native_ring::enable(true);
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
@@ -1079,7 +1079,7 @@ fn run() -> Result<()> {
         let watchdog_dump_path = args.dump_missing_natives.clone();
         let watchdog_dump_grouped_path = args.dump_missing_natives_grouped.clone();
         std::thread::Builder::new()
-            .name("rustjvm-stack-watchdog".into())
+            .name("cratonvm-stack-watchdog".into())
             .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(secs));
                 // Banner first so the user can tell we got this far.
@@ -1152,7 +1152,7 @@ fn run() -> Result<()> {
                     // KC-watchdog-native: dump the native-call ring
                     // buffer. The last entry with `STILL-IN-NATIVE`
                     // marks the hang site.
-                    rustjvm_native_api::native_ring::dump_to_stderr();
+                    cratonvm_native_api::native_ring::dump_to_stderr();
                 }
 
                 // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE
@@ -1194,7 +1194,7 @@ fn run() -> Result<()> {
             })
             .context("failed to spawn stack-dump watchdog thread")?;
         eprintln!(
-            "[rustjvm] stack-dump watchdog armed: will dump + abort after {secs}s"
+            "[cratonvm] stack-dump watchdog armed: will dump + abort after {secs}s"
         );
     }
 
@@ -1215,10 +1215,10 @@ fn run() -> Result<()> {
 
     // Resolve the String[] class id for the args array.
     // ClassId(0) is java/lang/Object Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the base reference array element type.
-    let string_array_class_id = rustjvm_vm::ClassId::new(0);
+    let string_array_class_id = cratonvm_vm::ClassId::new(0);
     let args_array = vm.shared.heap.alloc_array(
         string_array_class_id,
-        rustjvm_vm::memory::heap::ArrayElementType::Reference,
+        cratonvm_vm::memory::heap::ArrayElementType::Reference,
         java_args.len(),
     );
     for (i, val) in java_args.into_iter().enumerate() {
@@ -1244,7 +1244,7 @@ fn run() -> Result<()> {
                 // subsystems we don't fully emulate (e.g. Unsafe accessors hitting
                 // uninitialized reference slots).  The fallback path uses our
                 // synthetic System.in/out/err so stdout/stderr still work.
-                if let rustjvm_vm::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
+                if let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                     let exc_class_id = vm.shared.heap.class_id_of(*exc_ref);
                     let exc_class_name = vm.shared.class_manager.read()
                         .get_class(exc_class_id)
@@ -1274,7 +1274,7 @@ fn run() -> Result<()> {
         // WP1.3: initPhase2 / initPhase3 are pure-Java methods on
         // `java.lang.System` that finalise modules + classpath and
         // install `ClassLoader.scl`.  We don't run them end-to-end in
-        // rustjvm (the real-JDK module graph resolution pulls in
+        // cratonvm (the real-JDK module graph resolution pulls in
         // subsystems we don't implement), but many callers key on
         // `initLevel() >= 3` to decide whether
         // `ClassLoader.getSystemClassLoader()` may read the `scl`
@@ -1287,7 +1287,7 @@ fn run() -> Result<()> {
     // WP1.3: right before `main()` starts, advance to level 4 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ
     // HotSpot's "VM fully initialized" state.  This is the signal
     // that `ClassLoader.getSystemClassLoader()` may return `scl` if
-    // it is populated (in rustjvm it usually isn't, so callers fall
+    // it is populated (in cratonvm it usually isn't, so callers fall
     // through to `getBuiltinAppClassLoader()` without harm), that
     // `Thread.currentThread().getName()` is safe, and that every
     // subsystem keyed on `VM.awaitInitLevel(4)` can proceed.  We
@@ -1302,7 +1302,7 @@ fn run() -> Result<()> {
     // (logged inside the dispatcher) unless the agent throws a fatal
     // `Error`, in which case we abort here.
     if !java_agents.is_empty() {
-        let res = rustjvm_vm::runtime::agent_loader::invoke_premains(
+        let res = cratonvm_vm::runtime::agent_loader::invoke_premains(
             &vm.shared,
             &mut vm.main_thread,
             &java_agents,
@@ -1344,12 +1344,12 @@ fn run() -> Result<()> {
             Ok(()) => {
                 let count = vm.shared.get_missing_natives().len();
                 eprintln!(
-                    "[rustjvm] wrote {count} missing-native entries to {path}"
+                    "[cratonvm] wrote {count} missing-native entries to {path}"
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "[rustjvm] warning: could not write missing-natives JSON to {path}: {e}"
+                    "[cratonvm] warning: could not write missing-natives JSON to {path}: {e}"
                 );
             }
         }
@@ -1362,14 +1362,14 @@ fn run() -> Result<()> {
                 let grouped = vm.shared.classify_missing_natives_by_module();
                 let total: usize = grouped.values().map(|v| v.len()).sum();
                 eprintln!(
-                    "[rustjvm] wrote {total} missing-native entries across \
+                    "[cratonvm] wrote {total} missing-native entries across \
                      {} modules to {path}",
                     grouped.len()
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "[rustjvm] warning: could not write grouped missing-natives \
+                    "[cratonvm] warning: could not write grouped missing-natives \
                      JSON to {path}: {e}"
                 );
             }
@@ -1391,7 +1391,7 @@ fn run() -> Result<()> {
                 "WARN: main() completed with {swallowed} swallowed VM error(s) \
                  (class-init / invokedynamic / native). Re-run with \
                  RUST_LOG=warn (already default) to see each site, or \
-                 RUSTJVM_STRICT_SWALLOWS=1 to escalate the first swallow to a \
+                 CRATONVM_STRICT_SWALLOWS=1 to escalate the first swallow to a \
                  panic for diagnosis."
             );
         }
@@ -1441,7 +1441,7 @@ fn run() -> Result<()> {
             .len();
         if pending > 0 {
             eprintln!(
-                "[rustjvm] main() returned; VM held alive by {pending} \
+                "[cratonvm] main() returned; VM held alive by {pending} \
                  non-daemon thread(s) (JVM-spec behaviour). Send SIGINT/\
                  SIGTERM, use System.exit(), or pass --stack-dump-on-timeout \
                  to bound execution."
@@ -1453,7 +1453,7 @@ fn run() -> Result<()> {
             .wait_for_non_daemon_threads(None);
         if joined > 0 {
             tracing::info!(
-                "rustjvm: joined {joined} non-daemon thread(s) after main() returned"
+                "cratonvm: joined {joined} non-daemon thread(s) after main() returned"
             );
         }
     }
@@ -1470,7 +1470,7 @@ fn run() -> Result<()> {
             //
             // Also render the captured Java-side stack trace from the
             // `stackTrace` field on each Throwable when present. NOTE: in the
-            // current rustjvm, `Throwable.fillInStackTrace` (see
+            // current cratonvm, `Throwable.fillInStackTrace` (see
             // `native-builtins/src/lang_misc.rs`) only stashes frames into the
             // per-thread `JvmThread::throwable_stacks` map keyed by identity
             // hash Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ it does NOT populate the heap-side `stackTrace` /
@@ -1538,7 +1538,7 @@ fn run() -> Result<()> {
                 let message = if let Some(i) = msg_idx {
                     let v = vm.shared.heap.get_field(cur, i);
                     if let Value::Object(Some(s)) = v {
-                        rustjvm_vm::vm::read_java_string(&vm.shared.heap, s).unwrap_or_default()
+                        cratonvm_vm::vm::read_java_string(&vm.shared.heap, s).unwrap_or_default()
                     } else { String::new() }
                 } else { String::new() };
                 let line = if message.is_empty() {
@@ -1604,7 +1604,7 @@ fn run() -> Result<()> {
                                 let read_str = |idx: usize| -> Option<String> {
                                     match vm.shared.heap.get_field(elem_ref, idx) {
                                         Value::Object(Some(s)) => {
-                                            rustjvm_vm::vm::read_java_string(&vm.shared.heap, s)
+                                            cratonvm_vm::vm::read_java_string(&vm.shared.heap, s)
                                         }
                                         _ => None,
                                     }
@@ -1715,7 +1715,7 @@ fn run() -> Result<()> {
                             Ok(_) => {}
                             Err(e) => {
                                 lines.push(format!(
-                                    "[rustjvm-cli] InvocationTargetException.{meth}() failed: {e:?}"
+                                    "[cratonvm-cli] InvocationTargetException.{meth}() failed: {e:?}"
                                 ));
                             }
                         }
@@ -1760,7 +1760,7 @@ fn run() -> Result<()> {
                             Value::Object(Some(arr)) => {
                                 let n = vm.shared.heap.array_length(arr);
                                 lines.push(format!(
-                                    "[rustjvm-cli] PropertyBatchUpdateException.propertyAccessExceptions length={n}"
+                                    "[cratonvm-cli] PropertyBatchUpdateException.propertyAccessExceptions length={n}"
                                 ));
                                 for i in 0..n {
                                     let elem = vm.shared.heap.get_array_element(arr, i).ok();
@@ -1799,18 +1799,18 @@ fn run() -> Result<()> {
                                             }
                                             let read_s = |idx: Option<usize>| -> String {
                                                 idx.and_then(|i| match vm.shared.heap.get_field(eref, i) {
-                                                    Value::Object(Some(s)) => rustjvm_vm::vm::read_java_string(&vm.shared.heap, s),
+                                                    Value::Object(Some(s)) => cratonvm_vm::vm::read_java_string(&vm.shared.heap, s),
                                                     _ => None,
                                                 }).unwrap_or_default()
                                             };
                                             (ename, read_s(mi), ci, read_s(pn))
                                         };
                                         lines.push(format!(
-                                            "[rustjvm-cli]   [{i}] {ename} property='{spname}' message={smsg:?}"
+                                            "[cratonvm-cli]   [{i}] {ename} property='{spname}' message={smsg:?}"
                                         ));
                                         if let Some(frames) = vm.throwable_stack_for(eref) {
                                             if !frames.is_empty() {
-                                                lines.push(format!("[rustjvm-cli]       ({} captured frames)", frames.len()));
+                                                lines.push(format!("[cratonvm-cli]       ({} captured frames)", frames.len()));
                                                 for frame in frames.iter().take(12) {
                                                     let loc = match (frame.file.as_deref(), frame.line) {
                                                         (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
@@ -1860,15 +1860,15 @@ fn run() -> Result<()> {
                                                     } else { break; }
                                                 }
                                                 let m = mi.and_then(|i| match vm.shared.heap.get_field(sc, i) {
-                                                    Value::Object(Some(s)) => rustjvm_vm::vm::read_java_string(&vm.shared.heap, s),
+                                                    Value::Object(Some(s)) => cratonvm_vm::vm::read_java_string(&vm.shared.heap, s),
                                                     _ => None,
                                                 }).unwrap_or_default();
                                                 (sc_name, m, ci)
                                             };
-                                            lines.push(format!("[rustjvm-cli]       Caused by: {sc_name}: {sc_msg}"));
+                                            lines.push(format!("[cratonvm-cli]       Caused by: {sc_name}: {sc_msg}"));
                                             if let Some(frames) = vm.throwable_stack_for(sc) {
                                                 if !frames.is_empty() {
-                                                    lines.push(format!("[rustjvm-cli]         ({} captured frames)", frames.len()));
+                                                    lines.push(format!("[cratonvm-cli]         ({} captured frames)", frames.len()));
                                                     for frame in frames.iter().take(16) {
                                                         let loc = match (frame.file.as_deref(), frame.line) {
                                                             (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
@@ -1886,17 +1886,17 @@ fn run() -> Result<()> {
                                             });
                                         }
                                     } else {
-                                        lines.push(format!("[rustjvm-cli]   [{i}] <null>"));
+                                        lines.push(format!("[cratonvm-cli]   [{i}] <null>"));
                                     }
                                 }
                             }
                             Value::Object(None) => {
-                                lines.push("[rustjvm-cli] PropertyBatchUpdateException.propertyAccessExceptions = null".into());
+                                lines.push("[cratonvm-cli] PropertyBatchUpdateException.propertyAccessExceptions = null".into());
                             }
                             _ => {}
                         }
                     } else {
-                        lines.push("[rustjvm-cli] PropertyBatchUpdateException.propertyAccessExceptions field NOT FOUND on class".into());
+                        lines.push("[cratonvm-cli] PropertyBatchUpdateException.propertyAccessExceptions field NOT FOUND on class".into());
                     }
                 }
                 if let Some(c) = next_cause {
@@ -1916,7 +1916,7 @@ fn run() -> Result<()> {
                 if let Some(frames) = vm.throwable_stack_for(exc_ref) {
                     if !frames.is_empty() {
                         lines.push(
-                            "[rustjvm-cli] Throwable stack (fillInStackTrace) for InvocationTargetException:"
+                            "[cratonvm-cli] Throwable stack (fillInStackTrace) for InvocationTargetException:"
                                 .to_string(),
                         );
                         for frame in frames.iter().take(24) {
@@ -1994,7 +1994,7 @@ fn main() {
         // debug produces the "Keycloak exits in 5s with no output"
         // failure mode where 19 caught NPEs corrupt picocli state and
         // `parseAndRun` returns without ever calling `start-dev`.
-        let in_bootstrap = rustjvm_native_api::init_level::get_init_level() < 4;
+        let in_bootstrap = cratonvm_native_api::init_level::get_init_level() < 4;
         let is_known_bootstrap_quiet = (msg.contains("unaligned pointer")
             || msg.contains("null pointer"))
             && in_bootstrap;
@@ -2002,7 +2002,7 @@ fn main() {
         if is_known_bootstrap_quiet {
             if let Some(loc) = info.location() {
                 tracing::debug!(
-                    target: "rustjvm::panic",
+                    target: "cratonvm::panic",
                     file = loc.file(),
                     line = loc.line(),
                     column = loc.column(),
@@ -2011,7 +2011,7 @@ fn main() {
                 );
             } else {
                 tracing::debug!(
-                    target: "rustjvm::panic",
+                    target: "cratonvm::panic",
                     thread = thread_name,
                     "bootstrap-path panic (caught upstream): {msg}",
                 );
@@ -2054,7 +2054,7 @@ fn main() {
         // it out.
         if let Some(loc) = info.location() {
             tracing::warn!(
-                target: "rustjvm::panic",
+                target: "cratonvm::panic",
                 file = loc.file(),
                 line = loc.line(),
                 column = loc.column(),
@@ -2062,7 +2062,7 @@ fn main() {
                 "panic: {msg}",
             );
         } else {
-            tracing::warn!(target: "rustjvm::panic", thread = thread_name, "panic: {msg}");
+            tracing::warn!(target: "cratonvm::panic", thread = thread_name, "panic: {msg}");
         }
     }));
 
@@ -2228,13 +2228,13 @@ mod tests {
     #[test]
     fn extract_d_properties() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "-Djboss.home.dir=C:/craton/kc16".to_string(),
             "-Dmy.flag".to_string(),
             "com.example.Main".to_string(),
         ];
         let (filtered, props) = extract_system_properties(raw);
-        assert_eq!(filtered, vec!["rustjvm", "com.example.Main"]);
+        assert_eq!(filtered, vec!["cratonvm", "com.example.Main"]);
         assert_eq!(props, vec![
             ("jboss.home.dir".to_string(), "C:/craton/kc16".to_string()),
             ("my.flag".to_string(), String::new()),
@@ -2243,16 +2243,16 @@ mod tests {
 
     #[test]
     fn extract_d_no_properties() {
-        let raw = vec!["rustjvm".to_string(), "Main".to_string()];
+        let raw = vec!["cratonvm".to_string(), "Main".to_string()];
         let (filtered, props) = extract_system_properties(raw);
-        assert_eq!(filtered, vec!["rustjvm", "Main"]);
+        assert_eq!(filtered, vec!["cratonvm", "Main"]);
         assert!(props.is_empty());
     }
 
     #[test]
     fn extract_d_value_with_equals() {
         // -Dkey=val=ue  Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ  key = "val=ue"
-        let raw = vec!["rustjvm".to_string(), "-Dpath=a=b".to_string()];
+        let raw = vec!["cratonvm".to_string(), "-Dpath=a=b".to_string()];
         let (_, props) = extract_system_properties(raw);
         assert_eq!(props, vec![("path".to_string(), "a=b".to_string())]);
     }
@@ -2260,7 +2260,7 @@ mod tests {
     #[test]
     fn normalize_classpath_and_jar_for_clap() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "-classpath".to_string(),
             "a;b".to_string(),
             "-cp=c:d".to_string(),
@@ -2271,7 +2271,7 @@ mod tests {
         assert_eq!(
             normalize_java_launcher_argv(raw),
             vec![
-                "rustjvm",
+                "cratonvm",
                 "--classpath",
                 "a;b",
                 "--classpath",
@@ -2293,19 +2293,19 @@ mod tests {
     #[test]
     fn hotspot_flag_enables_heap_dump_on_oom() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "-XX:+HeapDumpOnOutOfMemoryError".to_string(),
             "Main".to_string(),
         ];
         let (filtered, flags) = extract_hotspot_flags(raw);
-        assert_eq!(filtered, vec!["rustjvm", "Main"]);
+        assert_eq!(filtered, vec!["cratonvm", "Main"]);
         assert_eq!(flags.heap_dump_on_oom, Some(true));
     }
 
     #[test]
     fn hotspot_flag_disables_heap_dump_on_oom() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "-XX:-HeapDumpOnOutOfMemoryError".to_string(),
             "Main".to_string(),
         ];
@@ -2316,26 +2316,26 @@ mod tests {
     #[test]
     fn hotspot_flag_extracts_heap_dump_path() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "-XX:HeapDumpPath=/tmp/heap.hprof".to_string(),
             "Main".to_string(),
         ];
         let (filtered, flags) = extract_hotspot_flags(raw);
-        assert_eq!(filtered, vec!["rustjvm", "Main"]);
+        assert_eq!(filtered, vec!["cratonvm", "Main"]);
         assert_eq!(flags.heap_dump_path.as_deref(), Some("/tmp/heap.hprof"));
     }
 
     #[test]
     fn hotspot_flag_preserves_all_agent_tokens() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "-agentlib:jdwp=transport=dt_socket,server=y,address=5005".to_string(),
             "-agentpath:/opt/myagent.so=trace".to_string(),
             "-javaagent:/opt/bytebuddy.jar".to_string(),
             "Main".to_string(),
         ];
         let (filtered, flags) = extract_hotspot_flags(raw);
-        assert_eq!(filtered, vec!["rustjvm", "Main"]);
+        assert_eq!(filtered, vec!["cratonvm", "Main"]);
         assert_eq!(flags.agent_options.len(), 3);
         assert!(flags.agent_options[0].starts_with("-agentlib:jdwp="));
         assert!(flags.agent_options[1].starts_with("-agentpath:/opt/myagent.so"));
@@ -2345,12 +2345,12 @@ mod tests {
     #[test]
     fn hotspot_flag_passes_unknown_through() {
         let raw = vec![
-            "rustjvm".to_string(),
+            "cratonvm".to_string(),
             "--foo".to_string(),
             "Main".to_string(),
         ];
         let (filtered, flags) = extract_hotspot_flags(raw);
-        assert_eq!(filtered, vec!["rustjvm", "--foo", "Main"]);
+        assert_eq!(filtered, vec!["cratonvm", "--foo", "Main"]);
         assert!(flags.agent_options.is_empty());
         assert!(flags.heap_dump_on_oom.is_none());
         assert!(flags.heap_dump_path.is_none());
@@ -2365,7 +2365,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("rustjvm-cli-{label}-{pid}-{id}"));
+        let dir = std::env::temp_dir().join(format!("cratonvm-cli-{label}-{pid}-{id}"));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

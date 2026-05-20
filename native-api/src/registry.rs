@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use rustjvm_types::ClassId;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, ObjectKind};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectKind};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Reflection metadata types
@@ -49,7 +49,7 @@ pub struct MethodMetadata {
 
 /// WP2.3 — defineClass options carried through `NativeContext::define_class_full`.
 ///
-/// Mirrors `rustjvm_classloading::DefineClassOptions` but without the
+/// Mirrors `cratonvm_classloading::DefineClassOptions` but without the
 /// crate dependency, so native-builtins can construct it without
 /// importing classloading directly. The VM's `NativeContext`
 /// implementation translates this into a `DefineClassOptions` and
@@ -475,7 +475,7 @@ pub trait NativeContext {
     fn ensure_class_initialized(
         &mut self,
         name: &str,
-    ) -> Result<ClassId, rustjvm_types::error::MethodCallFailed>;
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
 
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
@@ -544,16 +544,16 @@ pub trait NativeContext {
         &mut self,
         obj: ObjectRef,
         timeout_ms: Option<u64>,
-    ) -> rustjvm_types::error::MethodCallResult;
+    ) -> cratonvm_types::error::MethodCallResult;
 
     /// Perform Object.notify() on the given object's monitor.
-    fn monitor_notify(&mut self, obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn monitor_notify(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// Perform Object.notifyAll() on the given object's monitor.
-    fn monitor_notify_all(&mut self, obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn monitor_notify_all(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// Spawn a new OS thread to run Thread.run() on the given Java Thread object.
-    fn thread_start(&mut self, thread_obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn thread_start(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// T19_K2 — Register a native-spawned OS thread with the VM's
     /// `ThreadRegistry`.
@@ -681,7 +681,7 @@ pub trait NativeContext {
     }
 
     /// Block until the target thread (identified by Java Thread object) finishes.
-    fn thread_join(&mut self, thread_obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn thread_join(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// Check if the target thread (identified by Java Thread object) is alive.
     fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool;
@@ -1229,7 +1229,7 @@ pub trait NativeContext {
     fn free_native_memory(&mut self, alloc_id: i64);
 
     /// Load a native library. Returns library index or error.
-    fn load_native_library(&mut self, path: &str) -> Result<i64, rustjvm_types::error::MethodCallFailed>;
+    fn load_native_library(&mut self, path: &str) -> Result<i64, cratonvm_types::error::MethodCallFailed>;
 
     /// Find a symbol in a loaded library. Returns the symbol address.
     /// lib_index -1 means search the default/system library.

@@ -1,6 +1,6 @@
 //! Wave 3, Task C — `apps/selector_probe/SelectorProbe.java` regression test.
 //!
-//! Pin the JDK NIO selector loop end-to-end against the rustjvm CLI in
+//! Pin the JDK NIO selector loop end-to-end against the cratonvm CLI in
 //! real-JDK mode. The probe sets up a `ServerSocketChannel` + `Selector`
 //! pair, drives `select(500)` until OP_ACCEPT fires, accepts the
 //! connection, exchanges a single byte, and exits.
@@ -28,15 +28,15 @@ fn probe_dir() -> PathBuf {
     worktree_root().join("apps").join("selector_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -58,7 +58,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<String> {
-    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
         return Some(h);
     }
     if let Ok(h) = std::env::var("JAVA_HOME") {
@@ -72,7 +72,7 @@ fn java_home() -> Option<String> {
 }
 
 fn run_selector_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("SelectorProbe.class").exists() {
         eprintln!("[wave3-c] SelectorProbe.class missing — run javac in apps/selector_probe");
@@ -88,7 +88,7 @@ fn run_selector_probe(timeout: Duration) -> Option<(String, String, Option<i32>)
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave3-c] failed to spawn rustjvm: {e}");
+            eprintln!("[wave3-c] failed to spawn cratonvm: {e}");
             return None;
         }
     };
@@ -136,7 +136,7 @@ fn selector_probe_loopback_echo() {
     assert_eq!(
         rc,
         Some(0),
-        "wave3-c: rustjvm exited rc={:?}, stdout={:?}, stderr={:?}",
+        "wave3-c: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
         rc, stdout, stderr
     );
     assert!(

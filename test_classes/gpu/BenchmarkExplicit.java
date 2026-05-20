@@ -21,7 +21,7 @@
 //         -d test_classes/gpu \
 //         test_classes/gpu/BenchmarkExplicit.java \
 //         test_classes/gpu/EligibleVectorAdd.java
-//   rustjvm --gpu \
+//   cratonvm --gpu \
 //           --classpath test_classes/gpu:<craton-gpu-jar> \
 //           BenchmarkExplicit 16777216 5
 //

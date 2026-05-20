@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
 
 
 // ===========================================================================

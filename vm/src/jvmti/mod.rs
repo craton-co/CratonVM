@@ -294,7 +294,7 @@ pub fn iterate_over_heap(
 ) {
     for &(ptr, size) in heap_objects {
         let addr = ptr as usize;
-        let header = unsafe { &*(ptr as *const rustjvm_types::ObjectHeader) };
+        let header = unsafe { &*(ptr as *const cratonvm_types::ObjectHeader) };
         let info = HeapObjectInfo {
             address: addr,
             size,
@@ -315,7 +315,7 @@ pub fn iterate_over_instances_of_class(
     mut visitor: impl FnMut(&HeapObjectInfo) -> HeapVisitControl,
 ) {
     for &(ptr, size) in heap_objects {
-        let header = unsafe { &*(ptr as *const rustjvm_types::ObjectHeader) };
+        let header = unsafe { &*(ptr as *const cratonvm_types::ObjectHeader) };
         if header.class_id.as_u32() != target_class_id {
             continue;
         }

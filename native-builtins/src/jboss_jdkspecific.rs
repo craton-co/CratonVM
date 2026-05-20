@@ -16,7 +16,7 @@
 //!     that wires `modules()` / `findModule` to return populated values.)
 //!   - `java.lang.ModuleLayer.findModule(String)` — returns an `Optional<Module>`
 //!     populated with a synthetic `Module` whose `getPackages()` lists the JDK
-//!     packages rustjvm currently knows about.
+//!     packages cratonvm currently knows about.
 //!   - `java.lang.Module.getPackages()` — returns a `Set<String>` backed by a
 //!     concrete `java.util.HashSet` with the JDK's published boot packages.
 //!   - Safety-hardened inputs: module-name rejects `../`, backslashes, control
@@ -26,9 +26,9 @@
 //! This module is loaded from `lib.rs::register_essential_natives` alongside
 //! the existing `jboss_module_xml` handlers.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -176,14 +176,14 @@ fn build_boot_layer(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// Build a `java.util.HashSet<String>` pre-populated with `packages`.
 fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRef {
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    // Seed a descriptive default layout so rustjvm's synthetic HashSet
+    // Seed a descriptive default layout so cratonvm's synthetic HashSet
     // paths don't misread null slots: slot 0 = backing array or null
     // marker, slot 1 = size (Int), slot 2 = capacity (Int).
     ctx.set_field(set, 0, Value::Object(None));
     ctx.set_field(set, 1, Value::Int(packages.len() as i32));
     ctx.set_field(set, 2, Value::Int(16));
     // Actual element storage: an Object[] array referenced from slot 0.
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, packages.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, packages.len());
     for (i, pkg) in packages.iter().enumerate() {
         let s = ctx.create_string(pkg);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -472,7 +472,7 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         let cid = ctx
             .ensure_class_initialized(&class_name)
             .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))
-            .unwrap_or(rustjvm_types::ClassId::new(0));
+            .unwrap_or(cratonvm_types::ClassId::new(0));
         let mirror = ctx.get_class_mirror(cid);
         Ok(Some(Value::Object(Some(mirror))))
     }

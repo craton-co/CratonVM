@@ -305,10 +305,38 @@ impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cud
         backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
     }
 
+    /// Allocate and upload from `host` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::from_host`] but submits the H→D copy
+    /// against an explicit [`Stream`] (Phase 2). The transfer is
+    /// recorded as a [`StreamOp::UploadAsync`] on `stream` so stub-mode
+    /// callers can inspect the op log; in `cuda` mode `record_op` is a
+    /// no-op (the driver owns the queue).
+    pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        let buf = backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)?;
+        stream.record_op(StreamOp::UploadAsync {
+            bytes: std::mem::size_of_val(host),
+        });
+        Ok(buf)
+    }
+
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
         self.0.to_host(dst)
+    }
+
+    /// Copy `len()` elements back into `dst` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::to_host`] but submits the D→H copy
+    /// against an explicit [`Stream`] (Phase 2), recorded as a
+    /// [`StreamOp::DownloadAsync`] on `stream`.
+    pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        let bytes = std::mem::size_of_val(dst);
+        self.0.to_host(dst)?;
+        stream.record_op(StreamOp::DownloadAsync { bytes });
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -337,9 +365,34 @@ impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
         backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
     }
 
+    /// Allocate and upload from `host` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::from_host`] but records the H→D copy as
+    /// a [`StreamOp::UploadAsync`] on `stream`. The op is recorded
+    /// before the (stub-mode) allocation is attempted so the op log
+    /// reflects the submitted work even though the stub backend
+    /// returns `Err(DeviceError::NoDriver)` for the allocation itself.
+    pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        stream.record_op(StreamOp::UploadAsync {
+            bytes: std::mem::size_of_val(host),
+        });
+        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+    }
+
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
+        self.0.to_host(dst)
+    }
+
+    /// Copy `len()` elements back into `dst` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::to_host`] but records the D→H copy as a
+    /// [`StreamOp::DownloadAsync`] on `stream`.
+    pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        stream.record_op(StreamOp::DownloadAsync {
+            bytes: std::mem::size_of_val(dst),
+        });
         self.0.to_host(dst)
     }
 

@@ -5,10 +5,10 @@
 
 use std::cell::Cell;
 
-use rustjvm_jit::{
+use cratonvm_jit::{
     DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitPICSlot, JitRuntimeHelpers,
 };
-use rustjvm_types::{
+use cratonvm_types::{
     ArrayElementType, ClassId, ObjectRef, Value,
     ARRAY_LENGTH_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
@@ -585,8 +585,8 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     let vm = &*(vm_ptr as *const SharedVm);
     let heap = &vm.heap;
     // Try allocation; if young gen exhausted, run GC and retry
-    let data_size = rustjvm_types::array_data_size(length as usize, elem_type).unwrap_or(0);
-    let total_size = rustjvm_types::HEADER_SIZE + data_size;
+    let data_size = cratonvm_types::array_data_size(length as usize, elem_type).unwrap_or(0);
+    let total_size = cratonvm_types::HEADER_SIZE + data_size;
     if heap.try_alloc_young_probe(total_size).is_none() {
         // Young gen full — trigger GC from JIT context
         if let Some((thread, _guard)) = jit_thread_mut() {
@@ -655,7 +655,7 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     *(raw_ptr.add(16) as *mut u32) = num_fields as u32;
 
     // Reconstruct the typed handle and finish init.
-    let obj_ref = rustjvm_types::ObjectRef::from_raw(raw_ptr);
+    let obj_ref = cratonvm_types::ObjectRef::from_raw(raw_ptr);
 
     // Primitive-typed default values walk the class hierarchy under the
     // class_manager RwLock. Kept here (rather than inlined) because the
@@ -1309,7 +1309,7 @@ unsafe fn jit_typecheck_resolve(
     // the JIT'd lambda body because `checkcast [I` after the clone() return
     // hit the false branch below and zeroed the result. With this branch
     // in place, the cast succeeds and the array round-trips correctly.
-    if vm.heap.kind_of(obj_ref) == rustjvm_types::ObjectKind::Array {
+    if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
         if let Some(src_desc) =
             crate::runtime::interpreter::array_descriptor_of(vm, obj_ref)
         {
@@ -1380,7 +1380,7 @@ unsafe fn jit_typecheck_resolve(
     // lack class hierarchy entries.  Any reference array is assignable to
     // [Ljava/lang/Object; and any array is assignable to java/lang/Object,
     // java/io/Serializable, or java/lang/Cloneable.
-    if vm.heap.kind_of(obj_ref) == rustjvm_types::ObjectKind::Array {
+    if vm.heap.kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
         if class_name == "[Ljava/lang/Object;"
             || class_name == "java/lang/Object"
             || class_name == "java/io/Serializable"
@@ -1639,7 +1639,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // SAFETY: vm_ptr and info_ptr originate from JIT code; both point to valid, live objects.
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
-    // Defensive gate: when the user-facing RUSTJVM_DISABLE_JIT kill-switch is set,
+    // Defensive gate: when the user-facing CRATONVM_DISABLE_JIT kill-switch is set,
     // no JIT code should be executing — so this dispatch helper must never run.
     // Reaching it means a JIT entry point bypassed the flag (a real bug). Returning
     // 0 here is preferable to UB from a stale compiled callsite; emit a one-shot
@@ -1649,7 +1649,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             eprintln!(
-                "[rustjvm] WARN: jit_invoke_dispatch reached with RUSTJVM_DISABLE_JIT=1 \
+                "[cratonvm] WARN: jit_invoke_dispatch reached with CRATONVM_DISABLE_JIT=1 \
                  (callee {}.{}{}). A JIT entry-point bypassed the kill-switch — \
                  returning 0 to avoid undefined behavior.",
                 info.class_name, info.method_name, info.descriptor,
@@ -2063,7 +2063,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // of an enum type. Per JVMS §4.4.1, array classes inherit their
         // method table from `Object`; short-circuit accordingly.
         let class_name: String = if vm.heap.kind_of(receiver_ref)
-            == rustjvm_types::ObjectKind::Array
+            == cratonvm_types::ObjectKind::Array
         {
             "java/lang/Object".to_string()
         } else {
@@ -2162,7 +2162,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // their component class id, otherwise enum-array `clone()` resolves to
     // `Enum.clone()` (a JDK-deliberate CNSE thrower).
     let class_name: std::sync::Arc<str> = if vm.heap.kind_of(receiver_ref)
-        == rustjvm_types::ObjectKind::Array
+        == cratonvm_types::ObjectKind::Array
     {
         std::sync::Arc::from("java/lang/Object")
     } else {
@@ -2260,7 +2260,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 // ---------------------------------------------------------------------------
 
 /// Deopt reason codes passed from JIT-compiled code.
-/// These map to `rustjvm_jit::deopt::DeoptReason` variants.
+/// These map to `cratonvm_jit::deopt::DeoptReason` variants.
 pub const DEOPT_REASON_NULL_CHECK: i64 = 0;
 pub const DEOPT_REASON_CLASS_CHECK: i64 = 1;
 pub const DEOPT_REASON_BOUNDS_CHECK: i64 = 2;
@@ -2276,18 +2276,18 @@ pub const DEOPT_ACTION_REINTERPRET: i64 = 0;
 pub const DEOPT_ACTION_RECOMPILE: i64 = 1;
 pub const DEOPT_ACTION_BLACKLIST: i64 = 2;
 
-pub fn reason_code_to_deopt_reason(code: i64) -> rustjvm_jit::deopt::DeoptReason {
+pub fn reason_code_to_deopt_reason(code: i64) -> cratonvm_jit::deopt::DeoptReason {
     match code {
-        DEOPT_REASON_NULL_CHECK => rustjvm_jit::deopt::DeoptReason::NullCheck,
-        DEOPT_REASON_CLASS_CHECK => rustjvm_jit::deopt::DeoptReason::ClassCheck,
-        DEOPT_REASON_BOUNDS_CHECK => rustjvm_jit::deopt::DeoptReason::BoundsCheck,
-        DEOPT_REASON_DIV_BY_ZERO => rustjvm_jit::deopt::DeoptReason::DivByZero,
-        DEOPT_REASON_RECEIVER_TYPE_CHANGED => rustjvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
-        DEOPT_REASON_CLASS_LOADING => rustjvm_jit::deopt::DeoptReason::ClassLoading,
-        DEOPT_REASON_UNCOMMON_TRAP => rustjvm_jit::deopt::DeoptReason::UncommonTrap,
-        DEOPT_REASON_SPECULATION_FAILED => rustjvm_jit::deopt::DeoptReason::SpeculationFailed,
-        DEOPT_REASON_UNREACHED_CODE => rustjvm_jit::deopt::DeoptReason::UnreachedCode,
-        _ => rustjvm_jit::deopt::DeoptReason::UncommonTrap,
+        DEOPT_REASON_NULL_CHECK => cratonvm_jit::deopt::DeoptReason::NullCheck,
+        DEOPT_REASON_CLASS_CHECK => cratonvm_jit::deopt::DeoptReason::ClassCheck,
+        DEOPT_REASON_BOUNDS_CHECK => cratonvm_jit::deopt::DeoptReason::BoundsCheck,
+        DEOPT_REASON_DIV_BY_ZERO => cratonvm_jit::deopt::DeoptReason::DivByZero,
+        DEOPT_REASON_RECEIVER_TYPE_CHANGED => cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged,
+        DEOPT_REASON_CLASS_LOADING => cratonvm_jit::deopt::DeoptReason::ClassLoading,
+        DEOPT_REASON_UNCOMMON_TRAP => cratonvm_jit::deopt::DeoptReason::UncommonTrap,
+        DEOPT_REASON_SPECULATION_FAILED => cratonvm_jit::deopt::DeoptReason::SpeculationFailed,
+        DEOPT_REASON_UNREACHED_CODE => cratonvm_jit::deopt::DeoptReason::UnreachedCode,
+        _ => cratonvm_jit::deopt::DeoptReason::UncommonTrap,
     }
 }
 
@@ -2308,16 +2308,16 @@ impl DeoptimizationController {
         class_name: &str,
         method_name: &str,
         descriptor: &str,
-        reason: rustjvm_jit::deopt::DeoptReason,
+        reason: cratonvm_jit::deopt::DeoptReason,
         bci: u32,
-    ) -> rustjvm_jit::deopt::DeoptAction {
+    ) -> cratonvm_jit::deopt::DeoptAction {
         // Build method key for deopt log
         let method_key = format!("{}.{}:{}", class_name, method_name, descriptor);
 
         // Create the deopt event
-        let event = rustjvm_jit::deopt::DeoptEvent {
+        let event = cratonvm_jit::deopt::DeoptEvent {
             reason,
-            action: rustjvm_jit::deopt::DeoptAction::Reinterpret, // initial; may be overridden
+            action: cratonvm_jit::deopt::DeoptAction::Reinterpret, // initial; may be overridden
             bci,
             timestamp_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2327,7 +2327,7 @@ impl DeoptimizationController {
         };
 
         // Record in deopt log and get recommended action
-        let tiered_key = rustjvm_jit::tiered::MethodKey {
+        let tiered_key = cratonvm_jit::tiered::MethodKey {
             class_name: class_name.to_string(),
             method_name: method_name.to_string(),
             descriptor: descriptor.to_string(),
@@ -2344,9 +2344,9 @@ impl DeoptimizationController {
         // invalidation manager for dependent methods.
         if matches!(
             reason,
-            rustjvm_jit::deopt::DeoptReason::ReceiverTypeChanged
-                | rustjvm_jit::deopt::DeoptReason::ClassCheck
-                | rustjvm_jit::deopt::DeoptReason::ClassLoading
+            cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged
+                | cratonvm_jit::deopt::DeoptReason::ClassCheck
+                | cratonvm_jit::deopt::DeoptReason::ClassLoading
         ) {
             let mut inv_mgr = vm.invalidation_manager.lock();
             // Clear stale assumptions for the deoptimized method
@@ -2354,7 +2354,7 @@ impl DeoptimizationController {
         }
 
         // If the deopt log recommends giving up, add to the JIT skip set
-        if action == rustjvm_jit::deopt::DeoptAction::MakeNotCompilable {
+        if action == cratonvm_jit::deopt::DeoptAction::MakeNotCompilable {
             let mut skip = vm.jit_skip_set.write();
             skip.insert((
                 class_name.into(),
@@ -2378,27 +2378,27 @@ impl DeoptimizationController {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let reason_static: &'static str = match reason {
-                rustjvm_jit::deopt::DeoptReason::NullCheck => "NullCheck",
-                rustjvm_jit::deopt::DeoptReason::ClassCheck => "ClassCheck",
-                rustjvm_jit::deopt::DeoptReason::BoundsCheck => "BoundsCheck",
-                rustjvm_jit::deopt::DeoptReason::DivByZero => "DivByZero",
-                rustjvm_jit::deopt::DeoptReason::ReceiverTypeChanged => "ReceiverTypeChanged",
-                rustjvm_jit::deopt::DeoptReason::ClassLoading => "ClassLoading",
-                rustjvm_jit::deopt::DeoptReason::UninitializedAccess => "UninitializedAccess",
-                rustjvm_jit::deopt::DeoptReason::TransferToInterpreter => "TransferToInterpreter",
-                rustjvm_jit::deopt::DeoptReason::UncommonTrap => "UncommonTrap",
-                rustjvm_jit::deopt::DeoptReason::SpeculationFailed => "SpeculationFailed",
-                rustjvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
-                rustjvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
+                cratonvm_jit::deopt::DeoptReason::NullCheck => "NullCheck",
+                cratonvm_jit::deopt::DeoptReason::ClassCheck => "ClassCheck",
+                cratonvm_jit::deopt::DeoptReason::BoundsCheck => "BoundsCheck",
+                cratonvm_jit::deopt::DeoptReason::DivByZero => "DivByZero",
+                cratonvm_jit::deopt::DeoptReason::ReceiverTypeChanged => "ReceiverTypeChanged",
+                cratonvm_jit::deopt::DeoptReason::ClassLoading => "ClassLoading",
+                cratonvm_jit::deopt::DeoptReason::UninitializedAccess => "UninitializedAccess",
+                cratonvm_jit::deopt::DeoptReason::TransferToInterpreter => "TransferToInterpreter",
+                cratonvm_jit::deopt::DeoptReason::UncommonTrap => "UncommonTrap",
+                cratonvm_jit::deopt::DeoptReason::SpeculationFailed => "SpeculationFailed",
+                cratonvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
+                cratonvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
             };
             let action_static: &'static str = match action {
-                rustjvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",
-                rustjvm_jit::deopt::DeoptAction::RecompileAndReinterpret => "RecompileAndReinterpret",
-                rustjvm_jit::deopt::DeoptAction::MakeNotEntrant => "MakeNotEntrant",
-                rustjvm_jit::deopt::DeoptAction::MakeNotCompilable => "MakeNotCompilable",
+                cratonvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",
+                cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret => "RecompileAndReinterpret",
+                cratonvm_jit::deopt::DeoptAction::MakeNotEntrant => "MakeNotEntrant",
+                cratonvm_jit::deopt::DeoptAction::MakeNotCompilable => "MakeNotCompilable",
             };
             let mut jfr = vm.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_deoptimization_event(
+            cratonvm_jfr::builtin::emit_deoptimization_event(
                 &mut jfr,
                 &method_key,
                 0, // compile_id
@@ -2409,7 +2409,7 @@ impl DeoptimizationController {
                 // so JMC can attribute the deopt to the thread that triggered
                 // it. `current_jfr_thread_id()` is TLS-cached, allocates once
                 // per thread, and steady-state cost is a TLS read + branch.
-                rustjvm_jfr::builtin::current_jfr_thread_id(),
+                cratonvm_jfr::builtin::current_jfr_thread_id(),
                 now_ns,
             );
         }
@@ -2479,10 +2479,10 @@ pub unsafe extern "C" fn jit_uncommon_trap(
     );
 
     match action {
-        rustjvm_jit::deopt::DeoptAction::Reinterpret => DEOPT_ACTION_REINTERPRET,
-        rustjvm_jit::deopt::DeoptAction::RecompileAndReinterpret => DEOPT_ACTION_RECOMPILE,
-        rustjvm_jit::deopt::DeoptAction::MakeNotEntrant => DEOPT_ACTION_RECOMPILE,
-        rustjvm_jit::deopt::DeoptAction::MakeNotCompilable => DEOPT_ACTION_BLACKLIST,
+        cratonvm_jit::deopt::DeoptAction::Reinterpret => DEOPT_ACTION_REINTERPRET,
+        cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret => DEOPT_ACTION_RECOMPILE,
+        cratonvm_jit::deopt::DeoptAction::MakeNotEntrant => DEOPT_ACTION_RECOMPILE,
+        cratonvm_jit::deopt::DeoptAction::MakeNotCompilable => DEOPT_ACTION_BLACKLIST,
     }
 }
 
@@ -2719,8 +2719,8 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     // `Tlab::test_tlab_offsets` and `JvmThread::tlab_offset_matches_field_address`
     // pin the layout against drift.
     let tlab_off = JvmThread::tlab_offset();
-    let cursor_in_thread = tlab_off + rustjvm_gc::Tlab::CURSOR_OFFSET;
-    let end_in_thread = tlab_off + rustjvm_gc::Tlab::END_OFFSET;
+    let cursor_in_thread = tlab_off + cratonvm_gc::Tlab::CURSOR_OFFSET;
+    let end_in_thread = tlab_off + cratonvm_gc::Tlab::END_OFFSET;
 
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,

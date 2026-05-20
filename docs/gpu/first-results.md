@@ -26,7 +26,7 @@ On a CUDA-12.x Windows x64 box with an NVIDIA GPU + JDK 21:
 
 ```powershell
 # Build with the real driver bindings.
-cargo build --release -p rustjvm-cli --bin rustjvm --features gpu-driver
+cargo build --release -p cratonvm-cli --bin cratonvm --features gpu-driver
 
 # Locate the craton-gpu annotations jar (built by craton-gpu/build.rs).
 $annotJar = (Get-ChildItem -Recurse -Filter "craton-gpu-annotations.jar" target/release | Select-Object -First 1).FullName
@@ -42,13 +42,13 @@ $N = 16777216
 $ITERS = 5
 
 # 1. CPU baseline (no --gpu).
-./target/release/rustjvm.exe --classpath "test_classes/gpu" Benchmark $N $ITERS
+./target/release/cratonvm.exe --classpath "test_classes/gpu" Benchmark $N $ITERS
 
 # 2. Transparent GPU path.
-./target/release/rustjvm.exe --gpu --classpath "test_classes/gpu" Benchmark $N $ITERS
+./target/release/cratonvm.exe --gpu --classpath "test_classes/gpu" Benchmark $N $ITERS
 
 # 3. Explicit submit path (Phase 5–7).
-./target/release/rustjvm.exe --gpu --classpath "test_classes/gpu;$annotJar" BenchmarkExplicit $N $ITERS
+./target/release/cratonvm.exe --gpu --classpath "test_classes/gpu;$annotJar" BenchmarkExplicit $N $ITERS
 ```
 
 Each run emits one `iter=...` line per iteration plus a single
@@ -114,7 +114,7 @@ place. The cudarc backend (Phase 3.5) compiles cleanly against
 
 If the GPU run hangs or panics: pin the exact panic line + the
 last few `tracing::debug!` lines (run with
-`RUSTJVM_LOG=gpu.offload=debug,gpu=debug`) into an issue. The
+`CRATONVM_LOG=gpu.offload=debug,gpu=debug`) into an issue. The
 likely-to-bite places are:
 
 1. `cuda_bridge::backend_cuda::launch_on_raw_stream`'s
@@ -132,5 +132,5 @@ likely-to-bite places are:
 
 If correctness fails (`out[0]` mismatch between CPU and GPU runs):
 that's the kernel-emission bug. Diff the PTX (set
-`RUSTJVM_PTX_DUMP=1`) and compare against `EligibleVectorAdd`'s
+`CRATONVM_PTX_DUMP=1`) and compare against `EligibleVectorAdd`'s
 expected pattern.

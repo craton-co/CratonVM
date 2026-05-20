@@ -13,7 +13,7 @@
 //! - T1.9.1 — `Reference.reachabilityFence(Object)` returns normally
 //!   for any input including null.
 //!
-//! These tests exercise the rustjvm-vm public surface — no JIT in the
+//! These tests exercise the cratonvm-vm public surface — no JIT in the
 //! loop, no class files required.
 
 #![allow(clippy::unwrap_used)]
@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustjvm_vm::classloading::ClassId;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_vm::classloading::ClassId;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
+use cratonvm_vm::vm::SharedVm;
 
 // ===========================================================================
 // T1.6.7 — Thread.holdsLock
@@ -126,12 +126,12 @@ fn t1_hprof_dump_writes_a_real_file() {
     // HPROF v1.0.2 file with the right magic.
     let mut cfg = VmConfig::default();
     cfg.heap_dump_on_oom = true;
-    let path = std::env::temp_dir().join("rustjvm-tier1-hprof.hprof");
+    let path = std::env::temp_dir().join("cratonvm-tier1-hprof.hprof");
     let _ = std::fs::remove_file(&path);
 
     // Build a real Vm so self_arc is set, then call dump_heap directly.
-    let vm = rustjvm_vm::vm::Vm::new(cfg);
-    let bytes = rustjvm_vm::runtime::hprof::dump_heap(
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    let bytes = cratonvm_vm::runtime::hprof::dump_heap(
         &vm.shared,
         path.to_str().unwrap(),
     )
@@ -208,7 +208,7 @@ fn t1_vm_construct_and_drop_is_clean() {
 /// panicking.
 #[test]
 fn t1_jit_entry_guard_with_compiled_is_callable() {
-    use rustjvm_vm::jit::conservative_roots::JitEntryGuard;
+    use cratonvm_vm::jit::conservative_roots::JitEntryGuard;
 
     // Build a minimal CompiledMethod-shaped value to exercise the
     // precise guard path. `CompiledMethod` is not publicly
@@ -218,7 +218,7 @@ fn t1_jit_entry_guard_with_compiled_is_callable() {
     // confirm the T1.1.a wiring doesn't break the normal VM lifecycle.
     //
     // The actual oop-map population is covered by the x64 unit tests
-    // under `cargo test -p rustjvm-jit` which exercise the
+    // under `cargo test -p cratonvm-jit` which exercise the
     // `emit_oop_map_for_safepoint` helper end-to-end when the `new`,
     // `anewarray`, `aload`, `aaload`, and `aconst_null` opcodes are
     // compiled. Here we just prove the top-level integration stays
@@ -238,7 +238,7 @@ fn t1_jit_entry_guard_with_compiled_is_callable() {
 /// pre-existing precise-infra.
 #[test]
 fn t1_oop_map_round_trip_in_compiled_method() {
-    use rustjvm_jit::OopMapEntry;
+    use cratonvm_jit::OopMapEntry;
     // Minimum: build two entries with different pc offsets, verify the
     // find_oop_map_for_pc binary search returns the right one.
     let entry_a = OopMapEntry {
@@ -258,7 +258,7 @@ fn t1_oop_map_round_trip_in_compiled_method() {
 
 #[test]
 fn t1_init_complexity_classifier_is_wired_through_jit() {
-    use rustjvm_vm::jit::skip_list::{
+    use cratonvm_vm::jit::skip_list::{
         classify_init_complexity, should_skip_jit_with_init, InitComplexity, SkipPolicy,
     };
     // Trivial default constructor: aload_0; invokespecial; return
@@ -329,7 +329,7 @@ fn t1_vm_under_brief_load_does_not_deadlock() {
 /// pins the inter-crate data flow the T1.1.a push built).
 #[test]
 fn t1_oop_map_end_to_end_push_and_find() {
-    use rustjvm_jit::OopMapEntry;
+    use cratonvm_jit::OopMapEntry;
     // Simulate several safepoints in a fake method. Real codegen
     // records monotonically increasing native_pc_offsets.
     let entries = vec![
@@ -364,7 +364,7 @@ fn t1_oop_map_end_to_end_push_and_find() {
 /// emitted at safepoints inside inlined callee bodies).
 #[test]
 fn t1_oop_map_handles_inlined_callee_pattern() {
-    use rustjvm_jit::OopMapEntry;
+    use cratonvm_jit::OopMapEntry;
     // Simulate: safepoints at PCs 0x10 (caller entry alloc), 0x30
     // (inside inlined callee body), 0x50 (after callee returns).
     // Each has a different set of live oops.
@@ -396,7 +396,7 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
 /// deterministic RNG so the test is reproducible.
 #[test]
 fn t1_oop_map_property_random_slot_sets_round_trip() {
-    use rustjvm_jit::OopMapEntry;
+    use cratonvm_jit::OopMapEntry;
     // Deterministic LCG — reproducible without bringing in rand.
     let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
     let mut next_u32 = || {
@@ -534,7 +534,7 @@ fn t1_int_shift_amount_masked_with_1f() {
 /// T1.4.6 — open `$JAVA_HOME/lib/modules` via the jimage reader and
 /// verify we can enumerate at least 10 classes without the parser
 /// panicking. A full class-by-class round-trip is an integration
-/// test covered by `rustjvm-classloading::class_path::tests::
+/// test covered by `cratonvm-classloading::class_path::tests::
 /// load_real_jdk_jmod`; here we smoke-test the loader path from
 /// the vm crate so any regression in either side surfaces as a
 /// tier1 failure.
@@ -551,7 +551,7 @@ fn t1_jimage_loads_real_jdk_modules() {
         return;
     }
     // Use the jimage reader directly (no VM needed).
-    match rustjvm_reader::jimage::JImageReader::open(&path) {
+    match cratonvm_reader::jimage::JImageReader::open(&path) {
         Ok(jimage) => {
             // Smoke: we can locate at least one well-known class.
             let found = jimage
@@ -582,7 +582,7 @@ fn t1_jimage_loads_real_jdk_modules() {
 /// boundaries.
 #[test]
 fn t1_exception_escape_through_finally() {
-    use rustjvm_types::error::{MethodCallFailed, RuntimeError, VmError};
+    use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
 
     // Simulate: try { try { throw X; } finally { /* no catch */ } }
     // The error surfaced from the inner finally must still be X.
@@ -665,7 +665,7 @@ fn t1_jmm_publication_race_no_tear() {
 /// since `Object.wait` requires a full bytecode test.
 #[test]
 fn t1_interrupt_wakes_parked_thread() {
-    use rustjvm_vm::threading::jvm_thread::ParkState;
+    use cratonvm_vm::threading::jvm_thread::ParkState;
     use std::sync::Arc;
 
     let park = Arc::new(ParkState::new());
@@ -747,7 +747,7 @@ fn t1_gc_parallel_allocation_and_collection_no_lost_objects() {
 /// exercised from multiple threads without deadlock.
 #[test]
 fn t1_gc_under_simulated_jit_frames_no_deadlock() {
-    use rustjvm_vm::jit::conservative_roots::JitEntryGuard;
+    use cratonvm_vm::jit::conservative_roots::JitEntryGuard;
 
     let n_threads = 4;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -811,7 +811,7 @@ fn t1_reference_processor_weak_ref_stress() {
         let weak = shared.heap.alloc_object(ClassId::new(1), 2);
         let mut rp = shared.ref_processor.lock();
         rp.discover_reference(
-            rustjvm_gc::ReferenceType::Weak,
+            cratonvm_gc::ReferenceType::Weak,
             weak.as_ptr() as usize,
             referent.as_ptr() as usize,
             None,
@@ -828,7 +828,7 @@ fn t1_reference_processor_weak_ref_stress() {
 /// needed.
 #[test]
 fn t1_reachability_fence_accepts_null_and_object() {
-    use rustjvm_vm::classloading::ClassId;
+    use cratonvm_vm::classloading::ClassId;
     // The native registration uses `std::hint::black_box` so the
     // argument is not optimized away. We verify the contract by
     // running the same black_box-backed closure with null and with
@@ -836,7 +836,7 @@ fn t1_reachability_fence_accepts_null_and_object() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let obj = shared.heap.alloc_object(ClassId::new(1), 0);
     let _ = std::hint::black_box(Some(obj));
-    let _: Option<rustjvm_vm::types::ObjectRef> = std::hint::black_box(None);
+    let _: Option<cratonvm_vm::types::ObjectRef> = std::hint::black_box(None);
     // If we reach here, the fence path didn't panic or diverge.
 }
 
@@ -867,13 +867,13 @@ fn t1_math_fma_double_correctly_rounded() {
 /// T1.1.28 — the runtime helper function exposed to the JIT.
 #[test]
 fn t1_math_fma_double_helper_callable() {
-    let r = rustjvm_vm::jit::helpers::jit_math_fma_double(2.0, 3.0, 1.0);
+    let r = cratonvm_vm::jit::helpers::jit_math_fma_double(2.0, 3.0, 1.0);
     assert_eq!(r, 7.0);
 }
 
 #[test]
 fn t1_math_fma_float_helper_callable() {
-    let r = rustjvm_vm::jit::helpers::jit_math_fma_float(2.0, 3.0, 1.0);
+    let r = cratonvm_vm::jit::helpers::jit_math_fma_float(2.0, 3.0, 1.0);
     assert_eq!(r, 7.0);
 }
 
@@ -886,8 +886,8 @@ fn t1_math_fma_float_helper_callable() {
 /// safepoint via `interpreter::check_pending_async_exception`.
 #[test]
 fn t1_async_exception_round_trip_through_registry() {
-    use rustjvm_vm::runtime::interpreter::check_pending_async_exception;
-    use rustjvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
+    use cratonvm_vm::runtime::interpreter::check_pending_async_exception;
+    use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let tid = ThreadId(42);
@@ -912,7 +912,7 @@ fn t1_async_exception_round_trip_through_registry() {
     let failure = check_pending_async_exception(&mut jt).unwrap();
     assert!(jt.pending_async_exception.is_none());
     match failure {
-        rustjvm_vm::error::MethodCallFailed::ExceptionThrown(obj) => {
+        cratonvm_vm::error::MethodCallFailed::ExceptionThrown(obj) => {
             assert_eq!(obj.as_ptr(), throwable.as_ptr());
         }
         other => panic!("expected ExceptionThrown, got {other:?}"),
@@ -930,7 +930,7 @@ fn t1_async_exception_round_trip_through_registry() {
 /// shape so a future ARM64-host test can consume it.
 #[test]
 fn t1_aarch64_oop_map_data_shape() {
-    use rustjvm_jit::OopMapEntry;
+    use cratonvm_jit::OopMapEntry;
     // Representative entry matching what the ARM64 backend emits at
     // a safepoint in a method with one oop at [fp - 16].
     let entry = OopMapEntry {
@@ -951,7 +951,7 @@ fn t1_aarch64_oop_map_data_shape() {
 /// violation) from the vm crate's perspective.
 #[test]
 fn t1_regalloc_invariants_reject_gpr_xmm_overlap() {
-    use rustjvm_jit::regalloc::regalloc_invariants_hold;
+    use cratonvm_jit::regalloc::regalloc_invariants_hold;
     let gpr = vec![Some(12_u8)];
     let xmm = vec![Some(8_u8)]; // same local in both!
     let interference = vec![0_u64];
@@ -960,7 +960,7 @@ fn t1_regalloc_invariants_reject_gpr_xmm_overlap() {
 
 #[test]
 fn t1_regalloc_invariants_reject_interfering_same_register() {
-    use rustjvm_jit::regalloc::regalloc_invariants_hold;
+    use cratonvm_jit::regalloc::regalloc_invariants_hold;
     let gpr = vec![Some(12_u8), Some(12_u8)];
     let xmm = vec![None, None];
     let interference = vec![0b10_u64, 0b01];
@@ -998,7 +998,7 @@ fn t1_brooks_barrier_follows_forwarding_pointer() {
     // Directly install a forwarding pointer on `old`'s header. The
     // CompactHeader API is the path stop-the-world GC uses during
     // evacuation; we exercise it here without running the collector.
-    use rustjvm_gc::compact_header::{CompactHeader, LockState};
+    use cratonvm_gc::compact_header::{CompactHeader, LockState};
     let ptr = old.as_ptr() as *mut u64;
     let mut header = unsafe { CompactHeader::from_raw(std::ptr::read(ptr)) };
     header.set_forwarding_ptr(new_obj.as_ptr() as usize);
@@ -1052,7 +1052,7 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
 /// dirty cards the mutator marked since the last clear.
 #[test]
 fn t1_card_table_dirty_cards_round_trip() {
-    use rustjvm_gc::card_table::CardTable;
+    use cratonvm_gc::card_table::CardTable;
     // Cards are 512 bytes; use 64 KiB region so we have ≥ 3 distinct cards.
     let mut ct = CardTable::new(0x10_0000, 64 * 1024);
     // Three addresses in different cards (≥ 512 bytes apart).
@@ -1079,8 +1079,8 @@ fn t1_card_table_dirty_cards_round_trip() {
 
 /// T1.1.22-25 — regalloc miscompile reproducer for `exc_hierarchy`.
 ///
-/// Under `RUSTJVM_JIT_ALLOW_PACKAGES=rustjvm/`, the JIT-compiled
-/// version of `rustjvm/TckLang.exc_hierarchy` returns `Int(0)`
+/// Under `CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/`, the JIT-compiled
+/// version of `cratonvm/TckLang.exc_hierarchy` returns `Int(0)`
 /// instead of `Int(1)`. The method is:
 ///
 /// ```java
@@ -1104,17 +1104,17 @@ fn t1_card_table_dirty_cards_round_trip() {
 /// invariants in `regalloc::regalloc_invariants_hold` prevent any
 /// adjacent regalloc regression from sneaking in.
 #[test]
-#[ignore = "Known T1.1.22-25 miscompile under RUSTJVM_JIT_ALLOW_PACKAGES=rustjvm/; \
+#[ignore = "Known T1.1.22-25 miscompile under CRATONVM_JIT_ALLOW_PACKAGES=cratonvm/; \
             structural invariants cover the adjacent failure modes; \
             fix requires interactive JIT tracing tools tracked as NEW-1.3 follow-up"]
 fn t1_known_regalloc_miscompile_exc_hierarchy_reproducer() {
     // This test exists only to document the reproducer. Running it
-    // requires enabling the `rustjvm/` JIT package override at
+    // requires enabling the `cratonvm/` JIT package override at
     // process startup, which affects global JIT state and can't be
     // done from a per-test harness. The canonical repro path is:
     //
-    //   $Env:RUSTJVM_JIT_ALLOW_PACKAGES="rustjvm/"
-    //   cargo test -p rustjvm-vm --features synthetic-jdk \
+    //   $Env:CRATONVM_JIT_ALLOW_PACKAGES="cratonvm/"
+    //   cargo test -p cratonvm-vm --features synthetic-jdk \
     //       --test interpreter_tests test_s46_exc_hierarchy
     //
     // Expected after fix: `Ok(Some(Int(1)))`.
@@ -1132,7 +1132,7 @@ fn t1_known_regalloc_miscompile_exc_hierarchy_reproducer() {
 /// mutex (current) or hardware `LOCK CMPXCHG` (future optimization).
 #[test]
 fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
-    use rustjvm_vm::types::Value;
+    use cratonvm_vm::types::Value;
     use std::thread;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -1327,7 +1327,7 @@ fn t1_weak_ref_cleared_on_referent_unreachable() {
     {
         let mut rp = shared.ref_processor.lock();
         rp.discover_reference(
-            rustjvm_gc::ReferenceType::Weak,
+            cratonvm_gc::ReferenceType::Weak,
             ref_addr,
             refer_addr,
             None,
@@ -1366,8 +1366,8 @@ fn t1_subnormal_double_round_trip() {
 /// preserve the ObjectRef identity through match-and-rethrow.
 #[test]
 fn t1_chained_exception_preserves_identity() {
-    use rustjvm_vm::error::MethodCallFailed;
-    use rustjvm_vm::types::Value;
+    use cratonvm_vm::error::MethodCallFailed;
+    use cratonvm_vm::types::Value;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let throwable = shared.heap.alloc_object(ClassId::new(1), 2);
@@ -1395,7 +1395,7 @@ fn t1_chained_exception_preserves_identity() {
 /// timeout expires when no element is enqueued.
 #[test]
 fn t1_reference_queue_remove_honors_timeout() {
-    use rustjvm_gc::reference::ReferenceQueue;
+    use cratonvm_gc::reference::ReferenceQueue;
     let mut rq = ReferenceQueue::new(0x1000, 64);
     let start = Instant::now();
     // 50ms timeout, empty queue → must return None promptly.

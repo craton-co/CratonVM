@@ -38,12 +38,12 @@
 
 use std::path::PathBuf;
 
-use rustjvm_reader::class_reader::read_class;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::class_reader::read_class;
+use cratonvm_reader::method::ClassFileMethod;
 
-use rustjvm_vm::classloading::ClassId;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::runtime::offload::{LookupOutcome, OffloadCache};
+use cratonvm_vm::classloading::ClassId;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::runtime::offload::{LookupOutcome, OffloadCache};
 
 // PHASE1-GUESS: the annotation-aware analyzer entry point. Items 3/4
 // land this as `jit_cuda::analyzer::analyze_with_annotations` (taking
@@ -80,10 +80,10 @@ fn fixture_exists(class_name: &str) -> bool {
 /// `vm/src/runtime/offload.rs`'s test helper of the same shape — the
 /// `OffloadCache` API only needs `(class_id, class_name,
 /// method_index, &ClassFileMethod)`, so we don't go through the heavy
-/// `rustjvm_classloading::Class` path.
+/// `cratonvm_classloading::Class` path.
 fn load_methods(
     class_name: &str,
-) -> (Vec<ClassFileMethod>, String, rustjvm_reader::ConstantPool) {
+) -> (Vec<ClassFileMethod>, String, cratonvm_reader::ConstantPool) {
     let path = fixture_path(class_name);
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));

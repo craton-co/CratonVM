@@ -1,8 +1,8 @@
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
-use rustjvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};
-use rustjvm_types::{ClassId, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult};
+use cratonvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};
+use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,13 +15,13 @@ use crate::lang_math::alloc_wrapper;
 use crate::alloc_concurrent_synthetic;
 
 // ---------------------------------------------------------------------------
-// Cached `RUSTJVM_DBG_BB` env-var lookup
+// Cached `CRATONVM_DBG_BB` env-var lookup
 //
 // Env-var lookups go through the process-wide environ lock on Unix and a
 // kernel32 call on Windows; both are surprisingly expensive when hammered.
 // `Class.getName`, `Class.getSuperclass`, `Class.getInterfaces`, and the
 // generic-superclass / generic-interfaces helpers below each read
-// `RUSTJVM_DBG_BB` on every invocation to decide whether to emit ByteBuddy
+// `CRATONVM_DBG_BB` on every invocation to decide whether to emit ByteBuddy
 // debug traces. These natives sit on the hot reflection path (ByteBuddy
 // agents call them tens of thousands of times during JDK boot), so we
 // cache the boolean in a `OnceLock<bool>` — same pattern as
@@ -32,7 +32,7 @@ static DBG_BB: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 pub(crate) fn dbg_bb_enabled() -> bool {
-    *DBG_BB.get_or_init(|| std::env::var("RUSTJVM_DBG_BB").is_ok())
+    *DBG_BB.get_or_init(|| std::env::var("CRATONVM_DBG_BB").is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -150,12 +150,12 @@ pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
 // ---------------------------------------------------------------------------
 // Access control constants (JVM access flags)
 //
-// Canonical definitions live in `rustjvm_types::access_flags`; the `_I32`
+// Canonical definitions live in `cratonvm_types::access_flags`; the `_I32`
 // aliases here keep existing call sites compact while pointing at the
 // shared source of truth.
 // ---------------------------------------------------------------------------
 
-use rustjvm_types::access_flags::{
+use cratonvm_types::access_flags::{
     ACC_PUBLIC_I32 as ACC_PUBLIC,
     ACC_STATIC_I32 as ACC_STATIC,
     ACC_FINAL_I32 as ACC_FINAL,
@@ -180,14 +180,14 @@ fn check_final_for_set(
     modifiers: i32,
     accessible: bool,
     member_desc: &str,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if (modifiers & ACC_FINAL) == 0 {
         return Ok(());
     }
     let is_static = (modifiers & ACC_STATIC) != 0;
     // Static-final: hard-disallowed regardless of `setAccessible`.
     if is_static {
-        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
             message: format!(
                 "Can not set static final field via Field.set: {}",
                 member_desc,
@@ -197,7 +197,7 @@ fn check_final_for_set(
     }
     // Instance-final: requires `setAccessible(true)`.
     if !accessible {
-        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
             message: format!(
                 "Can not set final field without setAccessible(true): {}",
                 member_desc,
@@ -244,11 +244,11 @@ fn volatile_store_fence_post(modifiers: i32) {
 /// AccessibleObject (stored in field 7 for Method, field 6 for Field,
 /// field 5 for Constructor).
 /// Returns Ok(()) if access is allowed, Err(IllegalAccessException) otherwise.
-fn check_access(modifiers: i32, accessible: bool, member_desc: &str) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+fn check_access(modifiers: i32, accessible: bool, member_desc: &str) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if accessible || (modifiers & ACC_PUBLIC) != 0 {
         return Ok(());
     }
-    Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+    Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
         message: format!(
             "cannot access member: modifiers 0x{:04x}, {}",
             modifiers, member_desc,
@@ -418,14 +418,14 @@ fn enforce_module_check_from_mirror(
     mirror_field_index: usize,
     accessible: bool,
     operation: &str,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let target_class_name = match ctx.get_field(this, mirror_field_index) {
         Value::Object(Some(m)) => mirror_class_name(ctx, m),
         _ => None,
     };
     if let Some(name) = target_class_name {
         if let Err(msg) = check_reflection_module_access(ctx, &name, accessible) {
-            return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
                 message: format!("{operation}: {name}: {msg}"),
             }
             .into());
@@ -443,14 +443,14 @@ fn enforce_module_check_on_field(
     this: ObjectRef,
     accessible: bool,
     operation: &str,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let target_class_name = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => mirror_class_name(ctx, m),
         _ => None,
     };
     if let Some(name) = target_class_name {
         if let Err(msg) = check_reflection_module_access(ctx, &name, accessible) {
-            return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
                 message: format!("{operation}: {name}: {msg}"),
             }
             .into());
@@ -606,14 +606,14 @@ pub(crate) fn native_class_get_primitive_class(
 /// field 0 is no longer Int(-1) — it's Object(None) in real-JDK mode).
 pub(crate) fn mirror_class_id(
     ctx: &dyn NativeContext,
-    mirror: rustjvm_types::ObjectRef,
-) -> Option<rustjvm_types::ClassId> {
+    mirror: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ClassId> {
     if let Some(cid) = ctx.class_id_from_mirror(mirror) {
         return Some(cid);
     }
     if let Value::Int(v) = ctx.get_field(mirror, 0) {
         if v >= 0 {
-            return Some(rustjvm_types::ClassId::new(v as u32));
+            return Some(cratonvm_types::ClassId::new(v as u32));
         }
     }
     None
@@ -631,7 +631,7 @@ pub(crate) fn mirror_class_id(
 /// that encode `ClassId` only as `int` field 0 and put the internal name in
 /// slot 1), trust slot 1 first; only if it is missing do we fall back to
 /// [`mirror_class_id`] + `class_name_of_id`.
-pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: rustjvm_types::ObjectRef) -> Option<String> {
+pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: cratonvm_types::ObjectRef) -> Option<String> {
     if let Some(cid) = ctx.class_id_from_mirror(mirror) {
         return ctx.class_name_of_id(cid);
     }
@@ -670,7 +670,7 @@ pub(crate) fn mirror_class_name(ctx: &dyn NativeContext, mirror: rustjvm_types::
 /// not be silently re-aliased to Object.
 pub(crate) fn mirror_class_name_strict(
     ctx: &dyn NativeContext,
-    mirror: rustjvm_types::ObjectRef,
+    mirror: cratonvm_types::ObjectRef,
 ) -> Option<String> {
     if let Value::Object(Some(name_obj)) = ctx.get_field(mirror, 1) {
         if let Some(s) = ctx.read_string(name_obj) {
@@ -798,7 +798,7 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
     bytes: &[u8],
 ) -> ObjectRef {
     let len = bytes.len();
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
@@ -854,7 +854,7 @@ pub(crate) fn native_class_get_resource_as_stream(
             let len = bytes.len();
             let stream = t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
             tracing::debug!(
-                target: "rustjvm_vm::runtime::resources",
+                target: "cratonvm_vm::runtime::resources",
                 resource = %resource_name,
                 bytes = len,
                 "Class.getResourceAsStream served resource"
@@ -916,7 +916,7 @@ pub(crate) fn native_class_get_resource(
     };
 
     tracing::debug!(
-        target: "rustjvm_vm::runtime::resources",
+        target: "cratonvm_vm::runtime::resources",
         resource = %resource_name,
         url = %url_str,
         "Class.getResource resolved"
@@ -971,10 +971,10 @@ fn i18n_logger_locale_suffix(name: &str) -> bool {
 
 /// RKC16r23 — gate the verbose `Class.forName` diagnostic prints behind an
 /// env var so they don't pollute boot logs in normal runs. Set
-/// `RUSTJVM_S111_DBG=1` to re-enable.
+/// `CRATONVM_S111_DBG=1` to re-enable.
 fn s111_dbg_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("RUSTJVM_S111_DBG").is_ok())
+    *ENABLED.get_or_init(|| std::env::var("CRATONVM_S111_DBG").is_ok())
 }
 
 macro_rules! s111_dbg {
@@ -1179,7 +1179,7 @@ fn wf7_synthesise_entry_class_if_missing(
     // would then be invoked as the entry-point — short-circuiting any
     // real boot. The guard above ("if class already loaded, return None")
     // limits scope, but the gate-off is the safer default.
-    if std::env::var("RUSTJVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() != Ok("1") {
+    if std::env::var("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() != Ok("1") {
         let _ = internal_name;
         return None;
     }
@@ -1201,7 +1201,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     let name_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.forName: name is null".to_string()),
             }
             .into())
@@ -1236,7 +1236,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
     // language and (optional) country tokens look like locale codes
     // returns CNFE immediately without calling out to loader.loadClass.
     if i18n_logger_locale_suffix(&dotted_name) {
-        return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+        return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
             class_name: dotted_name,
         }
         .into());
@@ -1292,7 +1292,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                     );
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
-                return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
                 .into())
@@ -1305,9 +1305,9 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // resolves to `Comparable.loadClass` and raises NSME.
             // Fall back to bootstrap-style class loading so the
             // `Class.forName(name, init, loader)` chain still resolves.
-            Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Linkage(
-                    rustjvm_types::error::LinkageError::NoSuchMethodError { .. },
+            Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Linkage(
+                    cratonvm_types::error::LinkageError::NoSuchMethodError { .. },
                 ),
             )) => {
                 s111_dbg!("[S111-DBG] loadClass({}) -> NoSuchMethodError, fallback", dotted_name);
@@ -1327,7 +1327,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // org.jboss.modules.ModuleClassLoader — for those, CNFE is the
             // authoritative answer about module visibility. Detect Spring Boot's
             // LaunchedURLClassLoader by class name prefix.
-            Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(_)) => {
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(_)) => {
                 // Check if this is a LaunchedURLClassLoader (Spring Boot 2/3)
                 // or a URLClassLoader subclass that might have the same issues.
                 // For these, bootstrap fallback is safe. For module loaders, propagate.
@@ -1357,7 +1357,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                         );
                         return Ok(Some(Value::Object(Some(mirror))));
                     }
-                    return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                    return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
                         class_name: dotted_name,
                     }.into());
                 }
@@ -1378,7 +1378,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // `Class.forName` must throw ClassNotFoundException for them
             // even though they are loaded.
             if ctx.is_class_hidden(class_id) {
-                return Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+                return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
                     class_name: dotted_name,
                 }
                 .into());
@@ -1387,7 +1387,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(e) => {
-            if let rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
+            if let cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                 let exc_cid = ctx.class_id_of_object(*exc_ref);
                 let exc_class = ctx.class_name_of_id(exc_cid).unwrap_or_default();
                 let msg = match ctx.get_field(*exc_ref, 0) {
@@ -1418,7 +1418,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 );
                 return Ok(Some(Value::Object(Some(mirror))));
             }
-            Err(rustjvm_types::error::RuntimeError::ClassNotFoundException {
+            Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,
             }
             .into())
@@ -1462,7 +1462,7 @@ pub(crate) fn native_class_for_name_module(
     match args.first() {
         Some(Value::Object(Some(_))) => {}
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.forName: module is null".to_string()),
             }
             .into());
@@ -1471,7 +1471,7 @@ pub(crate) fn native_class_for_name_module(
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.forName: name is null".to_string()),
             }
             .into());
@@ -1533,7 +1533,7 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
     // callers (Spring's `TypeMappedAnnotation.adapt`, which throws
     // `IllegalArgumentException` when `type.isInstance(value)` returns
     // false for a wrapped attribute array) see consistent results.
-    let target_is_array = ctx.heap_kind_of(target) == rustjvm_types::ObjectKind::Array;
+    let target_is_array = ctx.heap_kind_of(target) == cratonvm_types::ObjectKind::Array;
     if target_is_array {
         let src_desc = array_descriptor_for(ctx, target);
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
@@ -1587,8 +1587,8 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
 /// `[I`, `[[Ljava/lang/String;`) for an array heap object.  Mirrors the
 /// interpreter's `array_descriptor_of` (vm/src/runtime/interpreter.rs)
 /// but lives in NativeContext-land so reflection natives can use it.
-fn array_descriptor_for(ctx: &dyn NativeContext, obj: rustjvm_types::ObjectRef) -> String {
-    use rustjvm_types::ArrayElementType;
+fn array_descriptor_for(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
+    use cratonvm_types::ArrayElementType;
     let et = ctx.heap_element_type_of(obj);
     match et {
         ArrayElementType::Boolean => "[Z".to_string(),
@@ -1725,7 +1725,7 @@ pub(crate) fn native_class_is_assignable_from(
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.isAssignableFrom: argument is null".to_string()),
             }
             .into())
@@ -2067,7 +2067,7 @@ pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Val
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.newInstance on null".to_string()),
             }
             .into())
@@ -2076,7 +2076,7 @@ pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Val
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            return Err(rustjvm_types::error::RuntimeError::NotImplemented {
+            return Err(cratonvm_types::error::RuntimeError::NotImplemented {
                 feature: "Class.newInstance: no class_id".to_string(),
             }
             .into())
@@ -2091,7 +2091,7 @@ pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Val
     let obj = match obj_val {
         Some(Value::Object(Some(obj))) => obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NotImplemented {
+            return Err(cratonvm_types::error::RuntimeError::NotImplemented {
                 feature: "Class.newInstance: new_object failed".to_string(),
             }
             .into())
@@ -2113,7 +2113,7 @@ pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Val
 ///
 /// Handles primitives ("I" → int.class), object types ("Ljava/lang/String;" → String.class),
 /// array types ("[I" → int[].class), and void ("V" → void.class).
-pub(crate) fn descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str) -> rustjvm_types::ObjectRef {
+pub(crate) fn descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str) -> cratonvm_types::ObjectRef {
     match desc {
         "I" => ctx.primitive_class_mirror("int"),
         "Z" => ctx.primitive_class_mirror("boolean"),
@@ -2164,11 +2164,11 @@ pub(crate) fn descriptor_to_class_mirror(ctx: &mut dyn NativeContext, desc: &str
 /// `ClassId(0)` / java.lang.Object).  Otherwise `invokevirtual Class.isArray`
 /// on the returned mirror walks up Object's superclass chain and raises
 /// `NoSuchMethodError: java/lang/Object.isArray()Z`.
-fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> rustjvm_types::ObjectRef {
+fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_types::ObjectRef {
     // Resolve java/lang/Class — ensure it's loaded so we get its real ClassId.
     let class_class_id = ctx
         .ensure_class_initialized("java/lang/Class")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     // Match the real-JDK java.lang.Class field count (19 slots).  Use the
     // loaded class's layout when available so our allocation isn't smaller
     // than what bytecode expects.
@@ -2288,7 +2288,7 @@ pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &s
 /// Unbox a wrapper object to a primitive Value.
 ///
 /// e.g. Integer object → Value::Int(42)
-pub(crate) fn unbox_value(ctx: &dyn NativeContext, obj: rustjvm_types::ObjectRef) -> Value {
+pub(crate) fn unbox_value(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Value {
     let class_id = ctx.class_id_of_object(obj);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     match class_name.as_str() {
@@ -2559,7 +2559,7 @@ fn primitive_tag_of(v: Value) -> &'static str {
 
 /// Build an `IllegalArgumentException` VmError carrying `msg`.
 pub(crate) fn illegal_arg_exc(msg: String) -> MethodCallFailed {
-    rustjvm_types::error::RuntimeError::IllegalArgumentException { message: msg }.into()
+    cratonvm_types::error::RuntimeError::IllegalArgumentException { message: msg }.into()
 }
 
 /// Wrap a propagated Java exception from a reflective call into
@@ -2686,7 +2686,7 @@ fn set_accessible_impl(
             if let Err(msg) =
                 check_reflection_module_access(ctx, &target_class_name, false)
             {
-                return Err(rustjvm_types::error::RuntimeError::InaccessibleObjectException {
+                return Err(cratonvm_types::error::RuntimeError::InaccessibleObjectException {
                     message: format!(
                         "Unable to make {member_label} accessible: {msg} \
                          (use --add-opens to grant access)"
@@ -2731,7 +2731,7 @@ pub(crate) fn native_field_set_accessible(
             if let Err(msg) =
                 check_reflection_module_access(ctx, &target_class_name, false)
             {
-                return Err(rustjvm_types::error::RuntimeError::InaccessibleObjectException {
+                return Err(cratonvm_types::error::RuntimeError::InaccessibleObjectException {
                     message: format!(
                         "Unable to make field accessible: {msg} \
                          (use --add-opens to grant access)"
@@ -2753,7 +2753,7 @@ pub(crate) fn native_field_set_accessible(
 /// Throws `InaccessibleObjectException` when the caller's module is not
 /// granted deep-reflection access to the declaring class's package.
 ///
-/// C6: accessible flag lives in a RustJVM extra slot (not a real JDK
+/// C6: accessible flag lives in a CratonVM extra slot (not a real JDK
 /// field); the declaring-class mirror is read via `get_field_by_name`.
 pub(crate) fn native_method_set_accessible(
     ctx: &mut dyn NativeContext,
@@ -2768,7 +2768,7 @@ pub(crate) fn native_method_set_accessible(
 /// Throws `InaccessibleObjectException` when the caller's module is not
 /// granted deep-reflection access to the declaring class's package.
 ///
-/// C6: Constructor accessible flag lives in a RustJVM extra slot (not a
+/// C6: Constructor accessible flag lives in a CratonVM extra slot (not a
 /// real JDK field); the declaring-class mirror is read via
 /// `get_field_by_name`.
 pub(crate) fn native_constructor_set_accessible(
@@ -2786,7 +2786,7 @@ fn set_method_like_accessible_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     member_label: &'static str,
-    mut write_flag: impl FnMut(&mut dyn NativeContext, rustjvm_types::ObjectRef, bool),
+    mut write_flag: impl FnMut(&mut dyn NativeContext, cratonvm_types::ObjectRef, bool),
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2808,7 +2808,7 @@ fn set_method_like_accessible_impl(
             if let Err(msg) =
                 check_reflection_module_access(ctx, &target_class_name, false)
             {
-                return Err(rustjvm_types::error::RuntimeError::InaccessibleObjectException {
+                return Err(cratonvm_types::error::RuntimeError::InaccessibleObjectException {
                     message: format!(
                         "Unable to make {member_label} accessible: {msg} \
                          (use --add-opens to grant access)"
@@ -2830,9 +2830,9 @@ fn set_method_like_accessible_impl(
 // ---------------------------------------------------------------------------
 
 /// Number of "extra" slots appended after the JDK Field layout to hold
-/// RustJVM-specific metadata that doesn't exist on real JDK Field:
+/// CratonVM-specific metadata that doesn't exist on real JDK Field:
 ///   +0 → String (raw descriptor, e.g. "J" or "Ljava/lang/String;")
-///   +1 → Int (RustJVM slot_index — absolute heap index for instance
+///   +1 → Int (CratonVM slot_index — absolute heap index for instance
 ///            fields, or field_index for static fields)
 ///   +2 → Int (accessible flag, 0 or 1)
 const FIELD_EXTRA_SLOTS: usize = 3;
@@ -2873,14 +2873,14 @@ fn field_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// IllegalAccessException for every `unreflectGetter(serialVersionUID)`.
 ///
 /// Fix: populate the real JDK-named fields via `set_field_by_name` and
-/// store RustJVM-specific metadata (descriptor string, slot_index,
+/// store CratonVM-specific metadata (descriptor string, slot_index,
 /// accessible flag) in extra slots appended *after* the JDK layout. All
 /// native readers go via `set_field_by_name` / `get_field_by_name` for
 /// JDK fields and via the extra-slot helpers for our metadata.
 pub(crate) fn create_field_object(
     ctx: &mut dyn NativeContext,
     meta: &FieldMetadata,
-) -> rustjvm_types::ObjectRef {
+) -> cratonvm_types::ObjectRef {
     let class_id = ctx.ensure_class_initialized("java/lang/reflect/Field")
         .unwrap_or(ClassId::new(0));
 
@@ -2904,7 +2904,7 @@ pub(crate) fn create_field_object(
     // JDK's `trustedFinal` is JVM-internal; default to false.
     ctx.set_field_by_name(obj, "trustedFinal", Value::Int(0));
 
-    // --- RustJVM extra metadata (append after JDK layout) ---
+    // --- CratonVM extra metadata (append after JDK layout) ---
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_DESC, Value::Object(Some(desc_str)));
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_RJ_SLOT, Value::Int(meta.slot_index as i32));
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
@@ -2918,12 +2918,12 @@ pub(crate) fn create_field_object(
 ///
 /// Uses `get_field_by_name` for the JDK-layout fields so the read lands on
 /// the right slot regardless of class hierarchy offsets, and falls back to
-/// the RustJVM extra-slot for the descriptor and slot_index (which don't
+/// the CratonVM extra-slot for the descriptor and slot_index (which don't
 /// exist on real JDK Field).
 pub(crate) fn read_field_meta(
     ctx: &dyn NativeContext,
-    field_obj: rustjvm_types::ObjectRef,
-) -> (bool, rustjvm_types::ClassId, usize, String) {
+    field_obj: cratonvm_types::ObjectRef,
+) -> (bool, cratonvm_types::ClassId, usize, String) {
     let modifiers = match ctx.get_field_by_name(field_obj, "modifiers") {
         Value::Int(v) => v,
         _ => 0,
@@ -2936,16 +2936,16 @@ pub(crate) fn read_field_meta(
             _ => {
                 return (
                     false,
-                    rustjvm_types::ClassId::new(0),
+                    cratonvm_types::ClassId::new(0),
                     0,
                     String::new(),
                 );
             }
         };
-        mirror_class_id(ctx, mirror).unwrap_or(rustjvm_types::ClassId::new(0))
+        mirror_class_id(ctx, mirror).unwrap_or(cratonvm_types::ClassId::new(0))
     };
 
-    // `slot_index` is stashed in our RustJVM extra slots (not a real JDK
+    // `slot_index` is stashed in our CratonVM extra slots (not a real JDK
     // field — the JDK `slot` field has different semantics).
     let field_class_id = {
         // Determine the object's class to locate the extra-slot base.
@@ -2953,7 +2953,7 @@ pub(crate) fn read_field_meta(
         // back to reading our custom `slot` field by name first, which
         // we intentionally populate both in JDK layout AND in the extra
         // slot. If neither is available we return 0.
-        rustjvm_types::ClassId::new(0)
+        cratonvm_types::ClassId::new(0)
     };
     let _ = field_class_id; // suppress unused
 
@@ -2976,11 +2976,11 @@ pub(crate) fn read_field_meta(
     (is_static, class_id, slot, descriptor)
 }
 
-/// Read the RustJVM-specific `slot_index` extra slot from a Field object.
+/// Read the CratonVM-specific `slot_index` extra slot from a Field object.
 /// Returns `None` if the extra slot is unreadable or zero-uninitialised.
 fn read_field_rj_slot(
     ctx: &dyn NativeContext,
-    field_obj: rustjvm_types::ObjectRef,
+    field_obj: cratonvm_types::ObjectRef,
 ) -> Option<usize> {
     let class_id = ctx.class_id_of_object(field_obj);
     let base = field_extra_base(ctx, class_id);
@@ -3016,10 +3016,10 @@ fn read_field_rj_slot(
     }
 }
 
-/// Read the RustJVM-specific `descriptor` extra slot from a Field object.
+/// Read the CratonVM-specific `descriptor` extra slot from a Field object.
 fn read_field_descriptor(
     ctx: &dyn NativeContext,
-    field_obj: rustjvm_types::ObjectRef,
+    field_obj: cratonvm_types::ObjectRef,
 ) -> Option<String> {
     let class_id = ctx.class_id_of_object(field_obj);
     let base = field_extra_base(ctx, class_id);
@@ -3029,10 +3029,10 @@ fn read_field_descriptor(
     }
 }
 
-/// Read the RustJVM-specific `accessible` extra slot from a Field object.
+/// Read the CratonVM-specific `accessible` extra slot from a Field object.
 fn read_field_accessible(
     ctx: &dyn NativeContext,
-    field_obj: rustjvm_types::ObjectRef,
+    field_obj: cratonvm_types::ObjectRef,
 ) -> bool {
     let class_id = ctx.class_id_of_object(field_obj);
     let base = field_extra_base(ctx, class_id);
@@ -3042,10 +3042,10 @@ fn read_field_accessible(
     }
 }
 
-/// Write the RustJVM-specific `accessible` extra slot on a Field object.
+/// Write the CratonVM-specific `accessible` extra slot on a Field object.
 pub(crate) fn write_field_accessible(
     ctx: &mut dyn NativeContext,
-    field_obj: rustjvm_types::ObjectRef,
+    field_obj: cratonvm_types::ObjectRef,
     value: bool,
 ) {
     let class_id = ctx.class_id_of_object(field_obj);
@@ -3061,7 +3061,7 @@ pub(crate) fn write_field_accessible(
 /// Same as `write_field_accessible` but kept as a stable cross-module name.
 pub(crate) fn write_field_accessible_external(
     ctx: &mut dyn NativeContext,
-    field_obj: rustjvm_types::ObjectRef,
+    field_obj: cratonvm_types::ObjectRef,
     value: bool,
 ) {
     write_field_accessible(ctx, field_obj, value);
@@ -3110,7 +3110,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Field.get: null Field".to_string()),
             }
             .into())
@@ -3124,7 +3124,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let (is_static, class_id, slot, descriptor) = read_field_meta(ctx, this);
 
     // Access control: read modifiers from JDK layout, accessible from
-    // the RustJVM extra slot.
+    // the CratonVM extra slot.
     let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.get({})", descriptor))?;
@@ -3139,7 +3139,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let raw_value = if is_static {
         ctx.get_static_field(class_id, slot)
     } else {
-        let recv = receiver.ok_or_else(|| rustjvm_types::error::RuntimeError::NullPointerException {
+        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.get: null receiver for instance field".to_string()),
         })?;
         ctx.get_field(recv, slot)
@@ -3154,7 +3154,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Field.set: null Field".to_string()),
             }
             .into())
@@ -3169,7 +3169,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let (is_static, class_id, slot, descriptor) = read_field_meta(ctx, this);
 
     // Access control: read modifiers from JDK layout, accessible from
-    // the RustJVM extra slot.
+    // the CratonVM extra slot.
     let modifiers = match ctx.get_field_by_name(this, "modifiers") { Value::Int(v) => v, _ => 0 };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
@@ -3189,7 +3189,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
-        let recv = receiver.ok_or_else(|| rustjvm_types::error::RuntimeError::NullPointerException {
+        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.set: null receiver for instance field".to_string()),
         })?;
         ctx.set_field(recv, slot, coerced);
@@ -3218,7 +3218,7 @@ fn validate_field_descriptor(
     descriptor: &str,
     accepted: &[u8],
     java_method: &str,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     // Empty descriptor means the meta lookup failed; fall back to the value-
     // variant check downstream rather than throwing here.
     if descriptor.is_empty() {
@@ -3241,11 +3241,11 @@ fn validate_field_descriptor(
 fn field_get_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Result<Value, rustjvm_types::error::MethodCallFailed> {
+) -> Result<Value, cratonvm_types::error::MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Field typed getter: null Field".to_string()),
             }
             .into())
@@ -3273,7 +3273,7 @@ fn field_get_raw(
     if is_static {
         Ok(ctx.get_static_field(class_id, slot))
     } else {
-        let recv = receiver.ok_or_else(|| rustjvm_types::error::RuntimeError::NullPointerException {
+        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field typed getter: null receiver for instance field".to_string()),
         })?;
         Ok(ctx.get_field(recv, slot))
@@ -3291,7 +3291,7 @@ pub(crate) fn native_field_get_int(ctx: &mut dyn NativeContext, args: &[Value]) 
     // the variant-only check. Validate the field *descriptor* first.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getInt: null Field".to_string()),
         }.into()),
     };
@@ -3310,7 +3310,7 @@ pub(crate) fn native_field_get_long(ctx: &mut dyn NativeContext, args: &[Value])
     // Accepts byte/short/char/int/long (widening). Rejects boolean/float/double/refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getLong: null Field".to_string()),
         }.into()),
     };
@@ -3330,7 +3330,7 @@ pub(crate) fn native_field_get_float(ctx: &mut dyn NativeContext, args: &[Value]
     // Accepts byte/short/char/int/long/float (widening). Rejects boolean/double/refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getFloat: null Field".to_string()),
         }.into()),
     };
@@ -3351,7 +3351,7 @@ pub(crate) fn native_field_get_double(ctx: &mut dyn NativeContext, args: &[Value
     // Accepts every numeric primitive (widening to double). Rejects boolean/refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getDouble: null Field".to_string()),
         }.into()),
     };
@@ -3375,7 +3375,7 @@ pub(crate) fn native_field_get_boolean(ctx: &mut dyn NativeContext, args: &[Valu
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Field.getBoolean: null Field".to_string()),
             }
             .into())
@@ -3411,11 +3411,11 @@ fn field_set_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     new_value: Value,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Field typed setter: null Field".to_string()),
             }
             .into())
@@ -3447,7 +3447,7 @@ fn field_set_raw(
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
     } else {
-        let recv = receiver.ok_or_else(|| rustjvm_types::error::RuntimeError::NullPointerException {
+        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field typed setter: null receiver for instance field".to_string()),
         })?;
         ctx.set_field(recv, slot, coerced);
@@ -3492,7 +3492,7 @@ pub(crate) fn native_field_get_byte(ctx: &mut dyn NativeContext, args: &[Value])
     // Field.getByte: only `B` is JLS-legal (no widening from C/S/I — those throw IAE).
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getByte: null Field".to_string()),
         }.into()),
     };
@@ -3512,7 +3512,7 @@ pub(crate) fn native_field_get_short(ctx: &mut dyn NativeContext, args: &[Value]
     // char→short narrowing without explicit cast), int, long, boolean, refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getShort: null Field".to_string()),
         }.into()),
     };
@@ -3532,7 +3532,7 @@ pub(crate) fn native_field_get_char(ctx: &mut dyn NativeContext, args: &[Value])
     // not permit widening into it from byte/short/int.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+        _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Field.getChar: null Field".to_string()),
         }.into()),
     };
@@ -3601,7 +3601,7 @@ pub(crate) fn native_class_get_declared_fields(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredFields on null".to_string()),
             }
             .into())
@@ -3611,13 +3611,13 @@ pub(crate) fn native_class_get_declared_fields(
         Some(id) => id,
         None => {
             // Primitive or array type — no declared fields
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
 
     let fields = ctx.declared_fields(class_id);
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), fields.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), fields.len());
     for (i, meta) in fields.iter().enumerate() {
         let field_obj = create_field_object(ctx, meta);
         ctx.set_array_element(arr, i, Value::Object(Some(field_obj)));
@@ -3632,7 +3632,7 @@ pub(crate) fn native_class_get_declared_field(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredField on null".to_string()),
             }
             .into())
@@ -3641,7 +3641,7 @@ pub(crate) fn native_class_get_declared_field(
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredField: name is null".to_string()),
             }
             .into())
@@ -3652,7 +3652,7 @@ pub(crate) fn native_class_get_declared_field(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchFieldException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchFieldException {
                 field_name: target_name,
             }
             .into())
@@ -3703,7 +3703,7 @@ pub(crate) fn native_class_get_declared_field(
         }
     }
 
-    Err(rustjvm_types::error::RuntimeError::NoSuchFieldException {
+    Err(cratonvm_types::error::RuntimeError::NoSuchFieldException {
         field_name: target_name,
     }
     .into())
@@ -3714,7 +3714,7 @@ pub(crate) fn native_class_get_declared_field(
 // ---------------------------------------------------------------------------
 
 /// Number of "extra" slots appended after the JDK Method layout to hold
-/// RustJVM-specific metadata that doesn't exist on real JDK Method:
+/// CratonVM-specific metadata that doesn't exist on real JDK Method:
 ///   +0 → String (raw descriptor, e.g. "(II)I")
 ///   +1 → Int    (parameter count — cached)
 ///   +2 → Int    (accessible flag, 0 or 1)
@@ -3764,14 +3764,14 @@ fn method_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// Method.invoke → isCallerSensitive → getDeclaringClass).
 ///
 /// Fix: populate the real JDK-named fields via `set_field_by_name` and
-/// store RustJVM-specific metadata (raw descriptor, cached parameter
+/// store CratonVM-specific metadata (raw descriptor, cached parameter
 /// count, accessible flag) in extra slots appended *after* the JDK
 /// layout. All native readers go via `get_field_by_name` for JDK fields
 /// and via the extra-slot helpers for our metadata.
 pub(crate) fn create_method_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
-) -> rustjvm_types::ObjectRef {
+) -> cratonvm_types::ObjectRef {
     let class_id = ctx.ensure_class_initialized("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
 
@@ -3789,7 +3789,7 @@ pub(crate) fn create_method_object(
     let ret_mirror = descriptor_to_class_mirror(ctx, &ret_desc);
 
     // Parameter type mirrors array.
-    let param_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), param_descs.len());
+    let param_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), param_descs.len());
     for (i, pdesc) in param_descs.iter().enumerate() {
         let pmirror = descriptor_to_class_mirror(ctx, pdesc);
         ctx.set_array_element(param_arr, i, Value::Object(Some(pmirror)));
@@ -3815,7 +3815,7 @@ pub(crate) fn create_method_object(
         &meta.descriptor,
     );
     let exception_arr = ctx.new_ref_array(
-        rustjvm_types::ClassId::new(0),
+        cratonvm_types::ClassId::new(0),
         exception_names.len(),
     );
     for (i, name) in exception_names.iter().enumerate() {
@@ -3827,7 +3827,7 @@ pub(crate) fn create_method_object(
         let mirror = descriptor_to_class_mirror(ctx, &desc);
         ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
     }
-    let empty_byte_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+    let empty_byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
 
     let desc_str = ctx.create_string(&meta.descriptor);
 
@@ -3850,12 +3850,12 @@ pub(crate) fn create_method_object(
     // `Method.getAnnotationBytes()` callers walk these without null
     // checks (e.g. `AnnotationParser.parseAnnotations` reads `arr.length`).
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_byte_arr)));
-    let empty_byte_arr2 = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+    let empty_byte_arr2 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field_by_name(obj, "parameterAnnotations", Value::Object(Some(empty_byte_arr2)));
-    let empty_byte_arr3 = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+    let empty_byte_arr3 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field_by_name(obj, "annotationDefault", Value::Object(Some(empty_byte_arr3)));
 
-    // --- RustJVM extra metadata (append after JDK layout) ---
+    // --- CratonVM extra metadata (append after JDK layout) ---
     ctx.set_field(
         obj,
         base + METHOD_EXTRA_OFFSET_DESC,
@@ -3875,10 +3875,10 @@ pub(crate) fn create_method_object(
     obj
 }
 
-/// Read the RustJVM-specific raw descriptor extra slot from a Method object.
+/// Read the CratonVM-specific raw descriptor extra slot from a Method object.
 pub(crate) fn read_method_descriptor(
     ctx: &dyn NativeContext,
-    method_obj: rustjvm_types::ObjectRef,
+    method_obj: cratonvm_types::ObjectRef,
 ) -> Option<String> {
     let class_id = ctx.class_id_of_object(method_obj);
     let base = method_extra_base(ctx, class_id);
@@ -3954,7 +3954,7 @@ fn compose_method_descriptor_from_type_fields(
     out
 }
 
-/// Descriptor for `Method.invoke`: RustJVM extra slot if present and
+/// Descriptor for `Method.invoke`: CratonVM extra slot if present and
 /// well-formed; otherwise reconstruct from JDK `Executable` fields.
 ///
 /// C6/Surefire: `method_extra_base` uses `max(LEGACY_FLOOR, class field
@@ -3984,7 +3984,7 @@ pub(crate) fn method_descriptor_for_invoke(
         if looks_like_jvm_method_descriptor(&d) {
             let (slot_params, slot_ret) = parse_descriptor_param_and_return(d.trim());
             let (comp_params, comp_ret) = parse_descriptor_param_and_return(&composed);
-            // Only trust the RustJVM extra-slot descriptor when it agrees with
+            // Only trust the CratonVM extra-slot descriptor when it agrees with
             // the Executable mirrors (`parameterTypes` / `returnType`). If the
             // slot lands on an unrelated `String` (C6), it can look like a
             // valid JVM descriptor but disagree — e.g. bogus `()V` while the
@@ -3998,10 +3998,10 @@ pub(crate) fn method_descriptor_for_invoke(
     composed
 }
 
-/// Read the RustJVM-specific cached parameter count extra slot.
+/// Read the CratonVM-specific cached parameter count extra slot.
 fn read_method_param_count(
     ctx: &dyn NativeContext,
-    method_obj: rustjvm_types::ObjectRef,
+    method_obj: cratonvm_types::ObjectRef,
 ) -> i32 {
     let class_id = ctx.class_id_of_object(method_obj);
     let base = method_extra_base(ctx, class_id);
@@ -4011,25 +4011,25 @@ fn read_method_param_count(
     }
 }
 
-/// Read the RustJVM-specific accessible flag extra slot.
+/// Read the CratonVM-specific accessible flag extra slot.
 ///
 /// In real JDK 25, `Method.setAccessible(boolean)` is NOT a native — it's
 /// inherited from `AccessibleObject.setAccessible(boolean)` which sets the
 /// `override` field directly via Java putfield. When dispatch routes through
 /// the Java method (or some other path that bypasses `native_method_set_accessible`),
-/// the RustJVM extra slot stays at 0 even though `override == true`.
+/// the CratonVM extra slot stays at 0 even though `override == true`.
 ///
 /// Therefore we consult BOTH:
 ///   1. The JDK-inherited `override` field (canonical bool, accessed via
 ///      `get_field_by_name` so it works whether stored as Int(0/1) or other
 ///      truthy encodings).
-///   2. The RustJVM extra-slot fallback (kept for paths that only set the
+///   2. The CratonVM extra-slot fallback (kept for paths that only set the
 ///      extra slot — e.g. internal write helpers).
 ///
 /// Either being truthy is enough to treat the Method as accessible.
 fn read_method_accessible(
     ctx: &dyn NativeContext,
-    method_obj: rustjvm_types::ObjectRef,
+    method_obj: cratonvm_types::ObjectRef,
 ) -> bool {
     // Check the JDK `override` field first — this is what JDK 25's
     // AccessibleObject.setAccessible writes via Java bytecode.
@@ -4038,7 +4038,7 @@ fn read_method_accessible(
             return true;
         }
     }
-    // Fall back to the RustJVM extra slot (set by our native setAccessible).
+    // Fall back to the CratonVM extra slot (set by our native setAccessible).
     let class_id = ctx.class_id_of_object(method_obj);
     let base = method_extra_base(ctx, class_id);
     match ctx.get_field(method_obj, base + METHOD_EXTRA_OFFSET_ACCESSIBLE) {
@@ -4047,10 +4047,10 @@ fn read_method_accessible(
     }
 }
 
-/// Write the RustJVM-specific accessible flag extra slot on a Method object.
+/// Write the CratonVM-specific accessible flag extra slot on a Method object.
 pub(crate) fn write_method_accessible(
     ctx: &mut dyn NativeContext,
-    method_obj: rustjvm_types::ObjectRef,
+    method_obj: cratonvm_types::ObjectRef,
     value: bool,
 ) {
     let class_id = ctx.class_id_of_object(method_obj);
@@ -4065,7 +4065,7 @@ pub(crate) fn write_method_accessible(
 /// Public wrapper used by `lang_reflect::native_method_try_set_accessible`.
 pub(crate) fn write_method_accessible_external(
     ctx: &mut dyn NativeContext,
-    method_obj: rustjvm_types::ObjectRef,
+    method_obj: cratonvm_types::ObjectRef,
     value: bool,
 ) {
     write_method_accessible(ctx, method_obj, value);
@@ -4187,7 +4187,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Method.invoke: null Method".to_string()),
             }
             .into())
@@ -4206,7 +4206,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => m,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Method.invoke: no declaring class".to_string()),
             }
             .into())
@@ -4220,7 +4220,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         _ => String::new(),
     };
 
-    // Access control: accessible flag lives in a RustJVM extra slot.
+    // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Method.invoke: {}.{}", class_name, method_name))?;
     // NEW-19: module-level opens check (JPMS). When `accessible == true`
@@ -4233,14 +4233,14 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     let is_public = (modifiers & 0x0001) != 0;
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
-            return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
                 message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
             }
             .into());
         }
     }
 
-    // Get descriptor — stored in RustJVM extra slot (not a real JDK field).
+    // Get descriptor — stored in CratonVM extra slot (not a real JDK field).
     let descriptor = method_descriptor_for_invoke(ctx, this);
 
     // Parse parameter types from descriptor
@@ -4264,7 +4264,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
 
     if !is_static {
         // Instance method: receiver is first arg
-        let recv = receiver.ok_or_else(|| rustjvm_types::error::RuntimeError::NullPointerException {
+        let recv = receiver.ok_or_else(|| cratonvm_types::error::RuntimeError::NullPointerException {
             message: Some("Method.invoke: null receiver for instance method".to_string()),
         })?;
         invoke_args.push(Value::Object(Some(recv)));
@@ -4336,7 +4336,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     let is_init = method_name == "<init>";
     let use_virtual_dispatch = !is_static && !is_private && !is_init;
 
-    let iae_trace = std::env::var_os("RUSTJVM_IAE_TRACE").is_some();
+    let iae_trace = std::env::var_os("CRATONVM_IAE_TRACE").is_some();
     if iae_trace {
         eprintln!("[Method.invoke] about to invoke: class={} method={} desc={} is_static={} use_virtual={}",
                   class_name, method_name, descriptor, is_static, use_virtual_dispatch);
@@ -4348,14 +4348,14 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         let recv = match invoke_args.first() {
             Some(Value::Object(Some(r))) => *r,
             _ => {
-                return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("Method.invoke: null receiver for virtual dispatch".to_string()),
                 }
                 .into());
             }
         };
         let virtual_args: &[Value] = &invoke_args[1..];
-        if std::env::var_os("RUSTJVM_BD_DEBUG").is_some() {
+        if std::env::var_os("CRATONVM_BD_DEBUG").is_some() {
             eprintln!("[Method.invoke] virtual class={} method={} desc={} recv={:p}",
                       class_name, method_name, descriptor, recv.as_ptr());
         }
@@ -4374,7 +4374,7 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         }
     };
 
-    if std::env::var_os("RUSTJVM_DIAG_METHOD_INVOKE_NULL").is_some() {
+    if std::env::var_os("CRATONVM_DIAG_METHOD_INVOKE_NULL").is_some() {
         let void_ret = ret_desc == "V" || ret_desc.is_empty();
         if !void_ret {
             match &result {
@@ -5034,14 +5034,14 @@ pub(crate) fn native_class_get_declared_methods(
         GET_DECLARED_METHODS_DEPTH.with(|d| d.set(prev_depth));
         // Bail safe: return an empty Method[] so ByteBuddy / Mockito can
         // recover rather than die on ExceptionInInitializerError.
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(arr))));
     }
     let result = (|| -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredMethods on null".to_string()),
             }
             .into())
@@ -5051,7 +5051,7 @@ pub(crate) fn native_class_get_declared_methods(
         Some(id) => id,
         None => {
             // Primitive or array type
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -5063,7 +5063,7 @@ pub(crate) fn native_class_get_declared_methods(
         .filter(|m| m.name != "<init>" && m.name != "<clinit>")
         .collect();
 
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), visible.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), visible.len());
     for (i, meta) in visible.iter().enumerate() {
         let method_obj = create_method_object(ctx, meta);
         ctx.set_array_element(arr, i, Value::Object(Some(method_obj)));
@@ -5082,7 +5082,7 @@ pub(crate) fn native_class_get_declared_method(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredMethod on null".to_string()),
             }
             .into())
@@ -5091,7 +5091,7 @@ pub(crate) fn native_class_get_declared_method(
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredMethod: name is null".to_string()),
             }
             .into())
@@ -5120,7 +5120,7 @@ pub(crate) fn native_class_get_declared_method(
             ) {
                 return Ok(Some(Value::Object(Some(method_obj))));
             }
-            return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
                 message: target_name,
             }
             .into());
@@ -5264,7 +5264,7 @@ pub(crate) fn native_class_get_declared_method(
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
-    Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+    Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
         message: target_name,
     }
     .into())
@@ -5287,7 +5287,7 @@ pub(crate) fn native_class_get_declared_method(
 /// `main([Ljava/lang/String;)V` and run it through the existing
 /// `create_method_object` so the Method mirror is layout-compatible with the
 /// rest of the reflection machinery (parameterTypes, returnType,
-/// exceptionTypes, annotation byte arrays, RustJVM extra slots).
+/// exceptionTypes, annotation byte arrays, CratonVM extra slots).
 fn wf_shim_synth_main_method(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -5298,9 +5298,9 @@ fn wf_shim_synth_main_method(
     // by default. It synthesized a fake `main(String[])` Method mirror
     // for any class whose name contains a WildFly / Keycloak fragment,
     // intercepting reflective lookup even when the real bytecode had
-    // already been loaded. Re-enable via `RUSTJVM_USE_WILDFLY_REFLECT_SHIM=1`
+    // already been loaded. Re-enable via `CRATONVM_USE_WILDFLY_REFLECT_SHIM=1`
     // for boot-test (exit-rc-only) diagnostics.
-    if std::env::var("RUSTJVM_USE_WILDFLY_REFLECT_SHIM").as_deref() != Ok("1") {
+    if std::env::var("CRATONVM_USE_WILDFLY_REFLECT_SHIM").as_deref() != Ok("1") {
         let _ = (this, name, param_types_arr);
         return None;
     }
@@ -5370,7 +5370,7 @@ fn wf_shim_synth_main_method(
 /// Stable metadata for `java.lang.reflect.Constructor` mirrors created by
 /// `create_constructor_object`.
 ///
-/// RustJVM stores the raw descriptor / parameter count / accessible flag in
+/// CratonVM stores the raw descriptor / parameter count / accessible flag in
 /// heap slots *after* `class_num_total_fields(java/lang/reflect/Constructor)`.
 /// When `ClassManager::upgrade_synthetic_class` replaces the stub with the real
 /// JDK class, `num_total_fields` grows (Wave 3-B: `max(old, new)`), so the
@@ -5426,7 +5426,7 @@ fn peek_constructor_mirror_side(obj: ObjectRef) -> Option<ConstructorMirrorSideM
 }
 
 /// Number of "extra" slots appended after the JDK Constructor layout to
-/// hold RustJVM-specific metadata (not present on real JDK Constructor):
+/// hold CratonVM-specific metadata (not present on real JDK Constructor):
 ///   +0 → String (raw descriptor, e.g. "(I)V")
 ///   +1 → Int    (parameter count — cached)
 ///   +2 → Int    (accessible flag, 0 or 1)
@@ -5454,12 +5454,12 @@ fn constructor_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// C6 fix (mirrors `create_method_object`): populate real JDK-named
 /// fields via `set_field_by_name` so Java bytecode `Getfield clazz` /
 /// `Getfield modifiers` reads land on the correct inherited slots. Store
-/// RustJVM-specific metadata in extra slots appended after the JDK
+/// CratonVM-specific metadata in extra slots appended after the JDK
 /// layout.
 pub(crate) fn create_constructor_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
-) -> rustjvm_types::ObjectRef {
+) -> cratonvm_types::ObjectRef {
     let class_id = ctx.ensure_class_initialized("java/lang/reflect/Constructor")
         .unwrap_or(ClassId::new(0));
 
@@ -5472,7 +5472,7 @@ pub(crate) fn create_constructor_object(
 
     // Parse descriptor for param types
     let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
-    let param_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), param_descs.len());
+    let param_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), param_descs.len());
     for (i, pdesc) in param_descs.iter().enumerate() {
         let pmirror = descriptor_to_class_mirror(ctx, pdesc);
         ctx.set_array_element(param_arr, i, Value::Object(Some(pmirror)));
@@ -5491,7 +5491,7 @@ pub(crate) fn create_constructor_object(
         &meta.descriptor,
     );
     let exception_arr = ctx.new_ref_array(
-        rustjvm_types::ClassId::new(0),
+        cratonvm_types::ClassId::new(0),
         exception_names.len(),
     );
     for (i, name) in exception_names.iter().enumerate() {
@@ -5507,7 +5507,7 @@ pub(crate) fn create_constructor_object(
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
 
-    // --- RustJVM extra metadata ---
+    // --- CratonVM extra metadata ---
     ctx.set_field(
         obj,
         base + CONSTRUCTOR_EXTRA_OFFSET_DESC,
@@ -5531,7 +5531,7 @@ pub(crate) fn create_constructor_object(
 
 pub(crate) fn read_constructor_descriptor(
     ctx: &dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
 ) -> Option<String> {
     if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
         return Some((*m.descriptor).to_string());
@@ -5545,13 +5545,13 @@ pub(crate) fn read_constructor_descriptor(
 }
 
 /// Build an `<init>` descriptor `(…)V` from the JDK `Constructor.parameterTypes`
-/// mirrors. Used when the RustJVM extra-slot descriptor is unreadable (C6 —
+/// mirrors. Used when the CratonVM extra-slot descriptor is unreadable (C6 —
 /// `class_num_total_fields` grew after stub→real upgrade); falling back to
 /// `()V` would run only `Object.<init>` and leave subclass fields unset
 /// (Surefire fork: `JUnitPlatformProvider.launcher == null`).
 fn compose_init_descriptor_from_parameter_types(
     ctx: &dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
 ) -> String {
     let params_arr = match ctx.get_field_by_name(ctor_obj, "parameterTypes") {
         Value::Object(Some(arr)) => arr,
@@ -5575,7 +5575,7 @@ fn compose_init_descriptor_from_parameter_types(
 /// `()V` alone — see `compose_init_descriptor_from_parameter_types`).
 fn constructor_descriptor_for_new_instance(
     ctx: &dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
 ) -> String {
     fn looks_like_init_descriptor(d: &str) -> bool {
         let d = d.trim();
@@ -5630,7 +5630,7 @@ fn constructor_descriptor_for_new_instance(
 
 fn read_constructor_param_count(
     ctx: &dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
 ) -> i32 {
     if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
         return m.param_count;
@@ -5645,7 +5645,7 @@ fn read_constructor_param_count(
 
 fn read_constructor_accessible(
     ctx: &dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
 ) -> bool {
     if let Some(m) = peek_constructor_mirror_side(ctor_obj) {
         if m.accessible {
@@ -5677,7 +5677,7 @@ fn read_constructor_accessible(
 
 pub(crate) fn write_constructor_accessible(
     ctx: &mut dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
     value: bool,
 ) {
     let key = ctor_obj.as_ptr() as usize;
@@ -5699,7 +5699,7 @@ pub(crate) fn write_constructor_accessible(
 /// Public wrapper used by `lang_reflect::native_constructor_try_set_accessible`.
 pub(crate) fn write_constructor_accessible_external(
     ctx: &mut dyn NativeContext,
-    ctor_obj: rustjvm_types::ObjectRef,
+    ctor_obj: cratonvm_types::ObjectRef,
     value: bool,
 ) {
     write_constructor_accessible(ctx, ctor_obj, value);
@@ -5760,7 +5760,7 @@ pub(crate) fn native_constructor_new_instance(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Constructor.newInstance: null Constructor".to_string()),
             }
             .into())
@@ -5771,7 +5771,7 @@ pub(crate) fn native_constructor_new_instance(
     let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => m,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Constructor.newInstance: no declaring class".to_string()),
             }
             .into())
@@ -5785,17 +5785,17 @@ pub(crate) fn native_constructor_new_instance(
         },
     };
     if class_name.is_empty() {
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "Constructor.newInstance: declaring class has empty name".to_string(),
         }
         .into());
     }
 
     // NEW-19: JPMS deep-reflection check. Accessible flag lives in a
-    // RustJVM extra slot; when true the check is already paid (JEP 403).
+    // CratonVM extra slot; when true the check is already paid (JEP 403).
     let accessible = read_constructor_accessible(ctx, this);
     if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
-        return Err(rustjvm_types::error::RuntimeError::IllegalAccessException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
             message: format!("Constructor.newInstance: {class_name}: {msg}"),
         }
         .into());
@@ -5811,10 +5811,10 @@ pub(crate) fn native_constructor_new_instance(
     // InstantiationException on abstract targets.
     if let Some(cid) = ctx.class_id_by_name(&class_name) {
         let flags = ctx.class_access_flags(cid);
-        let abstract_bit = rustjvm_types::access_flags::ACC_ABSTRACT;
-        let iface_bit = rustjvm_types::access_flags::ACC_INTERFACE;
+        let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
+        let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
         if flags & (abstract_bit | iface_bit) != 0 {
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: format!(
                     "InstantiationException: cannot instantiate abstract/interface type {class_name}"
                 ),
@@ -5828,7 +5828,7 @@ pub(crate) fn native_constructor_new_instance(
     let obj = match obj_val {
         Some(Value::Object(Some(o))) => o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: format!("Constructor.newInstance: failed to allocate {class_name}"),
             }
             .into())
@@ -5888,7 +5888,7 @@ pub(crate) fn native_class_get_declared_constructors(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredConstructors on null".to_string()),
             }
             .into())
@@ -5902,7 +5902,7 @@ pub(crate) fn native_class_get_declared_constructors(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -5916,7 +5916,7 @@ pub(crate) fn native_class_get_declared_constructors(
         })
         .collect();
 
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), constructors.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), constructors.len());
     for (i, meta) in constructors.iter().enumerate() {
         let ctor_obj = create_constructor_object(ctx, meta);
         ctx.set_array_element(arr, i, Value::Object(Some(ctor_obj)));
@@ -5931,7 +5931,7 @@ pub(crate) fn native_class_get_declared_constructor(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getDeclaredConstructor on null".to_string()),
             }
             .into())
@@ -5947,7 +5947,7 @@ pub(crate) fn native_class_get_declared_constructor(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
                 message: "<init>".to_string(),
             }
             .into())
@@ -5999,7 +5999,7 @@ pub(crate) fn native_class_get_declared_constructor(
         return Ok(Some(Value::Object(Some(ctor_obj))));
     }
 
-    Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+    Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
         message: "<init>".to_string(),
     }
     .into())
@@ -6016,8 +6016,8 @@ pub(crate) fn native_class_get_declared_constructor(
 /// (matches `collect_public_methods`).
 fn collect_public_fields(
     ctx: &mut dyn NativeContext,
-    class_id: rustjvm_types::ClassId,
-) -> Vec<rustjvm_types::ObjectRef> {
+    class_id: cratonvm_types::ClassId,
+) -> Vec<cratonvm_types::ObjectRef> {
     let mut result = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
@@ -6068,8 +6068,8 @@ fn collect_public_fields(
 /// matches.
 fn collect_public_methods(
     ctx: &mut dyn NativeContext,
-    class_id: rustjvm_types::ClassId,
-) -> Vec<rustjvm_types::ObjectRef> {
+    class_id: cratonvm_types::ClassId,
+) -> Vec<cratonvm_types::ObjectRef> {
     let mut result = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
@@ -6110,7 +6110,7 @@ pub(crate) fn native_class_get_fields(ctx: &mut dyn NativeContext, args: &[Value
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getFields on null".to_string()),
             }
             .into())
@@ -6119,12 +6119,12 @@ pub(crate) fn native_class_get_fields(ctx: &mut dyn NativeContext, args: &[Value
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
     let field_objs = collect_public_fields(ctx, class_id);
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), field_objs.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), field_objs.len());
     for (i, fobj) in field_objs.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(*fobj)));
     }
@@ -6135,7 +6135,7 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getField on null".to_string()),
             }
             .into())
@@ -6144,7 +6144,7 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getField: name is null".to_string()),
             }
             .into())
@@ -6155,7 +6155,7 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchFieldException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchFieldException {
                 field_name: target_name,
             }
             .into())
@@ -6214,7 +6214,7 @@ pub(crate) fn native_class_get_field(ctx: &mut dyn NativeContext, args: &[Value]
         }
     }
 
-    Err(rustjvm_types::error::RuntimeError::NoSuchFieldException {
+    Err(cratonvm_types::error::RuntimeError::NoSuchFieldException {
         field_name: target_name,
     }
     .into())
@@ -6233,14 +6233,14 @@ pub(crate) fn native_class_get_methods(ctx: &mut dyn NativeContext, args: &[Valu
     });
     if prev_depth > 50 {
         GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(arr))));
     }
     let result = (|| -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getMethods on null".to_string()),
             }
             .into())
@@ -6249,12 +6249,12 @@ pub(crate) fn native_class_get_methods(ctx: &mut dyn NativeContext, args: &[Valu
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
     let method_objs = collect_public_methods(ctx, class_id);
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), method_objs.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), method_objs.len());
     for (i, mobj) in method_objs.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(*mobj)));
     }
@@ -6268,7 +6268,7 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getMethod on null".to_string()),
             }
             .into())
@@ -6277,7 +6277,7 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getMethod: name is null".to_string()),
             }
             .into())
@@ -6304,7 +6304,7 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
             ) {
                 return Ok(Some(Value::Object(Some(method_obj))));
             }
-            return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
                 message: target_name,
             }
             .into());
@@ -6441,7 +6441,7 @@ pub(crate) fn native_class_get_method(ctx: &mut dyn NativeContext, args: &[Value
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
-    Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+    Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
         message: target_name,
     }
     .into())
@@ -6451,7 +6451,7 @@ pub(crate) fn native_class_get_constructors(ctx: &mut dyn NativeContext, args: &
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getConstructors on null".to_string()),
             }
             .into())
@@ -6460,7 +6460,7 @@ pub(crate) fn native_class_get_constructors(ctx: &mut dyn NativeContext, args: &
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -6471,7 +6471,7 @@ pub(crate) fn native_class_get_constructors(ctx: &mut dyn NativeContext, args: &
         .filter(|m| m.name == "<init>" && (m.access_flags & 0x0001) != 0)
         .collect();
 
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), public_ctors.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), public_ctors.len());
     for (i, meta) in public_ctors.iter().enumerate() {
         let ctor_obj = create_constructor_object(ctx, meta);
         ctx.set_array_element(arr, i, Value::Object(Some(ctor_obj)));
@@ -6483,7 +6483,7 @@ pub(crate) fn native_class_get_constructor(ctx: &mut dyn NativeContext, args: &[
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getConstructor on null".to_string()),
             }
             .into())
@@ -6497,7 +6497,7 @@ pub(crate) fn native_class_get_constructor(ctx: &mut dyn NativeContext, args: &[
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
                 message: "<init>".to_string(),
             }
             .into())
@@ -6544,7 +6544,7 @@ pub(crate) fn native_class_get_constructor(ctx: &mut dyn NativeContext, args: &[
         return Ok(Some(Value::Object(Some(ctor_obj))));
     }
 
-    Err(rustjvm_types::error::RuntimeError::NoSuchMethodException {
+    Err(cratonvm_types::error::RuntimeError::NoSuchMethodException {
         message: "<init>".to_string(),
     }
     .into())
@@ -6556,7 +6556,7 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Class.getInterfaces on null".to_string()),
             }
             .into())
@@ -6581,13 +6581,13 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
                     // proxy at field 1. The proxy retains the array,
                     // so it's still live.
                     let arr_ref = unsafe {
-                        rustjvm_types::ObjectRef::from_raw(bits as *mut u8)
+                        cratonvm_types::ObjectRef::from_raw(bits as *mut u8)
                     };
                     return Ok(Some(Value::Object(Some(arr_ref))));
                 }
                 // No proxy has been created yet — fall through and
                 // return an empty array.
-                let empty = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+                let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
                 return Ok(Some(Value::Object(Some(empty))));
             }
         }
@@ -6615,7 +6615,7 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
         if dbg_bb {
             eprintln!("[bb-dbg] getInterfaces({}) -> [] [object-early-strict]", this_name);
         }
-        let empty = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         return Ok(Some(Value::Object(Some(empty))));
     }
 
@@ -6625,7 +6625,7 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
             if dbg_bb {
                 eprintln!("[bb-dbg] getInterfaces({}) -> [] [no-class-id]", this_name);
             }
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -6638,7 +6638,7 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
             .collect();
         eprintln!("[bb-dbg] getInterfaces({}) -> {:?}", this_name, names);
     }
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), iface_ids.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), iface_ids.len());
     for (i, iface_id) in iface_ids.iter().enumerate() {
         let mirror = ctx.get_class_mirror(*iface_id);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
@@ -6714,7 +6714,7 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 /// Fills in default values for elements not explicitly provided.
 fn create_annotation_proxy(
     ctx: &mut dyn NativeContext,
-    ann: &rustjvm_native_api::AnnotationData,
+    ann: &cratonvm_native_api::AnnotationData,
 ) -> ObjectRef {
     let proxy = alloc_concurrent_synthetic(ctx, "java/lang/annotation/AnnotationProxy", ANN_PROXY_FIELDS);
     let desc_str = ctx.create_string(&ann.type_descriptor);
@@ -6737,11 +6737,11 @@ fn create_annotation_proxy(
             ann_class_id_opt = Some(cid);
             let mirror = ctx.get_class_mirror(cid);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
-        } else if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+        } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} — type mirror NOT set (class load failed)",
                 ann.type_descriptor, ann.type_descriptor);
         }
-    } else if std::env::var("RUSTJVM_IAE_TRACE").is_ok() {
+    } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
         eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} — annotation_desc_to_class_name returned None",
             ann.type_descriptor);
     }
@@ -6758,7 +6758,7 @@ fn create_annotation_proxy(
     // on `getStringArray("pattern")` for `@ComponentScan.Filter` (S111r19).
     let mut all_elements: Vec<(
         String,
-        rustjvm_native_api::AnnotationElementValue,
+        cratonvm_native_api::AnnotationElementValue,
         Option<String>,
     )> = ann
         .elements
@@ -6824,7 +6824,7 @@ fn create_annotation_proxy(
     // explicitly. Authorised by user as a targeted Spring shim while
     // CGLIB support is deferred.
     if ann.type_descriptor == "Lorg/springframework/context/annotation/Configuration;" {
-        let force_false = rustjvm_native_api::AnnotationElementValue::Int(0);
+        let force_false = cratonvm_native_api::AnnotationElementValue::Int(0);
         let mut found = false;
         for (name, val, ret_desc) in all_elements.iter_mut() {
             if name == "proxyBeanMethods" {
@@ -6868,7 +6868,7 @@ fn create_annotation_proxy(
 /// `instanceof Integer` checks.
 pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
-    val: &rustjvm_native_api::AnnotationElementValue,
+    val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Value {
     annotation_element_to_java_typed(ctx, val, None)
 }
@@ -6883,10 +6883,10 @@ pub(crate) fn annotation_element_to_java(
 /// `Annotation[].isInstance(Object[])`).
 pub(crate) fn annotation_element_to_java_typed(
     ctx: &mut dyn NativeContext,
-    val: &rustjvm_native_api::AnnotationElementValue,
+    val: &cratonvm_native_api::AnnotationElementValue,
     return_type_desc: Option<&str>,
 ) -> Value {
-    use rustjvm_native_api::AnnotationElementValue;
+    use cratonvm_native_api::AnnotationElementValue;
     match val {
         AnnotationElementValue::Int(v) => {
             // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
@@ -6954,7 +6954,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // the wrong switch case, surfacing as `IllegalArgumentException`
             // wrapped at `ConfigurationClassParser.parse:181`.  Load the
             // class on demand, mirroring the sibling `Class` arm (C29).
-            let iae_trace = std::env::var("RUSTJVM_IAE_TRACE").is_ok();
+            let iae_trace = std::env::var("CRATONVM_IAE_TRACE").is_ok();
             let enum_cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
                 let _ = ctx.load_class(class_name);
                 ctx.class_id_by_name(class_name)
@@ -6992,7 +6992,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // (common for annotation defaults that reference sibling classes
             // like picocli's NoOpModelTransformer), load it on demand. A null
             // return here causes downstream NullPointerExceptions (C29).
-            let iae_trace_cls = std::env::var("RUSTJVM_IAE_TRACE").is_ok();
+            let iae_trace_cls = std::env::var("CRATONVM_IAE_TRACE").is_ok();
             if let Some(class_name) = annotation_desc_to_class_name(desc) {
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
                     let mirror = ctx.get_class_mirror(cid);
@@ -7046,7 +7046,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // interface (F4) makes the array's `componentType()` report
             // `F4.class`, which `isAnnotation()` returns `true` for, and the
             // synthesize loop then runs as expected.
-            use rustjvm_native_api::AnnotationElementValue as AEV;
+            use cratonvm_native_api::AnnotationElementValue as AEV;
             // S111r19 — when the array is **empty** (no first element to
             // probe), fall back to the caller-provided method return-type
             // descriptor.  This recovers the right component class for
@@ -7114,7 +7114,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     let _ = ctx.load_class(&comp_name_owned);
                     ctx.class_id_by_name(&comp_name_owned)
                 })
-                .unwrap_or(rustjvm_types::ClassId::new(0));
+                .unwrap_or(cratonvm_types::ClassId::new(0));
             let arr = ctx.new_ref_array(comp_cid, elems.len());
             // Round 18: derive the per-element return-type descriptor from
             // the array descriptor (strip leading `[`) so primitive elements
@@ -7135,9 +7135,9 @@ pub(crate) fn annotation_element_to_java_typed(
 /// Build an Annotation[] array from annotation data.
 fn build_annotation_array(
     ctx: &mut dyn NativeContext,
-    annotations: &[rustjvm_native_api::AnnotationData],
+    annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
     let arr = ctx.new_ref_array(ClassId::new(0), annotations.len());
     for (i, ann) in annotations.iter().enumerate() {
         let proxy = create_annotation_proxy(ctx, ann);
@@ -7163,7 +7163,7 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
         }
     };
     let annotations = ctx.class_annotations(class_id);
-    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") || cn.contains("SpringBootConfiguration") {
             eprintln!("[GDA] {} -> {} annotations", cn, annotations.len());
@@ -7447,18 +7447,18 @@ pub(crate) fn native_class_get_annotations_by_type(
         {
             // The @Repeatable annotation has a single element "value" which is a Class
             // descriptor for the container annotation type.
-            if let Some((_, rustjvm_native_api::AnnotationElementValue::Class(container_desc))) =
+            if let Some((_, cratonvm_native_api::AnnotationElementValue::Class(container_desc))) =
                 repeatable_ann.elements.iter().find(|(name, _)| name == "value")
             {
                 // Find the container annotation on the target class
                 for ann in &annotations {
                     if ann.type_descriptor == *container_desc {
                         // The container's value() element is an Array of nested annotations
-                        if let Some((_, rustjvm_native_api::AnnotationElementValue::Array(elems))) =
+                        if let Some((_, cratonvm_native_api::AnnotationElementValue::Array(elems))) =
                             ann.elements.iter().find(|(name, _)| name == "value")
                         {
                             for elem in elems {
-                                if let rustjvm_native_api::AnnotationElementValue::Annotation(nested) = elem {
+                                if let cratonvm_native_api::AnnotationElementValue::Annotation(nested) = elem {
                                     if nested.type_descriptor == target_desc {
                                         matching.push(nested.clone());
                                     }
@@ -7619,7 +7619,7 @@ pub(crate) fn native_method_get_annotations(ctx: &mut dyn NativeContext, args: &
         }
     };
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
-    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication") || cn.contains("EnableAutoConfiguration") {
             eprintln!("[MGA] {}.{}{} -> {} method-anns", cn, method_name, method_desc, annotations.len());
@@ -7690,7 +7690,7 @@ pub(crate) fn native_method_get_annotation(ctx: &mut dyn NativeContext, args: &[
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
-    if std::env::var("RUSTJVM_ANN_TRACE").is_ok() {
+    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication") {
             eprintln!("[GMA] {}.{}{} target={} -> {} method-anns", cn, method_name, method_desc, target_desc, annotations.len());
@@ -8293,7 +8293,7 @@ pub(crate) fn native_class_get_component_type(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            if std::env::var("RUSTJVM_DBG_COMPONENT_TYPE").is_ok() {
+            if std::env::var("CRATONVM_DBG_COMPONENT_TYPE").is_ok() {
                 eprintln!("[CT-DBG] getComponentType receiver=null");
             }
             return Ok(Some(Value::Object(None)));
@@ -8458,7 +8458,7 @@ pub(crate) fn native_class_get_package_name(ctx: &mut dyn NativeContext, args: &
 /// Spring Boot fat-jar deployments where the class lives in a nested jar.
 fn t19_h10_class_manifest_attr(
     ctx: &mut dyn NativeContext,
-    class_id: rustjvm_types::ClassId,
+    class_id: cratonvm_types::ClassId,
     attr: &str,
 ) -> Option<String> {
     let url = ctx.class_code_base(class_id)?;
@@ -8537,7 +8537,7 @@ fn plain_jar_manifest_attr(path: &std::path::Path, attr: &str) -> Option<String>
         }
     }
 
-    let manifest = rustjvm_classloading::ClassPath::read_jar_manifest(path);
+    let manifest = cratonvm_classloading::ClassPath::read_jar_manifest(path);
     let mut map: HashMap<String, String> = HashMap::new();
     if let Some(m) = &manifest {
         for (k, v) in m.attributes.iter() {
@@ -8747,7 +8747,7 @@ pub(crate) fn i2_classloader_get_defined_packages(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(empty))))
 }
 
@@ -8883,7 +8883,7 @@ pub(crate) fn i2_classloader_define_package_class(
 /// both real-JDK and synthetic-jdk registration paths without any
 /// edits to `lib.rs` / `vm_init.rs` (per I2 surface rules).
 pub fn i2_register_classloader_package_natives(
-    r: &mut rustjvm_native_api::NativeMethodRegistry,
+    r: &mut cratonvm_native_api::NativeMethodRegistry,
 ) {
     let cl = "java/lang/ClassLoader";
     r.register(
@@ -9132,7 +9132,7 @@ pub(crate) fn native_class_get_class_loader(
     let class_id_opt = ctx.class_id_from_mirror(mirror).or_else(|| {
         if let Value::Int(v) = ctx.get_field(mirror, 0) {
             if v > 0 {
-                return Some(rustjvm_types::ClassId::new(v as u32));
+                return Some(cratonvm_types::ClassId::new(v as u32));
             }
         }
         None
@@ -9300,7 +9300,7 @@ pub(crate) fn native_class_get_enclosing_method(
             let enc_mirror = ctx.get_class_mirror(enc_class_id);
 
             // Build 3-element Object array: [Class, String, String]
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 3);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 3);
             ctx.set_array_element(arr, 0, Value::Object(Some(enc_mirror)));
 
             if !method_name.is_empty() {
@@ -9363,7 +9363,7 @@ pub(crate) fn native_class_get_raw_annotations(
         // Match OpenJDK semantics: return null when no RuntimeVisibleAnnotations attribute.
         Ok(Some(Value::Object(None)))
     } else {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -9390,7 +9390,7 @@ pub(crate) fn native_class_get_raw_type_annotations(
     if bytes.is_empty() {
         Ok(Some(Value::Object(None)))
     } else {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -9435,7 +9435,7 @@ pub(crate) fn native_class_get_declared_classes(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -9453,7 +9453,7 @@ pub(crate) fn native_class_get_declared_classes(
         }
     }
 
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, declared.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, declared.len());
     for (i, mirror) in declared.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(*mirror)));
     }
@@ -9503,7 +9503,7 @@ pub(crate) fn native_class_get_nest_members(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(this)));
             return Ok(Some(Value::Object(Some(arr))));
         }
@@ -9512,7 +9512,7 @@ pub(crate) fn native_class_get_nest_members(
     let members = ctx.nest_member_names(class_id);
     if members.is_empty() {
         // Not a nest host — return [self]
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(arr, 0, Value::Object(Some(this)));
         Ok(Some(Value::Object(Some(arr))))
     } else {
@@ -9525,7 +9525,7 @@ pub(crate) fn native_class_get_nest_members(
                 }
             }
         }
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, mirrors.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, mirrors.len());
         for (i, mirror) in mirrors.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(*mirror)));
         }
@@ -9568,7 +9568,7 @@ pub(crate) fn native_class_get_record_components(
     let components = ctx.record_components(class_id);
     let rc_class_id = ctx
         .ensure_class_initialized("java/lang/reflect/RecordComponent")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
 
     // Allocate with the JDK-layout total field count, falling back to a
     // 3-slot floor for synthetic mode where the class is unknown.
@@ -9584,7 +9584,7 @@ pub(crate) fn native_class_get_record_components(
     // component descriptor.
     let declared = ctx.declared_methods(class_id);
 
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, components.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, components.len());
     for (i, (name, descriptor)) in components.iter().enumerate() {
         let rc_obj = ctx.alloc_object(rc_class_id, num_fields);
         let name_str = ctx.create_string(name);
@@ -9649,7 +9649,7 @@ pub(crate) fn native_class_get_permitted_subclasses(
     }
 
     let subs = ctx.permitted_subclasses(class_id);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, subs.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, subs.len());
     for (i, sub_name) in subs.iter().enumerate() {
         if let Some(sub_id) = ctx.class_id_by_name(sub_name) {
             let mirror = ctx.get_class_mirror(sub_id);
@@ -9720,13 +9720,13 @@ pub(crate) fn native_class_get_annotated_interfaces(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
 
     let iface_ids = ctx.class_interfaces(class_id);
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), iface_ids.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), iface_ids.len());
     for (i, iface_id) in iface_ids.iter().enumerate() {
         let iface_mirror = ctx.get_class_mirror(*iface_id);
         let at = make_annotated_type(ctx, iface_mirror);
@@ -9750,21 +9750,21 @@ pub(crate) fn native_class_get_annotated_interfaces(
 /// accessor + non-null-ness.
 fn make_annotated_type(
     ctx: &mut dyn NativeContext,
-    backing_type: rustjvm_types::ObjectRef,
-) -> rustjvm_types::ObjectRef {
+    backing_type: cratonvm_types::ObjectRef,
+) -> cratonvm_types::ObjectRef {
     // Try the impl class first (real-JDK layout); fall back to the
     // interface name (synthetic-mode placeholder).
     let cid = ctx
         .ensure_class_initialized("sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl")
         .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
 
     let layout_fields = ctx.class_num_total_fields(cid);
     let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
     let obj = ctx.alloc_object(cid, num_fields);
 
     // empty Annotation[] for `annotations`
-    let empty_anns = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+    let empty_anns = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
 
     ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_anns)));
@@ -9904,7 +9904,7 @@ pub(crate) fn native_class_get_protection_domain0(
     ctx.set_field(url_obj, 6, Value::Object(Some(path_obj)));
     let cs_cid = ctx
         .ensure_class_initialized("java/security/CodeSource")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let cs_num_fields = ctx.class_num_total_fields(cs_cid).max(2);
     let cs = ctx.alloc_object(cs_cid, cs_num_fields);
     // Slot-based writes cover the synthetic layout; name-based writes
@@ -9916,9 +9916,9 @@ pub(crate) fn native_class_get_protection_domain0(
     // Attach signer certs as fresh byte[] copies on slot 1.
     let certs = ctx.class_code_source_certs(class_id);
     if !certs.is_empty() {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, certs.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, certs.len());
         for (i, cert) in certs.iter().enumerate() {
-            let cert_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, cert.len());
+            let cert_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cert.len());
             for (j, &b) in cert.iter().enumerate() {
                 ctx.set_array_element(cert_arr, j, Value::Int(b as i8 as i32));
             }
@@ -9932,13 +9932,13 @@ pub(crate) fn native_class_get_protection_domain0(
     // principals=empty).  Null permissions = "all permissions" per JDK default.
     let pd_cid = ctx
         .ensure_class_initialized("java/security/ProtectionDomain")
-        .unwrap_or(rustjvm_types::ClassId::new(0));
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let pd_num_fields = ctx.class_num_total_fields(pd_cid).max(4);
     let pd = ctx.alloc_object(pd_cid, pd_num_fields);
     ctx.set_field(pd, 0, Value::Object(Some(cs)));
     ctx.set_field(pd, 1, Value::Object(None));
     ctx.set_field(pd, 2, Value::Object(None));
-    let empty_principals = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let empty_principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     ctx.set_field(pd, 3, Value::Object(Some(empty_principals)));
     ctx.set_field_by_name(pd, "codesource", Value::Object(Some(cs)));
     ctx.set_field_by_name(pd, "permissions", Value::Object(None));
@@ -9977,11 +9977,11 @@ pub(crate) fn native_class_get_signers(
         return Ok(Some(Value::Object(None)));
     }
 
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, certs.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, certs.len());
     for (i, cert) in certs.iter().enumerate() {
         // Fresh byte[] copy — never leak the internal `CodeSource.certificates`
         // Vec<Vec<u8>> pointer to the caller.
-        let cert_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, cert.len());
+        let cert_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cert.len());
         for (j, &b) in cert.iter().enumerate() {
             ctx.set_array_element(cert_arr, j, Value::Int(b as i8 as i32));
         }
@@ -10018,7 +10018,7 @@ pub(crate) fn native_class_set_signers(
         _ => 0,
     };
     tracing::debug!(
-        target: "rustjvm_native_builtins::lang_class",
+        target: "cratonvm_native_builtins::lang_class",
         class = %class_name,
         signer_count = signer_count,
         "Class.setSigners called — documented no-op (signers not mutable post-define)"
@@ -10030,7 +10030,7 @@ pub(crate) fn native_class_set_signers(
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::NativeContext;
+    use cratonvm_native_api::NativeContext;
 
     /// Helper: create a Class mirror object with the given class_id and name.
     fn make_class_mirror(ctx: &mut crate::test_utils::MockNativeContext, class_id: u32, name: &str) -> ObjectRef {
@@ -10129,7 +10129,7 @@ mod tests {
         // Simulates `Class.getEnumConstantsShared(TimeUnit.class)` —
         // asserts that the native sees ACC_ENUM set, reads `$VALUES`,
         // and returns a fresh Object[] with 7 non-null elements.
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("java/util/concurrent/TimeUnit").unwrap();
         // Flag the class as an enum (ACC_ENUM = 0x4000).
@@ -10720,7 +10720,7 @@ mod tests {
 
     #[test]
     fn illegal_arg_exc_carries_message() {
-        use rustjvm_types::error::{MethodCallFailed, RuntimeError, VmError};
+        use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
         let err = illegal_arg_exc("bad".to_string());
         match err {
             MethodCallFailed::InternalError(VmError::Runtime(
@@ -10745,14 +10745,14 @@ mod tests {
         slot_index: i32,
     ) -> ObjectRef {
         // Allocate with room for the synthetic layout (slots 0..=6) plus
-        // the RustJVM extra-metadata slots (descriptor, rj_slot,
+        // the CratonVM extra-metadata slots (descriptor, rj_slot,
         // accessible) that the production readers now consult.
         let obj = ctx.alloc_object(
             ClassId::new(0),
             FIELD_NUM_FIELDS + FIELD_EXTRA_SLOTS,
         );
         // field 0: declaring class mirror (class_id = 1 arbitrary)
-        let mirror = make_class_mirror(ctx, 1, "rustjvm/test/Fixture");
+        let mirror = make_class_mirror(ctx, 1, "cratonvm/test/Fixture");
         ctx.set_field(obj, 0, Value::Object(Some(mirror)));
         let name_s = ctx.create_string(name);
         ctx.set_field(obj, 1, Value::Object(Some(name_s)));
@@ -10913,7 +10913,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn c5_field_get_declaring_class_returns_declared_not_object() {
-        use rustjvm_native_api::FieldMetadata;
+        use cratonvm_native_api::FieldMetadata;
 
         let mut ctx = mock_ctx();
         // Allocate a class id by initializing the declaring class name.
@@ -10996,7 +10996,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn c6_method_get_declaring_class_returns_declared_not_object() {
-        use rustjvm_native_api::MethodMetadata;
+        use cratonvm_native_api::MethodMetadata;
 
         let mut ctx = mock_ctx();
         let declaring_cid = ctx
@@ -11054,7 +11054,7 @@ mod tests {
             Some("length"),
         );
 
-        // RustJVM extra-slot descriptor must round-trip.
+        // CratonVM extra-slot descriptor must round-trip.
         let desc = read_method_descriptor(&ctx, method_obj).unwrap_or_default();
         assert_eq!(desc, "()I",
             "C6: Method raw descriptor must survive in the extra slot");
@@ -11208,8 +11208,8 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/SetSignersTarget").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/SetSignersTarget");
         // Allocate a fake signers array to pass in.
-        let signers = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
-        let dummy_cert = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 2);
+        let signers = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        let dummy_cert = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 2);
         ctx.set_array_element(dummy_cert, 0, Value::Int(0x42));
         ctx.set_array_element(dummy_cert, 1, Value::Int(0x43));
         ctx.set_array_element(signers, 0, Value::Object(Some(dummy_cert)));

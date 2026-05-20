@@ -1,6 +1,6 @@
-//! Build script for rustjvm-vm.
+//! Build script for cratonvm-vm.
 //!
-//! Automatically compiles Java test classes in `tests/resources/rustjvm/` if
+//! Automatically compiles Java test classes in `tests/resources/cratonvm/` if
 //! `javac` is available on the PATH. This allows integration tests to run
 //! without a manual compilation step.
 //!
@@ -52,7 +52,7 @@ fn compile_files(files: &[PathBuf], out_dir: &Path, extra_args: &[&str], log_fai
 /// Round-11 cross-cutting HIGH-6 (round-9 MED-10): cache the result of
 /// the `javac -version` availability probe in `OUT_DIR`. Without the
 /// cache this `Command::new("javac")` fork/exec runs on EVERY
-/// incremental build of the `rustjvm-vm` crate — even when no .java
+/// incremental build of the `cratonvm-vm` crate — even when no .java
 /// source changed. On Windows the `CreateProcess` + JVM startup cost
 /// alone is ~200ms; on macOS the toolchain shim adds another ~100ms.
 ///
@@ -84,12 +84,12 @@ fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir_var = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let out_dir = Path::new(&out_dir_var);
-    // Java files live under `tests/resources/rustjvm/`; the classpath
+    // Java files live under `tests/resources/cratonvm/`; the classpath
     // used by the integration tests is `tests/resources/`, so every
     // `.class` must land one level up from the sources (output dir =
     // `tests/resources`). Javac then places each compiled class
-    // under its package directory (e.g. `rustjvm/TckIo.class`).
-    let sources_dir = Path::new(&manifest_dir).join("tests/resources/rustjvm");
+    // under its package directory (e.g. `cratonvm/TckIo.class`).
+    let sources_dir = Path::new(&manifest_dir).join("tests/resources/cratonvm");
     let output_dir = Path::new(&manifest_dir).join("tests/resources");
 
     // Round-11 cross-cutting HIGH-6: declare an explicit allow-list of
@@ -100,7 +100,7 @@ fn main() {
     //     keeps the contract obvious.
     //   * PATH env var: if the user adds/removes a JDK from PATH, the
     //     `javac_available_cached` result must be re-probed.
-    println!("cargo:rerun-if-changed=tests/resources/rustjvm/");
+    println!("cargo:rerun-if-changed=tests/resources/cratonvm/");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=JAVA_HOME");

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ObjectRef;
 
 use crate::event::{AwtEvent, AwtEventData, PeerId, event_id};
 

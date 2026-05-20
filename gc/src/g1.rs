@@ -29,7 +29,7 @@ use crate::heap::{
 use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
 use crate::satb::SatbQueue;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Configuration

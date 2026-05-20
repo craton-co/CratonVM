@@ -34,7 +34,7 @@ JAVA
 
 "$JAVA_HOME_FOR_SMOKE/bin/javac" -cp "$CORE_JAR:$DATABIND_JAR:$ANN_JAR" -d "$FIX_DIR" "$FIX_DIR/JacksonSmoke.java"
 
-SMOKE_TIMEOUT=300 smoke_run_rustjvm \
+SMOKE_TIMEOUT=300 smoke_run_cratonvm \
     --Xmx 512m \
     --classpath "$FIX_DIR:$CORE_JAR:$DATABIND_JAR:$ANN_JAR" \
     -- JacksonSmoke

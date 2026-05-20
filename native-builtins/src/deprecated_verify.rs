@@ -6,8 +6,8 @@
 //! all JDK 25 `@Deprecated` tagged APIs and verifies each has a native
 //! implementation registered.
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
 // T8.5.1 — Round-trip test
@@ -167,13 +167,13 @@ fn jdk25_deprecated_api_checklist() -> Vec<(&'static str, &'static str, &'static
 /// A shim function that throws `UnsupportedOperationException` for any
 /// deprecated API that was not explicitly implemented.
 fn deprecated_shim(
-    _ctx: &mut dyn rustjvm_native_api::NativeContext,
+    _ctx: &mut dyn cratonvm_native_api::NativeContext,
     _args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
-    Err(rustjvm_types::error::MethodCallFailed::InternalError(
-        rustjvm_types::error::VmError::Runtime(
-            rustjvm_types::error::RuntimeError::UnsupportedOperationException {
-                message: "RustJVM T8.5.4: deprecated API not implemented".to_string(),
+) -> cratonvm_types::error::MethodCallResult {
+    Err(cratonvm_types::error::MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                message: "CratonVM T8.5.4: deprecated API not implemented".to_string(),
             },
         ),
     ))
@@ -281,9 +281,9 @@ mod tests {
         let r = build_deprecated_registry();
         let f = r.find("java/lang/Compiler", "compileClass", "(Ljava/lang/Class;)Z").unwrap();
         let mut ctx = MockNativeContext::new();
-        let result = f(&mut ctx, &[rustjvm_types::Value::Object(None)]);
+        let result = f(&mut ctx, &[cratonvm_types::Value::Object(None)]);
         match result {
-            Ok(Some(rustjvm_types::Value::Int(0))) => {} // false
+            Ok(Some(cratonvm_types::Value::Int(0))) => {} // false
             other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
         }
     }
@@ -293,9 +293,9 @@ mod tests {
         let r = build_deprecated_registry();
         let f = r.find("java/lang/Compiler", "command", "(Ljava/lang/Object;)Ljava/lang/Object;").unwrap();
         let mut ctx = MockNativeContext::new();
-        let result = f(&mut ctx, &[rustjvm_types::Value::Object(None)]);
+        let result = f(&mut ctx, &[cratonvm_types::Value::Object(None)]);
         match result {
-            Ok(Some(rustjvm_types::Value::Object(None))) => {} // null
+            Ok(Some(cratonvm_types::Value::Object(None))) => {} // null
             other => panic!("Expected Ok(Some(Object(None))), got: {other:?}"),
         }
     }
@@ -306,9 +306,9 @@ mod tests {
         let f = r.find("java/lang/Character", "isSpace", "(C)Z").unwrap();
         let mut ctx = MockNativeContext::new();
         // '\t' = 9, should return true
-        let result = f(&mut ctx, &[rustjvm_types::Value::Int(9)]);
+        let result = f(&mut ctx, &[cratonvm_types::Value::Int(9)]);
         match result {
-            Ok(Some(rustjvm_types::Value::Int(1))) => {}
+            Ok(Some(cratonvm_types::Value::Int(1))) => {}
             other => panic!("isSpace('\\t') should return true, got: {other:?}"),
         }
     }
@@ -319,9 +319,9 @@ mod tests {
         let f = r.find("java/lang/Character", "isJavaLetter", "(C)Z").unwrap();
         let mut ctx = MockNativeContext::new();
         // '_' = 95, should return true (valid Java identifier start)
-        let result = f(&mut ctx, &[rustjvm_types::Value::Int(95)]);
+        let result = f(&mut ctx, &[cratonvm_types::Value::Int(95)]);
         match result {
-            Ok(Some(rustjvm_types::Value::Int(1))) => {}
+            Ok(Some(cratonvm_types::Value::Int(1))) => {}
             other => panic!("isJavaLetter('_') should return true, got: {other:?}"),
         }
     }
@@ -332,9 +332,9 @@ mod tests {
         let f = r.find("java/lang/Character", "isJavaLetter", "(C)Z").unwrap();
         let mut ctx = MockNativeContext::new();
         // '5' = 53, should return false (not valid identifier start)
-        let result = f(&mut ctx, &[rustjvm_types::Value::Int(53)]);
+        let result = f(&mut ctx, &[cratonvm_types::Value::Int(53)]);
         match result {
-            Ok(Some(rustjvm_types::Value::Int(0))) => {}
+            Ok(Some(cratonvm_types::Value::Int(0))) => {}
             other => panic!("isJavaLetter('5') should return false, got: {other:?}"),
         }
     }

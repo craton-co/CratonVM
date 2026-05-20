@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use rustjvm_gc::collector::MonitorCleanup;
-use rustjvm_gc::g1::G1CollectorConfig;
-use rustjvm_gc::reference::{ReferenceProcessor, ReferenceType};
-use rustjvm_gc::{G1Collector, GenerationalHeap};
-use rustjvm_types::{ClassId, Value};
+use cratonvm_gc::collector::MonitorCleanup;
+use cratonvm_gc::g1::G1CollectorConfig;
+use cratonvm_gc::reference::{ReferenceProcessor, ReferenceType};
+use cratonvm_gc::{G1Collector, GenerationalHeap};
+use cratonvm_types::{ClassId, Value};
 
 /// No-op monitor cleanup helper for GC tests that don't exercise the
 /// monitor table.
@@ -331,7 +331,7 @@ fn rh7_oopmap_scaffolding_retains_references() {
     // 2. A populated map reports `has_precise_oop_maps() == true`.
     // 3. `find_oop_map_for_pc` returns the exact entry at a safepoint
     //    PC and `None` elsewhere.
-    use rustjvm_jit::{ExecutableBuffer, CompiledMethod, OopMapEntry};
+    use cratonvm_jit::{ExecutableBuffer, CompiledMethod, OopMapEntry};
 
     let buf = ExecutableBuffer::new(4096).expect("exec alloc");
     let mut cm = CompiledMethod::new(buf);
@@ -377,7 +377,7 @@ fn rh8_old_region_selection_prefers_high_garbage() {
         // region indices 0..10 → Old with efficiency = idx * 0.1
         // (0 = most garbage; 9 = least garbage)
         for (i, region) in regions.iter_mut().take(10).enumerate() {
-            region.region_type = rustjvm_gc::RegionType::Old;
+            region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = (i as f64) * 0.1;
         }
     });
@@ -400,7 +400,7 @@ fn rh8_pinned_regions_are_never_evacuated() {
     let g1 = G1Collector::new(config);
     g1.with_regions_mut(|regions| {
         for (i, region) in regions.iter_mut().take(5).enumerate() {
-            region.region_type = rustjvm_gc::RegionType::Old;
+            region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = (i as f64) * 0.1;
             // Pin the lowest-efficiency (would-be-first) region.
             region.pinned = i == 0;
@@ -424,7 +424,7 @@ fn rh8_selection_is_deterministic_under_ties() {
     let g1 = G1Collector::new(config);
     g1.with_regions_mut(|regions| {
         for region in regions.iter_mut().take(10) {
-            region.region_type = rustjvm_gc::RegionType::Old;
+            region.region_type = cratonvm_gc::RegionType::Old;
             region.gc_efficiency = 0.5; // all tied
         }
     });

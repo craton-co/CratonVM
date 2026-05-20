@@ -1,13 +1,13 @@
-# RustJVM
+# CratonVM
 
-[![CI](https://github.com/craton-co/rust-jvm/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/rust-jvm/actions/workflows/ci.yml)
+[![CI](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-%E2%89%A565%25-brightgreen.svg)](BUILD_GUIDE.md#running-tests)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
 A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
 
-**No JDK installation, no `JAVA_HOME`, no `rt.jar` needed** — RustJVM provides its own
+**No JDK installation, no `JAVA_HOME`, no `rt.jar` needed** — CratonVM provides its own
 synthetic implementations of the Java standard library classes.
 
 ## Features
@@ -33,7 +33,7 @@ synthetic implementations of the Java standard library classes.
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark | JDK 25 C2 | RustJVM | Ratio |
+| Benchmark | JDK 25 C2 | CratonVM | Ratio |
 |-----------|-----------|---------|-------|
 | Arithmetic 300M | 889 ms | 1,676 ms | 1.89x |
 | Fibonacci(42) | 1,876 ms | 2,457 ms | 1.31x |
@@ -49,7 +49,7 @@ See [docs/PRESENTATION.md](docs/PRESENTATION.md) for the full 26-round JIT optim
 ## Quick Start
 
 ```bash
-rustjvm --classpath path/to/classes MyProgram
+cratonvm --classpath path/to/classes MyProgram
 ```
 
 ### 1. Compile your Java source (requires `javac`)
@@ -58,16 +58,16 @@ rustjvm --classpath path/to/classes MyProgram
 javac HelloWorld.java
 ```
 
-### 2. Run with RustJVM
+### 2. Run with CratonVM
 
 ```bash
-cargo run --release -p rustjvm-cli -- --classpath . HelloWorld
+cargo run --release -p cratonvm-cli -- --classpath . HelloWorld
 ```
 
 ## Command-Line Reference
 
 ```
-rustjvm-cli [OPTIONS] <CLASS_NAME> [ARGS...]
+cratonvm-cli [OPTIONS] <CLASS_NAME> [ARGS...]
 ```
 
 | Option | Description |
@@ -85,16 +85,16 @@ rustjvm-cli [OPTIONS] <CLASS_NAME> [ARGS...]
 
 ```bash
 # Single class in current directory
-cargo run --release -p rustjvm-cli -- --classpath . HelloWorld
+cargo run --release -p cratonvm-cli -- --classpath . HelloWorld
 
 # Multiple classpath entries (Unix)
-cargo run --release -p rustjvm-cli -- --classpath "src:lib/utils.jar" com.example.Main
+cargo run --release -p cratonvm-cli -- --classpath "src:lib/utils.jar" com.example.Main
 
 # Pass arguments to the Java program
-cargo run --release -p rustjvm-cli -- --classpath . MyApp arg1 arg2
+cargo run --release -p cratonvm-cli -- --classpath . MyApp arg1 arg2
 
 # Increase heap for larger programs
-cargo run --release -p rustjvm-cli -- --Xmx 1g --classpath . BigProgram
+cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
 ```
 
 ## What Works
@@ -151,10 +151,10 @@ cargo run --release -p rustjvm-cli -- --Xmx 1g --classpath . BigProgram
 Requires **Rust 1.75+** and optionally **JDK 17+** (for compiling test Java classes).
 
 ```bash
-git clone https://github.com/craton-co/rust-jvm.git
-cd rust-jvm
-cargo build --release -p rustjvm-cli
-# Binary at: target/release/rustjvm-cli[.exe]
+git clone https://github.com/craton-co/cratonvm.git
+cd cratonvm
+cargo build --release -p cratonvm-cli
+# Binary at: target/release/cratonvm[.exe]
 ```
 
 ### Running Tests
@@ -177,7 +177,7 @@ cargo fmt --all --check
 ## Architecture
 
 ```
-rustjvm/
+cratonvm/
   reader/              - .class file parser
   types/               - Shared types (Value, ClassId, ObjectRef)
   classloading/        - Class loading & bytecode verification
@@ -188,7 +188,7 @@ rustjvm/
   native-io/           - java.io/nio native methods
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
-  (+ types, native-api, native-sql, jit-api, jfr)
+  (+ types, native-api, native-awt, jit-api, jit-cuda, cuda-bridge, jfr)
 ```
 
 - **Bytecode interpreter** — fast-path dispatch with 140+ opcodes
@@ -201,7 +201,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the codebase s
 See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarking, and project structure.
 See [docs/INSTALL.md](docs/INSTALL.md) for binary installation and getting started.
 See [docs/CONFIG.md](docs/CONFIG.md) for all configuration options and tuning parameters.
-See [docs/ROADMAP.md](docs/ROADMAP.md) for future plans and the performance roadmap.
+See [ROADMAP.md](ROADMAP.md) for future plans and the performance roadmap.
 See [docs/gpu/README.md](docs/gpu/README.md) for the full GPU-offload reference: build modes, CLI flags, architecture, file index, FAQ. The feature is opt-in via Cargo features — the default `cargo build` produces a CPU-only JVM with no GPU code linked.
 
 ## Contributing

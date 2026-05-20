@@ -131,12 +131,12 @@ All Phase 7 commits leave the dev-box test matrix green:
 | Target | Result |
 |---|---|
 | `cargo check --workspace` | clean |
-| `cargo check --workspace --features rustjvm-vm/gpu-offload` | clean |
+| `cargo check --workspace --features cratonvm-vm/gpu-offload` | clean |
 | `cargo check -p cuda-bridge --features cuda` | clean |
-| `cargo test -p rustjvm-gc --features gpu-offload --lib` | 680 passed |
-| `cargo test -p rustjvm-vm --features gpu-offload --lib offload` | 6 pass, 3 ignored |
-| `cargo test -p rustjvm-vm --features gpu-offload --lib gpu_residency` | 5 pass |
-| `cargo test -p rustjvm-vm --features gpu-offload --lib gpu_marshal` | 9 pass |
+| `cargo test -p cratonvm-gc --features gpu-offload --lib` | 680 passed |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib offload` | 6 pass, 3 ignored |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib gpu_residency` | 5 pass |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib gpu_marshal` | 9 pass |
 | `cargo test -p cuda-bridge` | 12 + 4 doc, 2 ignored |
 | `cargo test -p jit-cuda` | 31 pass, 2 ignored |
 

@@ -2,7 +2,7 @@
 //! memory.
 //!
 //! The whole module is gated behind the `gpu-offload` Cargo feature on
-//! `rustjvm-vm`. With the feature off, this file is not compiled and no
+//! `cratonvm-vm`. With the feature off, this file is not compiled and no
 //! GPU-related symbols leak into the default build.
 //!
 //! ## What lives here
@@ -19,8 +19,8 @@
 //! The original plan in
 //! [docs/plans](../../../../) speculated that primitive arrays on the JVM
 //! heap used a 16-byte slot stride (`SLOT_SIZE`). In the current
-//! `rustjvm-gc` layout, primitive arrays in fact use **native element
-//! sizes** (`element_byte_size` in `rustjvm_types::heap_types`): 4 bytes
+//! `cratonvm-gc` layout, primitive arrays in fact use **native element
+//! sizes** (`element_byte_size` in `cratonvm_types::heap_types`): 4 bytes
 //! for `int`/`float`, 8 bytes for `long`/`double`, 2 for `short`/`char`,
 //! 1 for `byte`/`boolean`. We therefore go through the heap's existing
 //! `get_array_element` / `set_array_element` accessors — they already
@@ -40,9 +40,9 @@
 //! through these functions; the GC delays collection while the token is
 //! alive.
 
-use rustjvm_gc::safepoint::SafepointToken;
-use rustjvm_gc::VmHeap;
-use rustjvm_types::{ArrayElementType, ObjectKind, ObjectRef, Value};
+use cratonvm_gc::safepoint::SafepointToken;
+use cratonvm_gc::VmHeap;
+use cratonvm_types::{ArrayElementType, ObjectKind, ObjectRef, Value};
 
 pub use cuda_bridge::{DeviceBuffer, DeviceContext, DeviceError, Result as DeviceResult};
 
@@ -450,8 +450,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_gc::{GcBackend, VmHeap};
-    use rustjvm_types::ClassId;
+    use cratonvm_gc::{GcBackend, VmHeap};
+    use cratonvm_types::ClassId;
     use std::sync::atomic::AtomicU32;
 
     /// Test class id — primitive arrays do not depend on this carrying any

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustjvm_reader::attribute::ExceptionTableEntry;
+use cratonvm_reader::attribute::ExceptionTableEntry;
 
 use crate::classloading::resolution::CachedBytecodeMethod;
 use crate::classloading::ClassId;

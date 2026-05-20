@@ -24,9 +24,9 @@
 //!    `get(Object)Object` entry — sanity-check that the dispatch target
 //!    actually exists on the class we now allocate against.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{NativeContextImpl, Vm};
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{NativeContextImpl, Vm};
 
 /// Pin the WP8.10.10 fix: `System.getenv()` returns a Map whose
 /// `class_id_of` resolves to a real, named class (`java/util/HashMap`),

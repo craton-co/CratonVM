@@ -9,11 +9,11 @@
 //! when the feature is enabled. The crate still compiles for backward compatibility
 //! but is not called in the default (real JDK) build path.
 
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::ClassId;
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectKind, ObjectRef, Value};
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::ClassId;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectKind, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Cached debug-flag probes.
@@ -26,22 +26,22 @@ use rustjvm_types::{ObjectKind, ObjectRef, Value};
 // "enabled iff the env var is set" — but the per-call OS probe is gone.
 // ---------------------------------------------------------------------------
 
-/// `true` iff `RUSTJVM_HM_TRACE` is set (HashMap equals/contract tracing).
+/// `true` iff `CRATONVM_HM_TRACE` is set (HashMap equals/contract tracing).
 fn dbg_hm_trace() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_HM_TRACE").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HM_TRACE").is_some())
 }
 
-/// `true` iff `RUSTJVM_HS_ITR_DBG` is set (HashSet iterator tracing).
+/// `true` iff `CRATONVM_HS_ITR_DBG` is set (HashSet iterator tracing).
 fn dbg_hs_itr() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_HS_ITR_DBG").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HS_ITR_DBG").is_some())
 }
 
-/// `true` iff `RUSTJVM_DBG_SBLOAD` is set (synthetic-build-load tracing).
+/// `true` iff `CRATONVM_DBG_SBLOAD` is set (synthetic-build-load tracing).
 fn dbg_sbload() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some())
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_SBLOAD").is_some())
 }
 
 /// Create an iterator backed by a snapshot array of the given size.
@@ -693,7 +693,7 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // JDK contract: out-of-range index throws IndexOutOfBoundsException
         // (ArrayIndexOutOfBoundsException is a subclass, so `catch
         // (IndexOutOfBoundsException)` still catches it).
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index,
         }
         .into());
@@ -719,7 +719,7 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
         // JDK contract: out-of-range index throws IndexOutOfBoundsException.
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index,
         }
         .into());
@@ -762,7 +762,7 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
     if index < 0 || index as usize > size {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index,
         }
         .into());
@@ -791,7 +791,7 @@ pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
         // JDK contract: out-of-range index throws IndexOutOfBoundsException.
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index,
         }
         .into());
@@ -980,13 +980,13 @@ pub fn native_al_to_array_typed(
     Ok(Some(Value::Object(Some(target))))
 }
 
-/// Collection.toArray(IntFunction) — delegates to toArray() since RustJVM uses Object[] uniformly.
+/// Collection.toArray(IntFunction) — delegates to toArray() since CratonVM uses Object[] uniformly.
 fn native_collection_to_array_generator(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // The IntFunction generator is used in real Java to create a typed array (T[]).
-    // Since RustJVM uses Object[] uniformly, we ignore the generator and delegate.
+    // Since CratonVM uses Object[] uniformly, we ignore the generator and delegate.
     native_al_to_array(ctx, args)
 }
 
@@ -1171,19 +1171,19 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let (data, size) = al_state(ctx, this);
     if from_i32 < 0 || from_i32 > size {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index: from_i32,
         }
         .into());
     }
     if to_i32 < 0 || to_i32 > size {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index: to_i32,
         }
         .into());
     }
     if from_i32 > to_i32 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("fromIndex({from_i32}) > toIndex({to_i32})"),
         }
         .into());
@@ -1282,7 +1282,7 @@ const NODE_NUM_FIELDS: usize = 4;
 fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
     // See through CratonVM's unmodifiable wrapper views. When a generic
     // `java/util/Map` interface native (registered to `native_map_*`) is
-    // dispatched on a `rustjvm/internal/UnmodifiableMap` receiver — which
+    // dispatched on a `cratonvm/internal/UnmodifiableMap` receiver — which
     // happens when the wrapper class does not itself register the invoked
     // method — slot 0 of the wrapper is the *backing map* ObjectRef, not a
     // bucket array. Without this unwrap, `map_state` reads a non-array
@@ -1562,7 +1562,7 @@ fn map_alloc_node(
     hash: i32,
     next: Option<ObjectRef>,
 ) -> ObjectRef {
-    let node = ctx.alloc_object(rustjvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    let node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     ctx.set_field(node, NODE_FIELD_KEY, Value::Object(Some(key)));
     ctx.set_field(node, NODE_FIELD_VALUE, value);
     ctx.set_field(node, NODE_FIELD_HASH, Value::Int(hash));
@@ -2476,7 +2476,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => None,
     };
     // Create node — for null keys, store Value::Object(None) in key field
-    let new_node = ctx.alloc_object(rustjvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
@@ -3523,7 +3523,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
-            // (Quieted: previously eprintln. Enable via RUSTJVM_HS_ITR_DBG.)
+            // (Quieted: previously eprintln. Enable via CRATONVM_HS_ITR_DBG.)
             if dbg_hs_itr() {
                 eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
             }
@@ -3960,7 +3960,7 @@ fn native_opt_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 fn native_opt_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match args.first() {
         Some(Value::Object(None)) | None => {
-            Err(rustjvm_types::error::RuntimeError::NullPointerException { message: None }.into())
+            Err(cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into())
         }
         Some(val) => {
             let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
@@ -3984,7 +3984,7 @@ fn native_opt_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     match val {
-        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
@@ -4040,7 +4040,7 @@ fn native_opt_or_else_throw(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
             .into())
@@ -4048,7 +4048,7 @@ fn native_opt_or_else_throw(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     match val {
-        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
@@ -4624,7 +4624,7 @@ fn native_opt_or_else_throw_supplier(
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
             .into());
@@ -4632,7 +4632,7 @@ fn native_opt_or_else_throw_supplier(
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     if matches!(val, Value::Object(None)) {
-        Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into())
@@ -7245,7 +7245,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
             let reduce_bucket = |ctx: &mut dyn NativeContext,
                                  bucket: &[Value]|
-             -> Result<Value, rustjvm_types::error::MethodCallFailed> {
+             -> Result<Value, cratonvm_types::error::MethodCallFailed> {
                 let v = match downstream_tag {
                     Some((_d, COLLECTOR_TAG_TO_LIST)) => {
                         make_list_of(ctx, bucket)?.unwrap_or(Value::Object(None))
@@ -7533,12 +7533,12 @@ fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, elements.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
@@ -7856,12 +7856,12 @@ fn native_long_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, elements.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
@@ -8133,13 +8133,13 @@ fn native_double_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Double, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
     let elements = stream_elements(ctx, this);
     let arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Double,
+        cratonvm_types::ArrayElementType::Double,
         elements.len(),
     );
     for (i, val) in elements.iter().enumerate() {
@@ -9214,7 +9214,7 @@ fn native_random_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => 1,
     };
     if bound <= 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "bound must be positive".to_string(),
         }
         .into());
@@ -9402,7 +9402,7 @@ fn native_opt_int_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
             .into())
@@ -9410,7 +9410,7 @@ fn native_opt_int_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     match ctx.get_field(this, OPT_FIELD_VALUE) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
-        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
@@ -9484,7 +9484,7 @@ fn native_opt_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
             .into())
@@ -9492,7 +9492,7 @@ fn native_opt_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     match ctx.get_field(this, OPT_FIELD_VALUE) {
         Value::Long(v) => Ok(Some(Value::Long(v))),
-        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
@@ -9566,7 +9566,7 @@ fn native_opt_double_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
             .into())
@@ -9574,7 +9574,7 @@ fn native_opt_double_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     match ctx.get_field(this, OPT_FIELD_VALUE) {
         Value::Double(v) => Ok(Some(Value::Double(v))),
-        Value::Object(None) => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
@@ -9853,7 +9853,7 @@ fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
             }
             .into())
@@ -9862,7 +9862,7 @@ fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) => r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
             }
             .into())
@@ -9874,7 +9874,7 @@ fn native_ll_listitr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let len = ctx.array_length(arr) as i32;
     if cursor >= len {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No more elements".to_string(),
         }
         .into());
@@ -9900,7 +9900,7 @@ fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No previous element".to_string(),
             }
             .into())
@@ -9909,7 +9909,7 @@ fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) => r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No previous element".to_string(),
             }
             .into())
@@ -9920,7 +9920,7 @@ fn native_ll_listitr_previous(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => 0,
     };
     if cursor <= 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No previous element".to_string(),
         }
         .into());
@@ -10119,7 +10119,7 @@ fn native_ll_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let element = args.get(2).copied().unwrap_or(Value::Object(None));
     let size = ll_size(ctx, this);
     if index < 0 || index > size {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index,
         }
         .into());
@@ -10147,7 +10147,7 @@ fn native_ll_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this);
     if index < 0 || index >= size {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index,
         }
         .into());
@@ -10204,7 +10204,7 @@ fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
-        None => Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
+        None => Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
     }
 }
 
@@ -10212,7 +10212,7 @@ fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "List is empty".to_string(),
             }
             .into())
@@ -10220,7 +10220,7 @@ fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
-        _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        _ => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
         }
         .into()),
@@ -10231,7 +10231,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "List is empty".to_string(),
             }
             .into())
@@ -10239,7 +10239,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     match ll_get(this, "tail") {
         Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, LL_NODE_ELEM))),
-        _ => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        _ => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
         }
         .into()),
@@ -10294,14 +10294,14 @@ fn native_ll_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "List is empty".to_string(),
             }
             .into())
         }
     };
     if ll_size(ctx, this) == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
         }
         .into());
@@ -10313,14 +10313,14 @@ fn native_ll_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "List is empty".to_string(),
             }
             .into())
         }
     };
     if ll_size(ctx, this) == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
         }
         .into());
@@ -10536,7 +10536,7 @@ fn native_ll_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
             }
             .into())
@@ -10545,7 +10545,7 @@ fn native_ll_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let cur = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) => r,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
             }
             .into())
@@ -11668,7 +11668,7 @@ fn native_ad_remove_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let (data, head, _tail, size) = ad_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "ArrayDeque is empty".to_string(),
         }
         .into());
@@ -11690,7 +11690,7 @@ fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let (data, _head, tail, size) = ad_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "ArrayDeque is empty".to_string(),
         }
         .into());
@@ -11736,7 +11736,7 @@ fn native_ad_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let (data, head, _, size) = ad_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "ArrayDeque is empty".to_string(),
         }
         .into());
@@ -11754,7 +11754,7 @@ fn native_ad_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let (data, _, tail, size) = ad_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "ArrayDeque is empty".to_string(),
         }
         .into());
@@ -11952,7 +11952,7 @@ fn pq_compare(
     this: ObjectRef,
     a: &Value,
     b: &Value,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     let comp = ctx.get_field(this, PQ_FIELD_COMPARATOR);
     if let Value::Object(Some(comparator)) = comp {
         let result = ctx.invoke_virtual(
@@ -11988,7 +11988,7 @@ fn pq_sift_up(
     this: ObjectRef,
     buf: ObjectRef,
     mut idx: usize,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     while idx > 0 {
         let parent = (idx - 1) / 2;
         let child_val = ctx.get_array_element(buf, idx);
@@ -12010,7 +12010,7 @@ fn pq_sift_down(
     buf: ObjectRef,
     mut idx: usize,
     size: usize,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     loop {
         let left = 2 * idx + 1;
         if left >= size {
@@ -12388,7 +12388,7 @@ fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let (data, size) = al_state(ctx, this);
     if idx >= size as usize {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index: idx as i32,
         }
         .into());
@@ -12431,7 +12431,7 @@ fn native_vec_first_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let (data, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "Vector is empty".to_string(),
         }
         .into());
@@ -12447,7 +12447,7 @@ fn native_vec_last_element(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (data, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "Vector is empty".to_string(),
         }
         .into());
@@ -12521,7 +12521,7 @@ fn native_stack_pop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let (_, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "Stack is empty".to_string(),
         }
         .into());
@@ -12536,7 +12536,7 @@ fn native_stack_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (data, size) = al_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "Stack is empty".to_string(),
         }
         .into());
@@ -13075,7 +13075,7 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             if !cn.is_empty() && cn != "java/util/Iterator" && cn != "java/util/ListIterator" {
                 return ctx.invoke(&cn, "next", "()Ljava/lang/Object;", &[Value::Object(Some(this))]);
             }
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
             }
             .into());
@@ -13087,7 +13087,7 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let len = ctx.array_length(arr) as i32;
     if cursor >= len {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No more elements".to_string(),
         }
         .into());
@@ -13449,7 +13449,7 @@ fn tree_compare(
     comparator: &Value,
     a: Value,
     b: Value,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     let result = match comparator {
         Value::Object(Some(cmp)) => comparator_compare(ctx, *cmp, a, b)?,
         _ => natural_compare(ctx, &a, &b)?,
@@ -13468,7 +13468,7 @@ fn tm_binary_search(
     size: i32,
     comparator: &Value,
     key: &Value,
-) -> Result<Result<usize, usize>, rustjvm_types::error::MethodCallFailed> {
+) -> Result<Result<usize, usize>, cratonvm_types::error::MethodCallFailed> {
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
@@ -13493,7 +13493,7 @@ fn ts_binary_search(
     size: i32,
     comparator: &Value,
     key: &Value,
-) -> Result<Result<usize, usize>, rustjvm_types::error::MethodCallFailed> {
+) -> Result<Result<usize, usize>, cratonvm_types::error::MethodCallFailed> {
     let mut low: usize = 0;
     let mut high = size as usize;
     while low < high {
@@ -13879,7 +13879,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "TreeMap is empty".to_string(),
             }
             .into())
@@ -13890,7 +13890,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         match first {
             Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
             None => {
-                return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                     message: "TreeMap is empty".to_string(),
                 }
                 .into())
@@ -13899,7 +13899,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "TreeMap is empty".to_string(),
         }
         .into());
@@ -13912,7 +13912,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "TreeMap is empty".to_string(),
             }
             .into())
@@ -13923,7 +13923,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         match last {
             Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
             None => {
-                return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+                return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                     message: "TreeMap is empty".to_string(),
                 }
                 .into())
@@ -13932,7 +13932,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
     let (data_opt, size, _) = tm_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "TreeMap is empty".to_string(),
         }
         .into());
@@ -14821,7 +14821,7 @@ fn native_ts_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "TreeSet is empty".to_string(),
             }
             .into())
@@ -14829,7 +14829,7 @@ fn native_ts_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let (data_opt, size, _) = ts_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "TreeSet is empty".to_string(),
         }
         .into());
@@ -14842,7 +14842,7 @@ fn native_ts_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "TreeSet is empty".to_string(),
             }
             .into())
@@ -14850,7 +14850,7 @@ fn native_ts_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let (data_opt, size, _) = ts_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "TreeSet is empty".to_string(),
         }
         .into());
@@ -17269,7 +17269,7 @@ fn native_props_property_names(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // snapshot-iterator natives (`hasMoreElements`/`nextElement` registered on
     // this class name) win virtual dispatch. Field 0 = Object[] snapshot,
     // field 1 = cursor.
-    let en = alloc_synthetic(ctx, "rustjvm/internal/SnapshotEnumeration", 2);
+    let en = alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2);
     ctx.set_field(en, 0, Value::Object(Some(arr)));
     ctx.set_field(en, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(en))))
@@ -17323,11 +17323,11 @@ fn native_props_string_property_names(
 // Mutators are registered natives that unconditionally throw.
 
 /// Synthetic class names for the unmodifiable wrappers.
-const UNMOD_LIST_CLASS: &str = "rustjvm/internal/UnmodifiableList";
-const UNMOD_SET_CLASS: &str = "rustjvm/internal/UnmodifiableSet";
-const UNMOD_MAP_CLASS: &str = "rustjvm/internal/UnmodifiableMap";
-const UNMOD_COLLECTION_CLASS: &str = "rustjvm/internal/UnmodifiableCollection";
-const UNMOD_ITR_CLASS: &str = "rustjvm/internal/UnmodifiableItr";
+const UNMOD_LIST_CLASS: &str = "cratonvm/internal/UnmodifiableList";
+const UNMOD_SET_CLASS: &str = "cratonvm/internal/UnmodifiableSet";
+const UNMOD_MAP_CLASS: &str = "cratonvm/internal/UnmodifiableMap";
+const UNMOD_COLLECTION_CLASS: &str = "cratonvm/internal/UnmodifiableCollection";
+const UNMOD_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableItr";
 
 /// Slot 0 of every wrapper holds the backing collection / iterator.
 const UNMOD_FIELD_BACKING: usize = 0;
@@ -17940,7 +17940,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     // dispatch over the interface-level Enumeration native, so a non-empty
     // snapshot built on EmptyEnumeration appears empty. Register concrete
     // overrides on a dedicated synthetic class.
-    let sne = "rustjvm/internal/SnapshotEnumeration";
+    let sne = "cratonvm/internal/SnapshotEnumeration";
     r.register(sne, "hasMoreElements", "()Z", native_snapshot_itr_has_next);
     r.register(
         sne,
@@ -19017,7 +19017,7 @@ fn native_itr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
     // Iterator.remove() is an optional operation; this snapshot-based iterator
     // does not support it. Throw UnsupportedOperationException per the contract
     // instead of silently doing nothing (which would mask caller bugs).
-    Err(rustjvm_types::error::RuntimeError::UnsupportedOperationException {
+    Err(cratonvm_types::error::RuntimeError::UnsupportedOperationException {
         message: "remove".to_string(),
     }
     .into())
@@ -19131,7 +19131,7 @@ fn native_spliterator_try_advance(ctx: &mut dyn NativeContext, args: &[Value]) -
     // receiver IS our synthetic shape; the array guard protects against
     // edge cases where dispatch routes the wrong way.
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
         _ => return Ok(Some(Value::Int(0))),
     };
     let cursor = match ctx.get_field(this, 1) {
@@ -19171,7 +19171,7 @@ fn native_spliterator_for_each_remaining(
     // ARRAY-LEN-GUARD warning and the rest of the stream pipeline collapses.
     // Fall back to driving the subclass's own `tryAdvance` until exhausted.
     let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(a)) if ctx.heap_kind_of(a) == rustjvm_types::ObjectKind::Array => a,
+        Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
         _ => {
             // Non-synthetic Spliterator subclass — drive its own tryAdvance
             // (which now correctly dispatches to the JDK default-method
@@ -19766,7 +19766,7 @@ fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "ConcurrentSkipListMap is empty".to_string(),
             }
             .into())
@@ -19776,7 +19776,7 @@ fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "ConcurrentSkipListMap is empty".to_string(),
         }
         .into());
@@ -19789,7 +19789,7 @@ fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "ConcurrentSkipListMap is empty".to_string(),
             }
             .into())
@@ -19799,7 +19799,7 @@ fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
-        return Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "ConcurrentSkipListMap is empty".to_string(),
         }
         .into());

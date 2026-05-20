@@ -26,9 +26,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Handle tables

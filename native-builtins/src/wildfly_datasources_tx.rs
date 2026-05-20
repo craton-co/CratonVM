@@ -75,9 +75,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::agroal_pool::{acquire, release};
 use crate::ironjacamar_pool::pool_id_for;

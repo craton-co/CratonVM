@@ -37,7 +37,7 @@
 //! validation `athrow`.
 //!
 //! Subprocess pattern with a hard 60s timeout (HotSpot finishes in
-//! ~0.3 s, rustjvm release in ~5 s). On regression the test fails with
+//! ~0.3 s, cratonvm release in ~5 s). On regression the test fails with
 //! the per-case `fail-N-...` line surfaced from the probe.
 
 use std::path::{Path, PathBuf};
@@ -54,8 +54,8 @@ fn probe_dir() -> PathBuf {
         .join("constructor_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -63,7 +63,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -95,7 +95,7 @@ fn ensure_probe_compiled() -> bool {
     matches!(status, Ok(s) if s.success()) && class_file.exists()
 }
 
-/// Run `ConstructorProbe` through the rustjvm binary with a hard timeout.
+/// Run `ConstructorProbe` through the cratonvm binary with a hard timeout.
 /// Returns `Some((stdout, stderr, exit_code))` on successful spawn, `None`
 /// if pre-requisites are missing (so the caller can `return` and skip).
 fn run_constructor_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
@@ -106,12 +106,12 @@ fn run_constructor_probe(timeout: Duration) -> Option<(String, String, Option<i3
         );
         return None;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[cluster_c_constructor] rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[cluster_c_constructor] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return None;
         }
@@ -127,7 +127,7 @@ fn run_constructor_probe(timeout: Duration) -> Option<(String, String, Option<i3
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[cluster_c_constructor] failed to spawn rustjvm: {e}");
+            eprintln!("[cluster_c_constructor] failed to spawn cratonvm: {e}");
             return None;
         }
     };

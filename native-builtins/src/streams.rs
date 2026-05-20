@@ -4,7 +4,7 @@
 //! terminal operations are implemented in Java bytecode that walks a
 //! Spliterator. In `--synthetic-jdk` mode we have no Java-side Stream
 //! bytecode to fall back to; the synthetic stream natives live in
-//! `rustjvm-native-collections`.
+//! `cratonvm-native-collections`.
 //!
 //! This module is intentionally small. Its purpose:
 //!
@@ -24,9 +24,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use rustjvm_types::Value;
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -200,7 +200,7 @@ fn native_flow_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     #[test]
     fn register_stream_overrides_installs_flow_subscription_request() {

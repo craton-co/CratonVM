@@ -25,8 +25,8 @@
 //! reports `getColumnIndex(col) = -1`, causing the offending
 //! index-conditions to be pruned — which matches real-JDK behaviour).
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
 
 /// Register Thread.threadState / Thread.getState overrides so the real-JDK
 /// bytecode path does not dereference the null `holder` FieldHolder.
@@ -45,7 +45,7 @@ pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
                 let n = real.max(2);
                 ctx.alloc_object(cid, n)
             }
-            Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+            Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
         };
         let name = ctx.create_string("RUNNABLE");
         ctx.set_field(obj, 0, Value::Object(Some(name)));
@@ -111,7 +111,7 @@ pub fn register_h2_table_filter_prepare(registry: &mut NativeMethodRegistry) {
 fn table_filter_prepare(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -122,8 +122,8 @@ fn table_filter_prepare(
 
 fn table_filter_prepare_on(
     ctx: &mut dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
-) -> rustjvm_types::error::MethodCallResult {
+    this: cratonvm_types::ObjectRef,
+) -> cratonvm_types::error::MethodCallResult {
     // Ensure `this.index` is non-null. If the optimiser never populated
     // the plan item for this filter, the index stays at null and the
     // rest of the method trips an NPE.

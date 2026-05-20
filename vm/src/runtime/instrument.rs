@@ -19,9 +19,9 @@
 //!     `appendToSystemClassLoaderSearch0`, `setNativeMethodPrefix0`,
 //!     `isRetransformClassesSupported0`, `isRedefineClassesSupported0`,
 //!     `isNativeMethodPrefixSupported0`).
-//!   * A few in-process helper natives on `rustjvm/Instrument` so the
+//!   * A few in-process helper natives on `cratonvm/Instrument` so the
 //!     `apps/instrument_probe` smoke fixture can run without a real
-//!     `-javaagent:` (see `rustjvm.Instrument.{addTransformer,
+//!     `-javaagent:` (see `cratonvm.Instrument.{addTransformer,
 //!     removeTransformer, getTransformerCount, getAllLoadedClasses,
 //!     isModifiableClass, getObjectSize, redefineClass}`).
 //!
@@ -61,8 +61,8 @@
 
 use std::sync::{OnceLock, RwLock};
 
-use rustjvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
-use rustjvm_types::{
+use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_types::{
     ArrayElementType, ClassId, ObjectKind, ObjectRef, Value,
     error::{MethodCallFailed, MethodCallResult, VmError},
 };
@@ -100,7 +100,7 @@ fn transformer_chain() -> &'static RwLock<Vec<TransformerEntry>> {
 
 /// Append `(transformer, canRetransform)` to the global chain. Used by
 /// both the `addTransformer0` native and the `addTransformer` helper on
-/// `rustjvm/Instrument`.  Order: appended at the end.
+/// `cratonvm/Instrument`.  Order: appended at the end.
 pub fn add_transformer_entry(entry: TransformerEntry) {
     if let Ok(mut chain) = transformer_chain().write() {
         chain.push(entry);
@@ -182,7 +182,7 @@ pub fn is_modifiable_class(is_primitive: bool, is_array: bool, is_hidden: bool) 
 ///
 ///   * Regular objects: `header_size + slots * slot_size`. We use the
 ///     same constants as the heap (32-byte header, 16-byte slots —
-///     matches `rustjvm_types::heap_types::HEADER_SIZE` /
+///     matches `cratonvm_types::heap_types::HEADER_SIZE` /
 ///     `SLOT_SIZE`).
 ///   * Primitive arrays: `header_size + length * element_size`,
 ///     8-byte aligned.
@@ -196,7 +196,7 @@ pub fn approximate_object_size(
     length: usize,
     num_slots: usize,
 ) -> i64 {
-    use rustjvm_types::{
+    use cratonvm_types::{
         HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE, element_byte_size,
     };
     let header = HEADER_SIZE as i64;
@@ -508,7 +508,7 @@ fn native_is_prefix_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
 }
 
 // ---------------------------------------------------------------------------
-// Native handlers — rustjvm.Instrument (in-process bridge)
+// Native handlers — cratonvm.Instrument (in-process bridge)
 // ---------------------------------------------------------------------------
 //
 // Each of these is a **static** native (no receiver), so args[0] is the
@@ -702,7 +702,7 @@ fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 ///    work.
 ///
 /// 2. **Rust-side [`TRANSFORMER_CHAIN`]** (the surface the
-///    in-process `rustjvm.Instrument.addTransformer` bridge and
+///    in-process `cratonvm.Instrument.addTransformer` bridge and
 ///    [`add_premain_transformer`] use). For each entry we invoke
 ///    the legacy 5-arg `ClassFileTransformer.transform(ClassLoader,
 ///    String, Class, ProtectionDomain, byte[])` directly via
@@ -768,7 +768,7 @@ fn run_transformer_chain(
     //    agent registered it via the public Java `addTransformer` (now
     //    a native, see [`register_instrumentation_natives`]), or via
     //    the internal `addTransformer0`, or via the in-process
-    //    [`rustjvm.Instrument.addTransformer`] bridge).
+    //    [`cratonvm.Instrument.addTransformer`] bridge).
     for entry in rust_chain {
         if retransform_only && !entry.can_retransform {
             continue;
@@ -1210,7 +1210,7 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     );
 
     // ---- in-process probe bridge ----
-    let bridge_class = "rustjvm/Instrument";
+    let bridge_class = "cratonvm/Instrument";
     r.register(
         bridge_class,
         "addTransformer",
@@ -1475,7 +1475,7 @@ mod tests {
             )
             .is_some());
         // Bridge surface for the in-process probe.
-        let bridge = "rustjvm/Instrument";
+        let bridge = "cratonvm/Instrument";
         assert!(r
             .find(bridge, "addTransformer", "(Ljava/lang/Object;)V")
             .is_some());

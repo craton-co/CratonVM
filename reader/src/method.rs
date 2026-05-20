@@ -8,7 +8,7 @@ use crate::class_access_flags::MethodAccessFlags;
 /// `name` and `descriptor` are stored as shared `Arc<str>` so repeated
 /// references to the same identifier across different classes share a
 /// single backing allocation. The reader populates them via
-/// [`rustjvm_types::intern_arc`] at parse time, so constructing a
+/// [`cratonvm_types::intern_arc`] at parse time, so constructing a
 /// `ClassFileMethod` from the class-file hot path is a single refcount
 /// bump plus a hash-table lookup.
 #[derive(Debug, Clone)]

@@ -12,9 +12,9 @@
 //! These are called during the real JDK 25 `System.initPhase1()` bytecode
 //! execution path and must return correct values for the bootstrap to succeed.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ArrayElementType, Value};
 
 // ---------------------------------------------------------------------------
 // platformProperties() NDX constants (JDK 25)
@@ -202,7 +202,7 @@ fn native_vm_properties(
     props.push(("java.vm.specification.name", "Java Virtual Machine Specification".to_string()));
     props.push(("java.vm.specification.vendor", "Oracle Corporation".to_string()));
     props.push(("java.vm.specification.version", "25".to_string()));
-    props.push(("java.vm.name", "RustJVM".to_string()));
+    props.push(("java.vm.name", "CratonVM".to_string()));
     props.push(("java.vm.vendor", "Craton".to_string()));
     props.push(("java.vm.version", "0.2.0".to_string()));
     props.push(("java.vm.info", "mixed mode".to_string()));
@@ -257,8 +257,8 @@ fn native_vm_properties(
     props.push(("java.class.version", "69.0".to_string()));
     props.push(("java.runtime.version", "25.0.1+8-LTS-27".to_string()));
     props.push(("java.runtime.name", "Java(TM) SE Runtime Environment".to_string()));
-    props.push(("java.vendor", "Craton / RustJVM".to_string()));
-    props.push(("java.vendor.url", "https://github.com/nicktretyakov/rustjvm".to_string()));
+    props.push(("java.vendor", "Craton / CratonVM".to_string()));
+    props.push(("java.vendor.url", "https://github.com/nicktretyakov/cratonvm".to_string()));
 
     // Misc
     props.push(("java.awt.headless", "true".to_string()));

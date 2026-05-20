@@ -39,13 +39,13 @@
 //!    probe; the load-bearing acceptance proof.
 //! 5. `fixture_class_file_is_staged` — anchor-grep style fixture guard.
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::native::register_builtins;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::native::register_builtins;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp21ClassReflectE2E";
+const FIXTURE_CLASS: &str = "cratonvm/Wp21ClassReflectE2E";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -54,7 +54,7 @@ fn test_resources_dir() -> String {
 
 fn fixture_compiled() -> bool {
     let path = format!(
-        "{}/rustjvm/Wp21ClassReflectE2E.class",
+        "{}/cratonvm/Wp21ClassReflectE2E.class",
         test_resources_dir()
     );
     std::path::Path::new(&path).exists()
@@ -81,7 +81,7 @@ fn run_probe(method: &str) -> Result<i32, String> {
 #[test]
 fn class_get_declared_methods_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/Class",
@@ -189,11 +189,11 @@ fn class_get_declared_methods_closure() {
 #[test]
 fn fixture_class_file_is_staged() {
     let java = format!(
-        "{}/rustjvm/Wp21ClassReflectE2E.java",
+        "{}/cratonvm/Wp21ClassReflectE2E.java",
         test_resources_dir()
     );
     let class = format!(
-        "{}/rustjvm/Wp21ClassReflectE2E.class",
+        "{}/cratonvm/Wp21ClassReflectE2E.class",
         test_resources_dir()
     );
     assert!(

@@ -1,8 +1,8 @@
 #JavaTest Interview Configuration
 #
-# JCK interview file for RustJVM. This file configures the JavaTest harness
-# to execute JCK tests against the RustJVM binary. The @RUSTJVM_BIN@ token
-# is replaced at CI time with the absolute path to the built `rustjvm` binary.
+# JCK interview file for CratonVM. This file configures the JavaTest harness
+# to execute JCK tests against the CratonVM binary. The @CRATONVM_BIN@ token
+# is replaced at CI time with the absolute path to the built `cratonvm` binary.
 #
 # See: https://openjdk.org/groups/conformance/JckAccess/
 #
@@ -15,12 +15,12 @@ jck.testsuite=$JCK_HOME/tests
 
 # --- Implementation under test ---
 jck.env.runtime.jvm=other
-jck.env.runtime.jvm.other.command=@RUSTJVM_BIN@
+jck.env.runtime.jvm.other.command=@CRATONVM_BIN@
 
-# The VM is invoked as: @RUSTJVM_BIN@ -cp <classpath> <classname> [args...]
+# The VM is invoked as: @CRATONVM_BIN@ -cp <classpath> <classname> [args...]
 jck.env.runtime.jvm.other.options=-cp @CLASSPATH@
 
-# --- Compiler configuration (not applicable; RustJVM is a runtime only) ---
+# --- Compiler configuration (not applicable; CratonVM is a runtime only) ---
 jck.env.compiler=skip
 
 # --- Test selection ---
@@ -49,7 +49,7 @@ jck.workdir=/tmp/jck-work
 jck.priorStatus.needAction=true
 
 # --- Keywords / exclude lists ---
-# Exclude tests that require AWT, Swing, or other UI subsystems that RustJVM
+# Exclude tests that require AWT, Swing, or other UI subsystems that CratonVM
 # does not implement.
 jck.excludeList=\
     api/java_awt \

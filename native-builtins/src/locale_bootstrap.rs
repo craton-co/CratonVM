@@ -16,9 +16,9 @@
 //! paths that still reach it get `null` instead of an `InternalError`.
 
 use parking_lot::Mutex;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 

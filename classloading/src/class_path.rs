@@ -1,4 +1,4 @@
-use rustjvm_types::error::ClassFileError;
+use cratonvm_types::error::ClassFileError;
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
@@ -120,7 +120,7 @@ fn read_file_for_classpath(path: &Path) -> std::io::Result<Vec<u8>> {
 /// in for pathological probe sets.
 const CANONICALIZE_CACHE_CAP: usize = 1024;
 
-/// Cached verdict for the `RUSTJVM_DBG_GETRESOURCES` env var.
+/// Cached verdict for the `CRATONVM_DBG_GETRESOURCES` env var.
 ///
 /// `find_all_resource_urls` is called once per `ClassPath` instance
 /// (bootstrap / extension / application) for every `getResources`
@@ -130,11 +130,11 @@ const CANONICALIZE_CACHE_CAP: usize = 1024;
 /// here and the boolean verdict reused on every subsequent call.
 static DBG_GETRESOURCES: OnceLock<bool> = OnceLock::new();
 
-/// `true` when `RUSTJVM_DBG_GETRESOURCES` is set to a non-empty,
+/// `true` when `CRATONVM_DBG_GETRESOURCES` is set to a non-empty,
 /// non-`"0"` value. Computed once and cached for the process lifetime.
 fn dbg_getresources() -> bool {
     *DBG_GETRESOURCES.get_or_init(|| {
-        std::env::var("RUSTJVM_DBG_GETRESOURCES")
+        std::env::var("CRATONVM_DBG_GETRESOURCES")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     })
@@ -265,7 +265,7 @@ enum ClassPathEntry {
     },
     /// A JDK 9+ `lib/modules` jimage file (NEW-5): one binary blob holding
     /// every class and resource in the boot layer, accessed through the
-    /// [`rustjvm_reader::JImageReader`] perfect-hash index.
+    /// [`cratonvm_reader::JImageReader`] perfect-hash index.
     ///
     /// The lookup strategy:
     ///   1. `class_to_module`: pre-built map from internal class name
@@ -278,7 +278,7 @@ enum ClassPathEntry {
     ///      stopping on the first hit (matches JDK `ModuleReader` semantics).
     JImageFile {
         path: PathBuf,
-        reader: rustjvm_reader::JImageReader,
+        reader: cratonvm_reader::JImageReader,
         /// Map from internal class name (no `.class` suffix) to its owning
         /// module name. Built once during load by walking every entry; used
         /// by `find_class` for O(1) module resolution.
@@ -1812,7 +1812,7 @@ impl ClassPath {
             return Vec::new();
         }
         // ES2-DBG: env-gated tracing for the classpath resource walk.
-        // `RUSTJVM_DBG_GETRESOURCES=1` emits per-entry hit/miss for every
+        // `CRATONVM_DBG_GETRESOURCES=1` emits per-entry hit/miss for every
         // call. Each `ClassPath` instance (bootstrap / extension /
         // application) calls this independently, so a real probe prints
         // one block per loader — useful for spotting whether a specific
@@ -2128,7 +2128,7 @@ impl ClassPath {
 
     /// Load a JDK 9+ `lib/modules` jimage file onto this classpath.
     ///
-    /// Opens the file via [`rustjvm_reader::JImageReader`], walks every
+    /// Opens the file via [`cratonvm_reader::JImageReader`], walks every
     /// entry once to build the class-to-module and resource-to-modules
     /// indexes, then inserts a [`ClassPathEntry::JImageFile`] onto the
     /// classpath. Lookups after this call return bytes directly from
@@ -2136,7 +2136,7 @@ impl ClassPath {
     ///
     /// Returns an error string if the file cannot be opened or is not
     /// a valid jimage. Callers that want a typed error should match on
-    /// [`rustjvm_reader::JImageError`] via the direct reader API.
+    /// [`cratonvm_reader::JImageError`] via the direct reader API.
     pub fn add_jimage(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
         let path = path.as_ref().to_path_buf();
         let entry = Self::load_jimage(&path)?;
@@ -2149,7 +2149,7 @@ impl ClassPath {
     /// builds the two lookup indexes. Returns a string error so the
     /// caller can surface it through the same error path as `load_jmod`.
     fn load_jimage(path: &Path) -> Result<ClassPathEntry, String> {
-        let reader = rustjvm_reader::JImageReader::open(path)
+        let reader = cratonvm_reader::JImageReader::open(path)
             .map_err(|e| format!("open jimage {}: {e}", path.display()))?;
 
         // Walk every entry once to build the indexes.
@@ -2401,7 +2401,7 @@ mod tests {
     #[test]
     fn load_class_from_jar() {
         // Create a temporary JAR file with a fake .class entry
-        let dir = std::env::temp_dir().join("rustjvm_test_jar");
+        let dir = std::env::temp_dir().join("cratonvm_test_jar");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("test.jar");
 
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[test]
     fn find_resource_from_directory() {
-        let dir = std::env::temp_dir().join("rustjvm_test_resource_dir");
+        let dir = std::env::temp_dir().join("cratonvm_test_resource_dir");
         let _ = fs::create_dir_all(&dir);
         let resource_path = dir.join("hello.txt");
         fs::write(&resource_path, b"hello world").unwrap();
@@ -2497,7 +2497,7 @@ mod tests {
 
     #[test]
     fn find_resource_from_jar() {
-        let dir = std::env::temp_dir().join("rustjvm_test_resource_jar");
+        let dir = std::env::temp_dir().join("cratonvm_test_resource_jar");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("resources.jar");
 
@@ -2596,7 +2596,7 @@ mod tests {
 
     #[test]
     fn fat_jar_detects_spring_boot_structure() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_detect");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_detect");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2615,7 +2615,7 @@ mod tests {
 
     #[test]
     fn fat_jar_loads_class_from_boot_inf_classes() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_classes");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_classes");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2632,7 +2632,7 @@ mod tests {
 
     #[test]
     fn fat_jar_loads_class_from_nested_jar() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_nested");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_nested");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2649,7 +2649,7 @@ mod tests {
 
     #[test]
     fn fat_jar_loads_launcher_from_root() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_root");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_root");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2666,7 +2666,7 @@ mod tests {
 
     #[test]
     fn fat_jar_loads_resource_from_boot_inf_classes() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_resource");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_resource");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2682,7 +2682,7 @@ mod tests {
 
     #[test]
     fn fat_jar_loads_resource_from_nested_jar() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_spi");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_spi");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2698,7 +2698,7 @@ mod tests {
 
     #[test]
     fn fat_jar_class_not_found_returns_error() {
-        let dir = std::env::temp_dir().join("rustjvm_test_fatjar_missing");
+        let dir = std::env::temp_dir().join("cratonvm_test_fatjar_missing");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2745,7 +2745,7 @@ mod tests {
 
     #[test]
     fn plain_jar_not_treated_as_fat_jar() {
-        let dir = std::env::temp_dir().join("rustjvm_test_plain_jar");
+        let dir = std::env::temp_dir().join("cratonvm_test_plain_jar");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("plain.jar");
 
@@ -2769,7 +2769,7 @@ mod tests {
 
     #[test]
     fn dynamic_add_path_fat_jar() {
-        let dir = std::env::temp_dir().join("rustjvm_test_dynamic_fatjar");
+        let dir = std::env::temp_dir().join("cratonvm_test_dynamic_fatjar");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("app.jar");
         create_fat_jar(&jar_path);
@@ -2794,7 +2794,7 @@ mod tests {
     #[test]
     fn jmod_magic_validation() {
         // A file with wrong magic should fail
-        let dir = std::env::temp_dir().join("rustjvm_test_jmod");
+        let dir = std::env::temp_dir().join("cratonvm_test_jmod");
         let _ = fs::create_dir_all(&dir);
         let bad_path = dir.join("bad.jmod");
         fs::write(&bad_path, b"NOT_JMOD_DATA").unwrap();
@@ -2805,7 +2805,7 @@ mod tests {
     #[test]
     fn load_class_from_synthetic_jmod() {
         // Create a synthetic JMOD file: 4-byte magic + ZIP with classes/ prefix
-        let dir = std::env::temp_dir().join("rustjvm_test_jmod2");
+        let dir = std::env::temp_dir().join("cratonvm_test_jmod2");
         let _ = fs::create_dir_all(&dir);
         let jmod_path = dir.join("test.jmod");
 
@@ -2975,7 +2975,7 @@ mod tests {
     #[test]
     fn find_class_canonicalize_with_real_dir() {
         // Create a temp directory with a class file, verify canonicalization works
-        let tmp = std::env::temp_dir().join("rustjvm_test_80_5");
+        let tmp = std::env::temp_dir().join("cratonvm_test_80_5");
         let _ = std::fs::create_dir_all(&tmp);
         let class_dir = tmp.join("com").join("test");
         let _ = std::fs::create_dir_all(&class_dir);
@@ -2992,7 +2992,7 @@ mod tests {
 
     // ── JMOD integration tests ────────────────────────────────────────
     // These require a real JDK 9+ installation. Run with:
-    //   cargo test -p rustjvm-classloading -- --ignored
+    //   cargo test -p cratonvm-classloading -- --ignored
 
     /// Helper: find java.base.jmod on this machine.
     fn find_java_base_jmod() -> Option<PathBuf> {
@@ -3163,7 +3163,7 @@ mod tests {
 
     #[test]
     fn load_jmod_rejects_bad_magic() {
-        let dir = std::env::temp_dir().join("rustjvm_test_bad_jmod");
+        let dir = std::env::temp_dir().join("cratonvm_test_bad_jmod");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("bad.jmod");
 
@@ -3182,7 +3182,7 @@ mod tests {
 
     #[test]
     fn load_jmod_rejects_unsupported_major_version() {
-        let dir = std::env::temp_dir().join("rustjvm_test_future_jmod");
+        let dir = std::env::temp_dir().join("cratonvm_test_future_jmod");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("future.jmod");
 
@@ -3205,7 +3205,7 @@ mod tests {
 
     #[test]
     fn load_jmod_rejects_too_small_file() {
-        let dir = std::env::temp_dir().join("rustjvm_test_tiny_jmod");
+        let dir = std::env::temp_dir().join("cratonvm_test_tiny_jmod");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("tiny.jmod");
 
@@ -3347,7 +3347,7 @@ mod tests {
 
     #[test]
     fn multi_release_jar_prefers_versioned_class() {
-        let dir = std::env::temp_dir().join("rustjvm_test_mr_jar");
+        let dir = std::env::temp_dir().join("cratonvm_test_mr_jar");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("mr.jar");
 
@@ -3380,7 +3380,7 @@ mod tests {
 
     #[test]
     fn multi_release_jar_highest_version_wins() {
-        let dir = std::env::temp_dir().join("rustjvm_test_mr_jar_highest");
+        let dir = std::env::temp_dir().join("cratonvm_test_mr_jar_highest");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("mr2.jar");
 
@@ -3416,7 +3416,7 @@ mod tests {
 
     #[test]
     fn non_multi_release_jar_ignores_versioned() {
-        let dir = std::env::temp_dir().join("rustjvm_test_no_mr");
+        let dir = std::env::temp_dir().join("cratonvm_test_no_mr");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("no_mr.jar");
 
@@ -3447,7 +3447,7 @@ mod tests {
 
     #[test]
     fn multi_release_jar_falls_back_to_base() {
-        let dir = std::env::temp_dir().join("rustjvm_test_mr_fallback");
+        let dir = std::env::temp_dir().join("cratonvm_test_mr_fallback");
         let _ = fs::create_dir_all(&dir);
         let jar_path = dir.join("mr_fallback.jar");
 
@@ -3479,7 +3479,7 @@ mod tests {
     /// Produce a temp-file path unique to this test run so concurrent
     /// tests don't collide.
     fn jimage_temp_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("rustjvm_jimage_test");
+        let dir = std::env::temp_dir().join("cratonvm_jimage_test");
         let _ = fs::create_dir_all(&dir);
         dir.join(format!(
             "{tag}_{}.img",
@@ -3536,7 +3536,7 @@ mod tests {
     /// every class via `find_class`.
     #[test]
     fn jimage_find_class_round_trip() {
-        let data = rustjvm_reader::jimage::test_builder::build_simple(
+        let data = cratonvm_reader::jimage::test_builder::build_simple(
             &sample_jimage_resources(),
         );
         let path = jimage_temp_path("find_class");
@@ -3568,11 +3568,11 @@ mod tests {
     /// up a file literally named `modules` without an extension.
     #[test]
     fn jimage_auto_detected_by_filename() {
-        let data = rustjvm_reader::jimage::test_builder::build_simple(
+        let data = cratonvm_reader::jimage::test_builder::build_simple(
             &sample_jimage_resources(),
         );
         let dir = std::env::temp_dir()
-            .join(format!("rustjvm_jimage_auto_{}", std::process::id()));
+            .join(format!("cratonvm_jimage_auto_{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("modules");
         fs::write(&path, &data).unwrap();
@@ -3594,7 +3594,7 @@ mod tests {
     /// distinct module in the jimage.
     #[test]
     fn jimage_scan_module_infos_returns_every_module() {
-        let data = rustjvm_reader::jimage::test_builder::build_simple(
+        let data = cratonvm_reader::jimage::test_builder::build_simple(
             &sample_jimage_resources(),
         );
         let path = jimage_temp_path("scan_module_infos");
@@ -3622,7 +3622,7 @@ mod tests {
     /// reflect every `.class` entry in the image (module-infos count).
     #[test]
     fn jimage_class_count_matches_resources() {
-        let data = rustjvm_reader::jimage::test_builder::build_simple(
+        let data = cratonvm_reader::jimage::test_builder::build_simple(
             &sample_jimage_resources(),
         );
         let path = jimage_temp_path("class_count");
@@ -3643,7 +3643,7 @@ mod tests {
     /// `list_class_names` should include every class in the jimage.
     #[test]
     fn jimage_list_class_names_includes_every_entry() {
-        let data = rustjvm_reader::jimage::test_builder::build_simple(
+        let data = cratonvm_reader::jimage::test_builder::build_simple(
             &sample_jimage_resources(),
         );
         let path = jimage_temp_path("list_class_names");
@@ -3671,7 +3671,7 @@ mod tests {
     /// ClassNotFound and not leak a panic.
     #[test]
     fn jimage_missing_class_returns_clean_error() {
-        let data = rustjvm_reader::jimage::test_builder::build_simple(
+        let data = cratonvm_reader::jimage::test_builder::build_simple(
             &sample_jimage_resources(),
         );
         let path = jimage_temp_path("missing");
@@ -3692,7 +3692,7 @@ mod tests {
     fn jimage_add_nonexistent_returns_error() {
         let mut cp = ClassPath::new(&[]);
         let err = cp
-            .add_jimage("/nonexistent/rustjvm/jimage/file")
+            .add_jimage("/nonexistent/cratonvm/jimage/file")
             .unwrap_err();
         assert!(
             err.contains("open jimage"),
@@ -3814,7 +3814,7 @@ Implementation-Version: 999.999\n";
     /// `dir/*` must expand to every `.jar` in the directory.
     #[test]
     fn wildcard_expands_dir_star_to_all_jars() {
-        let dir = make_jar_dir("rustjvm_wildcard_dir_star", &["a.jar", "b.jar", "c.jar"]);
+        let dir = make_jar_dir("cratonvm_wildcard_dir_star", &["a.jar", "b.jar", "c.jar"]);
         let pattern = format!("{}/*", dir.to_string_lossy());
         let cp = ClassPath::new(&[pattern]);
         assert_eq!(cp.entry_count(), 3, "wildcard should expand to 3 jars");
@@ -3829,7 +3829,7 @@ Implementation-Version: 999.999\n";
     #[test]
     fn wildcard_makes_every_jar_searchable_for_services() {
         let dir = make_jar_dir(
-            "rustjvm_wildcard_services",
+            "cratonvm_wildcard_services",
             &["alpha.jar", "beta.jar", "gamma.jar"],
         );
         let pattern = format!("{}/*", dir.to_string_lossy());
@@ -3846,7 +3846,7 @@ Implementation-Version: 999.999\n";
     /// Backslash form `dir\*` (Windows-style) must work identically.
     #[test]
     fn wildcard_accepts_backslash_form() {
-        let dir = make_jar_dir("rustjvm_wildcard_backslash", &["x.jar", "y.jar"]);
+        let dir = make_jar_dir("cratonvm_wildcard_backslash", &["x.jar", "y.jar"]);
         let pattern = format!("{}\\*", dir.to_string_lossy());
         let cp = ClassPath::new(&[pattern]);
         assert_eq!(cp.entry_count(), 2);
@@ -3856,7 +3856,7 @@ Implementation-Version: 999.999\n";
     /// Non-jar files in the wildcard directory are ignored.
     #[test]
     fn wildcard_skips_non_jar_files() {
-        let dir = make_jar_dir("rustjvm_wildcard_skips_non_jar", &["good.jar"]);
+        let dir = make_jar_dir("cratonvm_wildcard_skips_non_jar", &["good.jar"]);
         fs::write(dir.join("README.txt"), b"hello").unwrap();
         fs::write(dir.join("native.dll"), [0u8; 8]).unwrap();
         let pattern = format!("{}/*", dir.to_string_lossy());
@@ -3870,7 +3870,7 @@ Implementation-Version: 999.999\n";
     /// `Some-Lib.JAR`.
     #[test]
     fn wildcard_accepts_uppercase_jar_extension() {
-        let dir = make_jar_dir("rustjvm_wildcard_uppercase", &["LIB.JAR"]);
+        let dir = make_jar_dir("cratonvm_wildcard_uppercase", &["LIB.JAR"]);
         let pattern = format!("{}/*", dir.to_string_lossy());
         let cp = ClassPath::new(&[pattern]);
         assert_eq!(cp.entry_count(), 1);
@@ -3882,7 +3882,7 @@ Implementation-Version: 999.999\n";
     /// strings at runtime benefit.
     #[test]
     fn wildcard_works_via_add_path() {
-        let dir = make_jar_dir("rustjvm_wildcard_add_path", &["one.jar", "two.jar"]);
+        let dir = make_jar_dir("cratonvm_wildcard_add_path", &["one.jar", "two.jar"]);
         let pattern = format!("{}/*", dir.to_string_lossy());
         let mut cp = ClassPath::new(&[]);
         cp.add_path(&pattern);
@@ -3895,7 +3895,7 @@ Implementation-Version: 999.999\n";
     /// false-positive expansion).
     #[test]
     fn wildcard_passthrough_for_plain_jar() {
-        let dir = make_jar_dir("rustjvm_wildcard_passthrough", &["a.jar"]);
+        let dir = make_jar_dir("cratonvm_wildcard_passthrough", &["a.jar"]);
         let plain = dir.join("a.jar").to_string_lossy().into_owned();
         let cp = ClassPath::new(&[plain]);
         assert_eq!(cp.entry_count(), 1);
@@ -3917,7 +3917,7 @@ Implementation-Version: 999.999\n";
     #[test]
     fn wildcard_yields_deterministic_jar_order() {
         let dir = make_jar_dir(
-            "rustjvm_wildcard_order",
+            "cratonvm_wildcard_order",
             &["zeta.jar", "alpha.jar", "mu.jar"],
         );
         let pattern = format!("{}/*", dir.to_string_lossy());
@@ -3953,7 +3953,7 @@ Implementation-Version: 999.999\n";
     /// Mirrors the Elasticsearch `-cp <60 explicit jars>` shape.
     #[test]
     fn explicit_multi_jar_classpath_finds_lone_spi_provider() {
-        let dir = std::env::temp_dir().join("rustjvm_es2_multi_jar_spi");
+        let dir = std::env::temp_dir().join("cratonvm_es2_multi_jar_spi");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -4017,7 +4017,7 @@ Implementation-Version: 999.999\n";
     /// content.
     #[test]
     fn explicit_multi_jar_classpath_finds_lone_spi_bytes() {
-        let dir = std::env::temp_dir().join("rustjvm_es2_multi_jar_spi_bytes");
+        let dir = std::env::temp_dir().join("cratonvm_es2_multi_jar_spi_bytes");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

@@ -21,11 +21,11 @@
 //! `ClassLoader.getResources`) then NPEs, which breaks every
 //! `ServiceLoader` user (SLF4J, JDBC autodetection, etc).
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ArrayElementType, Value};
 
-/// `setBootLoaderUnnamedModule0(Ljava/lang/Module;)V` — no-op in RustJVM.
+/// `setBootLoaderUnnamedModule0(Ljava/lang/Module;)V` — no-op in CratonVM.
 ///
 /// In HotSpot this pins the boot loader's unnamed `Module` into the VM's
 /// module layer table. We don't model JPMS module layers, so the argument

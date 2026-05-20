@@ -54,9 +54,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 
 const CN_LOGMANAGER: &str = "org/apache/logging/log4j/LogManager";
 const CN_SIMPLE_LOGGER_CONTEXT: &str = "org/apache/logging/log4j/simple/SimpleLoggerContext";

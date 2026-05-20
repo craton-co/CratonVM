@@ -24,8 +24,8 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::NativeContext;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::NativeContext;
+use cratonvm_types::{ObjectRef, Value};
 
 /// One periodic registration. `runnable_ptr` is the raw `ObjectRef`
 /// pointer kept as `usize` so the registration is `Send`+`Sync`. The

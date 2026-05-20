@@ -177,13 +177,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     invisible to the GC root scanner — under a moving collector the
     //     cached ObjectRefs would point at relocated or reclaimed memory
     //     after the first compaction.
-    rustjvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
+    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
 
     // 16. Round-9 perf + GC fix: process-global LambdaMetafactory CallSite
     //     cache. Cached CallSites and their bootstrap-arg ObjectRef keys
     //     must stay live across collections; the matching post-compaction
     //     remap lives in `gc.rs` (`gc_update_lambda_callsite_cache_refs`).
-    rustjvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
+    cratonvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
 
     roots
 }
@@ -379,15 +379,15 @@ mod tests {
     /// compaction.
     #[test]
     fn jit_entry_sets_gc_quiescence_flag() {
-        let depth_before = rustjvm_gc::gc_quiescence::depth();
+        let depth_before = cratonvm_gc::gc_quiescence::depth();
         {
             let _g = crate::jit::conservative_roots::JitEntryGuard::enter();
             assert_eq!(
-                rustjvm_gc::gc_quiescence::depth(),
+                cratonvm_gc::gc_quiescence::depth(),
                 depth_before + 1
             );
-            assert!(rustjvm_gc::gc_quiescence::is_active());
+            assert!(cratonvm_gc::gc_quiescence::is_active());
         }
-        assert_eq!(rustjvm_gc::gc_quiescence::depth(), depth_before);
+        assert_eq!(cratonvm_gc::gc_quiescence::depth(), depth_before);
     }
 }

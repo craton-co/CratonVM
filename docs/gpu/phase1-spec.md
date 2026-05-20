@@ -184,7 +184,7 @@ pub fn read_class_annotations(
 ) -> ClassAnnotations { ... }
 ```
 
-Use the existing `classfile::*` types from `rustjvm-classfile` (the
+Use the existing `classfile::*` types from `cratonvm-classfile` (the
 crate already in the workspace). Use `Attribute` and `ConstantPool`
 from there.
 
@@ -399,7 +399,7 @@ comment per file describing what the annotation/enum does.
 - `jit-cuda/src/lib.rs` — `pub mod annotations;` and re-exports.
 
 **Dependency to add (if needed):**
-- `jit-cuda/Cargo.toml`: add `rustjvm-classfile` dependency on the
+- `jit-cuda/Cargo.toml`: add `cratonvm-classfile` dependency on the
   classfile crate already in the workspace. Look at how
   `jit-cuda` already loads methods to confirm correct dep name.
 
@@ -508,10 +508,10 @@ edit to be additive.
 Phase 1 is complete when:
 
 - [ ] `cargo check --workspace` clean
-- [ ] `cargo check --workspace --features rustjvm-vm/gpu-offload` clean
+- [ ] `cargo check --workspace --features cratonvm-vm/gpu-offload` clean
 - [ ] `cargo test -p jit-cuda` passes existing + new tests for hint behavior
-- [ ] `cargo test -p rustjvm-vm --features gpu-offload --lib offload` passes existing + new exclude/warmup tests
-- [ ] `cargo test -p rustjvm-vm --features gpu-offload --test annotations_end_to_end` passes
+- [ ] `cargo test -p cratonvm-vm --features gpu-offload --lib offload` passes existing + new exclude/warmup tests
+- [ ] `cargo test -p cratonvm-vm --features gpu-offload --test annotations_end_to_end` passes
 - [ ] The new `craton-gpu-annotations.jar` is reproducibly built by `cargo build -p craton-gpu`
 - [ ] `docs/gpu/annotations.md` exists and is linked from `docs/gpu/README.md`
 

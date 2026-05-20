@@ -24,12 +24,12 @@
 //! `Lookup.findSpecial(I.class, "m", mt, C.class)` must invoke I's default
 //! `m()` even when the receiver is a concrete `C` that overrides `m()`.
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 #[test]
 fn findspecial_native_registered_with_jdk25_signature() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut r);
+    cratonvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut r);
     assert!(
         r.find(
             "java/lang/invoke/MethodHandles$Lookup",
@@ -87,8 +87,8 @@ fn invoke_special_shared_exists_and_dispatches_no_retarget() {
     // exercise an end-to-end super-call in unit tests without a full Vm
     // bootstrap, so we verify the function is exported and callable in a
     // failure-tolerant way.
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::vm::SharedVm;
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::vm::SharedVm;
     use std::sync::Arc;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -104,7 +104,7 @@ fn findspecial_callback_resolved_via_registry_lookup() {
     // Sanity: the registry indexes findSpecial under both the bare name and
     // the JDK 25 4-Class signature.
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut r);
+    cratonvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut r);
     let cb = r.find(
         "java/lang/invoke/MethodHandles$Lookup",
         "findSpecial",
@@ -120,9 +120,9 @@ fn findspecial_callback_resolved_via_registry_lookup() {
 /// runtime if the fixture isn't staged.
 #[test]
 fn findspecial_probe_runs_to_completion() {
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::types::Value;
-    use rustjvm_vm::vm::Vm;
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::types::Value;
+    use cratonvm_vm::vm::Vm;
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let probe = manifest

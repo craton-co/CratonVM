@@ -1,12 +1,12 @@
 //! Panama FFI native method registrations.
 
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{obj_arg, alloc_concurrent_synthetic};
 
-use rustjvm_native_api::ffi::{
+use cratonvm_native_api::ffi::{
     self, LAYOUT_ADDRESS, LAYOUT_BOOLEAN, LAYOUT_BYTE, LAYOUT_CHAR, LAYOUT_DOUBLE, LAYOUT_FLOAT,
     LAYOUT_INT, LAYOUT_LONG, LAYOUT_PADDING, LAYOUT_SEQUENCE, LAYOUT_SHORT, LAYOUT_STRUCT,
     LAYOUT_UNION,
@@ -215,7 +215,7 @@ fn register_pe_arena(r: &mut NativeMethodRegistry) {
 
     r.register(arena, "global", "()Ljava/lang/foreign/Arena;", |ctx, _| {
         let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
-        let ids = ctx.new_array(rustjvm_types::ArrayElementType::Long, 256);
+        let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(ffi::ARENA_GLOBAL));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
         ctx.set_field(a, 2, Value::Int(0));
@@ -224,7 +224,7 @@ fn register_pe_arena(r: &mut NativeMethodRegistry) {
     });
     r.register(arena, "ofAuto", "()Ljava/lang/foreign/Arena;", |ctx, _| {
         let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
-        let ids = ctx.new_array(rustjvm_types::ArrayElementType::Long, 256);
+        let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(ffi::ARENA_AUTO));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
         ctx.set_field(a, 2, Value::Int(0));
@@ -237,7 +237,7 @@ fn register_pe_arena(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Arena;",
         |ctx, _| {
             let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
-            let ids = ctx.new_array(rustjvm_types::ArrayElementType::Long, 256);
+            let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
             ctx.set_field(a, 0, Value::Int(ffi::ARENA_CONFINED));
             ctx.set_field(a, 1, Value::Object(Some(ids)));
             ctx.set_field(a, 2, Value::Int(0));
@@ -252,7 +252,7 @@ fn register_pe_arena(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Arena;",
         |ctx, _| {
             let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
-            let ids = ctx.new_array(rustjvm_types::ArrayElementType::Long, 256);
+            let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
             ctx.set_field(a, 0, Value::Int(ffi::ARENA_SHARED));
             ctx.set_field(a, 1, Value::Object(Some(ids)));
             ctx.set_field(a, 2, Value::Int(0));
@@ -1770,27 +1770,27 @@ unsafe extern "C" fn upcall_dispatch(
     for (i, &kind) in userdata.param_kinds.iter().enumerate() {
         let slot = *args.add(i);
         let v = match kind {
-            rustjvm_native_api::ffi::LAYOUT_BYTE
-            | rustjvm_native_api::ffi::LAYOUT_BOOLEAN => {
+            cratonvm_native_api::ffi::LAYOUT_BYTE
+            | cratonvm_native_api::ffi::LAYOUT_BOOLEAN => {
                 Value::Int(*(slot as *const i8) as i32)
             }
-            rustjvm_native_api::ffi::LAYOUT_SHORT
-            | rustjvm_native_api::ffi::LAYOUT_CHAR => {
+            cratonvm_native_api::ffi::LAYOUT_SHORT
+            | cratonvm_native_api::ffi::LAYOUT_CHAR => {
                 Value::Int(*(slot as *const i16) as i32)
             }
-            rustjvm_native_api::ffi::LAYOUT_INT => {
+            cratonvm_native_api::ffi::LAYOUT_INT => {
                 Value::Int(*(slot as *const i32))
             }
-            rustjvm_native_api::ffi::LAYOUT_LONG => {
+            cratonvm_native_api::ffi::LAYOUT_LONG => {
                 Value::Long(*(slot as *const i64))
             }
-            rustjvm_native_api::ffi::LAYOUT_FLOAT => {
+            cratonvm_native_api::ffi::LAYOUT_FLOAT => {
                 Value::Float(*(slot as *const f32))
             }
-            rustjvm_native_api::ffi::LAYOUT_DOUBLE => {
+            cratonvm_native_api::ffi::LAYOUT_DOUBLE => {
                 Value::Double(*(slot as *const f64))
             }
-            rustjvm_native_api::ffi::LAYOUT_ADDRESS => {
+            cratonvm_native_api::ffi::LAYOUT_ADDRESS => {
                 Value::Long(*(slot as *const i64))
             }
             _ => Value::Long(0),
@@ -1804,7 +1804,7 @@ unsafe extern "C" fn upcall_dispatch(
         // We invoke its `invoke([Object])` method passing our boxed args.
         // Build an Object[] of boxed primitives.
         let arr =
-            ctx.new_array(rustjvm_types::ArrayElementType::Reference, java_args.len());
+            ctx.new_array(cratonvm_types::ArrayElementType::Reference, java_args.len());
         for (i, v) in java_args.iter().enumerate() {
             // Pass primitives through directly; the receiver is
             // expected to pattern-match on Value via lambda dispatch.
@@ -1830,15 +1830,15 @@ unsafe extern "C" fn upcall_dispatch(
     // Marshal Java return value into the C return slot.
     *result = match (userdata.return_kind, returned) {
         (-1, _) => 0,
-        (rustjvm_native_api::ffi::LAYOUT_BYTE, Value::Int(n))
-        | (rustjvm_native_api::ffi::LAYOUT_BOOLEAN, Value::Int(n))
-        | (rustjvm_native_api::ffi::LAYOUT_SHORT, Value::Int(n))
-        | (rustjvm_native_api::ffi::LAYOUT_CHAR, Value::Int(n))
-        | (rustjvm_native_api::ffi::LAYOUT_INT, Value::Int(n)) => n as u64,
-        (rustjvm_native_api::ffi::LAYOUT_LONG, Value::Long(n))
-        | (rustjvm_native_api::ffi::LAYOUT_ADDRESS, Value::Long(n)) => n as u64,
-        (rustjvm_native_api::ffi::LAYOUT_FLOAT, Value::Float(f)) => f.to_bits() as u64,
-        (rustjvm_native_api::ffi::LAYOUT_DOUBLE, Value::Double(d)) => d.to_bits(),
+        (cratonvm_native_api::ffi::LAYOUT_BYTE, Value::Int(n))
+        | (cratonvm_native_api::ffi::LAYOUT_BOOLEAN, Value::Int(n))
+        | (cratonvm_native_api::ffi::LAYOUT_SHORT, Value::Int(n))
+        | (cratonvm_native_api::ffi::LAYOUT_CHAR, Value::Int(n))
+        | (cratonvm_native_api::ffi::LAYOUT_INT, Value::Int(n)) => n as u64,
+        (cratonvm_native_api::ffi::LAYOUT_LONG, Value::Long(n))
+        | (cratonvm_native_api::ffi::LAYOUT_ADDRESS, Value::Long(n)) => n as u64,
+        (cratonvm_native_api::ffi::LAYOUT_FLOAT, Value::Float(f)) => f.to_bits() as u64,
+        (cratonvm_native_api::ffi::LAYOUT_DOUBLE, Value::Double(d)) => d.to_bits(),
         _ => 0,
     };
 }
@@ -2151,8 +2151,8 @@ fn pe_struct_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     let count = ctx.array_length(members_arr);
 
-    let offsets_arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, count);
-    let names_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+    let offsets_arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, count);
+    let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
 
     let mut offset: usize = 0;
     let mut max_align: usize = 1;
@@ -2759,7 +2759,7 @@ mod tests {
     /// Helper: create an arena object of the given kind using the actual registration logic.
     fn make_arena(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
         let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
-        let ids = ctx.new_array(rustjvm_types::ArrayElementType::Long, 256);
+        let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(kind));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
         ctx.set_field(a, 2, Value::Int(0)); // not closed
@@ -2911,7 +2911,7 @@ mod tests {
     fn test_85_2_of_array_int() {
         // ofArray(int[]) should create a segment wrapping array data
         let mut ctx = mock_ctx();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, 4);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, 4);
         ctx.set_array_element(arr, 0, Value::Int(10));
         ctx.set_array_element(arr, 1, Value::Int(20));
         ctx.set_array_element(arr, 2, Value::Int(30));
@@ -3068,7 +3068,7 @@ mod tests {
         // Build FunctionDescriptor: of(LAYOUT_LONG, ADDRESS)
         let ret_layout = make_layout(&mut ctx, LAYOUT_LONG);
         let param_layout = make_layout(&mut ctx, LAYOUT_ADDRESS);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
@@ -3081,7 +3081,7 @@ mod tests {
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
         // Build args array with the pointer as a Long
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Long(ptr as i64));
 
         // Invoke the downcall
@@ -3108,7 +3108,7 @@ mod tests {
         // FunctionDescriptor: of(LAYOUT_INT, LAYOUT_INT)
         let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
         let param_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
@@ -3119,7 +3119,7 @@ mod tests {
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(-42));
 
         let result = pe_downcall_invoke(&mut ctx, &[
@@ -3155,7 +3155,7 @@ mod tests {
         // FunctionDescriptor: int(int)
         let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
         let param_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
@@ -3175,7 +3175,7 @@ mod tests {
         let before = plf::CIF_BUILD_COUNT.load(Ordering::Relaxed);
 
         // --- First call: cache miss, Cif built and stashed ---
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(-7));
         let r1 = pe_downcall_invoke(
             &mut ctx,
@@ -3204,7 +3204,7 @@ mod tests {
         );
 
         // --- Second call: cache hit, Cif *not* rebuilt ---
-        let call_args2 = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let call_args2 = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args2, 0, Value::Int(-11));
         let r2 = pe_downcall_invoke(
             &mut ctx,
@@ -3249,7 +3249,7 @@ mod tests {
         let int_layout = make_layout(&mut ctx, LAYOUT_INT);
         let long_layout = make_layout(&mut ctx, LAYOUT_LONG);
 
-        let members = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 2);
+        let members = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
         ctx.set_array_element(members, 0, Value::Object(Some(int_layout)));
         ctx.set_array_element(members, 1, Value::Object(Some(long_layout)));
 
@@ -3281,7 +3281,7 @@ mod tests {
 
         // FunctionDescriptor: ofVoid(LAYOUT_INT)  — return_layout = None
         let param_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
@@ -3292,7 +3292,7 @@ mod tests {
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(5));
 
         let result = pe_downcall_invoke(&mut ctx, &[
@@ -3347,7 +3347,7 @@ mod tests {
 
         let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
         let param_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
@@ -3392,7 +3392,7 @@ mod tests {
         ctx.set_field(stub, 0, Value::Long(0)); // slot 0 in the VM's upcall table
 
         // Create args array
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(call_args, 0, Value::Int(42));
 
         let result = pe_upcall_invoke(&mut ctx, &[
@@ -3449,7 +3449,7 @@ mod tests {
 
         // Build descriptor: int(int,int,int,int,int,int,int,int,int,int,int,int)
         let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 12);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
             let p = make_layout(&mut ctx, LAYOUT_INT);
             ctx.set_array_element(params_arr, i, Value::Object(Some(p)));
@@ -3463,7 +3463,7 @@ mod tests {
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
 
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 12);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
             ctx.set_array_element(call_args, i, Value::Int((i + 1) as i32));
         }
@@ -3493,7 +3493,7 @@ mod tests {
         let p_dbl  = make_layout(&mut ctx, LAYOUT_DOUBLE);
         let p_int2 = make_layout(&mut ctx, LAYOUT_INT);
         let p_flt  = make_layout(&mut ctx, LAYOUT_FLOAT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p_int1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p_dbl)));
         ctx.set_array_element(params_arr, 2, Value::Object(Some(p_int2)));
@@ -3508,7 +3508,7 @@ mod tests {
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
 
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(call_args, 0, Value::Int(10));
         ctx.set_array_element(call_args, 1, Value::Double(2.5));
         ctx.set_array_element(call_args, 2, Value::Int(7));
@@ -3559,7 +3559,7 @@ mod tests {
         let p_len = make_layout(&mut ctx, LAYOUT_LONG);
         let p_fmt = make_layout(&mut ctx, LAYOUT_ADDRESS);
         let p_var = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p_buf)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p_len)));
         ctx.set_array_element(params_arr, 2, Value::Object(Some(p_fmt)));
@@ -3575,7 +3575,7 @@ mod tests {
         // First 3 args fixed; everything from index 3 is variadic.
         ctx.set_field(handle, 2, Value::Long(3));
 
-        let call_args = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+        let call_args = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_array_element(call_args, 0, Value::Long(buf_ptr as i64));
         ctx.set_array_element(call_args, 1, Value::Long(16));
         ctx.set_array_element(call_args, 2, Value::Long(fmt_ptr as i64));
@@ -3608,7 +3608,7 @@ mod tests {
         let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
         let p1 = make_layout(&mut ctx, LAYOUT_INT);
         let p2 = make_layout(&mut ctx, LAYOUT_INT);
-        let params_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 2);
+        let params_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p2)));
         let descriptor = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);

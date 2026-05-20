@@ -18,7 +18,7 @@ use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
     SLOT_SIZE,
 };
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // T6.3.1 — JVMTI GC hook registry
@@ -628,7 +628,7 @@ pub fn update_value_ref(value: &mut Value, pointer_map: &HashMap<usize, usize>) 
 mod tests {
     use super::*;
     use crate::heap::{ArrayElementType, Heap};
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
 
     /// Helper to create a test heap with small capacity for GC testing.
     fn small_heap() -> Heap {
@@ -911,7 +911,7 @@ mod tests {
 
         // Trigger a real GC cycle on a tiny heap.
         let heap = small_heap();
-        let obj = heap.alloc_object(rustjvm_types::ClassId::new(1), 1);
+        let obj = heap.alloc_object(cratonvm_types::ClassId::new(1), 1);
         let mut roots = vec![obj];
         let (mut from, mut to) = heap.lock_spaces();
         let _ = collect(&mut from, &mut to, &mut roots);
@@ -930,7 +930,7 @@ mod tests {
         let before_finish = GC_HOOK_FINISHES.load(CounterOrd::SeqCst);
 
         let heap = small_heap();
-        let obj = heap.alloc_object(rustjvm_types::ClassId::new(1), 1);
+        let obj = heap.alloc_object(cratonvm_types::ClassId::new(1), 1);
         let mut roots = vec![obj];
         let (mut from, mut to) = heap.lock_spaces();
         let _ = collect_with_finalizers(&mut from, &mut to, &mut roots, &[]);

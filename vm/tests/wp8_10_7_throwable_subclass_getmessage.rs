@@ -28,12 +28,12 @@
 //!   5. `getMessage()` and `printStackTrace(PrintStream)` are registered
 //!      across the full Throwable subclass family (registry-only check).
 
-use rustjvm_vm::classloading::ClassId;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{create_java_string, NativeContextImpl, SharedVm};
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::classloading::ClassId;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::threading::jvm_thread::{JvmThread, ThreadId};
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{create_java_string, NativeContextImpl, SharedVm};
+use cratonvm_native_api::NativeMethodRegistry;
 use std::sync::Arc;
 
 fn build_registry() -> NativeMethodRegistry {
@@ -41,16 +41,16 @@ fn build_registry() -> NativeMethodRegistry {
     // registration block that runs in BOTH `synthetic-jdk` and real-JDK
     // feature configurations. The vm-crate `register_builtins` re-export
     // is a no-op shim when the `synthetic-jdk` feature is OFF (default
-    // for `cargo test --release -p rustjvm-vm`), so going through it
+    // for `cargo test --release -p cratonvm-vm`), so going through it
     // would silently produce an empty registry.
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     r
 }
 
 /// Allocate a synthetic Throwable-shaped object with 2 fields (message, cause)
 /// and populate `field 0` (detailMessage) with `message` if `Some`.
-fn alloc_synthetic_throwable(shared: &SharedVm, message: Option<&str>) -> rustjvm_types::ObjectRef {
+fn alloc_synthetic_throwable(shared: &SharedVm, message: Option<&str>) -> cratonvm_types::ObjectRef {
     // ClassId is irrelevant for the native — the dispatch is keyed by the
     // *registered* class-name string at lookup time, not the heap object's
     // ClassId.  We only need the object to have ≥1 field so `get_field(this, 0)`
@@ -88,7 +88,7 @@ fn throwable_get_message_roundtrips() {
     let Some(Value::Object(Some(s))) = val else {
         panic!("expected non-null String return, got {val:?}");
     };
-    let read_back = rustjvm_vm::vm::read_java_string(&shared.heap, s)
+    let read_back = cratonvm_vm::vm::read_java_string(&shared.heap, s)
         .expect("getMessage return must be a readable String");
     assert_eq!(read_back, "boom");
 }
@@ -101,7 +101,7 @@ fn throwable_get_message_roundtrips() {
 fn no_class_def_found_error_get_message_registered() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let mut thread = JvmThread::new(ThreadId(0), "test");
-    let exc = alloc_synthetic_throwable(&shared, Some("missing module: rustjvm.fixture"));
+    let exc = alloc_synthetic_throwable(&shared, Some("missing module: cratonvm.fixture"));
 
     let registry = build_registry();
     let cb = registry
@@ -124,9 +124,9 @@ fn no_class_def_found_error_get_message_registered() {
     let Some(Value::Object(Some(s))) = val else {
         panic!("expected non-null String return, got {val:?}");
     };
-    let read_back = rustjvm_vm::vm::read_java_string(&shared.heap, s)
+    let read_back = cratonvm_vm::vm::read_java_string(&shared.heap, s)
         .expect("getMessage return must be a readable String");
-    assert_eq!(read_back, "missing module: rustjvm.fixture");
+    assert_eq!(read_back, "missing module: cratonvm.fixture");
 }
 
 // ---------------------------------------------------------------------------

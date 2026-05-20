@@ -1,8 +1,8 @@
 //! NIO, HTTP client, and resource loading natives.
 
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 use crate::phases_late::{p56_build_stream, p58_new_cf};
@@ -50,7 +50,7 @@ fn resolve_class_resource_name(ctx: &dyn NativeContext, class_mirror: ObjectRef,
 }
 
 pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     // -------------------------------------------------------------------------
     // java.lang.Class.getResourceAsStream(String) → InputStream
@@ -363,9 +363,9 @@ fn s1_url_to_fs_path(url_str: &str) -> Option<String> {
 /// in ServiceLoader field 1 for subsequent calls.
 fn s1_service_loader_ensure_loaded(
     ctx: &mut dyn NativeContext,
-    sl: rustjvm_types::ObjectRef,
-) -> rustjvm_types::ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    sl: cratonvm_types::ObjectRef,
+) -> cratonvm_types::ObjectRef {
+    use cratonvm_types::ArrayElementType;
 
     // If already loaded, return cached array
     if let Value::Object(Some(arr)) = ctx.get_field(sl, 1) {
@@ -395,7 +395,7 @@ fn s1_service_loader_ensure_loaded(
             return empty;
         }
     };
-    let class_id = rustjvm_types::ClassId::new(class_id_val);
+    let class_id = cratonvm_types::ClassId::new(class_id_val);
     let iface_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n.replace('/', "."),
         None => {
@@ -465,7 +465,7 @@ fn s1_service_loader_ensure_loaded(
 }
 
 pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     // =========================================================================
     // java.net.URLClassLoader
@@ -1216,7 +1216,7 @@ const S2DC_SOCK_ID: usize = 4;
 // ---- ByteBuffer helpers ----------------------------------------------------
 
 fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let arr = ctx.new_array(ArrayElementType::Byte, cap);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
     ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
@@ -1972,7 +1972,7 @@ s2_view_buf_fn!(s2_bb_as_double_buffer, "java/nio/DoubleBuffer", 8);
 s2_view_buf_fn!(s2_bb_as_char_buffer,   "java/nio/CharBuffer",   2);
 
 fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let bb = "java/nio/ByteBuffer";
 
     r.register(bb, "allocate", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -1989,7 +1989,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let alloc_id = match ctx.allocate_native_memory(cap, 8) {
             Some((id, _ptr)) => id,
             None => {
-                return Err(rustjvm_types::error::RuntimeError::OutOfMemoryError {
+                return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
                     message: "DirectByteBuffer.allocateDirect: native memory allocation failed"
                         .into(),
                 }
@@ -2001,7 +2001,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         //    carry alloc_id + direct_flag). Use an empty byte[] for BB_ARRAY
         //    so existing array-reading code paths see capacity 0 rather than
         //    aliasing the native memory.
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, cap);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 8);
         ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
         ctx.set_field(buf, BB_POS, Value::Int(0));
@@ -3011,7 +3011,7 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
     if let Value::Object(Some(sel)) = selector {
         let n       = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
         let new_cap = (n + 1).max(8);
-        let new_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), new_cap);
+        let new_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
         if let Value::Object(Some(old_arr)) = ctx.get_field(sel, S2SEL_KEYS) {
             for i in 0..n {
                 let k = ctx.get_array_element(old_arr, i);
@@ -3037,14 +3037,14 @@ fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bo
                 if !selected_only || rops != 0 { ready.push(k); }
             }
         }
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), ready.len());
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ready.len());
         for (i, k) in ready.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Object(Some(*k)));
         }
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(ready.len() as i32));
     } else {
-        let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(0));
     }
@@ -3328,7 +3328,7 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
 
     let mut request_str = format!(
-        "{method} {request_target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: RustJVM/1.0\r\nAccept: */*\r\n"
+        "{method} {request_target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: CratonVM/1.0\r\nAccept: */*\r\n"
     );
     if !body_bytes.is_empty() {
         request_str.push_str(&format!(

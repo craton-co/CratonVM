@@ -1,7 +1,7 @@
 //! WP2.6 — `Constructor.newInstance` edge-case conformance tests.
 //!
 //! Verifies the spec-classification helpers in
-//! `rustjvm_vm::runtime::lang_reflect_constructor` and the structural
+//! `cratonvm_vm::runtime::lang_reflect_constructor` and the structural
 //! invariants of the existing `native_constructor_new_instance` impl in
 //! `native-builtins/src/lang_class.rs`. End-to-end execution against
 //! the `apps/constructor_probe/` Java fixture is exercised when the
@@ -20,8 +20,8 @@
 //!   10. Record compact-canonical with validation
 //!   11. Generic varargs constructor
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::runtime::lang_reflect_constructor::{
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::runtime::lang_reflect_constructor::{
     ConstructorAccess, CtorTestCase, InstantiationClassification,
     is_inner_class_ctor_descriptor,
 };
@@ -29,7 +29,7 @@ use rustjvm_vm::runtime::lang_reflect_constructor::{
 #[test]
 fn constructor_natives_registered_with_jdk25_signatures() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
 
     // Constructor.newInstance is registered as part of essential
     // natives in real-JDK mode, and as part of register_builtins in
@@ -65,7 +65,7 @@ fn case_1_public_noarg_classification() {
 
 #[test]
 fn case_2_primitive_args_descriptor() {
-    use rustjvm_vm::runtime::proxy::count_descriptor_params;
+    use cratonvm_vm::runtime::proxy::count_descriptor_params;
     let desc = "(IJDZ)V"; // int, long, double, boolean
     assert_eq!(count_descriptor_params(desc), 4);
 }
@@ -76,7 +76,7 @@ fn case_2_primitive_args_descriptor() {
 
 #[test]
 fn case_3_object_args_descriptor() {
-    use rustjvm_vm::runtime::proxy::count_descriptor_params;
+    use cratonvm_vm::runtime::proxy::count_descriptor_params;
     let desc = "(Ljava/lang/String;Ljava/lang/Integer;Lcom/example/Foo;)V";
     assert_eq!(count_descriptor_params(desc), 3);
 }
@@ -188,7 +188,7 @@ fn case_8_inner_class_descriptor_detection() {
 fn case_9_record_canonical_descriptor_shape() {
     // record Point(int x, String tag) {} — canonical constructor
     // descriptor is `(ILjava/lang/String;)V`.
-    use rustjvm_vm::runtime::proxy::count_descriptor_params;
+    use cratonvm_vm::runtime::proxy::count_descriptor_params;
     let desc = "(ILjava/lang/String;)V";
     assert_eq!(count_descriptor_params(desc), 2);
 
@@ -220,7 +220,7 @@ fn case_10_compact_canonical_validation_label() {
 
 #[test]
 fn case_11_varargs_descriptor() {
-    use rustjvm_vm::runtime::proxy::count_descriptor_params;
+    use cratonvm_vm::runtime::proxy::count_descriptor_params;
     // Object... in bytecode is `[Ljava/lang/Object;`.
     let desc = "([Ljava/lang/Object;)V";
     assert_eq!(count_descriptor_params(desc), 1);
@@ -275,9 +275,9 @@ fn constructor_probe_compiled_class_files_exist() {
 }
 
 #[test]
-fn constructor_probe_loads_under_rustjvm_when_staged() {
-    use rustjvm_vm::config::VmConfig;
-    use rustjvm_vm::vm::Vm;
+fn constructor_probe_loads_under_cratonvm_when_staged() {
+    use cratonvm_vm::config::VmConfig;
+    use cratonvm_vm::vm::Vm;
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let probe_dir = manifest

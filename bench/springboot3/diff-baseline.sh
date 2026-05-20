@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env bash
 # bench/springboot3/diff-baseline.sh
-# WP8.7 — compare the last rust-jvm run for springboot3 against bench-baseline.json.
+# WP8.7 — compare the last cratonvm run for springboot3 against bench-baseline.json.
 # Schema-v1 contract identical to bench/wildfly/diff-baseline.sh.
 set -euo pipefail
 
@@ -16,7 +16,7 @@ if [[ ! -f "$BASELINE" ]]; then
 fi
 for f in "$STDOUT_LOG" "$STDERR_LOG" "$RC_FILE"; do
     if [[ ! -f "$f" ]]; then
-        echo "diff-baseline(springboot3): ERROR $f missing; run run-under-rustjvm.sh first" >&2
+        echo "diff-baseline(springboot3): ERROR $f missing; run run-under-cratonvm.sh first" >&2
         exit 2
     fi
 done

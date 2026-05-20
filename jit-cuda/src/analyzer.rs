@@ -18,10 +18,10 @@
 
 use crate::annotations::{AdmissionHint, MethodAnnotations};
 use crate::signature::KernelSignature;
-use rustjvm_reader::attribute::CodeAttribute;
-use rustjvm_reader::field_type::FieldType;
-use rustjvm_reader::method::ClassFileMethod;
-use rustjvm_reader::method_descriptor::MethodDescriptor;
+use cratonvm_reader::attribute::CodeAttribute;
+use cratonvm_reader::field_type::FieldType;
+use cratonvm_reader::method::ClassFileMethod;
+use cratonvm_reader::method_descriptor::MethodDescriptor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamKind {

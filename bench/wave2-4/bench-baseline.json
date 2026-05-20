@@ -1,7 +1,7 @@
 {
   "$schema_version": 1,
   "generated_at": "2026-04-25T00:00:00Z",
-  "rustjvm_version": "unknown",
+  "cratonvm_version": "unknown",
   "wp": "WP2.4-D",
   "fixture": {
     "mode": "real-or-skip",
@@ -37,7 +37,7 @@
         "NoSuchMethodError",
         "javaagent premain aborted VM"
       ],
-      "notes": "Today's reality (2026-04-29 session 99): rc=0 — the full agent retransform pipeline works. Premain runs, isRetransformClassesSupported returns true, addTransformer succeeds, retransformClasses fires the transformer which patches `bipush 42` → `bipush 99` in Target.class, and the retransformed Target.compute() returns 99. Required fixes that landed this session: (a) public-name aliases on InstrumentationImpl for isRetransform/isRedefine/isNativeMethodPrefixSupported, isModifiableClass, getObjectSize, getAllLoadedClasses, retransformClasses, redefineClasses; (b) promoted Class.forName(String) / forName(String,Z,ClassLoader) / forName(Module,String) overloads from `register_synthetic_overrides` (synthetic-jdk-only) into `register_essential_natives` (always registered). Combined with the WP2.4 v1+v2 work + WP2.5 v1+v2+v3 (real bytecode generator + UTE wrapping + static Method[] slots), this is end-to-end JVMTI-style javaagent retransform working under rust-jvm."
+      "notes": "Today's reality (2026-04-29 session 99): rc=0 — the full agent retransform pipeline works. Premain runs, isRetransformClassesSupported returns true, addTransformer succeeds, retransformClasses fires the transformer which patches `bipush 42` → `bipush 99` in Target.class, and the retransformed Target.compute() returns 99. Required fixes that landed this session: (a) public-name aliases on InstrumentationImpl for isRetransform/isRedefine/isNativeMethodPrefixSupported, isModifiableClass, getObjectSize, getAllLoadedClasses, retransformClasses, redefineClasses; (b) promoted Class.forName(String) / forName(String,Z,ClassLoader) / forName(Module,String) overloads from `register_synthetic_overrides` (synthetic-jdk-only) into `register_essential_natives` (always registered). Combined with the WP2.4 v1+v2 work + WP2.5 v1+v2+v3 (real bytecode generator + UTE wrapping + static Method[] slots), this is end-to-end JVMTI-style javaagent retransform working under cratonvm."
     },
     "jacoco": {
       "real_jar_search": [
@@ -66,7 +66,7 @@
       "expected_jacoco_exec_present": true,
       "expected_jacoco_exec_nonempty": false,
       "expected_jacoco_magic_ok": false,
-      "notes": "rc=0 today — main() runs to completion because rust-jvm's agent_loader catches the JaCoCo premain NPE and continues (without the transformer registered). The `jacoco.exec` file gets created (0-byte placeholder) but contains NO coverage data because the transformer never installed. Once 2.4-A's full Instrumentation surface lands AND 2.4-B's class_manager retransform path is wired, JaCoCo's premain completes, the rewriter installs, and `jacoco.exec` after main() exits should be >300 bytes and start with 0x01 0xC0 0xC0 (JaCoCo execdata magic). At that point flip expected_jacoco_exec_nonempty + expected_jacoco_magic_ok to true and clear the expected_stderr_contains entries."
+      "notes": "rc=0 today — main() runs to completion because cratonvm's agent_loader catches the JaCoCo premain NPE and continues (without the transformer registered). The `jacoco.exec` file gets created (0-byte placeholder) but contains NO coverage data because the transformer never installed. Once 2.4-A's full Instrumentation surface lands AND 2.4-B's class_manager retransform path is wired, JaCoCo's premain completes, the rewriter installs, and `jacoco.exec` after main() exits should be >300 bytes and start with 0x01 0xC0 0xC0 (JaCoCo execdata magic). At that point flip expected_jacoco_exec_nonempty + expected_jacoco_magic_ok to true and clear the expected_stderr_contains entries."
     },
     "mockito": {
       "real_jar_search": [
@@ -111,14 +111,14 @@
     {
       "name": "run",
       "rc": 1,
-      "notes": "rust-jvm runs all three probes. Per-probe rc / meta is pinned in summary.json. The harness itself exits 0; future agents diff summary.json against this baseline to detect drift."
+      "notes": "cratonvm runs all three probes. Per-probe rc / meta is pinned in summary.json. The harness itself exits 0; future agents diff summary.json against this baseline to detect drift."
     }
   ],
   "known_blockers": [
     {
       "id": "WP2.4-A",
       "owner": "agent 2.4-A",
-      "summary": "vm/src/runtime/instrument.rs must register the full sun/instrument/InstrumentationImpl native surface (isRetransformClassesSupported0, retransformClasses0, redefineClasses0, getAllLoadedClasses0, isModifiableClass0, getObjectSize0). Today only an in-process bridge exists (rustjvm.Instrument). Premain calls into the java.lang.instrument.Instrumentation API which is implemented as sun.instrument.InstrumentationImpl in OpenJDK; that bridge needs the natives wired.",
+      "summary": "vm/src/runtime/instrument.rs must register the full sun/instrument/InstrumentationImpl native surface (isRetransformClassesSupported0, retransformClasses0, redefineClasses0, getAllLoadedClasses0, isModifiableClass0, getObjectSize0). Today only an in-process bridge exists (cratonvm.Instrument). Premain calls into the java.lang.instrument.Instrumentation API which is implemented as sun.instrument.InstrumentationImpl in OpenJDK; that bridge needs the natives wired.",
       "see": "docs/wildfly-ejbca-roadmap.md WP2.4"
     },
     {

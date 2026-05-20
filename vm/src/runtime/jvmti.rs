@@ -2225,7 +2225,7 @@ impl fmt::Debug for JvmtiEnv {
 // Global JVMTI Event Manager (T6.3 wiring)
 // ---------------------------------------------------------------------------
 //
-// The global manager lets crates that must not depend on `rustjvm-vm`
+// The global manager lets crates that must not depend on `cratonvm-vm`
 // (classloading, gc) fire JVMTI events without carrying a back-reference
 // to the VM. The VM installs a manager at `SharedVm::new`; every other
 // component calls the free `fire_*` functions in this module.

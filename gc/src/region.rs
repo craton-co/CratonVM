@@ -344,7 +344,7 @@ impl RegionHeap {
             let region_addr = base + (start + i) * self.region_size;
             if self.regions[start + i].top >= HEADER_SIZE {
                 let filler = ObjectHeader::new(
-                    rustjvm_types::ClassId::new(0),
+                    cratonvm_types::ClassId::new(0),
                     ObjectKind::HumongousFiller,
                     ArrayElementType::Reference,
                     0,

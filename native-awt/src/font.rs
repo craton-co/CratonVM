@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use rustjvm_types::intern_arc;
+use cratonvm_types::intern_arc;
 
 // `metrics_cache` uses `FxHashMap`: smaller per-entry overhead than std
 // `HashMap` (no SipHash random state), which matters for the bounded cache

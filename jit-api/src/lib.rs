@@ -1,4 +1,4 @@
-//! JIT compiler API types for RustJVM.
+//! JIT compiler API types for CratonVM.
 //!
 //! Shared types used by the JIT compiler crate and the VM crate:
 //! - [`CachedBytecodeMethod`] — method data needed for JIT compilation
@@ -11,8 +11,8 @@ pub mod gpu_lowering;
 
 use std::sync::Arc;
 
-use rustjvm_reader::attribute::ExceptionTableEntry;
-use rustjvm_types::ClassId;
+use cratonvm_reader::attribute::ExceptionTableEntry;
+use cratonvm_types::ClassId;
 
 /// Cached bytecode method info — everything needed to create a Frame without
 /// any lock acquisitions or string allocations.

@@ -7,9 +7,9 @@
 //! - Java test classes are compiled automatically by `build.rs` if `javac`
 //!   is on the PATH. If not, tests will be skipped at runtime.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 /// Path to the test resources directory.
 fn test_resources_dir() -> String {
@@ -20,7 +20,7 @@ fn test_resources_dir() -> String {
 /// Check if compiled .class files are available.
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    let class_path = format!("{dir}/rustjvm/SimpleReturn.class");
+    let class_path = format!("{dir}/cratonvm/SimpleReturn.class");
     std::path::Path::new(&class_path).exists()
 }
 
@@ -48,7 +48,7 @@ macro_rules! require_class_files {
 fn test_simple_return() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SimpleReturn", "test", "()I", &[]);
+    let result = vm.invoke("cratonvm/SimpleReturn", "test", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -59,7 +59,7 @@ fn test_simple_return() {
 fn test_arithmetic_add() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/Arithmetic", "test", "()I", &[]);
+    let result = vm.invoke("cratonvm/Arithmetic", "test", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
         other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
@@ -70,7 +70,7 @@ fn test_arithmetic_add() {
 fn test_arithmetic_mul() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/Arithmetic", "testMul", "()I", &[]);
+    let result = vm.invoke("cratonvm/Arithmetic", "testMul", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -81,7 +81,7 @@ fn test_arithmetic_mul() {
 fn test_arithmetic_div() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/Arithmetic", "testDiv", "()I", &[]);
+    let result = vm.invoke("cratonvm/Arithmetic", "testDiv", "()I", &[]);
     match result {
         Ok(Some(Value::Int(25))) => {}
         other => panic!("Expected Ok(Some(Int(25))), got: {other:?}"),
@@ -92,7 +92,7 @@ fn test_arithmetic_div() {
 fn test_arithmetic_neg() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/Arithmetic", "testNeg", "()I", &[]);
+    let result = vm.invoke("cratonvm/Arithmetic", "testNeg", "()I", &[]);
     match result {
         Ok(Some(Value::Int(-42))) => {}
         other => panic!("Expected Ok(Some(Int(-42))), got: {other:?}"),
@@ -103,7 +103,7 @@ fn test_arithmetic_neg() {
 fn test_control_flow_if_else() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ControlFlow", "testIfElse", "()I", &[]);
+    let result = vm.invoke("cratonvm/ControlFlow", "testIfElse", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -114,7 +114,7 @@ fn test_control_flow_if_else() {
 fn test_control_flow_loop() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ControlFlow", "testLoop", "()I", &[]);
+    let result = vm.invoke("cratonvm/ControlFlow", "testLoop", "()I", &[]);
     match result {
         Ok(Some(Value::Int(45))) => {}
         other => panic!("Expected Ok(Some(Int(45))), got: {other:?}"),
@@ -125,7 +125,7 @@ fn test_control_flow_loop() {
 fn test_control_flow_while() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ControlFlow", "testWhile", "()I", &[]);
+    let result = vm.invoke("cratonvm/ControlFlow", "testWhile", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1024))) => {}
         other => panic!("Expected Ok(Some(Int(1024))), got: {other:?}"),
@@ -137,7 +137,7 @@ fn test_control_flow_switch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ControlFlow",
+        "cratonvm/ControlFlow",
         "testSwitch",
         "(I)I",
         &[Value::Int(2)],
@@ -156,7 +156,7 @@ fn test_control_flow_switch() {
 fn test_division_by_zero() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/Arithmetic", "testDivByZero", "()I", &[]);
+    let result = vm.invoke("cratonvm/Arithmetic", "testDivByZero", "()I", &[]);
     assert!(
         result.is_err(),
         "Division by zero should fail, got: {result:?}"
@@ -167,7 +167,7 @@ fn test_division_by_zero() {
 fn test_basic_exception_catch() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ExceptionTest", "testBasicCatch", "()V", &[]);
+    let result = vm.invoke("cratonvm/ExceptionTest", "testBasicCatch", "()V", &[]);
     assert!(result.is_ok(), "testBasicCatch failed: {result:?}");
 
     let printed_ints: Vec<i32> = vm
@@ -183,7 +183,7 @@ fn test_basic_exception_catch() {
 fn test_exception_propagation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ExceptionTest", "testPropagation", "()V", &[]);
+    let result = vm.invoke("cratonvm/ExceptionTest", "testPropagation", "()V", &[]);
     assert!(result.is_ok(), "testPropagation failed: {result:?}");
 
     let printed_ints: Vec<i32> = vm
@@ -199,7 +199,7 @@ fn test_exception_propagation() {
 fn test_finally_block() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ExceptionTest", "testFinally", "()V", &[]);
+    let result = vm.invoke("cratonvm/ExceptionTest", "testFinally", "()V", &[]);
     assert!(result.is_ok(), "testFinally failed: {result:?}");
 
     let printed_ints: Vec<i32> = vm
@@ -221,7 +221,7 @@ fn test_finally_block() {
 fn test_pattern_switch_exact_match() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testExactMatch", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testExactMatch", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -232,7 +232,7 @@ fn test_pattern_switch_exact_match() {
 fn test_pattern_switch_widening() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testWidening", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testWidening", "()I", &[]);
     match result {
         Ok(Some(Value::Int(107))) => {}
         other => panic!("Expected Ok(Some(Int(107))), got: {other:?}"),
@@ -243,7 +243,7 @@ fn test_pattern_switch_widening() {
 fn test_pattern_switch_narrowing() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testNarrowing", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testNarrowing", "()I", &[]);
     match result {
         Ok(Some(Value::Int(15))) => {}
         other => panic!("Expected Ok(Some(Int(15))), got: {other:?}"),
@@ -254,7 +254,7 @@ fn test_pattern_switch_narrowing() {
 fn test_pattern_switch_out_of_range() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testOutOfRange", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testOutOfRange", "()I", &[]);
     match result {
         Ok(Some(Value::Int(314))) => {}
         other => panic!("Expected Ok(Some(Int(314))), got: {other:?}"),
@@ -265,7 +265,7 @@ fn test_pattern_switch_out_of_range() {
 fn test_pattern_switch_null() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testNull", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(99))) => {}
         other => panic!("Expected Ok(Some(Int(99))), got: {other:?}"),
@@ -278,7 +278,7 @@ fn test_pattern_switch_null() {
 fn test_record_pattern_simple() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordPatterns", "testSimpleRecord", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordPatterns", "testSimpleRecord", "()I", &[]);
     match result {
         Ok(Some(Value::Int(7))) => {}
         other => panic!("Expected Ok(Some(Int(7))), got: {other:?}"),
@@ -289,7 +289,7 @@ fn test_record_pattern_simple() {
 fn test_record_pattern_nested() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordPatterns", "testNestedRecord", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordPatterns", "testNestedRecord", "()I", &[]);
     match result {
         Ok(Some(Value::Int(10))) => {}
         other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
@@ -300,7 +300,7 @@ fn test_record_pattern_nested() {
 fn test_record_pattern_with_guard() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordPatterns", "testRecordWithGuard", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordPatterns", "testRecordWithGuard", "()I", &[]);
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -311,7 +311,7 @@ fn test_record_pattern_with_guard() {
 fn test_record_pattern_null() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordPatterns", "testRecordNull", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordPatterns", "testRecordNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(77))) => {}
         other => panic!("Expected Ok(Some(Int(77))), got: {other:?}"),
@@ -322,7 +322,7 @@ fn test_record_pattern_null() {
 fn test_record_pattern_in_box() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordPatterns", "testRecordInBox", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordPatterns", "testRecordInBox", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -335,7 +335,7 @@ fn test_record_pattern_in_box() {
 fn test_guard_true() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testGuardTrue", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testGuardTrue", "()I", &[]);
     match result {
         Ok(Some(Value::Int(43))) => {}
         other => panic!("Expected Ok(Some(Int(43))), got: {other:?}"),
@@ -346,7 +346,7 @@ fn test_guard_true() {
 fn test_guard_false() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testGuardFalse", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testGuardFalse", "()I", &[]);
     match result {
         Ok(Some(Value::Int(103))) => {}
         other => panic!("Expected Ok(Some(Int(103))), got: {other:?}"),
@@ -357,7 +357,7 @@ fn test_guard_false() {
 fn test_guard_side_effect() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/PatternSwitch", "testGuardSideEffect", "()I", &[]);
+    let result = vm.invoke("cratonvm/PatternSwitch", "testGuardSideEffect", "()I", &[]);
     match result {
         Ok(Some(Value::Int(56))) => {}
         other => panic!("Expected Ok(Some(Int(56))), got: {other:?}"),
@@ -370,7 +370,7 @@ fn test_guard_side_effect() {
 fn test_sealed_exhaustive_circle() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SealedSwitch", "testExhaustive", "()I", &[]);
+    let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustive", "()I", &[]);
     match result {
         Ok(Some(Value::Int(5))) => {}
         other => panic!("Expected Ok(Some(Int(5))), got: {other:?}"),
@@ -381,7 +381,7 @@ fn test_sealed_exhaustive_circle() {
 fn test_sealed_exhaustive_rect() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SealedSwitch", "testExhaustiveRect", "()I", &[]);
+    let result = vm.invoke("cratonvm/SealedSwitch", "testExhaustiveRect", "()I", &[]);
     match result {
         Ok(Some(Value::Int(12))) => {}
         other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
@@ -392,7 +392,7 @@ fn test_sealed_exhaustive_rect() {
 fn test_sealed_with_default() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SealedSwitch", "testWithDefault", "()I", &[]);
+    let result = vm.invoke("cratonvm/SealedSwitch", "testWithDefault", "()I", &[]);
     match result {
         Ok(Some(Value::Int(12))) => {}
         other => panic!("Expected Ok(Some(Int(12))), got: {other:?}"),
@@ -409,7 +409,7 @@ fn test_sealed_with_default() {
 fn test_record_canonical_ctor() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testCanonicalCtor", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testCanonicalCtor", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
         other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
@@ -420,7 +420,7 @@ fn test_record_canonical_ctor() {
 fn test_record_accessor_generation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testAccessorGeneration", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testAccessorGeneration", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -433,7 +433,7 @@ fn test_record_accessor_generation() {
 fn test_record_equals_true() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testEqualsTrue", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsTrue", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -444,7 +444,7 @@ fn test_record_equals_true() {
 fn test_record_equals_false() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testEqualsFalse", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsFalse", "()I", &[]);
     match result {
         Ok(Some(Value::Int(0))) => {}
         other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
@@ -455,7 +455,7 @@ fn test_record_equals_false() {
 fn test_record_equals_null() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testEqualsNull", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testEqualsNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(0))) => {}
         other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
@@ -466,7 +466,7 @@ fn test_record_equals_null() {
 fn test_record_hashcode_consistent() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testHashCodeConsistent", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeConsistent", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -477,7 +477,7 @@ fn test_record_hashcode_consistent() {
 fn test_record_hashcode_different() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testHashCodeDifferent", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testHashCodeDifferent", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -488,7 +488,7 @@ fn test_record_hashcode_different() {
 fn test_record_tostring() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/RecordRuntime", "testToString", "()I", &[]);
+    let result = vm.invoke("cratonvm/RecordRuntime", "testToString", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -501,7 +501,7 @@ fn test_record_tostring() {
 fn test_sealed_permitted_loads() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SealedVerify", "testPermittedSubclassLoads", "()I", &[]);
+    let result = vm.invoke("cratonvm/SealedVerify", "testPermittedSubclassLoads", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -512,7 +512,7 @@ fn test_sealed_permitted_loads() {
 fn test_sealed_multiple_permitted() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SealedVerify", "testMultiplePermitted", "()I", &[]);
+    let result = vm.invoke("cratonvm/SealedVerify", "testMultiplePermitted", "()I", &[]);
     match result {
         Ok(Some(Value::Int(3))) => {}
         other => panic!("Expected Ok(Some(Int(3))), got: {other:?}"),
@@ -523,7 +523,7 @@ fn test_sealed_multiple_permitted() {
 fn test_sealed_verify_with_default() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SealedVerify", "testSealedWithDefault", "()I", &[]);
+    let result = vm.invoke("cratonvm/SealedVerify", "testSealedWithDefault", "()I", &[]);
     match result {
         Ok(Some(Value::Int(10))) => {}
         other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
@@ -540,7 +540,7 @@ fn test_sealed_verify_with_default() {
 fn test_reflect_method_static() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectMethod", "testStaticMethod", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectMethod", "testStaticMethod", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
         other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
@@ -551,7 +551,7 @@ fn test_reflect_method_static() {
 fn test_reflect_method_instance() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectMethod", "testInstanceMethod", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectMethod", "testInstanceMethod", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -562,7 +562,7 @@ fn test_reflect_method_instance() {
 fn test_reflect_method_string_return() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectMethod", "testStringReturn", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectMethod", "testStringReturn", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -573,7 +573,7 @@ fn test_reflect_method_string_return() {
 fn test_reflect_method_private_accessible() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectMethod", "testPrivateSetAccessible", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectMethod", "testPrivateSetAccessible", "()I", &[]);
     match result {
         Ok(Some(Value::Int(777))) => {}
         other => panic!("Expected Ok(Some(Int(777))), got: {other:?}"),
@@ -584,7 +584,7 @@ fn test_reflect_method_private_accessible() {
 fn test_reflect_method_exception_wrapping() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectMethod", "testExceptionWrapping", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectMethod", "testExceptionWrapping", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -597,7 +597,7 @@ fn test_reflect_method_exception_wrapping() {
 fn test_reflect_field_get_int() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectField", "testGetIntField", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectField", "testGetIntField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -608,7 +608,7 @@ fn test_reflect_field_get_int() {
 fn test_reflect_field_get_string() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectField", "testGetStringField", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectField", "testGetStringField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -619,7 +619,7 @@ fn test_reflect_field_get_string() {
 fn test_reflect_field_static() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectField", "testStaticField", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectField", "testStaticField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(300))) => {}
         other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
@@ -630,7 +630,7 @@ fn test_reflect_field_static() {
 fn test_reflect_field_set_int() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectField", "testSetIntField", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectField", "testSetIntField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(123))) => {}
         other => panic!("Expected Ok(Some(Int(123))), got: {other:?}"),
@@ -643,7 +643,7 @@ fn test_reflect_field_set_int() {
 fn test_reflect_constructor_noarg() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectConstructor", "testNoArgConstructor", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectConstructor", "testNoArgConstructor", "()I", &[]);
     match result {
         Ok(Some(Value::Int(10))) => {}
         other => panic!("Expected Ok(Some(Int(10))), got: {other:?}"),
@@ -654,7 +654,7 @@ fn test_reflect_constructor_noarg() {
 fn test_reflect_constructor_param() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectConstructor", "testParamConstructor", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectConstructor", "testParamConstructor", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -665,7 +665,7 @@ fn test_reflect_constructor_param() {
 fn test_reflect_constructor_exception() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectConstructor", "testExceptionInConstructor", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectConstructor", "testExceptionInConstructor", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -678,7 +678,7 @@ fn test_reflect_constructor_exception() {
 fn test_reflect_annotation_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectAnnotation", "testClassAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testClassAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -689,7 +689,7 @@ fn test_reflect_annotation_class() {
 fn test_reflect_annotation_method() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectAnnotation", "testMethodAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testMethodAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -700,7 +700,7 @@ fn test_reflect_annotation_method() {
 fn test_reflect_annotation_absent() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectAnnotation", "testNoAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testNoAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -711,7 +711,7 @@ fn test_reflect_annotation_absent() {
 fn test_reflect_annotation_is_present() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectAnnotation", "testIsAnnotationPresent", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectAnnotation", "testIsAnnotationPresent", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -727,7 +727,7 @@ fn test_reflect_annotation_is_present() {
 fn test_serialize_simple_round_trip() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SerializeBasic", "testSimpleRoundTrip", "()I", &[]);
+    let result = vm.invoke("cratonvm/SerializeBasic", "testSimpleRoundTrip", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -739,7 +739,7 @@ fn test_serialize_simple_round_trip() {
 fn test_serialize_nested_object() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SerializeBasic", "testNestedObject", "()I", &[]);
+    let result = vm.invoke("cratonvm/SerializeBasic", "testNestedObject", "()I", &[]);
     match result {
         Ok(Some(Value::Int(30))) => {}
         other => panic!("Expected Ok(Some(Int(30))), got: {other:?}"),
@@ -751,7 +751,7 @@ fn test_serialize_nested_object() {
 fn test_serialize_transient_field() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SerializeBasic", "testTransientField", "()I", &[]);
+    let result = vm.invoke("cratonvm/SerializeBasic", "testTransientField", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -763,7 +763,7 @@ fn test_serialize_transient_field() {
 fn test_serialize_non_serializable_throws() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/SerializeBasic", "testNonSerializableThrows", "()I", &[]);
+    let result = vm.invoke("cratonvm/SerializeBasic", "testNonSerializableThrows", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -775,7 +775,7 @@ fn test_serialize_non_serializable_throws() {
 fn test_context_class_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testContextClassLoader", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testContextClassLoader", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -787,7 +787,7 @@ fn test_context_class_loader() {
 fn test_parent_delegation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testParentDelegation", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testParentDelegation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -799,7 +799,7 @@ fn test_parent_delegation() {
 fn test_set_context_class_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testSetContextClassLoader", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSetContextClassLoader", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -811,7 +811,7 @@ fn test_set_context_class_loader() {
 fn test_class_get_class_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testClassGetClassLoader", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassGetClassLoader", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -827,7 +827,7 @@ fn test_class_get_class_loader() {
 fn test_bootstrap_class_loader_is_null() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testBootstrapClassLoaderIsNull", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testBootstrapClassLoaderIsNull", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -838,7 +838,7 @@ fn test_bootstrap_class_loader_is_null() {
 fn test_string_bootstrap_loader() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testStringBootstrapLoader", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testStringBootstrapLoader", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -850,7 +850,7 @@ fn test_string_bootstrap_loader() {
 fn test_loader_name() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoaderName", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderName", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -861,7 +861,7 @@ fn test_loader_name() {
 fn test_platform_loader_name() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testPlatformLoaderName", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testPlatformLoaderName", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -873,7 +873,7 @@ fn test_platform_loader_name() {
 fn test_system_class_loader_chain() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testSystemClassLoaderChain", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderChain", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -885,7 +885,7 @@ fn test_system_class_loader_chain() {
 fn test_load_class_delegation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoadClassDelegation", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassDelegation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -897,7 +897,7 @@ fn test_load_class_delegation() {
 fn test_load_class_for_user_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoadClassForUserClass", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoadClassForUserClass", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -909,7 +909,7 @@ fn test_load_class_for_user_class() {
 fn test_class_loader_identity() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testClassLoaderIdentity", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testClassLoaderIdentity", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -921,7 +921,7 @@ fn test_class_loader_identity() {
 fn test_system_class_loader_identity() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testSystemClassLoaderIdentity", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testSystemClassLoaderIdentity", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -933,7 +933,7 @@ fn test_system_class_loader_identity() {
 fn test_loader_isolation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ClassLoaderTest", "testLoaderIsolation", "()I", &[]);
+    let result = vm.invoke("cratonvm/ClassLoaderTest", "testLoaderIsolation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -949,7 +949,7 @@ fn test_loader_isolation() {
 fn test_method_handle_static() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testStaticMethodHandle", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testStaticMethodHandle", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -961,7 +961,7 @@ fn test_method_handle_static() {
 fn test_method_handle_virtual() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testVirtualMethodHandle", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testVirtualMethodHandle", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -973,7 +973,7 @@ fn test_method_handle_virtual() {
 fn test_method_handle_constructor() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testConstructorMethodHandle", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testConstructorMethodHandle", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -985,7 +985,7 @@ fn test_method_handle_constructor() {
 fn test_method_handle_bind_to() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testBindTo", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testBindTo", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -997,7 +997,7 @@ fn test_method_handle_bind_to() {
 fn test_lookup_in() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testLookupIn", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testLookupIn", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1009,7 +1009,7 @@ fn test_lookup_in() {
 fn test_var_handle_get_set() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testVarHandleGetSet", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleGetSet", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1021,7 +1021,7 @@ fn test_var_handle_get_set() {
 fn test_var_handle_cas() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testVarHandleCAS", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testVarHandleCAS", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1033,7 +1033,7 @@ fn test_var_handle_cas() {
 fn test_method_handle_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/MethodHandleTest", "testMethodHandleType", "()I", &[]);
+    let result = vm.invoke("cratonvm/MethodHandleTest", "testMethodHandleType", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1050,7 +1050,7 @@ fn test_method_handle_invoke_exact_round_trip() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/MethodHandleTest",
+        "cratonvm/MethodHandleTest",
         "testInvokeExactRoundTrip",
         "()I",
         &[],
@@ -1071,7 +1071,7 @@ fn test_var_handle_acquire_release() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/MethodHandleTest",
+        "cratonvm/MethodHandleTest",
         "testVarHandleAcquireRelease",
         "()I",
         &[],
@@ -1089,7 +1089,7 @@ fn test_var_handle_acquire_release() {
 // 97.1: JTReg directive parsing — compile test
 #[test]
 fn test_jtreg_parse_compile() {
-    use rustjvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
+    use cratonvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
 
     let source = r#"
 /*
@@ -1120,7 +1120,7 @@ public class TestCompile {
 // 97.1: JTReg directive parsing — run test with othervm
 #[test]
 fn test_jtreg_parse_run() {
-    use rustjvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
+    use cratonvm_vm::runtime::tck::{JtregTestDescriptor, JtregDirective, JtregRunMode};
 
     let source = r#"
 /* @test
@@ -1149,7 +1149,7 @@ public class TestOther {
 // 97.1: JTReg output comparison
 #[test]
 fn test_jtreg_compare_output() {
-    use rustjvm_vm::runtime::tck::compare_output;
+    use cratonvm_vm::runtime::tck::compare_output;
 
     let actual = vec!["hello".to_string(), "world".to_string()];
     let expected = vec!["hello".to_string(), "world".to_string()];
@@ -1171,7 +1171,7 @@ fn test_jtreg_compare_output() {
 fn test_tck_class_file_magic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckClassFile", "testMagicNumber", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckClassFile", "testMagicNumber", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1182,7 +1182,7 @@ fn test_tck_class_file_magic() {
 fn test_tck_class_file_version() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckClassFile", "testClassVersion", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckClassFile", "testClassVersion", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1193,7 +1193,7 @@ fn test_tck_class_file_version() {
 fn test_tck_class_file_constant_pool() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckClassFile", "testConstantPool", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckClassFile", "testConstantPool", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1204,7 +1204,7 @@ fn test_tck_class_file_constant_pool() {
 fn test_tck_class_file_field_access() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckClassFile", "testFieldAccess", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckClassFile", "testFieldAccess", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1215,7 +1215,7 @@ fn test_tck_class_file_field_access() {
 fn test_tck_class_file_method_access() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckClassFile", "testMethodAccess", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckClassFile", "testMethodAccess", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1227,7 +1227,7 @@ fn test_tck_class_file_method_access() {
 fn test_tck_loading_class_loading() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckLoading", "testClassLoading", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckLoading", "testClassLoading", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1238,7 +1238,7 @@ fn test_tck_loading_class_loading() {
 fn test_tck_loading_static_init() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckLoading", "testStaticInit", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckLoading", "testStaticInit", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1249,7 +1249,7 @@ fn test_tck_loading_static_init() {
 fn test_tck_loading_interface_init() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckLoading", "testInterfaceInit", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckLoading", "testInterfaceInit", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1260,7 +1260,7 @@ fn test_tck_loading_interface_init() {
 fn test_tck_loading_array_creation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckLoading", "testArrayCreation", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckLoading", "testArrayCreation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1271,7 +1271,7 @@ fn test_tck_loading_array_creation() {
 fn test_tck_loading_inheritance() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckLoading", "testInheritance", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckLoading", "testInheritance", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1283,7 +1283,7 @@ fn test_tck_loading_inheritance() {
 fn test_tck_instructions_int_arithmetic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testIntArithmetic", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testIntArithmetic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1294,7 +1294,7 @@ fn test_tck_instructions_int_arithmetic() {
 fn test_tck_instructions_long_arithmetic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testLongArithmetic", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testLongArithmetic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1305,7 +1305,7 @@ fn test_tck_instructions_long_arithmetic() {
 fn test_tck_instructions_float_arithmetic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testFloatArithmetic", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testFloatArithmetic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1316,7 +1316,7 @@ fn test_tck_instructions_float_arithmetic() {
 fn test_tck_instructions_comparisons() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testComparisons", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testComparisons", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1327,7 +1327,7 @@ fn test_tck_instructions_comparisons() {
 fn test_tck_instructions_tableswitch() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testTableswitch", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testTableswitch", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1338,7 +1338,7 @@ fn test_tck_instructions_tableswitch() {
 fn test_tck_instructions_lookupswitch() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testLookupswitch", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testLookupswitch", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1349,7 +1349,7 @@ fn test_tck_instructions_lookupswitch() {
 fn test_tck_instructions_field_ops() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testFieldOps", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testFieldOps", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1360,7 +1360,7 @@ fn test_tck_instructions_field_ops() {
 fn test_tck_instructions_array_ops() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testArrayOps", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testArrayOps", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1371,7 +1371,7 @@ fn test_tck_instructions_array_ops() {
 fn test_tck_instructions_invoke_virtual() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testInvokeVirtual", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testInvokeVirtual", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1382,7 +1382,7 @@ fn test_tck_instructions_invoke_virtual() {
 fn test_tck_instructions_invoke_static() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testInvokeStatic", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testInvokeStatic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1393,7 +1393,7 @@ fn test_tck_instructions_invoke_static() {
 fn test_tck_instructions_exception_handling() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testExceptionHandling", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testExceptionHandling", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1404,7 +1404,7 @@ fn test_tck_instructions_exception_handling() {
 fn test_tck_instructions_checkcast() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testCheckcast", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testCheckcast", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1415,7 +1415,7 @@ fn test_tck_instructions_checkcast() {
 fn test_tck_instructions_instanceof() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/TckInstructions", "testInstanceof", "()I", &[]);
+    let result = vm.invoke("cratonvm/TckInstructions", "testInstanceof", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1430,7 +1430,7 @@ fn test_tck_instructions_instanceof() {
 fn test_s17_method_invoke_private() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodInvokePrivateViaReflection", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokePrivateViaReflection", "()I", &[]);
     match result {
         Ok(Some(Value::Int(49))) => {}
         other => panic!("Expected Ok(Some(Int(49))), got: {other:?}"),
@@ -1441,7 +1441,7 @@ fn test_s17_method_invoke_private() {
 fn test_s17_method_invoke_instance() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodInvokeInstance", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeInstance", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1452,7 +1452,7 @@ fn test_s17_method_invoke_instance() {
 fn test_s17_method_invoke_type_coercion() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodInvokeTypeCoercion", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodInvokeTypeCoercion", "()I", &[]);
     match result {
         Ok(Some(Value::Int(36))) => {}
         other => panic!("Expected Ok(Some(Int(36))), got: {other:?}"),
@@ -1463,7 +1463,7 @@ fn test_s17_method_invoke_type_coercion() {
 fn test_s17_field_get_private() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldGetPrivate", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldGetPrivate", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1474,7 +1474,7 @@ fn test_s17_field_get_private() {
 fn test_s17_field_set_private() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldSetPrivate", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldSetPrivate", "()I", &[]);
     match result {
         Ok(Some(Value::Int(999))) => {}
         other => panic!("Expected Ok(Some(Int(999))), got: {other:?}"),
@@ -1485,7 +1485,7 @@ fn test_s17_field_set_private() {
 fn test_s17_field_static_get_set() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldStaticGetSet", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldStaticGetSet", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1496,7 +1496,7 @@ fn test_s17_field_static_get_set() {
 fn test_s17_constructor_noarg() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testConstructorNoArg", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorNoArg", "()I", &[]);
     match result {
         Ok(Some(Value::Int(0))) => {}
         other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
@@ -1507,7 +1507,7 @@ fn test_s17_constructor_noarg() {
 fn test_s17_constructor_with_args() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testConstructorWithArgs", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorWithArgs", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1518,7 +1518,7 @@ fn test_s17_constructor_with_args() {
 fn test_s17_constructor_set_accessible() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testConstructorSetAccessible", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testConstructorSetAccessible", "()I", &[]);
     match result {
         Ok(Some(Value::Int(300))) => {}
         other => panic!("Expected Ok(Some(Int(300))), got: {other:?}"),
@@ -1529,7 +1529,7 @@ fn test_s17_constructor_set_accessible() {
 fn test_s17_proxy_basic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testProxyBasic", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyBasic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -1540,7 +1540,7 @@ fn test_s17_proxy_basic() {
 fn test_s17_proxy_is_proxy_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testProxyIsProxyClass", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyIsProxyClass", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1551,7 +1551,7 @@ fn test_s17_proxy_is_proxy_class() {
 fn test_s17_proxy_get_handler() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testProxyGetHandler", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testProxyGetHandler", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1562,7 +1562,7 @@ fn test_s17_proxy_get_handler() {
 fn test_s17_get_declared_methods() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredMethods", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethods", "()I", &[]);
     match result {
         Ok(Some(Value::Int(0))) => {}
         other => panic!("Expected Ok(Some(Int(0))), got: {other:?}"),
@@ -1573,7 +1573,7 @@ fn test_s17_get_declared_methods() {
 fn test_s17_get_declared_fields() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredFields", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredFields", "()I", &[]);
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -1584,7 +1584,7 @@ fn test_s17_get_declared_fields() {
 fn test_s17_get_declared_constructors() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredConstructors", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredConstructors", "()I", &[]);
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -1595,7 +1595,7 @@ fn test_s17_get_declared_constructors() {
 fn test_s17_get_declared_method_by_name() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testGetDeclaredMethodByName", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testGetDeclaredMethodByName", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1606,7 +1606,7 @@ fn test_s17_get_declared_method_by_name() {
 fn test_s17_method_modifiers() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodModifiers", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodModifiers", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1617,7 +1617,7 @@ fn test_s17_method_modifiers() {
 fn test_s17_field_modifiers() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldModifiers", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldModifiers", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1628,7 +1628,7 @@ fn test_s17_field_modifiers() {
 fn test_s17_method_return_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodReturnType", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodReturnType", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1639,7 +1639,7 @@ fn test_s17_method_return_type() {
 fn test_s17_method_parameter_types() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodParameterTypes", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterTypes", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1650,7 +1650,7 @@ fn test_s17_method_parameter_types() {
 fn test_s17_method_parameter_count() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodParameterCount", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodParameterCount", "()I", &[]);
     match result {
         Ok(Some(Value::Int(2))) => {}
         other => panic!("Expected Ok(Some(Int(2))), got: {other:?}"),
@@ -1661,7 +1661,7 @@ fn test_s17_method_parameter_count() {
 fn test_s17_field_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldType", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldType", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1672,7 +1672,7 @@ fn test_s17_field_type() {
 fn test_s17_field_declaring_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testFieldDeclaringClass", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testFieldDeclaringClass", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1683,7 +1683,7 @@ fn test_s17_field_declaring_class() {
 fn test_s17_method_declaring_class() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ReflectionComplete", "testMethodDeclaringClass", "()I", &[]);
+    let result = vm.invoke("cratonvm/ReflectionComplete", "testMethodDeclaringClass", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1698,7 +1698,7 @@ fn test_s17_method_declaring_class() {
 fn test_s18_custom_annotation_values() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testCustomAnnotationValues", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testCustomAnnotationValues", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1709,7 +1709,7 @@ fn test_s18_custom_annotation_values() {
 fn test_s18_inherited_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testInheritedAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1720,7 +1720,7 @@ fn test_s18_inherited_annotation() {
 fn test_s18_non_inherited_not_present() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testNonInheritedNotPresent", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testNonInheritedNotPresent", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1731,7 +1731,7 @@ fn test_s18_non_inherited_not_present() {
 fn test_s18_get_inherited_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testGetInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testGetInheritedAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1742,7 +1742,7 @@ fn test_s18_get_inherited_annotation() {
 fn test_s18_declared_annotations_no_inherited() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testDeclaredAnnotationsNoInherited", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testDeclaredAnnotationsNoInherited", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1753,7 +1753,7 @@ fn test_s18_declared_annotations_no_inherited() {
 fn test_s18_overriding_inherited_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testOverridingInheritedAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testOverridingInheritedAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1764,7 +1764,7 @@ fn test_s18_overriding_inherited_annotation() {
 fn test_s18_method_annotation_present() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testMethodAnnotationPresent", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodAnnotationPresent", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1775,7 +1775,7 @@ fn test_s18_method_annotation_present() {
 fn test_s18_method_no_annotation() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testMethodNoAnnotation", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testMethodNoAnnotation", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1786,7 +1786,7 @@ fn test_s18_method_no_annotation() {
 fn test_s18_parameter_annotation_count() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testParameterAnnotationCount", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationCount", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1797,7 +1797,7 @@ fn test_s18_parameter_annotation_count() {
 fn test_s18_parameter_annotation_empty() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/AnnotationTest", "testParameterAnnotationEmpty", "()I", &[]);
+    let result = vm.invoke("cratonvm/AnnotationTest", "testParameterAnnotationEmpty", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1812,7 +1812,7 @@ fn test_s18_parameter_annotation_empty() {
 fn test_s19_class_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testClassTypeParams", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testClassTypeParams", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1823,7 +1823,7 @@ fn test_s19_class_type_params() {
 fn test_s19_multiple_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMultipleTypeParams", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMultipleTypeParams", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1834,7 +1834,7 @@ fn test_s19_multiple_type_params() {
 fn test_s19_bounded_type_param() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testBoundedTypeParam", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testBoundedTypeParam", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1845,7 +1845,7 @@ fn test_s19_bounded_type_param() {
 fn test_s19_generic_superclass() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testGenericSuperclass", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testGenericSuperclass", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1856,7 +1856,7 @@ fn test_s19_generic_superclass() {
 fn test_s19_non_generic_superclass() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testNonGenericSuperclass", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNonGenericSuperclass", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1867,7 +1867,7 @@ fn test_s19_non_generic_superclass() {
 fn test_s19_method_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMethodTypeParams", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodTypeParams", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1878,7 +1878,7 @@ fn test_s19_method_type_params() {
 fn test_s19_method_generic_return_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMethodGenericReturnType", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericReturnType", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1889,7 +1889,7 @@ fn test_s19_method_generic_return_type() {
 fn test_s19_method_generic_param_types() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testMethodGenericParamTypes", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testMethodGenericParamTypes", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1900,7 +1900,7 @@ fn test_s19_method_generic_param_types() {
 fn test_s19_field_generic_type() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testFieldGenericType", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testFieldGenericType", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1911,7 +1911,7 @@ fn test_s19_field_generic_type() {
 fn test_s19_no_type_params() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
+    let result = vm.invoke("cratonvm/GenericReflectionTest", "testNoTypeParams", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -1928,7 +1928,7 @@ fn test_s19_parameterized_superclass() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/GenericReflectionTest",
+        "cratonvm/GenericReflectionTest",
         "testParameterizedSuperclass",
         "()I",
         &[],
@@ -1946,7 +1946,7 @@ fn test_s19_parameterized_field() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/GenericReflectionTest",
+        "cratonvm/GenericReflectionTest",
         "testParameterizedField",
         "()I",
         &[],
@@ -1964,7 +1964,7 @@ fn test_s19_two_arg_parameterized_field() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/GenericReflectionTest",
+        "cratonvm/GenericReflectionTest",
         "testTwoArgParameterizedField",
         "()I",
         &[],
@@ -1982,7 +1982,7 @@ fn test_s19_wildcard_extends_number() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/GenericReflectionTest",
+        "cratonvm/GenericReflectionTest",
         "testWildcardExtendsNumber",
         "()I",
         &[],
@@ -2003,7 +2003,7 @@ macro_rules! s20_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/StreamComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/StreamComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2053,7 +2053,7 @@ macro_rules! s21_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/StringFormatComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/StringFormatComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2103,7 +2103,7 @@ macro_rules! s22_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/PropertiesComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/PropertiesComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2153,7 +2153,7 @@ macro_rules! s23_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/MemoryModelTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/MemoryModelTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -2166,7 +2166,7 @@ macro_rules! s23_test {
 fn test_s23_thread_basic() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ThreadBasicTest", "testThreadBasic", "()I", &[]);
+    let result = vm.invoke("cratonvm/ThreadBasicTest", "testThreadBasic", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -2194,7 +2194,7 @@ macro_rules! s23b_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/JmmComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/JmmComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2244,7 +2244,7 @@ macro_rules! s24_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/InterruptComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/InterruptComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2294,7 +2294,7 @@ macro_rules! s25_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/VirtualThreadTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/VirtualThreadTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2324,7 +2324,7 @@ macro_rules! s27_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/FinalizerTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/FinalizerTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2351,7 +2351,7 @@ macro_rules! s32_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/EscapeAnalysisTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/EscapeAnalysisTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2378,7 +2378,7 @@ macro_rules! s31_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/InlineComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/InlineComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2427,7 +2427,7 @@ macro_rules! s33_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/InlineCacheTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/InlineCacheTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2456,7 +2456,7 @@ macro_rules! s35_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/OsrComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/OsrComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2506,7 +2506,7 @@ macro_rules! s37_test_int {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/FPCompletenessTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2521,7 +2521,7 @@ macro_rules! s37_test_long {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/FPCompletenessTest", $method, "()J", &[]);
+            let result = vm.invoke("cratonvm/FPCompletenessTest", $method, "()J", &[]);
             match result {
                 Ok(Some(Value::Long(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Long({}))), got: {other:?}", $expected),
@@ -2576,7 +2576,7 @@ macro_rules! s39_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/JdwpComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/JdwpComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2637,7 +2637,7 @@ macro_rules! s44_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/JniComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/JniComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2707,7 +2707,7 @@ macro_rules! s46_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/TckLang", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/TckLang", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2859,7 +2859,7 @@ macro_rules! s50_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/TckReflect", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/TckReflect", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -2992,7 +2992,7 @@ macro_rules! s38_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/PgoTest", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/PgoTest", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -3030,7 +3030,7 @@ s38_test!(test_s38_nested_loops, "testNestedLoops", 2025);
 fn test_s45_hello_world_check() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/HelloWorld", "check", "()I", &[]);
+    let result = vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -3040,7 +3040,7 @@ fn test_s45_hello_world_check() {
 /// Test ManifestInfo parsing including Class-Path attribute.
 #[test]
 fn test_s45_manifest_class_path_parsing() {
-    use rustjvm_vm::ManifestInfo;
+    use cratonvm_vm::ManifestInfo;
 
     let manifest = b"Manifest-Version: 1.0\r\nMain-Class: com.example.Main\r\nClass-Path: lib/foo.jar lib/bar.jar\r\n";
     let info = ManifestInfo::parse(manifest);
@@ -3051,7 +3051,7 @@ fn test_s45_manifest_class_path_parsing() {
 /// Test resolve_class_path resolves relative to JAR parent directory.
 #[test]
 fn test_s45_resolve_class_path() {
-    use rustjvm_vm::ManifestInfo;
+    use cratonvm_vm::ManifestInfo;
 
     let manifest = b"Manifest-Version: 1.0\r\nMain-Class: Main\r\nClass-Path: lib/dep.jar other.jar\r\n";
     let info = ManifestInfo::parse(manifest);
@@ -3067,7 +3067,7 @@ fn test_s45_resolve_class_path() {
 /// Test resolve_class_path returns empty vec when no Class-Path attribute.
 #[test]
 fn test_s45_resolve_class_path_empty() {
-    use rustjvm_vm::ManifestInfo;
+    use cratonvm_vm::ManifestInfo;
 
     let manifest = b"Manifest-Version: 1.0\r\nMain-Class: Main\r\n";
     let info = ManifestInfo::parse(manifest);
@@ -3079,10 +3079,10 @@ fn test_s45_resolve_class_path_empty() {
 /// Test read_jar_manifest reads Main-Class and Class-Path from a real JAR file.
 #[test]
 fn test_s45_read_jar_manifest() {
-    use rustjvm_vm::ClassPath;
+    use cratonvm_vm::ClassPath;
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join("rustjvm_test_s45_manifest");
+    let dir = std::env::temp_dir().join("cratonvm_test_s45_manifest");
     let _ = std::fs::create_dir_all(&dir);
     let jar_path = dir.join("test.jar");
 
@@ -3118,13 +3118,13 @@ fn test_s45_run_class_from_jar() {
     require_class_files!();
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join("rustjvm_test_s45_jar_run");
+    let dir = std::env::temp_dir().join("cratonvm_test_s45_jar_run");
     let _ = std::fs::create_dir_all(&dir);
     let jar_path = dir.join("hello.jar");
 
     // Read the compiled HelloWorld.class from test resources
     let resources = test_resources_dir();
-    let class_file = format!("{resources}/rustjvm/HelloWorld.class");
+    let class_file = format!("{resources}/cratonvm/HelloWorld.class");
     let class_bytes = match std::fs::read(&class_file) {
         Ok(b) => b,
         Err(_) => {
@@ -3139,17 +3139,17 @@ fn test_s45_run_class_from_jar() {
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
-    zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: rustjvm.HelloWorld\r\n")
+    zip.write_all(b"Manifest-Version: 1.0\r\nMain-Class: cratonvm.HelloWorld\r\n")
         .unwrap();
-    zip.start_file("rustjvm/HelloWorld.class", opts).unwrap();
+    zip.start_file("cratonvm/HelloWorld.class", opts).unwrap();
     zip.write_all(&class_bytes).unwrap();
     zip.finish().unwrap();
 
     // Load the class from the JAR and invoke check()
-    let config = rustjvm_vm::config::VmConfig::new()
+    let config = cratonvm_vm::config::VmConfig::new()
         .with_classpath(vec![jar_path.to_string_lossy().into_owned()]);
-    let mut vm = rustjvm_vm::vm::Vm::new(config);
-    let result = vm.invoke("rustjvm/HelloWorld", "check", "()I", &[]);
+    let mut vm = cratonvm_vm::vm::Vm::new(config);
+    let result = vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]);
     match result {
         Ok(Some(Value::Int(42))) => {}
         other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
@@ -3161,10 +3161,10 @@ fn test_s45_run_class_from_jar() {
 /// Test that read_jar_manifest returns None for a JAR with no manifest.
 #[test]
 fn test_s45_read_jar_no_manifest() {
-    use rustjvm_vm::ClassPath;
+    use cratonvm_vm::ClassPath;
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join("rustjvm_test_s45_no_manifest");
+    let dir = std::env::temp_dir().join("cratonvm_test_s45_no_manifest");
     let _ = std::fs::create_dir_all(&dir);
     let jar_path = dir.join("nomanifest.jar");
 
@@ -3188,7 +3188,7 @@ fn test_s45_read_jar_no_manifest() {
 /// Test that nonexistent JAR returns None from read_jar_manifest.
 #[test]
 fn test_s45_read_jar_nonexistent() {
-    use rustjvm_vm::ClassPath;
+    use cratonvm_vm::ClassPath;
     let manifest = ClassPath::read_jar_manifest(std::path::Path::new("/nonexistent/path.jar"));
     assert!(manifest.is_none());
 }
@@ -3203,7 +3203,7 @@ macro_rules! s47_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/TckUtil", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/TckUtil", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -3264,7 +3264,7 @@ macro_rules! s49_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/JucComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -3276,7 +3276,7 @@ macro_rules! s49_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/JucComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/JucComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(v))) if v == $expected => {}
                 other => panic!("Expected Ok(Some(Int({}))), got: {other:?}", $expected),
@@ -3387,7 +3387,7 @@ macro_rules! s51_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/ScopedValueComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/ScopedValueComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -3456,7 +3456,7 @@ macro_rules! s48_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/TckIo", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/TckIo", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
@@ -3541,7 +3541,7 @@ macro_rules! new14_jdbc_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/TckJdbc", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/TckJdbc", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!(
@@ -3577,7 +3577,7 @@ macro_rules! s53_test {
         fn $name() {
             require_class_files!();
             let mut vm = test_vm();
-            let result = vm.invoke("rustjvm/PatternComplete", $method, "()I", &[]);
+            let result = vm.invoke("cratonvm/PatternComplete", $method, "()I", &[]);
             match result {
                 Ok(Some(Value::Int(1))) => {}
                 other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),

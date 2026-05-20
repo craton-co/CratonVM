@@ -15,7 +15,7 @@
 //! via `capture_stack_trace` tests elsewhere (jck_conformance); this file
 //! focuses on the unit-level guarantees.
 
-use rustjvm_native_api::{NativeMethodRegistry, StackTraceEntry};
+use cratonvm_native_api::{NativeMethodRegistry, StackTraceEntry};
 use std::sync::Arc;
 
 #[test]
@@ -36,7 +36,7 @@ fn stack_trace_entry_carries_bci_and_line_number() {
 #[test]
 fn native_stack_walker_boot_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::stack_walker::register_stack_walker_boot(&mut r);
+    cratonvm_native_builtins::stack_walker::register_stack_walker_boot(&mut r);
     assert!(r
         .find("java/lang/StackWalker", "getInstance", "()Ljava/lang/StackWalker;")
         .is_some());
@@ -55,7 +55,7 @@ fn native_stack_walker_boot_natives_registered() {
 #[test]
 fn lang_stackwalker_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::lang_stackwalker::register_lang_stackwalker(&mut r);
+    cratonvm_native_builtins::lang_stackwalker::register_lang_stackwalker(&mut r);
     assert!(r
         .find(
             "java/lang/StackStreamFactory$AbstractStackWalker",
@@ -102,7 +102,7 @@ fn lang_stackwalker_natives_registered() {
 
 #[test]
 fn line_number_for_bci_picks_largest_start_leq_bci() {
-    use rustjvm_reader::attribute::LineNumberEntry;
+    use cratonvm_reader::attribute::LineNumberEntry;
     // Simulate the core scan logic for LineNumberTable lookup that
     // `crate::runtime::stackwalker::line_number_for_bci` uses.
     let entries = vec![
@@ -136,7 +136,7 @@ fn stack_walker_default_never_returns_null() {
     // Smoke: `StackWalker.getInstance()` native builds a synthetic walker
     // object with a freshly allocated options Set. The returned value must
     // be a non-null object ref.
-    use rustjvm_native_api::NativeContext;
+    use cratonvm_native_api::NativeContext;
     let _ = |_ctx: &mut dyn NativeContext| {
         // Compile-time guard only — runtime verification lives in
         // native-builtins/src/stack_walker.rs::tests.
@@ -145,7 +145,7 @@ fn stack_walker_default_never_returns_null() {
 
 #[test]
 fn line_number_sentinels_are_minus_one_and_minus_two() {
-    use rustjvm_vm::runtime::stackwalker::{LINE_NUMBER_NATIVE, LINE_NUMBER_UNKNOWN};
+    use cratonvm_vm::runtime::stackwalker::{LINE_NUMBER_NATIVE, LINE_NUMBER_UNKNOWN};
     assert_eq!(LINE_NUMBER_UNKNOWN, -1);
     assert_eq!(LINE_NUMBER_NATIVE, -2);
 }

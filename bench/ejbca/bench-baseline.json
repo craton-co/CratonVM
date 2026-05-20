@@ -1,7 +1,7 @@
 ﻿{
   "$schema_version": 1,
   "generated_at": "2026-04-26T00:00:00Z",
-  "rustjvm_version": "unknown",
+  "cratonvm_version": "unknown",
   "fixture": {
     "mode": "placeholder",
     "placeholder_source": "bench/ejbca/fixture/Main.java",
@@ -17,7 +17,7 @@
     {
       "name": "run",
       "rc": 1,
-      "notes": "rust-jvm currently throws NullPointerException on the 2nd System.out.println (WP0.1 blocker, session 93). Placeholder Main.java triggers this intentionally. Once WP0.1 lands rc flips to 0 and the expected_stderr_contains list shrinks; expected_stdout_contains gains 'ejbca_fixture: ok'."
+      "notes": "cratonvm currently throws NullPointerException on the 2nd System.out.println (WP0.1 blocker, session 93). Placeholder Main.java triggers this intentionally. Once WP0.1 lands rc flips to 0 and the expected_stderr_contains list shrinks; expected_stdout_contains gains 'ejbca_fixture: ok'."
     }
   ],
   "expected_stderr_contains": [

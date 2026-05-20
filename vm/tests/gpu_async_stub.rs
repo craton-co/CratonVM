@@ -33,13 +33,13 @@
 //! # What does run today
 //!
 //! `residency_tracker_compiles` is a true unit smoke test against
-//! `rustjvm_vm::runtime::gpu_residency::ResidencyTracker` (Item
+//! `cratonvm_vm::runtime::gpu_residency::ResidencyTracker` (Item
 //! P3-7). It does not need the SharedVm harness and runs on the
 //! no-GPU dev box.
 
 #![cfg(feature = "gpu-offload")]
 
-use rustjvm_vm::runtime::gpu_residency::{PrimitiveType, ResidencyTracker};
+use cratonvm_vm::runtime::gpu_residency::{PrimitiveType, ResidencyTracker};
 
 /// True unit smoke. The `ResidencyTracker` is a pure host-side
 /// structure (Item P3-7); it tracks Java primitive-array handles
@@ -97,8 +97,8 @@ fn residency_tracker_compiles() {
 fn open_executor_returns_handle() {
     // PHASE3-GUESS: shape of the test once the harness exists.
     //
-    //   use rustjvm_vm::config::VmConfig;
-    //   use rustjvm_vm::vm::SharedVm;
+    //   use cratonvm_vm::config::VmConfig;
+    //   use cratonvm_vm::vm::SharedVm;
     //   use std::sync::Arc;
     //
     //   let mut config = VmConfig::default();
@@ -146,7 +146,7 @@ fn submit_returns_failed_future_no_device() {
     //        assert!(msg.contains("no CUDA device"));
     //
     // The numeric `2 = Failed` constant matches the
-    // `SubmissionStatus` enum in `rustjvm_vm::runtime::offload`
+    // `SubmissionStatus` enum in `cratonvm_vm::runtime::offload`
     // (Item P3-6).
     panic!("scaffold — see PHASE3-GUESS comment above");
 }
@@ -183,7 +183,7 @@ fn array_wrap_round_trip() {
 fn submission_handle_unique() {
     // PHASE3-GUESS:
     //
-    //   use rustjvm_vm::runtime::offload::{
+    //   use cratonvm_vm::runtime::offload::{
     //       lookup_submission, register_submission, SerializedResult,
     //       StreamSubmission, SubmissionStatus,
     //   };

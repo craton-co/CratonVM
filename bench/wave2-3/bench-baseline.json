@@ -1,7 +1,7 @@
 {
   "$schema_version": 1,
   "generated_at": "2026-04-25T00:00:00Z",
-  "rustjvm_version": "unknown",
+  "cratonvm_version": "unknown",
   "wp": "WP2.3-D",
   "fixture": {
     "mode": "real-or-synthetic",
@@ -43,7 +43,7 @@
       "expected_stderr_contains_synthetic": [
         "Cannot invoke getCodeSource on null"
       ],
-      "notes": "Real CglibProbe2 reaches CGLIB's net.sf.cglib.core.ReflectUtils.<clinit>, which reflectively looks up ClassLoader.defineClass(String,byte[],int,int,ProtectionDomain). That overload is currently missing/unwired in rust-jvm — see WP2.3-C. Pre-clinit dispatch already works (`pre-toString=Target#toString` reaches stdout). Once 2.3-A/B/C land, expected_final_rc flips to 0 and stdout gains 'OK'. The synthetic CglibProbe (jar absent fallback) NPEs on `getCodeSource` instead — also WP2.3-C territory."
+      "notes": "Real CglibProbe2 reaches CGLIB's net.sf.cglib.core.ReflectUtils.<clinit>, which reflectively looks up ClassLoader.defineClass(String,byte[],int,int,ProtectionDomain). That overload is currently missing/unwired in cratonvm — see WP2.3-C. Pre-clinit dispatch already works (`pre-toString=Target#toString` reaches stdout). Once 2.3-A/B/C land, expected_final_rc flips to 0 and stdout gains 'OK'. The synthetic CglibProbe (jar absent fallback) NPEs on `getCodeSource` instead — also WP2.3-C territory."
     },
     "bytebuddy": {
       "real_jar_search": [
@@ -84,7 +84,7 @@
     {
       "name": "run",
       "rc": 1,
-      "notes": "rust-jvm fails on both probes — see per-probe `expected_stderr_contains`. The harness still exits 0; the per-probe rc / meta are pinned in summary.json. Future agents diff summary.json against this baseline to detect drift."
+      "notes": "cratonvm fails on both probes — see per-probe `expected_stderr_contains`. The harness still exits 0; the per-probe rc / meta are pinned in summary.json. Future agents diff summary.json against this baseline to detect drift."
     }
   ],
   "known_blockers": [

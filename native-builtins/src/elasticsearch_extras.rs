@@ -14,9 +14,9 @@
 //! All three entry classes are registered defensively so the boot-test
 //! succeeds regardless of which the launcher script picks.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn es_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[es-shim] Elasticsearch main short-circuited (boot-test mode)");
@@ -28,12 +28,12 @@ fn es_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 }
 
 pub fn register_es_stubs(registry: &mut NativeMethodRegistry) {
-    // Real-mode gate: when RUSTJVM_ES_REAL is set (any value), skip every
+    // Real-mode gate: when CRATONVM_ES_REAL is set (any value), skip every
     // boot-test short-circuit so the real Elasticsearch entry chain runs.
     // Used by diag harnesses to measure how far CratonVM gets on the
     // actual ES launcher before failure.
-    if std::env::var_os("RUSTJVM_ES_REAL").is_some() {
-        tracing::warn!("[es-shim] RUSTJVM_ES_REAL set - skipping ES boot-test shims");
+    if std::env::var_os("CRATONVM_ES_REAL").is_some() {
+        tracing::warn!("[es-shim] CRATONVM_ES_REAL set - skipping ES boot-test shims");
         return;
     }
     // Primary + alternative documented entry points. Each major ES release

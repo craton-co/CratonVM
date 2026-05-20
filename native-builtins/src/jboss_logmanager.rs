@@ -69,9 +69,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CLS_JUL_LOGGER: &str = "java/util/logging/Logger";
 const CLS_JBOSS_LOGGER: &str = "org/jboss/logmanager/Logger";
@@ -94,7 +94,7 @@ fn boot_log_file() -> &'static Mutex<Option<std::fs::File>> {
 /// is unset, empty, or the open syscall failed — callers fall back to
 /// stderr-only.
 fn open_boot_log_path() -> Option<std::fs::File> {
-    let path = std::env::var("RUSTJVM_JBOSS_BOOT_LOG_FILE").ok()
+    let path = std::env::var("CRATONVM_JBOSS_BOOT_LOG_FILE").ok()
         .or_else(|| std::env::var("org.jboss.boot.log.file").ok());
     let path = match path {
         Some(p) if !p.is_empty() => p,
@@ -161,7 +161,7 @@ fn emit_log_line(ctx: &dyn NativeContext, line: &str) {
 /// human-readable level name. Slot 0 of the synthetic Level layout is
 /// the level name string; if the slot is null or the receiver is null
 /// we return `INFO` so the line is still legible.
-fn level_name(ctx: &mut dyn NativeContext, level_obj: Option<rustjvm_types::ObjectRef>) -> String {
+fn level_name(ctx: &mut dyn NativeContext, level_obj: Option<cratonvm_types::ObjectRef>) -> String {
     let Some(obj) = level_obj else { return "INFO".to_string() };
     if let Value::Object(Some(name_str)) = ctx.get_field(obj, LOGGER_FIELD_NAME) {
         if let Some(s) = ctx.read_string(name_str) {
@@ -176,7 +176,7 @@ fn level_name(ctx: &mut dyn NativeContext, level_obj: Option<rustjvm_types::Obje
 /// Read the `name` field of a synthetic Logger instance. Falls back to
 /// `<root>` when the receiver is null or the slot is unset (the JDK
 /// root logger has the empty-string name).
-fn logger_name(ctx: &mut dyn NativeContext, this: Option<rustjvm_types::ObjectRef>) -> String {
+fn logger_name(ctx: &mut dyn NativeContext, this: Option<cratonvm_types::ObjectRef>) -> String {
     let Some(obj) = this else { return "<root>".to_string() };
     if let Value::Object(Some(name_str)) = ctx.get_field(obj, LOGGER_FIELD_NAME) {
         if let Some(s) = ctx.read_string(name_str) {
@@ -190,7 +190,7 @@ fn logger_name(ctx: &mut dyn NativeContext, this: Option<rustjvm_types::ObjectRe
 /// so `info`/`warning`/`severe`/`log(Level,String)` all produce a
 /// consistent shape.
 fn log_one(ctx: &mut dyn NativeContext, level: &str, logger: &str, message: &str) {
-    if std::env::var("RUSTJVM_DBG_JLM").is_ok() {
+    if std::env::var("CRATONVM_DBG_JLM").is_ok() {
         tracing::debug!(level, logger, message, "synthetic JBoss LM: log line");
     }
     emit_log_line(ctx, &format!("{level} [{logger}] {message}\n"));
@@ -300,7 +300,7 @@ fn native_jboss_logger_log_unchecked(ctx: &mut dyn NativeContext, args: &[Value]
     // they all reduce to "format an entry then emit". Emit a single
     // best-effort line so a `tracing::warn!`-style stub indicator is
     // still preferable to a silent NoSuchMethodError.
-    if std::env::var("RUSTJVM_DBG_JLM").is_ok() {
+    if std::env::var("CRATONVM_DBG_JLM").is_ok() {
         tracing::debug!(arg_count = args.len(), "synthetic JBoss LM: stub method logRaw called");
     }
     let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
@@ -384,7 +384,7 @@ pub(crate) fn reset_for_tests() {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     /// Process-wide guard so two tests don't race on the file handle
     /// state mutated by `reset_for_tests`.
@@ -420,7 +420,7 @@ mod tests {
         // we don't need a real System.setProperty implementation in the
         // mock context.
         let mut path = std::env::temp_dir();
-        path.push(format!("rustjvm-block2c-{}.log", std::process::id()));
+        path.push(format!("cratonvm-block2c-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         std::env::set_var("org.jboss.boot.log.file", &path);
 

@@ -9,12 +9,12 @@
 //!   T8.2.13 — URLDecoder.decode(String)   (deprecated_io_util.rs)
 //!   T8.2.14 — URLEncoder.encode(String)   (deprecated_io_util.rs)
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 #[cfg(test)]
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::ObjectRef;
-use rustjvm_types::Value;
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::ObjectRef;
+use cratonvm_types::Value;
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -151,7 +151,7 @@ pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
 // Field accessors for java.util.Date (field 0 = epoch millis as Long)
 // ---------------------------------------------------------------------------
 
-fn get_date_millis(ctx: &dyn NativeContext, this: rustjvm_types::ObjectRef) -> i64 {
+fn get_date_millis(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> i64 {
     match ctx.get_field(this, 0) {
         Value::Long(v) => v,
         Value::Int(v)  => v as i64,
@@ -159,7 +159,7 @@ fn get_date_millis(ctx: &dyn NativeContext, this: rustjvm_types::ObjectRef) -> i
     }
 }
 
-fn set_date_millis(ctx: &dyn NativeContext, this: rustjvm_types::ObjectRef, millis: i64) {
+fn set_date_millis(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef, millis: i64) {
     ctx.set_field(this, 0, Value::Long(millis));
 }
 
@@ -387,7 +387,7 @@ fn native_string_init_hibyte(
 /// sequences) and copy its layout onto `this`.
 fn string_from_bytes_utf8(
     ctx: &mut dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
+    this: cratonvm_types::ObjectRef,
     bytes: &[u8],
 ) -> MethodCallResult {
     // UTF-8 lossy decode: invalid sequences become U+FFFD. This matches
@@ -689,7 +689,7 @@ fn make_hashtable_enumeration(
 ) -> MethodCallResult {
     // phases_late `java/util/Enumeration` registration expects
     // field 0 = Object[] array, field 1 = Int cursor.
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, snapshot.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, snapshot.len());
     for (i, v) in snapshot.into_iter().enumerate() {
         ctx.set_array_element(arr, i, v);
     }
@@ -825,8 +825,8 @@ fn native_lnis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// normalising `\r` and `\r\n` to `\n` while incrementing the line counter.
 fn lnis_read_one(
     ctx: &mut dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+    this: cratonvm_types::ObjectRef,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => o,
         _ => return Ok(-1),
@@ -1327,7 +1327,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_date_at(ctx: &mut MockNativeContext, year: i32, month: i32, date: i32,
-                    hrs: i32, min: i32, sec: i32) -> rustjvm_types::ObjectRef {
+                    hrs: i32, min: i32, sec: i32) -> cratonvm_types::ObjectRef {
         let obj = alloc_concurrent_synthetic(ctx, "java/util/Date", 4);
         let ms  = date_fields_to_millis(year, month, date, hrs, min, sec);
         set_date_millis(ctx, obj, ms);
@@ -1868,7 +1868,7 @@ mod tests {
         ctx: &mut MockNativeContext,
         reg: &NativeMethodRegistry,
         data: &str,
-    ) -> (rustjvm_types::ObjectRef, rustjvm_types::ObjectRef) {
+    ) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
         // We use a StringBufferInputStream as the underlying stream.
         let sbis = alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string(data);

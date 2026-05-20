@@ -22,7 +22,7 @@ KOTLIN
 
 JAVA_HOME="$JAVA_HOME_FOR_SMOKE" kotlinc "$FIX_DIR/Hello.kt" -d "$FIX_DIR/hello.jar"
 
-SMOKE_TIMEOUT=120 smoke_run_rustjvm \
+SMOKE_TIMEOUT=120 smoke_run_cratonvm \
     --classpath "$FIX_DIR/hello.jar:$DIST_DIR/lib/kotlin-stdlib.jar" \
     -- HelloKt
 

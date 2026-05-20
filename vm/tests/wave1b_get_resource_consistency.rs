@@ -32,8 +32,8 @@ use std::process::Command;
 
 const RESOURCE_NAME: &str = "META-INF/services/wave1b.foo.svc";
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CRATONVM_BIN") {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Some(pb);
@@ -42,7 +42,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let candidate = PathBuf::from(manifest_dir)
         .parent()
-        .map(|p| p.join("target").join("release").join("rustjvm.exe"))?;
+        .map(|p| p.join("target").join("release").join("cratonvm.exe"))?;
     if candidate.exists() {
         Some(candidate)
     } else {
@@ -138,18 +138,18 @@ fn format_classpath(parts: &[&Path]) -> String {
         .join(";")
 }
 
-/// Wave-1 Task B acceptance: spawn rustjvm in real-JDK mode against a
+/// Wave-1 Task B acceptance: spawn cratonvm in real-JDK mode against a
 /// JAR containing only `META-INF/services/...`, and assert the
 /// singular `getResource` returns a non-null URL whenever the plural
 /// `getResources` returns ≥ 1.
 #[test]
 fn singular_get_resource_matches_bulk_get_resources_for_jar_entry() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "Skipping: rustjvm release binary not available at \
-                 target/release/rustjvm.exe"
+                "Skipping: cratonvm release binary not available at \
+                 target/release/cratonvm.exe"
             );
             return;
         }
@@ -172,14 +172,14 @@ fn singular_get_resource_matches_bulk_get_resources_for_jar_entry() {
     let output = Command::new(&bin)
         .args(["--java-home", &java_home, "-c", &cp, "SingleLookup"])
         .output()
-        .expect("must spawn rustjvm.exe");
+        .expect("must spawn cratonvm.exe");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
         output.status.success(),
-        "rustjvm exited non-zero. stdout: {stdout}\nstderr: {stderr}"
+        "cratonvm exited non-zero. stdout: {stdout}\nstderr: {stderr}"
     );
 
     let plural_count: i32 = stdout

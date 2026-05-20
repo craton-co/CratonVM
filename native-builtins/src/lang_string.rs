@@ -1,9 +1,9 @@
 //! String, StringBuilder, and StringBuffer native method implementations.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::Value;
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::intern_arc;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::intern_arc;
 
 use crate::{compile_java_regex, native_noop_with_this, obj_arg};
 
@@ -37,7 +37,7 @@ thread_local! {
 /// The vector is cleared first; capacity is pre-reserved to `len`.
 fn fill_string_chars(
     ctx: &dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
+    obj: cratonvm_types::ObjectRef,
     dst: &mut Vec<u16>,
 ) {
     dst.clear();
@@ -57,7 +57,7 @@ fn fill_string_chars(
     // compact-string byte[] backings (LATIN-1 or UTF-16 BE) where the
     // bulk intrinsic does not apply.
     let elem_type = ctx.heap_element_type_of(arr);
-    if matches!(elem_type, rustjvm_types::ArrayElementType::Char) {
+    if matches!(elem_type, cratonvm_types::ArrayElementType::Char) {
         // Safety: we reserved capacity above; set the length and have the
         // VM fill the buffer in one shot.
         dst.resize(len, 0);
@@ -83,7 +83,7 @@ fn fill_string_chars(
 /// once it has grown to the steady-state size.
 fn with_string_chars_scratch<R>(
     ctx: &dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
+    obj: cratonvm_types::ObjectRef,
     f: impl FnOnce(&[u16]) -> R,
 ) -> R {
     STRING_CHARS_SCRATCH_A.with(|cell| {
@@ -98,8 +98,8 @@ fn with_string_chars_scratch<R>(
 /// indexOf(String), startsWith(String), endsWith, contains, replace).
 fn with_two_string_chars_scratches<R>(
     ctx: &dyn NativeContext,
-    obj_a: rustjvm_types::ObjectRef,
-    obj_b: rustjvm_types::ObjectRef,
+    obj_a: cratonvm_types::ObjectRef,
+    obj_b: cratonvm_types::ObjectRef,
     f: impl FnOnce(&[u16], &[u16]) -> R,
 ) -> R {
     STRING_CHARS_SCRATCH_A.with(|cell_a| {
@@ -476,8 +476,8 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
 /// Helper: get the char[] value array from a String object's field 0.
 pub(crate) fn string_char_array(
     ctx: &dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
-) -> Option<(rustjvm_types::ObjectRef, usize)> {
+    this: cratonvm_types::ObjectRef,
+) -> Option<(cratonvm_types::ObjectRef, usize)> {
     match ctx.get_field(this, 0) {
         Value::Object(Some(arr)) => {
             let len = ctx.array_length(arr);
@@ -491,7 +491,7 @@ pub(crate) fn native_string_intern(ctx: &mut dyn NativeContext, args: &[Value]) 
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.intern on null".to_string()),
             }
             .into())
@@ -534,7 +534,7 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
     let elem_type = ctx.heap_element_type_of(arr);
     let is_byte_array = matches!(
         elem_type,
-        rustjvm_types::ArrayElementType::Byte | rustjvm_types::ArrayElementType::Boolean,
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
     );
     let hash_field_index: usize = if is_byte_array { 2 } else { 1 };
 
@@ -645,7 +645,7 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.charAt on null".to_string()),
             }
             .into())
@@ -660,13 +660,13 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
         Some(v) => v,
         None => {
             return Err(
-                rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
             )
         }
     };
 
     if index < 0 || index >= len as i32 {
-        return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
+        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
     }
 
     let ch = ctx.get_array_element(arr, index as usize);
@@ -822,7 +822,7 @@ pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.substring on null".to_string()),
             }
             .into())
@@ -846,7 +846,7 @@ pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value
             let elem_type = ctx.heap_element_type_of(arr);
             let is_byte_array = matches!(
                 elem_type,
-                rustjvm_types::ArrayElementType::Byte | rustjvm_types::ArrayElementType::Boolean,
+                cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
             );
             let (char_count, is_utf16) = if is_byte_array {
                 let utf16 = matches!(ctx.get_field(this, 1), Value::Int(1));
@@ -861,7 +861,7 @@ pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value
 
     if begin < 0 || end < begin || end > char_count as i32 {
         return Err(
-            rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
                 index: if begin < 0 { begin } else { end },
             }
             .into(),
@@ -949,8 +949,8 @@ pub(crate) fn format_double(v: f64) -> String {
 /// Helper: read field 0 (char[] buffer) and field 1 (int count) from StringBuilder.
 pub(crate) fn sb_state(
     ctx: &dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
-) -> (Option<rustjvm_types::ObjectRef>, i32) {
+    this: cratonvm_types::ObjectRef,
+) -> (Option<cratonvm_types::ObjectRef>, i32) {
     let buf = match ctx.get_field(this, 0) {
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
@@ -966,10 +966,10 @@ pub(crate) fn sb_state(
 /// Returns the char[] buffer (possibly newly allocated and copied).
 pub(crate) fn sb_ensure_capacity(
     ctx: &mut dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
+    this: cratonvm_types::ObjectRef,
     additional: usize,
-) -> rustjvm_types::ObjectRef {
-    use rustjvm_types::ArrayElementType;
+) -> cratonvm_types::ObjectRef {
+    use cratonvm_types::ArrayElementType;
 
     let (buf, count) = sb_state(ctx, this);
     let count = count as usize;
@@ -997,7 +997,7 @@ pub(crate) fn sb_ensure_capacity(
 }
 
 /// Helper: append a slice of u16 chars to a StringBuilder.
-pub(crate) fn sb_append_chars(ctx: &mut dyn NativeContext, this: rustjvm_types::ObjectRef, chars: &[u16]) {
+pub(crate) fn sb_append_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, chars: &[u16]) {
     let buf = sb_ensure_capacity(ctx, this, chars.len());
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
@@ -1008,13 +1008,13 @@ pub(crate) fn sb_append_chars(ctx: &mut dyn NativeContext, this: rustjvm_types::
 }
 
 /// Helper: append a Rust string to a StringBuilder.
-pub(crate) fn sb_append_str(ctx: &mut dyn NativeContext, this: rustjvm_types::ObjectRef, text: &str) {
+pub(crate) fn sb_append_str(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, text: &str) {
     let chars: Vec<u16> = text.encode_utf16().collect();
     sb_append_chars(ctx, this, &chars);
 }
 
 pub(crate) fn native_sb_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1026,7 +1026,7 @@ pub(crate) fn native_sb_init_default(ctx: &mut dyn NativeContext, args: &[Value]
 }
 
 pub(crate) fn native_sb_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1047,7 +1047,7 @@ pub(crate) fn native_sb_init_string(ctx: &mut dyn NativeContext, args: &[Value])
 }
 
 pub(crate) fn native_sb_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1233,8 +1233,8 @@ pub(crate) fn native_sb_append_float(ctx: &mut dyn NativeContext, args: &[Value]
 /// `toString()` which will find overridden versions in user-defined classes.
 pub(crate) fn invoke_to_string(
     ctx: &mut dyn NativeContext,
-    obj: rustjvm_types::ObjectRef,
-) -> Result<String, rustjvm_types::error::MethodCallFailed> {
+    obj: cratonvm_types::ObjectRef,
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
     // Fast path: if it's already a String object, just read it
     if let Some(s) = ctx.read_string(obj) {
         return Ok(s);
@@ -1424,7 +1424,7 @@ pub(crate) fn native_sb_get_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     let (buf, count) = sb_state(ctx, this);
     if src_begin < 0 || src_end > count || src_begin > src_end {
-        return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
             index: src_begin,
         }.into());
     }
@@ -1457,7 +1457,7 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let (buf, count) = sb_state(ctx, this);
     if index < 0 || index >= count {
-        return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
+        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
     }
     let buf = buf.unwrap();
     let ch = ctx.get_array_element(buf, index as usize);
@@ -1491,7 +1491,7 @@ pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // ---------------------------------------------------------------------------
 
 /// Helper: read the current content of a StringBuilder as a Vec<u16>.
-pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: rustjvm_types::ObjectRef) -> Vec<u16> {
+pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> Vec<u16> {
     let (buf, count) = sb_state(ctx, this);
     let count = count as usize;
     let mut chars = Vec::with_capacity(count);
@@ -1508,7 +1508,7 @@ pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: rustjvm_types::Object
 }
 
 /// Helper: write a Vec<u16> back into a StringBuilder, replacing all content.
-pub(crate) fn sb_write_chars(ctx: &mut dyn NativeContext, this: rustjvm_types::ObjectRef, chars: &[u16]) {
+pub(crate) fn sb_write_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, chars: &[u16]) {
     let current_count = sb_state(ctx, this).1 as usize;
     let additional = chars.len().saturating_sub(current_count);
     let buf = sb_ensure_capacity(ctx, this, additional);
@@ -1895,7 +1895,7 @@ pub(crate) fn format_float(v: f32) -> String {
 /// Performance-critical binary callers (compareTo, indexOf, startsWith,
 /// endsWith, contains, replace) should prefer `with_string_chars_scratch`
 /// or `with_two_string_chars_scratches` to avoid this allocation entirely.
-pub(crate) fn read_string_chars(ctx: &dyn NativeContext, obj: rustjvm_types::ObjectRef) -> Vec<u16> {
+pub(crate) fn read_string_chars(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Vec<u16> {
     // Pre-size the result Vec, then fill via the same tight loop used by
     // the scratch path. One allocation per call (down from the previous
     // alloc + per-element trait-dispatched pushes).
@@ -1915,7 +1915,7 @@ pub(crate) fn read_string_chars(ctx: &dyn NativeContext, obj: rustjvm_types::Obj
 }
 
 pub(crate) fn native_string_to_char_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2148,7 +2148,7 @@ pub(crate) fn native_string_compare_to(ctx: &mut dyn NativeContext, args: &[Valu
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.compareTo on null argument".to_string()),
             }
             .into())
@@ -2197,7 +2197,7 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.substring on null".to_string()),
             }
             .into())
@@ -2215,7 +2215,7 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
             let elem_type = ctx.heap_element_type_of(arr);
             let is_byte_array = matches!(
                 elem_type,
-                rustjvm_types::ArrayElementType::Byte | rustjvm_types::ArrayElementType::Boolean,
+                cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
             );
             let (char_count, is_utf16) = if is_byte_array {
                 let utf16 = matches!(ctx.get_field(this, 1), Value::Int(1));
@@ -2231,7 +2231,7 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
 
     if begin < 0 || begin > end {
         return Err(
-            rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }.into(),
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index: begin }.into(),
         );
     }
 
@@ -2276,7 +2276,7 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
 }
 
 pub(crate) fn native_string_get_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -2298,7 +2298,7 @@ pub(crate) fn native_string_concat(ctx: &mut dyn NativeContext, args: &[Value]) 
     let other = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.concat: argument is null".to_string()),
             }
             .into())
@@ -2376,7 +2376,7 @@ pub(crate) fn native_string_split_impl(
     // Create String[] array
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -2659,7 +2659,7 @@ pub(crate) fn native_string_code_point_at(ctx: &mut dyn NativeContext, args: &[V
     let s = ctx.read_string(this).unwrap_or_default();
     let chars: Vec<u16> = s.encode_utf16().collect();
     if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
-        return Err(rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+        return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
             index: index_i32,
         }
         .into());
@@ -2803,10 +2803,10 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
     // Use the Stream pattern from collections
     let stream_class_id = match ctx.ensure_class_initialized("java/util/stream/Stream") {
         Ok(id) => id,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let stream = ctx.alloc_object(stream_class_id, 1);
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), elements.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
@@ -2871,7 +2871,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
     let fmt_obj = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("String.format: format is null".to_string()),
             }
             .into())
@@ -2901,7 +2901,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             // UnknownFormatConversionException (an IllegalFormatException,
             // which extends IllegalArgumentException).
             if i + 1 >= chars.len() {
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: "Format string ends with a lone '%'".to_string(),
                 }
                 .into());
@@ -2990,7 +2990,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             } else {
                 // Reached end of string after consuming flags/width/precision
                 // with no conversion character — a truncated specifier.
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: "Format string ends with an incomplete conversion".to_string(),
                 }
                 .into());
@@ -3097,7 +3097,7 @@ fn extract_float_value(ctx: &dyn NativeContext, val: &Value) -> f64 {
 /// Format a single argument for String.format.
 pub(crate) fn format_arg(ctx: &dyn NativeContext, val: &Value, spec: char) -> String {
     // Helper: unbox wrapper object to primitive
-    fn unbox_obj(ctx: &dyn NativeContext, obj: rustjvm_types::ObjectRef) -> Value {
+    fn unbox_obj(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Value {
         let nf = ctx.object_num_fields(obj);
         if nf >= 1 {
             let f = ctx.get_field(obj, 0);
@@ -3207,7 +3207,7 @@ pub(crate) fn native_string_is_blank(ctx: &mut dyn NativeContext, args: &[Value]
 
 /// chars() — returns IntStream of char values
 pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
 
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3421,7 +3421,7 @@ pub(crate) fn native_string_check_bounds_begin_end(
         // the offending arg, otherwise `end`.
         let index = if begin < 0 { begin } else { end };
         return Err(
-            rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
         );
     }
     Ok(None)
@@ -3459,7 +3459,7 @@ pub(crate) fn native_string_check_bounds_off_count(
     if bad_size {
         let index = if offset < 0 { offset } else { count };
         return Err(
-            rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
         );
     }
     Ok(Some(Value::Int(offset)))
@@ -4232,7 +4232,7 @@ mod tests {
     // bytecode would otherwise misread slot 2 as `count` and trigger huge array
     // allocations inside `Formatter.format`.
 
-    fn make_sb(ctx: &mut dyn NativeContext) -> rustjvm_types::ObjectRef {
+    fn make_sb(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
         let cid = ctx.ensure_class_initialized("java/lang/StringBuilder").unwrap();
         // Allocate enough slots to match real JDK layout width (value/coder/count ≈ 3).
         let sb = ctx.alloc_object(cid, 4);
@@ -4407,13 +4407,13 @@ mod tests {
     // StringIndexOutOfBoundsException, never ArrayIndexOutOfBoundsException.
     // -----------------------------------------------------------------------
 
-    fn err_kind(e: &rustjvm_types::error::MethodCallFailed) -> &'static str {
+    fn err_kind(e: &cratonvm_types::error::MethodCallFailed) -> &'static str {
         match e {
-            rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(re),
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(re),
             ) => match re {
-                rustjvm_types::error::RuntimeError::StringIndexOutOfBoundsException { .. } => "sioobe",
-                rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { .. } => "aioobe",
+                cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { .. } => "sioobe",
+                cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { .. } => "aioobe",
                 _ => "other-runtime",
             },
             _ => "other-failed",

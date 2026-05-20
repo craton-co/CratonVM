@@ -1,7 +1,7 @@
 //! Wave 1, Task D — `apps/xml_probe/XmlProbe.java` regression test.
 //!
 //! Pin the JAXP / StAX (`javax.xml.stream`) cursor API end-to-end against
-//! the rustjvm CLI in real-JDK mode. Spawns a subprocess, feeds it a
+//! the cratonvm CLI in real-JDK mode. Spawns a subprocess, feeds it a
 //! tiny XML fixture, and asserts the probe parses it correctly.
 //!
 //! Required output lines (`STEP 5` of the Wave 1.D method):
@@ -35,15 +35,15 @@ fn probe_dir() -> PathBuf {
     worktree_root().join("apps").join("xml_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -54,7 +54,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<String> {
-    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
         return Some(h);
     }
     if let Ok(h) = std::env::var("JAVA_HOME") {
@@ -71,7 +71,7 @@ fn java_home() -> Option<String> {
 /// `<config>` with two `<server/>` children and a CDATA `<metadata/>`
 /// payload that contains a literal `<bracketed>` token.
 fn write_fixture() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join("rustjvm-wave1-d");
+    let dir = std::env::temp_dir().join("cratonvm-wave1-d");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("[wave1-d] failed to create fixture dir {:?}: {e}", dir);
         return None;
@@ -99,7 +99,7 @@ fn write_fixture() -> Option<PathBuf> {
 }
 
 fn run_xml_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("XmlProbe.class").exists() {
         eprintln!("[wave1-d] XmlProbe.class missing — run javac in apps/xml_probe");
@@ -116,7 +116,7 @@ fn run_xml_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave1-d] failed to spawn rustjvm: {e}");
+            eprintln!("[wave1-d] failed to spawn cratonvm: {e}");
             return None;
         }
     };
@@ -164,7 +164,7 @@ fn xml_probe_parses_servers_and_first_name() {
     assert_eq!(
         rc,
         Some(0),
-        "wave1-d: rustjvm exited rc={:?}, stdout={:?}, stderr={:?}",
+        "wave1-d: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
         rc, stdout, stderr
     );
     assert!(

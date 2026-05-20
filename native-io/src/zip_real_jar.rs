@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 /// Owned jar state per open handle.
 struct JarState {

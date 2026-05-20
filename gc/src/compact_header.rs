@@ -466,7 +466,7 @@ impl NarrowKlassTable {
     /// Get or assign a narrow klass ID for the given [`ClassId`].
     ///
     /// Thread-safe: concurrent calls for the same ClassId return the same value.
-    pub fn get_or_assign(&self, class_id: rustjvm_types::ClassId) -> u32 {
+    pub fn get_or_assign(&self, class_id: cratonvm_types::ClassId) -> u32 {
         let raw = class_id.as_u32();
         // Fast path: already assigned.
         {
@@ -489,11 +489,11 @@ impl NarrowKlassTable {
 
     /// Look up the ClassId for a narrow klass value. Returns `None` if the
     /// narrow klass has never been assigned.
-    pub fn resolve(&self, narrow_klass: u32) -> Option<rustjvm_types::ClassId> {
+    pub fn resolve(&self, narrow_klass: u32) -> Option<cratonvm_types::ClassId> {
         self.to_class_id
             .read()
             .get(&narrow_klass)
-            .map(|&raw| rustjvm_types::ClassId::new(raw))
+            .map(|&raw| cratonvm_types::ClassId::new(raw))
     }
 
     /// Number of registered class mappings.
@@ -507,7 +507,7 @@ impl NarrowKlassTable {
     }
 
     /// Check if a ClassId already has a narrow klass assignment.
-    pub fn contains(&self, class_id: rustjvm_types::ClassId) -> bool {
+    pub fn contains(&self, class_id: cratonvm_types::ClassId) -> bool {
         self.to_narrow.read().contains_key(&class_id.as_u32())
     }
 }
@@ -530,7 +530,7 @@ impl Default for NarrowKlassTable {
 pub enum HeaderView {
     /// The legacy 32-byte header (direct reference).
     Legacy {
-        class_id: rustjvm_types::ClassId,
+        class_id: cratonvm_types::ClassId,
         is_array: bool,
         element_type: u8,
         array_length: u32,
@@ -670,7 +670,7 @@ impl CompactAllocator {
     /// followed by `num_fields * COMPACT_SLOT_SIZE` bytes of field data.
     pub fn alloc_object(
         &self,
-        class_id: rustjvm_types::ClassId,
+        class_id: cratonvm_types::ClassId,
         num_fields: usize,
     ) -> Option<*mut u8> {
         let nk = self.klass_table.get_or_assign(class_id);
@@ -708,7 +708,7 @@ impl CompactAllocator {
     /// Returns `Some(ptr)` on success, `None` on OOM.
     pub fn alloc_array(
         &self,
-        class_id: rustjvm_types::ClassId,
+        class_id: cratonvm_types::ClassId,
         element_type: crate::heap::ArrayElementType,
         length: usize,
     ) -> Option<*mut u8> {
@@ -753,7 +753,7 @@ impl CompactAllocator {
     }
 
     /// Resolve the ClassId from a compact header at the given pointer.
-    pub fn class_id_at(&self, ptr: *const u8) -> Option<rustjvm_types::ClassId> {
+    pub fn class_id_at(&self, ptr: *const u8) -> Option<cratonvm_types::ClassId> {
         let header = self.read_header(ptr);
         self.klass_table.resolve(header.narrow_klass())
     }
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn migrate_preserves_class_and_age() {
         let mut old = crate::heap::ObjectHeader::new(
-            rustjvm_types::ClassId::new(77),
+            cratonvm_types::ClassId::new(77),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
             0,
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn migrate_array_preserves_element_type() {
         let old = crate::heap::ObjectHeader::new(
-            rustjvm_types::ClassId::new(10),
+            cratonvm_types::ClassId::new(10),
             crate::heap::ObjectKind::Array,
             crate::heap::ArrayElementType::Int,
             0,
@@ -1217,7 +1217,7 @@ mod tests {
     #[test]
     fn migrate_hash_code_to_side_table() {
         let old = crate::heap::ObjectHeader::new(
-            rustjvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(1),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
             42,
@@ -1285,8 +1285,8 @@ mod tests {
     #[test]
     fn s54_narrow_klass_table_assign_sequential() {
         let t = NarrowKlassTable::new();
-        let nk1 = t.get_or_assign(rustjvm_types::ClassId::new(100));
-        let nk2 = t.get_or_assign(rustjvm_types::ClassId::new(200));
+        let nk1 = t.get_or_assign(cratonvm_types::ClassId::new(100));
+        let nk2 = t.get_or_assign(cratonvm_types::ClassId::new(200));
         assert_ne!(nk1, nk2);
         assert!(nk1 >= 1);
         assert!(nk2 >= 1);
@@ -1296,8 +1296,8 @@ mod tests {
     #[test]
     fn s54_narrow_klass_table_idempotent() {
         let t = NarrowKlassTable::new();
-        let nk1 = t.get_or_assign(rustjvm_types::ClassId::new(42));
-        let nk2 = t.get_or_assign(rustjvm_types::ClassId::new(42));
+        let nk1 = t.get_or_assign(cratonvm_types::ClassId::new(42));
+        let nk2 = t.get_or_assign(cratonvm_types::ClassId::new(42));
         assert_eq!(nk1, nk2);
         assert_eq!(t.len(), 1);
     }
@@ -1305,9 +1305,9 @@ mod tests {
     #[test]
     fn s54_narrow_klass_table_resolve() {
         let t = NarrowKlassTable::new();
-        let nk = t.get_or_assign(rustjvm_types::ClassId::new(77));
+        let nk = t.get_or_assign(cratonvm_types::ClassId::new(77));
         let resolved = t.resolve(nk);
-        assert_eq!(resolved, Some(rustjvm_types::ClassId::new(77)));
+        assert_eq!(resolved, Some(cratonvm_types::ClassId::new(77)));
     }
 
     #[test]
@@ -1319,7 +1319,7 @@ mod tests {
     #[test]
     fn s54_narrow_klass_table_contains() {
         let t = NarrowKlassTable::new();
-        let cid = rustjvm_types::ClassId::new(55);
+        let cid = cratonvm_types::ClassId::new(55);
         assert!(!t.contains(cid));
         t.get_or_assign(cid);
         assert!(t.contains(cid));
@@ -1329,7 +1329,7 @@ mod tests {
     fn s54_narrow_klass_table_many_classes() {
         let t = NarrowKlassTable::new();
         for i in 0..500 {
-            let cid = rustjvm_types::ClassId::new(i);
+            let cid = cratonvm_types::ClassId::new(i);
             let nk = t.get_or_assign(cid);
             assert!(nk > 0);
             assert_eq!(t.resolve(nk), Some(cid));
@@ -1346,7 +1346,7 @@ mod tests {
                 let t = t.clone();
                 std::thread::spawn(move || {
                     for j in 0..50 {
-                        let cid = rustjvm_types::ClassId::new(i * 50 + j);
+                        let cid = cratonvm_types::ClassId::new(i * 50 + j);
                         let nk = t.get_or_assign(cid);
                         assert_eq!(t.resolve(nk), Some(cid));
                     }
@@ -1364,7 +1364,7 @@ mod tests {
     #[test]
     fn s54_header_view_from_legacy() {
         let mut old = crate::heap::ObjectHeader::new(
-            rustjvm_types::ClassId::new(10),
+            cratonvm_types::ClassId::new(10),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
             42,
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn s54_header_view_legacy_forwarded() {
         let mut old = crate::heap::ObjectHeader::new(
-            rustjvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(1),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
             0,
@@ -1426,7 +1426,7 @@ mod tests {
     #[test]
     fn s54_compact_allocator_alloc_object() {
         let alloc = CompactAllocator::new(4096);
-        let cid = rustjvm_types::ClassId::new(42);
+        let cid = cratonvm_types::ClassId::new(42);
         let ptr = alloc.alloc_object(cid, 3);
         assert!(ptr.is_some());
         let ptr = ptr.unwrap();
@@ -1447,7 +1447,7 @@ mod tests {
     #[test]
     fn s54_compact_allocator_alloc_array() {
         let alloc = CompactAllocator::new(4096);
-        let cid = rustjvm_types::ClassId::new(10);
+        let cid = cratonvm_types::ClassId::new(10);
         let ptr = alloc.alloc_array(cid, crate::heap::ArrayElementType::Int, 5);
         assert!(ptr.is_some());
         let ptr = ptr.unwrap();
@@ -1465,7 +1465,7 @@ mod tests {
     #[test]
     fn s54_compact_allocator_oom() {
         let alloc = CompactAllocator::new(16); // Too small for a 3-field object
-        let cid = rustjvm_types::ClassId::new(1);
+        let cid = cratonvm_types::ClassId::new(1);
         // 8 header + 3*16 fields = 56 bytes, won't fit in 16
         let ptr = alloc.alloc_object(cid, 3);
         assert!(ptr.is_none());
@@ -1475,7 +1475,7 @@ mod tests {
     fn s54_compact_allocator_multiple_objects() {
         let alloc = CompactAllocator::new(1024 * 1024);
         for i in 0..100 {
-            let cid = rustjvm_types::ClassId::new(i);
+            let cid = cratonvm_types::ClassId::new(i);
             let ptr = alloc.alloc_object(cid, 2);
             assert!(ptr.is_some(), "Failed to alloc object {}", i);
         }
@@ -1486,7 +1486,7 @@ mod tests {
     #[test]
     fn s54_compact_allocator_identity_hash() {
         let alloc = CompactAllocator::new(4096);
-        let cid = rustjvm_types::ClassId::new(1);
+        let cid = cratonvm_types::ClassId::new(1);
         let ptr = alloc.alloc_object(cid, 1).unwrap();
 
         let h1 = alloc.identity_hash_code(ptr as usize);
@@ -1501,7 +1501,7 @@ mod tests {
     #[test]
     fn s54_compact_allocator_header_view() {
         let alloc = CompactAllocator::new(4096);
-        let cid = rustjvm_types::ClassId::new(5);
+        let cid = cratonvm_types::ClassId::new(5);
         let ptr = alloc.alloc_object(cid, 2).unwrap();
 
         let view = alloc.header_view(ptr);
@@ -1525,7 +1525,7 @@ mod tests {
     fn s54_savings_report_with_objects() {
         let alloc = CompactAllocator::new(1024 * 1024);
         for i in 0..50 {
-            alloc.alloc_object(rustjvm_types::ClassId::new(i), 1).unwrap();
+            alloc.alloc_object(cratonvm_types::ClassId::new(i), 1).unwrap();
         }
         let report = alloc.savings_report();
         assert_eq!(report.object_count, 50);
@@ -1537,7 +1537,7 @@ mod tests {
     #[test]
     fn s54_savings_report_format() {
         let alloc = CompactAllocator::new(4096);
-        alloc.alloc_object(rustjvm_types::ClassId::new(1), 2).unwrap();
+        alloc.alloc_object(cratonvm_types::ClassId::new(1), 2).unwrap();
         let report = alloc.savings_report();
         let formatted = report.format();
         assert!(formatted.contains("Compact Object Headers Report"));
@@ -1549,7 +1549,7 @@ mod tests {
     #[test]
     fn s54_savings_report_with_hash_codes() {
         let alloc = CompactAllocator::new(4096);
-        let ptr = alloc.alloc_object(rustjvm_types::ClassId::new(1), 1).unwrap();
+        let ptr = alloc.alloc_object(cratonvm_types::ClassId::new(1), 1).unwrap();
         alloc.identity_hash_code(ptr as usize);
         let report = alloc.savings_report();
         assert_eq!(report.hash_table_entries, 1);
@@ -1582,7 +1582,7 @@ mod tests {
     #[test]
     fn s54_compact_allocator_klass_table_access() {
         let alloc = CompactAllocator::new(4096);
-        let cid = rustjvm_types::ClassId::new(99);
+        let cid = cratonvm_types::ClassId::new(99);
         alloc.alloc_object(cid, 1).unwrap();
 
         let kt = alloc.klass_table();
@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn s54_compact_array_all_element_types() {
         let alloc = CompactAllocator::new(1024 * 1024);
-        let cid = rustjvm_types::ClassId::new(1);
+        let cid = cratonvm_types::ClassId::new(1);
         let types = [
             crate::heap::ArrayElementType::Boolean,
             crate::heap::ArrayElementType::Byte,
@@ -1630,7 +1630,7 @@ mod tests {
     #[test]
     fn s54_klass_roundtrip_through_header() {
         let alloc = CompactAllocator::new(4096);
-        let cid = rustjvm_types::ClassId::new(12345);
+        let cid = cratonvm_types::ClassId::new(12345);
         let ptr = alloc.alloc_object(cid, 0).unwrap();
         let header = alloc.read_header(ptr);
         let nk = header.narrow_klass();
@@ -1645,7 +1645,7 @@ mod tests {
         let alloc = CompactAllocator::new(16 * 1024 * 1024); // 16 MB
         let mut ptrs = Vec::new();
         for i in 0..10_000 {
-            let cid = rustjvm_types::ClassId::new(i % 100);
+            let cid = cratonvm_types::ClassId::new(i % 100);
             if let Some(ptr) = alloc.alloc_object(cid, 2) {
                 ptrs.push(ptr);
             } else {
@@ -1659,7 +1659,7 @@ mod tests {
         // Verify all objects have correct class IDs
         for (i, ptr) in ptrs.iter().enumerate() {
             let cid = alloc.class_id_at(*ptr);
-            assert_eq!(cid, Some(rustjvm_types::ClassId::new(i as u32 % 100)));
+            assert_eq!(cid, Some(cratonvm_types::ClassId::new(i as u32 % 100)));
         }
     }
 
@@ -1669,8 +1669,8 @@ mod tests {
     fn s54_compact_object_layout_size() {
         // Object with 2 fields: 8 (header) + 2*16 (slots) = 40, aligned to 8
         let alloc = CompactAllocator::new(4096);
-        let p1 = alloc.alloc_object(rustjvm_types::ClassId::new(1), 2).unwrap();
-        let p2 = alloc.alloc_object(rustjvm_types::ClassId::new(1), 2).unwrap();
+        let p1 = alloc.alloc_object(cratonvm_types::ClassId::new(1), 2).unwrap();
+        let p2 = alloc.alloc_object(cratonvm_types::ClassId::new(1), 2).unwrap();
         let diff = (p2 as usize) - (p1 as usize);
         // 8 + 2*16 = 40, 8-byte aligned
         assert_eq!(diff, 40);
@@ -1681,12 +1681,12 @@ mod tests {
         let alloc = CompactAllocator::new(4096);
         // int[5]: 8 (header) + 8 (length+pad) + 5*4 = 36, aligned to 8 → 40
         let p1 = alloc.alloc_array(
-            rustjvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(1),
             crate::heap::ArrayElementType::Int,
             5,
         ).unwrap();
         let p2 = alloc.alloc_array(
-            rustjvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(1),
             crate::heap::ArrayElementType::Int,
             5,
         ).unwrap();
@@ -1709,9 +1709,9 @@ mod tests {
 
         // NarrowKlassTable round-trip
         let nk = NarrowKlassTable::new();
-        let id1 = nk.get_or_assign(rustjvm_types::ClassId::new(42));
-        let id2 = nk.get_or_assign(rustjvm_types::ClassId::new(43));
-        let id1_again = nk.get_or_assign(rustjvm_types::ClassId::new(42));
+        let id1 = nk.get_or_assign(cratonvm_types::ClassId::new(42));
+        let id2 = nk.get_or_assign(cratonvm_types::ClassId::new(43));
+        let id1_again = nk.get_or_assign(cratonvm_types::ClassId::new(42));
         assert_eq!(id1, id1_again, "same ClassId returns same narrow id");
         assert_ne!(id1, id2, "different ClassId gets distinct narrow id");
     }

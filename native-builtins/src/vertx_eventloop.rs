@@ -7,7 +7,7 @@
 //! # Architecture
 //!
 //! This module is self-contained within `native-builtins` (which cannot
-//! depend on `rustjvm-vm`).  It embeds its own event-loop runtime:
+//! depend on `cratonvm-vm`).  It embeds its own event-loop runtime:
 //!
 //! * A process-wide `VertxEventLoopRegistry` keyed by a stable u64 id.
 //! * Each `VertxEventLoop` runs a 5-phase loop identical in structure to
@@ -70,9 +70,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -689,7 +689,7 @@ fn spawn_vertx_event_loop_inner(
         // layout is only relevant if Java-side reflection asks for
         // the name / tid directly — which it does for tracing.
         if vm_tid != 0 {
-            let mirror = ctx.alloc_object(rustjvm_types::ClassId::new(0), THREAD_MIRROR_SLOTS);
+            let mirror = ctx.alloc_object(cratonvm_types::ClassId::new(0), THREAD_MIRROR_SLOTS);
             let name_obj = ctx.create_string(&name);
             ctx.set_field(mirror, THREAD_MIRROR_NAME_SLOT, Value::Object(Some(name_obj)));
             // priority slot 1: leave at 0 (NORM_PRIORITY = 5 in the
@@ -973,7 +973,7 @@ fn native_vertx_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // the loop is running. This is what keeps Quarkus/Keycloak
         // alive past `main()`.
         let el = spawn_vertx_event_loop_with_ctx(ctx, name, false).map_err(|e| {
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IllegalStateException {
                     message: format!("VertxImpl.init: spawn failed: {e}"),
                 },
@@ -1032,7 +1032,7 @@ fn native_nel_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             let el =
                 spawn_vertx_event_loop_with_ctx(ctx, "netty-eventloop-auto", false).map_err(
                     |e| {
-                        MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+                        MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                             RuntimeError::IllegalStateException {
                                 message: format!("NioEventLoop.run: spawn failed: {e}"),
                             },
@@ -2115,7 +2115,7 @@ mod tests {
     #[test]
     fn t19_k4_set_native_thread_java_obj_rejects_unknown_id() {
         let mut ctx = mock_ctx();
-        let mirror = ctx.alloc_object(rustjvm_types::ClassId::new(0), 5);
+        let mirror = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
         // Bogus thread id past the high-water mark.
         let res = ctx.set_native_thread_java_obj(u64::MAX / 2, mirror);
         assert!(!res, "unknown thread id must return false");

@@ -1,16 +1,17 @@
 [package]
-name = "rustjvm-native-api"
+name = "cratonvm-native-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Native method API for RustJVM — NativeContext trait and registry"
+description = "Native method API for CratonVM — NativeContext trait and registry"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-rustjvm-types = { path = "../types" }
+cratonvm-types = { path = "../types" }
 parking_lot.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 native-tls = "0.2"

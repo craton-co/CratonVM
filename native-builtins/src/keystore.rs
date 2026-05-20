@@ -55,9 +55,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use parking_lot::RwLock;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -661,7 +661,7 @@ fn read_password(ctx: &mut dyn NativeContext, v: &Value) -> Vec<u8> {
 /// for arbitrary streams (FileInputStream, network streams, gzip, ...).
 fn read_stream_to_end(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8> {
     // Cheap path: ByteArrayInputStream
-    if matches!(ctx.heap_kind_of(stream), rustjvm_types::ObjectKind::Object) {
+    if matches!(ctx.heap_kind_of(stream), cratonvm_types::ObjectKind::Object) {
         let cls_id = ctx.class_id_of_object(stream);
         if let Some(name) = ctx.class_name_of_id(cls_id) {
             if name == "java/io/ByteArrayInputStream" {
@@ -747,7 +747,7 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
                 // surface a runtime error — callers (real-JDK glue) wrap
                 // this as IOException at the bytecode boundary.
                 return Err(MethodCallFailed::InternalError(
-                    rustjvm_types::error::VmError::Runtime(RuntimeError::IOException {
+                    cratonvm_types::error::VmError::Runtime(RuntimeError::IOException {
                         message: e.to_string(),
                     }),
                 ));
@@ -828,7 +828,7 @@ fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
     let cls_id = match ctx.ensure_class_initialized("java/security/cert/X509Certificate") {
         Ok(c) => c,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
@@ -848,7 +848,7 @@ fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     let cls_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(c) => c,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let arr = ctx.new_ref_array(cls_id, aliases.len());
     for (i, a) in aliases.iter().enumerate() {
@@ -952,7 +952,7 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     // mirror (with all the real fields) or a 5-field synthetic mirror that
     // `tls.rs` allocates. Probe by name first, fall back to the conventional
     // slot index.
-    let by_name = ctx.get_field_by_name(this, "rustjvm$keystore$storeId");
+    let by_name = ctx.get_field_by_name(this, "cratonvm$keystore$storeId");
     if let Value::Int(i) = by_name {
         if i != 0 {
             return i;
@@ -975,7 +975,7 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
 }
 
 fn set_store_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
-    ctx.set_field_by_name(this, "rustjvm$keystore$storeId", Value::Int(id));
+    ctx.set_field_by_name(this, "cratonvm$keystore$storeId", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > FIELD_STORE_ID {
         ctx.set_field(this, FIELD_STORE_ID, Value::Int(id));

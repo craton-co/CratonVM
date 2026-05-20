@@ -61,7 +61,7 @@ pub struct FrozenFrame {
     pub class_id: Option<crate::classloading::ClassId>,
     pub max_stack: Option<u16>,
     pub max_locals: Option<u16>,
-    pub exception_table: Option<Arc<[rustjvm_reader::attribute::ExceptionTableEntry]>>,
+    pub exception_table: Option<Arc<[cratonvm_reader::attribute::ExceptionTableEntry]>>,
     pub source_file: Option<String>,
 }
 
@@ -1763,7 +1763,7 @@ mod tests {
     fn p81_continuation_freeze_preserves_exception_state() {
         use crate::classloading::ClassId;
         use crate::runtime::frame::Frame;
-        use rustjvm_reader::attribute::ExceptionTableEntry;
+        use cratonvm_reader::attribute::ExceptionTableEntry;
 
         let scope = ContinuationScope { name: "VirtualThread".into() };
         let mut cont = Continuation::new(scope);

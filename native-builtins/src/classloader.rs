@@ -5,9 +5,9 @@
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallResult;
 use crate::{obj_arg, alloc_concurrent_synthetic};
 
 /// Monotonic counter for generating unique hidden class names.
@@ -328,7 +328,7 @@ fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, UCL_URL_COUNT, Value::Int(0));
     ctx.set_field(obj, UCL_CLOSED, Value::Int(0));
     // Allocate initial URLs array (capacity 16)
-    let urls_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+    let urls_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     ctx.set_field(obj, UCL_URLS_ARRAY, Value::Object(Some(urls_arr)));
     // Assign unique loader ID
     let lid = ctx.allocate_loader_id();
@@ -867,7 +867,7 @@ fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Define via the shared backend. Empty name = use class file's
     // own this_class. Loader id 0 = application loader.
     let loader_id = get_or_assign_loader_id(ctx, this);
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
         ..Default::default()
     };
@@ -1177,11 +1177,11 @@ fn define_class_via_full(
     name: &str,
     bytes: Vec<u8>,
     loader_id: u32,
-    opts: rustjvm_native_api::DefineClassFull,
+    opts: cratonvm_native_api::DefineClassFull,
     initialize: bool,
     class_data: Option<Value>,
 ) -> MethodCallResult {
-    use rustjvm_types::error::{LinkageError, RuntimeError};
+    use cratonvm_types::error::{LinkageError, RuntimeError};
 
     // Pre-validate the class file header: at least 8 bytes (magic +
     // minor + major) and CAFEBABE magic must be present, otherwise the
@@ -1249,7 +1249,7 @@ fn define_class_via_full(
 ///     ClassLoader loader, String name, byte[] b, int off, int len,
 ///     ProtectionDomain pd, String source);`
 fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::error::RuntimeError;
+    use cratonvm_types::error::RuntimeError;
 
     let loader = args.first().copied().unwrap_or(Value::Object(None));
     let name = read_optional_internal_name(ctx, args, 1);
@@ -1275,7 +1275,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        rustjvm_types::error::MethodCallFailed::from(
+        cratonvm_types::error::MethodCallFailed::from(
             RuntimeError::ArrayIndexOutOfBoundsException {
                 index: (off as i32).max(0),
             },
@@ -1288,7 +1288,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     // Optional ProtectionDomain at slot 5.
-    let mut opts = rustjvm_native_api::DefineClassFull::default();
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
     if let Some(Value::Object(Some(pd))) = args.get(5) {
         opts.code_source_url = extract_pd_code_source_url(ctx, *pd);
     }
@@ -1300,7 +1300,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if let Some(Value::Object(Some(src_obj))) = args.get(6) {
         if let Some(src) = ctx.read_string(*src_obj) {
             tracing::debug!(
-                target: "rustjvm_native_builtins::classloader",
+                target: "cratonvm_native_builtins::classloader",
                 class = %name,
                 source = %src,
                 "defineClass1 source hint"
@@ -1316,7 +1316,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 ///     ClassLoader loader, String name, ByteBuffer bb, int off,
 ///     int len, ProtectionDomain pd, String source);`
 fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::error::{LinkageError, RuntimeError};
+    use cratonvm_types::error::{LinkageError, RuntimeError};
 
     let loader = args.first().copied().unwrap_or(Value::Object(None));
     let name = read_optional_internal_name(ctx, args, 1);
@@ -1342,7 +1342,7 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let bytes = read_byte_buffer_slice(ctx, bb, off, len).map_err(|msg| {
-        rustjvm_types::error::MethodCallFailed::from(LinkageError::ClassFormatError {
+        cratonvm_types::error::MethodCallFailed::from(LinkageError::ClassFormatError {
             class_name: name.clone(),
             message: format!("defineClass2: {msg}"),
         })
@@ -1353,14 +1353,14 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Ok(Some(v));
     }
 
-    let mut opts = rustjvm_native_api::DefineClassFull::default();
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
     if let Some(Value::Object(Some(pd))) = args.get(5) {
         opts.code_source_url = extract_pd_code_source_url(ctx, *pd);
     }
     if let Some(Value::Object(Some(src_obj))) = args.get(6) {
         if let Some(src) = ctx.read_string(*src_obj) {
             tracing::debug!(
-                target: "rustjvm_native_builtins::classloader",
+                target: "cratonvm_native_builtins::classloader",
                 class = %name,
                 source = %src,
                 "defineClass2 source hint"
@@ -1390,7 +1390,7 @@ const DEFINE_CLASS0_FLAG_VM_ANNOTATIONS: i32 = 0x08;
 ///     byte[] b, int off, int len, ProtectionDomain pd,
 ///     boolean initialize, int flags, Object classData);`
 fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use rustjvm_types::error::RuntimeError;
+    use cratonvm_types::error::RuntimeError;
 
     let loader = args.first().copied().unwrap_or(Value::Object(None));
     // Slot 1: lookup class (used for nest-host derivation when the
@@ -1422,7 +1422,7 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let bytes = read_byte_array_slice(ctx, byte_array, off, len).map_err(|_msg| {
-        rustjvm_types::error::MethodCallFailed::from(
+        cratonvm_types::error::MethodCallFailed::from(
             RuntimeError::ArrayIndexOutOfBoundsException {
                 index: (off as i32).max(0),
             },
@@ -1435,7 +1435,7 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     // Slot 6: ProtectionDomain
-    let mut opts = rustjvm_native_api::DefineClassFull::default();
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
     if let Some(Value::Object(Some(pd))) = args.get(6) {
         opts.code_source_url = extract_pd_code_source_url(ctx, *pd);
     }
@@ -1685,7 +1685,7 @@ fn unsafe_define_class_defensive(
         }
     }
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
         ..Default::default()
     };
@@ -1858,7 +1858,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     } else if ctx.find_resource(resource_name).is_some() {
         format!("classpath:{name}")
     } else {
-        let dbg_all = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+        let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         if dbg_all {
@@ -1867,7 +1867,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(Some(Value::Object(None)));
     };
 
-    let dbg_all = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+    let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     if dbg_all {
@@ -1875,7 +1875,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 
     tracing::debug!(
-        target: "rustjvm_vm::runtime::resources",
+        target: "cratonvm_vm::runtime::resources",
         resource = %resource_name,
         url = %url_str,
         "ClassLoader.getResource resolved"
@@ -1931,11 +1931,11 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // spring.factories trace path is subsumed by the env-gated emitter so
     // a single switch covers both diagnostics surfaces.
     //
-    // Set `RUSTJVM_DBG_GETRESOURCES=1` to dump every invocation's
+    // Set `CRATONVM_DBG_GETRESOURCES=1` to dump every invocation's
     // (resource, count, urls) triple. We also keep the legacy
     // spring-specific trace as a no-op fall-through condition because some
     // older debug runs rely on it being always-on.
-    let dbg_all = std::env::var("RUSTJVM_DBG_GETRESOURCES")
+    let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     let is_spring_legacy_probe = resource_name == "META-INF/spring.factories"
@@ -1948,7 +1948,7 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     tracing::debug!(
-        target: "rustjvm_vm::runtime::resources",
+        target: "cratonvm_vm::runtime::resources",
         resource = %resource_name,
         matches = urls.len(),
         "ClassLoader.getResources enumerated"
@@ -1959,7 +1959,7 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // are registered unconditionally by `register_enumeration_impl_natives`
     // so this works in both synthetic-JDK and real-JDK modes without
     // relying on java.util.Vector's internal layout.
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
         let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
@@ -2019,10 +2019,10 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// Boot's clearCache iteration complete in zero iterations.
 fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::debug!(
-        target: "rustjvm_vm::runtime::classloader",
+        target: "cratonvm_vm::runtime::classloader",
         "[URLClassPath shim] getURLs() returning empty URL[]"
     );
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -2034,7 +2034,7 @@ fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// and matches Spring Boot's expectation (it just logs and continues).
 fn ucp_close_loaders_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::debug!(
-        target: "rustjvm_vm::runtime::classloader",
+        target: "cratonvm_vm::runtime::classloader",
         "[URLClassPath shim] closeLoaders() returning empty ArrayList"
     );
     let list = match ctx.new_object("java/util/ArrayList")? {
@@ -2054,7 +2054,7 @@ fn ucp_close_loaders_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 /// Always succeed without side effects.
 fn ucp_close_loaders_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::debug!(
-        target: "rustjvm_vm::runtime::classloader",
+        target: "cratonvm_vm::runtime::classloader",
         "[URLClassPath shim] closeLoaders()V (void variant) no-op"
     );
     Ok(None)
@@ -2071,7 +2071,7 @@ fn ucp_close_loaders_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
 /// otherwise re-introduce NPEs through any new code path the JDK adds.
 fn ucp_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::debug!(
-        target: "rustjvm_vm::runtime::classloader",
+        target: "cratonvm_vm::runtime::classloader",
         "[URLClassPath shim] <clinit>() no-op"
     );
     Ok(None)
@@ -2203,7 +2203,7 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             let len = bytes.len();
             let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
             tracing::debug!(
-                target: "rustjvm_vm::runtime::resources",
+                target: "cratonvm_vm::runtime::resources",
                 resource = %resource_name,
                 bytes = len,
                 "ClassLoader.getResourceAsStream served resource"
@@ -2218,7 +2218,7 @@ fn cl_get_defined_package(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
 }
 
 fn cl_get_defined_packages(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(empty))))
 }
 
@@ -2298,7 +2298,7 @@ fn ucl_setup(
 
     let count = ctx.array_length(url_arr);
     // Copy URLs into a storage array and extract paths for classpath registration.
-    let storage = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count.max(16));
+    let storage = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count.max(16));
     let mut paths = Vec::with_capacity(count);
     for i in 0..count {
         let elem = ctx.get_array_element(url_arr, i);
@@ -2371,7 +2371,7 @@ fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         _ => 0,
     };
     // Copy stored URLs into a new array of the exact size
-    let result = ctx.new_array(rustjvm_types::ArrayElementType::Reference, count);
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
     if let Value::Object(Some(urls_arr)) = ctx.get_field(this, UCL_URLS_ARRAY) {
         for i in 0..count {
             let url = ctx.get_array_element(urls_arr, i);
@@ -2408,7 +2408,7 @@ fn ucl_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             } else {
                 // Grow the array (double capacity)
                 let new_cap = arr_len * 2;
-                let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_cap);
+                let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
                 for i in 0..arr_len {
                     let elem = ctx.get_array_element(urls_arr, i);
                     ctx.set_array_element(new_arr, i, elem);
@@ -2522,7 +2522,7 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // `this_class` name (no mangling). Throws an
     // IllegalArgumentException on bad magic / parse error per JLS
     // §5.3.5.
-    use rustjvm_types::error::RuntimeError;
+    use cratonvm_types::error::RuntimeError;
 
     let byte_array = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
@@ -2589,7 +2589,7 @@ fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // and reject mismatches with NoClassDefFoundError. We pass an
     // empty name so the backend skips its name-mismatch check (the
     // class file's `this_class` is authoritative here per JEP 274).
-    let opts = rustjvm_native_api::DefineClassFull::default();
+    let opts = cratonvm_native_api::DefineClassFull::default();
     // catch_unwind: backend may panic on malformed bytecode.
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full("", &class_bytes, 0, opts)
@@ -2751,7 +2751,7 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     //   * On any failure, throws the appropriate Java exception
     //     (IllegalArgumentException, ClassFormatError) so the caller
     //     observes a typed error rather than a silently-empty Lookup.
-    use rustjvm_types::error::RuntimeError;
+    use cratonvm_types::error::RuntimeError;
 
     // --- 1. Extract `this` (the defining Lookup) and the bytecode array. ---
     let this_lookup = obj_arg(args, 0)?;
@@ -2859,7 +2859,7 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         None
     };
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         override_name: Some(hidden_name.clone()),
         hidden: true,
         nest_host_class_name,
@@ -3478,7 +3478,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let stream = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field(this, 0, stream); // in (FilterInputStream.in)
         // readBuffer = new byte[8]
-        let rb = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 8);
+        let rb = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
         ctx.set_field(this, 1, Value::Object(Some(rb)));
         Ok(None)
     });
@@ -3487,7 +3487,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 4);
         if bytes.len() < 4 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readInt".into(),
             }.into());
         }
@@ -3499,7 +3499,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 2);
         if bytes.len() < 2 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readShort".into(),
             }.into());
         }
@@ -3511,7 +3511,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 2);
         if bytes.len() < 2 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUnsignedShort".into(),
             }.into());
         }
@@ -3523,7 +3523,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 8);
         if bytes.len() < 8 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readLong".into(),
             }.into());
         }
@@ -3536,7 +3536,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 1);
         if bytes.is_empty() {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readBoolean".into(),
             }.into());
         }
@@ -3547,7 +3547,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 1);
         if bytes.is_empty() {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readByte".into(),
             }.into());
         }
@@ -3558,7 +3558,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 1);
         if bytes.is_empty() {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUnsignedByte".into(),
             }.into());
         }
@@ -3569,7 +3569,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 2);
         if bytes.len() < 2 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readChar".into(),
             }.into());
         }
@@ -3581,7 +3581,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 4);
         if bytes.len() < 4 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readFloat".into(),
             }.into());
         }
@@ -3593,7 +3593,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let bytes = dis_read_n(ctx, this, 8);
         if bytes.len() < 8 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readDouble".into(),
             }.into());
         }
@@ -3609,7 +3609,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let len = args[3].as_int().unwrap_or(0) as usize;
         let bytes = dis_read_n(ctx, this, len);
         if bytes.len() < len {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readFully".into(),
             }.into());
         }
@@ -3625,7 +3625,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(dst);
         let bytes = dis_read_n(ctx, this, len);
         if bytes.len() < len {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readFully".into(),
             }.into());
         }
@@ -3641,14 +3641,14 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         // Read 2-byte length prefix
         let len_bytes = dis_read_n(ctx, this, 2);
         if len_bytes.len() < 2 {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUTF".into(),
             }.into());
         }
         let utf_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
         let data = dis_read_n(ctx, this, utf_len);
         if data.len() < utf_len {
-            return Err(rustjvm_types::error::RuntimeError::IOException {
+            return Err(cratonvm_types::error::RuntimeError::IOException {
                 message: "EOF in readUTF data".into(),
             }.into());
         }
@@ -3826,7 +3826,7 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod classloader_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     fn make_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();
@@ -3973,7 +3973,7 @@ mod classloader_tests {
         // bits. We synthesize a fake `ObjectRef` from an
         // 8-byte-aligned, non-null integer constant (validated by
         // `ObjectRef::from_raw`). The pointer is never dereferenced.
-        use rustjvm_types::ObjectRef;
+        use cratonvm_types::ObjectRef;
         let fake = unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
         let _prev = set_class_data(fake, Value::Int(42));
         let got = get_class_data(fake);
@@ -4231,7 +4231,7 @@ mod classloader_tests {
     fn new8_define_hidden_class_rejects_bad_magic() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         // Build a byte[] of zeros (no magic).
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 16);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
         let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
         let result = lk_define_hidden_class(
             &mut ctx,
@@ -4256,7 +4256,7 @@ mod classloader_tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let bytes = minimal_class_file("com/example/Widget");
         // Copy the Rust Vec<u8> into a Java byte[].
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
@@ -4312,11 +4312,11 @@ mod classloader_tests {
     fn new8_define_hidden_class_names_are_unique() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let bytes = minimal_class_file("Foo");
-        let arr1 = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr1 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr1, i, Value::Int((*b as i8) as i32));
         }
-        let arr2 = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr2 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr2, i, Value::Int((*b as i8) as i32));
         }
@@ -4366,7 +4366,7 @@ mod classloader_tests {
     fn new8_define_hidden_class_with_nestmate_option() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let bytes = minimal_class_file("com/example/Nested");
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
@@ -4377,7 +4377,7 @@ mod classloader_tests {
             1,
         );
         ctx.set_field(option, 0, Value::Int(0)); // NESTMATE ordinal
-        let options_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let options_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(options_arr, 0, Value::Object(Some(option)));
 
         let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
@@ -4554,8 +4554,8 @@ mod classloader_tests {
         use crate::test_utils::MockNativeContext;
         let mut ctx = MockNativeContext::new();
         let _ = ctx.ensure_class_initialized("java/lang/String").unwrap();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), CL_FIELD_COUNT);
-        let module = ctx.alloc_object(rustjvm_types::ClassId::new(0), 5);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), CL_FIELD_COUNT);
+        let module = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
         let name = ctx.create_string("java.lang.String");
         let r = cl_load_class_module(
             &mut ctx,
@@ -4575,8 +4575,8 @@ mod classloader_tests {
     fn t19_h12_cl_load_class_module_missing_returns_null() {
         use crate::test_utils::MockNativeContext;
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), CL_FIELD_COUNT);
-        let module = ctx.alloc_object(rustjvm_types::ClassId::new(0), 5);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), CL_FIELD_COUNT);
+        let module = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
         let name = ctx.create_string("does.not.exist.Bogus");
         // Note: the mock's ensure_class_initialized always succeeds (auto-creates).
         // To verify the spec'd null return on a real miss, we test the
@@ -4597,7 +4597,7 @@ mod classloader_tests {
     fn t19_h12_cl_load_class_module_null_module_returns_null() {
         use crate::test_utils::MockNativeContext;
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), CL_FIELD_COUNT);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), CL_FIELD_COUNT);
         let name = ctx.create_string("java.lang.String");
         let r = cl_load_class_module(
             &mut ctx,
@@ -4617,8 +4617,8 @@ mod classloader_tests {
     fn t19_h12_cl_load_class_module_null_name_returns_null() {
         use crate::test_utils::MockNativeContext;
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), CL_FIELD_COUNT);
-        let module = ctx.alloc_object(rustjvm_types::ClassId::new(0), 5);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), CL_FIELD_COUNT);
+        let module = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
         let r = cl_load_class_module(
             &mut ctx,
             &[
@@ -4639,8 +4639,8 @@ mod classloader_tests {
         // to null, never reach `ensure_class_initialized`.
         use crate::test_utils::MockNativeContext;
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), CL_FIELD_COUNT);
-        let module = ctx.alloc_object(rustjvm_types::ClassId::new(0), 5);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), CL_FIELD_COUNT);
+        let module = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
         let evil = ctx.create_string("../../etc/passwd");
         let r = cl_load_class_module(
             &mut ctx,

@@ -41,9 +41,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_APP: &str = "org/sonar/application/App";
 const CN_APP_SETTINGS: &str = "org/sonar/application/config/AppSettingsLoaderImpl";
@@ -64,9 +64,9 @@ fn sonar_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 }
 
 pub fn register_sonar_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_SONAR_REAL=1, skip all short-circuits so
+    // Diagnostic gate: when CRATONVM_SONAR_REAL=1, skip all short-circuits so
     // the real SonarQube launcher runs end-to-end (used for `--help` etc).
-    if std::env::var("RUSTJVM_SONAR_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_SONAR_REAL").as_deref() == Ok("1") {
         return;
     }
     // Primary entry: sonar-application-*.jar's Main-Class is `org.sonar.application.App`.

@@ -4,7 +4,7 @@
 //! present in the NativeMethodRegistry and that the method signatures
 //! match the JDK 25 specification.
 //!
-//!     cargo test -p rustjvm-vm --test t13_class_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test t13_class_conformance -- --nocapture
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

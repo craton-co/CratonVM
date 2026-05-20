@@ -30,15 +30,15 @@ fn probe_dir() -> PathBuf {
         .join("bigdecimal_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -49,7 +49,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<String> {
-    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
         return Some(h);
     }
     if let Ok(h) = std::env::var("JAVA_HOME") {
@@ -63,7 +63,7 @@ fn java_home() -> Option<String> {
 }
 
 fn run_bdprobe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("BdProbe.class").exists() {
         eprintln!("[rbigdec1-full] BdProbe.class missing — run javac in apps/bigdecimal_probe");
@@ -112,7 +112,7 @@ fn bdprobe_full_arithmetic_roundtrip() {
     assert_eq!(
         rc,
         Some(0),
-        "rbigdec1-full: rustjvm exited rc={:?}, stdout={:?}, stderr={:?}",
+        "rbigdec1-full: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
         rc, stdout, stderr
     );
     // Ignore [tracing]-prefixed warn lines so the assertion only sees the

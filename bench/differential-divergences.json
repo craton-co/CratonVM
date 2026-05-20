@@ -1,92 +1,92 @@
 {
   "divergences": [
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "length",
       "descriptor": "()I",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"length\", method_descriptor: \"()I\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"length\", method_descriptor: \"()I\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "5"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "concat",
       "descriptor": "()Ljava/lang/String;",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "object",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "object",
       "hotspot_stdout": "",
       "hotspot_return": "hello world"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "charAt",
       "descriptor": "()C",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"charAt\", method_descriptor: \"(I)C\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"charAt\", method_descriptor: \"(I)C\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "d"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "substring",
       "descriptor": "()Ljava/lang/String;",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"substring\", method_descriptor: \"(I)Ljava/lang/String;\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"substring\", method_descriptor: \"(I)Ljava/lang/String;\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "world"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "indexOf",
       "descriptor": "()I",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"indexOf\", method_descriptor: \"(Ljava/lang/String;)I\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"indexOf\", method_descriptor: \"(Ljava/lang/String;)I\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "1"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "toUpperCase",
       "descriptor": "()Ljava/lang/String;",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"toUpperCase\", method_descriptor: \"()Ljava/lang/String;\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"toUpperCase\", method_descriptor: \"()Ljava/lang/String;\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "HELLO"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "trim",
       "descriptor": "()Ljava/lang/String;",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"trim\", method_descriptor: \"()Ljava/lang/String;\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"trim\", method_descriptor: \"()Ljava/lang/String;\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "hello"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "equals",
       "descriptor": "()Z",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"equals\", method_descriptor: \"(Ljava/lang/Object;)Z\" }))",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "error:InternalError(Linkage(NoSuchMethodError { class_name: \"java/lang/String\", method_name: \"equals\", method_descriptor: \"(Ljava/lang/Object;)Z\" }))",
       "hotspot_stdout": "",
       "hotspot_return": "true"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "valueOf",
       "descriptor": "()Ljava/lang/String;",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "object",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "object",
       "hotspot_stdout": "",
       "hotspot_return": "42"
     },
     {
-      "class_name": "rustjvm/DiffString",
+      "class_name": "cratonvm/DiffString",
       "method": "main",
       "descriptor": "([Ljava/lang/String;)V",
-      "rustjvm_stdout": "",
-      "rustjvm_return": "void",
+      "cratonvm_stdout": "",
+      "cratonvm_return": "void",
       "hotspot_stdout": "5\r\nhello world\r\nd\r\nworld\r\n1\r\nHELLO\r\nhello\r\ntrue\r\n42",
       "hotspot_return": "void"
     }

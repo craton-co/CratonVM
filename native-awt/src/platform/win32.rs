@@ -169,7 +169,7 @@ impl Win32Backend {
         if self.class_registered {
             return Ok(());
         }
-        let class_name = w!("RustJVMAWTWindow");
+        let class_name = w!("CratonVMAWTWindow");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
@@ -330,7 +330,7 @@ impl PlatformBackend for Win32Backend {
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
-                w!("RustJVMAWTWindow"),
+                w!("CratonVMAWTWindow"),
                 PCWSTR(tw.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
                 x,

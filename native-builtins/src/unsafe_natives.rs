@@ -43,9 +43,9 @@
 //! WP1.2 delta. Duplicate registration would panic or silently
 //! overwrite, either of which is a bug.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{LinkageError, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{LinkageError, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{
     native_unsafe_cas_int, native_unsafe_cas_long, native_unsafe_cas_object,
@@ -641,7 +641,7 @@ fn native_unsafe_define_class(
     // we skip verification — matching real HotSpot, where
     // `Unsafe::defineClass0` invokes `SystemDictionary::resolve_from_stream`
     // with the verifier disabled for class data presented through Unsafe.
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
         skip_verification: true,
         ..Default::default()
@@ -740,7 +740,7 @@ fn native_unsafe_define_anonymous_class(
     //    flatten to the application loader (loader_id = 0); the backend
     //    treats hidden classes as living in their host's namespace via
     //    `nest_host_class_name`, so visibility still resolves correctly.
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         override_name: Some(hidden_name.clone()),
         hidden: true,
         skip_verification: true,
@@ -959,7 +959,7 @@ fn cae_int_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
     let current = if crate::is_synthetic_offset(offset) {
         crate::synthetic_get(ctx, obj, offset)
-    } else if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    } else if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = crate::unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
     } else {
@@ -986,7 +986,7 @@ fn cae_long_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let current = if crate::is_synthetic_offset(offset) {
         crate::synthetic_get(ctx, obj, offset)
-    } else if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    } else if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = crate::unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
     } else {
@@ -1008,7 +1008,7 @@ fn cae_object_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let current = if crate::is_synthetic_offset(offset) {
         crate::synthetic_get(ctx, obj, offset)
-    } else if ctx.heap_kind_of(obj) == rustjvm_types::ObjectKind::Array {
+    } else if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         let idx = crate::unsafe_array_index_from_offset(ctx, obj, offset);
         ctx.get_array_element(obj, idx)
     } else {
@@ -1383,7 +1383,7 @@ fn native_unsafe_get_and_add_int_from_unsafe(
 mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
 
     fn dummy_this() -> Value {
         Value::Object(None)

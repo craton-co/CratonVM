@@ -38,9 +38,9 @@ use parking_lot::Mutex;
 use quick_xml::events::Event as QXmlEvent;
 use quick_xml::reader::Reader;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // StAX event constants (mirror `javax.xml.stream.XMLStreamConstants`).

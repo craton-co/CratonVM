@@ -1736,6 +1736,7 @@ mod tests {
             1,
             &[EventValue::Int(42)],
             None,
+            0,
         )
         .unwrap();
         // Should be non-empty and start with a size prefix

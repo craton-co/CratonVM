@@ -1,4 +1,4 @@
-# JCK (Java Compatibility Kit) conformance runner for RustJVM.
+# JCK (Java Compatibility Kit) conformance runner for CratonVM.
 #
 # This workflow is gated on the JCK_HOME environment variable. It will be
 # skipped entirely in environments where the JCK is not installed (e.g. public
@@ -40,8 +40,8 @@ jobs:
           distribution: 'oracle'
           java-version: '25'
 
-      - name: Build RustJVM CLI
-        run: cargo build --release -p rustjvm-cli
+      - name: Build CratonVM CLI
+        run: cargo build --release -p cratonvm-cli
 
       - name: Verify JCK installation
         run: |
@@ -52,15 +52,15 @@ jobs:
 
       - name: Configure JCK harness
         run: |
-          RUSTJVM_BIN="$(pwd)/target/release/rustjvm"
-          chmod +x "$RUSTJVM_BIN"
+          CRATONVM_BIN="$(pwd)/target/release/cratonvm"
+          chmod +x "$CRATONVM_BIN"
           # Substitute the VM path into the JCK interview configuration
-          sed "s|@RUSTJVM_BIN@|$RUSTJVM_BIN|g" ci/jck-config.jti > /tmp/jck-config.jti
-          echo "Configured JCK to use VM at: $RUSTJVM_BIN"
+          sed "s|@CRATONVM_BIN@|$CRATONVM_BIN|g" ci/jck-config.jti > /tmp/jck-config.jti
+          echo "Configured JCK to use VM at: $CRATONVM_BIN"
 
       - name: Run JCK tests
         run: |
-          RUSTJVM_BIN="$(pwd)/target/release/rustjvm"
+          CRATONVM_BIN="$(pwd)/target/release/cratonvm"
           java -jar "$JCK_HOME/lib/javatest.jar" \
             -config /tmp/jck-config.jti \
             -workdir /tmp/jck-work \

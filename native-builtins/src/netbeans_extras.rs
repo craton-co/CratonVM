@@ -16,13 +16,13 @@
 //! class named by the `netbeans.mainclass` property (default
 //! `org.netbeans.core.startup.Main`).
 //!
-//! # Default mode (RUSTJVM_NETBEANS_REAL unset)
+//! # Default mode (CRATONVM_NETBEANS_REAL unset)
 //!
 //! Short-circuit `Main.main` / `<clinit>` and `MainImpl.main` /
 //! `<clinit>` so the JVM exits rc=0 without exercising the NetBeans
 //! module bootstrap.
 //!
-//! # Real mode (RUSTJVM_NETBEANS_REAL=1)
+//! # Real mode (CRATONVM_NETBEANS_REAL=1)
 //!
 //! The short-circuit is disabled. The launcher then prints
 //!
@@ -59,9 +59,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_NETBEANS_MAIN: &str = "org/netbeans/Main";
 const CN_NETBEANS_MAIN_IMPL: &str = "org/netbeans/MainImpl";
@@ -77,15 +77,15 @@ fn netbeans_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 
 /// Install NetBeans boot-test short-circuits.
 ///
-/// **Default mode** (`RUSTJVM_NETBEANS_REAL` unset): short-circuit
+/// **Default mode** (`CRATONVM_NETBEANS_REAL` unset): short-circuit
 /// `Main.main` / `<clinit>` and `MainImpl.main` / `<clinit>` so the
 /// JVM exits rc=0 without driving the NetBeans module system.
 ///
-/// **Real mode** (`RUSTJVM_NETBEANS_REAL=1`): no shims are
+/// **Real mode** (`CRATONVM_NETBEANS_REAL=1`): no shims are
 /// registered. The real launcher is allowed to run end-to-end. See
 /// the file-level doc comment for the required system properties.
 pub fn register_netbeans_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_NETBEANS_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_NETBEANS_REAL").as_deref() == Ok("1") {
         return;
     }
     registry.register(

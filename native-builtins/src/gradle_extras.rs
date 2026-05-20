@@ -21,9 +21,9 @@
 //! gradle_extras::register_gradle_stubs(registry);
 //! ```
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn gradle_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[gradle-shim] launcher main short-circuited (no Gradle distribution required)");
@@ -35,8 +35,8 @@ fn gradle_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
 }
 
 pub fn register_gradle_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_GRADLE_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[gradle-shim] RUSTJVM_GRADLE_REAL=1 — skipping shim registration, running real Gradle");
+    if std::env::var("CRATONVM_GRADLE_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[gradle-shim] CRATONVM_GRADLE_REAL=1 — skipping shim registration, running real Gradle");
         return;
     }
     // org.gradle.launcher.GradleMain.main([Ljava/lang/String;)V — primary

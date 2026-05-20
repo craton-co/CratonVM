@@ -254,12 +254,12 @@ PHASE2/3-CUDA-TODO marker. Replace with real cudarc calls.
 ## Acceptance
 
 - `cargo check --workspace` clean
-- `cargo check --workspace --features rustjvm-vm/gpu-offload` clean
+- `cargo check --workspace --features cratonvm-vm/gpu-offload` clean
 - `cargo check -p cuda-bridge --features cuda` clean **(if the port
   succeeds; if cudarc 0.13's API genuinely won't admit what we want,
   the build returning a compile error is honest and is fine — the
   orchestrator will dispatch a fix agent)**
-- `cargo test -p rustjvm-vm --features gpu-offload` all-green for
+- `cargo test -p cratonvm-vm --features gpu-offload` all-green for
   the GPU surface (offload, gpu_residency, gpu_marshal,
   gpu_async_stub).
 - Java impl classes compile via the existing `craton-gpu/build.rs`

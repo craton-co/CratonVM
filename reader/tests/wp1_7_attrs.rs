@@ -16,9 +16,9 @@
 //! Fixture location is resolved relative to `CARGO_MANIFEST_DIR` so the
 //! test runs from any working directory.
 
-use rustjvm_reader::attribute::{Attribute, ElementValue, LazyAttribute};
-use rustjvm_reader::class_file::ClassFile;
-use rustjvm_reader::read_class;
+use cratonvm_reader::attribute::{Attribute, ElementValue, LazyAttribute};
+use cratonvm_reader::class_file::ClassFile;
+use cratonvm_reader::read_class;
 use std::path::PathBuf;
 
 /// Load one of the probe's compiled `.class` files.
@@ -45,7 +45,7 @@ fn utf8<'a>(cf: &'a ClassFile, idx: u16) -> &'a str {
 
 /// Extract the single `RuntimeVisibleAnnotations` attribute from a list;
 /// returns an empty slice if missing.
-fn visible<'a>(attrs: &'a [LazyAttribute]) -> &'a [rustjvm_reader::attribute::Annotation] {
+fn visible<'a>(attrs: &'a [LazyAttribute]) -> &'a [cratonvm_reader::attribute::Annotation] {
     attrs
         .iter()
         .find_map(|a| match a.as_decoded() {
@@ -139,7 +139,7 @@ fn class_annotation_element_values_cover_every_tag() {
         Some(ElementValue::Const { tag, const_value_index }) => {
             assert_eq!(*tag, b'I', "'count' must carry int tag");
             match cf.constant_pool.get(*const_value_index) {
-                Some(rustjvm_reader::constant_pool::ConstantPoolEntry::Integer(v)) => {
+                Some(cratonvm_reader::constant_pool::ConstantPoolEntry::Integer(v)) => {
                     assert_eq!(*v, 42);
                 }
                 other => panic!("count must resolve to Integer(42), got {other:?}"),

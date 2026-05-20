@@ -441,7 +441,7 @@ dev box — no GPU required.
    - `vm/src/runtime/mod.rs` — P3-7 adds ONE line.
    - `native-builtins/src/lib.rs` — P3-4 adds ONE line.
 6. **Two feature flags**:
-   - `gpu-offload` on `rustjvm-vm` — enables the runtime side.
+   - `gpu-offload` on `cratonvm-vm` — enables the runtime side.
    - `gpu-offload` on `native-builtins` — new, gates the registry module.
      Add this feature in P3-4.
 7. **Stub-mode compiles without a GPU.** Every native shim has a
@@ -456,10 +456,10 @@ dev box — no GPU required.
 ## 5. Acceptance for Phase 3
 
 - [ ] `cargo check --workspace` (default features) clean
-- [ ] `cargo check --workspace --features rustjvm-vm/gpu-offload` clean
+- [ ] `cargo check --workspace --features cratonvm-vm/gpu-offload` clean
 - [ ] `cargo check -p craton-gpu` clean (javac compiles the new Java sources)
-- [ ] `cargo test -p rustjvm-vm --features gpu-offload --test gpu_async_stub` passes
-- [ ] `cargo test -p rustjvm-vm --features gpu-offload --lib offload` passes (existing)
+- [ ] `cargo test -p cratonvm-vm --features gpu-offload --test gpu_async_stub` passes
+- [ ] `cargo test -p cratonvm-vm --features gpu-offload --lib offload` passes (existing)
 - [ ] `docs/gpu/async-api.md` exists and is linked from `docs/gpu/README.md`
 - [ ] All Phase 1 + Phase 2 tests still green
 

@@ -14,7 +14,7 @@
 //! cglib `Enhancer.create()` → `defineClass` path runs cleanly.
 //!
 //! This registration body is intentionally empty — no synthetic stubs.
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 pub fn register_cglib_stubs(_registry: &mut NativeMethodRegistry) {
     // Neutered: the underlying VM bug (null `defaultDomain` on custom

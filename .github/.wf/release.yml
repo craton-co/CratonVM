@@ -20,13 +20,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: rustjvm-cli
+            artifact: cratonvm-cli
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: rustjvm-cli.exe
+            artifact: cratonvm-cli.exe
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: rustjvm-cli
+            artifact: cratonvm-cli
 
     steps:
       - uses: actions/checkout@v4
@@ -39,25 +39,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p rustjvm-cli
+        run: cargo build --release --target ${{ matrix.target }} -p cratonvm-cli
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../rustjvm-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          tar czf ../../../cratonvm-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../rustjvm-${{ matrix.target }}.zip ${{ matrix.artifact }}
+          7z a ../../../cratonvm-${{ matrix.target }}.zip ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rustjvm-${{ matrix.target }}
-          path: rustjvm-${{ matrix.target }}.*
+          name: cratonvm-${{ matrix.target }}
+          path: cratonvm-${{ matrix.target }}.*
 
   release:
     name: Create Release

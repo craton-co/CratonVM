@@ -110,10 +110,10 @@ direction is speculative.
 ## Verification on no-GPU dev box
 
   cargo check --workspace                                       clean
-  cargo check --workspace --features rustjvm-vm/gpu-offload     clean
-  cargo test  -p rustjvm-vm --features gpu-offload --lib offload
+  cargo check --workspace --features cratonvm-vm/gpu-offload     clean
+  cargo test  -p cratonvm-vm --features gpu-offload --lib offload
                                                                 6 passed, 3 ignored
-  cargo test  -p rustjvm-gc --features gpu-offload --lib        680 passed
+  cargo test  -p cratonvm-gc --features gpu-offload --lib        680 passed
 
 ## What this means for the project
 

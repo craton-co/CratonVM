@@ -1,7 +1,7 @@
-//! Java I/O native methods for RustJVM.
+//! Java I/O native methods for CratonVM.
 //!
 //! Contains native method implementations for java.io and java.nio I/O classes.
-//! The FileDescriptorTable is provided by rustjvm-native-api.
+//! The FileDescriptorTable is provided by cratonvm-native-api.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::{ClassId, ObjectRef, Value};
-use rustjvm_native_api::fd_table::FdId;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::fd_table::FdId;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
 pub mod random_access_file;
 pub mod nio_native;
@@ -326,7 +326,7 @@ const AL_FIELD_SIZE: usize = 1;
 const AL_DEFAULT_CAPACITY: usize = 10;
 
 fn al_init(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let buf = ctx.new_ref_array(rustjvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
+    let buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
     ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
 }
@@ -339,7 +339,7 @@ fn al_add(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
     let buf = match ctx.get_field(this, AL_FIELD_DATA) {
         Value::Object(Some(a)) => a,
         _ => {
-            let new_buf = ctx.new_ref_array(rustjvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
+            let new_buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
             ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
             new_buf
         }
@@ -347,7 +347,7 @@ fn al_add(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
     let cap = ctx.array_length(buf);
     let buf = if size >= cap {
         let new_cap = (cap * 2).max(size + 1);
-        let new_buf = ctx.new_ref_array(rustjvm_types::ClassId::new(0), new_cap);
+        let new_buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
         for i in 0..size {
             let v = ctx.get_array_element(buf, i);
             ctx.set_array_element(new_buf, i, v);
@@ -661,7 +661,7 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Err(_) => return Ok(Some(Value::Object(None))),
     };
     // Create a String[] array
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), entries.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), entries.len());
     for (i, name) in entries.iter().enumerate() {
         let s = ctx.create_string(name);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -1612,7 +1612,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // `remaining_chars` bytes + slack for multi-byte continuations.
     let want = (len - written).saturating_add(3);
     if !eof_seen {
-        let bytes_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, want);
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, want);
         let read_result = ctx.invoke_virtual(
             in_stream, "read", "([BII)I",
             &[Value::Object(Some(bytes_arr)), Value::Int(0), Value::Int(want as i32)],
@@ -3121,7 +3121,7 @@ fn native_scanner_use_delimiter_string(
     // Create a Pattern synthetic: 2 fields (source=0, flags=1)
     let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
         Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     ctx.set_field(pat, 0, Value::Object(Some(pattern_str)));
     ctx.set_field(pat, 1, Value::Int(0));
@@ -3176,7 +3176,7 @@ fn native_scanner_delimiter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let src = ctx.create_string(SCAN_DEFAULT_DELIM);
         let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
             Ok(cid) => ctx.alloc_object(cid, 2),
-            Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+            Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
         };
         ctx.set_field(pat, 0, Value::Object(Some(src)));
         ctx.set_field(pat, 1, Value::Int(0));
@@ -3901,7 +3901,7 @@ fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -3914,7 +3914,7 @@ fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             _ => break,
         }
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b));
     }
@@ -3926,7 +3926,7 @@ fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -3943,7 +3943,7 @@ fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             _ => break,
         }
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b));
     }
@@ -4222,7 +4222,7 @@ fn buf_read_mark(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
 fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), BB_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -5353,7 +5353,7 @@ fn native_bb_duplicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let mark = buf_read_mark(ctx, this);
     let dup = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), BB_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
     };
     ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(arr))); // shares backing array
     ctx.set_field_by_name(dup, "hb", Value::Object(Some(arr)));
@@ -5416,7 +5416,7 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     let fc = match ctx.ensure_class_initialized("java/nio/channels/FileChannel") {
         Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     ctx.set_field(fc, FC_FIELD_FD, Value::Int(fd_id as i32));
     ctx.set_field(fc, FC_FIELD_POS, Value::Long(0));
@@ -5843,7 +5843,7 @@ fn native_sw_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, 32);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 32);
     ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(buf)));
     ctx.set_field(this, SW_FIELD_COUNT, Value::Int(0));
     Ok(None)
@@ -5858,7 +5858,7 @@ fn native_sw_init_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(v)) => *v as usize,
         _ => 32,
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, cap.max(1));
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap.max(1));
     ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(buf)));
     ctx.set_field(this, SW_FIELD_COUNT, Value::Int(0));
     Ok(None)
@@ -5876,7 +5876,7 @@ fn sw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usiz
     };
     if count + needed > cap {
         let new_cap = (cap * 2).max(count + needed);
-        let new_buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, new_cap);
+        let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
         for i in 0..count {
             let v = ctx.get_array_element(buf, i);
             ctx.set_array_element(new_buf, i, v);
@@ -6130,7 +6130,7 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
 fn dis_read_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
         _ => return Ok(-1),
@@ -6341,7 +6341,7 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 bytes.push(b as u8);
             }
             let s = decode_modified_utf8(&bytes)
-                .map_err(|e| rustjvm_types::error::RuntimeError::IOException {
+                .map_err(|e| cratonvm_types::error::RuntimeError::IOException {
                     message: format!("readUTF: {e}"),
                 })?;
             let result = ctx.create_string(&s);
@@ -6381,7 +6381,7 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         bytes.push(b as u8);
     }
     let s = decode_modified_utf8(&bytes)
-        .map_err(|e| rustjvm_types::error::RuntimeError::IOException {
+        .map_err(|e| cratonvm_types::error::RuntimeError::IOException {
             message: format!("readUTF: {e}"),
         })?;
     let result = ctx.create_string(&s);
@@ -6668,7 +6668,7 @@ fn dos_write_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     b: i32,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, DOS_FIELD_OUT) {
         Value::Object(Some(s)) => s,
         _ => return Ok(()),
@@ -6820,7 +6820,7 @@ fn native_dos_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let bytes = encode_modified_utf8(&s);
     if bytes.len() > 65535 {
-        return Err(rustjvm_types::error::RuntimeError::IOException {
+        return Err(cratonvm_types::error::RuntimeError::IOException {
             message: format!(
                 "writeUTF: encoded string too long ({} bytes, max 65535)",
                 bytes.len()
@@ -7076,7 +7076,7 @@ fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
             let n = real.max(1);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
     let s = ctx.create_string(path_str);
     ctx.set_field(path, PATH_FIELD_STR, Value::Object(Some(s)));
@@ -7351,7 +7351,7 @@ fn native_path_to_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let s = read_path_str(ctx, this);
     let file = match ctx.ensure_class_initialized("java/io/File") {
         Ok(cid) => ctx.alloc_object(cid, 1),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
     let path_str = ctx.create_string(&s);
     ctx.set_field(file, 0, Value::Object(Some(path_str)));
@@ -7535,7 +7535,7 @@ fn native_files_create_directories(
 fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = files_path_str(ctx, args);
     let bytes = std::fs::read(&s).map_err(io_err)?;
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
@@ -7583,7 +7583,7 @@ fn native_files_read_all_lines(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Return as ArrayList
     let list = match ctx.ensure_class_initialized("java/util/ArrayList") {
         Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     al_init(ctx, list);
     for line in &lines {
@@ -8131,7 +8131,7 @@ fn native_caw_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, 32);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 32);
     ctx.set_field(this, CAW_FIELD_BUF, Value::Object(Some(buf)));
     ctx.set_field(this, CAW_FIELD_COUNT, Value::Int(0));
     Ok(None)
@@ -8147,7 +8147,7 @@ fn caw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
         return;
     }
     let new_cap = std::cmp::max(needed, cap * 2);
-    let new_buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, new_cap);
+    let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
     let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
         Value::Int(v) => v as usize,
         _ => 0,
@@ -8253,7 +8253,7 @@ fn native_caw_to_char_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Value::Int(v) => v as usize,
         _ => 0,
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Char, count);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, count);
     for i in 0..count {
         let v = ctx.get_array_element(buf, i);
         ctx.set_array_element(arr, i, v);
@@ -8854,7 +8854,7 @@ fn alloc_typed_buffer(
             (ctx.alloc_object(cid, n), n)
         }
         Err(_) => (
-            ctx.alloc_object(rustjvm_types::ClassId::new(0), BB_NUM_FIELDS),
+            ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
             BB_NUM_FIELDS,
         ),
     };
@@ -9976,14 +9976,14 @@ fn mmap_next_id() -> i64 {
 fn alloc_file_lock(ctx: &mut dyn NativeContext) -> ObjectRef {
     match ctx.ensure_class_initialized("java/nio/channels/FileLock") {
         Ok(cid) => ctx.alloc_object(cid, FL_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), FL_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), FL_NUM_FIELDS),
     }
 }
 
 fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/MappedByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, MBB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), MBB_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), MBB_NUM_FIELDS),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -10618,9 +10618,9 @@ fn collect_dir_entries_inner(
 fn make_path_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
     let stream = match ctx.ensure_class_initialized("java/util/stream/Stream") {
         Ok(cid) => ctx.alloc_object(cid, 1),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), elements.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
@@ -12269,7 +12269,7 @@ fn native_sel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 #[cfg(test)]
 mod io_tests {
     use super::*;
-    use rustjvm_native_api::fd_table::FileDescriptorTable;
+    use cratonvm_native_api::fd_table::FileDescriptorTable;
     use std::io::Write;
 
     // -----------------------------------------------------------------------
@@ -13612,7 +13612,7 @@ mod t2_mutf8_tests {
 
     #[test]
     fn t2_round_trip_complex_string() {
-        let input = "RustJVM ✨ 中文 \0 end";
+        let input = "CratonVM ✨ 中文 \0 end";
         let encoded = encode_modified_utf8(input);
         let decoded = decode_modified_utf8(&encoded).unwrap();
         assert_eq!(decoded, input);

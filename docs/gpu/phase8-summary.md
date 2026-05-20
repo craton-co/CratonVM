@@ -119,10 +119,10 @@ on the captured `KernelArgs`, plus a graph-replay mechanism on
 | Target | Result |
 |---|---|
 | `cargo check --workspace` | clean |
-| `cargo check --workspace --features rustjvm-vm/gpu-offload` | clean |
+| `cargo check --workspace --features cratonvm-vm/gpu-offload` | clean |
 | `cargo check -p cuda-bridge --features cuda` | clean |
-| `cargo test -p rustjvm-vm --features gpu-offload --lib offload` | 6 passed, 3 ignored |
-| `cargo test -p rustjvm-gc --features gpu-offload --lib` | 680 passed |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib offload` | 6 passed, 3 ignored |
+| `cargo test -p cratonvm-gc --features gpu-offload --lib` | 680 passed |
 | All other GPU-tagged test crates | unchanged from Phase 7 |
 | `test_classes/gpu/{Benchmark,BenchmarkExplicit}.class` | compiled by javac during `cargo build` |
 

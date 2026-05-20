@@ -11,8 +11,8 @@
 // Usage on a CUDA-equipped machine:
 //   javac -d test_classes/gpu test_classes/gpu/Benchmark.java
 //                                      test_classes/gpu/EligibleVectorAdd.java
-//   rustjvm        --classpath test_classes/gpu Benchmark 16777216 5   # CPU baseline
-//   rustjvm --gpu  --classpath test_classes/gpu Benchmark 16777216 5   # GPU
+//   cratonvm        --classpath test_classes/gpu Benchmark 16777216 5   # CPU baseline
+//   cratonvm --gpu  --classpath test_classes/gpu Benchmark 16777216 5   # GPU
 //
 // Arguments:
 //   args[0]  n            — element count (default 1<<24 = 16,777,216)
@@ -33,7 +33,7 @@
 //     than the CPU mean. Target ≥ 2×; smaller is a follow-up topic,
 //     not a fail.
 //   - No regression: `cargo check --workspace` clean both with and
-//     without `--features rustjvm-vm/gpu-offload`.
+//     without `--features cratonvm-vm/gpu-offload`.
 public class Benchmark {
     public static void main(String[] args) {
         int n          = (args.length > 0) ? Integer.parseInt(args[0]) : (1 << 24);

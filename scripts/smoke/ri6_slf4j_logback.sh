@@ -39,7 +39,7 @@ JAVA
 
 "$JAVA_HOME_FOR_SMOKE/bin/javac" -cp "$SLF4J_JAR" -d "$FIX_DIR" "$FIX_DIR/LogSmoke.java"
 
-SMOKE_TIMEOUT=180 smoke_run_rustjvm \
+SMOKE_TIMEOUT=180 smoke_run_cratonvm \
     --Xmx 512m \
     --classpath "$FIX_DIR:$SLF4J_JAR:$LB_CORE:$LB_CLASSIC" \
     -- LogSmoke

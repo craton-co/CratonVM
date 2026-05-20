@@ -30,7 +30,7 @@ use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_MARKED, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 
 /// A contiguous free block in the old generation.
 #[derive(Debug, Clone, Copy)]

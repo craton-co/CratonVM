@@ -40,9 +40,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rustjvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::Value;
+use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::Value;
 
 /// Monotonic counter for generating unique enhancer subclass names. Mirrors
 /// CGLIB's own `KeyFactory.generateName` counter.
@@ -321,8 +321,8 @@ fn build_enhancer_class(super_internal_name: &str) -> (String, Vec<u8>) {
 fn coerce_class_arg(v: Value) -> Value {
     match v {
         Value::Long(bits) => {
-            if let Some(p) = rustjvm_types::jlong_bits_as_aligned_object_ptr(bits as u64) {
-                Value::Object(Some(unsafe { rustjvm_types::ObjectRef::from_raw(p as *mut u8) }))
+            if let Some(p) = cratonvm_types::jlong_bits_as_aligned_object_ptr(bits as u64) {
+                Value::Object(Some(unsafe { cratonvm_types::ObjectRef::from_raw(p as *mut u8) }))
             } else {
                 Value::Object(None)
             }

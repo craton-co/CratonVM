@@ -1,6 +1,6 @@
 //! NEW-18: libffi-backed Panama FFI bridge.
 //!
-//! This module translates RustJVM's `java.lang.foreign.MemoryLayout`
+//! This module translates CratonVM's `java.lang.foreign.MemoryLayout`
 //! synthetic objects into `libffi::middle::Type` values, marshals
 //! Java `Value`s into typed argument storage, and unmarshals return
 //! slots back into `Value`s.
@@ -33,7 +33,7 @@
 use libffi::middle::{Type as FfiType, Cif};
 use libffi::low::{ffi_cif, ffi_type, prep_cif_var, ffi_abi_FFI_DEFAULT_ABI};
 
-use rustjvm_native_api::{
+use cratonvm_native_api::{
     ffi::{
         layout_alignment, layout_byte_size, LAYOUT_ADDRESS, LAYOUT_BOOLEAN, LAYOUT_BYTE,
         LAYOUT_CHAR, LAYOUT_DOUBLE, LAYOUT_FLOAT, LAYOUT_INT, LAYOUT_LONG, LAYOUT_PADDING,
@@ -41,7 +41,7 @@ use rustjvm_native_api::{
     },
     NativeContext,
 };
-use rustjvm_types::{
+use cratonvm_types::{
     error::{MethodCallFailed, RuntimeError},
     ObjectRef, Value,
 };

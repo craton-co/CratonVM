@@ -22,7 +22,7 @@
 //!
 //! # Two-tier strategy
 //!
-//! The open-sourced rust-jvm baseline has known gaps in `java.time.*`
+//! The open-sourced cratonvm baseline has known gaps in `java.time.*`
 //! factory methods (`LocalDate.of`, `Instant.ofEpochMilli`, etc.) and in
 //! reflection (`Class.forName(String)`, `Class.getField`) — see the
 //! `Time` (0/16 floor → currently 0) and `Reflect` floors in
@@ -47,12 +47,12 @@
 // the `0` return — at the cost of camelCase identifiers in Rust.
 #![allow(non_snake_case)]
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const CLASS: &str = "rustjvm/Wp73SqlTypesDateTime";
+const CLASS: &str = "cratonvm/Wp73SqlTypesDateTime";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -61,7 +61,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    let class_path = format!("{dir}/rustjvm/Wp73SqlTypesDateTime.class");
+    let class_path = format!("{dir}/cratonvm/Wp73SqlTypesDateTime.class");
     std::path::Path::new(&class_path).exists()
 }
 
@@ -207,7 +207,7 @@ fn wp7_3_sqlTime_millis_roundtrip() {
 #[test]
 fn wp7_3_jdbc_essential_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     // ServiceLoader.load(Class) is the entrypoint a JDBC driver
     // discovery walk routes through; if WP7.1's `register_jdbc_driver_natives`
     // is silently dropped from the essential-natives bundle the SQL
@@ -337,7 +337,7 @@ fn wp7_3_sqlTimestamp_valueOf_string() {
 // `LocalDateTime` via an H2 standard `TIMESTAMP` column. H2 is a
 // pure-Java JAR; if the H2 driver is on the test classpath it should
 // work end-to-end via `java.sql.DriverManager` (WP7.1) without any
-// additional JVM-side change. Today the rust-jvm test classpath does
+// additional JVM-side change. Today the cratonvm test classpath does
 // not stage H2, so the round-trip belongs to WP7.1's evidence harness
 // — the JVM-side proof above (Tier-1 reachability + `java.sql.Types`
 // constants) is sufficient for WP7.3.

@@ -9,8 +9,8 @@
 
 #![cfg(test)]
 
-use rustjvm_reader::class_reader::read_class;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::class_reader::read_class;
+use cratonvm_reader::method::ClassFileMethod;
 
 /// Load `class_name.class` from the fixtures directory and return the
 /// named method. Panics if the class or method cannot be found — tests

@@ -3,10 +3,10 @@
 # Overrides hardcoded 195.24.66.69 from application-localdev.yml to localhost.
 set -u
 WT=/c/Projects/CratonVM/.claude/worktrees/peaceful-sammet-b9d7ca
-RUSTJVM="$WT/target/release/rustjvm.exe"
+CRATONVM="$WT/target/release/cratonvm.exe"
 JH="C:\\Program Files\\Eclipse Adoptium\\jdk-25.0.2.10-hotspot"
 JAR="C:\\Users\\Admin\\Yandex.Disk\\PRO\\JAVA\\SportMe-master\\target\\sportme-backend.jar"
-RUSTJVM_DISABLE_JIT=1 timeout 60 "$RUSTJVM" --java-home "$JH" --Xmx 1g \
+CRATONVM_DISABLE_JIT=1 timeout 60 "$CRATONVM" --java-home "$JH" --Xmx 1g \
   -Dredis.url=redis://localhost:6379 \
   -Dspring.redis.host=localhost \
   -Dspring.redis.port=6379 \

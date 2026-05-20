@@ -1,6 +1,6 @@
-# RustJVM JIT Compiler — Round 26 Performance Results
+# CratonVM JIT Compiler — Round 26 Performance Results
 
-## The Journey: From 97x Slower to Matching JDK C2
+## The Journey: From 97x Slower to Within 1.5x of JDK C2
 
 ```
                     Performance vs OpenJDK -Xint (interpreter mode)
@@ -29,12 +29,12 @@
   Round 25     ◀═══════════════════  (SoA Value layout: 16B → 9B per slot)
   Round 26     ◀═══════════════════  (loop unrolling, speculative BCE, OSR fast-path)
                ▏                                                    ←── OpenJDK -Xint
-               ▏  ◀════                                            ←── OpenJDK C2 (1.41x)
+               ▏  ◀═════                                           ←── OpenJDK C2 (1.50x)
 ```
 
 ---
 
-## What Is RustJVM?
+## What Is CratonVM?
 
 A Java Virtual Machine written entirely in Rust:
 
@@ -46,7 +46,7 @@ A Java Virtual Machine written entirely in Rust:
 - Multi-threading with monitors, locks, and barriers
 - Lambda/invokedynamic support
 - **x86-64 JIT compiler** (~7,200 lines, ~140 bytecodes, 26 optimization rounds)
-- **Within 1.41x of JDK C2** (Fibonacci within 7%)
+- **Within 1.50x of JDK C2** on QuickBench (Fibonacci 1.31x)
 
 ---
 
@@ -55,7 +55,7 @@ A Java Virtual Machine written entirely in Rust:
 ### Architecture
 
 ```
-  Java Source          javac          JVM Bytecode         RustJVM JIT
+  Java Source          javac          JVM Bytecode         CratonVM JIT
   ┌──────────┐      ────────►      ┌──────────────┐      ────────►      ┌─────────────┐
   │ int fib( │                     │ iload_0      │                     │ push rbp    │
   │   int n  │                     │ iconst_1     │                     │ mov rbp,rsp │
@@ -149,18 +149,20 @@ A Java Virtual Machine written entirely in Rust:
 
 ### QuickBench — Scaled Workloads (Round 26)
 
-```
-  Benchmark               JDK C2      RustJVM R26    Ratio     Notes
-  ────────────────────     ──────      ───────────    ─────     ─────
-  Arithmetic (300M)         490 ms      1050 ms      2.15x     ★ loop unrolling + magic div
-  Fibonacci(42) recursive  1325 ms      1425 ms      1.07x     ★ JIT self-calls + regalloc
-  Sieve (100K×500 reps)     165 ms       325 ms      1.97x     ★ OSR + speculative BCE
-  Matrix 500×500 multiply   195 ms       260 ms      1.34x     ★ LICM + compact refs
-  ─────────────────────────────────────────────────────────────────────────────
-  TOTAL                    2175 ms      3060 ms      1.41x
+*Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS.*
 
-  Fibonacci: within 7% of HotSpot C2 ✓
-  Overall:   1.41x gap (down from ~1.0x R25 on older hardware)
+```
+  Benchmark               JDK C2      CratonVM R26    Ratio     Notes
+  ────────────────────     ──────      ───────────    ─────     ─────
+  Arithmetic (300M)         889 ms      1676 ms      1.89x     ★ loop unrolling + magic div
+  Fibonacci(42) recursive  1876 ms      2457 ms      1.31x     ★ JIT self-calls + regalloc
+  Sieve (100K×500 reps)     324 ms       510 ms      1.57x     ★ OSR + speculative BCE
+  Matrix 500×500 multiply   351 ms       518 ms      1.48x     ★ LICM + compact refs
+  ─────────────────────────────────────────────────────────────────────────────
+  TOTAL                    3440 ms      5161 ms      1.50x
+
+  Binary Trees (depth=18)   714 ms     16657 ms     23.3x     ✗ GC allocation bottleneck
+  Overall:   1.50x on QuickBench vs HotSpot C2 (Binary Trees tracked separately)
 ```
 
 ★ = JIT-compiled to native x86-64 machine code
@@ -186,10 +188,10 @@ A Java Virtual Machine written entirely in Rust:
   R13 compact   █████████████████████████████████████          4660 ms (2.4x slower)
   R14 full-regs ███████████████████████████████                3978 ms (1.93x slower)
   R20 compact+  █████████████████████████████████████████      9562 ms (1.8x slower)
-  R25 SoA+SIMD  ████████████████████                           5210 ms (1.0x!) ← MATCHED C2!
-  R26 unroll    ███████████████                                3060 ms (1.41x)
+  R25 SoA+SIMD  ████████████████████                           5210 ms (1.51x)
+  R26 unroll    ███████████████████                            5161 ms (1.50x) ← latest
                ────────────────────────────────────────────────────────────────
-  JDK C2        ██████████                                     2175 ms  (1.0x)
+  JDK C2        █████████████                                  3440 ms  (1.0x)
   JDK -Xint    █████████████████████████████████████████████ 144543 ms (27.7x)
 
   R20→R26: BCE + invokevirtual + OSR + SIMD + SoA + loop unrolling + speculative BCE
@@ -201,30 +203,30 @@ A Java Virtual Machine written entirely in Rust:
   Fibonacci(42) — 267,914,296 recursive calls
   ═══════════════════════════════════════════
 
-  JDK C2       ███████████████                                  1325 ms
-  RustJVM R26  ████████████████                                 1425 ms  ★ 1.07x — nearly matched!
-                                                                         ↑ within 7%
+  JDK C2       ███████████████                                  1876 ms
+  CratonVM R26  ████████████████████                            2457 ms  ★ JIT self-calls + regalloc
+                                                                         ↑ gap: 1.31x
 
   Arithmetic (300M iterations, mixed ops)
   ═══════════════════════════════════════
 
-  JDK C2       ██████                                            490 ms
-  RustJVM R26  ████████████                                     1050 ms  ★ loop unrolling
-                                                                         ↑ gap: 2.15x
+  JDK C2       ████████                                          889 ms
+  CratonVM R26  ███████████████                                  1676 ms  ★ loop unrolling
+                                                                         ↑ gap: 1.89x
 
   Sieve of Eratosthenes (100K × 500 reps)
   ════════════════════════════════════════
 
-  JDK C2       ████                                              165 ms
-  RustJVM R26  ████████                                          325 ms  ★ OSR + speculative BCE
-                                                                         ↑ gap: 1.97x
+  JDK C2       ████████                                          324 ms
+  CratonVM R26  █████████████                                     510 ms  ★ OSR + speculative BCE
+                                                                         ↑ gap: 1.57x
 
   Matrix 500×500 multiply (125M multiply-adds)
   ═════════════════════════════════════════════
 
-  JDK C2       █████████                                         195 ms
-  RustJVM R26  ████████████                                      260 ms  ★ LICM + compact refs
-                                                                         ↑ gap: 1.34x
+  JDK C2       █████████                                         351 ms
+  CratonVM R26  █████████████                                     518 ms  ★ LICM + compact refs
+                                                                         ↑ gap: 1.48x
 ```
 
 ---
@@ -471,7 +473,7 @@ A Java Virtual Machine written entirely in Rust:
   Phase 5 (R21-25)  BCE + invokevirtual + OSR + SIMD + SoA        COMPLETE
   Phase 6 (R26)     Loop unrolling + speculative BCE + regalloc    COMPLETE
   -----------------------------------------------------------------------
-  Result:           1.41x vs JDK C2 (Fibonacci within 7%)         DONE
+  Result:           1.50x vs JDK C2 (Fibonacci 1.31x)             DONE
 ```
 
 ### Timeline
@@ -480,12 +482,12 @@ A Java Virtual Machine written entirely in Rust:
   Phase 1    Phase 2    Phase 3    Phase 4         Phase 5     Phase 6
   R15-16     R17        R18        R19-20          R21-25      R26
   ------     ------     --------   --------        --------    --------
-  1.93x      fields     LICM       1.8x            1.0x        1.41x
+  1.93x      fields     LICM       1.8x            1.0x        1.50x
   SSE done   done       done       compact refs    SoA+SIMD    unroll+BCE
 
   R8   R10   R14   R16   R18   R20   R22   R24   R25   R26
   JIT  regs  regs  SSE   LICM  comp  virt  SIMD  SoA   unroll
-  97x  0.3x  1.9x  1.9x  ~2x  1.8x  1.8x  ~1.2x 1.0x  1.41x
+  97x  0.3x  1.9x  1.9x  ~2x  1.8x  1.8x  ~1.2x 1.0x  1.50x
 ```
 
 ---
@@ -505,4 +507,4 @@ A Java Virtual Machine written entirely in Rust:
 | Optimization rounds | **26** |
 | Total speedup (small) | **253x** (5064ms → 20ms) |
 | vs JDK -Xint | **~28x FASTER** |
-| vs JDK C2 | **1.41x (Fibonacci within 7%)** |
+| vs JDK C2 | **1.50x QuickBench (Fibonacci 1.31x)** |

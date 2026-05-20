@@ -6,9 +6,9 @@
 //! short-circuit `main`, `activate()`, and `<clinit>` so the JVM exits rc=0
 //! for the boot smoke test.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn cassandra_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[cassandra-shim] entry short-circuited (boot-test mode)");
@@ -16,7 +16,7 @@ fn cassandra_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 }
 
 pub fn register_cassandra_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_CASSANDRA_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_CASSANDRA_REAL").as_deref() == Ok("1") {
         return;
     }
     // Primary boot entry.

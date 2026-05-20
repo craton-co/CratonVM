@@ -61,9 +61,9 @@
 //! This avoids double-close issues.
 
 use parking_lot::{Mutex, RwLock};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -2562,7 +2562,7 @@ mod tests {
         assert!(r.is_err(), "negative timeout must fail");
         match r {
             Err(MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
+                cratonvm_types::error::VmError::Runtime(
                     RuntimeError::IllegalArgumentException { message: _ },
                 ),
             )) => {}
@@ -2664,7 +2664,7 @@ mod tests {
     #[test]
     fn wp3_1_register_real_entry_point_compiles() {
         // Confirm the public registration surface exists.
-        let mut reg = rustjvm_native_api::NativeMethodRegistry::new();
+        let mut reg = cratonvm_native_api::NativeMethodRegistry::new();
         register_nio_selector_real(&mut reg);
         // No assertion on internal counts — just that it runs without panic.
     }

@@ -1,6 +1,6 @@
-# Contributing to RustJVM
+# Contributing to CratonVM
 
-Thank you for your interest in contributing to RustJVM! This document provides guidelines
+Thank you for your interest in contributing to CratonVM! This document provides guidelines
 and information to help you get started.
 
 ## Code of Conduct
@@ -31,7 +31,7 @@ All of the following must pass — CI enforces each one:
 2. **Lint** — `cargo clippy --all-targets -- -D warnings` (zero warnings required)
 3. **Format** — `cargo fmt --all --check`
 4. **Test** — `cargo test --all` (6,000+ tests must pass)
-5. **Coverage** — CI requires 60% line coverage minimum (`cargo llvm-cov`)
+5. **Coverage** — CI requires 65% line coverage minimum (`cargo llvm-cov`)
 6. **Security audit** — `cargo audit` (no known vulnerabilities)
 
 On nightly Rust, CI also runs **Miri** (`cargo miri test --all`) to detect undefined behavior.
@@ -54,9 +54,11 @@ On nightly Rust, CI also runs **Miri** (`cargo miri test --all`) to detect undef
 | `native-builtins` | java.lang.* native methods |
 | `native-collections` | java.util.* native methods |
 | `native-io` | java.io/nio native methods |
-| `native-sql` | java.sql native methods |
+| `native-awt` | AWT/Swing/Java2D native peer implementation |
 | `jit-api` | JIT compiler API types |
 | `jit` | x86-64 / AArch64 JIT compiler |
+| `jit-cuda` | Java bytecode -> PTX lowering for GPU offload |
+| `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
 | `classloading` | Class loading & bytecode verification |
 | `gc` | Garbage collectors (semi-space, G1, ZGC) |
 | `jfr` | Java Flight Recorder |
@@ -156,13 +158,13 @@ When your PR adds a feature, fixes a bug, or changes behavior:
 4. **Test it** — add a `#[test]` in the same file using `TestNativeContext` from
    `native-builtins/src/test_utils.rs`.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full list of planned work.
+See [ROADMAP.md](ROADMAP.md) for the full list of planned work.
 
 ## Reporting Issues
 
-- Use [GitHub Issues](https://github.com/craton-co/rust-jvm/issues) for bug reports and feature requests
+- Use [GitHub Issues](https://github.com/craton-co/cratonvm/issues) for bug reports and feature requests
 - Include the Java source code and `.class` file (or steps to reproduce) for bugs
-- Include the full error output from RustJVM
+- Include the full error output from CratonVM
 
 ## Developer Certificate of Origin (DCO)
 

@@ -91,7 +91,7 @@ jobs:
           distribution: 'temurin'
           java-version: '25'
 
-      - name: Build RustJVM
+      - name: Build CratonVM
         if: steps.jck-check.outputs.skip != 'true'
         run: cargo build --release -p vm-cli
 
@@ -102,8 +102,8 @@ jobs:
           export JCK_HOME="${{ secrets.JCK_HOME }}${{ vars.JCK_HOME }}"
           echo "JCK_HOME=${JCK_HOME}" >> "$GITHUB_ENV"
 
-          # Path to the RustJVM binary
-          echo "RUSTJVM_BIN=$(pwd)/target/release/vm-cli" >> "$GITHUB_ENV"
+          # Path to the CratonVM binary
+          echo "CRATONVM_BIN=$(pwd)/target/release/vm-cli" >> "$GITHUB_ENV"
 
           # Optional: restrict to specific modules
           if [ -n "${{ github.event.inputs.jck_modules }}" ]; then
@@ -113,7 +113,7 @@ jobs:
       - name: Run JCK harness
         if: steps.jck-check.outputs.skip != 'true'
         run: |
-          cargo test --release -p rustjvm-vm --test jck_harness -- \
+          cargo test --release -p cratonvm-vm --test jck_harness -- \
             --ignored --nocapture 2>&1 | tee jck-output.log
 
       - name: Run JCK conformance gate
@@ -124,7 +124,7 @@ jobs:
             echo "Capture-only mode: not enforcing failure threshold."
           else
             export DIVERGENCE_THRESHOLD="${THRESHOLD}"
-            cargo test --release -p rustjvm-vm --test jck_conformance -- \
+            cargo test --release -p cratonvm-vm --test jck_conformance -- \
               --ignored --nocapture
           fi
 
@@ -144,10 +144,10 @@ jobs:
           path: jck-output.log
           if-no-files-found: ignore
 
-  # Differential testing -- runs a subset of classes through both RustJVM
+  # Differential testing -- runs a subset of classes through both CratonVM
   # and HotSpot to detect behavioral divergences.
   differential:
-    name: Differential tests (RustJVM vs HotSpot)
+    name: Differential tests (CratonVM vs HotSpot)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -178,7 +178,7 @@ jobs:
 
       - name: Run differential tests
         run: |
-          cargo test --release -p rustjvm-vm --test differential -- \
+          cargo test --release -p cratonvm-vm --test differential -- \
             --ignored --nocapture 2>&1 | tee differential-output.log
 
       - name: Upload divergence report

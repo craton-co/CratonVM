@@ -502,7 +502,7 @@ Target ~250-350 lines.
 Phase 2 is complete when:
 
 - [ ] `cargo check --workspace` (default) clean
-- [ ] `cargo check --workspace --features rustjvm-vm/gpu-offload` clean
+- [ ] `cargo check --workspace --features cratonvm-vm/gpu-offload` clean
 - [ ] `cargo check -p cuda-bridge --features cuda` clean (validates real backend compiles even if no GPU)
 - [ ] `cargo test -p cuda-bridge` — passes existing 3 tests + new stream/event tests in inline modules
 - [ ] `cargo test -p cuda-bridge --test stub_op_log` — passes Item P2-6's four integration tests

@@ -79,7 +79,7 @@
 
 use std::collections::HashMap;
 
-use rustjvm_types::error::ClassFileError;
+use cratonvm_types::error::ClassFileError;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -133,7 +133,7 @@ pub struct ProxyMethod {
 
 /// Emit a JVMS §4 ClassFile for the given proxy spec. Returns the raw bytes.
 ///
-/// The result is intended to be consumed by `rustjvm_reader::read_class`
+/// The result is intended to be consumed by `cratonvm_reader::read_class`
 /// (round-trip) and `ClassManager::define_class_with_options`.
 ///
 /// v3 layout: emits a `static Method m_<i>` field per `ProxyMethod`,
@@ -1275,7 +1275,7 @@ fn build_method_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_reader::read_class;
+    use cratonvm_reader::read_class;
 
     fn supplier_spec() -> ProxyClassSpec {
         ProxyClassSpec {
@@ -1509,7 +1509,7 @@ mod tests {
     /// empty.
     #[test]
     fn emitted_class_is_straight_line_no_handlers() {
-        use rustjvm_reader::attribute::Attribute;
+        use cratonvm_reader::attribute::Attribute;
 
         let specs = vec![
             // Reference return, no params.

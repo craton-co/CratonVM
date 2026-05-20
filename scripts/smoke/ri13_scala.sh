@@ -26,7 +26,7 @@ JAVA_HOME="$JAVA_HOME_FOR_SMOKE" scalac -d "$FIX_DIR/out" "$FIX_DIR/Hello.scala"
 STDLIB=$(ls "$DIST_DIR"/lib/scala3-library_3-*.jar | head -1)
 SCALA_LIB=$(ls "$DIST_DIR"/lib/scala-library-*.jar | head -1)
 
-SMOKE_TIMEOUT=120 smoke_run_rustjvm \
+SMOKE_TIMEOUT=120 smoke_run_cratonvm \
     --classpath "$FIX_DIR/out:$STDLIB:$SCALA_LIB" \
     -- hello
 

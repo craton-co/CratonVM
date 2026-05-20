@@ -14,13 +14,13 @@
 //! - Round-trip through `CompactValue::decode_by_descriptor` for the
 //!   exact KC26 SIZECTL drift case.
 //!
-//!     cargo test -p rustjvm-vm --test t10_9_e_descriptor_aware -- --nocapture
+//!     cargo test -p cratonvm-vm --test t10_9_e_descriptor_aware -- --nocapture
 
-use rustjvm_gc::heap::coerce_field_value_by_descriptor;
-use rustjvm_vm::classloading::ClassId;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::{CompactValue, Value};
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_gc::heap::coerce_field_value_by_descriptor;
+use cratonvm_vm::classloading::ClassId;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::{CompactValue, Value};
+use cratonvm_vm::vm::SharedVm;
 use std::sync::Arc;
 
 fn shared() -> Arc<SharedVm> {

@@ -1,8 +1,8 @@
 //! Phase 50-54 native method registrations.
 
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{native_noop, native_noop_with_this, native_return_false, native_return_zero, obj_arg, alloc_concurrent_synthetic, build_real_layout_string_hashset};
 use crate::{native_return_null, native_return_first_arg};
@@ -277,7 +277,7 @@ fn native_collections_singleton_list(
     args: &[Value],
 ) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(arr, 0, elem);
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     ctx.set_field(list, 0, Value::Object(Some(arr)));
@@ -302,7 +302,7 @@ fn native_collections_singleton_map(
     // Create HashMap with 1 entry
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
     let cap = 16;
-    let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(map, 0, Value::Object(Some(buckets)));
     ctx.set_field(map, 1, Value::Int(0));
     ctx.set_field(map, 2, Value::Int(cap as i32));
@@ -326,7 +326,7 @@ fn native_collections_enumeration(
 ) -> MethodCallResult {
     // Return empty iterator as enumeration stub
     let itr = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
@@ -343,7 +343,7 @@ fn native_collections_ncopies(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => 0,
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, n);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
     for i in 0..n {
         ctx.set_array_element(arr, i, elem);
     }
@@ -364,21 +364,21 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let cu = "java/util/Collections";
     r.register(cu, "emptyList", "()Ljava/util/List;", |ctx, _args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
     r.register(cu, "emptyMap", "()Ljava/util/Map;", |ctx, _args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(cu, "emptySet", "()Ljava/util/Set;", |ctx, _args| {
         // S111r7: use the native-collections HashSet layout (single
         // `map` field holding the backing HashMap) so real-JDK
         // `HashSet.iterator()` bytecode reads the correct receiver.
-        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(cu, "emptyIterator", "()Ljava/util/Iterator;", |ctx, _args| {
@@ -396,14 +396,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(a))) => *a,
             _ => {
                 let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 ctx.set_field(list, 0, Value::Object(Some(empty)));
                 ctx.set_field(list, 1, Value::Int(0));
                 return Ok(Some(Value::Object(Some(list))));
             }
         };
         let len = ctx.array_length(arr);
-        let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         for i in 0..len {
             let v = ctx.get_array_element(arr, i);
             ctx.set_array_element(new_arr, i, v);
@@ -425,7 +425,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         };
         let new_len = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
         let src_len = ctx.array_length(src);
-        let dst = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_len);
+        let dst = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len);
         let copy_len = src_len.min(new_len);
         for i in 0..copy_len {
             ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
@@ -455,7 +455,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let src_len = ctx.array_length(src);
-            let dst = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_len);
+            let dst = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len);
             let copy_len = src_len.min(new_len);
             for i in 0..copy_len {
                 ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
@@ -472,7 +472,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         };
         let new_len = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
         let src_len = ctx.array_length(src);
-        let dst = ctx.new_array(rustjvm_types::ArrayElementType::Int, new_len);
+        let dst = ctx.new_array(cratonvm_types::ArrayElementType::Int, new_len);
         let copy_len = src_len.min(new_len);
         for i in 0..copy_len {
             ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
@@ -489,7 +489,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let from = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
         let to = match args.get(2) { Some(Value::Int(n)) => *n as usize, _ => 0 };
         let new_len = to.saturating_sub(from);
-        let dst = ctx.new_array(rustjvm_types::ArrayElementType::Reference, new_len);
+        let dst = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len);
         let src_len = ctx.array_length(src);
         for i in 0..new_len {
             if from + i < src_len {
@@ -508,7 +508,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let from = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
         let to = match args.get(2) { Some(Value::Int(n)) => *n as usize, _ => 0 };
         let new_len = to.saturating_sub(from);
-        let dst = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+        let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
         let src_len = ctx.array_length(src);
         for i in 0..new_len {
             if from + i < src_len {
@@ -525,7 +525,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let new_len = match args.get(1) { Some(Value::Int(n)) => *n as usize, _ => 0 };
-        let dst = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+        let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
         let src_len = ctx.array_length(src);
         let copy_len = src_len.min(new_len);
         for i in 0..copy_len {
@@ -902,14 +902,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let li = "java/util/List";
     r.register(li, "of", "()Ljava/util/List;", |ctx, _args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
     r.register(li, "of", "(Ljava/lang/Object;)Ljava/util/List;", |ctx, args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(arr, 0, args.first().copied().unwrap_or(Value::Object(None)));
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(1));
@@ -917,7 +917,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(li, "of", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/List;", |ctx, args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 2);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
         ctx.set_array_element(arr, 0, args.first().copied().unwrap_or(Value::Object(None)));
         ctx.set_array_element(arr, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
         ctx.set_field(list, 0, Value::Object(Some(arr)));
@@ -929,14 +929,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(a))) => *a,
             _ => {
                 let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 ctx.set_field(list, 0, Value::Object(Some(arr)));
                 ctx.set_field(list, 1, Value::Int(0));
                 return Ok(Some(Value::Object(Some(list))));
             }
         };
         let len = ctx.array_length(src);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         for i in 0..len {
             ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
         }
@@ -953,7 +953,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // `AbstractSet.equals()` bytecode finds a HashMap on `getfield map`.
     let si = "java/util/Set";
     r.register(si, "of", "()Ljava/util/Set;", |ctx, _args| {
-        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(si, "of", "([Ljava/lang/Object;)Ljava/util/Set;", |ctx, args| {
@@ -966,7 +966,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 elems.push(ctx.get_array_element(arr, i));
             }
         }
-        let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
+        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(si, "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;", native_return_first_arg);
@@ -975,20 +975,20 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let mi = "java/util/Map";
     r.register(mi, "of", "()Ljava/util/Map;", |ctx, _args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(mi, "of", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;", |ctx, args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         let k = args.first().copied().unwrap_or(Value::Object(None));
         let v = args.get(1).copied().unwrap_or(Value::Object(None));
-        rustjvm_native_collections::native_map_put_pub(ctx, &[Value::Object(Some(map)), k, v]).ok();
+        cratonvm_native_collections::native_map_put_pub(ctx, &[Value::Object(Some(map)), k, v]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(mi, "ofEntries", "([Ljava/util/Map$Entry;)Ljava/util/Map;", |ctx, _args| {
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(mi, "copyOf", "(Ljava/util/Map;)Ljava/util/Map;", native_return_first_arg);
@@ -1097,7 +1097,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let val = ctx.read_string(this).unwrap_or_default();
         // Create an int array of char values
         let chars: Vec<i32> = val.chars().map(|c| c as i32).collect();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, chars.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, chars.len());
         for (i, &c) in chars.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(c));
         }
@@ -1127,7 +1127,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let val = ctx.read_string(this).unwrap_or_default();
         let bytes = val.as_bytes();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -1139,7 +1139,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let val = ctx.read_string(this).unwrap_or_default();
         let bytes = val.as_bytes();
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -1164,7 +1164,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let empty_prefix = ctx.create_string("");
         ctx.set_field(this, 1, Value::Object(Some(empty_prefix)));
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Object(Some(list)));
@@ -1178,7 +1178,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             // Store prefix in field 1 (we'll use suffix from arg 3 at toString time)
             ctx.set_field(this, 1, args.get(2).cloned().unwrap_or(Value::Object(None)));
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(0));
             ctx.set_field(this, 2, Value::Object(Some(list)));
@@ -1200,7 +1200,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         };
         let cap = ctx.array_length(arr);
         if size >= cap {
-            let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap * 2);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap * 2);
             for i in 0..size {
                 let v = ctx.get_array_element(arr, i);
                 ctx.set_array_element(new_arr, i, v);
@@ -1263,7 +1263,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 _ => {
                     // Return empty list
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     ctx.set_field(list, 0, Value::Object(Some(arr)));
                     ctx.set_field(list, 1, Value::Int(0));
                     return Ok(Some(Value::Object(Some(list))));
@@ -1271,7 +1271,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             };
             let len = ctx.array_length(backing);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
             for i in 0..len {
                 let v = ctx.get_array_element(backing, i);
                 ctx.set_array_element(arr, i, v);
@@ -1300,7 +1300,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/List;", |ctx, args| {
         let elem = args.first().cloned().unwrap_or(Value::Object(None));
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 1);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(arr, 0, elem);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(1));
@@ -1311,8 +1311,8 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let key = args.first().cloned().unwrap_or(Value::Object(None));
         let val = args.get(1).cloned().unwrap_or(Value::Object(None));
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        rustjvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
-        rustjvm_native_collections::native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]).ok();
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+        cratonvm_native_collections::native_map_put_pub(ctx, &[Value::Object(Some(map)), key, val]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
     r.register(cu, "singleton",
@@ -1618,7 +1618,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // -----------------------------------------------------------------------
     // Real JDK classes call registerNatives() in their <clinit>. This is a
     // native method that in HotSpot registers JNI method pointers, but in
-    // RustJVM it's a no-op since we register native methods in Rust at startup.
+    // CratonVM it's a no-op since we register native methods in Rust at startup.
     for cls in &[
         "java/lang/ClassLoader",
         "java/lang/invoke/MethodHandleNatives",
@@ -1679,13 +1679,13 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // jdk.internal.misc.VM natives
     r.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);
     // WP1.3: VM.initLevel() reads the process-wide init-level registry
-    // (see rustjvm_native_api::init_level).  Advances as the VM
+    // (see cratonvm_native_api::init_level).  Advances as the VM
     // bootstrap progresses 0 -> 4.  We clamp the visible value to at
     // least 2 because many JDK clinits assume initPhase1 completed;
     // see the matching registration in lib.rs for the rationale.
     r.register("jdk/internal/misc/VM", "initLevel", "()I",
         |_ctx, _args| {
-            let live = rustjvm_native_api::init_level::get_init_level();
+            let live = cratonvm_native_api::init_level::get_init_level();
             Ok(Some(Value::Int(live.max(2))))
         });
     r.register("jdk/internal/misc/VM", "awaitInitLevel", "(I)V",
@@ -1694,7 +1694,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) => *n,
                 _ => 0,
             };
-            rustjvm_native_api::init_level::await_init_level(target);
+            cratonvm_native_api::init_level::await_init_level(target);
             Ok(None)
         });
     r.register("jdk/internal/misc/VM", "getSavedProperty",
@@ -1710,7 +1710,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let props = "java/util/Properties";
     r.register(props, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let data = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 32);
+        let data = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
         ctx.set_field(this, 0, Value::Object(Some(data)));
         ctx.set_field(this, 1, Value::Int(0));
         Ok(None)
@@ -2481,7 +2481,7 @@ fn native_st_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // turned downstream `nextToken()` calls into a spurious
             // NoSuchElementException instead of the expected NPE — see
             // OSGi `Version("null")` mis-parse in Felix bootstrap.
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Cannot invoke \"String.length()\" because \"str\" is null".into()),
             }
             .into());
@@ -2501,7 +2501,7 @@ fn native_st_init_delims(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => {
             // JDK parity: the StringTokenizer constructors dereference the
             // input string (`str.length()`) and throw NPE on a null string.
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Cannot invoke \"String.length()\" because \"str\" is null".into()),
             }
             .into());
@@ -2577,7 +2577,7 @@ fn native_st_next_token(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             let s = ctx.create_string(&token);
             Ok(Some(Value::Object(Some(s))))
         }
-        None => Err(rustjvm_types::error::RuntimeError::NoSuchElementException {
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "StringTokenizer: no more tokens".to_string(),
         }
         .into()),
@@ -2709,7 +2709,7 @@ fn bs_word_count(nbits: usize) -> usize {
 
 fn native_bs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let words = ctx.new_array(rustjvm_types::ArrayElementType::Long, 1);
+    let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, 1);
     ctx.set_field(this, BS_FIELD_WORDS, Value::Object(Some(words)));
     ctx.set_field(this, BS_FIELD_NBITS, Value::Int(64));
     Ok(None)
@@ -2722,7 +2722,7 @@ fn native_bs_init_nbits(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 64,
     };
     let nwords = bs_word_count(nbits).max(1);
-    let words = ctx.new_array(rustjvm_types::ArrayElementType::Long, nwords);
+    let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, nwords);
     ctx.set_field(this, BS_FIELD_WORDS, Value::Object(Some(words)));
     ctx.set_field(this, BS_FIELD_NBITS, Value::Int((nwords * 64) as i32));
     Ok(None)
@@ -2747,7 +2747,7 @@ fn bs_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, bit_index: u
         ctx.set_field(this, BS_FIELD_NBITS, Value::Int(needed as i32));
         return;
     }
-    let new_words = ctx.new_array(rustjvm_types::ArrayElementType::Long, new_len);
+    let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, new_len);
     for i in 0..old_len {
         let v = ctx.get_array_element(old_words, i);
         ctx.set_array_element(new_words, i, v);
@@ -3168,7 +3168,7 @@ fn native_bs_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => 64,
     };
     let clone = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2);
-    let new_words = ctx.new_array(rustjvm_types::ArrayElementType::Long, words.len());
+    let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
     for (i, w) in words.iter().enumerate() {
         ctx.set_array_element(new_words, i, Value::Long(*w));
     }
@@ -3201,7 +3201,7 @@ fn native_bs_value_of_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let len = ctx.array_length(arr);
     let bs = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2);
-    let new_words = ctx.new_array(rustjvm_types::ArrayElementType::Long, len);
+    let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, len);
     for i in 0..len {
         let v = ctx.get_array_element(arr, i);
         ctx.set_array_element(new_words, i, v);
@@ -3219,7 +3219,7 @@ fn native_bs_to_long_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     while logical_len > 0 && words[logical_len - 1] == 0 {
         logical_len -= 1;
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, logical_len);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, logical_len);
     for (i, &w) in words.iter().enumerate().take(logical_len) {
         ctx.set_array_element(arr, i, Value::Long(w));
     }
@@ -3239,7 +3239,7 @@ fn native_bs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
     // Create IntStream as 1-field synthetic (Object[] backing array of boxed ints)
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, set_bits.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, set_bits.len());
     for (i, &b) in set_bits.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b));
     }
@@ -3327,7 +3327,7 @@ pub(crate) fn register_enum_set_natives(r: &mut NativeMethodRegistry) {
 
 fn native_es_none_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     ctx.set_field(backing, 0, Value::Object(Some(arr)));
     ctx.set_field(backing, 1, Value::Int(0));
@@ -3339,7 +3339,7 @@ fn native_es_none_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
 fn native_es_of_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, elem);
     let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     ctx.set_field(backing, 0, Value::Object(Some(arr)));
@@ -3395,7 +3395,7 @@ pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return Ok(Some(Value::Object(Some(set))));
     }
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
@@ -3420,7 +3420,7 @@ pub(crate) fn native_es_of_three(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
 
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 4);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     ctx.set_array_element(arr, 2, e3);
@@ -3449,7 +3449,7 @@ fn native_es_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(backing) = es_get_backing(ctx, this) {
         // Delegate to ArrayList add
-        rustjvm_native_collections::native_al_add(ctx, &[Value::Object(Some(backing)), elem])?;
+        cratonvm_native_collections::native_al_add(ctx, &[Value::Object(Some(backing)), elem])?;
     }
     Ok(Some(Value::Int(1)))
 }
@@ -3528,7 +3528,7 @@ fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Value::Object(Some(o)) => o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let snap = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         for i in 0..size {
             let v = ctx.get_array_element(data, i);
             ctx.set_array_element(snap, i, v);
@@ -3552,14 +3552,14 @@ fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Value::Object(Some(o)) => o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
         for i in 0..size {
             let v = ctx.get_array_element(data, i);
             ctx.set_array_element(arr, i, v);
         }
         return Ok(Some(Value::Object(Some(arr))));
     }
-    let empty = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     Ok(Some(Value::Object(Some(empty))))
 }
 
@@ -3596,7 +3596,7 @@ fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             let comp_cid = ctx.class_id_of_object(arr);
             ctx.new_ref_array(comp_cid, size)
         }
-        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
     };
     if let Some(d) = data {
         let copy = size.min(ctx.array_length(d));
@@ -3628,7 +3628,7 @@ fn native_es_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             }
         };
         let new_arr = ctx.new_array(
-            rustjvm_types::ArrayElementType::Reference,
+            cratonvm_types::ArrayElementType::Reference,
             size.max(4),
         );
         for i in 0..size {
@@ -3655,67 +3655,67 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
         c,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_put_pub,
+        cratonvm_native_collections::native_map_put_pub,
     );
     r.register(
         c,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_get_pub,
+        cratonvm_native_collections::native_map_get_pub,
     );
     r.register(
         c,
         "remove",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_remove_pub,
+        cratonvm_native_collections::native_map_remove_pub,
     );
     r.register(
         c,
         "containsKey",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_key_pub,
+        cratonvm_native_collections::native_map_contains_key_pub,
     );
     r.register(
         c,
         "containsValue",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_value_pub,
+        cratonvm_native_collections::native_map_contains_value_pub,
     );
     r.register(
         c,
         "size",
         "()I",
-        rustjvm_native_collections::native_map_size_pub,
+        cratonvm_native_collections::native_map_size_pub,
     );
     r.register(
         c,
         "isEmpty",
         "()Z",
-        rustjvm_native_collections::native_map_is_empty_pub,
+        cratonvm_native_collections::native_map_is_empty_pub,
     );
     r.register(
         c,
         "clear",
         "()V",
-        rustjvm_native_collections::native_map_clear_pub,
+        cratonvm_native_collections::native_map_clear_pub,
     );
     r.register(
         c,
         "keySet",
         "()Ljava/util/Set;",
-        rustjvm_native_collections::native_map_key_set_pub,
+        cratonvm_native_collections::native_map_key_set_pub,
     );
     r.register(
         c,
         "values",
         "()Ljava/util/Collection;",
-        rustjvm_native_collections::native_map_values_pub,
+        cratonvm_native_collections::native_map_values_pub,
     );
     r.register(
         c,
         "entrySet",
         "()Ljava/util/Set;",
-        rustjvm_native_collections::native_map_entry_set_pub,
+        cratonvm_native_collections::native_map_entry_set_pub,
     );
     r.register(c, "clone", "()Ljava/lang/Object;", native_em_clone);
     // T9 — equals: identity comparison (this == other). Was
@@ -3738,14 +3738,14 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
         c,
         "toString",
         "()Ljava/lang/String;",
-        rustjvm_native_collections::native_map_to_string_pub,
+        cratonvm_native_collections::native_map_to_string_pub,
     );
 }
 
 fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let cap = 16;
-    let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(this, 0, Value::Object(Some(buckets)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, Value::Int(cap as i32));
@@ -3758,7 +3758,7 @@ fn native_em_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let _ = this;
     let em = alloc_concurrent_synthetic(ctx, "java/util/EnumMap", 3);
     let cap = 16;
-    let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
+    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(em, 0, Value::Object(Some(buckets)));
     ctx.set_field(em, 1, Value::Int(0));
     ctx.set_field(em, 2, Value::Int(cap as i32));
@@ -3777,67 +3777,67 @@ pub(crate) fn register_identity_hashmap_natives(r: &mut NativeMethodRegistry) {
         c,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_put_pub,
+        cratonvm_native_collections::native_map_put_pub,
     );
     r.register(
         c,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_get_pub,
+        cratonvm_native_collections::native_map_get_pub,
     );
     r.register(
         c,
         "remove",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_remove_pub,
+        cratonvm_native_collections::native_map_remove_pub,
     );
     r.register(
         c,
         "containsKey",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_key_pub,
+        cratonvm_native_collections::native_map_contains_key_pub,
     );
     r.register(
         c,
         "containsValue",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_value_pub,
+        cratonvm_native_collections::native_map_contains_value_pub,
     );
     r.register(
         c,
         "size",
         "()I",
-        rustjvm_native_collections::native_map_size_pub,
+        cratonvm_native_collections::native_map_size_pub,
     );
     r.register(
         c,
         "isEmpty",
         "()Z",
-        rustjvm_native_collections::native_map_is_empty_pub,
+        cratonvm_native_collections::native_map_is_empty_pub,
     );
     r.register(
         c,
         "clear",
         "()V",
-        rustjvm_native_collections::native_map_clear_pub,
+        cratonvm_native_collections::native_map_clear_pub,
     );
     r.register(
         c,
         "keySet",
         "()Ljava/util/Set;",
-        rustjvm_native_collections::native_map_key_set_pub,
+        cratonvm_native_collections::native_map_key_set_pub,
     );
     r.register(
         c,
         "values",
         "()Ljava/util/Collection;",
-        rustjvm_native_collections::native_map_values_pub,
+        cratonvm_native_collections::native_map_values_pub,
     );
     r.register(
         c,
         "entrySet",
         "()Ljava/util/Set;",
-        rustjvm_native_collections::native_map_entry_set_pub,
+        cratonvm_native_collections::native_map_entry_set_pub,
     );
     // T9 — equals: identity comparison (this == other). Was
     // `native_return_false` which incorrectly returned false for
@@ -3861,7 +3861,7 @@ pub(crate) fn register_identity_hashmap_natives(r: &mut NativeMethodRegistry) {
         c,
         "toString",
         "()Ljava/lang/String;",
-        rustjvm_native_collections::native_map_to_string_pub,
+        cratonvm_native_collections::native_map_to_string_pub,
     );
 }
 
@@ -3878,73 +3878,73 @@ pub(crate) fn register_weak_hashmap_natives(r: &mut NativeMethodRegistry) {
         c,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_put_pub,
+        cratonvm_native_collections::native_map_put_pub,
     );
     r.register(
         c,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_get_pub,
+        cratonvm_native_collections::native_map_get_pub,
     );
     r.register(
         c,
         "remove",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        rustjvm_native_collections::native_map_remove_pub,
+        cratonvm_native_collections::native_map_remove_pub,
     );
     r.register(
         c,
         "containsKey",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_key_pub,
+        cratonvm_native_collections::native_map_contains_key_pub,
     );
     r.register(
         c,
         "containsValue",
         "(Ljava/lang/Object;)Z",
-        rustjvm_native_collections::native_map_contains_value_pub,
+        cratonvm_native_collections::native_map_contains_value_pub,
     );
     r.register(
         c,
         "size",
         "()I",
-        rustjvm_native_collections::native_map_size_pub,
+        cratonvm_native_collections::native_map_size_pub,
     );
     r.register(
         c,
         "isEmpty",
         "()Z",
-        rustjvm_native_collections::native_map_is_empty_pub,
+        cratonvm_native_collections::native_map_is_empty_pub,
     );
     r.register(
         c,
         "clear",
         "()V",
-        rustjvm_native_collections::native_map_clear_pub,
+        cratonvm_native_collections::native_map_clear_pub,
     );
     r.register(
         c,
         "keySet",
         "()Ljava/util/Set;",
-        rustjvm_native_collections::native_map_key_set_pub,
+        cratonvm_native_collections::native_map_key_set_pub,
     );
     r.register(
         c,
         "values",
         "()Ljava/util/Collection;",
-        rustjvm_native_collections::native_map_values_pub,
+        cratonvm_native_collections::native_map_values_pub,
     );
     r.register(
         c,
         "entrySet",
         "()Ljava/util/Set;",
-        rustjvm_native_collections::native_map_entry_set_pub,
+        cratonvm_native_collections::native_map_entry_set_pub,
     );
     r.register(
         c,
         "toString",
         "()Ljava/lang/String;",
-        rustjvm_native_collections::native_map_to_string_pub,
+        cratonvm_native_collections::native_map_to_string_pub,
     );
 }
 
@@ -4675,7 +4675,7 @@ pub(crate) fn register_timezone_natives(r: &mut NativeMethodRegistry) {
         "getAvailableIDs",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 6);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 6);
             let ids = [
                 "UTC",
                 "GMT",
@@ -5271,7 +5271,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(pool, "shutdownNow", "()Ljava/util/List;", |ctx, _args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 10);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
@@ -5847,7 +5847,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     });
     r.register(ses, "shutdownNow", "()Ljava/util/List;", |ctx, _args| {
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 10);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
@@ -6116,7 +6116,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
         "values",
         "()[Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 7);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 7);
             for i in 0..7 {
                 let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
                 ctx.set_field_by_name(tu, "ordinal", Value::Int(i));
@@ -6415,7 +6415,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(month, "values", "()[Ljava/time/Month;", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 12);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
             let m = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
             ctx.set_field(m, MONTH_FIELD_VALUE, Value::Int(i as i32 + 1));
@@ -6616,7 +6616,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(dow, "values", "()[Ljava/time/DayOfWeek;", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 7);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 7);
         for i in 0..7 {
             let d = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
             ctx.set_field(d, 0, Value::Int(i as i32 + 1));
@@ -7083,7 +7083,7 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
         "values",
         "()[Ljava/time/temporal/ChronoUnit;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 16);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             for i in 0..16 {
                 let u = alloc_concurrent_synthetic(ctx, "java/time/temporal/ChronoUnit", 1);
                 ctx.set_field(u, 0, Value::Int(i as i32));
@@ -7828,7 +7828,7 @@ pub(crate) fn register_phase52_rounding_mode(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(rm, "values", "()[Ljava/math/RoundingMode;", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 8);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
         for i in 0..8 {
             let obj = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
             ctx.set_field(obj, 0, Value::Int(i as i32));
@@ -8379,9 +8379,9 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         ctx.set_field(obj, CIPHER_MODE, Value::Int(0));
         ctx.set_field(obj, CIPHER_KEY, Value::Object(None));
         ctx.set_field(obj, CIPHER_IV, Value::Object(None));
-        let acc = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let acc = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(obj, CIPHER_ACCUM, Value::Object(Some(acc)));
-        let aad = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let aad = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(obj, CIPHER_AAD, Value::Object(Some(aad)));
         obj
     }
@@ -8415,9 +8415,9 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, CIPHER_MODE, Value::Int(mode));
         ctx.set_field(this, CIPHER_KEY, Value::Object(Some(key)));
         // Reset accumulators
-        let acc = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let acc = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, CIPHER_ACCUM, Value::Object(Some(acc)));
-        let aad = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let aad = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, CIPHER_AAD, Value::Object(Some(aad)));
         Ok(Some(Value::Object(None)))
     });
@@ -8440,9 +8440,9 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 }
             }
             // Reset accumulators
-            let acc = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let acc = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, CIPHER_ACCUM, Value::Object(Some(acc)));
-            let aad = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let aad = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, CIPHER_AAD, Value::Object(Some(aad)));
             Ok(Some(Value::Object(None)))
         },
@@ -8463,9 +8463,9 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                     ctx.set_field(this, CIPHER_IV, Value::Object(Some(iv_arr)));
                 }
             }
-            let acc = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let acc = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, CIPHER_ACCUM, Value::Object(Some(acc)));
-            let aad = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let aad = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, CIPHER_AAD, Value::Object(Some(aad)));
             Ok(Some(Value::Object(None)))
         },
@@ -8568,7 +8568,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         // Copy the IV bytes
         let iv_arr = obj_arg(args, 1)?;
         let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
         for i in 0..len {
             ctx.set_array_element(copy, i, ctx.get_array_element(iv_arr, i));
         }
@@ -8587,7 +8587,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         let t_len = args[1].as_int().unwrap_or(128);
         let iv_arr = obj_arg(args, 2)?;
         let len = ctx.array_length(iv_arr);
-        let copy = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+        let copy = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
         for i in 0..len {
             ctx.set_array_element(copy, i, ctx.get_array_element(iv_arr, i));
         }
@@ -8735,7 +8735,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             // Reject obviously invalid sizes. Upper bound is generous — the
             // JCE spec allows any positive multiple of 8 up to provider limits.
             if key_size <= 0 || key_size > 1 << 20 || (key_size & 7) != 0 {
-                return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                     message: format!(
                         "KeyGenerator.generateKey: invalid key size {key_size} bits"
                     ),
@@ -8743,14 +8743,14 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 .into());
             }
             let byte_len = (key_size / 8) as usize;
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, byte_len);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_len);
 
             // Fill with cryptographic OS entropy. Fallback loop exists only
             // to bubble up a clear RuntimeException rather than silently
             // producing weak keys if the OS CSPRNG refuses to deliver.
             let mut buf = vec![0u8; byte_len];
             if !crate::crypto_impl::os_random_bytes(&mut buf) {
-                return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                     message: "KeyGenerator.generateKey: OS entropy source unavailable".to_string(),
                 }
                 .into());
@@ -9397,7 +9397,7 @@ fn cipher_append_accum(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
         _ => Vec::new(),
     };
     let new_len = existing.len() + bytes.len();
-    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
     for (i, &b) in existing.iter().chain(bytes.iter()).enumerate() {
         ctx.set_array_element(new_arr, i, Value::Int(b as i8 as i32));
     }
@@ -9411,7 +9411,7 @@ fn cipher_append_aad(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8])
         _ => Vec::new(),
     };
     let new_len = existing.len() + bytes.len();
-    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
     for (i, &b) in existing.iter().chain(bytes.iter()).enumerate() {
         ctx.set_array_element(new_arr, i, Value::Int(b as i8 as i32));
     }
@@ -9577,14 +9577,14 @@ fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallRe
 
     match result_bytes {
         Ok(bytes) => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
             // Reset accumulator
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, CIPHER_ACCUM, Value::Object(Some(empty)));
-            let empty_aad = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let empty_aad = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, CIPHER_AAD, Value::Object(Some(empty_aad)));
             Ok(Some(Value::Object(Some(arr))))
         }
@@ -9659,7 +9659,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Return empty set
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(set))))
         },
@@ -9716,7 +9716,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         "()[Ljava/security/Provider;",
         |ctx, _args| {
             let snapshot: Vec<(String, f64)> = provider_registry_snapshot();
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, snapshot.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, snapshot.len());
             for (i, (name, ver)) in snapshot.iter().enumerate() {
                 let p = make_provider(ctx, name, *ver);
                 ctx.set_array_element(arr, i, Value::Object(Some(p)));
@@ -9856,7 +9856,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 _ => &[],
             };
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, algos.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, algos.len());
             for (i, &algo) in algos.iter().enumerate() {
                 let s = ctx.create_string(algo);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -10007,7 +10007,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 if let Some(ks_data) = crypto_impl::keystore_get(ks_id) {
                     let keys: Vec<String> = ks_data.entries.keys().cloned().collect();
                     if !keys.is_empty() {
-                        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, keys.len());
+                        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
                         for (i, k) in keys.iter().enumerate() {
                             let s = ctx.create_string(k);
                             ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -10240,9 +10240,9 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             // Generate stub keys
             let pub_key = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 1);
             let priv_key = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 1);
-            let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(pub_key, 0, Value::Object(Some(empty)));
-            let empty2 = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let empty2 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(priv_key, 0, Value::Object(Some(empty2)));
             let kp = alloc_concurrent_synthetic(ctx, "java/security/KeyPair", 2);
             ctx.set_field(kp, 0, Value::Object(Some(pub_key)));
@@ -10268,7 +10268,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0)); // uninitialized
             ctx.set_field(obj, 2, Value::Object(None)); // key
-            let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(obj, 3, Value::Object(Some(data))); // accumulated data
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -10283,7 +10283,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Object(None));
-            let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(obj, 3, Value::Object(Some(data)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -10296,7 +10296,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, 1, Value::Int(1)); // sign mode
             ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
-            let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, 3, Value::Object(Some(data)));
             Ok(None)
         },
@@ -10309,7 +10309,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(this, 1, Value::Int(2)); // verify mode
-            let data = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             ctx.set_field(this, 3, Value::Object(Some(data)));
             Ok(None)
         },
@@ -10423,12 +10423,12 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         // match the declared algorithm even though the bytes themselves
         // are HMAC-derived.
         let signature = pad_signature_for_algo(&algo, signature);
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, signature.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, signature.len());
         for (i, &b) in signature.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         // Reset data accumulator
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Object(Some(arr))))
     });
@@ -10500,7 +10500,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             _ => false,
         };
         // Reset data accumulator
-        let empty = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Int(if valid { 1 } else { 0 })))
     });
@@ -10544,7 +10544,7 @@ fn sig_append_data(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
         _ => Vec::new(),
     };
     let new_len = existing.len() + bytes.len();
-    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, new_len);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
     for (i, &b) in existing.iter().chain(bytes.iter()).enumerate() {
         ctx.set_array_element(new_arr, i, Value::Int(b as i8 as i32));
     }
@@ -11446,7 +11446,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             Value::Object(Some(list)) => Ok(Some(Value::Object(Some(list)))),
             _ => {
                 let empty = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 ctx.set_field(empty, 0, Value::Object(Some(arr)));
                 ctx.set_field(empty, 1, Value::Int(0));
                 Ok(Some(Value::Object(Some(empty))))
@@ -11611,7 +11611,7 @@ pub(crate) fn register_phase53_service_loader(r: &mut NativeMethodRegistry) {
     });
     // stream() -> Stream (empty)
     r.register(sl, "stream", "()Ljava/util/stream/Stream;", |ctx, _args| {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
         ctx.set_field(stream, 0, Value::Object(Some(arr)));
         Ok(Some(Value::Object(Some(stream))))
@@ -11649,7 +11649,7 @@ pub(crate) fn register_phase53_sealed(r: &mut NativeMethodRegistry) {
                 .map(|cid| ctx.permitted_subclasses(cid))
                 .unwrap_or_default();
             let arr = ctx.new_array(
-                rustjvm_types::ArrayElementType::Reference,
+                cratonvm_types::ArrayElementType::Reference,
                 names.len(),
             );
             for (i, name) in names.iter().enumerate() {
@@ -11836,7 +11836,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let op = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException { message: Some("IntUnaryOperator is null".into()) }.into()),
+            _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: Some("IntUnaryOperator is null".into()) }.into()),
         };
         loop {
             let cur = ctx.get_field_volatile(this, 0);
@@ -11850,7 +11850,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let op = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException { message: Some("IntUnaryOperator is null".into()) }.into()),
+            _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: Some("IntUnaryOperator is null".into()) }.into()),
         };
         loop {
             let cur = ctx.get_field_volatile(this, 0);
@@ -12061,7 +12061,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let op = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException { message: Some("LongUnaryOperator is null".into()) }.into()),
+            _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: Some("LongUnaryOperator is null".into()) }.into()),
         };
         loop {
             let cur = ctx.get_field_volatile(this, 0);
@@ -12075,7 +12075,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let op = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException { message: Some("LongUnaryOperator is null".into()) }.into()),
+            _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: Some("LongUnaryOperator is null".into()) }.into()),
         };
         loop {
             let cur = ctx.get_field_volatile(this, 0);
@@ -12280,7 +12280,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let op = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
-                _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException { message: Some("UnaryOperator is null".into()) }.into()),
+                _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: Some("UnaryOperator is null".into()) }.into()),
             };
             loop {
                 let cur = ctx.get_field_volatile(this, 0);
@@ -12299,7 +12299,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let op = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
-                _ => return Err(rustjvm_types::error::RuntimeError::NullPointerException { message: Some("UnaryOperator is null".into()) }.into()),
+                _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException { message: Some("UnaryOperator is null".into()) }.into()),
             };
             loop {
                 let cur = ctx.get_field_volatile(this, 0);
@@ -12448,7 +12448,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     r.register(aia, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let len = args[1].as_int().unwrap_or(0) as usize;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Int, len);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(len as i32));
         Ok(Some(Value::Object(None)))
@@ -12551,7 +12551,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     r.register(ala, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let len = args[1].as_int().unwrap_or(0) as usize;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Long, len);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, len);
         ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(len as i32));
         Ok(Some(Value::Object(None)))
@@ -12618,7 +12618,7 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
     r.register(ara, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let len = args[1].as_int().unwrap_or(0) as usize;
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, len);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
         // Use by-name writes so we land on the real `array` slot regardless of
         // how the class layout numbers its fields.
         ctx.set_field_by_name(this, "array", Value::Object(Some(arr)));
@@ -13197,7 +13197,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let hdr_arr = match ctx.get_field(this, 4) {
             Value::Object(Some(a)) => a,
             _ => {
-                let a = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 32);
+                let a = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
                 ctx.set_field(this, 4, Value::Object(Some(a)));
                 a
             }
@@ -13224,7 +13224,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let hdr_arr = match ctx.get_field(this, 4) {
             Value::Object(Some(a)) => a,
             _ => {
-                let a = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 32);
+                let a = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
                 ctx.set_field(this, 4, Value::Object(Some(a)));
                 a
             }
@@ -13254,7 +13254,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         // Return ByteArrayInputStream wrapping response body
         let body_arr = match ctx.get_field(this, 6) {
             Value::Object(Some(a)) => a,
-            _ => ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0),
+            _ => ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
         };
         let len = ctx.array_length(body_arr);
         let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
@@ -13268,7 +13268,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 8, Value::Int(1)); // doOutput = true
         let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
-        let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 4096);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4096);
         ctx.set_field(baos, 0, Value::Object(Some(buf)));
         ctx.set_field(baos, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(baos))))
@@ -13588,7 +13588,7 @@ fn p54_huc_do_request(
 
     // Parse response headers
     let resp_headers: Vec<String> = lines.map(|l| l.to_string()).collect();
-    let hdr_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, resp_headers.len());
+    let hdr_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, resp_headers.len());
     for (i, h) in resp_headers.iter().enumerate() {
         let s = ctx.create_string(h);
         ctx.set_array_element(hdr_arr, i, Value::Object(Some(s)));
@@ -13607,7 +13607,7 @@ fn p54_huc_do_request(
     };
 
     // Store body as byte array
-    let body_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, body_bytes.len());
+    let body_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, body_bytes.len());
     for (i, &b) in body_bytes.iter().enumerate() {
         ctx.set_array_element(body_arr, i, Value::Int(b as i8 as i32));
     }
@@ -14218,7 +14218,7 @@ fn register_chm_tab_natives(r: &mut NativeMethodRegistry) {
 fn chm_tab_index(
     ctx: &dyn NativeContext,
     args: &[Value],
-) -> Option<(rustjvm_types::ObjectRef, usize)> {
+) -> Option<(cratonvm_types::ObjectRef, usize)> {
     let tab = match args.first() {
         Some(Value::Object(Some(a))) => *a,
         _ => return None,
@@ -14323,14 +14323,14 @@ fn native_arraylist_element_data(
                 Some(Value::Int(v)) => *v,
                 _ => -1,
             };
-            return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
                 index: bad,
             }
             .into());
         }
     };
     if idx >= ctx.array_length(data) {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: idx as i32 }
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: idx as i32 }
             .into());
     }
     Ok(Some(ctx.get_array_element(data, idx)))
@@ -14380,25 +14380,25 @@ fn register_arrays_parallel_sort(r: &mut NativeMethodRegistry) {
     );
 }
 
-fn null_arr_npe() -> rustjvm_types::error::MethodCallFailed {
-    rustjvm_types::error::RuntimeError::NullPointerException { message: None }.into()
+fn null_arr_npe() -> cratonvm_types::error::MethodCallFailed {
+    cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into()
 }
 
 fn range_bounds(
     ctx: &dyn NativeContext,
-    arr: rustjvm_types::ObjectRef,
+    arr: cratonvm_types::ObjectRef,
     from: i32,
     to: i32,
-) -> Result<(usize, usize), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(usize, usize), cratonvm_types::error::MethodCallFailed> {
     if from > to {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("fromIndex({from}) > toIndex({to})"),
         }
         .into());
     }
     let len = ctx.array_length(arr);
     if from < 0 || (to as usize) > len {
-        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: from }
+        return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index: from }
             .into());
     }
     Ok((from as usize, to as usize))
@@ -14437,7 +14437,7 @@ fn native_parallel_sort_int_range(
 
 fn parallel_sort_int_slice(
     ctx: &mut dyn NativeContext,
-    arr: rustjvm_types::ObjectRef,
+    arr: cratonvm_types::ObjectRef,
     from: usize,
     to: usize,
 ) {
@@ -14486,7 +14486,7 @@ fn native_parallel_sort_long_range(
 
 fn parallel_sort_long_slice(
     ctx: &mut dyn NativeContext,
-    arr: rustjvm_types::ObjectRef,
+    arr: cratonvm_types::ObjectRef,
     from: usize,
     to: usize,
 ) {
@@ -14535,7 +14535,7 @@ fn native_parallel_sort_double_range(
 
 fn parallel_sort_double_slice(
     ctx: &mut dyn NativeContext,
-    arr: rustjvm_types::ObjectRef,
+    arr: cratonvm_types::ObjectRef,
     from: usize,
     to: usize,
 ) {
@@ -14593,10 +14593,10 @@ fn native_parallel_sort_objects_range(
 /// this is a real polymorphic dispatch, not just pointer comparison.
 fn parallel_sort_objects_slice(
     ctx: &mut dyn NativeContext,
-    arr: rustjvm_types::ObjectRef,
+    arr: cratonvm_types::ObjectRef,
     from: usize,
     to: usize,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if to <= from + 1 {
         return Ok(());
     }
@@ -14605,12 +14605,12 @@ fn parallel_sort_objects_slice(
     // and sort them to the front — mirroring OpenJDK's behavior, which
     // throws NPE if any null is encountered. We replicate that: any
     // null element in the slice is an error.
-    let mut buf: Vec<rustjvm_types::ObjectRef> = Vec::with_capacity(to - from);
+    let mut buf: Vec<cratonvm_types::ObjectRef> = Vec::with_capacity(to - from);
     for i in from..to {
         match ctx.get_array_element(arr, i) {
             Value::Object(Some(r)) => buf.push(r),
             _ => {
-                return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("parallelSort: null element".to_string()),
                 }
                 .into());
@@ -14712,9 +14712,9 @@ fn register_spliterator_primitive_one(
     try_advance_desc: &str,
     for_each_desc: &str,
     try_split_desc: &str,
-    try_advance: rustjvm_native_api::NativeCallback,
-    for_each: rustjvm_native_api::NativeCallback,
-    try_split: rustjvm_native_api::NativeCallback,
+    try_advance: cratonvm_native_api::NativeCallback,
+    for_each: cratonvm_native_api::NativeCallback,
+    try_split: cratonvm_native_api::NativeCallback,
 ) {
     r.register(class, "tryAdvance", try_advance_desc, try_advance);
     r.register(class, "forEachRemaining", for_each_desc, for_each);
@@ -14804,7 +14804,7 @@ enum SplPrim {
     Double,
 }
 
-fn spl_remaining(ctx: &dyn NativeContext, this: rustjvm_types::ObjectRef) -> usize {
+fn spl_remaining(ctx: &dyn NativeContext, this: cratonvm_types::ObjectRef) -> usize {
     let cursor = match ctx.get_field(this, SPL_FIELD_CURSOR) {
         Value::Int(v) => v.max(0) as usize,
         _ => 0,
@@ -14936,12 +14936,12 @@ fn register_scanner_find_within_horizon(r: &mut NativeMethodRegistry) {
 
 fn scanner_find_within_horizon_impl(
     ctx: &mut dyn NativeContext,
-    this: rustjvm_types::ObjectRef,
+    this: cratonvm_types::ObjectRef,
     regex: crate::JavaRegex,
     horizon: i32,
 ) -> MethodCallResult {
     if horizon < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: format!("horizon < 0: {horizon}"),
         }
         .into());
@@ -14994,7 +14994,7 @@ fn native_scanner_find_within_horizon_pattern_int(
     let pattern = match args.get(1) {
         Some(Value::Object(Some(p))) => *p,
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("pattern".to_string()),
             }
             .into());
@@ -15016,7 +15016,7 @@ fn native_scanner_find_within_horizon_string_int(
     let pattern_str = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => {
-            return Err(rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("pattern".to_string()),
             }
             .into());
@@ -15027,8 +15027,8 @@ fn native_scanner_find_within_horizon_string_int(
         _ => 0,
     };
     let regex = crate::compile_java_regex(&pattern_str, 0).map_err(|e| {
-        rustjvm_types::error::MethodCallFailed::from(
-            rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        cratonvm_types::error::MethodCallFailed::from(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
                 message: format!("{e:?}"),
             },
         )
@@ -15043,7 +15043,7 @@ fn native_scanner_find_within_horizon_string_int(
 mod t2_tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_types::ArrayElementType;
+    use cratonvm_types::ArrayElementType;
 
     // -----------------------------------------------------------------------
     // T2.3.13: StringTokenizer.countTokens — O(n) single pass
@@ -15053,7 +15053,7 @@ mod t2_tests {
         ctx: &mut dyn NativeContext,
         input: &str,
         delims: &str,
-    ) -> rustjvm_types::ObjectRef {
+    ) -> cratonvm_types::ObjectRef {
         let st = crate::alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3);
         let input_s = ctx.create_string(input);
         let delim_s = ctx.create_string(delims);
@@ -15115,7 +15115,7 @@ mod t2_tests {
     // T2.3.1: ArraysSupport.vectorizedHashCode
     // -----------------------------------------------------------------------
 
-    fn make_int_array(ctx: &mut dyn NativeContext, data: &[i32]) -> rustjvm_types::ObjectRef {
+    fn make_int_array(ctx: &mut dyn NativeContext, data: &[i32]) -> cratonvm_types::ObjectRef {
         let arr = ctx.new_array(ArrayElementType::Int, data.len());
         for (i, &v) in data.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(v));
@@ -15315,7 +15315,7 @@ mod t2_tests {
     fn make_ref_array(
         ctx: &mut dyn NativeContext,
         values: &[Value],
-    ) -> rustjvm_types::ObjectRef {
+    ) -> cratonvm_types::ObjectRef {
         let arr = ctx.new_array(ArrayElementType::Reference, values.len());
         for (i, v) in values.iter().enumerate() {
             ctx.set_array_element(arr, i, *v);
@@ -15402,7 +15402,7 @@ mod t2_tests {
     fn make_arraylist(
         ctx: &mut dyn NativeContext,
         values: &[Value],
-    ) -> rustjvm_types::ObjectRef {
+    ) -> cratonvm_types::ObjectRef {
         let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
         let data = make_ref_array(ctx, values);
         ctx.set_field(list, 0, Value::Object(Some(data)));
@@ -15537,7 +15537,7 @@ mod t2_tests {
     fn make_int_spliterator(
         ctx: &mut dyn NativeContext,
         data: &[i32],
-    ) -> rustjvm_types::ObjectRef {
+    ) -> cratonvm_types::ObjectRef {
         let arr = make_int_array(ctx, data);
         let spl = crate::alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2);
         ctx.set_field(spl, SPL_FIELD_DATA, Value::Object(Some(arr)));
@@ -15598,7 +15598,7 @@ mod t2_tests {
     fn make_scanner(
         ctx: &mut dyn NativeContext,
         text: &str,
-    ) -> rustjvm_types::ObjectRef {
+    ) -> cratonvm_types::ObjectRef {
         let sc = crate::alloc_concurrent_synthetic(ctx, "java/util/Scanner", 3);
         let s = ctx.create_string(text);
         ctx.set_field(sc, SC_FIELD_SOURCE, Value::Object(Some(s)));

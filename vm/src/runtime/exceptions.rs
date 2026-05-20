@@ -10,7 +10,7 @@ use crate::types::{ObjectRef, Value};
 use crate::vm::{create_java_string, invoke_on_class_shared, SharedVm};
 use std::sync::OnceLock;
 
-/// Cached read of the `RUSTJVM_IAE_TRACE` env var. Env-var lookups are
+/// Cached read of the `CRATONVM_IAE_TRACE` env var. Env-var lookups are
 /// surprisingly expensive (mutex + string alloc on some platforms); the
 /// exception-throw hot path is sensitive to per-throw overhead, so we read
 /// once at first use and cache the boolean. Process-lifetime cache: setting
@@ -19,7 +19,7 @@ static IAE_TRACE: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn iae_trace_enabled() -> bool {
-    *IAE_TRACE.get_or_init(|| std::env::var("RUSTJVM_IAE_TRACE").is_ok())
+    *IAE_TRACE.get_or_init(|| std::env::var("CRATONVM_IAE_TRACE").is_ok())
 }
 
 /// Resolve `Throwable.detailMessage` (or any inherited String field by
@@ -212,7 +212,7 @@ pub fn throw_runtime_error(
     // skipped when DEBUG-level tracing is not active. The env-var checks
     // are additionally cached in a `OnceLock<bool>` (see
     // `iae_trace_enabled`) so the eprintln-style stack dumps that only
-    // fire under `RUSTJVM_IAE_TRACE` cost a single atomic load + branch
+    // fire under `CRATONVM_IAE_TRACE` cost a single atomic load + branch
     // instead of a syscall + heap alloc.
     if tracing::enabled!(tracing::Level::DEBUG) {
         let frame = thread.frames.last();
@@ -459,7 +459,7 @@ pub fn convert_class_not_found(
     class_name: &str,
     err: MethodCallFailed,
 ) -> MethodCallFailed {
-    if std::env::var_os("RUSTJVM_DBG_NCDFE").is_some() {
+    if std::env::var_os("CRATONVM_DBG_NCDFE").is_some() {
         eprintln!("[NCDFE] class={} err={:?}", class_name, err);
         let cm = shared.class_manager.read();
         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {

@@ -9,9 +9,9 @@
 //! smoke test. The actual server is started by Jetty's `start.Main`, which
 //! is already shimmed in `jetty_extras.rs`.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn solr_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[solr-shim] entry short-circuited (boot-test mode)");
@@ -19,7 +19,7 @@ fn solr_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 }
 
 pub fn register_solr_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_SOLR_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_SOLR_REAL").as_deref() == Ok("1") {
         return;
     }
     // Solr 9.x entry classes — the actual server invokes the Jetty start.Main

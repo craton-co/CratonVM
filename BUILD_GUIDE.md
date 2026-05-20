@@ -1,12 +1,12 @@
-# RustJVM — Build & Run Guide
+# CratonVM — Build & Run Guide
 
 ## Project Overview
 
-RustJVM is a Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
+CratonVM is a Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
 
 **Project stats:**
 - **~323,000+ lines** of Rust across ~200+ files
-- 14 crates: `reader`, `types`, `native-api`, `native-builtins`, `native-collections`, `native-io`, `native-sql`, `jit-api`, `jit`, `classloading`, `gc`, `vm`, `vm-cli`, `jfr`
+- 16 crates: `reader`, `types`, `native-api`, `native-collections`, `native-io`, `native-builtins`, `native-awt`, `jit-api`, `jit`, `jit-cuda`, `cuda-bridge`, `classloading`, `gc`, `vm`, `vm-cli`, `jfr`
 - **6,000+ tests** passing, **0** clippy warnings
 - **~3,100+ native method** registrations
 - **~7,200 lines** of JIT compiler code (custom x86-64)
@@ -42,7 +42,7 @@ cargo build --all-targets
 cargo build --release --all-targets
 
 # Output binary
-target/release/rustjvm-cli    # or target/debug/rustjvm-cli
+target/release/cratonvm    # or target/debug/cratonvm
 ```
 
 **Build times:**
@@ -62,11 +62,11 @@ RUST_MIN_STACK=8388608 cargo test --all -- --test-threads=4
 cargo test --all
 
 # Specific crate
-cargo test -p rustjvm-vm
-cargo test -p rustjvm-reader
+cargo test -p cratonvm-vm
+cargo test -p cratonvm-reader
 
 # Specific test
-cargo test -p rustjvm-vm -- test_name
+cargo test -p cratonvm-vm -- test_name
 ```
 
 **Expected:** 6,000+ tests pass, 0 failures.
@@ -90,10 +90,10 @@ cargo fmt --all            # auto-fix
 
 ```bash
 # Run a compiled .class file
-cargo run --release -p rustjvm-cli -- --classpath . ClassName
+cargo run --release -p cratonvm-cli -- --classpath . ClassName
 
 # Run the benchmark suite
-cargo run --release -p rustjvm-cli -- --classpath bench QuickBench
+cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
 ```
 
 **Compile Java test classes:**
@@ -108,7 +108,7 @@ javac -source 8 -target 8 bench/*.java
 
 ```bash
 # Run QuickBench (fib42, sieve*500, matrix 500x500, arithmetic 300M)
-cargo run --release -p rustjvm-cli -- --classpath bench QuickBench
+cargo run --release -p cratonvm-cli -- --classpath bench QuickBench
 
 # Compare with JDK
 java -cp bench QuickBench          # JDK C2 (full JIT) — baseline
@@ -117,7 +117,7 @@ java -Xint -cp bench QuickBench    # JDK interpreter only
 
 **Expected results (vs HotSpot JDK 25 C2):**
 
-| Benchmark | JDK 25 C2 | RustJVM | Ratio |
+| Benchmark | JDK 25 C2 | CratonVM | Ratio |
 |-----------|-----------|---------|-------|
 | Arithmetic 300M | 889 ms | 1,676 ms | 1.89x |
 | Fibonacci(42) | 1,876 ms | 2,457 ms | 1.31x |
@@ -132,16 +132,18 @@ java -Xint -cp bench QuickBench    # JDK interpreter only
 ## Project Structure
 
 ```
-rustjvm/
+cratonvm/
   reader/              # .class file parser
   types/               # Shared types (Value, ClassId, ObjectRef)
   native-api/          # NativeContext trait & FD table
   native-builtins/     # java.lang.* native methods
   native-collections/  # java.util.* native methods
   native-io/           # java.io/nio native methods
-  native-sql/          # java.sql native methods
+  native-awt/          # AWT/Swing/Java2D native peers
   jit-api/             # JIT compiler API types
   jit/                 # x86-64 / AArch64 JIT compiler
+  jit-cuda/            # Java bytecode -> PTX lowering for GPU offload
+  cuda-bridge/         # Thin CUDA Driver API bridge for GPU offload
   classloading/        # Class loading & bytecode verification
   gc/                  # Garbage collectors (semi-space, G1, ZGC)
   jfr/                 # Java Flight Recorder
@@ -190,4 +192,4 @@ After any changes:
 1. `cargo build --all-targets` — compiles
 2. `cargo clippy --all-targets -- -D warnings` — 0 warnings
 3. `RUST_MIN_STACK=8388608 cargo test --all -- --test-threads=4` — all tests pass
-4. `cargo run --release -p rustjvm-cli -- --classpath bench QuickBench` — benchmark runs
+4. `cargo run --release -p cratonvm-cli -- --classpath bench QuickBench` — benchmark runs

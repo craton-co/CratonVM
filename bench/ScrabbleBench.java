@@ -3,7 +3,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 
 /**
- * Standalone Scrabble benchmark — simplified for RustJVM compatibility.
+ * Standalone Scrabble benchmark — simplified for CratonVM compatibility.
  * Scores Shakespeare words using Scrabble letter values.
  */
 public class ScrabbleBench {

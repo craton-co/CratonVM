@@ -2,7 +2,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 
 /**
- * Comprehensive benchmark suite for RustJVM vs OpenJDK comparison.
+ * Comprehensive benchmark suite for CratonVM vs OpenJDK comparison.
  * All benchmarks use System.currentTimeMillis() for portable timing.
  * Compiled with: javac --release 8 Benchmark.java
  */
@@ -170,7 +170,7 @@ public class Benchmark {
     // Runner
     // ========================================================================
     public static void main(String[] args) {
-        System.out.println("=== RustJVM Performance Benchmark ===");
+        System.out.println("=== CratonVM Performance Benchmark ===");
         System.out.println();
 
         long total = 0;
