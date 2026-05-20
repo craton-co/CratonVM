@@ -1,4 +1,4 @@
-//! Process-lifetime cache for the `RUSTJVM_*` debug/trace environment
+//! Process-lifetime cache for the `CRATONVM_*` debug/trace environment
 //! variables that are read from interpreter and JIT hot paths.
 //!
 //! `std::env::var` / `std::env::var_os` are surprisingly expensive on every
@@ -12,7 +12,7 @@
 //! Reading any of these flags on every JIT entry, frame push/pop, branch or
 //! exception throw burns measurable CPU and serialises threads on the libc
 //! env-lock. Since the flags are only meant to be set once at process start
-//! (`RUSTJVM_FRAME_TRACE=1 java …`), we cache the parsed boolean (or value)
+//! (`CRATONVM_FRAME_TRACE=1 java …`), we cache the parsed boolean (or value)
 //! the first time it is read and serve every subsequent query from the
 //! cached `OnceLock`. Setting the variable after the first read will have
 //! no effect — same semantics as `runtime::exceptions::iae_trace_enabled`,
@@ -55,7 +55,7 @@ macro_rules! cached_is_ok {
 
 // ── Flags read from the JIT entry / dispatch hot path ───────────────────
 
-/// `RUSTJVM_DISABLE_JIT` — kill-switch that forces interpreter-only
+/// `CRATONVM_DISABLE_JIT` — kill-switch that forces interpreter-only
 /// execution. Read at every `jit_invoke_dispatch` call, every OSR
 /// candidate, and several other JIT entry points. Semantics: treat empty
 /// or `"0"` as disabled, anything else as enabled — same as the original
@@ -63,46 +63,46 @@ macro_rules! cached_is_ok {
 #[inline]
 pub fn disable_jit() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("RUSTJVM_DISABLE_JIT") {
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_DISABLE_JIT") {
         Ok(v) => !v.is_empty() && v != "0",
         Err(_) => false,
     })
 }
 
-cached_is_set!(jit_dispatch_dbg, "RUSTJVM_DBG_JIT_DISPATCH");
-cached_is_set!(jit_mic_dbg, "RUSTJVM_DBG_JIT_MIC");
-cached_is_set!(jit_entry_dbg, "RUSTJVM_DBG_JIT_ENTRY");
-cached_is_set!(letsgo_dbg, "RUSTJVM_DBG_LETSGO");
+cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
+cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
+cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
+cached_is_set!(letsgo_dbg, "CRATONVM_DBG_LETSGO");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 
-cached_is_set!(frame_trace, "RUSTJVM_FRAME_TRACE");
-cached_is_set!(iae_trace_os, "RUSTJVM_IAE_TRACE");
-cached_is_set!(bd_debug, "RUSTJVM_BD_DEBUG");
-cached_is_set!(nocode_dbg, "RUSTJVM_DBG_NOCODE");
-cached_is_set!(nsme_dbg, "RUSTJVM_DBG_NSME");
-cached_is_set!(cce_dbg, "RUSTJVM_DBG_CCE");
-cached_is_set!(lambda_dbg, "RUSTJVM_DBG_LAMBDA");
-cached_is_set!(resume_pc_dbg, "RUSTJVM_DBG_RESUME_PC");
+cached_is_set!(frame_trace, "CRATONVM_FRAME_TRACE");
+cached_is_set!(iae_trace_os, "CRATONVM_IAE_TRACE");
+cached_is_set!(bd_debug, "CRATONVM_BD_DEBUG");
+cached_is_set!(nocode_dbg, "CRATONVM_DBG_NOCODE");
+cached_is_set!(nsme_dbg, "CRATONVM_DBG_NSME");
+cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");
+cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
+cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
-cached_is_ok!(trace_sb_filter, "RUSTJVM_TRACE_SB_FILTER");
-cached_is_ok!(nsee_trace, "RUSTJVM_NSEE_TRACE");
-cached_is_ok!(iae_trace, "RUSTJVM_IAE_TRACE");
-cached_is_ok!(athrow_dbg, "RUSTJVM_DBG_ATHROW");
-cached_is_ok!(npe_invoke_dbg, "RUSTJVM_DBG_NPE_INVOKE");
+cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
+cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
+cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
+cached_is_ok!(athrow_dbg, "CRATONVM_DBG_ATHROW");
+cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 
-// ── `RUSTJVM_STRICT_SWALLOWS` is read for its value, not just presence ──
+// ── `CRATONVM_STRICT_SWALLOWS` is read for its value, not just presence ──
 
-/// `RUSTJVM_STRICT_SWALLOWS=1` switches several diagnostic sites into a
+/// `CRATONVM_STRICT_SWALLOWS=1` switches several diagnostic sites into a
 /// hard-fail mode for swallowed exceptions. Cached as a single bool —
 /// only the literal `"1"` is honoured (matching the existing call sites
 /// `... .as_deref() == Some("1")`).
 #[inline]
 pub fn strict_swallows() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("RUSTJVM_STRICT_SWALLOWS") {
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_STRICT_SWALLOWS") {
         Ok(v) => v == "1",
         Err(_) => false,
     })

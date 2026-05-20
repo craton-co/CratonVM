@@ -1,4 +1,4 @@
-# Clippy configuration for RustJVM
+# Clippy configuration for CratonVM
 # See https://doc.rust-lang.org/clippy/lint_configuration.html
 
 # MSRV — clippy uses this to avoid suggesting features unavailable on older toolchains

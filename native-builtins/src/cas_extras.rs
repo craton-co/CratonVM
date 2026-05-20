@@ -37,9 +37,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_CAS_WEB: &str = "org/apereo/cas/CasWebApplication";
 const CN_CAS_SHELL: &str = "org/apereo/cas/CasCommandLineShellApplication";
@@ -65,11 +65,11 @@ fn cas_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_cas_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_CAS_REAL=1, skip the short-circuit
+    // Diagnostic gate: when CRATONVM_CAS_REAL=1, skip the short-circuit
     // so the real CAS main runs (lets us measure how far CratonVM gets
     // through the Spring Boot autoconfiguration chain).
-    if std::env::var("RUSTJVM_CAS_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[cas-shim] RUSTJVM_CAS_REAL=1 — skipping shim registration, running real CAS");
+    if std::env::var("CRATONVM_CAS_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[cas-shim] CRATONVM_CAS_REAL=1 — skipping shim registration, running real CAS");
         return;
     }
     // CasWebApplication.main — primary server entry point.

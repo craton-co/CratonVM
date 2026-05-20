@@ -3,12 +3,12 @@
 //! Provides metadata structures for GraalVM native-image configuration
 //! (reflection, resources, JNI, proxies, serialization) and compatibility
 //! stubs so that code targeting GraalVM's Substrate VM APIs can run on
-//! RustJVM without native-image.
+//! CratonVM without native-image.
 
 use parking_lot::RwLock;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 use std::collections::HashMap;
 
 /// Escape a string for safe JSON embedding. Handles `"`, `\`, and control chars.
@@ -1215,9 +1215,9 @@ pub(crate) fn register_graalvm_compat_natives(r: &mut NativeMethodRegistry) {
         graalvm_feature_register,
     );
 
-    // --- RustJVM extension: metadata dump ---
+    // --- CratonVM extension: metadata dump ---
     r.register(
-        "rustjvm/graalvm/MetadataAgent",
+        "cratonvm/graalvm/MetadataAgent",
         "dumpConfigs",
         "(Ljava/lang/String;)I",
         graalvm_dump_metadata,
@@ -2054,7 +2054,7 @@ mod tests {
         init_graalvm_metadata();
         graalvm_register_reflection("com.example.Test", true, false);
 
-        // Per-test tempdir so parallel tests don't share "rustjvm_graalvm_test"
+        // Per-test tempdir so parallel tests don't share "cratonvm_graalvm_test"
         // in $TMP and clobber each other's dumps.  TempDir cleans up on drop.
         let tmp = tempfile::TempDir::new().expect("create per-test tempdir");
         let dir = tmp.path();

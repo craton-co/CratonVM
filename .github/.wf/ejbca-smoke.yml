@@ -59,8 +59,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build rustjvm (release)
-        run: cargo build --release -p rustjvm-cli
+      - name: Build cratonvm (release)
+        run: cargo build --release -p cratonvm-cli
 
       - name: Install jq (for diff-baseline.sh robust parsing)
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -68,8 +68,8 @@ jobs:
       - name: Stage EJBCA minimum fixture
         run: bash bench/wildfly/stage-ejbca-min.sh
 
-      - name: Run under rust-jvm
-        run: bash bench/wildfly/run-under-rustjvm.sh
+      - name: Run under cratonvm
+        run: bash bench/wildfly/run-under-cratonvm.sh
 
       - name: Diff against baseline
         id: diff

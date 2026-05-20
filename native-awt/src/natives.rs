@@ -8,9 +8,9 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::edt;
 use crate::edt::InvokeAndWaitError;
@@ -1164,7 +1164,20 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             let w = w_raw as u32;
             let h = h_raw as u32;
             let it = match get_int(args, 3) { 1 => ImageType::IntRgb, 3 => ImageType::IntArgbPre, _ => ImageType::IntArgb };
-            let img_id = image::image_registry().create(w, h, it);
+            // `create` returns `None` when `w * h` overflows the `u32`
+            // pixel count (image larger than ~65535x65535). Surface that as
+            // a Java `OutOfMemoryError` instead of panicking in the multiply.
+            let img_id = match image::image_registry().create(w, h, it) {
+                Some(id) => id,
+                None => {
+                    return Err(RuntimeError::OutOfMemoryError {
+                        message: format!(
+                            "BufferedImage pixel buffer too large: {w}x{h}"
+                        ),
+                    }
+                    .into());
+                }
+            };
             ctx.set_field_by_name(this, "imageId", Value::Long(img_id.0 as i64));
             ctx.set_field_by_name(this, "width", Value::Int(w as i32));
             ctx.set_field_by_name(this, "height", Value::Int(h as i32));
@@ -1185,20 +1198,25 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/awt/image/BufferedImage", "getRGB", "(II)I", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
-            // Compare as signed `i32` before the `as u32` cast — a negative
-            // Java coordinate would otherwise wrap to ~4 billion and index OOB.
-            let (x_raw, y_raw) = (get_int(args, 1), get_int(args, 2));
+            // Java `int` coordinates: validate the *signed* values before any
+            // `as u32` cast, so a negative coordinate is rejected rather than
+            // wrapping to a huge index. Mirrors `BufferedImage.getRGB`'s
+            // documented `ArrayIndexOutOfBoundsException` contract.
+            let (x, y) = (get_int(args, 1), get_int(args, 2));
             if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
                 let reg = image::image_registry();
                 if let Some(img) = reg.get(image::ImageId(id as u64)) {
-                    let (iw, ih) = (img.width() as i32, img.height() as i32);
-                    if x_raw < 0 || x_raw >= iw || y_raw < 0 || y_raw >= ih {
+                    let (w, h) = (img.width() as i32, img.height() as i32);
+                    if x < 0 || y < 0 || x >= w || y >= h {
+                        // Match the JDK: the index reported is the offending
+                        // linear pixel index `y * width + x`.
+                        let index = (y as i64) * (w as i64) + (x as i64);
                         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                            index: if x_raw < 0 || x_raw >= iw { x_raw } else { y_raw },
+                            index: index as i32,
                         }
                         .into());
                     }
-                    return int_ok(img.get_rgb(x_raw as u32, y_raw as u32) as i32);
+                    return int_ok(img.get_rgb(x as u32, y as u32) as i32);
                 }
             }
         }
@@ -1206,20 +1224,20 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/awt/image/BufferedImage", "setRGB", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
-            // Compare as signed `i32` before the `as u32` cast — see getRGB.
-            let (x_raw, y_raw) = (get_int(args, 1), get_int(args, 2));
-            let argb = get_int(args, 3) as u32;
+            // Validate signed coordinates before casting (see `getRGB`).
+            let (x, y, argb) = (get_int(args, 1), get_int(args, 2), get_int(args, 3) as u32);
             if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
                 let mut reg = image::image_registry();
                 if let Some(img) = reg.get_mut(image::ImageId(id as u64)) {
-                    let (iw, ih) = (img.width() as i32, img.height() as i32);
-                    if x_raw < 0 || x_raw >= iw || y_raw < 0 || y_raw >= ih {
+                    let (w, h) = (img.width() as i32, img.height() as i32);
+                    if x < 0 || y < 0 || x >= w || y >= h {
+                        let index = (y as i64) * (w as i64) + (x as i64);
                         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
-                            index: if x_raw < 0 || x_raw >= iw { x_raw } else { y_raw },
+                            index: index as i32,
                         }
                         .into());
                     }
-                    img.set_rgb(x_raw as u32, y_raw as u32, argb);
+                    img.set_rgb(x as u32, y as u32, argb);
                 }
             }
         }
@@ -1299,7 +1317,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                 Some(a) => a,
                 None => {
                     let len = needed.max(0).min(i32::MAX as i64) as usize;
-                    ctx.new_array(rustjvm_types::ArrayElementType::Int, len)
+                    ctx.new_array(cratonvm_types::ArrayElementType::Int, len)
                 }
             };
             let arr_len = ctx.array_length(arr) as i64;
@@ -1325,7 +1343,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // `initIDs` natives cache JNI field/method IDs for the real JDK image
-    // classes. RustJVM resolves fields by name, so no IDs need caching —
+    // classes. CratonVM resolves fields by name, so no IDs need caching —
     // register these as no-ops so the real-JDK `<clinit>` of each class can
     // complete (it would otherwise throw UnsatisfiedLinkError).
     for class in [

@@ -1,4 +1,4 @@
-//! AWT/Swing/Java2D native peer implementation for RustJVM.
+//! AWT/Swing/Java2D native peer implementation for CratonVM.
 //!
 //! This crate provides the native method implementations that back Java's
 //! desktop GUI stack: AWT (Abstract Window Toolkit), Swing, and Java2D.
@@ -57,7 +57,7 @@ pub mod swing;
 pub mod edt;
 pub mod natives;
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 /// Register all AWT/Swing/Java2D native methods with the VM.
 pub fn register_awt_natives(registry: &mut NativeMethodRegistry) {

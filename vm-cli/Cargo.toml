@@ -1,5 +1,5 @@
 [package]
-name = "rustjvm-cli"
+name = "cratonvm-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,27 +7,27 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Command-line launcher for the RustJVM"
+description = "Command-line launcher for the CratonVM"
 readme = "../README.md"
 
 [[bin]]
-name = "rustjvm"
+name = "cratonvm"
 path = "src/main.rs"
 
-# Same launcher as `rustjvm`; built as `java.exe` so Maven Surefire's
+# Same launcher as `cratonvm`; built as `java.exe` so Maven Surefire's
 # `<jvm>` / `-Djvm=` validation (path must end with `java` / `java.exe`) accepts it.
 [[bin]]
 name = "java"
 path = "src/main.rs"
 
 [dependencies]
-rustjvm-vm = { path = "../vm" }
-rustjvm-native-api = { path = "../native-api" }
+cratonvm-vm = { path = "../vm" }
+cratonvm-native-api = { path = "../native-api" }
 # Direct dep so vm-cli can install the pre-`std::process::exit` hook on
 # `native_system_exit` (see `lang_system::set_pre_exit_hook`) — used to
 # dump the dispatch_trace ring before silent System.exit calls so the
 # last Java method is visible in stderr for diagnosis.
-rustjvm-native-builtins = { path = "../native-builtins" }
+cratonvm-native-builtins = { path = "../native-builtins" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
@@ -56,10 +56,10 @@ default = ["mimalloc"]
 # with `--no-default-features`.
 mimalloc = ["dep:mimalloc"]
 # Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
-synthetic-jdk = ["rustjvm-vm/synthetic-jdk"]
+synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
 # Expose --gpu* flags and link cuda-bridge in stub mode. Probing the
 # device returns DeviceError::NoDriver but the CLI surface exists.
-gpu = ["dep:cuda-bridge", "rustjvm-vm/gpu-offload"]
+gpu = ["dep:cuda-bridge", "cratonvm-vm/gpu-offload"]
 # As above, plus the real CUDA driver bindings via cudarc.
 gpu-driver = ["gpu", "cuda-bridge/cuda"]
 

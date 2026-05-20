@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn file_output_creates_file() {
-        let dir = std::env::temp_dir().join("rustjvm_unified_log_test");
+        let dir = std::env::temp_dir().join("cratonvm_unified_log_test");
         let _ = std::fs::create_dir_all(&dir);
         let log_path = dir.join("test.log");
         // Clean up from previous runs

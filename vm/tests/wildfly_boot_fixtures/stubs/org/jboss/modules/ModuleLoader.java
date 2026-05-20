@@ -6,7 +6,7 @@ package org.jboss.modules;
  * Mirrors the synthetic class shape declared in
  * classloading/src/class_manager.rs at line ~3817 (single `root`
  * field).  Only the surface needed by JBossModulesProbe is declared
- * here; the rust-jvm runtime substitutes the actual native
+ * here; the cratonvm runtime substitutes the actual native
  * implementation registered in
  * native-builtins/src/jboss_module_loader.rs.
  */

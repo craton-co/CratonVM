@@ -7,7 +7,7 @@
 //! ```text
 //! java.lang.NullPointerException
 //!     at sun.awt.Win32GraphicsEnvironment.<clinit>(...)
-//! [rustjvm] process terminating rc=1
+//! [cratonvm] process terminating rc=1
 //! ```
 //!
 //! Win32GraphicsEnvironment cannot initialize off-Windows, and CratonVM
@@ -54,9 +54,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 // Primary jar entry point (from BlueJ-540.jar MANIFEST: Main-Class: Installer).
 const CN_INSTALLER: &str = "Installer";
@@ -98,11 +98,11 @@ fn bluej_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_bluej_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_BLUEJ_REAL=1, skip all short-circuits so
+    // Diagnostic gate: when CRATONVM_BLUEJ_REAL=1, skip all short-circuits so
     // the real BlueJ entry classes execute under CratonVM. Used to measure
     // how far the real boot path gets without our shims masking failures.
-    if std::env::var("RUSTJVM_BLUEJ_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[bluej-shim] RUSTJVM_BLUEJ_REAL=1 — skipping shim registration, running real BlueJ");
+    if std::env::var("CRATONVM_BLUEJ_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[bluej-shim] CRATONVM_BLUEJ_REAL=1 — skipping shim registration, running real BlueJ");
         return;
     }
     // Primary: jar MANIFEST entry point.

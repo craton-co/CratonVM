@@ -49,8 +49,8 @@
 
 use std::sync::Arc;
 
-use rustjvm_reader::constant_pool::ConstantPoolEntry;
-use rustjvm_reader::instruction::Instruction;
+use cratonvm_reader::constant_pool::ConstantPoolEntry;
+use cratonvm_reader::instruction::Instruction;
 use tracing::trace;
 
 use crate::classloading::resolution::{
@@ -132,7 +132,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     .unwrap_or_default()
                     // Truncation-checked: nanos since epoch fits u64 until year ~2554
                     .as_nanos() as u64;
-                rustjvm_jfr::builtin::emit_gc_event(
+                cratonvm_jfr::builtin::emit_gc_event(
                     &mut jfr,
                     1, // gc_id
                     "YoungGC",
@@ -140,7 +140,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     now_ns.saturating_sub(gc_duration_ms * 1_000_000),
                     gc_duration_ms * 1_000_000,
                 );
-                rustjvm_jfr::builtin::emit_young_gc_event(
+                cratonvm_jfr::builtin::emit_young_gc_event(
                     &mut jfr,
                     1,
                     15, // default tenuring threshold
@@ -149,7 +149,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 );
                 // Truncation-checked: heap bytes (usize) to i64; heaps > 8 EiB are unrealistic
                 let heap_used = i64::try_from(shared.heap.allocated_bytes()).unwrap_or(i64::MAX);
-                rustjvm_jfr::builtin::emit_gc_heap_summary_event(
+                cratonvm_jfr::builtin::emit_gc_heap_summary_event(
                     &mut jfr,
                     1,
                     "After GC",
@@ -543,12 +543,12 @@ fn gc_alloc_object(
     class_id: ClassId,
     num_fields: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    use rustjvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+    use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
 
     let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
 
     // TLAB fast path: try thread-local bump allocation (no lock)
-    let obj = if total_size <= rustjvm_gc::tlab::tlab_max_alloc() {
+    let obj = if total_size <= cratonvm_gc::tlab::tlab_max_alloc() {
         if let Some(ptr) = tlab_alloc_object(thread, shared, class_id, num_fields, total_size) {
             ptr
         } else {
@@ -625,7 +625,7 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
 ///
 /// T19.3.G1 (GC allocation-storm): the refill size consulted here is
 /// adaptive — after the first refill on a given thread the tracker
-/// inside the thread's [`rustjvm_gc::Tlab`] recommends the next size
+/// inside the thread's [`cratonvm_gc::Tlab`] recommends the next size
 /// based on fill time and alloc count, so a thread that just burned
 /// through 64 KB in under a millisecond gets a 128 KB chunk next
 /// time and so on up to the documented cap. Each refill bumps
@@ -671,21 +671,21 @@ fn tlab_alloc_object(
         // First allocation on this thread — no history yet. Use the
         // "start big" baseline so a static-init burst doesn't refill
         // three times before the sizer gets a chance to weigh in.
-        rustjvm_gc::tlab::initial_refill_size()
+        cratonvm_gc::tlab::initial_refill_size()
     } else {
         // Subsequent refill — consult the thread-local pressure
         // tracker attached to the just-retired TLAB.
         let n = thread.tlab.next_refill_size();
         // Never fall below the documented floor even if the tracker
         // somehow returns zero (pathological input).
-        n.max(rustjvm_gc::tlab::min_tlab_size())
+        n.max(cratonvm_gc::tlab::min_tlab_size())
     };
 
     let refill = shared.heap.refill_tlab(requested);
     if let Some((buf, size)) = refill {
         shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
-        thread.tlab = unsafe { rustjvm_gc::Tlab::new(buf, size) };
+        thread.tlab = unsafe { cratonvm_gc::Tlab::new(buf, size) };
         // Start the new refill-window timer so `next_refill_size`
         // measures this TLAB's lifetime from the moment we installed it.
         thread.tlab.begin_refill(size);
@@ -719,7 +719,7 @@ fn tlab_alloc_object(
 /// fast path into agreement with them.
 #[inline(always)]
 fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identity_hash_code: i32) {
-    use rustjvm_gc::heap::{ObjectHeader, ObjectKind, ArrayElementType};
+    use cratonvm_gc::heap::{ObjectHeader, ObjectKind, ArrayElementType};
     let header = ObjectHeader {
         class_id,
         kind: ObjectKind::Object,
@@ -733,7 +733,7 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
         gc_flags: 0,
         _gc_reserved: [0; 2],
         forwarding_ptr: std::ptr::null_mut(),
-        mark_word: std::sync::atomic::AtomicU64::new(rustjvm_types::MARK_NEUTRAL),
+        mark_word: std::sync::atomic::AtomicU64::new(cratonvm_types::MARK_NEUTRAL),
     };
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
@@ -746,7 +746,7 @@ fn alloc_object_shared(
     class_id: ClassId,
     num_fields: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    use rustjvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+    use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
     let total_size = HEADER_SIZE + num_fields.saturating_mul(SLOT_SIZE);
     if let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) {
         // T19.3.G1 — slow-path bytes count toward the allocation rate
@@ -988,7 +988,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let (old_gen_base, old_gen_size) = shared.heap.old_gen_info();
 
     // Create a temporary concurrent marker for this cycle
-    let marker = rustjvm_gc::ConcurrentMarker::new(old_gen_base, old_gen_size);
+    let marker = cratonvm_gc::ConcurrentMarker::new(old_gen_base, old_gen_size);
 
     // Phase 1: Initial Mark — brief STW pause
     let initial_mark_done = shared.gc_barrier.brief_stw(
@@ -1084,7 +1084,7 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
             // Mark roots into the G1 mark bitmap
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let all_roots: Vec<rustjvm_types::ObjectRef> = roots
+            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
                 .into_iter()
                 .chain(snapshot_roots.into_iter())
                 .collect();
@@ -1289,7 +1289,7 @@ pub fn execute(
     }
 
     // letsgo postmortem instrumentation: record every bytecode-method
-    // entry into the global dispatch ring. Gated by `RUSTJVM_DBG_LETSGO=1`
+    // entry into the global dispatch ring. Gated by `CRATONVM_DBG_LETSGO=1`
     // (cheap atomic-bool check on the disabled path).
     if crate::dispatch_trace::is_enabled() {
         let class_name_owned = shared
@@ -1309,13 +1309,20 @@ pub fn execute(
         eprintln!("[interpreter::execute] class_id={:?} method={} desc={} args.len={}",
                   class_id, method_name, method_descriptor, args.len());
     }
-    // RUSTJVM_IAE_TRACE: log args when executing AnnotationScopeMetadataResolver.<init>
-    if crate::runtime::env_cache::iae_trace_os() {
+    // CRATONVM_IAE_TRACE: log args when executing AnnotationScopeMetadataResolver.<init>
+    //
+    // Perf: the eprintln! only ever fires for `<init>` methods, so gate the
+    // env-flag check + `class_manager.read()` RwLock acquire + `to_string()`
+    // allocation behind the cheap `method_name == "<init>"` predicate first.
+    // For every non-`<init>` call (the overwhelming majority) this path now
+    // does zero work even when CRATONVM_IAE_TRACE is set. Behaviour is
+    // identical — `method_name == "<init>"` was already a required conjunct.
+    if method_name == "<init>" && crate::runtime::env_cache::iae_trace_os() {
         let class_name_for_trace = shared.class_manager.read()
             .get_class(class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        if class_name_for_trace.contains("AnnotationScopeMetadataResolver") && method_name == "<init>" {
+        if class_name_for_trace.contains("AnnotationScopeMetadataResolver") {
             eprintln!("[execute] {}.{}{} args={:?}", class_name_for_trace, method_name, method_descriptor, args);
         }
     }
@@ -1500,7 +1507,7 @@ pub fn execute(
                             .unwrap_or(false)
                     };
                     if recv_cid == ClassId::new(0)
-                        || recv_kind == rustjvm_types::ObjectKind::Array
+                        || recv_kind == cratonvm_types::ObjectKind::Array
                         || recv_is_iface
                     {
                         // Map well-known interfaces -> canonical concrete
@@ -1704,9 +1711,9 @@ pub fn execute(
             .native_methods
             .find(&class_name_str, method_name, method_descriptor)
             .is_some();
-        // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+        // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
-        // `try_osr` so the user-facing RUSTJVM_DISABLE_JIT flag actually disables
+        // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
         let env_disable_jit = crate::runtime::env_cache::disable_jit();
         if env_disable_jit || already_skipped || static_skip_reason.is_some() || fjp_skip || native_skip {
@@ -2109,7 +2116,7 @@ pub fn execute(
                         // `Arc<str>` once and pass it to the `_arc` variant so
                         // the emit path doesn't re-do `Arc::from(&str)`.
                         let method_arc: Arc<str> = Arc::from(buf.as_str());
-                        rustjvm_jfr::builtin::emit_compilation_event_arc(
+                        cratonvm_jfr::builtin::emit_compilation_event_arc(
                             &mut jfr, method_arc,
                             1, // compile_id
                             2, // tier (C2-equivalent)
@@ -2780,6 +2787,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     exc_pc =
                                         thread.frames[frame_idx].last_instr_pc;
                                 } else {
+                                    // Perf: the previous `exc_class` / `caller` /
+                                    // `mname` bindings here each took a
+                                    // `class_manager.read()` RwLock + `to_string()`
+                                    // allocation on every top-frame exception
+                                    // unwind, but their values were never used
+                                    // (no trace site consumed them). Dropped —
+                                    // behaviour is identical (pure, discarded
+                                    // computations).
                                     return Err(MethodCallFailed::ExceptionThrown(
                                         current_exc,
                                     ));
@@ -4586,7 +4601,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
         );
 
         // K1 diagnostic: capture per-opcode context (class, method, pc, opcode byte).
-        // Debug-only and further gated at runtime by RUSTJVM_DEBUG_STACK_TAG=1;
+        // Debug-only and further gated at runtime by CRATONVM_DEBUG_STACK_TAG=1;
         // release builds compile update_diag_ctx to an empty function.
         #[cfg(debug_assertions)]
         {
@@ -4737,19 +4752,12 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         current_exc,
                     ) {
                         Some((handler_pc, exc_ref)) => {
-                            // Trace when QuarkusEntryPoint catches an exception
-                            {
-                                let caller_name = shared.class_manager.read()
-                                    .get_class(thread.frames[frame_idx].class_id)
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_default();
-                                if caller_name.contains("uarkus") {
-                                    let exc_class = shared.class_manager.read()
-                                        .get_class(shared.heap.class_id_of(current_exc))
-                                        .map(|c| c.name.to_string())
-                                        .unwrap_or_default();
-                                }
-                            }
+                            // Perf: a leftover Quarkus trace block here took a
+                            // `class_manager.read()` RwLock + `to_string()` on
+                            // every exception caught by a handler, plus a second
+                            // RwLock + alloc for the (also-unused) `exc_class`.
+                            // The trace site was empty, so all of it was dead
+                            // computation. Dropped — behaviour is identical.
                             thread.frames[frame_idx].stack.clear();
                             thread.frames[frame_idx]
                                 .stack
@@ -4776,16 +4784,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 // it is current at any throw site reachable from this path.
                                 exc_pc = thread.frames[frame_idx].last_instr_pc;
                             } else {
-                                // Trace exception propagation out of top frame
-                                let exc_class = shared.class_manager.read()
-                                    .get_class(shared.heap.class_id_of(current_exc))
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_default();
-                                let caller = shared.class_manager.read()
-                                    .get_class(thread.frames[frame_idx].class_id)
-                                    .map(|c| c.name.to_string())
-                                    .unwrap_or_default();
-                                let mname = thread.frames[frame_idx].method_name().to_string();
+                                // Perf: the previous `exc_class` / `caller` /
+                                // `mname` bindings here each took a
+                                // `class_manager.read()` RwLock + `to_string()`
+                                // allocation on every top-frame exception
+                                // propagation, but their values were never used
+                                // (no trace site consumed them). Dropped —
+                                // behaviour is identical (pure, discarded
+                                // computations).
                                 return Err(MethodCallFailed::ExceptionThrown(current_exc));
                             }
                         }
@@ -6596,11 +6602,13 @@ fn execute_instruction(
             maybe_gc(shared, thread);
         }
         Instruction::Arraylength => {
-            let class_id = thread.frames[frame_idx].class_id;
             let pc = thread.frames[frame_idx].pc;
-            let current_class_name = shared.class_manager.read()
-                .get_class(class_id)
-                .map(|c| c.name.to_string()).unwrap_or_default();
+            // Perf: the class name is already cached on the Frame as an
+            // `Arc<str>` (see `Frame::class_name`), so read it from there
+            // instead of re-acquiring the `class_manager` RwLock on every
+            // `arraylength` opcode. `frame.class_name()` returns exactly the
+            // same value as `class_manager.get_class(class_id).name`.
+            let current_class_name = thread.frames[frame_idx].class_name().to_string();
             let mname = thread.frames[frame_idx].method_name().to_string();
             let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
             // S111r14 diag: print full Java stack trace on arraylength failure
@@ -6718,7 +6726,7 @@ fn execute_instruction(
                             }
                         }
                     }
-                    // RUSTJVM_DBG_ATHROW=1 — env-gated dump of every Java
+                    // CRATONVM_DBG_ATHROW=1 — env-gated dump of every Java
                     // exception throw (class name, detailMessage, and a
                     // short stack trace). Useful when an exception is
                     // caught by an outer handler that swallows it and the
@@ -6757,13 +6765,13 @@ fn execute_instruction(
                     // Round-5 MED-fix (Bug 6, 2026-05-17): emit
                     // `jdk.JavaErrorThrow` for `java.lang.Error` subclasses.
                     // The emit fn was previously dead code. Gated by
-                    // `rustjvm_jfr::is_enabled()` so the disabled path is
+                    // `cratonvm_jfr::is_enabled()` so the disabled path is
                     // ~3 ns (one Acquire load + branch). We only fire for a
                     // small whitelist of well-known `Error` types so the
                     // `class_name` argument can stay `&'static str` (per
                     // the emit-fn API contract — Errors are a fixed
                     // taxonomy).
-                    if rustjvm_jfr::is_enabled() {
+                    if cratonvm_jfr::is_enabled() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .class_manager
@@ -6812,7 +6820,7 @@ fn execute_instruction(
                                 .unwrap_or_default()
                                 .as_nanos() as u64;
                             let mut jfr = shared.flight_recorder.lock();
-                            rustjvm_jfr::builtin::emit_java_error_throw_event(
+                            cratonvm_jfr::builtin::emit_java_error_throw_event(
                                 &mut jfr,
                                 class_name,
                                 message,
@@ -6941,10 +6949,10 @@ fn execute_instruction(
                                 || obj_class_name == "java/lang/Object";
                         if is_classloader_target && obj_is_bare_object {
                             if let Some(loader_obj) =
-                                rustjvm_native_builtins::classloader::peek_app_loader()
+                                cratonvm_native_builtins::classloader::peek_app_loader()
                             {
                                 tracing::debug!(
-                                    target: "rustjvm::interp::checkcast",
+                                    target: "cratonvm::interp::checkcast",
                                     "S-trinity #1 — substituting app ClassLoader for cid=0 \
                                      Object on checkcast → {}",
                                     target_class_name,
@@ -7052,7 +7060,7 @@ fn execute_instruction(
         //     the `pop_object_ref_ctx_with` closure only fires on a
         //     stack-shape error (the names live in the frame as `&str`).
         // Gate every cold piece of work behind a single cached AtomicBool
-        // (`rustjvm_jfr::is_enabled()`) and rebuild the diagnostic context
+        // (`cratonvm_jfr::is_enabled()`) and rebuild the diagnostic context
         // lazily from `&str` borrows inside the closure that actually needs
         // it.  Borrowing through a fresh borrow scope avoids the
         // `thread.frames[..]`-borrow-while-also-mut-borrowing-stack issue.
@@ -7085,7 +7093,7 @@ fn execute_instruction(
             // matching exit can decide whether to emit a paired event
             // without re-reading the global flag (which may have flipped
             // mid-critical-section — round-7 vm #5).
-            let jfr_on = rustjvm_jfr::is_enabled();
+            let jfr_on = cratonvm_jfr::is_enabled();
             let mon_start = if jfr_on {
                 Some(std::time::Instant::now())
             } else {
@@ -7106,7 +7114,7 @@ fn execute_instruction(
                     // frame already holds an `Arc<str>` for the class name
                     // (`frame.class_name_arc()`), so this is a refcount
                     // bump instead of a `memcpy + alloc`.
-                    rustjvm_jfr::builtin::emit_monitor_enter_event_arc(
+                    cratonvm_jfr::builtin::emit_monitor_enter_event_arc(
                         &mut jfr,
                         thread.frames[frame_idx].class_name_arc(),
                         "unknown",
@@ -7245,7 +7253,7 @@ pub fn synthetic_implements_public(
 /// ClassId).
 pub(crate) fn proxy_instance_satisfies_target(
     shared: &SharedVm,
-    obj_ref: rustjvm_types::ObjectRef,
+    obj_ref: cratonvm_types::ObjectRef,
     target_class_name: &str,
 ) -> bool {
     use crate::runtime::proxy::PROXY_FIELD_INTERFACES;
@@ -7269,7 +7277,7 @@ pub(crate) fn proxy_instance_satisfies_target(
     }
 
     let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
-        rustjvm_types::Value::Object(Some(a)) => a,
+        cratonvm_types::Value::Object(Some(a)) => a,
         _ => {
             // Unknown — no interfaces stored. Fall back to old liberal rule
             // for safety so we don't regress proxies that never went through
@@ -7285,7 +7293,7 @@ pub(crate) fn proxy_instance_satisfies_target(
         .ok();
     for i in 0..n {
         let mirror = match shared.heap.get_array_element(interfaces_arr, i) {
-            Ok(rustjvm_types::Value::Object(Some(m))) => m,
+            Ok(cratonvm_types::Value::Object(Some(m))) => m,
             _ => continue,
         };
         // Read the `name` String off the Class mirror via the heap (slot 0
@@ -7366,8 +7374,8 @@ fn lambda_proxy_satisfies(
 /// Compute the JVM array descriptor (e.g. `"[I"`, `"[Ljava/lang/String;"`)
 /// for a heap object that is known to be an array. Returns `None` if the
 /// object is not actually an array.
-pub(crate) fn array_descriptor_of(shared: &SharedVm, obj_ref: rustjvm_types::ObjectRef) -> Option<String> {
-    if shared.heap.kind_of(obj_ref) != rustjvm_types::ObjectKind::Array {
+pub(crate) fn array_descriptor_of(shared: &SharedVm, obj_ref: cratonvm_types::ObjectRef) -> Option<String> {
+    if shared.heap.kind_of(obj_ref) != cratonvm_types::ObjectKind::Array {
         return None;
     }
     let et = shared.heap.element_type_of(obj_ref);
@@ -8605,7 +8613,7 @@ fn execute_invoke_kind(
     let receiver_class_id = if !is_special {
         match &args[0] {
             Value::Object(Some(obj_ref)) => {
-                if shared.heap.kind_of(*obj_ref) == rustjvm_types::ObjectKind::Array {
+                if shared.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
                     None // Don't cache array dispatches — component class_id would conflict
                 } else {
                     Some(shared.heap.class_id_of(*obj_ref))
@@ -8627,7 +8635,7 @@ fn execute_invoke_kind(
                 // Arrays store the component class_id in their header, but
                 // method dispatch must go through java.lang.Object (JVMS §4.4.1).
                 // Check heap kind first to avoid misrouting clone()/toString()/etc.
-                if shared.heap.kind_of(*obj_ref) == rustjvm_types::ObjectKind::Array {
+                if shared.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
                     // S111r8: an Object[] array (cid=0 component class)
                     // being dispatched for a non-Object method like
                     // iterator()/hasNext()/size() typically means a
@@ -8858,7 +8866,7 @@ fn execute_invoke_kind(
                                 .class_manager
                                 .read()
                                 .get_loaded_class_id("java/lang/Class")
-                                .unwrap_or(rustjvm_types::ClassId::new(0));
+                                .unwrap_or(cratonvm_types::ClassId::new(0));
                             let arr = gc_alloc_array(
                                 shared,
                                 thread,
@@ -9055,7 +9063,7 @@ fn execute_invoke_kind(
         && !is_special
         && matches!(
             args.first(),
-            Some(Value::Object(Some(r))) if shared.heap.kind_of(*r) == rustjvm_types::ObjectKind::Object
+            Some(Value::Object(Some(r))) if shared.heap.kind_of(*r) == cratonvm_types::ObjectKind::Object
         )
     {
         if let Value::Object(Some(ann_ref)) = &args[0] {
@@ -9275,12 +9283,20 @@ fn coerce_arg(
     }
     // SAM = reference (e.g. Object), impl = primitive — unbox.
     if is_reference_desc(sam_tok) && is_primitive_desc(impl_tok) {
-        let ch = impl_tok.chars().next().unwrap();
+        let ch = impl_tok.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_arg".to_string(),
+            })
+        })?;
         return Ok(unbox_wrapper(shared, ch, v));
     }
     // SAM = primitive, impl = reference — box.
     if is_primitive_desc(sam_tok) && is_reference_desc(impl_tok) {
-        let ch = sam_tok.chars().next().unwrap();
+        let ch = sam_tok.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_arg".to_string(),
+            })
+        })?;
         return box_primitive(shared, thread, ch, v);
     }
     // Primitive widening (e.g. I -> J) — best-effort.
@@ -9342,13 +9358,21 @@ pub fn coerce_return(
     }
     // SAM expects reference (Object/Integer/etc), impl returned primitive — box.
     if is_reference_desc(sam_ret) && is_primitive_desc(impl_ret) {
-        let ch = impl_ret.chars().next().unwrap();
+        let ch = impl_ret.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_return".to_string(),
+            })
+        })?;
         let boxed = box_primitive(shared, thread, ch, raw)?;
         return Ok(Some(boxed));
     }
     // SAM expects primitive, impl returned reference — unbox.
     if is_primitive_desc(sam_ret) && is_reference_desc(impl_ret) {
-        let ch = sam_ret.chars().next().unwrap();
+        let ch = sam_ret.chars().next().ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "empty primitive descriptor token in coerce_return".to_string(),
+            })
+        })?;
         return Ok(Some(unbox_wrapper(shared, ch, raw)));
     }
     // Both primitive: maybe widen.
@@ -9489,7 +9513,7 @@ pub(crate) fn try_lambda_dispatch(
     };
     if crate::runtime::env_cache::lambda_dbg() {
         eprintln!(
-            "[rustjvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
+            "[cratonvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
             obj_class_id,
             call_site.functional_interface,
             method_name,
@@ -9684,9 +9708,9 @@ pub(crate) fn try_lambda_dispatch(
         for desc in &descriptors {
             if let Some(callback) = shared.native_methods.find(iface, method_name, desc) {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+                let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
                 let result = callback(&mut ctx, &full_args);
-                rustjvm_native_api::native_ring::record_exit(_ring_idx);
+                cratonvm_native_api::native_ring::record_exit(_ring_idx);
                 let result = result?;
                 return Ok(Some(result));
             }
@@ -9723,7 +9747,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
-                    "[rustjvm-dbg] lambda static-pre-invoke: {}.{}{} args={}",
+                    "[cratonvm-dbg] lambda static-pre-invoke: {}.{}{} args={}",
                     call_site.impl_handle.class_name,
                     call_site.impl_handle.member_name,
                     call_site.impl_handle.descriptor,
@@ -9740,7 +9764,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
-                    "[rustjvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
+                    "[cratonvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
                     call_site.impl_handle.class_name,
                     call_site.impl_handle.member_name,
                     call_site.impl_handle.descriptor,
@@ -10044,13 +10068,13 @@ fn invoke_cached_native_callback(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
-    callback: rustjvm_native_api::NativeCallback,
+    callback: cratonvm_native_api::NativeCallback,
     args: &[Value],
     method_descriptor: &str,
 ) -> Result<(), MethodCallFailed> {
-    let _ring_idx = rustjvm_native_api::native_ring::record_enter(callback as usize);
+    let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
     let result = crate::vm::safe_native_call(shared, thread, callback, args);
-    rustjvm_native_api::native_ring::record_exit(_ring_idx);
+    cratonvm_native_api::native_ring::record_exit(_ring_idx);
     let result = result?;
     if let Some(value) = result {
         let ret = crate::jit::return_type(method_descriptor);
@@ -10163,7 +10187,7 @@ fn surefire_lazy_launcher_discover_native(
     method_name: &str,
     descriptor: &str,
     recv_obj: ObjectRef,
-) -> Option<rustjvm_native_api::NativeCallback> {
+) -> Option<cratonvm_native_api::NativeCallback> {
     const DESC_DISCOVER: &str =
         "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;";
     const LAZY: &str = "org/apache/maven/surefire/junitplatform/LazyLauncher";
@@ -10348,8 +10372,8 @@ fn try_stackless_invoke(
             let pc = f.pc;
             let b = f.code.get(pc).copied().unwrap_or(0);
             tracing::error!(
-                target: "rustjvm_vm::dbg_resume_pc",
-                "[RUSTJVM_DBG_RESUME_PC] after stackless native enhance: caller {}.{}\n\
+                target: "cratonvm_vm::dbg_resume_pc",
+                "[CRATONVM_DBG_RESUME_PC] after stackless native enhance: caller {}.{}\n\
                  caller_pc={} next_bytecode=0x{:02x}",
                 f.class_name(),
                 f.method_name(),
@@ -10671,6 +10695,43 @@ fn execute_invokestatic(
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
+    }
+
+    // GPU offload hook (Part E). Behind `gpu-offload`: with the
+    // feature off, the entire block is removed by the preprocessor
+    // and `execute_invokestatic` falls through to the existing CPU
+    // path unchanged. On Hit we consult the OffloadCache; the actual
+    // marshal-and-launch glue is deliberately scoped to a separate
+    // follow-up because it needs real GPU hardware to validate — see
+    // `crate::runtime::offload::try_dispatch` for the contract.
+    #[cfg(feature = "gpu-offload")]
+    {
+        if shared.config.gpu_offload_enabled
+            && shared
+                .offload_registry
+                .get_or_create(shared.config.gpu_device_ordinal, &shared.config)
+                .has_device()
+        {
+            match crate::runtime::offload::try_dispatch(
+                shared,
+                thread,
+                frame_idx,
+                &method_class_name,
+                &method_name,
+                &method_descriptor,
+                &args,
+            )? {
+                crate::runtime::offload::DispatchOutcome::Handled => {
+                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThrough => {
+                    // Method is ineligible / blacklisted / launch
+                    // deopted. Run the CPU path below; the operand
+                    // stack and locals are untouched.
+                }
+            }
+        }
     }
 
     // Try stackless frame push for bytecode methods
@@ -11126,10 +11187,10 @@ fn try_osr(
     class_id: ClassId,
     entry_pc: usize,
 ) -> Option<Option<Value>> {
-    // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
     // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
-    // RUSTJVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
+    // CRATONVM_DISABLE_JIT flag actually disables ALL three JIT entry points.
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
@@ -11161,7 +11222,7 @@ fn try_osr(
                 .find(|m| &*m.name == method_name_check)
                 .and_then(|m| {
                     m.attributes.iter().find_map(|a| match a.as_decoded() {
-                        Some(rustjvm_reader::attribute::Attribute::Code(ca)) => Some(&ca.code),
+                        Some(cratonvm_reader::attribute::Attribute::Code(ca)) => Some(&ca.code),
                         _ => None,
                     })
                 })
@@ -11699,9 +11760,9 @@ fn try_jit_upgrade_with_gate(
     cached: &Arc<CachedBytecodeMethod>,
     gate: RedefineGate,
 ) -> Option<CachedInvokeTarget> {
-    // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Mirrors the gate in `try_jit_compile_callee` so the user-facing
-    // RUSTJVM_DISABLE_JIT flag actually disables BOTH JIT entry points
+    // CRATONVM_DISABLE_JIT flag actually disables BOTH JIT entry points
     // (the caller-method counter path here, and the dispatcher path there).
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
@@ -12189,7 +12250,7 @@ pub fn try_jit_compile_callee(
     method_name: &str,
     descriptor: &str,
 ) -> Option<(usize, bool)> {
-    // Kill-switch: RUSTJVM_DISABLE_JIT=1 forces interpreter-only execution.
+    // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
         return None;
@@ -12353,7 +12414,7 @@ pub fn try_jit_compile_callee(
     let helpers = crate::jit::helpers::build_helpers();
 
     // Build inline resolver for method inlining (Session 31)
-    let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<rustjvm_jit::InlineSite> {
+    let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<cratonvm_jit::InlineSite> {
         resolve_inline_site(shared, callee_class, callee_method, callee_desc)
     };
 
@@ -12390,7 +12451,7 @@ pub fn try_jit_compile_callee(
             "{}::{}{}",
             cached.class_name, cached.method_name, cached.method_descriptor
         ));
-        rustjvm_jfr::builtin::emit_compilation_event_arc(
+        cratonvm_jfr::builtin::emit_compilation_event_arc(
             &mut jfr,
             method_desc,
             1,     // compile_id
@@ -12491,8 +12552,8 @@ fn resolve_inline_site(
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
-) -> Option<rustjvm_jit::InlineSite> {
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+) -> Option<cratonvm_jit::InlineSite> {
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     let cm = shared.class_manager.read();
     let callee_class_id = cm.find_class_by_name(callee_class)?;
@@ -12509,7 +12570,7 @@ fn resolve_inline_site(
     }
     let code_attr = method.code()?;
     let code_len = code_attr.code.len();
-    if code_len > rustjvm_jit::MAX_INLINE_BYTECODE_SIZE {
+    if code_len > cratonvm_jit::MAX_INLINE_BYTECODE_SIZE {
         return None;
     }
     if !code_attr.exception_table.is_empty() {
@@ -12642,14 +12703,14 @@ fn resolve_inline_site(
 
     let num_params = count_method_params(callee_desc);
     let callee_num_args = num_params + if is_static { 0 } else { 1 };
-    let return_type = rustjvm_jit::return_type(callee_desc);
+    let return_type = cratonvm_jit::return_type(callee_desc);
     let needs_heap = has_field_ops || has_static_field_ops;
 
     let padded = crate::runtime::frame::padded_bytecode(&code_bytes);
 
     drop(cm);
 
-    Some(rustjvm_jit::InlineSite {
+    Some(cratonvm_jit::InlineSite {
         callee_code: padded.to_vec(),
         callee_code_len: code_len,
         callee_max_locals: callee_max_locals,
@@ -13021,7 +13082,7 @@ fn execute_invokevirtual_vtable_fast(
 
     // Arrays go through java/lang/Object — don't dispatch via the
     // receiver's array-component vtable. Let the slow path handle it.
-    if shared.heap.kind_of(receiver_obj) == rustjvm_types::ObjectKind::Array {
+    if shared.heap.kind_of(receiver_obj) == cratonvm_types::ObjectKind::Array {
         return Ok(CachedCallResult::CacheMiss);
     }
     let receiver_class_id = shared.heap.class_id_of(receiver_obj);
@@ -13267,7 +13328,7 @@ fn native_override_for_cached_reflect_invoke(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
-) -> Option<rustjvm_native_api::NativeCallback> {
+) -> Option<cratonvm_native_api::NativeCallback> {
     match (class_name, method_name, descriptor) {
         (
             "java/lang/reflect/Method",
@@ -14481,7 +14542,7 @@ mod tests {
     /// check is caught at `cargo test` time without needing a full VM.
     #[test]
     fn tco_suppressed_when_invoke_pc_lies_inside_handler_range() {
-        use rustjvm_reader::attribute::ExceptionTableEntry;
+        use cratonvm_reader::attribute::ExceptionTableEntry;
         let table: &[ExceptionTableEntry] = &[ExceptionTableEntry {
             start_pc: 22,
             end_pc: 27,
@@ -15293,7 +15354,7 @@ mod tests {
     // site falls inside the handler range.
     #[test]
     fn exception_handler_range_covers_invoke_pc() {
-        use rustjvm_reader::attribute::ExceptionTableEntry;
+        use cratonvm_reader::attribute::ExceptionTableEntry;
         let entry = ExceptionTableEntry {
             start_pc: 22,
             end_pc: 27,
@@ -16160,8 +16221,8 @@ mod tests {
     ///      even for a zero-field java.lang.Object instance.
     #[test]
     fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
-        use rustjvm_gc::heap::ObjectHeader;
-        use rustjvm_types::ClassId;
+        use cratonvm_gc::heap::ObjectHeader;
+        use cratonvm_types::ClassId;
 
         // Allocate a 32-byte buffer, properly aligned, to host an
         // ObjectHeader. We use a Vec<u64> so it's 8-aligned.
@@ -16189,7 +16250,7 @@ mod tests {
 
         // Path 2: verify VmHeap::next_identity_hash never returns 0
         // (matching the legacy non-TLAB allocators).
-        use rustjvm_gc::vm_heap::{VmHeap, GcBackend};
+        use cratonvm_gc::vm_heap::{VmHeap, GcBackend};
         let heap = VmHeap::new(GcBackend::Generational, 1024 * 1024);
         for _ in 0..16 {
             assert_ne!(

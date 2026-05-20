@@ -28,7 +28,7 @@ use crate::heap::{
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
-use rustjvm_types::Value;
+use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
 // Concurrent GC phase tracking
@@ -119,6 +119,19 @@ impl std::fmt::Debug for ConcurrentGcState {
 /// different pointer ranges will typically hit different shards.
 pub struct MarkQueue {
     shards: Vec<Mutex<VecDeque<*mut u8>>>,
+    /// Round-11 perf: bitmask hint of which shards are currently
+    /// non-empty (bit `k` set ⇒ shard `k` *may* hold work). Updated
+    /// under the corresponding shard lock — `push` sets bit `k` after a
+    /// `push_back`, `pop` clears bit `k` when it drains the shard empty.
+    ///
+    /// `pop` consults this to jump straight to a populated shard instead
+    /// of probing all [`MARK_QUEUE_SHARDS`] mutexes. The mask is only a
+    /// *hint*: a concurrent thread may flip a bit between the load and
+    /// the lock, so a set bit can be stale (shard already drained). To
+    /// stay correct `pop` falls back to a full probe if the hint-directed
+    /// lookup finds nothing — it never reports the queue empty while a
+    /// shard still holds work.
+    nonempty_shards: AtomicU8,
     /// Round-9 gc HIGH-5 fix — set when any `push` is dropped because
     /// its target shard hit [`MARK_QUEUE_SHARD_CAP`]. The marker checks
     /// this flag at the end of remark and, if true, falls back to a
@@ -176,6 +189,7 @@ impl MarkQueue {
             .collect();
         Self {
             shards,
+            nonempty_shards: AtomicU8::new(0),
             overflowed: AtomicBool::new(false),
         }
     }
@@ -210,6 +224,12 @@ impl MarkQueue {
             return;
         }
         shard.push_back(obj_ptr);
+        // Round-11 perf: mark this shard non-empty in the hint mask.
+        // Done under the shard lock so the bit is set before the lock
+        // (and therefore the queued pointer) becomes visible to a
+        // concurrent `pop`.
+        self.nonempty_shards
+            .fetch_or(1u8 << idx, Ordering::Release);
     }
 
     /// Round-9 gc HIGH-5 — true iff any push since the last
@@ -232,9 +252,48 @@ impl MarkQueue {
             c.set(v.wrapping_add(1));
             v
         }) & (MARK_QUEUE_SHARDS - 1);
+
+        // Round-11 perf: consult the non-empty bitmask hint and visit
+        // only the shards it flags, instead of probing all 8 mutexes.
+        // The mask is a hint — a bit can be stale either way — so this
+        // pass is best-effort and is backed by the full probe below.
+        let hint = self.nonempty_shards.load(Ordering::Acquire);
+        if hint != 0 {
+            for offset in 0..MARK_QUEUE_SHARDS {
+                let idx = (start + offset) & (MARK_QUEUE_SHARDS - 1);
+                if hint & (1u8 << idx) == 0 {
+                    continue;
+                }
+                let mut shard = self.shards[idx].lock();
+                match shard.pop_front() {
+                    Some(ptr) => {
+                        if shard.is_empty() {
+                            self.nonempty_shards
+                                .fetch_and(!(1u8 << idx), Ordering::Release);
+                        }
+                        return Some(ptr);
+                    }
+                    None => {
+                        // Stale set bit — shard was drained by another
+                        // thread. Clear it so future pops skip it.
+                        self.nonempty_shards
+                            .fetch_and(!(1u8 << idx), Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        // Fallback: the hint found nothing, but a concurrent `push` may
+        // have populated a shard whose bit we hadn't observed. Probe
+        // every shard so `pop` never reports empty while work remains.
         for offset in 0..MARK_QUEUE_SHARDS {
             let idx = (start + offset) & (MARK_QUEUE_SHARDS - 1);
-            if let Some(ptr) = self.shards[idx].lock().pop_front() {
+            let mut shard = self.shards[idx].lock();
+            if let Some(ptr) = shard.pop_front() {
+                if shard.is_empty() {
+                    self.nonempty_shards
+                        .fetch_and(!(1u8 << idx), Ordering::Release);
+                }
                 return Some(ptr);
             }
         }
@@ -263,6 +322,10 @@ impl MarkQueue {
         for shard in &self.shards {
             shard.lock().clear();
         }
+        // Round-11 perf: every shard is now empty, so reset the
+        // non-empty hint mask. Safe to clear unconditionally — `clear`
+        // is only called during STW transitions.
+        self.nonempty_shards.store(0, Ordering::Release);
         // Round-9 gc HIGH-5: reset the overflow flag so the next
         // cycle starts clean. Safe to clear unconditionally — `clear`
         // is only called during STW transitions.
@@ -563,7 +626,7 @@ impl std::fmt::Debug for ConcurrentMarker {
 mod tests {
     use super::*;
     use crate::heap::{ObjectHeader, ObjectKind, ArrayElementType, HEADER_SIZE, SLOT_SIZE};
-    use rustjvm_types::{ClassId, ObjectRef, Value};
+    use cratonvm_types::{ClassId, ObjectRef, Value};
 
     fn make_old_gen_with_object(num_slots: u32) -> (OldGen, *mut u8) {
         let mut og = OldGen::new(65536);

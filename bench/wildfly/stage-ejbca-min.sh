@@ -110,7 +110,7 @@ if [[ "$MODE" == "real" ]]; then
         exit 12
     fi
     # Also copy the pre-compiled hamcrest/junit jars next to the classes so
-    # rustjvm can pick them up via -c <classes>;<jars>.
+    # cratonvm can pick them up via -c <classes>;<jars>.
     cp -f "$LIB_DIR/junit.jar"    "$STAGED_DIR/junit.jar"    2>/dev/null || true
     cp -f "$LIB_DIR/hamcrest.jar" "$STAGED_DIR/hamcrest.jar" 2>/dev/null || true
 

@@ -1,7 +1,7 @@
-# RustJVM Lock Order (T1.8.4)
+# CratonVM Lock Order (T1.8.4)
 
 This document defines the **global lock acquisition order** for every
-mutex and rwlock in `rustjvm-vm` and its dependencies. Acquiring locks
+mutex and rwlock in `cratonvm-vm` and its dependencies. Acquiring locks
 out of order is a deadlock waiting to happen and *will* be caught by
 the lock-order regression tests in `vm/tests/lock_order_tests.rs`.
 
@@ -198,4 +198,4 @@ follow-up; T1.8.5 landed the enforcement mechanism:
 - [Roadmap T1.8 — Native API consistency](roadmap-100.md)
 - HotSpot's own lock-order documentation in
   `src/hotspot/share/runtime/mutexLocker.hpp` (informational —
-  RustJVM uses different locks but the principle is the same).
+  CratonVM uses different locks but the principle is the same).

@@ -19,7 +19,7 @@ if [[ ! -d "$APP_DIR" ]]; then
     ( cd "$APP_DIR" && ./mvnw -q package -Dquarkus.package.jar.type=fast-jar -DskipTests )
 fi
 
-SMOKE_TIMEOUT=300 smoke_run_rustjvm \
+SMOKE_TIMEOUT=300 smoke_run_cratonvm \
     --Xmx 1g \
     --jar "$APP_DIR/target/quarkus-app/quarkus-run.jar" -- &
 BOOT_PID=$!

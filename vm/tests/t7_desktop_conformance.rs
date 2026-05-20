@@ -1,15 +1,15 @@
 //! T7 — Desktop (AWT/Swing/Java2D) conformance test suite.
 //!
-//! These tests verify that RustJVM's native-awt crate correctly implements
+//! These tests verify that CratonVM's native-awt crate correctly implements
 //! the AWT, Swing, and Java2D native peer layer. Most tests run headless
 //! (software renderer only, no display required). Tests requiring a real
 //! display are marked `#[ignore]`.
 //!
-//!     cargo test -p rustjvm-vm --test t7_desktop_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test t7_desktop_conformance -- --nocapture
 //!
 //! For display-dependent tests:
 //!
-//!     cargo test -p rustjvm-vm --test t7_desktop_conformance -- --ignored --nocapture
+//!     cargo test -p cratonvm-vm --test t7_desktop_conformance -- --ignored --nocapture
 
 // ---------------------------------------------------------------------------
 // T7.1 — Native windowing (headless / unit-level tests)
@@ -18,7 +18,7 @@
 #[test]
 fn t7_1_1_platform_backend_exists() {
     // Verify the native-awt crate compiles and the platform backend is selectable.
-    use rustjvm_native_awt::platform::backend::WindowId;
+    use cratonvm_native_awt::platform::backend::WindowId;
     let _id = WindowId(1);
     eprintln!("[t7] Platform backend type compiled OK");
 }
@@ -26,9 +26,9 @@ fn t7_1_1_platform_backend_exists() {
 #[test]
 fn t7_1_2_awt_toolkit_shim() {
     // Verify the AWT toolkit shim registers expected native methods.
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
     let mut registry = NativeMethodRegistry::new();
-    rustjvm_native_awt::register_awt_natives(&mut registry);
+    cratonvm_native_awt::register_awt_natives(&mut registry);
     let count = registry.len();
     eprintln!("[t7] AWT natives registered: {count}");
     assert!(count >= 50, "Expected >= 50 AWT natives, got {count}");
@@ -36,7 +36,7 @@ fn t7_1_2_awt_toolkit_shim() {
 
 #[test]
 fn t7_1_5_buffered_image_backing_store() {
-    use rustjvm_native_awt::image::{BufferedImageData, ImageType};
+    use cratonvm_native_awt::image::{BufferedImageData, ImageType};
 
     let mut img = BufferedImageData::new(100, 100, ImageType::IntArgb);
     assert_eq!(img.width(), 100);
@@ -69,7 +69,7 @@ fn t7_1_5_buffered_image_backing_store() {
 
 #[test]
 fn t7_2_1_metal_look_and_feel() {
-    use rustjvm_native_awt::swing::{MetalTheme, UIDefaults};
+    use cratonvm_native_awt::swing::{MetalTheme, UIDefaults};
 
     let theme = MetalTheme::ocean();
     assert_ne!(theme.primary1, 0);
@@ -88,7 +88,7 @@ fn t7_2_1_metal_look_and_feel() {
 
 #[test]
 fn t7_2_7_edt_safety() {
-    use rustjvm_native_awt::edt;
+    use cratonvm_native_awt::edt;
 
     // Initially we're NOT on the EDT
     assert!(!edt::is_edt());
@@ -101,7 +101,7 @@ fn t7_2_7_edt_safety() {
     assert!(edt_inst.is_running());
 
     // Post events
-    use rustjvm_native_awt::event::{AwtEvent, AwtEventData, PeerId, event_id};
+    use cratonvm_native_awt::event::{AwtEvent, AwtEventData, PeerId, event_id};
     let evt = AwtEvent {
         id: event_id::ACTION_PERFORMED,
         source_peer_id: PeerId(1),
@@ -124,7 +124,7 @@ fn t7_2_7_edt_safety() {
 
 #[test]
 fn t7_2_peer_registry() {
-    use rustjvm_native_awt::peer::{PeerRegistry, ComponentType};
+    use cratonvm_native_awt::peer::{PeerRegistry, ComponentType};
 
     let mut reg = PeerRegistry::new();
     let frame_id = reg.create_peer(ComponentType::Frame);
@@ -163,7 +163,7 @@ fn t7_2_peer_registry() {
 
 #[test]
 fn t7_3_1_draw_shapes() {
-    use rustjvm_native_awt::renderer::SoftwareRenderer;
+    use cratonvm_native_awt::renderer::SoftwareRenderer;
 
     let mut r = SoftwareRenderer::new(200, 200);
 
@@ -193,7 +193,7 @@ fn t7_3_1_draw_shapes() {
 
 #[test]
 fn t7_3_2_fill_shapes() {
-    use rustjvm_native_awt::renderer::SoftwareRenderer;
+    use cratonvm_native_awt::renderer::SoftwareRenderer;
 
     let mut r = SoftwareRenderer::new(100, 100);
     r.set_color(0xFF0000FF); // blue
@@ -211,7 +211,7 @@ fn t7_3_2_fill_shapes() {
 
 #[test]
 fn t7_3_3_antialiasing_hint() {
-    use rustjvm_native_awt::renderer::SoftwareRenderer;
+    use cratonvm_native_awt::renderer::SoftwareRenderer;
 
     let mut r = SoftwareRenderer::new(100, 100);
     r.set_antialias(true);
@@ -227,7 +227,7 @@ fn t7_3_3_antialiasing_hint() {
 
 #[test]
 fn t7_3_4_affine_transforms() {
-    use rustjvm_native_awt::renderer::AffineTransform;
+    use cratonvm_native_awt::renderer::AffineTransform;
 
     let identity = AffineTransform::identity();
     assert!(identity.is_identity());
@@ -263,7 +263,7 @@ fn t7_3_4_affine_transforms() {
 
 #[test]
 fn t7_3_5_image_rendering_bilinear() {
-    use rustjvm_native_awt::renderer::{InterpolationKind, SoftwareRenderer};
+    use cratonvm_native_awt::renderer::{InterpolationKind, SoftwareRenderer};
 
     // Create a 2x2 source image: red, green, blue, white
     let src = [0xFFFF0000u32, 0xFF00FF00, 0xFF0000FF, 0xFFFFFFFF];
@@ -285,7 +285,7 @@ fn t7_3_5_image_rendering_bilinear() {
 
 #[test]
 fn t7_color_operations() {
-    use rustjvm_native_awt::color::Color;
+    use cratonvm_native_awt::color::Color;
 
     let red = Color::new(255, 0, 0);
     assert_eq!(red.red(), 255);
@@ -316,7 +316,7 @@ fn t7_color_operations() {
 
 #[test]
 fn t7_font_metrics() {
-    use rustjvm_native_awt::font::{FontEngine, FontSpec, PLAIN, BOLD};
+    use cratonvm_native_awt::font::{FontEngine, FontSpec, PLAIN, BOLD};
 
     let mut engine = FontEngine::new();
 
@@ -343,7 +343,7 @@ fn t7_font_metrics() {
 
 #[test]
 fn t7_graphics2d_state() {
-    use rustjvm_native_awt::graphics2d::Graphics2DState;
+    use cratonvm_native_awt::graphics2d::Graphics2DState;
 
     let mut state = Graphics2DState::create(200, 150);
     state.set_color(255, 0, 0, 255);
@@ -372,12 +372,12 @@ fn t7_graphics2d_state() {
 
 #[test]
 fn t7_clipboard_operations() {
-    use rustjvm_native_awt::clipboard::{ClipboardManager, ClipboardKind, DataFlavor};
+    use cratonvm_native_awt::clipboard::{ClipboardManager, ClipboardKind, DataFlavor};
 
     let mut clip = ClipboardManager::new();
-    clip.set_text(ClipboardKind::System, "Hello from RustJVM".to_string(), None);
+    clip.set_text(ClipboardKind::System, "Hello from CratonVM".to_string(), None);
 
-    assert_eq!(clip.get_text(ClipboardKind::System), Some("Hello from RustJVM"));
+    assert_eq!(clip.get_text(ClipboardKind::System), Some("Hello from CratonVM"));
     assert!(clip.has_flavor(ClipboardKind::System, &DataFlavor::StringFlavor));
 
     let flavors = clip.available_flavors(ClipboardKind::System);
@@ -452,9 +452,9 @@ fn t7_5_3_dbeaver_graphical() {
 /// T7.5.4 — Re-measure readiness after T7 desktop support.
 #[test]
 fn t7_5_4_readiness_measurement() {
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
     let mut registry = NativeMethodRegistry::new();
-    rustjvm_native_awt::register_awt_natives(&mut registry);
+    cratonvm_native_awt::register_awt_natives(&mut registry);
     let count = registry.len();
     eprintln!("[t7] AWT/Swing native methods: {count}");
     eprintln!("[t7] T7 desktop support is functional (headless)");

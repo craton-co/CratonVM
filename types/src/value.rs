@@ -263,6 +263,43 @@ pub fn encode_value(v: Value) -> (u64, u8) {
     }
 }
 
+/// Cold path for [`decode_value`]'s `VTAG_OBJECT` branch: a `VTAG_OBJECT`
+/// slot whose pointer is null or unaligned (a corrupted or zero-initialized
+/// stale slot). This degrades to `Value::Object(None)` in release builds and
+/// panics via `debug_assert!` in debug builds so the underlying bug surfaces.
+///
+/// Splitting this out as a `#[cold]` non-inlined function mirrors
+/// `compact_value::cold_degraded_object_ptr` and gives LLVM permission to
+/// place it off the hot path, freeing icache for the well-formed object
+/// branch in `decode_value`. The well-formed slot satisfies both predicates,
+/// so this is taken essentially never in steady-state interpretation.
+#[cold]
+#[inline(never)]
+fn cold_decode_degraded_object_ptr(ptr: *mut u8) -> Value {
+    // T14: Gracefully handle corrupted or zero-initialized slots that have
+    // VTAG_OBJECT but invalid pointer values in release builds. In debug
+    // builds we panic via `debug_assert!(false, ...)` so tests catch the
+    // underlying bug (writing non-reference bits through a reference
+    // accessor) instead of silent degradation.
+    if ptr.is_null() {
+        debug_assert!(
+            false,
+            "decode_value: VTAG_OBJECT with null pointer — likely a non-reference bit pattern \
+             written through a reference accessor; degrading to Object(None) in release"
+        );
+    } else {
+        // KC16 SIGSEGV audit: unaligned-but-nonzero pointers are treated as
+        // null in release rather than crashing; debug builds panic so the
+        // underlying bug surfaces.
+        debug_assert!(
+            false,
+            "decode_value: VTAG_OBJECT with unaligned pointer {ptr:p} — likely a non-reference \
+             bit pattern written through a reference accessor; degrading to Object(None) in release"
+        );
+    }
+    Value::Object(None)
+}
+
 /// Decode a compact (u64, u8) pair back into a Value.
 #[inline(always)]
 pub fn decode_value(val: u64, tag: u8) -> Value {
@@ -273,28 +310,13 @@ pub fn decode_value(val: u64, tag: u8) -> Value {
         VTAG_DOUBLE => Value::Double(f64::from_bits(val)),
         VTAG_OBJECT => {
             let ptr = val as *mut u8;
-            // T14: Gracefully handle corrupted or zero-initialized slots
-            // that have VTAG_OBJECT but invalid pointer values in release
-            // builds.  In debug builds we panic via `debug_assert!(false, ...)`
-            // so tests catch the underlying bug (writing non-reference bits
-            // through a reference accessor) instead of silent degradation.
-            if ptr.is_null() {
-                debug_assert!(
-                    false,
-                    "decode_value: VTAG_OBJECT with null pointer — likely a non-reference bit pattern \
-                     written through a reference accessor; degrading to Object(None) in release"
-                );
-                Value::Object(None)
-            } else if (ptr as usize) % 8 != 0 {
-                // KC16 SIGSEGV audit: unaligned-but-nonzero pointers are
-                // treated as null in release rather than crashing; debug
-                // builds panic so the underlying bug surfaces.
-                debug_assert!(
-                    false,
-                    "decode_value: VTAG_OBJECT with unaligned pointer {ptr:p} — likely a non-reference \
-                     bit pattern written through a reference accessor; degrading to Object(None) in release"
-                );
-                Value::Object(None)
+            // The degraded paths (null or unaligned pointer arising from a
+            // stale slot) are split into a `#[cold]` helper: every
+            // well-formed object slot satisfies both predicates, so the
+            // branch predictor and LLVM's basic-block layout treat them as
+            // cold.
+            if ptr.is_null() || (ptr as usize) % 8 != 0 {
+                cold_decode_degraded_object_ptr(ptr)
             } else {
                 Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
             }

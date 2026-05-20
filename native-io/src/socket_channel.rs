@@ -35,9 +35,9 @@
 //! All public surface is registered via `register_socket_channel_real`.
 
 use parking_lot::RwLock;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 fn ipc_dbg_enabled() -> bool {
-    std::env::var("RUSTJVM_SUREFIRE_IPC_DBG")
+    std::env::var("CRATONVM_SUREFIRE_IPC_DBG")
         .map(|v| {
             let t = v.trim();
             !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
@@ -179,7 +179,7 @@ fn connect_pool_sender() -> &'static std::sync::mpsc::Sender<ConnectJob> {
         for w in 0..workers {
             let rx = std::sync::Arc::clone(&rx);
             let _ = std::thread::Builder::new()
-                .name(format!("rustjvm-connect-pool-{w}"))
+                .name(format!("cratonvm-connect-pool-{w}"))
                 .spawn(move || connect_pool_worker(rx));
         }
         // Bug 3 / Bug 6 (HIGH round-9 carryover): the pool currently has
@@ -529,19 +529,15 @@ fn buffer_read_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<Vec<u
             Some(v)
         }
         BufferAccess::Heap { arr, offset, length } if length > 0 => {
+            // Bulk read via NativeContext intrinsic. The old element-by-element
+            // loop clamped `length` to whatever fit before `arr_len`; preserve
+            // that by clamping the effective length here.
             let arr_len = ctx.array_length(arr);
-            let mut v = Vec::with_capacity(length as usize);
-            for i in 0..length as usize {
-                let pos = offset as usize + i;
-                if pos >= arr_len {
-                    break;
-                }
-                if let Value::Int(b) = ctx.get_array_element(arr, pos) {
-                    v.push((b & 0xff) as u8);
-                } else {
-                    break;
-                }
-            }
+            let off = offset as usize;
+            let avail = arr_len.saturating_sub(off);
+            let eff_len = (length as usize).min(avail);
+            let mut v = vec![0u8; eff_len];
+            ctx.read_byte_array_into(arr, off, &mut v);
             Some(v)
         }
         _ => Some(Vec::new()),
@@ -565,18 +561,18 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
             n
         }
         BufferAccess::Heap { arr, offset, length } if length > 0 => {
+            // Bulk write via NativeContext intrinsic. The old loop wrote at
+            // most `min(data.len(), length)` bytes, stopping early if it ran
+            // past `arr_len`; clamp the effective length the same way.
             let arr_len = ctx.array_length(arr);
-            let n = (data.len() as i32).min(length).max(0);
-            let mut written = 0;
-            for i in 0..n as usize {
-                let pos = offset as usize + i;
-                if pos >= arr_len {
-                    break;
-                }
-                ctx.set_array_element(arr, pos, Value::Int(data[i] as i32));
-                written += 1;
-            }
-            written
+            let off = offset as usize;
+            let avail = arr_len.saturating_sub(off);
+            let n = (data.len() as i32)
+                .min(length)
+                .max(0)
+                .min(avail as i32);
+            ctx.write_byte_array_from(arr, off, &data[..n as usize]);
+            n
         }
         _ => 0,
     }

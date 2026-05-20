@@ -5,17 +5,16 @@
 //! heuristic calculations. Platform backends override these with exact
 //! values from the OS font engine.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
-use rustjvm_types::intern_arc;
+use rustc_hash::FxHashMap;
+use cratonvm_types::intern_arc;
 
-// TODO: switch `metrics_cache` to `rustc_hash::FxHashMap` once `rustc-hash`
-// is added to `native-awt/Cargo.toml`. FxHashMap has smaller per-entry
-// overhead than std HashMap (no SipHash random state) which matters for
-// the bounded cache below.
+// `metrics_cache` uses `FxHashMap`: smaller per-entry overhead than std
+// `HashMap` (no SipHash random state), which matters for the bounded cache
+// below on this lookup hot path.
 
 /// Hard cap on entries in the per-engine font metrics cache.
 ///
@@ -105,7 +104,7 @@ pub struct FontEngine {
     /// cheap (refcount-bump) clone instead of a fresh `String` allocation
     /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP` to
     /// prevent unbounded growth.
-    metrics_cache: HashMap<(Arc<str>, i32, i32), FontMetrics>,
+    metrics_cache: FxHashMap<(Arc<str>, i32, i32), FontMetrics>,
 }
 
 /// Logical font family categories.
@@ -119,7 +118,7 @@ enum FontCategory {
 impl FontEngine {
     pub fn new() -> Self {
         FontEngine {
-            metrics_cache: HashMap::new(),
+            metrics_cache: FxHashMap::default(),
         }
     }
 

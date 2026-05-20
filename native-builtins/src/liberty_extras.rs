@@ -36,9 +36,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 const CN_ENV_CHECK: &str = "com/ibm/ws/kernel/boot/cmdline/EnvCheck";
 const CN_LAUNCHER: &str = "com/ibm/ws/kernel/boot/Launcher";
@@ -60,9 +60,9 @@ fn liberty_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 }
 
 pub fn register_liberty_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_LIBERTY_REAL=1, skip all short-circuits
+    // Diagnostic gate: when CRATONVM_LIBERTY_REAL=1, skip all short-circuits
     // so the real Liberty launcher runs end-to-end (used for `--version` etc).
-    if std::env::var("RUSTJVM_LIBERTY_REAL").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_LIBERTY_REAL").as_deref() == Ok("1") {
         return;
     }
     // The entry the `--jar ws-server.jar` invocation lands on.

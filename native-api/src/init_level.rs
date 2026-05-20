@@ -65,7 +65,7 @@ pub fn set_init_level(level: i32) {
         // so we write to stderr directly. Stays out of the hot path
         // because downward transitions should never happen.
         eprintln!(
-            "[rustjvm] warning: VM.setInitLevel: refusing downward \
+            "[cratonvm] warning: VM.setInitLevel: refusing downward \
              transition {cur}->{level}"
         );
         return;

@@ -13,7 +13,7 @@ smoke_download "$MVN_CENTRAL/org/apache/commons/commons-lang3/$V/commons-lang3-$
 smoke_download "$MVN_CENTRAL/org/apache/commons/commons-lang3/$V/commons-lang3-$V-tests.jar" "$COMMONS_TEST_JAR"
 smoke_download "$MVN_CENTRAL/org/junit/platform/junit-platform-console-standalone/1.10.2/junit-platform-console-standalone-1.10.2.jar" "$JUNIT_LAUNCHER"
 
-SMOKE_TIMEOUT=600 smoke_run_rustjvm \
+SMOKE_TIMEOUT=600 smoke_run_cratonvm \
     --Xmx 1g \
     --classpath "$COMMONS_JAR:$COMMONS_TEST_JAR:$JUNIT_LAUNCHER" \
     -- org.junit.platform.console.ConsoleLauncher \

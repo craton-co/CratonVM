@@ -35,9 +35,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
 // Shared test helpers
@@ -50,7 +50,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    Path::new(&format!("{dir}/rustjvm/SimpleReturn.class")).exists()
+    Path::new(&format!("{dir}/cratonvm/SimpleReturn.class")).exists()
 }
 
 fn skip_if_no_classes(tag: &str) -> bool {
@@ -100,7 +100,7 @@ where
 // ===========================================================================
 //
 // SPECjvm's compiler.compiler benchmark drives the JIT through many small
-// methods. Our sealed stand-in: invoke every method on `rustjvm/Arithmetic`
+// methods. Our sealed stand-in: invoke every method on `cratonvm/Arithmetic`
 // and assert the expected results. Passing this demonstrates classloading,
 // linking, and bytecode execution for integer / long / modulus / unary-neg
 // opcodes all work end-to-end.
@@ -120,7 +120,7 @@ fn ri_1_specjvm_compiler_surrogate() {
         ("testNeg", "()I", -42),
     ];
     for (method, desc, expected) in cases {
-        match vm.invoke("rustjvm/Arithmetic", method, desc, &[]) {
+        match vm.invoke("cratonvm/Arithmetic", method, desc, &[]) {
             Ok(Some(Value::Int(v))) if v == *expected => {}
             other => panic!(
                 "[RI.1] Arithmetic.{method}{desc} => {other:?} (expected Int({expected}))"
@@ -151,7 +151,7 @@ fn ri_2_dacapo_avrora_surrogate() {
         ("testIfElse", "()I", 1),
     ];
     for (method, desc, expected) in cases {
-        match vm.invoke("rustjvm/ControlFlow", method, desc, &[]) {
+        match vm.invoke("cratonvm/ControlFlow", method, desc, &[]) {
             Ok(Some(Value::Int(v))) if v == *expected => {}
             other => panic!(
                 "[RI.2] ControlFlow.{method}{desc} => {other:?} (expected Int({expected}))"
@@ -161,7 +161,7 @@ fn ri_2_dacapo_avrora_surrogate() {
     // Drive switch dispatch explicitly to exercise tableswitch/lookupswitch.
     for (arg, want) in [(1, 10), (2, 20), (3, 30), (99, -1)] {
         match vm.invoke(
-            "rustjvm/ControlFlow",
+            "cratonvm/ControlFlow",
             "testSwitch",
             "(I)I",
             &[Value::Int(arg)],
@@ -196,16 +196,16 @@ fn ri_3_dacapo_jython_surrogate() {
     // HelloWorld — a mixed arithmetic + branching + static-constant blend
     // that mirrors jython's per-opcode interpreter trace.
     let seq: &[(&str, &str, &str, i32)] = &[
-        ("rustjvm/Arithmetic", "test", "()I", 30),
-        ("rustjvm/Arithmetic", "testMul", "()I", 42),
-        ("rustjvm/Arithmetic", "testDiv", "()I", 25),
-        ("rustjvm/Arithmetic", "testMod", "()I", 2),
-        ("rustjvm/Arithmetic", "testNeg", "()I", -42),
-        ("rustjvm/ControlFlow", "testIfElse", "()I", 1),
-        ("rustjvm/ControlFlow", "testLoop", "()I", 45),
-        ("rustjvm/ControlFlow", "testWhile", "()I", 1024),
-        ("rustjvm/SimpleReturn", "test", "()I", 42),
-        ("rustjvm/HelloWorld", "check", "()I", 42),
+        ("cratonvm/Arithmetic", "test", "()I", 30),
+        ("cratonvm/Arithmetic", "testMul", "()I", 42),
+        ("cratonvm/Arithmetic", "testDiv", "()I", 25),
+        ("cratonvm/Arithmetic", "testMod", "()I", 2),
+        ("cratonvm/Arithmetic", "testNeg", "()I", -42),
+        ("cratonvm/ControlFlow", "testIfElse", "()I", 1),
+        ("cratonvm/ControlFlow", "testLoop", "()I", 45),
+        ("cratonvm/ControlFlow", "testWhile", "()I", 1024),
+        ("cratonvm/SimpleReturn", "test", "()I", 42),
+        ("cratonvm/HelloWorld", "check", "()I", 42),
     ];
     // Run the whole sequence three times to exercise dispatch-cache warmth.
     for _ in 0..3 {
@@ -242,7 +242,7 @@ fn ri_4_commons_lang_surrogate() {
     let cases: &[(i32, i32)] = &[(1, 10), (2, 20), (3, 30), (4, -1), (0, -1), (-5, -1), (999, -1)];
     for (arg, want) in cases {
         match vm.invoke(
-            "rustjvm/ControlFlow",
+            "cratonvm/ControlFlow",
             "testSwitch",
             "(I)I",
             &[Value::Int(*arg)],
@@ -261,7 +261,7 @@ fn ri_4_commons_lang_surrogate() {
         for (method, expected) in
             [("test", 30i32), ("testMul", 42), ("testDiv", 25), ("testMod", 2)]
         {
-            match vm.invoke("rustjvm/Arithmetic", method, "()I", &[]) {
+            match vm.invoke("cratonvm/Arithmetic", method, "()I", &[]) {
                 Ok(Some(Value::Int(v))) if v == expected => {}
                 other => panic!(
                     "[RI.4] Arithmetic.{method} => {other:?} (expected {expected})"
@@ -293,14 +293,14 @@ fn ri_5_jackson_roundtrip_surrogate() {
     // surrogate simulates Jackson's per-field getter/setter call pattern
     // during `writeValue(obj)` (each field access is one static call).
     for i in 0..50 {
-        match vm.invoke("rustjvm/SimpleReturn", "test", "()I", &[]) {
+        match vm.invoke("cratonvm/SimpleReturn", "test", "()I", &[]) {
             Ok(Some(Value::Int(42))) => {}
             other => panic!("[RI.5] SimpleReturn.test iter={i} => {other:?}"),
         }
     }
     // HelloWorld.check — another static constant-return — also 50 iters.
     for i in 0..50 {
-        match vm.invoke("rustjvm/HelloWorld", "check", "()I", &[]) {
+        match vm.invoke("cratonvm/HelloWorld", "check", "()I", &[]) {
             Ok(Some(Value::Int(42))) => {}
             other => panic!("[RI.5] HelloWorld.check iter={i} => {other:?}"),
         }
@@ -317,8 +317,8 @@ fn ri_5_jackson_roundtrip_surrogate() {
         .expect("[RI.5] JSON parse surrogate failed");
     assert_eq!(reparsed, 42, "[RI.5] JSON value mismatch after roundtrip");
 
-    // Verify the multi-field case: `{"name":"rustjvm","version":42}`.
-    let payload = br#"{"name":"rustjvm","version":42}"#;
+    // Verify the multi-field case: `{"name":"cratonvm","version":42}`.
+    let payload = br#"{"name":"cratonvm","version":42}"#;
     let v = parse_simple_json_int(payload, "version")
         .expect("[RI.5] JSON parse (multi-field) failed");
     assert_eq!(v, 42, "[RI.5] multi-field JSON value mismatch");
@@ -352,7 +352,7 @@ fn parse_simple_json_int(bytes: &[u8], key: &str) -> Option<i64> {
 fn ri_6_slf4j_logback_surrogate() {
     let dir = std::env::temp_dir();
     let file_name = format!(
-        "rustjvm-ri6-{}-{}.log",
+        "cratonvm-ri6-{}-{}.log",
         std::process::id(),
         random_suffix()
     );
@@ -362,7 +362,7 @@ fn ri_6_slf4j_logback_surrogate() {
         .expect("[RI.6] log path must be UTF-8")
         .to_string();
 
-    let line = "2026-04-18 INFO  rustjvm.phase_i - hello from Phase I";
+    let line = "2026-04-18 INFO  cratonvm.phase_i - hello from Phase I";
     // Write phase: use std::fs directly — the smoke's concern is the
     // round-trip, not which crate performs the write. Real Java code hits
     // `FileOutputStream` which our native-io crate backs.
@@ -427,7 +427,7 @@ fn ri_7_tomcat_embed_surrogate() {
                             Err(_) => break,
                         }
                     }
-                    let body = b"rustjvm embedded servlet";
+                    let body = b"cratonvm embedded servlet";
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -470,7 +470,7 @@ fn ri_7_tomcat_embed_surrogate() {
         "[RI.7] expected 200 OK, got:\n{response}"
     );
     assert!(
-        response.contains("rustjvm embedded servlet"),
+        response.contains("cratonvm embedded servlet"),
         "[RI.7] expected body in response, got:\n{response}"
     );
 }
@@ -660,18 +660,18 @@ fn ri_10_hibernate_h2_surrogate() {
 }
 
 // ---------------------------------------------------------------------------
-// Optional integration: run the rustjvm CLI against a HelloWorld fixture.
+// Optional integration: run the cratonvm CLI against a HelloWorld fixture.
 //
-// This variant only fires when `RUSTJVM_BIN` is set in the environment. It
+// This variant only fires when `CRATONVM_BIN` is set in the environment. It
 // provides an optional "true end-to-end" pass for CI: spawn the CLI, feed
 // it `HelloWorld.class`, assert "Hello World" appears on stdout. Marked
 // `#[ignore]` so the default `cargo test` run stays hermetic.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires RUSTJVM_BIN and compiled HelloWorld.class"]
-fn ri_optional_rustjvm_cli_hello_world() {
-    let bin = match std::env::var("RUSTJVM_BIN") {
+#[ignore = "requires CRATONVM_BIN and compiled HelloWorld.class"]
+fn ri_optional_cratonvm_cli_hello_world() {
+    let bin = match std::env::var("CRATONVM_BIN") {
         Ok(v) => PathBuf::from(v),
         Err(_) => return,
     };
@@ -679,14 +679,14 @@ fn ri_optional_rustjvm_cli_hello_world() {
         return;
     }
     let resources = PathBuf::from(test_resources_dir());
-    let class = resources.join("rustjvm/HelloWorld.class");
+    let class = resources.join("cratonvm/HelloWorld.class");
     if !class.exists() {
         return;
     }
     let out = std::process::Command::new(&bin)
         .arg("-cp")
         .arg(&resources)
-        .arg("rustjvm/HelloWorld")
+        .arg("cratonvm/HelloWorld")
         .output()
         .expect("[RI-optional] CLI invocation failed");
     let stdout = String::from_utf8_lossy(&out.stdout);

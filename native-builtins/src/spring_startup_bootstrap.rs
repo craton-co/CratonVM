@@ -23,9 +23,9 @@
 //!    to the same singleton so GETSTATIC paths also get a non-null value.
 
 use parking_lot::Mutex;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 use std::sync::OnceLock;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ fn step_get_tags(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
         .unwrap_or(1);
     let n_fields = std::cmp::max(data_slot, size_slot) + 1;
     let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     ctx.set_field(list, data_slot, Value::Object(Some(arr)));
     ctx.set_field(list, size_slot, Value::Int(0));
     Ok(Some(Value::Object(Some(list))))
@@ -312,11 +312,11 @@ fn throw_iae_not_exist(ctx: &mut dyn NativeContext, name: &str) -> MethodCallRes
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(e)), Value::Object(Some(m))],
         );
-        return Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(e));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(e));
     }
-    Err(rustjvm_types::error::MethodCallFailed::InternalError(
-        rustjvm_types::error::VmError::Runtime(
-            rustjvm_types::error::RuntimeError::NullPointerException {
+    Err(cratonvm_types::error::MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::Runtime(
+            cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some(msg),
             },
         ),
@@ -338,7 +338,7 @@ fn mps_replace_impl(
     }
     // Build a new array with the replaced element; COWAL is copy-on-write.
     let len = ctx.array_length(arr);
-    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(rustjvm_types::ClassId::new(0));
+    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(cratonvm_types::ClassId::new(0));
     let new_arr = ctx.new_ref_array(cid, len);
     let idx_u = idx as usize;
     for i in 0..len {
@@ -404,7 +404,7 @@ fn mps_add_at_offset_impl(
         items.push(source);
     }
 
-    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(rustjvm_types::ClassId::new(0));
+    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(cratonvm_types::ClassId::new(0));
     let new_arr = ctx.new_ref_array(cid, items.len());
     for (i, v) in items.iter().enumerate() {
         ctx.set_array_element(new_arr, i, *v);
@@ -472,7 +472,7 @@ fn env_contains_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 
 // Environment.getActiveProfiles() → empty String[]
 fn env_get_active_profiles(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -481,7 +481,7 @@ fn env_get_default_profiles(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
     let default_str = ctx.create_string("default");
     ctx.set_array_element(arr, 0, Value::Object(Some(default_str)));
     Ok(Some(Value::Object(Some(arr))))
@@ -650,9 +650,9 @@ fn get_bean_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let receiver = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            return Err(rustjvm_types::error::MethodCallFailed::InternalError(
-                rustjvm_types::error::VmError::Runtime(
-                    rustjvm_types::error::RuntimeError::NullPointerException {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Runtime(
+                    cratonvm_types::error::RuntimeError::NullPointerException {
                         message: Some("getBeanFactory: null receiver".to_string()),
                     },
                 ),
@@ -974,14 +974,14 @@ fn cache_get_configuration_property_names(
     if data_is_null {
         let cpn_cid = ctx
             .class_id_by_name(SICP_NAME)
-            .unwrap_or_else(|| rustjvm_types::ClassId::new(0));
+            .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
         let arr = ctx.new_ref_array(cpn_cid, 0);
         return Ok(Some(Value::Object(Some(arr))));
     }
     // Fallback: empty array (avoids re-entering bytecode and avoids Assert.state).
     let cpn_cid = ctx
         .class_id_by_name(SICP_NAME)
-        .unwrap_or_else(|| rustjvm_types::ClassId::new(0));
+        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cpn_cid, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -2050,13 +2050,13 @@ fn walk_imports_recursive(
     };
 
     let entries = match value_array {
-        rustjvm_native_api::AnnotationElementValue::Array(v) => v,
+        cratonvm_native_api::AnnotationElementValue::Array(v) => v,
         single => vec![single],
     };
 
     for entry in entries {
         let desc = match entry {
-            rustjvm_native_api::AnnotationElementValue::Class(d) => d,
+            cratonvm_native_api::AnnotationElementValue::Class(d) => d,
             _ => continue,
         };
         // Convert "Lcom/foo/Bar;" → "com/foo/Bar".
@@ -2214,8 +2214,8 @@ fn s_instantiation_strategy_instantiate(
     // BeanInstantiationException it can recover from.
     if let Some(cid) = ctx.class_id_by_name(&class_name) {
         let flags = ctx.class_access_flags(cid);
-        let abstract_bit = rustjvm_types::access_flags::ACC_ABSTRACT;
-        let iface_bit = rustjvm_types::access_flags::ACC_INTERFACE;
+        let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
+        let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
         if flags & (abstract_bit | iface_bit) != 0 {
             tracing::debug!(
                 "[spring-shim] SimpleInstantiationStrategy.instantiate: {} is abstract/interface, skipping",
@@ -2656,7 +2656,7 @@ fn ccpp_process_config_bean_definitions_noop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     fn build_registry() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

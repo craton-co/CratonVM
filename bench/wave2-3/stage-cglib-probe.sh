@@ -2,7 +2,7 @@
 # bench/wave2-3/stage-cglib-probe.sh
 # WP2.3-D — stage the CGLIB acceptance probes (real Enhancer.create() +
 # the legacy synthetic placeholder) for end-to-end execution under
-# rust-jvm. Mirrors the shape of bench/wildfly/stage-ejbca-min.sh.
+# cratonvm. Mirrors the shape of bench/wildfly/stage-ejbca-min.sh.
 #
 # Behaviour:
 #   * Locate cglib-nodep-X.Y.jar under one of the well-known local

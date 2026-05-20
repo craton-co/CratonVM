@@ -92,15 +92,26 @@ impl StringPool {
         // Slow path: take the write lock. Allocate the `Arc<str>` exactly
         // ONCE — `Arc::<str>::from(&str)` copies the bytes into the Arc's
         // single backing allocation directly, no intermediate `String` or
-        // `Box<str>`. Re-check under the write lock in case a concurrent
-        // writer beat us to it.
-        let mut write = self.map.write();
-        if let Some((existing, _)) = write.get_key_value(s) {
-            return Arc::clone(existing);
-        }
+        // `Box<str>`.
+        //
+        // Hashing: the previous structure hashed `s` a *third* time on the
+        // miss path (`get_key_value` to re-check, then `insert`). Using the
+        // `entry` API instead hashes the (now owned) key exactly once for the
+        // combined re-check + insert: `entry` performs a single lookup, and
+        // `or_insert_with` does not re-hash. The `entry` key must be owned, so
+        // we allocate the `Arc<str>` up front; on the rare re-check hit (a
+        // concurrent writer beat us between dropping the read lock and taking
+        // the write lock) that allocation is dropped when the closure is not
+        // run, exactly as the old `get_key_value` early-return discarded work.
         let arc: Arc<str> = Arc::from(s);
-        write.insert(Arc::clone(&arc), ());
-        arc
+        let mut write = self.map.write();
+        match write.entry(Arc::clone(&arc)) {
+            std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.key()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(());
+                arc
+            }
+        }
     }
 
     /// Returns the number of unique strings currently interned.

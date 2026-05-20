@@ -37,15 +37,15 @@ fn probe_dir() -> PathBuf {
     worktree_root().join("apps").join("bytebuddy_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = worktree_root().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -56,7 +56,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<String> {
-    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
         return Some(h);
     }
     if let Ok(h) = std::env::var("JAVA_HOME") {
@@ -70,7 +70,7 @@ fn java_home() -> Option<String> {
 }
 
 fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("ByteBuddyProbe.class").exists() {
         eprintln!("[wave2-bytebuddy] ByteBuddyProbe.class missing — run javac");
@@ -101,7 +101,7 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave2-bytebuddy] failed to spawn rustjvm: {e}");
+            eprintln!("[wave2-bytebuddy] failed to spawn cratonvm: {e}");
             return None;
         }
     };
@@ -140,7 +140,7 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
 #[test]
 fn bytebuddy_probe_console_istty_native_present() {
     // Negative regression: ensure the Console.istty native is registered.
-    // We inspect the rustjvm binary's behavior via a swallow-strict run; if
+    // We inspect the cratonvm binary's behavior via a swallow-strict run; if
     // the native is missing, a warn line will mention `java/io/Console.istty`
     // as a missing native method.
     let (stdout, stderr, _rc) = match run_probe(Duration::from_secs(120)) {

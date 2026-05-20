@@ -1,5 +1,5 @@
 [package]
-name = "rustjvm-vm"
+name = "cratonvm-vm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,12 +19,12 @@ readme = "../README.md"
 # `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
 # for the rationale and the census-driven migration plan.
 default = ["experimental-tls", "legacy-synthetic-crypto", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug"]
-synthetic-jdk = ["rustjvm-native-builtins/synthetic-jdk", "rustjvm-native-collections/synthetic-jdk", "rustjvm-native-io/synthetic-jdk"]
-experimental-tls = ["rustjvm-native-builtins/experimental-tls"]
-legacy-synthetic-crypto = ["rustjvm-native-builtins/legacy-synthetic-crypto"]
-experimental-jmx = ["rustjvm-native-builtins/experimental-jmx"]
-experimental-serialization = ["rustjvm-native-builtins/experimental-serialization"]
-experimental-aot = ["rustjvm-native-builtins/experimental-aot"]
+synthetic-jdk = ["cratonvm-native-builtins/synthetic-jdk", "cratonvm-native-collections/synthetic-jdk", "cratonvm-native-io/synthetic-jdk"]
+experimental-tls = ["cratonvm-native-builtins/experimental-tls"]
+legacy-synthetic-crypto = ["cratonvm-native-builtins/legacy-synthetic-crypto"]
+experimental-jmx = ["cratonvm-native-builtins/experimental-jmx"]
+experimental-serialization = ["cratonvm-native-builtins/experimental-serialization"]
+experimental-aot = ["cratonvm-native-builtins/experimental-aot"]
 experimental-debug = []
 # T19.H7 diagnostic logger. Off by default — these warn-level traces are
 # bring-up scaffolding that fired on every class-load, opcode dispatch, and
@@ -36,25 +36,26 @@ experimental-t19-diag = []
 # GPU offload — Part C marshalling + (future Parts E/F) interpreter hook and
 # safepoint coordination. Off by default. With this feature off, the VM crate
 # compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
-gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "rustjvm-gc/gpu-offload"]
+gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cratonvm-native-builtins/gpu-offload", "dep:bytemuck"]
 
 [dependencies]
-rustjvm-reader = { path = "../reader" }
-rustjvm-types = { path = "../types" }
-rustjvm-native-api = { path = "../native-api" }
-rustjvm-native-collections = { path = "../native-collections" }
-rustjvm-native-io = { path = "../native-io" }
-rustjvm-native-builtins = { path = "../native-builtins" }
-rustjvm-jit-api = { path = "../jit-api" }
-rustjvm-jit = { path = "../jit" }
-rustjvm-classloading = { path = "../classloading" }
-rustjvm-gc = { path = "../gc" }
-rustjvm-jfr = { path = "../jfr" }
-rustjvm-native-awt = { path = "../native-awt" }
+cratonvm-reader = { path = "../reader" }
+cratonvm-types = { path = "../types" }
+cratonvm-native-api = { path = "../native-api" }
+cratonvm-native-collections = { path = "../native-collections" }
+cratonvm-native-io = { path = "../native-io" }
+cratonvm-native-builtins = { path = "../native-builtins" }
+cratonvm-jit-api = { path = "../jit-api" }
+cratonvm-jit = { path = "../jit" }
+cratonvm-classloading = { path = "../classloading" }
+cratonvm-gc = { path = "../gc" }
+cratonvm-jfr = { path = "../jfr" }
+cratonvm-native-awt = { path = "../native-awt" }
 # Optional, only pulled in by the `gpu-offload` feature. See the feature
 # table above. With `gpu-offload` off, these crates are not linked.
 cuda-bridge = { path = "../cuda-bridge", optional = true }
 jit-cuda = { path = "../jit-cuda", optional = true }
+bytemuck = { version = "1.16", optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 indexmap = "2"

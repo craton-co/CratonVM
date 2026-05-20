@@ -62,9 +62,9 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Process-table (holds live std::process::Child handles)
@@ -219,7 +219,7 @@ pub fn spawn_and_wrap(
     );
 
     // Allocate synthetic Process and populate its 6 fields.
-    let proc_ref = ctx.alloc_object(rustjvm_types::ClassId::new(0), PROC_FIELD_COUNT);
+    let proc_ref = ctx.alloc_object(cratonvm_types::ClassId::new(0), PROC_FIELD_COUNT);
     ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
     ctx.set_field(proc_ref, PROC_FIELD_STDIN_FD, Value::Int(stdin_fd));
     ctx.set_field(proc_ref, PROC_FIELD_STDOUT_FD, Value::Int(stdout_fd));

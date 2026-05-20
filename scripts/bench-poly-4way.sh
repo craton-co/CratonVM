@@ -4,14 +4,14 @@
 #
 # Runs:
 #   1. HotSpot C2          — CpuPolyBench (pure Java, plain JVM)
-#   2. CratonVM CPU JIT-on — CpuPolyBench under rustjvm (no --gpu)
-#   3. CratonVM CPU JIT-off — same with RUSTJVM_DISABLE_JIT=1
-#   4. CratonVM GPU         — GpuPolyBench under rustjvm --gpu (explicit submit)
+#   2. CratonVM CPU JIT-on — CpuPolyBench under cratonvm (no --gpu)
+#   3. CratonVM CPU JIT-off — same with CRATONVM_DISABLE_JIT=1
+#   4. CratonVM GPU         — GpuPolyBench under cratonvm --gpu (explicit submit)
 #   5. TornadoVM            — PolyEvalTornado.java via tornado launcher
 set +e
 
 ROOT=C:/craton/CratonVM/.claude/worktrees/angry-brown-38c5dc
-RJVM="$ROOT/target/release/rustjvm.exe"
+RJVM="$ROOT/target/release/cratonvm.exe"
 HOTSPOT="C:/Program Files/Java/jdk-25/bin/java.exe"
 TORNADO_DIR="$ROOT/bench-tornado"
 CRATON_GPU=$(ls -d "$ROOT/target/release/build/craton-gpu-"*/out/classes 2>/dev/null | head -1)
@@ -48,7 +48,7 @@ echo "hotspot_c2,$(extract "$LOG/hotspot.out")" >> "$CSV"
 
 # 2. CratonVM CPU JIT-on
 echo "----- CratonVM CPU JIT-on -----"
-RUSTJVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
     --Xmx 2g -c "$BENCH_CLASSES" CpuPolyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu_jit_on.out" 2> "$LOG/cratoncpu_jit_on.err"
 echo "cratoncpu_jit_on rc=$?"
@@ -56,7 +56,7 @@ echo "cratonvm_cpu_jit_on,$(extract "$LOG/cratoncpu_jit_on.out")" >> "$CSV"
 
 # 3. CratonVM CPU JIT-off
 echo "----- CratonVM CPU JIT-off -----"
-RUSTJVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
     --Xmx 2g -c "$BENCH_CLASSES" CpuPolyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu_jit_off.out" 2> "$LOG/cratoncpu_jit_off.err"
 echo "cratoncpu_jit_off rc=$?"
@@ -64,7 +64,7 @@ echo "cratonvm_cpu_jit_off,$(extract "$LOG/cratoncpu_jit_off.out")" >> "$CSV"
 
 # 4. CratonVM GPU
 echo "----- CratonVM GPU -----"
-RUSTJVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
     --Xmx 2g --gpu --print-gpu-decisions \
     -c "$BENCH_CLASSES;$CRATON_GPU" GpuPolyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratongpu.out" 2> "$LOG/cratongpu.err"

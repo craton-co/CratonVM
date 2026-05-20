@@ -9,17 +9,17 @@
 //! file is kept so the call site in `lib.rs::register_essential_natives`
 //! continues to compile.
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 /// Audit cleanup: no longer registers any natives. Previously short-
 /// circuited every WildFly bootstrap entry-class `main(String[])`.
 ///
-/// Re-enable via `RUSTJVM_USE_WILDFLY_MAIN_SHIM=1` only for boot-test
+/// Re-enable via `CRATONVM_USE_WILDFLY_MAIN_SHIM=1` only for boot-test
 /// (exit-rc-only) work; the shim is OFF by default so real bytecode runs.
 pub fn register_wildfly_stubs(_registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_USE_WILDFLY_MAIN_SHIM").as_deref() == Ok("1") {
+    if std::env::var("CRATONVM_USE_WILDFLY_MAIN_SHIM").as_deref() == Ok("1") {
         tracing::warn!(
-            "[wildfly-shim] RUSTJVM_USE_WILDFLY_MAIN_SHIM=1 set — legacy shim opt-in noted but \
+            "[wildfly-shim] CRATONVM_USE_WILDFLY_MAIN_SHIM=1 set — legacy shim opt-in noted but \
              registration code has been removed in the real-bytecode audit."
         );
     }

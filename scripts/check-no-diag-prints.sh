@@ -9,10 +9,10 @@
 # `tracing::{debug,info,warn,error}!`.
 #
 # Allowed exceptions (do NOT trip this gate):
-#   * `[rustjvm] ...`        — intentional user-visible CLI messages
+#   * `[cratonvm] ...`        — intentional user-visible CLI messages
 #                              (watchdog banner, System.exit notice, etc.)
 #   * `tracing::*!(...)`     — structured logger, filterable
-#   * env-gated under `RUSTJVM_DBG_*` — opt-in diagnostics
+#   * env-gated under `CRATONVM_DBG_*` — opt-in diagnostics
 #   * anything inside `#[cfg(test)]` or under `tests/`
 #
 # Usage:

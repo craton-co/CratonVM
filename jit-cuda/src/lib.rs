@@ -1,4 +1,4 @@
-//! Java bytecode → PTX lowering for RustJVM GPU offload.
+//! Java bytecode → PTX lowering for CratonVM GPU offload.
 //!
 //! This crate is consumed by the VM to decide whether a static method
 //! is GPU-eligible (see [`analyzer`]) and, if so, to emit a PTX text
@@ -14,6 +14,7 @@
 //!   `test_classes/gpu/`, compiled by the workspace `build.rs`.
 
 pub mod analyzer;
+pub mod annotations;
 pub mod emitter;
 pub mod lowering;
 pub mod signature;
@@ -22,5 +23,9 @@ pub mod signature;
 mod test_support;
 
 pub use analyzer::{analyze, OffloadVerdict, ParamKind, Reason};
+pub use annotations::{
+    AdmissionHint, ClassAnnotations, EnableAsyncAttrs, GpuExcludeAttrs, GpuKernelAttrs, GridShape,
+    MethodAnnotations,
+};
 pub use emitter::{LoweringError, PtxKernel, PtxModule, PtxParam};
 pub use signature::KernelSignature;

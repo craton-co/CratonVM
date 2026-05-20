@@ -50,9 +50,9 @@
 
 #![allow(clippy::collapsible_if)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
 use crate::crypto_impl;
@@ -91,6 +91,49 @@ fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize
     ctx.class_num_total_fields(cid)
 }
 
+// ---------------------------------------------------------------------------
+// SigProbe fix: process-wide side tables for KPG / KeyFactory algorithm +
+// key size.  Real-JDK class layouts make raw-slot writes of `Value::Int`
+// silently turn into `Value::Object(None)` (the inherited slot 0 is an
+// object reference, not an int), so the raw-slot path is unreliable across
+// the `getInstance` → `initialize` → `generateKeyPair` chain.  Side tables
+// keyed on the receiver `ObjectRef` survive layout changes — same proven
+// pattern as `message_digest::accumulators`.  The base-offset slot writes
+// below are kept as a secondary store for synthetic-mode callers.
+// ---------------------------------------------------------------------------
+
+fn kpg_algo_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn kpg_keysize_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn set_kpg_algo(this: ObjectRef, idx: i32) {
+    kpg_algo_table().lock().insert(this, idx);
+}
+
+fn get_kpg_algo(this: ObjectRef) -> Option<i32> {
+    kpg_algo_table().lock().get(&this).copied()
+}
+
+fn set_kpg_keysize(this: ObjectRef, bits: i32) {
+    kpg_keysize_table().lock().insert(this, bits);
+}
+
+fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
+    kpg_keysize_table().lock().get(&this).copied()
+}
+
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
@@ -119,7 +162,7 @@ fn read_string(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> Strin
     }
 }
 
-fn this_arg(args: &[Value]) -> Result<ObjectRef, rustjvm_types::error::MethodCallFailed> {
+fn this_arg(args: &[Value]) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(o))) => Ok(*o),
         _ => Err(RuntimeError::NullPointerException {
@@ -236,8 +279,22 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         "java/security/KeyPairGenerator",
         base + KPG_PRIVATE_SLOTS,
     );
-    ctx.set_field(kpg, base + KPG_OFF_ALGO, Value::Int(idx));
+    // SigProbe fix: the JDK 25 `KeyPairGenerator` class declares
+    // `String algorithm` at the inherited `KeyPairGeneratorSpi` layout
+    // boundary. The side table (keyed on the receiver ObjectRef) carries
+    // the algorithm index reliably across the call chain, mirroring the
+    // proven pattern in `message_digest::accumulators`.
+    set_kpg_algo(kpg, idx);
     let default_bits = if idx == ALGO_RSA { 2048 } else if idx == ALGO_EC { 256 } else { 0 };
+    set_kpg_keysize(kpg, default_bits);
+    // Also write the algorithm string to the real-JDK named field so the
+    // bytecode-side `getAlgorithm()` (if ever reached on this receiver)
+    // sees the expected value.
+    let algo_str = ctx.create_string(&alg);
+    ctx.set_field_by_name(kpg, "algorithm", Value::Object(Some(algo_str)));
+    // Base-offset slot path: appended past the real layout, so these
+    // writes are a reliable secondary store for synthetic-mode callers.
+    ctx.set_field(kpg, base + KPG_OFF_ALGO, Value::Int(idx));
     ctx.set_field(kpg, base + KPG_OFF_KEYSIZE, Value::Int(default_bits));
     ctx.set_field(kpg, base + KPG_OFF_STATE, Value::Int(0));
     Ok(Some(Value::Object(Some(kpg))))
@@ -250,6 +307,7 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(n)) => *n,
         _ => 2048,
     };
+    set_kpg_keysize(this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
     Ok(None)
@@ -265,15 +323,16 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // from the previous value / the default.
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
-    let cur = match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
+    let cur = get_kpg_keysize(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
         Value::Int(n) => n,
         _ => 0,
-    };
-    let algo = match ctx.get_field(this, base + KPG_OFF_ALGO) {
+    });
+    let algo = get_kpg_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
-    };
+    });
     let bits = if algo == ALGO_EC { 256 } else if cur == 0 { 2048 } else { cur };
+    set_kpg_keysize(this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
     Ok(None)
@@ -286,17 +345,27 @@ fn kpg_initialize_spec_random(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
-    let algo = match ctx.get_field(this, base + KPG_OFF_ALGO) {
-        Value::Int(i) => i,
-        _ => return Err(RuntimeError::NotImplemented {
+    // SigProbe fix: prefer the side-table read (survives real-JDK class
+    // layouts where slot 0 collides with an inherited Object field).
+    let algo = get_kpg_algo(this).or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
+        Value::Int(i) => Some(i),
+        _ => None,
+    });
+    let algo = match algo {
+        Some(i) => i,
+        None => return Err(RuntimeError::NotImplemented {
             feature: "KeyPairGenerator with no algorithm".into(),
         }
         .into()),
     };
-    let bits = match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
-        Value::Int(n) if n > 0 => n as usize,
-        _ => 2048,
-    };
+    let bits = get_kpg_keysize(this)
+        .filter(|n| *n > 0)
+        .or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
+            Value::Int(n) if n > 0 => Some(n),
+            _ => None,
+        })
+        .map(|n| n as usize)
+        .unwrap_or(2048);
 
     if algo == ALGO_RSA {
         let (pk, sk) = crypto_impl::Rsa::generate_keypair(bits);

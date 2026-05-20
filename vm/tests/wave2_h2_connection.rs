@@ -41,15 +41,15 @@ fn h2_jar() -> PathBuf {
     h2_dir().join("lib").join("h2-2.2.224.jar")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -60,7 +60,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<String> {
-    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
         return Some(h);
     }
     if let Ok(h) = std::env::var("JAVA_HOME") {
@@ -75,10 +75,10 @@ fn java_home() -> Option<String> {
 
 #[test]
 fn h2test_connect_and_select_roundtrip() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
-            eprintln!("[wave2_h2] skipping: rustjvm binary not built");
+            eprintln!("[wave2_h2] skipping: cratonvm binary not built");
             return;
         }
     };
@@ -102,7 +102,7 @@ fn h2test_connect_and_select_roundtrip() {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave2_h2] failed to spawn rustjvm: {e}");
+            eprintln!("[wave2_h2] failed to spawn cratonvm: {e}");
             return;
         }
     };
@@ -131,7 +131,7 @@ fn h2test_connect_and_select_roundtrip() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "wave2_h2: rustjvm exited rc={:?}, stdout={:?}, stderr={:?}",
+        "wave2_h2: cratonvm exited rc={:?}, stdout={:?}, stderr={:?}",
         out.status.code(),
         stdout,
         stderr,

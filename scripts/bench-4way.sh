@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 4-way vector-add benchmark across:
 #   1. HotSpot C2          — Oracle JDK 25 (CPU JIT'd reference)
-#   2. CratonVM CPU         — rustjvm, no --gpu (JIT enabled when stable, off when not)
-#   3. CratonVM GPU         — rustjvm --gpu (transparent GPU offload)
+#   2. CratonVM CPU         — cratonvm, no --gpu (JIT enabled when stable, off when not)
+#   3. CratonVM GPU         — cratonvm --gpu (transparent GPU offload)
 #   4. TornadoVM            — TornadoVM @Parallel + TaskGraph API
 #
 # Each platform runs vector-add `out[i] = a[i] + b[i]` for n=1<<20 elements,
@@ -11,7 +11,7 @@
 set +e
 
 ROOT=C:/craton/CratonVM/.claude/worktrees/angry-brown-38c5dc
-RJVM="$ROOT/target/release/rustjvm.exe"
+RJVM="$ROOT/target/release/cratonvm.exe"
 HOTSPOT="C:/Program Files/Java/jdk-25/bin/java.exe"
 TORNADO_SDK_SETUP="C:/craton/tornadovm/setvars.sh"
 CRATON_GPU=$(ls -d "$ROOT/target/release/build/craton-gpu-"*/out/classes 2>/dev/null | head -1)
@@ -49,7 +49,7 @@ echo "hotspot_c2,$(extract "$LOG/hotspot.out")" >> "$CSV"
 
 # ----- 2. CratonVM CPU (JIT on) -----
 echo "----- CratonVM CPU JIT-on -----"
-RUSTJVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
     -c "$BENCH_CLASSES" CpuOnlyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu.out" 2> "$LOG/cratoncpu.err"
 echo "cratoncpu rc=$?"
@@ -57,7 +57,7 @@ echo "cratonvm_cpu_jit_on,$(extract "$LOG/cratoncpu.out")" >> "$CSV"
 
 # ----- 3. CratonVM CPU (JIT off — workaround for int[] loop regression) -----
 echo "----- CratonVM CPU JIT-off -----"
-RUSTJVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
     -c "$BENCH_CLASSES" CpuOnlyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu_nojit.out" 2> "$LOG/cratoncpu_nojit.err"
 echo "cratoncpu_nojit rc=$?"
@@ -65,7 +65,7 @@ echo "cratonvm_cpu_jit_off,$(extract "$LOG/cratoncpu_nojit.out")" >> "$CSV"
 
 # ----- 4. CratonVM GPU (--gpu) — uses GpuBench (with craton.gpu.*) -----
 echo "----- CratonVM GPU -----"
-RUSTJVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
     --gpu --print-gpu-decisions \
     -c "$BENCH_CLASSES;$CRATON_GPU" GpuBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratongpu.out" 2> "$LOG/cratongpu.err"

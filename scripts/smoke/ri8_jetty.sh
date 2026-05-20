@@ -49,6 +49,6 @@ JAVA
 CP="$FIX_DIR:$JETTY_SERVER:$JETTY_HTTP:$JETTY_IO:$JETTY_UTIL:$SERVLET"
 "$JAVA_HOME_FOR_SMOKE/bin/javac" -cp "$CP" -d "$FIX_DIR" "$FIX_DIR/JettySmoke.java"
 
-SMOKE_TIMEOUT=300 smoke_run_rustjvm --Xmx 1g --classpath "$CP" -- JettySmoke
+SMOKE_TIMEOUT=300 smoke_run_cratonvm --Xmx 1g --classpath "$CP" -- JettySmoke
 
 smoke_require_signal "JETTY_BODY=JETTY_SMOKE_OK"

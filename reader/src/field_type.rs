@@ -185,6 +185,22 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_array_is_rejected_not_overflow() {
+        // 256 leading '[' exceeds the 255-dimension cap: must return an
+        // error rather than recursing into a stack overflow.
+        let descriptor = format!("{}I", "[".repeat(256));
+        assert!(FieldType::parse(&descriptor).is_err());
+
+        // Far past the cap stays an error (and does not panic/overflow).
+        let huge = format!("{}I", "[".repeat(100_000));
+        assert!(FieldType::parse(&huge).is_err());
+
+        // Exactly 255 dimensions remains valid.
+        let at_cap = format!("{}I", "[".repeat(255));
+        assert!(FieldType::parse(&at_cap).is_ok());
+    }
+
+    #[test]
     fn display_roundtrip() {
         let types = ["I", "J", "Ljava/lang/String;", "[I", "[[D"];
         for desc in types {

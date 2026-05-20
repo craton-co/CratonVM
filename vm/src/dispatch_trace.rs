@@ -1,6 +1,6 @@
 //! 256-slot ring buffer for postmortem dispatch tracing.
 //!
-//! Gated by `RUSTJVM_DBG_LETSGO=1`. When enabled, every bytecode-method
+//! Gated by `CRATONVM_DBG_LETSGO=1`. When enabled, every bytecode-method
 //! entry and every native dispatch is recorded into a fixed-size ring
 //! protected by a single `parking_lot::Mutex`.  All record sites use
 //! `try_lock` so a contended slot never blocks the interpreter — it
@@ -48,7 +48,7 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn init_from_env() {
-    let on = std::env::var_os("RUSTJVM_DBG_LETSGO")
+    let on = std::env::var_os("CRATONVM_DBG_LETSGO")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     if on {
@@ -121,7 +121,7 @@ pub fn note_bb_dispatcher_cap_hit(depth: u32) {
     // confirm the guard fired, not so much we drown stderr.
     if n == 0 || (n + 1).is_power_of_two() {
         eprintln!(
-            "[rustjvm] bb-dispatcher cap hit at depth={} (total={})",
+            "[cratonvm] bb-dispatcher cap hit at depth={} (total={})",
             depth,
             n + 1,
         );
@@ -161,13 +161,13 @@ pub fn dump_to_stderr(label: &str) {
 /// teardown) that want **any** ring contents — even an empty one — to
 /// land in stderr so the user can tell that:
 ///   (a) the dump path ran, and
-///   (b) either the ring captured nothing (RUSTJVM_DBG_LETSGO was off)
+///   (b) either the ring captured nothing (CRATONVM_DBG_LETSGO was off)
 ///       or the last-dispatched method is visible.
 ///
 /// Unlike [`dump_to_stderr`], this never short-circuits on the
 /// `ENABLED` flag. The ring is still only populated when tracing was
 /// enabled at `record_*` time, so this typically yields a header with
-/// 0 slots when `RUSTJVM_DBG_LETSGO` wasn't set — that's still useful
+/// 0 slots when `CRATONVM_DBG_LETSGO` wasn't set — that's still useful
 /// because it confirms the dump path executed.
 pub fn dump_to_stderr_unconditional(label: &str) {
     dump_inner(label);

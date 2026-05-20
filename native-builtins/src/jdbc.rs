@@ -17,7 +17,7 @@
 //!      classpath.
 //!
 //!   2. A direct, native-side classpath-walking helper
-//!      (`rustjvm/Wp71JdbcSpi.findDriverProviderNative`) that proves the
+//!      (`cratonvm/Wp71JdbcSpi.findDriverProviderNative`) that proves the
 //!      core WP7.1 discovery contract — "given a `META-INF/services/java.sql.Driver`
 //!      on the classpath, the lookup surface can read it and report the
 //!      listed class names" — without going through the JDK
@@ -38,9 +38,9 @@
 //! `META-INF/services/java.sql.Driver` and asserts these natives discover
 //! the listed driver class.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use cratonvm_types::Value;
 
 /// Public entry: register every native that WP7.1 owns. Idempotent —
 /// safe to call from both `register_essential_natives` and
@@ -79,7 +79,7 @@ fn register_jdbc_service_loader(registry: &mut NativeMethodRegistry) {
 /// roadmap). When those gaps close, this helper becomes redundant
 /// and the fixture can switch to plain `ServiceLoader.load`.
 fn register_jdbc_driver_helpers(registry: &mut NativeMethodRegistry) {
-    let cls = "rustjvm/Wp71JdbcSpi";
+    let cls = "cratonvm/Wp71JdbcSpi";
     registry.register(
         cls,
         "countDriverProvidersNative",
@@ -263,13 +263,13 @@ mod tests {
             .is_some());
         assert!(r
             .find(
-                "rustjvm/Wp71JdbcSpi",
+                "cratonvm/Wp71JdbcSpi",
                 "findDriverProviderNative",
                 "(Ljava/lang/String;)I",
             )
             .is_some());
         assert!(r
-            .find("rustjvm/Wp71JdbcSpi", "countDriverProvidersNative", "()I",)
+            .find("cratonvm/Wp71JdbcSpi", "countDriverProvidersNative", "()I",)
             .is_some());
     }
 

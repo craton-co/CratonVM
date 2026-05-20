@@ -29,7 +29,7 @@ use crate::heap::{
 use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
 use crate::satb::SatbQueue;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -2608,6 +2608,11 @@ impl GarbageCollector for G1Collector {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
+        // Phase 6 #1: defer until every live `SafepointToken` has
+        // dropped — see `vm_heap::wait_for_gpu_critical_drain` for
+        // the rationale. No-op when `gpu-offload` is off.
+        crate::vm_heap::wait_for_gpu_critical_drain();
+
         // 1. Check if mixed GC is needed
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)

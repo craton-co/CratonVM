@@ -215,7 +215,10 @@ fn classify_counted_loop(
         // Loop-exit comparisons: if_icmp* (0x9F-0xA4) and unary if*
         // (0x99-0x9E) whose target is the post-loop region.
         if (0x99..=0xA4).contains(&op) {
-            let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
+            let off = i16::from_be_bytes([
+                *bytes.get(pc + 1).ok_or_else(truncated)?,
+                *bytes.get(pc + 2).ok_or_else(truncated)?,
+            ]) as i32;
             let target = (pc as i32 + off) as usize;
             if target > back_branch_pc && exit_if_pc.is_none() {
                 exit_if_pc = Some(pc);

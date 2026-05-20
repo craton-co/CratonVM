@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 use crate::classloading::resolution::{
     LambdaCallSite, MethodHandle, MethodHandleKind, RecordMethodKind, ResolvedCallSite, SwitchLabel,
@@ -805,7 +805,7 @@ fn value_to_string(
             // Call toString() via virtual dispatch if thread context is available
             if let Some(t) = thread {
                 let mut ctx = NativeContextImpl { shared, thread: t };
-                use rustjvm_native_api::NativeContext;
+                use cratonvm_native_api::NativeContext;
                 match ctx.invoke_virtual(*obj_ref, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(str_ref)))) => {
                         return ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string());
@@ -1826,7 +1826,7 @@ mod tests {
 
     /// Build a ConstantPool for testing resolve_method_handle_full.
     fn make_method_handle_cp(ref_kind: u8) -> ConstantPool {
-        use rustjvm_reader::constant_pool::ConstantPoolEntry as CPE;
+        use cratonvm_reader::constant_pool::ConstantPoolEntry as CPE;
 
         let entries = vec![
             CPE::Tombstone,                                         // 0 (unused)
@@ -1875,7 +1875,7 @@ mod tests {
 
     #[test]
     fn resolve_method_handle_full_field_ref() {
-        use rustjvm_reader::constant_pool::ConstantPoolEntry as CPE;
+        use cratonvm_reader::constant_pool::ConstantPoolEntry as CPE;
         let entries = vec![
             CPE::Tombstone,                                  // 0
             CPE::Utf8("com/example/Bar".to_string().into()), // 1
@@ -1905,7 +1905,7 @@ mod tests {
 
     #[test]
     fn resolve_method_type_test() {
-        use rustjvm_reader::constant_pool::ConstantPoolEntry as CPE;
+        use cratonvm_reader::constant_pool::ConstantPoolEntry as CPE;
         let entries = vec![
             CPE::Tombstone,
             CPE::Utf8("(Ljava/lang/Object;)V".to_string().into()), // 1

@@ -1,4 +1,4 @@
-//! JCK harness — discovers and runs JCK test classes through the RustJVM.
+//! JCK harness — discovers and runs JCK test classes through the CratonVM.
 //!
 //! This test is `#[ignore]` by default because it requires a valid JCK
 //! installation pointed to by the `JCK_HOME` environment variable. Run it
@@ -13,9 +13,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 // ---------------------------------------------------------------------------
 // JCK discovery

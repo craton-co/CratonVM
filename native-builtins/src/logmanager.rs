@@ -65,9 +65,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -1697,8 +1697,8 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use rustjvm_native_api::NativeMethodRegistry;
-    use rustjvm_types::Value;
+    use cratonvm_native_api::NativeMethodRegistry;
+    use cratonvm_types::Value;
 
     // Tests that mutate the singleton + registry share process-wide
     // state; guard them with a mutex so parallel threads don't race.

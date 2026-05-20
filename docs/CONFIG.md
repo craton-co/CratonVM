@@ -1,12 +1,12 @@
-# RustJVM — Configuration Reference
+# CratonVM — Configuration Reference
 
-The `rustjvm` launcher accepts JVM-style flags. Some are HotSpot-compatible
+The `cratonvm` launcher accepts JVM-style flags. Some are HotSpot-compatible
 (parsed before clap so the non-standard `-XX:+Foo` / `-agentlib:` spellings
 work), some are clap-style long options.
 
 ```
-rustjvm [OPTIONS] <CLASS_NAME> [ARGS...]
-rustjvm [OPTIONS] --jar <FILE.jar> [ARGS...]
+cratonvm [OPTIONS] <CLASS_NAME> [ARGS...]
+cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 ```
 
 ## Class loading
@@ -85,7 +85,7 @@ rustjvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 
 | Flag | Description |
 |------|-------------|
-| `--stack-dump-on-timeout <SECONDS>` | Spawn a watchdog that dumps every interpreter thread's stack to stderr after the deadline and aborts the process. Used to diagnose silent hangs. Pass `0` to disable. A 45-second default is installed automatically; set `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` to opt out. |
+| `--stack-dump-on-timeout <SECONDS>` | Spawn a watchdog that dumps every interpreter thread's stack to stderr after the deadline and aborts the process. Used to diagnose silent hangs. Pass `0` to disable. A 45-second default is installed automatically; set `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` to opt out. |
 
 ## System properties
 
@@ -93,7 +93,7 @@ rustjvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 become Java system properties (`System.getProperty`).
 
 ```
-rustjvm -Dfoo=bar -Dpath.separator=: MyApp
+cratonvm -Dfoo=bar -Dpath.separator=: MyApp
 ```
 
 ## Internal `VmConfig` defaults
@@ -124,5 +124,5 @@ and can be overridden by editing the `Default for VmConfig` impl:
 | `RUST_MIN_STACK` | Minimum thread stack size. Set to `8388608` (8 MB) for deep-recursion tests. |
 | `RUST_LOG` | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`). Defaults to `WARN`. |
 | `RJ_MAX_STACK_DEPTH` | Override `max_stack_depth` at startup (64–65536). |
-| `RUSTJVM_DISABLE_DEFAULT_WATCHDOG` | Set to `1` to disable the 45-second hang watchdog. |
-| `RUSTJVM_DEFAULT_WATCHDOG_SEC` | Override the default watchdog timeout. |
+| `CRATONVM_DISABLE_DEFAULT_WATCHDOG` | Set to `1` to disable the 45-second hang watchdog. |
+| `CRATONVM_DEFAULT_WATCHDOG_SEC` | Override the default watchdog timeout. |

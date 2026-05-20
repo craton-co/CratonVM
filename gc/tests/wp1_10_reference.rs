@@ -7,7 +7,7 @@
 //! weak / phantom / cleaner / finalizer references and their queue
 //! enqueueing.
 
-use rustjvm_gc::reference::{
+use cratonvm_gc::reference::{
     CleanerThread, FinalizerThread, ReferenceProcessor, ReferenceQueue, ReferenceType,
 };
 

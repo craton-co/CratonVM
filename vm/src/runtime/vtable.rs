@@ -62,7 +62,7 @@ pub struct VtableEntry {
     /// hook. `None` means the slot is abstract, native without a
     /// captured snapshot, or was built from an older
     /// `VtableSlotDescriptor` that predates this field.
-    pub resolved_method: Option<Arc<rustjvm_jit_api::CachedBytecodeMethod>>,
+    pub resolved_method: Option<Arc<cratonvm_jit_api::CachedBytecodeMethod>>,
     /// T10.9.A — true when the underlying Java method is declared
     /// `native`. The interpreter uses this bit to bypass the bytecode
     /// dispatch and fall through to the native-method registry lookup.
@@ -519,7 +519,7 @@ impl VtableManager {
         class_id: u64,
         name: &str,
         descriptor: &str,
-    ) -> Option<Arc<rustjvm_jit_api::CachedBytecodeMethod>> {
+    ) -> Option<Arc<cratonvm_jit_api::CachedBytecodeMethod>> {
         let vtable = self.tables.get(&class_id)?;
         let slot = vtable.lookup_slot(name, descriptor)?;
         let entry = vtable.get(slot)?;
@@ -630,7 +630,7 @@ impl VtableManager {
         &self,
         class_id: u64,
         slot: usize,
-    ) -> Option<Arc<rustjvm_jit_api::CachedBytecodeMethod>> {
+    ) -> Option<Arc<cratonvm_jit_api::CachedBytecodeMethod>> {
         self.vtable_entry_ref(class_id, slot)
             .and_then(|e| e.resolved_method.clone())
     }
@@ -763,7 +763,7 @@ pub fn global_vtable_manager() -> Option<Arc<RwLock<VtableManager>>> {
     GLOBAL_VTABLE_MANAGER.get().cloned()
 }
 
-/// Adapter that satisfies `rustjvm_classloading::VtableInstallHook`.
+/// Adapter that satisfies `cratonvm_classloading::VtableInstallHook`.
 ///
 /// Converts each `VtableSlotDescriptor` into a `VtableEntry` and writes
 /// the whole vec into the global `VtableManager` via `install_vtable`.
@@ -772,7 +772,7 @@ pub fn global_vtable_manager() -> Option<Arc<RwLock<VtableManager>>> {
 /// while the install lock is held only for the index rebuild.
 pub fn vtable_install_adapter(
     class_id: u32,
-    entries: Vec<Option<rustjvm_classloading::VtableSlotDescriptor>>,
+    entries: Vec<Option<cratonvm_classloading::VtableSlotDescriptor>>,
 ) {
     let manager = match global_vtable_manager() {
         Some(m) => m,
@@ -808,7 +808,7 @@ pub fn vtable_install_adapter(
                             v.push(0);
                             Arc::<[u8]>::from(v.into_boxed_slice())
                         };
-                        let cached = Arc::new(rustjvm_jit_api::CachedBytecodeMethod {
+                        let cached = Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
                             declaring_class_id: crate::classloading::ClassId::new(
                                 d.declaring_class_id,
                             ),
@@ -847,7 +847,7 @@ pub fn vtable_install_adapter(
     manager.write().install_vtable(class_id as u64, converted);
 }
 
-/// T10.9.A — adapter that satisfies `rustjvm_classloading::VtableOverrideHook`.
+/// T10.9.A — adapter that satisfies `cratonvm_classloading::VtableOverrideHook`.
 ///
 /// Fires on the same global `VtableManager` as the install hook. Each call
 /// invalidates exactly one `(super_class_id, slot)` pair so in-flight
@@ -1504,9 +1504,9 @@ mod tests {
         declaring_class_id: u32,
         method_name: &str,
         descriptor: &str,
-    ) -> Arc<rustjvm_jit_api::CachedBytecodeMethod> {
-        Arc::new(rustjvm_jit_api::CachedBytecodeMethod {
-            declaring_class_id: rustjvm_types::ClassId::new(declaring_class_id),
+    ) -> Arc<cratonvm_jit_api::CachedBytecodeMethod> {
+        Arc::new(cratonvm_jit_api::CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(declaring_class_id),
             class_name: Arc::<str>::from("Stub"),
             method_name: Arc::<str>::from(method_name),
             method_descriptor: Arc::<str>::from(descriptor),
@@ -1637,7 +1637,7 @@ mod tests {
     fn t10_9_a_adapter_preserves_empty_dispatch() {
         // We can't call vtable_install_adapter without a global
         // manager; simulate the conversion manually.
-        let desc = rustjvm_classloading::VtableSlotDescriptor {
+        let desc = cratonvm_classloading::VtableSlotDescriptor {
             declaring_class_id: 77,
             method_index: 3,
             method_name: Arc::<str>::from("abstr"),

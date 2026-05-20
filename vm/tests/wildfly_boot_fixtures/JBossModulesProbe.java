@@ -1,4 +1,4 @@
-package rustjvm.wildfly;
+package cratonvm.wildfly;
 
 import org.jboss.modules.DefaultBootModuleLoaderHolder;
 import org.jboss.modules.LocalModuleLoader;
@@ -10,7 +10,7 @@ import org.jboss.modules.ModuleLoader;
  * WP8.10 — minimal jboss-modules boot probe.
  *
  * Exercises just enough of the org.jboss.modules.Main.main(String[])
- * boot chain to surface a *deterministic* first-failure under rust-jvm,
+ * boot chain to surface a *deterministic* first-failure under cratonvm,
  * without needing the 150 MB WildFly tarball or a real jboss-modules.jar.
  *
  * What the real Main.main() does, abridged (verified against
@@ -71,7 +71,7 @@ public class JBossModulesProbe {
             return loader != null ? 1 : 0;
         } catch (Throwable t) {
             // Avoid printStackTrace — its native is not always wired
-            // up under rust-jvm.  Instead, write the throwable FQN +
+            // up under cratonvm.  Instead, write the throwable FQN +
             // message via System.err.println, which routes through the
             // PrintStream natives we know are registered.
             try {
@@ -95,7 +95,7 @@ public class JBossModulesProbe {
             return (loader instanceof LocalModuleLoader) ? 1 : 0;
         } catch (Throwable t) {
             // Avoid printStackTrace — its native is not always wired
-            // up under rust-jvm.  Instead, write the throwable FQN +
+            // up under cratonvm.  Instead, write the throwable FQN +
             // message via System.err.println, which routes through the
             // PrintStream natives we know are registered.
             try {
@@ -130,7 +130,7 @@ public class JBossModulesProbe {
             return m != null ? 1 : 0;
         } catch (Throwable t) {
             // Avoid printStackTrace — its native is not always wired
-            // up under rust-jvm.  Instead, write the throwable FQN +
+            // up under cratonvm.  Instead, write the throwable FQN +
             // message via System.err.println, which routes through the
             // PrintStream natives we know are registered.
             try {
@@ -158,7 +158,7 @@ public class JBossModulesProbe {
             return moduleName.equals(got) ? 1 : 0;
         } catch (Throwable t) {
             // Avoid printStackTrace — its native is not always wired
-            // up under rust-jvm.  Instead, write the throwable FQN +
+            // up under cratonvm.  Instead, write the throwable FQN +
             // message via System.err.println, which routes through the
             // PrintStream natives we know are registered.
             try {
@@ -190,7 +190,7 @@ public class JBossModulesProbe {
             return mcl != null ? 1 : 0;
         } catch (Throwable t) {
             // Avoid printStackTrace — its native is not always wired
-            // up under rust-jvm.  Instead, write the throwable FQN +
+            // up under cratonvm.  Instead, write the throwable FQN +
             // message via System.err.println, which routes through the
             // PrintStream natives we know are registered.
             try {
@@ -224,7 +224,7 @@ public class JBossModulesProbe {
             }
         } catch (Throwable t) {
             // Avoid printStackTrace — its native is not always wired
-            // up under rust-jvm.  Instead, write the throwable FQN +
+            // up under cratonvm.  Instead, write the throwable FQN +
             // message via System.err.println, which routes through the
             // PrintStream natives we know are registered.
             try {

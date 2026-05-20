@@ -9,9 +9,8 @@
 
 #![cfg(test)]
 
-use rustjvm_reader::attribute::force_decode_all;
-use rustjvm_reader::class_reader::read_class;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::class_reader::read_class;
+use cratonvm_reader::method::ClassFileMethod;
 
 /// Load `class_name.class` from the fixtures directory and return the
 /// named method. Panics if the class or method cannot be found — tests
@@ -31,17 +30,22 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
     let mut class = read_class(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-    // Force-decode every method's lazy `Raw` attributes against the
-    // class constant pool so `ClassFileMethod::code()` returns `Some`
-    // downstream — otherwise the analyzer rejects every fixture with a
-    // spurious `Reason::NoCode`.
-    for method in &mut class.methods {
-        force_decode_all(&mut method.attributes, &class.constant_pool).unwrap_or_else(|e| {
-            panic!(
-                "failed to decode attributes for a method in {}: {e:?}",
-                path.display()
-            )
-        });
+    // The reader keeps method attributes lazy (`LazyAttribute::Raw`);
+    // `ClassFileMethod::code()` only returns an already-decoded Code
+    // attribute. Force-decode the `Code` attribute (in place, while the
+    // constant pool is still borrowable) so the analyzer can see the
+    // method body — otherwise `analyze()` returns `Rejected(NoCode)`.
+    // Only `Code` is decoded: force-decoding every attribute can hit a
+    // ByteView range panic on certain malformed annotation attributes
+    // (`reader/src/byte_view.rs` — a separate reader-crate issue), and
+    // the analyzer only needs the method body anyway.
+    let cp = &class.constant_pool;
+    for method in class.methods.iter_mut() {
+        for attr in method.attributes.iter_mut() {
+            if attr.name() == "Code" {
+                let _ = attr.decode(cp);
+            }
+        }
     }
     class
         .methods

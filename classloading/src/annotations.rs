@@ -54,9 +54,9 @@
 //! Every tag is exercised by the integration probe at
 //! `apps/annotation_probe/AnnotationProbe.java`.
 
-use rustjvm_reader::attribute::{Annotation, Attribute, ElementValue, LazyAttribute, TypeAnnotation};
-use rustjvm_reader::field::ClassFileField;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::attribute::{Annotation, Attribute, ElementValue, LazyAttribute, TypeAnnotation};
+use cratonvm_reader::field::ClassFileField;
+use cratonvm_reader::method::ClassFileMethod;
 
 use crate::Class;
 
@@ -139,7 +139,7 @@ impl<'a> AnnotationsView<'a> {
 
     /// Type-annotation rows (JVMS §4.7.20). The type-use target info is
     /// intentionally left as raw bytes — see
-    /// [`rustjvm_reader::attribute::TypeAnnotation`] for the rationale.
+    /// [`cratonvm_reader::attribute::TypeAnnotation`] for the rationale.
     pub fn type_annotations(self) -> impl Iterator<Item = &'a TypeAnnotation> {
         self.attributes.iter().flat_map(|a| match a.as_decoded() {
             Some(
@@ -210,7 +210,7 @@ pub fn annotation_descriptor_to_class_name(descriptor: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_reader::attribute::{
+    use cratonvm_reader::attribute::{
         Annotation, Attribute, ElementValue, ElementValuePair, LazyAttribute, TypeAnnotation,
         TypePathEntry,
     };

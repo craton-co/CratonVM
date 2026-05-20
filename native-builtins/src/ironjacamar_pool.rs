@@ -38,9 +38,9 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::agroal_pool::{
     acquire, close_pool, create_pool, pool_stats, release, validate_select_1, PoolConfig,

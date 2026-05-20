@@ -24,10 +24,10 @@
 //!     caller provided a non-null address. A null address yields
 //!     IOException.
 
-use rustjvm_native_api::fd_table::FdId;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::fd_table::FdId;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -491,7 +491,7 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
 //   DatagramChannel               = 5 fields (port=0, open=1, connected=2, blocking=3, sock_id=4)
 
 use parking_lot::RwLock;
-use rustjvm_types::ClassId;
+use cratonvm_types::ClassId;
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::OnceLock;
@@ -529,14 +529,14 @@ fn udp_remove(id: i32) {
 /// the synthetic field layout. Tolerates classes that don't appear in the
 /// bootstrap classloader — falls back to `ClassId::new(0)` with the
 /// explicit field count.
-fn alloc_t16(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> rustjvm_types::ObjectRef {
+fn alloc_t16(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> cratonvm_types::ObjectRef {
     match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => ctx.alloc_object(cid, nfields),
         Err(_) => ctx.alloc_object(ClassId::new(0), nfields),
     }
 }
 
-fn obj_or_none(args: &[Value], idx: usize) -> Option<rustjvm_types::ObjectRef> {
+fn obj_or_none(args: &[Value], idx: usize) -> Option<cratonvm_types::ObjectRef> {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => Some(*o),
         _ => None,

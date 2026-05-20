@@ -1,7 +1,7 @@
 ﻿{
     "generated_at":  "2026-05-15T03:13:32Z",
-    "rustjvm_bin":  "c:\\craton\\CratonVM\\target\\wf-build2\\release\\rustjvm.exe",
-    "rustjvm_rev":  "74007a8",
+    "cratonvm_bin":  "c:\\craton\\CratonVM\\target\\wf-build2\\release\\cratonvm.exe",
+    "cratonvm_rev":  "74007a8",
     "main_class":  "DirectRunner",
     "classpath":  "C:\\craton\\CratonVM\\bench\\wildfly\\staged\\classes",
     "rc":  0,

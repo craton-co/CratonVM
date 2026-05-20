@@ -129,7 +129,7 @@ fn no_unconditional_diag_eprintln() {
     assert!(
         hits.is_empty(),
         "RJ.1 CI gate: found {} forbidden debug-trace print(s):\n{}\n\
-         Remove them or convert to tracing::debug!(target: \"rustjvm::...\", ...).",
+         Remove them or convert to tracing::debug!(target: \"cratonvm::...\", ...).",
         hits.len(),
         hits.join("\n")
     );

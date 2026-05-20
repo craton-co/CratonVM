@@ -42,7 +42,7 @@ use crate::heap::{
 };
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -678,7 +678,7 @@ impl GenerationalHeap {
         let num_slots = header.num_slots as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 obj = ?obj_ref.as_ptr(),
                 index,
                 num_slots,
@@ -725,7 +725,7 @@ impl GenerationalHeap {
         let num_slots = header.num_slots as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 obj = ?obj_ref.as_ptr(),
                 index,
                 num_slots,
@@ -746,7 +746,7 @@ impl GenerationalHeap {
             // neighboring object, but log first — silently swallowing this
             // masks real layout-mismatch bugs in the caller.
             tracing::error!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 obj = ?obj_ref.as_ptr(),
                 index,
                 num_slots,
@@ -868,7 +868,7 @@ impl GenerationalHeap {
             // can hit this path tens of thousands of times. Emitting a full
             // `Backtrace::force_capture` each time produces hundreds of MB
             // of stderr and exhausts disk. Keep the first few one-line
-            // warnings (with backtrace gated by `RUSTJVM_GC_ARRAY_GUARD_BT`)
+            // warnings (with backtrace gated by `CRATONVM_GC_ARRAY_GUARD_BT`)
             // and silently return 0 thereafter.
             static GUARD_COUNT: AtomicUsize = AtomicUsize::new(0);
             const GUARD_LIMIT: usize = 5;
@@ -908,7 +908,7 @@ impl GenerationalHeap {
                     let stored_len = (obj_ptr.add(12) as *const u32).read_unaligned();
                     (kind_byte, elem_byte, class_id_raw, stored_len)
                 };
-                let msg = if std::env::var_os("RUSTJVM_GC_ARRAY_GUARD_BT").is_some() {
+                let msg = if std::env::var_os("CRATONVM_GC_ARRAY_GUARD_BT").is_some() {
                     let bt = Backtrace::force_capture();
                     format!(
                         "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{})\nbacktrace:\n{}\n",
@@ -923,7 +923,7 @@ impl GenerationalHeap {
                     )
                 } else {
                     format!(
-                        "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{}; set RUSTJVM_GC_ARRAY_GUARD_BT=1 for backtrace)\n",
+                        "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{}; set CRATONVM_GC_ARRAY_GUARD_BT=1 for backtrace)\n",
                         kind_byte,
                         class_id_raw,
                         elem_byte,
@@ -1041,22 +1041,30 @@ impl GenerationalHeap {
             return Err(index as i32);
         }
         // SAFETY: Bounds check above guarantees `index < array_length`. The array
-        // data region is within the allocation. For reference elements, the inner
-        // `ObjectRef` was stored by a prior `set_array_element`, so dereferencing
-        // its header to check `AUTOBOX_CLASS_ID` is valid.
-        unsafe {
+        // data region is within the allocation.
+        let value = unsafe {
             let base = obj_ref.as_ptr().add(HEADER_SIZE);
-            let value = read_prim_element(base, index, header.element_type);
-            if header.element_type == ArrayElementType::Reference {
-                if let Value::Object(Some(obj)) = value {
-                    let obj_header = &*(obj.as_ptr() as *const ObjectHeader);
+            read_prim_element(base, index, header.element_type)
+        };
+        if header.element_type == ArrayElementType::Reference {
+            if let Value::Object(Some(obj)) = value {
+                // The stored word is treated as an `ObjectRef`, but a stale or
+                // garbage non-zero element could point anywhere. Validate it
+                // against the heap arenas (region + alignment + header sanity)
+                // before dereferencing it as an `ObjectHeader`. If it does not
+                // look like a live heap object, skip the unboxing and return
+                // the value as-is rather than performing a wild read.
+                if self.is_object_address(obj.as_ptr() as usize).is_some() {
+                    // SAFETY: `is_object_address` confirmed `obj` points to a
+                    // valid object header inside one of this heap's arenas.
+                    let obj_header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
                     if obj_header.class_id == AUTOBOX_CLASS_ID {
                         return Ok(self.get_field(obj, 0));
                     }
                 }
             }
-            Ok(value)
         }
+        Ok(value)
     }
 
     /// Set an array element at the given index.
@@ -1286,6 +1294,13 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // Phase 6 #1: spin-yield until every live `SafepointToken` has
+        // dropped. While a kernel is reading a JVM array on the GPU, we
+        // must not move that array — a single token held anywhere on
+        // any thread defers this collection until it is released.
+        // No-op when the `gpu-offload` feature is off.
+        crate::vm_heap::wait_for_gpu_critical_drain();
+
         // SAFETY: If any thread is currently inside a JIT call, we MUST NOT
         // run a *moving* collection. JIT frames hold raw object pointers in
         // their spill slots / registers which are NOT precisely described by
@@ -2437,7 +2452,7 @@ impl GenerationalHeap {
         let node = self.numa_slow_path_hint();
         if self.numa_num_nodes > 1 && node != self.numa_node_hint {
             tracing::trace!(
-                target: "rustjvm::gc::numa",
+                target: "cratonvm::gc::numa",
                 node, primary = self.numa_node_hint, size,
                 "try_alloc_young: cross-node slow path (single-arena fallback)",
             );
@@ -2480,7 +2495,7 @@ impl GenerationalHeap {
         let node = self.numa_slow_path_hint();
         if self.numa_num_nodes > 1 && node != self.numa_node_hint {
             tracing::trace!(
-                target: "rustjvm::gc::numa",
+                target: "cratonvm::gc::numa",
                 node, primary = self.numa_node_hint, requested_size,
                 "refill_tlab: cross-node refill (single-arena fallback)",
             );
@@ -2564,7 +2579,7 @@ impl GenerationalHeap {
             || header.array_length > (1 << 27)
         {
             tracing::debug!(
-                target: "rustjvm::gc::guard",
+                target: "cratonvm::gc::guard",
                 old_ptr = ?old_ptr,
                 kind_byte,
                 num_slots = header.num_slots,
@@ -2589,7 +2604,7 @@ impl GenerationalHeap {
             // callers to freed memory.
             if fwd.is_null() || (fwd as usize) % 8 != 0 {
                 tracing::debug!(
-                    target: "rustjvm::gc::guard",
+                    target: "cratonvm::gc::guard",
                     fwd = ?fwd,
                     old_ptr = ?old_ptr,
                     class_id = ?header.class_id,
@@ -2767,34 +2782,60 @@ impl GenerationalHeap {
         // O(total cards). `take_dirty_cards` also clears the tracking list,
         // which is fine because `card_table.clear_all()` is called by the
         // caller right after the dirty-card scan completes.
-        let dirty_indices = card_table.take_dirty_cards();
+        let mut dirty_indices = card_table.take_dirty_cards();
         if dirty_indices.is_empty() {
             return;
         }
 
-        // Build an O(1) lookup set so per-object membership testing avoids
-        // re-acquiring the card-table lock in `is_dirty` for every object
-        // in the old gen.
-        let dirty_set: FxHashSet<usize> = dirty_indices.iter().copied().collect();
         let card_base = card_table.base_addr();
         let card_size = crate::card_table::CARD_SIZE;
+        let old_base = old_gen.base_ptr() as usize;
 
-        // Walk objects in old gen exactly once; skip any whose card is not
-        // dirty. The walk itself is unavoidable because old-gen layout is
-        // header-following (objects have no external index), but the
-        // per-object work is now a single HashSet lookup.
-        let objects = old_gen.walk_objects();
+        // Round-11 perf: instead of `walk_objects()` (which allocates a Vec
+        // of *every* old-gen object and then filters per-object), translate
+        // the dirty card indices into byte-offset ranges relative to the
+        // old-gen data buffer and let `walk_objects_in_card_ranges` collect
+        // only the objects that actually start inside a dirty card.
+        //
+        // The card table covers a region starting at `card_base`; old-gen
+        // object pointers may sit at `old_base >= card_base`. Convert each
+        // dirty card's `[card_start, card_end)` address window into an
+        // offset window relative to `old_base`, clamped to `[0, capacity)`.
+        // Cards entirely below the old gen contribute nothing.
+        dirty_indices.sort_unstable();
+        let old_cap = old_gen.capacity();
+        let mut dirty_ranges: Vec<(usize, usize)> = Vec::with_capacity(dirty_indices.len());
+        for &card_idx in &dirty_indices {
+            let card_start = card_base.saturating_add(card_idx * card_size);
+            let card_end = card_start.saturating_add(card_size);
+            // Skip cards that end at or before the old-gen base.
+            if card_end <= old_base {
+                continue;
+            }
+            let lo = card_start.saturating_sub(old_base).min(old_cap);
+            let hi = card_end.saturating_sub(old_base).min(old_cap);
+            if lo < hi {
+                // Coalesce with the previous range if the cards are
+                // contiguous (adjacent dirty cards are common).
+                if let Some(last) = dirty_ranges.last_mut() {
+                    if last.1 >= lo {
+                        last.1 = last.1.max(hi);
+                        continue;
+                    }
+                }
+                dirty_ranges.push((lo, hi));
+            }
+        }
+        if dirty_ranges.is_empty() {
+            return;
+        }
+
+        // Walk old gen, collecting only objects whose start offset lands in
+        // a dirty card range. Preserves the original semantics (an object
+        // is a root iff the card containing its *header* is dirty).
+        let objects = old_gen.walk_objects_in_card_ranges(&dirty_ranges);
         for (obj_ptr, _total_size) in objects {
-            let obj_addr = obj_ptr as usize;
-            if obj_addr < card_base {
-                continue;
-            }
-            let card_idx = (obj_addr - card_base) / card_size;
-            if !dirty_set.contains(&card_idx) {
-                continue;
-            }
-
-            // SAFETY: `obj_ptr` is from `old_gen.walk_objects()`, pointing to a valid old-gen object header.
+            // SAFETY: `obj_ptr` is from `old_gen.walk_objects_in_card_ranges()`, pointing to a valid old-gen object header.
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
 
             // Scan ref slots: ref arrays use compact 8-byte pointers,
@@ -2888,9 +2929,26 @@ impl GenerationalHeap {
                     break;
                 }
                 let total_size = if header.kind == ObjectKind::Array {
-                    HEADER_SIZE
-                        + array_data_size(header.array_length as usize, header.element_type)
-                            .unwrap_or(0)
+                    // A malformed `array_length` makes `array_data_size`
+                    // overflow/fail. Do NOT silently treat it as a 0-byte
+                    // payload — that would advance the cursor by only
+                    // HEADER_SIZE and mis-parse the rest of the arena as
+                    // bogus objects. Treat it as heap corruption and stop
+                    // the walk cleanly, matching the `size < HEADER_SIZE`
+                    // handling below.
+                    match array_data_size(header.array_length as usize, header.element_type) {
+                        Ok(data) => HEADER_SIZE + data,
+                        Err(_) => {
+                            tracing::warn!(
+                                "GC: stopping young-gen heap walk at {:p} — implausible \
+                                 array_length {} (element_type={:?}); suspected corrupt header",
+                                ptr,
+                                header.array_length,
+                                header.element_type,
+                            );
+                            break;
+                        }
+                    }
                 } else {
                     HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
                 };
@@ -2940,11 +2998,29 @@ impl std::fmt::Debug for GenerationalHeap {
 
 /// Compute total size of a heap object (for GC cursor advancement).
 /// Objects use SLOT_SIZE per field. Arrays use compact element sizes.
+///
+/// A malformed `array_length` makes `array_data_size` overflow/fail. Rather
+/// than silently returning a 0-byte payload (`HEADER_SIZE`, which advances a
+/// scan cursor by the wrong amount and mis-parses subsequent memory), this
+/// returns `0` — a value below `HEADER_SIZE`. Every caller already either
+/// breaks the walk on `total_size < HEADER_SIZE` or rejects it via the
+/// `MAX_SANE_OBJECT_SIZE` corrupt-header check, so a bad array length is
+/// surfaced as corruption instead of corrupting the cursor.
 #[inline]
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
-            .unwrap_or(0)
+        match array_data_size(header.array_length as usize, header.element_type) {
+            Ok(data) => HEADER_SIZE + data,
+            Err(_) => {
+                tracing::warn!(
+                    "GC: implausible array_length {} (element_type={:?}) in heap object \
+                     header — treating as corrupt; caller will stop/skip the walk",
+                    header.array_length,
+                    header.element_type,
+                );
+                0
+            }
+        }
     } else {
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }

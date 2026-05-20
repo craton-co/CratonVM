@@ -1,17 +1,17 @@
 //! WP2.8 — Runtime conversion: parsed signature AST → Java reflective Type objects.
 //!
-//! The parser itself lives in `rustjvm_reader::signature`. This module
+//! The parser itself lives in `cratonvm_reader::signature`. This module
 //! contains the runtime layer that consumes parsed nodes and builds
 //! `java.lang.reflect.{ParameterizedType, TypeVariable, WildcardType,
 //! GenericArrayType}` heap objects via `NativeContext`.
 
-use rustjvm_native_api::registry::NativeContext;
-use rustjvm_types::Value;
+use cratonvm_native_api::registry::NativeContext;
+use cratonvm_types::Value;
 
 // Re-export the AST + parser entry points so existing callers can keep
 // importing from `crate::generics::...`. Internally everything routes
-// through `rustjvm_reader::signature`.
-pub use rustjvm_reader::signature::{
+// through `cratonvm_reader::signature`.
+pub use cratonvm_reader::signature::{
     parse_class_signature, parse_field_signature, parse_method_signature, ClassSig, MethodSig,
     TypeArg, TypeParam, TypeSig,
 };
@@ -103,7 +103,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             if !matches!(raw_val, Value::Object(None)) {
                 ctx.set_field(pt, 0, raw_val);
             }
-            let args_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), type_args.len());
+            let args_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), type_args.len());
             for (i, arg) in type_args.iter().enumerate() {
                 let val = type_arg_to_java(ctx, arg);
                 ctx.set_array_element(args_arr, i, val);
@@ -117,7 +117,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             let name_str = ctx.create_string(name);
             ctx.set_field(tv, 0, Value::Object(Some(name_str)));
             // Bounds: default to Object if no bounds known
-            let bounds_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+            let bounds_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
                 ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
@@ -160,23 +160,23 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
         TypeArg::Extends(sig) => {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
-            let upper = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+            let upper = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             let bound_val = type_sig_to_java(ctx, sig);
             ctx.set_array_element(upper, 0, bound_val);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
-            let lower = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let lower = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             Value::Object(Some(wt))
         }
         TypeArg::Super(sig) => {
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
-            let upper = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+            let upper = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
                 ctx.set_array_element(upper, 0, Value::Object(Some(obj_mirror)));
             }
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
-            let lower = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+            let lower = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             let bound_val = type_sig_to_java(ctx, sig);
             ctx.set_array_element(lower, 0, bound_val);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
@@ -185,13 +185,13 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
         TypeArg::Unbounded => {
             // ? => WildcardType with upper=Object, lower=empty
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
-            let upper = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+            let upper = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
                 ctx.set_array_element(upper, 0, Value::Object(Some(obj_mirror)));
             }
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
-            let lower = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 0);
+            let lower = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             Value::Object(Some(wt))
         }
@@ -214,7 +214,7 @@ pub fn type_param_to_java(ctx: &mut dyn NativeContext, tp: &TypeParam) -> Value 
     }
     if bound_sigs.is_empty() {
         // Default bound is Object
-        let bounds_arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 1);
+        let bounds_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
         if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
             let obj_mirror = ctx.get_class_mirror(obj_cid);
             ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
@@ -222,7 +222,7 @@ pub fn type_param_to_java(ctx: &mut dyn NativeContext, tp: &TypeParam) -> Value 
         ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
     } else {
         let bounds_arr =
-            ctx.new_ref_array(rustjvm_types::ClassId::new(0), bound_sigs.len());
+            ctx.new_ref_array(cratonvm_types::ClassId::new(0), bound_sigs.len());
         for (i, bs) in bound_sigs.iter().enumerate() {
             let val = type_sig_to_java(ctx, bs);
             ctx.set_array_element(bounds_arr, i, val);

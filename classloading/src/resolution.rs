@@ -5,7 +5,7 @@
 //!
 //! # Round 7 audit fix (LOW #13): `ClassFile` parse is parallelizable
 //!
-//! `rustjvm_reader::read_class` is pure and stateless — it takes a
+//! `cratonvm_reader::read_class` is pure and stateless — it takes a
 //! `&[u8]` and returns a fully-owned `ClassFile`. The cold-start JDK
 //! bootstrap parses ~6 000 classes serially and `read_class` is
 //! ~40-60 µs per class on a modern x86 core, so the serial cost adds
@@ -22,20 +22,21 @@
 //!
 //! **TODO:** if `rayon` becomes a workspace dep for another reason,
 //! revisit: add `pub fn parallel_parse(inputs: &[(Arc<str>, &[u8])])
-//! -> Vec<Result<ClassFile, ClassFileError>>` in `rustjvm_reader`
+//! -> Vec<Result<ClassFile, ClassFileError>>` in `cratonvm_reader`
 //! and call it from the bootstrap-scan path in `class_manager`.
 //!
 //! # Round 7 audit fix (LOW #14): JFR `StringPool` vs `intern_arc` are intentionally distinct
 //!
-//! `rustjvm_jfr::dump::StringPool` assigns `u16` IDs for the JFR
+//! `cratonvm_jfr::dump::StringPool` assigns `u16` IDs for the JFR
 //! binary wire format (one ID per unique string per JFR chunk; the
-//! pool resets between chunks). `rustjvm_types::intern_arc` returns
+//! pool resets between chunks). `cratonvm_types::intern_arc` returns
 //! a process-lifetime `Arc<str>` for runtime sharing across the
 //! VM. Different lifetimes (chunk-scoped vs process-scoped),
 //! different keying (`u16` wire ID vs identity-by-arc), different
 //! consumers (JFR file writer vs constant-pool tables). No
 //! unification opportunity — flagged for closure.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -43,7 +44,7 @@ use std::sync::Arc;
 use crate::fx_hash::{fx_hashmap_with_capacity, FxHashMap};
 
 use super::ClassId;
-use rustjvm_types::Value;
+use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
 // Resolved field / method references
@@ -263,6 +264,43 @@ pub struct LambdaCallSite {
 /// Cache key: (referring class, constant pool index).
 type ResolutionKey = (ClassId, u16);
 
+/// Per-map FIFO cap for [`ResolutionCache`].
+///
+/// The cache is keyed on `(referring class, cp index)` so its natural
+/// size is bounded by the total CP-reference count of the loaded
+/// program — but a long-running JVM that loads and unloads many
+/// classes (agents, redefine churn, fileless classloaders) can grow
+/// each map without bound. Mirrors the FIFO cap on `class_bytes_cache`
+/// (`class_manager.rs`) and `CanonicalizeCache` (`class_path.rs`).
+/// Generous enough that real programs never evict — eviction only
+/// kicks in for pathological reference sets.
+const RESOLUTION_CACHE_CAP: usize = 1 << 16;
+
+/// Insert `(key, value)` into `map` honouring the FIFO `order` tracker
+/// and `RESOLUTION_CACHE_CAP`. If `key` already exists the value is
+/// overwritten in place and the FIFO position is left unchanged
+/// (avoiding a linear `VecDeque` scan — resolution is idempotent, so a
+/// repeat insert writes an identical value). Mirrors
+/// [`CanonicalizeCache::insert`] in `class_path.rs`.
+fn resolution_cache_insert<V>(
+    map: &mut FxHashMap<ResolutionKey, V>,
+    order: &mut VecDeque<ResolutionKey>,
+    key: ResolutionKey,
+    value: V,
+) {
+    if map.contains_key(&key) {
+        map.insert(key, value);
+        return;
+    }
+    if map.len() >= RESOLUTION_CACHE_CAP {
+        if let Some(oldest) = order.pop_front() {
+            map.remove(&oldest);
+        }
+    }
+    order.push_back(key);
+    map.insert(key, value);
+}
+
 /// Caches resolved symbolic references from the constant pool.
 ///
 /// Avoids re-resolving the same field/method/call-site reference every time the
@@ -275,6 +313,14 @@ pub struct ResolutionCache {
     call_sites: FxHashMap<ResolutionKey, ResolvedCallSite>,
     /// Cached CONSTANT_Dynamic values (condy, JEP 309).
     condy: FxHashMap<ResolutionKey, Value>,
+    /// Insertion-order trackers for FIFO eviction, one per map. The
+    /// front is the oldest entry; the back is the most recent. Kept in
+    /// sync with each map: every fresh insert pushes to the back; every
+    /// eviction pops from the front. Bounded by `RESOLUTION_CACHE_CAP`.
+    fields_order: VecDeque<ResolutionKey>,
+    methods_order: VecDeque<ResolutionKey>,
+    call_sites_order: VecDeque<ResolutionKey>,
+    condy_order: VecDeque<ResolutionKey>,
 }
 
 impl ResolutionCache {
@@ -285,6 +331,10 @@ impl ResolutionCache {
             methods: fx_hashmap_with_capacity(64),
             call_sites: fx_hashmap_with_capacity(16),
             condy: fx_hashmap_with_capacity(16),
+            fields_order: VecDeque::with_capacity(64),
+            methods_order: VecDeque::with_capacity(64),
+            call_sites_order: VecDeque::with_capacity(16),
+            condy_order: VecDeque::with_capacity(16),
         }
     }
 
@@ -295,7 +345,12 @@ impl ResolutionCache {
 
     /// Cache a resolved field.
     pub fn put_field(&mut self, class_id: ClassId, cp_index: u16, resolved: ResolvedField) {
-        self.fields.insert((class_id, cp_index), resolved);
+        resolution_cache_insert(
+            &mut self.fields,
+            &mut self.fields_order,
+            (class_id, cp_index),
+            resolved,
+        );
     }
 
     /// Look up a cached method resolution.
@@ -305,7 +360,12 @@ impl ResolutionCache {
 
     /// Cache a resolved method.
     pub fn put_method(&mut self, class_id: ClassId, cp_index: u16, resolved: ResolvedMethod) {
-        self.methods.insert((class_id, cp_index), resolved);
+        resolution_cache_insert(
+            &mut self.methods,
+            &mut self.methods_order,
+            (class_id, cp_index),
+            resolved,
+        );
     }
 
     /// Look up a cached call site (invokedynamic).
@@ -315,7 +375,12 @@ impl ResolutionCache {
 
     /// Cache a resolved call site.
     pub fn put_call_site(&mut self, class_id: ClassId, cp_index: u16, resolved: ResolvedCallSite) {
-        self.call_sites.insert((class_id, cp_index), resolved);
+        resolution_cache_insert(
+            &mut self.call_sites,
+            &mut self.call_sites_order,
+            (class_id, cp_index),
+            resolved,
+        );
     }
 
     /// The number of cached field resolutions.
@@ -340,11 +405,16 @@ impl ResolutionCache {
 
     /// Cache a resolved CONSTANT_Dynamic value.
     pub fn put_condy(&mut self, class_id: ClassId, cp_index: u16, value: Value) {
-        self.condy.insert((class_id, cp_index), value);
+        resolution_cache_insert(
+            &mut self.condy,
+            &mut self.condy_order,
+            (class_id, cp_index),
+            value,
+        );
     }
 
     /// Scan cached CONSTANT_Dynamic values for GC roots.
-    pub fn scan_condy_roots(&self, roots: &mut Vec<rustjvm_types::ObjectRef>) {
+    pub fn scan_condy_roots(&self, roots: &mut Vec<cratonvm_types::ObjectRef>) {
         for val in self.condy.values() {
             if let Value::Object(Some(obj_ref)) = val {
                 roots.push(*obj_ref);
@@ -359,7 +429,7 @@ impl ResolutionCache {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
                     debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                    *obj_ref = unsafe { rustjvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
                 }
             }
         }
@@ -372,6 +442,11 @@ impl ResolutionCache {
         self.methods.clear();
         self.call_sites.clear();
         self.condy.clear();
+        // Keep the FIFO trackers in sync with their maps.
+        self.fields_order.clear();
+        self.methods_order.clear();
+        self.call_sites_order.clear();
+        self.condy_order.clear();
     }
 
     /// Round 4 audit fix (CRIT): drop every cached resolution that
@@ -413,6 +488,13 @@ impl ResolutionCache {
         // carry no reachable declaring-class link.)
         self.call_sites.retain(|(key_class, _), _| *key_class != class_id);
         self.condy.retain(|(key_class, _), _| *key_class != class_id);
+        // Rebuild the FIFO trackers so they stay in sync with the maps:
+        // keep only keys still present, preserving insertion order.
+        self.fields_order.retain(|key| self.fields.contains_key(key));
+        self.methods_order.retain(|key| self.methods.contains_key(key));
+        self.call_sites_order
+            .retain(|key| self.call_sites.contains_key(key));
+        self.condy_order.retain(|key| self.condy.contains_key(key));
     }
 }
 
@@ -442,7 +524,7 @@ impl Default for ResolutionCache {
 pub enum ResolvedMember {
     /// A method was found at `declaring_class_id`, position `index`
     /// inside its `methods` vec. Callers re-fetch the
-    /// [`rustjvm_reader::ClassFileMethod`] via the class store so the
+    /// [`cratonvm_reader::ClassFileMethod`] via the class store so the
     /// cache stays small (no full snapshot).
     Method {
         declaring_class_id: ClassId,
@@ -690,8 +772,8 @@ impl LinkResolver {
                 None => ResolvedMember::NotFound,
             };
             (
-                rustjvm_types::intern_arc(name),
-                rustjvm_types::intern_arc(descriptor),
+                cratonvm_types::intern_arc(name),
+                cratonvm_types::intern_arc(descriptor),
                 resolved,
             )
         })
@@ -716,14 +798,14 @@ impl LinkResolver {
                     declaring_class_id: declaring,
                     absolute_index: field_index as u32,
                     is_static: field.access_flags.contains(
-                        rustjvm_reader::class_access_flags::FieldAccessFlags::STATIC,
+                        cratonvm_reader::class_access_flags::FieldAccessFlags::STATIC,
                     ),
                 },
                 None => ResolvedMember::NotFound,
             };
             (
-                rustjvm_types::intern_arc(name),
-                rustjvm_types::intern_arc(""),
+                cratonvm_types::intern_arc(name),
+                cratonvm_types::intern_arc(""),
                 resolved,
             )
         })
@@ -786,10 +868,10 @@ impl std::fmt::Debug for LinkResolver {
 // Invoke cache — stores everything needed to create a Frame directly
 // ---------------------------------------------------------------------------
 
-use rustjvm_native_api::NativeCallback;
+use cratonvm_native_api::NativeCallback;
 
 // Re-export from jit-api crate — the canonical definition lives there now.
-pub use rustjvm_jit_api::CachedBytecodeMethod;
+pub use cratonvm_jit_api::CachedBytecodeMethod;
 
 /// WP2.4-F1 — JEP 109 redefinition staleness gate for an invoke-cache entry.
 ///
@@ -897,7 +979,7 @@ pub enum CachedInvokeTarget {
     },
     /// JIT-compiled method: call native code directly, no frame push needed.
     Jit {
-        compiled: Arc<rustjvm_jit::CompiledMethod>,
+        compiled: Arc<cratonvm_jit::CompiledMethod>,
         num_params: u16,
         return_type: u8, // b'I', b'J', b'V'
         needs_heap: bool,

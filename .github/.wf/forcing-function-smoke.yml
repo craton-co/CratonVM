@@ -7,9 +7,9 @@
 # Each matrix slot:
 #   1. checkout
 #   2. set up JDK 21 + Rust stable (with cache)
-#   3. cargo build --release -p rustjvm-cli
+#   3. cargo build --release -p cratonvm-cli
 #   4. bash bench/<app>/stage.sh
-#   5. bash bench/<app>/run-under-rustjvm.sh   (10-minute timeout)
+#   5. bash bench/<app>/run-under-cratonvm.sh   (10-minute timeout)
 #   6. bash bench/<app>/diff-baseline.sh
 # Drift against bench/<app>/bench-baseline.json fails the slot.
 #
@@ -72,8 +72,8 @@ jobs:
         with:
           shared-key: forcing-function-smoke
 
-      - name: Build rustjvm (release)
-        run: cargo build --release -p rustjvm-cli
+      - name: Build cratonvm (release)
+        run: cargo build --release -p cratonvm-cli
 
       - name: Install jq (for diff-baseline.sh robust parsing)
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -81,8 +81,8 @@ jobs:
       - name: Stage ${{ matrix.app }}
         run: bash bench/${{ matrix.app }}/stage.sh
 
-      - name: Run ${{ matrix.app }} under rust-jvm
-        run: bash bench/${{ matrix.app }}/run-under-rustjvm.sh
+      - name: Run ${{ matrix.app }} under cratonvm
+        run: bash bench/${{ matrix.app }}/run-under-cratonvm.sh
         env:
           # 10-minute per-app timeout (per WP8.7). Matrix-level timeout-minutes
           # above gives slack for build + cache.

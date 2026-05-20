@@ -42,8 +42,8 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
-use rustjvm_native_api::registry::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{error::MethodCallResult, ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::registry::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{error::MethodCallResult, ArrayElementType, ObjectRef, Value};
 
 /// Per-object property cap.  10_000 keys * 64 KiB max value = 640 MiB
 /// per object, but in practice `.properties` files are tiny.  This
@@ -66,7 +66,7 @@ const MAX_KV_LEN: usize = 64 * 1024;
 #[inline]
 fn props_stderr_diag() -> bool {
     matches!(
-        std::env::var("RUSTJVM_DIAG_PROPERTIES").as_deref(),
+        std::env::var("CRATONVM_DIAG_PROPERTIES").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     )
 }
@@ -174,7 +174,7 @@ fn drain_input_stream(
     // --- Strategy 3: invoke_virtual read([BII)I loop ---
     // Handles any real InputStream implementation.
     let chunk_size = 8192usize;
-    let chunk_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, chunk_size);
+    let chunk_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk_size);
     let mut out = Vec::new();
     loop {
         let n = match ctx.invoke_virtual(
@@ -690,14 +690,14 @@ fn native_properties_get_property_1(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     if let Some(v) = get_kv(this, &key) {
         tracing::debug!(
-            target: "rustjvm_vm::props_sidetable",
+            target: "cratonvm_vm::props_sidetable",
             ?this, key = %key, bytes = v.len(),
             "PROPS-GET sidetable hit"
         );
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
     tracing::debug!(
-        target: "rustjvm_vm::props_sidetable",
+        target: "cratonvm_vm::props_sidetable",
         ?this, key = %key,
         "PROPS-GET sidetable MISS, falling back to system"
     );
@@ -907,7 +907,7 @@ fn build_key_set(
         let s = ctx.create_string(k);
         elems.push(Value::Object(Some(s)));
     }
-    let set = rustjvm_native_collections::make_hashset_with_elements(ctx, &elems);
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems);
     set
 }
 
@@ -944,7 +944,7 @@ fn native_properties_string_property_names(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -963,7 +963,7 @@ fn native_properties_key_set(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -1001,7 +1001,7 @@ fn native_properties_entry_set(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -1026,7 +1026,7 @@ fn native_properties_entry_set(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             // Fallback: synthetic empty HashSet via collections helper.
-            let empty = rustjvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };

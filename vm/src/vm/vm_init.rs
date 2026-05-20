@@ -168,7 +168,7 @@ fn canonical_os_version() -> String {
 #[cfg(target_os = "windows")]
 fn windows_build_number() -> Option<u32> {
     // Tests can override via env to validate the threshold logic.
-    if let Ok(override_str) = std::env::var("RUSTJVM_FORCE_WIN_BUILD") {
+    if let Ok(override_str) = std::env::var("CRATONVM_FORCE_WIN_BUILD") {
         if let Ok(n) = override_str.parse::<u32>() {
             return Some(n);
         }
@@ -228,15 +228,19 @@ pub struct SharedVm {
     /// VM configuration (immutable after construction).
     pub config: VmConfig,
 
-    /// GPU offload cache (Part E). Holds the CUDA `DeviceContext` and
-    /// per-method compiled-kernel cache. Cheap when offload is off:
-    /// constructed with `ctx = None` and every lookup short-circuits
-    /// to `LookupOutcome::Skip`.
+    /// GPU offload cache registry (Part E, Phase 3). Owns one
+    /// [`OffloadCache`](crate::runtime::offload::OffloadCache) per
+    /// CUDA device ordinal — each cache holds its own
+    /// `DeviceContext` and per-method compiled-kernel map. Cheap when
+    /// offload is off: no `OffloadCache` is constructed until the
+    /// first `get_or_create` call, and absent that call the registry
+    /// is just an empty `FxHashMap`.
     ///
     /// Behind the `gpu-offload` Cargo feature — the field does not
     /// exist on the CPU-only build.
     #[cfg(feature = "gpu-offload")]
-    pub offload_cache: std::sync::Arc<crate::runtime::offload::OffloadCache>,
+    pub offload_registry:
+        std::sync::Arc<crate::runtime::offload::OffloadCacheRegistry>,
 
     /// Class loader and cache, protected by an RwLock.
     pub class_manager: RwLock<ClassManager>,
@@ -257,7 +261,7 @@ pub struct SharedVm {
     pub native_method_cache: parking_lot::RwLock<
         crate::runtime::fx_collections::FxHashMap<
             (String, String, String),
-            rustjvm_native_api::NativeCallback,
+            cratonvm_native_api::NativeCallback,
         >,
     >,
 
@@ -395,7 +399,7 @@ pub struct SharedVm {
     pub jni_global_refs: parking_lot::Mutex<crate::native::jni::JniGlobalRefs>,
 
     /// Reference processor for weak/soft/phantom reference tracking during GC.
-    pub ref_processor: parking_lot::Mutex<rustjvm_gc::ReferenceProcessor>,
+    pub ref_processor: parking_lot::Mutex<cratonvm_gc::ReferenceProcessor>,
 
     /// Cached field count for java/lang/String (0 = not yet resolved).
     /// Once resolved, this is the actual `num_total_fields` from the loaded
@@ -457,10 +461,10 @@ pub struct SharedVm {
 
     /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
     /// dependent compiled methods when class loading breaks those assumptions.
-    pub invalidation_manager: parking_lot::Mutex<rustjvm_jit::deopt::InvalidationManager>,
+    pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
 
     /// Java Flight Recorder — records VM events (GC, thread, class loading, compilation).
-    pub flight_recorder: parking_lot::Mutex<rustjvm_jfr::FlightRecorder>,
+    pub flight_recorder: parking_lot::Mutex<cratonvm_jfr::FlightRecorder>,
 
     /// JVMTI debug state — breakpoints, step requests, and event callbacks.
     #[cfg(feature = "experimental-debug")]
@@ -486,11 +490,11 @@ pub struct SharedVm {
     /// Finalizer thread queue — objects with `finalize()` overrides are enqueued
     /// here when the GC determines they are unreachable.  The VM drains this
     /// queue and invokes each object's `finalize()` method (JLS §12.6).
-    pub finalizer_thread: rustjvm_gc::reference::FinalizerThread,
+    pub finalizer_thread: cratonvm_gc::reference::FinalizerThread,
 
     /// Cleaner thread queue — Cleaner actions are enqueued when the associated
     /// referent becomes unreachable.  The VM drains and executes them.
-    pub cleaner_thread: rustjvm_gc::reference::CleanerThread,
+    pub cleaner_thread: cratonvm_gc::reference::CleanerThread,
 
     /// Per-class initialization condition variables (JVM spec §5.5).
     ///
@@ -513,7 +517,7 @@ pub struct SharedVm {
     /// B6: Counter of silent swallows during class init / invokedynamic / native calls.
     /// Incremented whenever an error is swallowed (converted to a WARN) so the CLI
     /// can surface a summary after main() completes silently. Visible via tracing
-    /// at WARN level. Setting RUSTJVM_STRICT_SWALLOWS=1 escalates swallows to panics.
+    /// at WARN level. Setting CRATONVM_STRICT_SWALLOWS=1 escalates swallows to panics.
     pub swallow_counter: std::sync::atomic::AtomicU64,
 
     /// Per-class-name loading locks (Session 30: Thread-Safe Class Loading).
@@ -828,11 +832,11 @@ impl SharedVm {
                 .expect("java/util/Map must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
             let unmod_specs: [(&str, &[ClassId]); 5] = [
-                ("rustjvm/internal/UnmodifiableCollection", &[collection_id]),
-                ("rustjvm/internal/UnmodifiableList", &[list_id, collection_id]),
-                ("rustjvm/internal/UnmodifiableSet", &[set_id, collection_id]),
-                ("rustjvm/internal/UnmodifiableMap", &[map_id]),
-                ("rustjvm/internal/UnmodifiableItr", &[iterator_id]),
+                ("cratonvm/internal/UnmodifiableCollection", &[collection_id]),
+                ("cratonvm/internal/UnmodifiableList", &[list_id, collection_id]),
+                ("cratonvm/internal/UnmodifiableSet", &[set_id, collection_id]),
+                ("cratonvm/internal/UnmodifiableMap", &[map_id]),
+                ("cratonvm/internal/UnmodifiableItr", &[iterator_id]),
             ];
             for (name, ifaces) in unmod_specs {
                 let cid = class_manager.ensure_synthetic_class(name, 1);
@@ -854,7 +858,7 @@ impl SharedVm {
         let heap = VmHeap::new(gc_backend, config.max_heap_size);
 
         // Reset singleton classloader instances from any previous VM
-        rustjvm_native_builtins::classloader::reset_loader_singletons();
+        cratonvm_native_builtins::classloader::reset_loader_singletons();
 
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
@@ -872,33 +876,33 @@ impl SharedVm {
                     "(Ljava/util/Collection;I)I",
                     |ctx, args| {
                         let this = match args.first() {
-                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                         };
                         let coll = match args.get(1) {
-                            Some(rustjvm_types::Value::Object(Some(c))) => *c,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                            Some(cratonvm_types::Value::Object(Some(c))) => *c,
+                            _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                         };
                         let max_elements = match args.get(2) {
-                            Some(rustjvm_types::Value::Int(n)) => *n,
+                            Some(cratonvm_types::Value::Int(n)) => *n,
                             _ => i32::MAX,
                         };
                         // Ensure monitor is initialized before entering
                         ctx.monitor_enter(this);
-                        let size = match ctx.get_field(this, 1) { rustjvm_types::Value::Int(n) => n, _ => 0 };
+                        let size = match ctx.get_field(this, 1) { cratonvm_types::Value::Int(n) => n, _ => 0 };
                         let arr = match ctx.get_field(this, 0) {
-                            rustjvm_types::Value::Object(Some(a)) => a,
-                            _ => { ctx.monitor_exit(this); return Ok(Some(rustjvm_types::Value::Int(0))); }
+                            cratonvm_types::Value::Object(Some(a)) => a,
+                            _ => { ctx.monitor_exit(this); return Ok(Some(cratonvm_types::Value::Int(0))); }
                         };
                         let to_drain = size.min(max_elements);
                         for i in 0..to_drain as usize {
                             let elem = ctx.get_array_element(arr, i);
                             ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
                         }
-                        ctx.set_field(this, 1, rustjvm_types::Value::Int(size - to_drain));
+                        ctx.set_field(this, 1, cratonvm_types::Value::Int(size - to_drain));
                         ctx.monitor_notify_all(this)?;
                         ctx.monitor_exit(this);
-                        Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                        Ok(Some(cratonvm_types::Value::Int(to_drain)))
                     },
                 );
             } else {
@@ -908,7 +912,7 @@ impl SharedVm {
                 register_essential_natives(&mut native_methods);
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
-                rustjvm_native_builtins::register_concurrent_natives(&mut native_methods);
+                cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
@@ -918,65 +922,65 @@ impl SharedVm {
                     "(Ljava/util/Collection;I)I",
                     |ctx, args| {
                         let this = match args.first() {
-                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                         };
                         let coll = match args.get(1) {
-                            Some(rustjvm_types::Value::Object(Some(c))) => *c,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                            Some(cratonvm_types::Value::Object(Some(c))) => *c,
+                            _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                         };
                         let max_elements = match args.get(2) {
-                            Some(rustjvm_types::Value::Int(n)) => *n,
+                            Some(cratonvm_types::Value::Int(n)) => *n,
                             _ => i32::MAX,
                         };
                         // Use object monitor instead of ReentrantLock to avoid field layout issues
                         ctx.monitor_enter(this);
                         // Try to access fields - real JDK LinkedBlockingQueue has different field layout
                         // We'll try common field names/offsets
-                        let size = match ctx.get_field(this, 1) { rustjvm_types::Value::Int(n) => n, _ => 0 };
+                        let size = match ctx.get_field(this, 1) { cratonvm_types::Value::Int(n) => n, _ => 0 };
                         let arr = match ctx.get_field(this, 0) {
-                            rustjvm_types::Value::Object(Some(a)) => a,
-                            _ => { ctx.monitor_exit(this); return Ok(Some(rustjvm_types::Value::Int(0))); }
+                            cratonvm_types::Value::Object(Some(a)) => a,
+                            _ => { ctx.monitor_exit(this); return Ok(Some(cratonvm_types::Value::Int(0))); }
                         };
                         let to_drain = size.min(max_elements);
                         for i in 0..to_drain as usize {
                             let elem = ctx.get_array_element(arr, i);
                             ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
                         }
-                        ctx.set_field(this, 1, rustjvm_types::Value::Int(size - to_drain));
+                        ctx.set_field(this, 1, cratonvm_types::Value::Int(size - to_drain));
                         ctx.monitor_notify_all(this)?;
                         ctx.monitor_exit(this);
-                        Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                        Ok(Some(cratonvm_types::Value::Int(to_drain)))
                     },
                 );
                 // invokevirtual can resolve `drainTo` against the
                 // `BlockingQueue` interface type while the receiver is a real
                 // `LinkedBlockingQueue`. Register on the interface too so the
                 // native walk in `invoke_or_native` finds the implementation.
-                let lbq_drain_bounded = |ctx: &mut dyn rustjvm_native_api::NativeContext,
-                                         args: &[rustjvm_types::Value]| {
+                let lbq_drain_bounded = |ctx: &mut dyn cratonvm_native_api::NativeContext,
+                                         args: &[cratonvm_types::Value]| {
                     let this = match args.first() {
-                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                     };
                     let coll = match args.get(1) {
-                        Some(rustjvm_types::Value::Object(Some(c))) => *c,
-                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        Some(cratonvm_types::Value::Object(Some(c))) => *c,
+                        _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                     };
                     let max_elements = match args.get(2) {
-                        Some(rustjvm_types::Value::Int(n)) => *n,
+                        Some(cratonvm_types::Value::Int(n)) => *n,
                         _ => i32::MAX,
                     };
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
-                        rustjvm_types::Value::Int(n) => n,
+                        cratonvm_types::Value::Int(n) => n,
                         _ => 0,
                     };
                     let arr = match ctx.get_field(this, 0) {
-                        rustjvm_types::Value::Object(Some(a)) => a,
+                        cratonvm_types::Value::Object(Some(a)) => a,
                         _ => {
                             ctx.monitor_exit(this);
-                            return Ok(Some(rustjvm_types::Value::Int(0)));
+                            return Ok(Some(cratonvm_types::Value::Int(0)));
                         }
                     };
                     let to_drain = size.min(max_elements);
@@ -984,10 +988,10 @@ impl SharedVm {
                         let elem = ctx.get_array_element(arr, i);
                         ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
                     }
-                    ctx.set_field(this, 1, rustjvm_types::Value::Int(size - to_drain));
+                    ctx.set_field(this, 1, cratonvm_types::Value::Int(size - to_drain));
                     ctx.monitor_notify_all(this)?;
                     ctx.monitor_exit(this);
-                    Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                    Ok(Some(cratonvm_types::Value::Int(to_drain)))
                 };
                 native_methods.register(
                     "java/util/concurrent/BlockingQueue",
@@ -1001,23 +1005,23 @@ impl SharedVm {
                     "(Ljava/util/Collection;)I",
                     |ctx, args| {
                         let this = match args.first() {
-                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                            _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                         };
                         let coll = match args.get(1) {
-                            Some(rustjvm_types::Value::Object(Some(c))) => *c,
-                            _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                            Some(cratonvm_types::Value::Object(Some(c))) => *c,
+                            _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                         };
                         ctx.monitor_enter(this);
                         let size = match ctx.get_field(this, 1) {
-                            rustjvm_types::Value::Int(n) => n,
+                            cratonvm_types::Value::Int(n) => n,
                             _ => 0,
                         };
                         let arr = match ctx.get_field(this, 0) {
-                            rustjvm_types::Value::Object(Some(a)) => a,
+                            cratonvm_types::Value::Object(Some(a)) => a,
                             _ => {
                                 ctx.monitor_exit(this);
-                                return Ok(Some(rustjvm_types::Value::Int(0)));
+                                return Ok(Some(cratonvm_types::Value::Int(0)));
                             }
                         };
                         let to_drain = size;
@@ -1025,10 +1029,10 @@ impl SharedVm {
                             let elem = ctx.get_array_element(arr, i);
                             ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
                         }
-                        ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                        ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
                         ctx.monitor_notify_all(this)?;
                         ctx.monitor_exit(this);
-                        Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                        Ok(Some(cratonvm_types::Value::Int(to_drain)))
                     },
                 );
                 native_methods.register(
@@ -1037,15 +1041,15 @@ impl SharedVm {
                     "(ILjava/util/concurrent/ThreadFactory;)V",
                     |ctx, args| {
                         let this = match args.first() {
-                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
                             _ => return Ok(None),
                         };
                         let cores = match args.get(1) {
-                            Some(rustjvm_types::Value::Int(v)) => *v,
+                            Some(cratonvm_types::Value::Int(v)) => *v,
                             _ => 1,
                         };
-                        ctx.set_field(this, 0, rustjvm_types::Value::Int(cores));
-                        ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                        ctx.set_field(this, 0, cratonvm_types::Value::Int(cores));
+                        ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
                         Ok(None)
                     },
                 );
@@ -1059,14 +1063,14 @@ impl SharedVm {
                     "(Z)V",
                     |ctx, args| {
                         let this = match args.first() {
-                            Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
                             _ => return Ok(None),
                         };
                         let v = match args.get(1) {
-                            Some(rustjvm_types::Value::Int(n)) if *n != 0 => 1,
+                            Some(cratonvm_types::Value::Int(n)) if *n != 0 => 1,
                             _ => 0,
                         };
-                        ctx.set_field(this, 0, rustjvm_types::Value::Int(v));
+                        ctx.set_field(this, 0, cratonvm_types::Value::Int(v));
                         Ok(None)
                     },
                 );
@@ -1079,40 +1083,40 @@ impl SharedVm {
                 // `register_collections_natives` (see real-JDK arm below for
                 // rationale) — Surefire's BooterDeserializer needs the
                 // side-table round-trip to retrieve forkNumber et al.
-                rustjvm_native_builtins::properties_sidetable::register_properties_sidetable(
+                cratonvm_native_builtins::properties_sidetable::register_properties_sidetable(
                     &mut native_methods,
                 );
                 // T12: Register JDK 25 Unsafe natives (addressSize0, fences, etc.)
-                rustjvm_native_builtins::unsafe_jdk25::register_t12_unsafe_natives(&mut native_methods);
+                cratonvm_native_builtins::unsafe_jdk25::register_t12_unsafe_natives(&mut native_methods);
                 // T14: Register System bootstrap natives (SystemProps$Raw, FileDescriptor, etc.)
-                rustjvm_native_builtins::system_bootstrap::register_t14_system_bootstrap(&mut native_methods);
+                cratonvm_native_builtins::system_bootstrap::register_t14_system_bootstrap(&mut native_methods);
                 // C4: Register jdk.internal.loader.BootLoader natives so its
                 // <clinit> completes and BootLoader.INSTANCE is non-null;
                 // downstream URLClassPath.<clinit> stops NPE'ing and
                 // ClassLoader.getResources can walk the boot packages.
-                rustjvm_native_builtins::boot_loader::register_boot_loader_natives(&mut native_methods);
+                cratonvm_native_builtins::boot_loader::register_boot_loader_natives(&mut native_methods);
                 // KC26: Register NIO Path/FileSystem natives — needed because Path is an interface
                 // in the real JDK (abstract methods have no Code attribute) and our synthetic
                 // Path objects need native dispatch.
-                rustjvm_native_builtins::phases_late::register_phase57_nio_file(&mut native_methods);
+                cratonvm_native_builtins::phases_late::register_phase57_nio_file(&mut native_methods);
                 // KC26: Register URL codec (URLDecoder/URLEncoder) natives — the real JDK
                 // bytecode depends on internal sun.net classes we don't support.
-                rustjvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
+                cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
                 // KC26: Register Charset/StandardCharsets natives
-                rustjvm_native_builtins::register_charset_natives_pub(&mut native_methods);
+                cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);
                 // KC26: Register Charset coder natives
-                rustjvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
+                cratonvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
                 // Phase B (RB.1/RB.2): real charset transcoding (overrides the
                 // no-op stubs registered by register_p58_charset_coder above).
-                rustjvm_native_builtins::charset::register_real_charset_natives(&mut native_methods);
+                cratonvm_native_builtins::charset::register_real_charset_natives(&mut native_methods);
                 // KC26: Register reflection/signal/unsafe-deprecated natives
                 // (needed for getCallerClass, StackWalker, etc.)
-                rustjvm_native_builtins::deprecated_internal::register_deprecated_internal_natives(&mut native_methods);
+                cratonvm_native_builtins::deprecated_internal::register_deprecated_internal_natives(&mut native_methods);
                 // KC26: ArraysSupport vectorized intrinsics (vectorizedMismatch, vectorizedHashCode)
-                rustjvm_native_builtins::phases_early::register_arrays_support_natives(&mut native_methods);
+                cratonvm_native_builtins::phases_early::register_arrays_support_natives(&mut native_methods);
                 // KC26: StringLatin1 compareTo/getChar — native overrides to bypass
                 // bytecode loop bugs in the interpreter's baload/if_icmpge interaction.
-                rustjvm_native_builtins::phases_early::register_string_latin1_natives(&mut native_methods);
+                cratonvm_native_builtins::phases_early::register_string_latin1_natives(&mut native_methods);
                 // KC26: RunnerClassLoader.close() — the real bytecode crashes on null
                 // map values (HashMap entries with null value field). Register a no-op
                 // until the underlying HashMap null-value issue is resolved.
@@ -1126,26 +1130,26 @@ impl SharedVm {
                 // is extremely complex (creates ArrayList, ProtectionDomain,
                 // NativeLibraries, Module, etc.) and fails on missing internals.
                 // Register simplified constructors that just store the parent field.
-                rustjvm_native_builtins::classloader_real::register_classloader_real_natives(&mut native_methods);
+                cratonvm_native_builtins::classloader_real::register_classloader_real_natives(&mut native_methods);
                 // KC26: MethodType factories + MethodHandle basics — needed because
                 // the real JDK bytecode for these depends on deep JDK internals
                 // (MethodHandleNatives, DirectMethodHandle) we don't support.
-                rustjvm_native_builtins::lang_invoke::register_phase54_method_handle(&mut native_methods);
+                cratonvm_native_builtins::lang_invoke::register_phase54_method_handle(&mut native_methods);
                 // KC26: MethodHandles.lookup() + Lookup.findStatic/findVirtual/etc.
                 // Phase 63 overrides phase 54's stub find* with real implementations
                 // that resolve class/method/descriptor for proper MH dispatch.
-                rustjvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut native_methods);
+                cratonvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut native_methods);
                 // KC26: MethodHandle.invoke/invokeExact — signature-polymorphic
                 // dispatch that reads the target class/method/descriptor from
                 // our synthetic 5-field MethodHandle and invokes the target.
-                rustjvm_native_builtins::lang_invoke::register_t4_method_handle_invoke(&mut native_methods);
+                cratonvm_native_builtins::lang_invoke::register_t4_method_handle_invoke(&mut native_methods);
                 // C5: Lookup.unreflect/unreflectGetter/unreflectSetter/
                 // unreflectConstructor/permuteArguments/guardWithTest overrides.
                 // Without these, real-JDK Lookup.unreflectGetter runs Java
                 // bytecode that relies on MethodHandleNatives.init populating
                 // the MemberName, and our Field's JDK layout must match —
                 // which we fix in lang_class.rs::create_field_object.
-                rustjvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
+                cratonvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
                 // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
                 // log4j ServiceLoaderUtil.callServiceLoader calls
                 // LambdaMetafactory.metafactory directly (not via invokedynamic).
@@ -1154,7 +1158,7 @@ impl SharedVm {
                 // "Bad CP index: 0" inside our incomplete classfile shim.
                 // Intercept with a native stub that returns null so the JDK path
                 // is bypassed entirely (callers tolerate the missing call site).
-                rustjvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
+                cratonvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
                 // RA.8 + WP1.8: Real ServiceLoader.load/iterator that walks
                 // META-INF/services. Registration + classpath-scan bootstrap
                 // are kept together in `init_service_loader_bootstrap` so
@@ -1168,10 +1172,10 @@ impl SharedVm {
                 // intercepts the synthetic Proxy$Instance allocation
                 // path that the dispatcher in interpreter.rs already
                 // recognizes.
-                rustjvm_native_builtins::register_reflect_proxy_natives(&mut native_methods);
+                cratonvm_native_builtins::register_reflect_proxy_natives(&mut native_methods);
                 // WP2.4-A: java.lang.instrument runtime natives —
                 // sun.instrument.InstrumentationImpl + the in-process
-                // rustjvm.Instrument bridge used by the
+                // cratonvm.Instrument bridge used by the
                 // apps/instrument_probe smoke fixture.
                 crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
                 // RKC16N.10: sun.management.VMManagementImpl natives —
@@ -1180,7 +1184,7 @@ impl SharedVm {
                 // JBoss Modules boot path (Keycloak) trips on an
                 // UnsatisfiedLinkError. Lives outside register_jmx_natives
                 // (which is synthetic-only) so the real-JDK path picks it up.
-                rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
                 // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
                 // friends. The real-JDK bytecode delegates to
                 // `getPlatformMXBean(Class)` which throws "X is not a platform
@@ -1191,24 +1195,24 @@ impl SharedVm {
                 // ForkedBooter.isDebugging() / dumpHelp() succeed and the
                 // forked test JVM continue past constructor.
                 #[cfg(feature = "experimental-jmx")]
-                rustjvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
                 // RKC16N.11: pre-register the rest of the sun.management.*
                 // native surface so future Keycloak-boot iterations don't
                 // trip on missing-native errors as JMM init walks deeper.
                 // All return reasonable defaults (zeros / empty arrays /
                 // -1 for "metric unavailable"); JBoss only iterates these
                 // MXBeans for diagnostic display, not control flow.
-                rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
-                rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
-                rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
                 // Wave 1 / Task A: per-pool / per-manager MXBean natives
                 // so ManagementFactory.getXxxMXBeans() returns at least
                 // one usable bean per type (not just empty arrays).
-                rustjvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
-                rustjvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
-                rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
-                rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
-                rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
                 // Spring Boot 2.x fat-jars: SLF4J 1.7's MDC.<clinit> /
                 // LoggerFactory.<clinit> call StaticMDCBinder.getSingleton()
                 // / StaticLoggerBinder.getSingleton() which only resolve
@@ -1220,7 +1224,7 @@ impl SharedVm {
                 // Register synthetic singletons + a no-op BasicMDCAdapter so
                 // <clinit> completes; the existing MDC / Logger natives
                 // already cover the actual API surface.
-                rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
+                cratonvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
                 // ApplicationStartup / StartupStep: `spring_startup_bootstrap` in essentials.
                 tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
             }
@@ -1228,37 +1232,37 @@ impl SharedVm {
         #[cfg(not(feature = "synthetic-jdk"))]
         {
             register_essential_natives(&mut native_methods);
-            // rustjvm-cli default features omit `synthetic-jdk`; the rich
+            // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
-            rustjvm_native_builtins::register_concurrent_natives(&mut native_methods);
+            cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
             fn real_jdk_lbq_drain_to_bounded(
-                ctx: &mut dyn rustjvm_native_api::NativeContext,
-                args: &[rustjvm_types::Value],
-            ) -> rustjvm_types::error::MethodCallResult {
+                ctx: &mut dyn cratonvm_native_api::NativeContext,
+                args: &[cratonvm_types::Value],
+            ) -> cratonvm_types::error::MethodCallResult {
                 let this = match args.first() {
-                    Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                    _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                    _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                 };
                 let coll = match args.get(1) {
-                    Some(rustjvm_types::Value::Object(Some(c))) => *c,
-                    _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                    Some(cratonvm_types::Value::Object(Some(c))) => *c,
+                    _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                 };
                 let max_elements = match args.get(2) {
-                    Some(rustjvm_types::Value::Int(n)) => *n,
+                    Some(cratonvm_types::Value::Int(n)) => *n,
                     _ => i32::MAX,
                 };
                 ctx.monitor_enter(this);
                 let size = match ctx.get_field(this, 1) {
-                    rustjvm_types::Value::Int(n) => n,
+                    cratonvm_types::Value::Int(n) => n,
                     _ => 0,
                 };
                 let arr = match ctx.get_field(this, 0) {
-                    rustjvm_types::Value::Object(Some(a)) => a,
+                    cratonvm_types::Value::Object(Some(a)) => a,
                     _ => {
                         ctx.monitor_exit(this);
-                        return Ok(Some(rustjvm_types::Value::Int(0)));
+                        return Ok(Some(cratonvm_types::Value::Int(0)));
                     }
                 };
                 let to_drain = size.min(max_elements);
@@ -1266,10 +1270,10 @@ impl SharedVm {
                     let elem = ctx.get_array_element(arr, i);
                     ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
                 }
-                ctx.set_field(this, 1, rustjvm_types::Value::Int(size - to_drain));
+                ctx.set_field(this, 1, cratonvm_types::Value::Int(size - to_drain));
                 ctx.monitor_notify_all(this)?;
                 ctx.monitor_exit(this);
-                Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                Ok(Some(cratonvm_types::Value::Int(to_drain)))
             }
             native_methods.register(
                 "java/util/concurrent/LinkedBlockingQueue",
@@ -1289,23 +1293,23 @@ impl SharedVm {
                 "(Ljava/util/Collection;)I",
                 |ctx, args| {
                     let this = match args.first() {
-                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                     };
                     let coll = match args.get(1) {
-                        Some(rustjvm_types::Value::Object(Some(c))) => *c,
-                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        Some(cratonvm_types::Value::Object(Some(c))) => *c,
+                        _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                     };
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
-                        rustjvm_types::Value::Int(n) => n,
+                        cratonvm_types::Value::Int(n) => n,
                         _ => 0,
                     };
                     let arr = match ctx.get_field(this, 0) {
-                        rustjvm_types::Value::Object(Some(a)) => a,
+                        cratonvm_types::Value::Object(Some(a)) => a,
                         _ => {
                             ctx.monitor_exit(this);
-                            return Ok(Some(rustjvm_types::Value::Int(0)));
+                            return Ok(Some(cratonvm_types::Value::Int(0)));
                         }
                     };
                     let to_drain = size;
@@ -1313,10 +1317,10 @@ impl SharedVm {
                         let elem = ctx.get_array_element(arr, i);
                         ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?;
                     }
-                    ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                    ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
                     ctx.monitor_notify_all(this)?;
                     ctx.monitor_exit(this);
-                    Ok(Some(rustjvm_types::Value::Int(to_drain)))
+                    Ok(Some(cratonvm_types::Value::Int(to_drain)))
                 },
             );
             native_methods.register(
@@ -1325,15 +1329,15 @@ impl SharedVm {
                 "(ILjava/util/concurrent/ThreadFactory;)V",
                 |ctx, args| {
                     let this = match args.first() {
-                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        Some(cratonvm_types::Value::Object(Some(o))) => *o,
                         _ => return Ok(None),
                     };
                     let cores = match args.get(1) {
-                        Some(rustjvm_types::Value::Int(v)) => *v,
+                        Some(cratonvm_types::Value::Int(v)) => *v,
                         _ => 1,
                     };
-                    ctx.set_field(this, 0, rustjvm_types::Value::Int(cores));
-                    ctx.set_field(this, 1, rustjvm_types::Value::Int(0));
+                    ctx.set_field(this, 0, cratonvm_types::Value::Int(cores));
+                    ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
                     Ok(None)
                 },
             );
@@ -1343,41 +1347,41 @@ impl SharedVm {
                 "(Ljava/lang/Object;)Z",
                 |ctx, args| {
                     let this = match args.first() {
-                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
-                        _ => return Ok(Some(rustjvm_types::Value::Int(0))),
+                        Some(cratonvm_types::Value::Object(Some(o))) => *o,
+                        _ => return Ok(Some(cratonvm_types::Value::Int(0))),
                     };
                     let elem = args
                         .get(1)
                         .copied()
-                        .unwrap_or(rustjvm_types::Value::Object(None));
+                        .unwrap_or(cratonvm_types::Value::Object(None));
                     ctx.monitor_enter(this);
                     let size = match ctx.get_field(this, 1) {
-                        rustjvm_types::Value::Int(n) => n.max(0) as usize,
+                        cratonvm_types::Value::Int(n) => n.max(0) as usize,
                         _ => 0,
                     };
                     let old_arr = match ctx.get_field(this, 0) {
-                        rustjvm_types::Value::Object(Some(a)) => a,
+                        cratonvm_types::Value::Object(Some(a)) => a,
                         _ => {
-                            let a = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
-                            ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(a)));
+                            let a = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                            ctx.set_field(this, 0, cratonvm_types::Value::Object(Some(a)));
                             a
                         }
                     };
                     for i in 0..size {
                         if ctx.get_array_element(old_arr, i) == elem {
                             ctx.monitor_exit(this);
-                            return Ok(Some(rustjvm_types::Value::Int(0)));
+                            return Ok(Some(cratonvm_types::Value::Int(0)));
                         }
                     }
-                    let new_arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, size + 1);
+                    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size + 1);
                     for i in 0..size {
                         ctx.set_array_element(new_arr, i, ctx.get_array_element(old_arr, i));
                     }
                     ctx.set_array_element(new_arr, size, elem);
-                    ctx.set_field(this, 0, rustjvm_types::Value::Object(Some(new_arr)));
-                    ctx.set_field(this, 1, rustjvm_types::Value::Int((size + 1) as i32));
+                    ctx.set_field(this, 0, cratonvm_types::Value::Object(Some(new_arr)));
+                    ctx.set_field(this, 1, cratonvm_types::Value::Int((size + 1) as i32));
                     ctx.monitor_exit(this);
-                    Ok(Some(rustjvm_types::Value::Int(1)))
+                    Ok(Some(cratonvm_types::Value::Int(1)))
                 },
             );
             native_methods.register(
@@ -1386,14 +1390,14 @@ impl SharedVm {
                 "(Z)V",
                 |ctx, args| {
                     let this = match args.first() {
-                        Some(rustjvm_types::Value::Object(Some(o))) => *o,
+                        Some(cratonvm_types::Value::Object(Some(o))) => *o,
                         _ => return Ok(None),
                     };
                     let v = match args.get(1) {
-                        Some(rustjvm_types::Value::Int(n)) if *n != 0 => 1,
+                        Some(cratonvm_types::Value::Int(n)) if *n != 0 => 1,
                         _ => 0,
                     };
-                    ctx.set_field(this, 0, rustjvm_types::Value::Int(v));
+                    ctx.set_field(this, 0, cratonvm_types::Value::Int(v));
                     Ok(None)
                 },
             );
@@ -1409,14 +1413,14 @@ impl SharedVm {
             // `SystemPropertyManager.loadProperties(InputStream)` round-trip
             // (load → stringPropertyNames → getProperty) so the forked JVM
             // sees `forkNumber`, `reportsDirectory`, `shutdown`, etc.
-            rustjvm_native_builtins::properties_sidetable::register_properties_sidetable(
+            cratonvm_native_builtins::properties_sidetable::register_properties_sidetable(
                 &mut native_methods,
             );
-            rustjvm_native_builtins::unsafe_jdk25::register_t12_unsafe_natives(&mut native_methods);
-            rustjvm_native_builtins::system_bootstrap::register_t14_system_bootstrap(&mut native_methods);
+            cratonvm_native_builtins::unsafe_jdk25::register_t12_unsafe_natives(&mut native_methods);
+            cratonvm_native_builtins::system_bootstrap::register_t14_system_bootstrap(&mut native_methods);
             // C4: BootLoader natives (see comment at first registration site above).
-            rustjvm_native_builtins::boot_loader::register_boot_loader_natives(&mut native_methods);
-            rustjvm_native_builtins::phases_late::register_phase57_nio_file(&mut native_methods);
+            cratonvm_native_builtins::boot_loader::register_boot_loader_natives(&mut native_methods);
+            cratonvm_native_builtins::phases_late::register_phase57_nio_file(&mut native_methods);
             // Spring Boot 3.2 fat-jar launcher needs File.<init>(String) to
             // normalise URI-style `/<drive>:/...` paths so the round-trip
             // `URL.toURI().getSchemeSpecificPart() -> new File(...)` lands on
@@ -1426,7 +1430,7 @@ impl SharedVm {
             // override), so route File constructors and metadata accessors
             // through our Rust natives in `register_phase57_file`. Paired
             // with the `check_override` allow-list entry for `java/io/File`.
-            rustjvm_native_builtins::phases_late::register_phase57_file(&mut native_methods);
+            cratonvm_native_builtins::phases_late::register_phase57_file(&mut native_methods);
             // Spring Boot 3.2: JarFileArchive.<init> opens the fat-jar via
             // `new JarFile(File)` and immediately calls `jarFile.stream()`
             // / `jarFile.getManifest()` to walk `BOOT-INF/lib/*.jar`. The
@@ -1435,13 +1439,13 @@ impl SharedVm {
             // through `register_p59_jar` (which uses the `zip` crate to
             // open the archive directly). Paired with the `check_override`
             // allow-list entry for `java/util/jar/JarFile`.
-            rustjvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+            cratonvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
             // SB3-LOGBACK: Spring Boot 3.2's DefaultLogbackConfiguration.apply
             // NPEs on its first monitorenter against a synthetic LoggerContext.
             // Register a no-op native override so the boot path skips logback's
             // default configuration (logs fall back to JVM stderr). Paired with
             // the `check_override` allow-list entry in `vm_exec.rs`.
-            rustjvm_native_builtins::register_spring_boot_logback_apply(&mut native_methods);
+            cratonvm_native_builtins::register_spring_boot_logback_apply(&mut native_methods);
             // Spring Boot 3 fat-jar launcher: `Launcher.createClassLoader`
             // calls `urls.toArray(new URL[0])` on the 67-element URL list
             // returned by `JarFileArchive.getClassPathUrls`. The real-JDK
@@ -1460,10 +1464,10 @@ impl SharedVm {
             // covers the real-JDK path which never calls that bulk
             // registration.
             fn real_jdk_to_array_typed(
-                ctx: &mut dyn rustjvm_native_api::NativeContext,
-                args: &[rustjvm_types::Value],
-            ) -> rustjvm_types::error::MethodCallResult {
-                use rustjvm_types::Value;
+                ctx: &mut dyn cratonvm_native_api::NativeContext,
+                args: &[cratonvm_types::Value],
+            ) -> cratonvm_types::error::MethodCallResult {
+                use cratonvm_types::Value;
                 let this = match args.first() {
                     Some(Value::Object(Some(o))) => *o,
                     _ => return Ok(Some(Value::Object(None))),
@@ -1501,7 +1505,7 @@ impl SharedVm {
                     };
                     let target = match template {
                         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
-                        _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+                        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                     };
                     let it_v = ctx.invoke(
                         &recv_class,
@@ -1549,7 +1553,7 @@ impl SharedVm {
                 };
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
-                    _ => ctx.new_array(rustjvm_types::ArrayElementType::Reference, size),
+                    _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                 };
                 if let Some(d) = data {
                     let d_len = ctx.array_length(d);
@@ -1576,25 +1580,25 @@ impl SharedVm {
                 "([Ljava/lang/Object;)[Ljava/lang/Object;",
                 real_jdk_to_array_typed,
             );
-            rustjvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
-            rustjvm_native_builtins::register_charset_natives_pub(&mut native_methods);
-            rustjvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
-            rustjvm_native_builtins::charset::register_real_charset_natives(&mut native_methods);
-            rustjvm_native_builtins::deprecated_internal::register_deprecated_internal_natives(&mut native_methods);
-            rustjvm_native_builtins::phases_early::register_arrays_support_natives(&mut native_methods);
-            rustjvm_native_builtins::phases_early::register_string_latin1_natives(&mut native_methods);
+            cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
+            cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);
+            cratonvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
+            cratonvm_native_builtins::charset::register_real_charset_natives(&mut native_methods);
+            cratonvm_native_builtins::deprecated_internal::register_deprecated_internal_natives(&mut native_methods);
+            cratonvm_native_builtins::phases_early::register_arrays_support_natives(&mut native_methods);
+            cratonvm_native_builtins::phases_early::register_string_latin1_natives(&mut native_methods);
             native_methods.register(
                 "io/quarkus/bootstrap/runner/RunnerClassLoader",
                 "close",
                 "()V",
                 |_ctx, _args| Ok(None),
             );
-            rustjvm_native_builtins::classloader_real::register_classloader_real_natives(&mut native_methods);
-            rustjvm_native_builtins::lang_invoke::register_phase54_method_handle(&mut native_methods);
-            rustjvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut native_methods);
-            rustjvm_native_builtins::lang_invoke::register_t4_method_handle_invoke(&mut native_methods);
+            cratonvm_native_builtins::classloader_real::register_classloader_real_natives(&mut native_methods);
+            cratonvm_native_builtins::lang_invoke::register_phase54_method_handle(&mut native_methods);
+            cratonvm_native_builtins::lang_invoke::register_p63_method_handles_lookup(&mut native_methods);
+            cratonvm_native_builtins::lang_invoke::register_t4_method_handle_invoke(&mut native_methods);
             // C5: See the synthetic-jdk branch above for rationale.
-            rustjvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
+            cratonvm_native_builtins::lang_invoke::register_t28_method_handle_completeness(&mut native_methods);
             // Round 85: LambdaMetafactory.metafactory/altMetafactory natives.
             // log4j ServiceLoaderUtil.callServiceLoader (and similar code paths
             // in WildFly's PropertiesUtil bootstrap) invokes
@@ -1604,21 +1608,21 @@ impl SharedVm {
             // shim with "Bad CP index: 0" inside StackMapGenerator. Intercept
             // with a native stub that returns null so the JDK path is bypassed
             // entirely; the surrounding code tolerates a null call site.
-            rustjvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
+            cratonvm_native_builtins::lang_invoke::register_p68_invoke_extras(&mut native_methods);
             // RA.8 + WP1.8: ServiceLoader bootstrap — see
             // `init_service_loader_bootstrap` doc for the rationale around
             // keeping registration + classpath seeding in a single entry.
             init_service_loader_bootstrap(&mut native_methods);
             // WP2.5: java.lang.reflect.Proxy natives. See companion
             // call in the `feature = "synthetic-jdk"` branch above.
-            rustjvm_native_builtins::register_reflect_proxy_natives(&mut native_methods);
+            cratonvm_native_builtins::register_reflect_proxy_natives(&mut native_methods);
             // WP2.4-A: java.lang.instrument runtime natives. See
             // companion call in the `feature = "synthetic-jdk"` branch
             // above.
             crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
-            rustjvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
             // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
             // friends. See companion call in the `feature = "synthetic-jdk"`
             // branch above for the rationale (real-JDK bytecode delegates
@@ -1626,29 +1630,29 @@ impl SharedVm {
             // `IllegalArgumentException: ... is not a platform management
             // interface`, killing the forked test JVM constructor).
             #[cfg(feature = "experimental-jmx")]
-            rustjvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_jmx_natives(&mut native_methods);
             // RKC16N.11: rest of the sun.management.* native surface.
             // See companion calls in the `feature = "synthetic-jdk"`
             // branch above for the full rationale.
-            rustjvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
-            rustjvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
-            rustjvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_thread_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_class_loading_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_garbage_collector_impl(&mut native_methods);
             // Wave 1 / Task A: per-pool / per-manager MXBean natives.
             // See companion call in the synthetic-jdk branch above.
-            rustjvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
-            rustjvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
-            rustjvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
-            rustjvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
-            rustjvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_memory_pool_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_memory_manager_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_operating_system_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_hotspot_diagnostic(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_flag_impl(&mut native_methods);
             // SLF4J 1.7 binder stubs — see companion call in the synthetic-jdk
             // branch above for the rationale (Spring Boot 2.x fat-jar
             // <clinit> survival).
-            rustjvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
+            cratonvm_native_builtins::register_slf4j_binder_stubs_pub(&mut native_methods);
             // Spring ApplicationStartup: see `spring_startup_bootstrap` in essentials.
             tracing::info!("Real JDK mode: {} native methods registered", native_methods.len());
         }
         // T7: Register AWT/Swing/Java2D native methods for desktop support
-        rustjvm_native_awt::register_awt_natives(&mut native_methods);
+        cratonvm_native_awt::register_awt_natives(&mut native_methods);
         tracing::info!("AWT/Swing native methods registered (total: {})", native_methods.len());
         // Build system properties from platform defaults + user overrides.
         //
@@ -1675,8 +1679,8 @@ impl SharedVm {
         sys_props.insert("java.version".to_string(), "25.0.1".to_string());
         sys_props.insert("java.runtime.version".to_string(), "25.0.1+8".to_string());
         sys_props.insert("java.vm.version".to_string(), "25.0.1+8".to_string());
-        sys_props.insert("java.vm.name".to_string(), "rust-jvm".to_string());
-        sys_props.insert("java.vm.vendor".to_string(), "rust-jvm".to_string());
+        sys_props.insert("java.vm.name".to_string(), "cratonvm".to_string());
+        sys_props.insert("java.vm.vendor".to_string(), "cratonvm".to_string());
         sys_props.insert("java.vm.info".to_string(), "mixed mode".to_string());
         sys_props.insert(
             "java.vm.specification.name".to_string(),
@@ -1694,14 +1698,14 @@ impl SharedVm {
             "java.runtime.name".to_string(),
             "Java(TM) SE Runtime Environment".to_string(),
         );
-        sys_props.insert("java.vendor".to_string(), "RustJVM".to_string());
+        sys_props.insert("java.vendor".to_string(), "CratonVM".to_string());
         sys_props.insert(
             "java.vendor.url".to_string(),
-            "https://rustjvm.invalid/".to_string(),
+            "https://cratonvm.invalid/".to_string(),
         );
         sys_props.insert(
             "java.vendor.url.bug".to_string(),
-            "https://rustjvm.invalid/bugs".to_string(),
+            "https://cratonvm.invalid/bugs".to_string(),
         );
         sys_props.insert(
             "java.vendor.version".to_string(),
@@ -1821,9 +1825,9 @@ impl SharedVm {
 
         // ---- Tier 3: env/config-derived keys ----
         // java.home — same resolution order as boot classpath discovery
-        // (`resolve_java_home_public`): explicit config, RUSTJVM_JAVA_HOME,
+        // (`resolve_java_home_public`): explicit config, CRATONVM_JAVA_HOME,
         // JAVA_HOME, then PATH. Avoid reading JAVA_HOME alone here — that
-        // skipped RUSTJVM_JAVA_HOME and could disagree with boot discovery.
+        // skipped CRATONVM_JAVA_HOME and could disagree with boot discovery.
         let java_home_val = crate::config::resolve_java_home_public(config.java_home.as_deref())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
@@ -1905,7 +1909,7 @@ impl SharedVm {
         // Load CDS archive if configured
         if matches!(config.cds_mode, crate::config::CdsMode::On | crate::config::CdsMode::Auto) {
             if let Some(ref archive_path) = config.shared_archive_file {
-                let mut loader = rustjvm_native_builtins::cds::CdsArchiveLoader::new(archive_path.clone());
+                let mut loader = cratonvm_native_builtins::cds::CdsArchiveLoader::new(archive_path.clone());
                 if loader.try_load() {
                     let n = loader.classes_loaded();
                     tracing::info!("CDS: loaded {} classes from {}", n, archive_path);
@@ -1921,18 +1925,19 @@ impl SharedVm {
             }
         }
 
-        // Build the GPU offload cache from the config *before* moving
-        // `config` into the struct literal. With the feature off, this
-        // block does not exist.
+        // Build the GPU offload cache registry. With the feature off,
+        // this block does not exist. The registry itself is empty until
+        // the first `get_or_create` call constructs a per-device
+        // `OffloadCache`, so this is effectively free at startup.
         #[cfg(feature = "gpu-offload")]
-        let offload_cache = std::sync::Arc::new(
-            crate::runtime::offload::OffloadCache::new(&config),
+        let offload_registry = std::sync::Arc::new(
+            crate::runtime::offload::OffloadCacheRegistry::new(),
         );
 
         let vm = Self {
             config,
             #[cfg(feature = "gpu-offload")]
-            offload_cache,
+            offload_registry,
             class_manager: RwLock::new(class_manager),
             heap,
             native_methods,
@@ -1971,7 +1976,7 @@ impl SharedVm {
             native_libraries: parking_lot::Mutex::new(Vec::new()),
             upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
             jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
-            ref_processor: parking_lot::Mutex::new(rustjvm_gc::ReferenceProcessor::new()),
+            ref_processor: parking_lot::Mutex::new(cratonvm_gc::ReferenceProcessor::new()),
             cached_string_num_fields: AtomicUsize::new(0),
             compact_strings: std::sync::atomic::AtomicBool::new(false),
             cached_class_mirror_num_fields: AtomicUsize::new(0),
@@ -1980,8 +1985,8 @@ impl SharedVm {
             jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
             tiered_manager: crate::jit::tiered::TieredCompilationManager::with_default_policy(),
             deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
-            invalidation_manager: parking_lot::Mutex::new(rustjvm_jit::deopt::InvalidationManager::new()),
-            flight_recorder: parking_lot::Mutex::new(rustjvm_jfr::create_flight_recorder()),
+            invalidation_manager: parking_lot::Mutex::new(cratonvm_jit::deopt::InvalidationManager::new()),
+            flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
             #[cfg(feature = "experimental-debug")]
             debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
             #[cfg(feature = "experimental-debug")]
@@ -1992,8 +1997,8 @@ impl SharedVm {
             debug_event_tx: std::sync::Mutex::new(None),
             #[cfg(feature = "experimental-debug")]
             debug_event_rx: std::sync::Mutex::new(None),
-            finalizer_thread: rustjvm_gc::reference::FinalizerThread::new(),
-            cleaner_thread: rustjvm_gc::reference::CleanerThread::new(),
+            finalizer_thread: cratonvm_gc::reference::FinalizerThread::new(),
+            cleaner_thread: cratonvm_gc::reference::CleanerThread::new(),
             class_init_waiters: parking_lot::Mutex::new(FxHashMap::default()),
             class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
             diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters::new(),
@@ -2063,8 +2068,8 @@ impl SharedVm {
         fn class_prepare_adapter(class_id: u32, _class_name: &str, thread_id: u64) {
             crate::runtime::jvmti::fire_class_prepare(thread_id, class_id as u64);
         }
-        rustjvm_classloading::install_class_load_hook(class_load_adapter);
-        rustjvm_classloading::install_class_prepare_hook(class_prepare_adapter);
+        cratonvm_classloading::install_class_load_hook(class_load_adapter);
+        cratonvm_classloading::install_class_prepare_hook(class_prepare_adapter);
 
         // T10.5 — register the class loader's vtable-install hook so each
         // class-link emits its descriptor vec into `shared.vtable_manager`.
@@ -2082,14 +2087,14 @@ impl SharedVm {
         crate::runtime::vtable::install_global_vtable_manager(std::sync::Arc::clone(
             &vm.vtable_manager,
         ));
-        rustjvm_classloading::install_vtable_install_hook(
+        cratonvm_classloading::install_vtable_install_hook(
             crate::runtime::vtable::vtable_install_adapter,
         );
         // T10.9.A — also register the override hook so each subclass's
         // link-time slot-override fires `invalidate_for_override` on the
         // super-class vtable. Closes the CHA loop for cached invoke
         // entries and JIT leaf-class assumptions.
-        rustjvm_classloading::install_vtable_override_hook(
+        cratonvm_classloading::install_vtable_override_hook(
             crate::runtime::vtable::vtable_override_adapter,
         );
 
@@ -2104,7 +2109,7 @@ impl SharedVm {
         // set), but installing the hook here is fine — the adapter's
         // `if let Some(vm) = ...upgrade()` falls through to a no-op until
         // the weak handle is wired.
-        rustjvm_classloading::install_resolution_invalidate_hook(
+        cratonvm_classloading::install_resolution_invalidate_hook(
             resolution_invalidate_adapter,
         );
 
@@ -2135,8 +2140,8 @@ impl SharedVm {
         fn gc_finish_adapter() {
             crate::runtime::jvmti::fire_gc_finish();
         }
-        rustjvm_gc::install_gc_start_hook(gc_start_adapter);
-        rustjvm_gc::install_gc_finish_hook(gc_finish_adapter);
+        cratonvm_gc::install_gc_start_hook(gc_start_adapter);
+        cratonvm_gc::install_gc_finish_hook(gc_finish_adapter);
 
         // Round 4 audit fix (CRIT) — publish the global Weak<SharedVm>
         // handle used by `resolution_invalidate_adapter`. Done at the
@@ -2163,7 +2168,7 @@ impl SharedVm {
 // Round 4 audit fix (CRIT) — ResolutionCache invalidation on redefine
 // ---------------------------------------------------------------------------
 //
-// `rustjvm_classloading::ClassManager::redefine_class` fires a plain
+// `cratonvm_classloading::ClassManager::redefine_class` fires a plain
 // `fn(u32)` hook (see `install_resolution_invalidate_hook`) when the
 // bytecode of a class is replaced in place. The hook has no captured
 // state, so we bridge it to the VM-owned `SharedVm::resolution_cache`
@@ -2224,7 +2229,7 @@ impl SharedVm {
             .unwrap_or("classes.jsa");
 
         let cm = self.class_manager.read();
-        let mut generator = rustjvm_native_builtins::cds::CdsArchiveGenerator::new(archive_path);
+        let mut generator = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(archive_path);
 
         // Iterate all loaded classes and add non-synthetic ones with cached bytes
         for class in cm.class_store.iter() {
@@ -2232,7 +2237,7 @@ impl SharedVm {
                 continue;
             }
             if let Some(bytes) = cm.class_bytes_cache.get(&*class.name) {
-                let entry = rustjvm_native_builtins::cds::CdsArchiveEntry {
+                let entry = cratonvm_native_builtins::cds::CdsArchiveEntry {
                     class_name: class.name.to_string(),
                     bytes_offset: 0,
                     bytes_length: bytes.len() as u32,
@@ -2572,7 +2577,7 @@ impl SharedVm {
 /// safe to call from any context including `no_std` tests.
 pub fn classify_jdk_module(class_name: &str) -> &'static str {
     // The list is ordered longest-prefix first. Any time a new JDK module
-    // grows a package RustJVM needs to track, add it ABOVE its parent
+    // grows a package CratonVM needs to track, add it ABOVE its parent
     // module (e.g. `"java/net/http"` must appear before `"java/net"`).
     //
     // Prefixes use the JVMS binary form with `/` separators and always
@@ -2644,7 +2649,7 @@ pub fn classify_jdk_module(class_name: &str) -> &'static str {
 /// awareness, at which point this function gains a second scan source).
 ///
 /// Today all the heavy lifting happens inside the native registration
-/// (see [`rustjvm_native_builtins::service_loader::register_service_loader_natives`])
+/// (see [`cratonvm_native_builtins::service_loader::register_service_loader_natives`])
 /// which bridges into `ClassLoader.getResources("META-INF/services/<fqcn>")`
 /// and instantiates each listed provider via reflection. We keep this
 /// entry point even though the body is minimal so that:
@@ -2663,7 +2668,7 @@ pub fn classify_jdk_module(class_name: &str) -> &'static str {
 /// branches alongside the existing `register_service_loader_natives`
 /// call — see the call sites immediately below that comment.
 pub fn init_service_loader_bootstrap(registry: &mut NativeMethodRegistry) {
-    rustjvm_native_builtins::service_loader::register_service_loader_natives(registry);
+    cratonvm_native_builtins::service_loader::register_service_loader_natives(registry);
     tracing::info!(
         "WP1.8: ServiceLoader bootstrap wired — META-INF/services classpath scan enabled"
     );
@@ -2711,7 +2716,7 @@ impl SharedVm {
     pub fn load_class_concurrent(
         &self,
         name: &str,
-    ) -> Result<crate::classloading::ClassId, rustjvm_types::error::VmError> {
+    ) -> Result<crate::classloading::ClassId, cratonvm_types::error::VmError> {
         // Fast path: read lock only — no contention for already-loaded classes.
         // Bind the result to a local so the `RwLockReadGuard` is dropped at
         // the semicolon, not extended to the end of an `if let` block.
@@ -2791,7 +2796,7 @@ impl SharedVm {
         let _t19_h7_n = T19_H7_LOAD_TRACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "experimental-t19-diag")]
         if _t19_h7_n < 250 {
-            tracing::debug!(target: "rustjvm::t19_h7", "load[#{_t19_h7_n}] ENTER class={name}");
+            tracing::debug!(target: "cratonvm::t19_h7", "load[#{_t19_h7_n}] ENTER class={name}");
         }
 
         // Actually load the class (this takes the global write lock briefly)
@@ -2802,8 +2807,8 @@ impl SharedVm {
         #[cfg(feature = "experimental-t19-diag")]
         if _t19_h7_n < 250 {
             match &result {
-                Ok(_) => tracing::debug!(target: "rustjvm::t19_h7", "load[#{_t19_h7_n}] OK class={name}"),
-                Err(e) => tracing::debug!(target: "rustjvm::t19_h7", "load[#{_t19_h7_n}] ERR class={name} err={e:?}"),
+                Ok(_) => tracing::debug!(target: "cratonvm::t19_h7", "load[#{_t19_h7_n}] OK class={name}"),
+                Err(e) => tracing::debug!(target: "cratonvm::t19_h7", "load[#{_t19_h7_n}] ERR class={name} err={e:?}"),
             }
         }
 
@@ -2855,6 +2860,26 @@ impl SharedVm {
             if let Some(sup) = superclass {
                 let _evicted_sup = self.invalidate_jit_for_class(&sup);
             }
+
+            // Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load
+            // warmup. If the class is annotated, eagerly pre-compile up
+            // to `N` `@GpuKernel`-annotated methods so the first call
+            // does not pay the analyzer + PTX lowering cost. Cheap when
+            // offload is off — `maybe_warmup_gpu` short-circuits on the
+            // `gpu_offload_enabled` flag.
+            //
+            // The class manager read-lock is held for the duration of
+            // the warmup; the inner `lookup_or_compile` only touches
+            // the `OffloadCache`'s own locks (`kernels`, `blacklist`)
+            // so there is no re-entrancy risk against the manager.
+            #[cfg(feature = "gpu-offload")]
+            {
+                let class_id = *class_id;
+                let cm = self.class_manager.read();
+                if let Some(class) = cm.get_class(class_id) {
+                    crate::runtime::offload::maybe_warmup_gpu(self, class, class_id);
+                }
+            }
         }
 
         // Mark done and notify all waiters for this class
@@ -2882,7 +2907,7 @@ impl SharedVm {
     pub fn register_finalizable(&self, obj_addr: usize) {
         let mut rp = self.ref_processor.lock();
         rp.discover_reference(
-            rustjvm_gc::reference::ReferenceType::Finalizer,
+            cratonvm_gc::reference::ReferenceType::Finalizer,
             obj_addr, // reference_obj = the object itself
             obj_addr, // referent = same object
             None,     // no ReferenceQueue
@@ -2956,7 +2981,7 @@ impl SharedVm {
     /// T5.4.4 — Class-hierarchy change listener.
     ///
     /// When `class_name` is linked/registered, walk the
-    /// [`rustjvm_jit::deopt::InvalidationManager`] to collect every compiled
+    /// [`cratonvm_jit::deopt::InvalidationManager`] to collect every compiled
     /// method that made a `LeafClass(class_id)` assumption (or registered a
     /// direct `class_dependencies` entry) for the newly loaded class, then
     /// evict each of those entries from [`Self::jit_cache`]. Method keys in
@@ -3044,7 +3069,7 @@ impl SharedVm {
 
         for (key, _profile) in &snapshots {
             let name = class_mgr.class_store
-                .get(rustjvm_types::ClassId::new(key.class_id))
+                .get(cratonvm_types::ClassId::new(key.class_id))
                 .map(|c| c.name.to_string());
             class_names.push(name);
         }
@@ -3081,7 +3106,7 @@ impl SharedVm {
                         .entry(receiver_class_id)
                         .or_insert_with(|| {
                             class_mgr.class_store
-                                .get(rustjvm_types::ClassId::new(receiver_class_id))
+                                .get(cratonvm_types::ClassId::new(receiver_class_id))
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_default()
                         });
@@ -3391,7 +3416,7 @@ impl SharedVm {
 // ---------------------------------------------------------------------------
 
 /// WP1.3 — Re-exports of the process-wide init-level registry that
-/// lives in [`rustjvm_native_api::init_level`].  The native-api crate
+/// lives in [`cratonvm_native_api::init_level`].  The native-api crate
 /// hosts the shared state so both the `vm` crate (which has a
 /// `SharedVm`) and the `native-builtins` crate (which implements
 /// `jdk/internal/misc/VM.initLevel()`) reach the same monotonic
@@ -3401,7 +3426,7 @@ impl SharedVm {
 ///   blocked in [`await_init_level`].
 /// * [`get_init_level`] reads the current level with `Acquire` ordering.
 /// * [`await_init_level`] blocks until the level reaches the target.
-pub use rustjvm_native_api::init_level::{
+pub use cratonvm_native_api::init_level::{
     await_init_level, get_init_level, set_init_level,
 };
 
@@ -3444,7 +3469,7 @@ impl SharedVm {
     pub fn set_init_level(&self, level: i32) {
         // Keep the process-wide registry in sync first — the native
         // `VM.initLevel()` handler reads it directly.
-        rustjvm_native_api::init_level::set_init_level(level);
+        cratonvm_native_api::init_level::set_init_level(level);
         // Mirror into the per-SharedVm atomic so in-process readers
         // with a `&SharedVm` don't have to go through the global
         // OnceLock.  `set_init_level` above already rejected downward
@@ -3597,7 +3622,7 @@ impl Vm {
         // captures the host-RAM totals as an EveryChunk diagnostic.
         //
         // Round-5 CRIT-fix (Bug 2, 2026-05-17 follow-up): drop the
-        // surrounding `rustjvm_jfr::is_enabled()` gate. vm-cli never calls
+        // surrounding `cratonvm_jfr::is_enabled()` gate. vm-cli never calls
         // `start_recording`, so the gate kept this call permanently
         // disabled and made the wired emit dead code. The emit function
         // itself bypasses the global gate (see
@@ -3618,26 +3643,26 @@ impl Vm {
         // schema check passes.
         let total = shared.config.max_heap_size as i64;
         let mut jfr = shared.flight_recorder.lock();
-        rustjvm_jfr::builtin::emit_physical_memory_event(
+        cratonvm_jfr::builtin::emit_physical_memory_event(
             &mut jfr, total, total, now_ns,
         );
 
         // Round-5 JFR Fix 4: emit `jdk.InitialEnvironmentVariable` for
         // each VM-relevant env var so dumps capture the startup config
-        // surface. We restrict to `RUSTJVM_*`, `JAVA_*`, `_JAVA_OPTIONS`,
+        // surface. We restrict to `CRATONVM_*`, `JAVA_*`, `_JAVA_OPTIONS`,
         // `JAVA_TOOL_OPTIONS`, `CLASSPATH` to avoid leaking unrelated
         // shell variables into the recording (and to keep the per-chunk
         // metadata small). OpenJDK's reference snapshot includes a
         // similar filtered set. Cost: ~N emit calls at startup, each
         // bounded-ring push; N is typically < 10.
         for (key, value) in std::env::vars() {
-            let interesting = key.starts_with("RUSTJVM_")
+            let interesting = key.starts_with("CRATONVM_")
                 || key.starts_with("JAVA_")
                 || key == "_JAVA_OPTIONS"
                 || key == "JAVA_TOOL_OPTIONS"
                 || key == "CLASSPATH";
             if interesting {
-                rustjvm_jfr::builtin::emit_initial_environment_variable_event(
+                cratonvm_jfr::builtin::emit_initial_environment_variable_event(
                     &mut jfr, &key, &value, now_ns,
                 );
             }
@@ -4061,7 +4086,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     }
 
     fn command_line(&self) -> String {
-        let mut parts = vec!["rustjvm".to_string()];
+        let mut parts = vec!["cratonvm".to_string()];
         if self.config.max_heap_size != 256 * 1024 * 1024 {
             parts.push(format!("-Xmx{}m", self.config.max_heap_size / (1024 * 1024)));
         }
@@ -4112,7 +4137,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         use crate::runtime::serviceability::{
             HprofClassInfo, HprofObjectInfo, HprofWriter,
         };
-        use rustjvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, SLOT_SIZE};
+        use cratonvm_gc::heap::{HEADER_SIZE, ObjectHeader, ObjectKind, SLOT_SIZE};
 
         // Step 1: Walk all heap objects
         let walked = self.heap.walk_objects();
@@ -4337,7 +4362,7 @@ mod tests {
         assert!(props.contains_key("path.separator"));
         assert!(props.contains_key("line.separator"));
         assert!(props.contains_key("java.version"));
-        assert_eq!(props.get("java.vendor").map(|s| s.as_str()), Some("RustJVM"));
+        assert_eq!(props.get("java.vendor").map(|s| s.as_str()), Some("CratonVM"));
         assert!(props.contains_key("file.encoding"));
     }
 
@@ -4648,7 +4673,7 @@ mod tests {
             Some("another/caller.m()V".into()),
         );
 
-        let tmp_dir = std::env::temp_dir().join("rustjvm_new10_test");
+        let tmp_dir = std::env::temp_dir().join("cratonvm_new10_test");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let path = tmp_dir.join(format!(
             "missing_{}.json",
@@ -4706,7 +4731,7 @@ mod tests {
         shared2.record_missing_native("a/A", "two", "()I", None);
         shared2.record_missing_native("a/B", "one", "()V", Some("x".into()));
 
-        let tmp = std::env::temp_dir().join("rustjvm_new10_diff_stable");
+        let tmp = std::env::temp_dir().join("cratonvm_new10_diff_stable");
         let _ = std::fs::create_dir_all(&tmp);
         let p1 = tmp.join(format!("d1_{}.json", std::process::id()));
         let p2 = tmp.join(format!("d2_{}.json", std::process::id()));
@@ -4736,7 +4761,7 @@ mod tests {
             "()V",
             Some("caller\u{0001}ctrl".into()),
         );
-        let tmp = std::env::temp_dir().join("rustjvm_new10_escape");
+        let tmp = std::env::temp_dir().join("cratonvm_new10_escape");
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join(format!("esc_{}.json", std::process::id()));
         shared.dump_missing_natives_json(&path).expect("missing natives dump should succeed");
@@ -4757,7 +4782,7 @@ mod tests {
     #[test]
     fn new10_dump_missing_natives_json_empty_log() {
         let shared = SharedVm::new(VmConfig::default());
-        let tmp = std::env::temp_dir().join("rustjvm_new10_empty");
+        let tmp = std::env::temp_dir().join("cratonvm_new10_empty");
         let _ = std::fs::create_dir_all(&tmp);
         let path = tmp.join(format!("empty_{}.json", std::process::id()));
         shared.dump_missing_natives_json(&path).expect("missing natives dump should succeed");
@@ -4875,7 +4900,7 @@ mod tests {
         {
             let mut rp = shared.ref_processor.lock();
             rp.discover_reference(
-                rustjvm_gc::reference::ReferenceType::Finalizer,
+                cratonvm_gc::reference::ReferenceType::Finalizer,
                 addr, addr, None,
             );
         }
@@ -4919,7 +4944,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Session 7: Bootstrap java.lang.Object from real JDK bytecode
-    // Run with: cargo test -p rustjvm-vm -- --ignored
+    // Run with: cargo test -p cratonvm-vm -- --ignored
     // -----------------------------------------------------------------------
 
     /// Helper: create a SharedVm configured for real JDK mode.
@@ -6967,7 +6992,7 @@ mod tests {
         assert!(!cls.is_synthetic_stub, "Spliterator should be from real bytecode");
 
         // Spliterator is an interface
-        assert!(cls.access_flags.contains(rustjvm_reader::class_access_flags::ClassAccessFlags::INTERFACE),
+        assert!(cls.access_flags.contains(cratonvm_reader::class_access_flags::ClassAccessFlags::INTERFACE),
             "Spliterator should be an interface");
     }
 
@@ -8182,7 +8207,7 @@ mod tests {
             crate::threading::jvm_thread::ThreadId(1), "test",
         );
         let class_id = shared.class_manager.write()
-            .load_class("rustjvm/DeepCallTest")
+            .load_class("cratonvm/DeepCallTest")
             .expect("Failed to load DeepCallTest");
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_id)
             .expect("clinit failed");
@@ -8204,7 +8229,7 @@ mod tests {
             crate::threading::jvm_thread::ThreadId(1), "test",
         );
         let class_id = shared.class_manager.write()
-            .load_class("rustjvm/DeepCallTest")
+            .load_class("cratonvm/DeepCallTest")
             .expect("Failed to load DeepCallTest");
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_id)
             .expect("clinit failed");
@@ -8229,7 +8254,7 @@ mod tests {
             crate::threading::jvm_thread::ThreadId(1), "test",
         );
         let class_id = shared.class_manager.write()
-            .load_class("rustjvm/DeepCallTest")
+            .load_class("cratonvm/DeepCallTest")
             .expect("Failed to load DeepCallTest");
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_id)
             .expect("clinit failed");
@@ -8254,7 +8279,7 @@ mod tests {
             crate::threading::jvm_thread::ThreadId(1), "test",
         );
         let class_id = shared.class_manager.write()
-            .load_class("rustjvm/DeepCallTest")
+            .load_class("cratonvm/DeepCallTest")
             .expect("Failed to load DeepCallTest");
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_id)
             .expect("clinit failed");
@@ -8279,7 +8304,7 @@ mod tests {
             crate::threading::jvm_thread::ThreadId(1), "test",
         );
         let class_id = shared.class_manager.write()
-            .load_class("rustjvm/DeepCallTest")
+            .load_class("cratonvm/DeepCallTest")
             .expect("Failed to load DeepCallTest");
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_id)
             .expect("clinit failed");
@@ -8453,7 +8478,7 @@ mod tests {
         use crate::runtime::serviceability::VmDiagnosticState;
         let shared = SharedVm::new(VmConfig::default());
         let cmd = shared.command_line();
-        assert!(cmd.contains("rustjvm"));
+        assert!(cmd.contains("cratonvm"));
     }
 
     #[test]
@@ -8545,7 +8570,7 @@ mod tests {
     fn heap_dump_empty_heap_to_file() {
         use crate::runtime::serviceability::VmDiagnosticState;
         let shared = SharedVm::new(VmConfig::default());
-        let tmp_path = std::env::temp_dir().join("rustjvm_test_empty_heap.hprof");
+        let tmp_path = std::env::temp_dir().join("cratonvm_test_empty_heap.hprof");
         let result = shared.heap_dump(tmp_path.to_str().expect("heap dump should succeed"));
         assert!(result.is_ok(), "heap_dump failed: {:?}", result);
         let bytes = result.expect("result should be Ok");
@@ -8575,7 +8600,7 @@ mod tests {
         let _obj1 = shared.heap.alloc_object(ClassId::new(0), 2);
         let _obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
 
-        let tmp_path = std::env::temp_dir().join("rustjvm_test_objects_heap.hprof");
+        let tmp_path = std::env::temp_dir().join("cratonvm_test_objects_heap.hprof");
         let result = shared.heap_dump(tmp_path.to_str().expect("heap dump should succeed"));
         assert!(result.is_ok(), "heap_dump failed: {:?}", result);
         let bytes = result.expect("result should be Ok");
@@ -8595,7 +8620,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let jcmd = JcmdProcessor::new_with_vm_state(shared.clone());
 
-        let tmp_path = std::env::temp_dir().join("rustjvm_test_jcmd_heap.hprof");
+        let tmp_path = std::env::temp_dir().join("cratonvm_test_jcmd_heap.hprof");
         let cmd = format!("GC.heap_dump {}", tmp_path.to_str().expect("heap dump should succeed"));
         let result = jcmd.process_command(&cmd);
         assert!(result.success, "GC.heap_dump command failed: {}", result.output);

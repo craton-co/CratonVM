@@ -21,7 +21,7 @@
 //!   * the HttpServer-mediated `srv.getAddress().getPort()` round trip that
 //!     was the actual repro from `HttpServer.create(InetSocketAddress(0), 0)`.
 //!
-//! Subprocess pattern: spawn `rustjvm.exe`, javac the probe sources on
+//! Subprocess pattern: spawn `cratonvm.exe`, javac the probe sources on
 //! demand into a temp dir, assert the four marker lines + the trailing `OK`.
 
 use std::io::Write as _;
@@ -62,8 +62,8 @@ public class HttpServerDispatchProbe {
 }
 "#;
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -71,7 +71,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -82,7 +82,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("RUSTJVM_TEST_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_TEST_JAVA_HOME") {
         let p = PathBuf::from(h);
         if p.join("bin").join(if cfg!(windows) { "javac.exe" } else { "javac" }).exists() {
             return Some(p);
@@ -152,7 +152,7 @@ fn run_probe(bin: &Path, jh: &Path, classes: &Path, name: &str) -> Option<(Strin
 }
 
 fn temp_classes_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rustjvm-w3b2-{tag}"));
+    let dir = std::env::temp_dir().join(format!("cratonvm-w3b2-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -160,10 +160,10 @@ fn temp_classes_dir(tag: &str) -> PathBuf {
 
 #[test]
 fn w3b2_direct_dispatch_inet_socket_address_get_port() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
-            eprintln!("[w3b2] rustjvm binary not found; skipping");
+            eprintln!("[w3b2] cratonvm binary not found; skipping");
             return;
         }
     };
@@ -207,10 +207,10 @@ fn w3b2_direct_dispatch_inet_socket_address_get_port() {
 
 #[test]
 fn w3b2_http_server_get_address_get_port() {
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
-            eprintln!("[w3b2] rustjvm binary not found; skipping");
+            eprintln!("[w3b2] cratonvm binary not found; skipping");
             return;
         }
     };

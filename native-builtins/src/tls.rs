@@ -1,7 +1,7 @@
 //! TLS/SSL native method implementations.
 //!
 //! Provides javax.net.ssl.*, java.security.KeyStore, and related classes
-//! for TLS/SSL support in the RustJVM native layer.
+//! for TLS/SSL support in the CratonVM native layer.
 
 // The `tls_impl` submodule contains a TLS 1.3 handshake emulator that depends
 // on the crypto primitives in `crate::crypto::crypto_impl`. It is therefore
@@ -11,10 +11,10 @@
 #[path = "tls_impl.rs"]
 pub mod tls_impl;
 
-use rustjvm_types::ClassId;
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
@@ -607,7 +607,7 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Build a 32-byte session ID derived from object identity
         let hash = ctx.identity_hash_code(this);
-        let id_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 32);
+        let id_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         for i in 0..4 {
             let byte_val = ((hash >> (i * 8)) & 0xFF) as i8;
             ctx.set_array_element(id_arr, i, Value::Int(byte_val as i32));
@@ -1225,7 +1225,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
                         if !aliases.is_empty() {
                             // Build a Vector-backed enumeration
                             let vec_obj = alloc_concurrent_synthetic(ctx, "java/util/Vector", 2);
-                            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, aliases.len());
+                            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, aliases.len());
                             for (i, alias) in aliases.iter().enumerate() {
                                 let s = ctx.create_string(alias);
                                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -1452,7 +1452,7 @@ fn validate_cert_chain(
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
             // Null chain — reject (security: never accept missing certificates)
-            return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                 message: "Certificate chain is null — TLS connection rejected".into(),
             }.into());
         }
@@ -1460,7 +1460,7 @@ fn validate_cert_chain(
     let chain_len = ctx.array_length(chain_arr);
     if chain_len == 0 {
         // Empty chain — reject
-        return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
             message: "Certificate chain is empty — TLS connection rejected".into(),
         }.into());
     }
@@ -1509,7 +1509,7 @@ fn validate_cert_chain_crypto(
             if let Some(cert) = crate::crypto::crypto_impl::cert_get(cert_id) {
                 // 1. Check validity dates (always — no feature gate)
                 if now < cert.not_before {
-                    return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                    return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                         message: format!(
                             "Certificate not yet valid: {} (not before {})",
                             cert.subject_cn, cert.not_before
@@ -1517,7 +1517,7 @@ fn validate_cert_chain_crypto(
                     }.into());
                 }
                 if now > cert.not_after {
-                    return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                    return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                         message: format!(
                             "Certificate expired: {} (expired at {})",
                             cert.subject_cn, cert.not_after
@@ -1545,7 +1545,7 @@ fn validate_cert_chain_crypto(
             };
             if let Some(spki) = issuer_spki {
                 if !cert.verify_signature(spki) {
-                    return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                    return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                         message: format!(
                             "Certificate signature verification failed for: {}",
                             cert.subject_cn
@@ -1560,7 +1560,7 @@ fn validate_cert_chain_crypto(
     for i in 0..parsed_certs.len().saturating_sub(1) {
         if let (Some(ref cert), Some(ref issuer)) = (&parsed_certs[i], &parsed_certs[i + 1]) {
             if cert.issuer_raw != issuer.subject_raw {
-                return Err(rustjvm_types::error::RuntimeError::IllegalStateException {
+                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
                     message: format!(
                         "Certificate chain broken: issuer of '{}' does not match subject of '{}'",
                         cert.subject_cn, issuer.subject_cn
@@ -1797,7 +1797,7 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
         // Real rustls sessions hand back the server-assigned id; for
         // synthetic native-only paths we emit a 32-byte deterministic
         // buffer so callers can compare equality across invocations.
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 32);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         let addr = this.as_ptr() as u64;
         for i in 0..32 {
             let b = ((addr >> ((i % 8) * 8)) & 0xFF) as u8;
@@ -1893,7 +1893,7 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(name_ref)) = ctx.get_array_element(arr_ref, i) {
                     let name = ctx.read_string(name_ref).unwrap_or_default();
                     if !is_tls13_allowed_suite_name(&name) {
-                        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+                        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
                             message: format!(
                                 "setEnabledCipherSuites: cipher {} is not on the RFC 8446 §9.1 MTI allowlist",
                                 name,
@@ -1957,7 +1957,7 @@ pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tls_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // --- Registration tests -------------------------------------------------
 
@@ -2739,7 +2739,7 @@ mod tls_tests {
         // The rustls-backed self-test surface is what verifies ticket
         // resumption at the wire level (see t27_tls::tests::t27_session_resumption).
         assert!(r
-            .find("rustjvm/tls/T27SelfTest", "run", "()Ljava/lang/String;")
+            .find("cratonvm/tls/T27SelfTest", "run", "()Ljava/lang/String;")
             .is_some());
     }
 

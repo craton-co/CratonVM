@@ -2,9 +2,9 @@
 //!
 //! Phase 19.2 — AES (ECB/CBC/GCM), SHA-2 (256/384/512), HMAC, HKDF, SecureRandom.
 
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ClassId, Value};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ClassId, Value};
 
 // ============================================================================
 // CryptoError
@@ -1025,7 +1025,7 @@ impl Hkdf {
 /// Derive key bytes using HKDF with the hash function corresponding to the
 /// KDF algorithm index (0 = HKDF-SHA256, 1 = HKDF-SHA384, 2 = HKDF-SHA512).
 /// For PBKDF2 indices (3-5), falls back to HKDF with the matching hash.
-/// Uses a fixed salt and info of "rustjvm-kdf" for deterministic derivation
+/// Uses a fixed salt and info of "cratonvm-kdf" for deterministic derivation
 /// when no explicit keying material is provided from the JVM layer.
 pub fn derive_key_bytes(alg_idx: i32, key_bytes: usize) -> Vec<u8> {
     let hash_fn = match alg_idx {
@@ -1036,9 +1036,9 @@ pub fn derive_key_bytes(alg_idx: i32, key_bytes: usize) -> Vec<u8> {
     // Use a fixed IKM and salt so the stub produces non-zero deterministic output.
     // Real key material would come from the JVM-side AlgorithmParameterSpec in a
     // full implementation; this ensures callers at least get usable derived bytes.
-    let salt = b"rustjvm-kdf-salt";
-    let ikm = b"rustjvm-kdf-ikm";
-    let info = b"rustjvm-kdf";
+    let salt = b"cratonvm-kdf-salt";
+    let ikm = b"cratonvm-kdf-ikm";
+    let info = b"cratonvm-kdf";
     Hkdf::derive(hash_fn, salt, ikm, info, key_bytes)
 }
 
@@ -1215,7 +1215,7 @@ fn native_secure_random_generate_seed(ctx: &mut dyn NativeContext, args: &[Value
         Some(Value::Int(n)) => *n as usize,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, num_bytes);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, num_bytes);
     let mut buf = vec![0u8; num_bytes];
     let mut sr = SecureRandom::new(); // uses OS entropy by default
     sr.next_bytes(&mut buf);
@@ -1248,7 +1248,7 @@ fn native_message_digest_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let digest = hasher.finalize();
 
     // Return as byte array
-    let result = ctx.new_array(rustjvm_types::ArrayElementType::Byte, digest.len());
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
     for (i, &b) in digest.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
     }
@@ -1319,7 +1319,7 @@ pub fn native_cipher_do_final(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         AesEcb::decrypt(&aes_key, &input).unwrap_or_default()
     };
 
-    let result = ctx.new_array(rustjvm_types::ArrayElementType::Byte, result_bytes.len());
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, result_bytes.len());
     for (i, &b) in result_bytes.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
     }
@@ -1339,7 +1339,7 @@ fn native_mac_do_final(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     let hmac = Hmac::new(&[0u8; 32], HashFunction::Sha256);
     let mac_bytes = hmac.finalize();
 
-    let result = ctx.new_array(rustjvm_types::ArrayElementType::Byte, mac_bytes.len());
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, mac_bytes.len());
     for (i, &b) in mac_bytes.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
     }

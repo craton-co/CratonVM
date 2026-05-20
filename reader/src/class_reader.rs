@@ -48,21 +48,27 @@ fn validate_count(label: &str, count: u16, limit: u16) -> Result<(), ClassReader
 }
 
 /// Parse a `.class` file from a byte slice.
+///
+/// This copies `data` once into a fresh `Arc<[u8]>` and delegates to
+/// [`read_class_arc`]. Callers that already hold the class bytes as an
+/// `Arc<[u8]>` should call [`read_class_arc`] directly to skip that copy.
 pub fn read_class(data: &[u8]) -> Result<ClassFile, ClassReaderError> {
-    // Wrap the input bytes in a single shared `Arc<[u8]>` that will be
-    // threaded through every `LazyAttribute::Raw` produced for this class
-    // file. Each lazy attribute is then a `(name: Arc<str>, source:
-    // Arc<[u8]>, range: Range<usize>)` — a refcount bump on the source plus
-    // a range, no body memcpy. The Arc is kept alive by whichever lazy
-    // attribute(s) survive parsing; once they decode or drop, the backing
-    // buffer is freed.
-    //
-    // The single `Arc::from(data)` here copies `data` once into a fresh
-    // heap allocation. That's one O(class_file_size) copy at parse entry,
-    // replacing potentially hundreds of per-attribute `to_vec()` copies
-    // inside `read_attributes`.
-    let source: Arc<[u8]> = Arc::from(data);
+    read_class_arc(Arc::from(data))
+}
 
+/// Parse a `.class` file from an already-`Arc`-wrapped byte buffer.
+///
+/// The `source` `Arc<[u8]>` is threaded through every `LazyAttribute::Raw`
+/// produced for this class file. Each lazy attribute is then a `(name:
+/// Arc<str>, source: Arc<[u8]>, range: Range<usize>)` — a refcount bump on
+/// the source plus a range, no body memcpy. The Arc is kept alive by
+/// whichever lazy attribute(s) survive parsing; once they decode or drop,
+/// the backing buffer is freed.
+///
+/// Accepting an `Arc<[u8]>` directly avoids the O(class_file_size) copy
+/// that [`read_class`] performs at parse entry when the caller already
+/// owns a shared buffer.
+pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> {
     let mut buf = ClassFileBuffer::new(&source);
 
     // Magic number
@@ -199,7 +205,7 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
                 let bytes = buf.read_bytes(length as usize)?;
                 let string = cesu8::from_java_cesu8(bytes)
                     .map_err(|_| ClassReaderError::InvalidCesu8String { index: i })?;
-                ConstantPoolEntry::Utf8(rustjvm_types::intern_arc(&string))
+                ConstantPoolEntry::Utf8(cratonvm_types::intern_arc(&string))
             }
             3 => {
                 // CONSTANT_Integer
@@ -368,7 +374,7 @@ fn read_field(
     let access_flags = FieldAccessFlags::from_bits_truncate(access_flags_raw);
     let name_index = buf.read_u16()?;
     // Fetch the `Arc<str>` straight from the constant pool — it was already
-    // interned at parse time via `rustjvm_types::intern_arc`, so this is a
+    // interned at parse time via `cratonvm_types::intern_arc`, so this is a
     // single refcount bump (no allocation, no UTF-8 re-copy).
     let name = constant_pool
         .get_utf8_arc(name_index)
@@ -403,7 +409,7 @@ fn read_method(
     let access_flags = MethodAccessFlags::from_bits_truncate(access_flags_raw);
     let name_index = buf.read_u16()?;
     // Fetch the `Arc<str>` straight from the constant pool — it was already
-    // interned at parse time via `rustjvm_types::intern_arc`, so this is a
+    // interned at parse time via `cratonvm_types::intern_arc`, so this is a
     // single refcount bump (no allocation, no UTF-8 re-copy).
     let name = constant_pool
         .get_utf8_arc(name_index)
@@ -778,7 +784,7 @@ mod tests {
         // Parse a real class file. Each distinct UTF-8 string in its
         // constant pool must share its `Arc<str>` allocation with every
         // other pool entry holding the same content — and with every
-        // matching string returned by `rustjvm_types::intern_arc`.
+        // matching string returned by `cratonvm_types::intern_arc`.
         let class_bytes = include_bytes!("../../test_classes/HelloWorld.class");
         let class_file = read_class(class_bytes).expect("HelloWorld.class must parse");
 
@@ -807,9 +813,9 @@ mod tests {
 
         // And every Utf8 in the pool must match the global pool's interned
         // Arc<str> for the same content — proof the reader funnels through
-        // `rustjvm_types::intern_arc` at parse time.
+        // `cratonvm_types::intern_arc` at parse time.
         for arc in &utf8_arcs {
-            let pooled = rustjvm_types::intern_arc(arc);
+            let pooled = cratonvm_types::intern_arc(arc);
             assert!(
                 std::sync::Arc::ptr_eq(arc, &pooled),
                 "pool-stored Utf8 '{}' must match global pool intern",

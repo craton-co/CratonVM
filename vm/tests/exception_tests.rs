@@ -8,9 +8,9 @@
 //! - Java test classes are compiled automatically by `build.rs` if `javac`
 //!   is on the PATH. If not, tests will be skipped at runtime.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -19,7 +19,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!("{dir}/rustjvm/ExceptionAdvanced.class")).exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/ExceptionAdvanced.class")).exists()
 }
 
 fn test_vm() -> Vm {
@@ -53,7 +53,7 @@ fn test_nested_try_catch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionAdvanced",
+        "cratonvm/ExceptionAdvanced",
         "testNestedTryCatch",
         "()V",
         &[],
@@ -67,7 +67,7 @@ fn test_exception_in_catch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionAdvanced",
+        "cratonvm/ExceptionAdvanced",
         "testExceptionInCatch",
         "()V",
         &[],
@@ -81,7 +81,7 @@ fn test_finally_with_return() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionAdvanced",
+        "cratonvm/ExceptionAdvanced",
         "testFinallyWithReturn",
         "()I",
         &[],
@@ -97,7 +97,7 @@ fn test_finally_with_return() {
 fn test_multi_catch() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ExceptionAdvanced", "testMultiCatch", "()V", &[]);
+    let result = vm.invoke("cratonvm/ExceptionAdvanced", "testMultiCatch", "()V", &[]);
     assert!(result.is_ok(), "testMultiCatch failed: {result:?}");
     assert_eq!(printed_ints(&vm), vec![1, 2, 3]);
 }
@@ -106,7 +106,7 @@ fn test_multi_catch() {
 fn test_rethrow() {
     require_class_files!();
     let mut vm = test_vm();
-    let result = vm.invoke("rustjvm/ExceptionAdvanced", "testRethrow", "()V", &[]);
+    let result = vm.invoke("cratonvm/ExceptionAdvanced", "testRethrow", "()V", &[]);
     assert!(result.is_ok(), "testRethrow failed: {result:?}");
     assert_eq!(printed_ints(&vm), vec![1, 2]);
 }
@@ -116,7 +116,7 @@ fn test_stack_unwinding() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionAdvanced",
+        "cratonvm/ExceptionAdvanced",
         "testStackUnwinding",
         "()V",
         &[],

@@ -7,7 +7,7 @@ ROOT="C:/Projects/CratonVM/.claude/worktrees/infallible-solomon-1d423b"
 LOGDIR="$ROOT/applogs/loop-$ITER"
 mkdir -p "$LOGDIR"
 
-RUSTJVM="$ROOT/target/release/rustjvm.exe"
+CRATONVM="$ROOT/target/release/cratonvm.exe"
 JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot"
 APPS="C:/Projects/cratonvm/apps"
 
@@ -15,7 +15,7 @@ run_app() {
     local name="$1"; shift
     local timeout_s="$1"; shift
     echo "===== running $name =====" >&2
-    timeout "$timeout_s" "$RUSTJVM" --java-home "$JDK" "$@" \
+    timeout "$timeout_s" "$CRATONVM" --java-home "$JDK" "$@" \
         > "$LOGDIR/$name.out.txt" 2> "$LOGDIR/$name.err.txt"
     local rc=$?
     echo "$rc" > "$LOGDIR/$name.rc.txt"

@@ -2,7 +2,7 @@
 //! `java.util.concurrent.locks.ReentrantReadWriteLock` integration shim.
 //!
 //! The lock state machine itself lives in
-//! `rustjvm-native-builtins::stamped_lock` so the natives that implement
+//! `cratonvm-native-builtins::stamped_lock` so the natives that implement
 //! the JDK `<init>` / `readLock` / `writeLock` / `validate` /
 //! `tryConvertTo*` / `unlockRead` / `unlockWrite` callbacks can call into
 //! it without re-importing the entire VM. This module documents how the
@@ -52,11 +52,11 @@
 //! to render a heap dump).
 //!
 //! No state is held here — every function below is a thin re-export of
-//! the corresponding `rustjvm_native_builtins::stamped_lock` symbol.
+//! the corresponding `cratonvm_native_builtins::stamped_lock` symbol.
 
 #![allow(dead_code)]
 
-pub use rustjvm_native_builtins::stamped_lock::{
+pub use cratonvm_native_builtins::stamped_lock::{
     rw_init,
     rw_is_write_locked,
     rw_read_count,

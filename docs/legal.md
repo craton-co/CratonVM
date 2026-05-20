@@ -5,7 +5,7 @@
 The Java Compatibility Kit (JCK) is Oracle's official test suite for verifying
 that a Java SE implementation conforms to the specification. Running the JCK
 requires a license agreement with Oracle. This document describes the licensing
-options, application process, and the current status for RustJVM.
+options, application process, and the current status for CratonVM.
 
 ## License Options
 
@@ -17,7 +17,7 @@ Kit) for implementations of Java SE. Key points:
 - Available to individuals, academic institutions, and non-commercial projects.
 - Grants the right to download and execute the JCK test suite against a
   Java SE implementation under development.
-- The implementation under test must target a specific Java SE version (RustJVM
+- The implementation under test must target a specific Java SE version (CratonVM
   targets **OpenJDK 25 / Java SE 25**).
 - Results may not be used for marketing or compatibility claims unless the
   implementation passes the full TCK and the licensee signs an additional
@@ -39,8 +39,8 @@ implementations:
 
 ## Application Process
 
-1. **Identify the target specification.** RustJVM targets Java SE 25 (OpenJDK 25).
-2. **Choose the license path.** For RustJVM, either the OCTLA (non-commercial)
+1. **Identify the target specification.** CratonVM targets Java SE 25 (OpenJDK 25).
+2. **Choose the license path.** For CratonVM, either the OCTLA (non-commercial)
    or the TCK Community License (open-source) is applicable.
 3. **Submit an application** through Oracle's TCK program page at
    `https://openjdk.org/groups/conformance/JckAccess/`. The application requires:
@@ -55,7 +55,7 @@ implementations:
 6. **Download the JCK.** The JCK bundle includes the JavaTest harness, test
    classes, and configuration templates.
 
-## Requirements for RustJVM
+## Requirements for CratonVM
 
 - **Target version:** Java SE 25 (OpenJDK 25).
 - **Implementation language:** Rust (with a bytecode interpreter, x86-64 JIT,
@@ -70,7 +70,7 @@ implementations:
   categories (ClassNotFound, NativeMethodNotFound, RuntimeError, etc.) are
   pre-defined in the JSON schema.
 - **Differential testing:** The `vm/tests/differential.rs` harness runs
-  methods under both RustJVM and HotSpot to detect behavioral divergences.
+  methods under both CratonVM and HotSpot to detect behavioral divergences.
   Known divergences are tracked in `docs/divergence-log.md`.
 
 ## Current Status

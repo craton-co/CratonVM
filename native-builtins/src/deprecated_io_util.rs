@@ -3,9 +3,9 @@
 //! This module provides native implementations for deprecated methods that
 //! legacy code may still call. Every method is registered via NativeMethodRegistry.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -613,8 +613,8 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
             // target abstract/interface type does not actually have.
             if let Some(cid_check) = Some(class_id) {
                 let flags = ctx.class_access_flags(cid_check);
-                let abstract_bit = rustjvm_types::access_flags::ACC_ABSTRACT;
-                let iface_bit = rustjvm_types::access_flags::ACC_INTERFACE;
+                let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
+                let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
                 if flags & (abstract_bit | iface_bit) != 0 {
                     return Err(RuntimeError::UnsupportedOperationException {
                         message: format!(
@@ -755,7 +755,7 @@ fn register_hashtable_enumerations(r: &mut NativeMethodRegistry) {
         out
     }
     fn build_enum(ctx: &mut dyn NativeContext, items: Vec<Value>) -> MethodCallResult {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, items.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
         for (i, v) in items.into_iter().enumerate() {
             ctx.set_array_element(arr, i, v);
         }
@@ -1479,7 +1479,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
         // Create byte array [65, 66, 67] = "ABC" with hibyte=0
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 3);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 3);
         ctx.set_array_element(arr, 0, Value::Int(65));
         ctx.set_array_element(arr, 1, Value::Int(66));
         ctx.set_array_element(arr, 2, Value::Int(67));
@@ -1499,7 +1499,7 @@ mod tests {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
         let str_obj = ctx.create_string("Hello");
-        let dst = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 10);
+        let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 10);
 
         let result = call_native(
             &reg, &mut ctx, "java/lang/String", "getBytes", "(II[BI)V",
@@ -1728,7 +1728,7 @@ mod tests {
             &[Value::Object(Some(sbis)), Value::Object(Some(str_obj))],
         ).unwrap();
 
-        let buf = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 10);
+        let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 10);
         let n = call_native(
             &reg, &mut ctx, "java/io/StringBufferInputStream", "read", "([BII)I",
             &[Value::Object(Some(sbis)), Value::Object(Some(buf)),

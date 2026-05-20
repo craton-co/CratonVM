@@ -31,8 +31,8 @@ fn probe_dir() -> PathBuf {
         .join("classes")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -40,7 +40,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -83,12 +83,12 @@ fn run_aqs_probe(timeout: Duration) -> Option<(String, String)> {
         );
         return None;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[cluster_a_aqs_chm] rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[cluster_a_aqs_chm] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return None;
         }
@@ -104,7 +104,7 @@ fn run_aqs_probe(timeout: Duration) -> Option<(String, String)> {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[cluster_a_aqs_chm] failed to spawn rustjvm: {e}");
+            eprintln!("[cluster_a_aqs_chm] failed to spawn cratonvm: {e}");
             return None;
         }
     };

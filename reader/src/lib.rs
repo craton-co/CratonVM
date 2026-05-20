@@ -2,7 +2,7 @@
 // are added to all spec-derived types (struct fields, enum variants, etc.).
 #![allow(missing_docs)]
 
-//! Java `.class` file parser for the RustJVM project.
+//! Java `.class` file parser for the CratonVM project.
 //!
 //! This crate handles parsing of Java class files according to the JVM specification,
 //! supporting class file versions from Java 1.1 (major version 45) through Java 25
@@ -38,7 +38,7 @@ pub mod stack_map;
 pub use attribute::{LazyAttribute, decode_attribute, force_decode_all};
 pub use byte_view::ByteView;
 pub use class_file::ClassFile;
-pub use class_reader::read_class;
+pub use class_reader::{read_class, read_class_arc};
 pub use class_reader_error::ClassReaderError;
 pub use constant_pool::ConstantPool;
 pub use jimage::{JImageError, JImageReader};

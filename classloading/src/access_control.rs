@@ -3,13 +3,13 @@
 //! Checks whether a class, field, or method is accessible from a given context.
 //! Returns `IllegalAccessError` when access is denied.
 
-use rustjvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
+use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
 #[cfg(test)]
 use std::sync::Arc;
 
 use super::class::{Class, ClassStore};
 use crate::module::{package_of as module_pkg_of, ModuleRegistry, UNNAMED_MODULE};
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 /// Check whether `accessor` can access `target` class.
 ///
@@ -56,7 +56,7 @@ pub fn check_field_access(
 
     // Private: only from the declaring class itself or a nestmate (JEP 181)
     if flags.contains(FieldAccessFlags::PRIVATE) {
-        if accessor.id == declaring.id || are_nestmates(accessor, declaring) {
+        if accessor.id == declaring.id || are_nestmates(accessor, declaring, store) {
             return Ok(());
         }
         return Err(LinkageError::IllegalAccessError {
@@ -113,7 +113,7 @@ pub fn check_method_access(
 
     // Private: only from the declaring class itself or a nestmate (JEP 181)
     if flags.contains(MethodAccessFlags::PRIVATE) {
-        if accessor.id == declaring.id || are_nestmates(accessor, declaring) {
+        if accessor.id == declaring.id || are_nestmates(accessor, declaring, store) {
             return Ok(());
         }
         return Err(LinkageError::IllegalAccessError {
@@ -158,14 +158,57 @@ pub fn check_method_access(
 /// Two classes are nestmates if they have the same nest host. The nest host is:
 /// - The class named by the `NestHost` attribute, if present.
 /// - Otherwise, the class itself (it is its own nest host).
+///
+/// Per JVMS В§5.4.4, nest membership must be confirmed *bidirectionally*:
+/// a self-declared `NestHost` attribute is not sufficient. The claimed host
+/// class must actually be loadable and must list the claiming class in its
+/// `NestMembers` attribute. Without this confirmation a hostile class file
+/// could spoof its `NestHost` to gain `private` access to a victim's
+/// nestmates. If a claimed host cannot be resolved in the [`ClassStore`],
+/// or does not list the claiming member, that class is treated as its own
+/// nest host (so the spoof simply fails to grant access).
 #[inline]
-pub fn are_nestmates(a: &Class, b: &Class) -> bool {
+pub fn are_nestmates(a: &Class, b: &Class, store: &ClassStore) -> bool {
     if a.id == b.id {
         return true;
     }
-    let host_a = a.nest_host.as_deref().unwrap_or(&a.name);
-    let host_b = b.nest_host.as_deref().unwrap_or(&b.name);
+    let host_a = confirmed_nest_host(a, store);
+    let host_b = confirmed_nest_host(b, store);
     host_a == host_b
+}
+
+/// Resolve the *confirmed* nest host of `class`.
+///
+/// If `class` declares a `NestHost` attribute, the named host must be
+/// loadable and must list `class` in its own `NestMembers` attribute for
+/// the claim to be honored (JVMS В§5.4.4). When the claim cannot be
+/// confirmed, `class` is its own nest host.
+fn confirmed_nest_host<'a>(class: &'a Class, store: &ClassStore) -> &'a str {
+    match class.nest_host.as_deref() {
+        // A class that names itself as its NestHost is its own host.
+        Some(host) if host == &*class.name => &class.name,
+        Some(host) => {
+            // The host must exist and must explicitly list this class as a
+            // member. Otherwise the NestHost claim is unconfirmed (spoofed).
+            match store.find_by_name(host) {
+                Some(host_class)
+                    if host_class
+                        .nest_members
+                        .iter()
+                        .any(|m| m == &*class.name) =>
+                {
+                    // Confirmed: return the claiming class's view of the
+                    // host name (byte-identical to the resolved host, and
+                    // borrowed from `class` so it satisfies the `'a`
+                    // lifetime without tying it to `store`).
+                    host
+                }
+                _ => &class.name,
+            }
+        }
+        // No NestHost attribute: the class is its own nest host.
+        None => &class.name,
+    }
 }
 
 /// Check if two classes are in the same runtime package.
@@ -297,9 +340,9 @@ pub fn check_module_access_by_id(
 mod tests {
     use super::*;
     use crate::class::{Class, ClassId, ClassLoaderId, ClassState, ClassStore};
-    use rustjvm_reader::class_access_flags::ClassAccessFlags;
-    use rustjvm_reader::class_file_version::ClassFileVersion;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_reader::class_file_version::ClassFileVersion;
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     fn empty_cp() -> ConstantPool {
         ConstantPool::new(vec![ConstantPoolEntry::Tombstone])
@@ -741,6 +784,14 @@ mod tests {
     #[test]
     fn nestmates_both_inner_classes() {
         let mut store = ClassStore::new();
+        // The nest host must exist and must list both members for the
+        // bidirectional confirmation (JVMS В§5.4.4) to succeed.
+        let _outer_id = make_nest_class(
+            &mut store,
+            "com/foo/Outer",
+            None,
+            &["com/foo/Outer$A", "com/foo/Outer$B"],
+        );
         // Two inner classes with the same nest host
         let a_id = make_nest_class(&mut store, "com/foo/Outer$A", Some("com/foo/Outer"), &[]);
         let b_id = make_nest_class(&mut store, "com/foo/Outer$B", Some("com/foo/Outer"), &[]);
@@ -781,6 +832,52 @@ mod tests {
         let mut store = ClassStore::new();
         let id = make_nest_class(&mut store, "com/foo/A", None, &[]);
         let class = store.get(id).unwrap();
-        assert!(are_nestmates(class, class));
+        assert!(are_nestmates(class, class, &store));
+    }
+
+    #[test]
+    fn spoofed_nest_host_is_rejected() {
+        let mut store = ClassStore::new();
+        // Victim nest: Host explicitly lists only its legitimate member.
+        let _host_id = make_nest_class(
+            &mut store,
+            "com/victim/Host",
+            None,
+            &["com/victim/Host$Member"],
+        );
+        let member_id = make_nest_class(
+            &mut store,
+            "com/victim/Host$Member",
+            Some("com/victim/Host"),
+            &[],
+        );
+        // Attacker self-declares the victim's host as its NestHost but is
+        // NOT listed in Host's NestMembers.
+        let attacker_id = make_nest_class(
+            &mut store,
+            "com/attacker/Evil",
+            Some("com/victim/Host"),
+            &[],
+        );
+
+        let member = store.get(member_id).unwrap();
+        let attacker = store.get(attacker_id).unwrap();
+
+        // Spoof must fail: attacker is not a confirmed nestmate of member.
+        assert!(!are_nestmates(attacker, member, &store));
+        assert!(check_field_access(attacker, member, FieldAccessFlags::PRIVATE, &store).is_err());
+        assert!(check_method_access(attacker, member, MethodAccessFlags::PRIVATE, &store).is_err());
+    }
+
+    #[test]
+    fn unconfirmed_nest_host_when_host_missing() {
+        let mut store = ClassStore::new();
+        // Two classes claim the same host, but the host class is not loaded.
+        let a_id = make_nest_class(&mut store, "com/foo/Outer$A", Some("com/foo/Outer"), &[]);
+        let b_id = make_nest_class(&mut store, "com/foo/Outer$B", Some("com/foo/Outer"), &[]);
+        let a = store.get(a_id).unwrap();
+        let b = store.get(b_id).unwrap();
+        // Host unresolvable в†’ claim unconfirmed в†’ not nestmates.
+        assert!(!are_nestmates(a, b, &store));
     }
 }

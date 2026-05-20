@@ -69,7 +69,7 @@ impl<'h> SafepointToken<'h> {
     /// The constructor is `pub` so callers in the VM crate (the
     /// interpreter's GPU-offload hook) can build a token against a
     /// counter they own, mirroring the `Heap::enter_gpu_critical` path
-    /// inside `rustjvm-gc`. The lifetime ties the token to the
+    /// inside `cratonvm-gc`. The lifetime ties the token to the
     /// counter so it cannot outlive it.
     pub fn new(counter: &'h std::sync::atomic::AtomicU32) -> Self {
         counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);

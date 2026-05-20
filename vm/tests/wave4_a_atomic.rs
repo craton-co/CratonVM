@@ -3,7 +3,7 @@
 //! Pins the runtime behavior of `AtomicInteger` / `AtomicLong` /
 //! `AtomicReference` `compareAndSet` (and the 8-thread contended-loop
 //! pattern that ConcurrentHashMap, AQS, lock-free queues etc. depend on)
-//! end-to-end through the `rustjvm.exe` CLI binary against
+//! end-to-end through the `cratonvm.exe` CLI binary against
 //! `apps/atomic_probe/AtomicProbe.java`.
 //!
 //! Acceptance criteria (all in a single subprocess run):
@@ -19,9 +19,9 @@
 //! The contention test is the real regression pin: a non-atomic
 //! `Unsafe.compareAndSet*` would surface here as `final < 800000` (lost
 //! updates) or as a livelock / deadlock (subprocess timeout). 30 s subprocess
-//! timeout — HotSpot finishes in ~0.3 s, rustjvm release in ~5 s.
+//! timeout — HotSpot finishes in ~0.3 s, cratonvm release in ~5 s.
 //!
-//! The binary path is resolved via `RUSTJVM_BIN` env var, then the cargo
+//! The binary path is resolved via `CRATONVM_BIN` env var, then the cargo
 //! `target/{release,debug}` fallback. Class files are produced on-demand via
 //! `javac --release 21` if absent. If neither the binary nor `javac` is
 //! available the test reports `skipped` rather than failing.
@@ -40,8 +40,8 @@ fn probe_dir() -> PathBuf {
         .join("atomic_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -49,7 +49,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -81,7 +81,7 @@ fn ensure_probe_compiled() -> bool {
     matches!(status, Ok(s) if s.success()) && class_file.exists()
 }
 
-/// Run `AtomicProbe` through the rustjvm binary with a hard timeout.
+/// Run `AtomicProbe` through the cratonvm binary with a hard timeout.
 /// Returns `Some((stdout, stderr))` on successful spawn, `None` if
 /// pre-requisites are missing (so the caller can `return` and skip).
 fn run_atomic_probe(timeout: Duration) -> Option<(String, String)> {
@@ -92,12 +92,12 @@ fn run_atomic_probe(timeout: Duration) -> Option<(String, String)> {
         );
         return None;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[wave4_a_atomic] rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[wave4_a_atomic] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return None;
         }
@@ -113,7 +113,7 @@ fn run_atomic_probe(timeout: Duration) -> Option<(String, String)> {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave4_a_atomic] failed to spawn rustjvm: {e}");
+            eprintln!("[wave4_a_atomic] failed to spawn cratonvm: {e}");
             return None;
         }
     };

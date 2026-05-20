@@ -13,7 +13,7 @@ The default `cargo build` produces a CPU-only JVM that is byte-identical
 to the pre-GPU codebase — no `cuda-bridge` link, no `--gpu*` CLI flags,
 no GPU branches in the interpreter.
 
-Three feature levels (Cargo features on `rustjvm-cli`):
+Three feature levels (Cargo features on `cratonvm-cli`):
 
 | Build invocation                                  | What you get                                                                 |
 | ------------------------------------------------- | ---------------------------------------------------------------------------- |
@@ -21,8 +21,8 @@ Three feature levels (Cargo features on `rustjvm-cli`):
 | `cargo build --features gpu`                      | + `cuda-bridge` stub backend, `--gpu*` flags visible. Probe → `NoDriver`.    |
 | `cargo build --features gpu-driver`               | + real cudarc bindings to libcuda / nvcuda.dll.                              |
 
-Every GPU integration into a CPU-path crate (`rustjvm-vm`,
-`rustjvm-cli`, `rustjvm-jit-api`, `rustjvm-gc`) lives behind
+Every GPU integration into a CPU-path crate (`cratonvm-vm`,
+`cratonvm-cli`, `cratonvm-jit-api`, `cratonvm-gc`) lives behind
 `#[cfg(feature = "...")]`. There is no runtime-gated-dead-code path
 through the hot interpreter loop.
 

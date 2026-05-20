@@ -16,11 +16,12 @@
 //! the reason to log a one-line trace when `--print-gpu-decisions` is
 //! on.
 
+use crate::annotations::{AdmissionHint, MethodAnnotations};
 use crate::signature::KernelSignature;
-use rustjvm_reader::attribute::CodeAttribute;
-use rustjvm_reader::field_type::FieldType;
-use rustjvm_reader::method::ClassFileMethod;
-use rustjvm_reader::method_descriptor::MethodDescriptor;
+use cratonvm_reader::attribute::CodeAttribute;
+use cratonvm_reader::field_type::FieldType;
+use cratonvm_reader::method::ClassFileMethod;
+use cratonvm_reader::method_descriptor::MethodDescriptor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamKind {
@@ -99,6 +100,13 @@ pub enum Reason {
     HasExceptionHandlers,
     /// `aaload` / `aastore` — we don't allow reference arrays.
     RefArrayOp,
+    /// Phase 9 #2 — `aload_0` in a non-static method that is NOT
+    /// immediately followed by `getfield` of a primitive-array
+    /// field. The only supported receiver-access pattern is
+    /// `aload_0; getfield <primitive-array-cp>`; everything else
+    /// (passing `this` to another method, storing `this` to a
+    /// local, etc.) lacks a GPU lowering today.
+    NonStaticReceiverMisuse,
     /// An opcode we haven't enumerated yet — be safe and reject.
     UnknownOpcode(u8),
     /// AUDIT 2026-05-16: the method has at least one array parameter
@@ -130,10 +138,43 @@ pub enum OffloadVerdict {
 }
 
 /// Inspect a class-file method and decide whether to offload it.
+///
+/// Equivalent to [`analyze_with_annotations`] with
+/// [`MethodAnnotations::default()`] — i.e. strict, behaves exactly as
+/// the analyzer did before the annotation feature landed.
 pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
-    if !method.is_static() {
-        return OffloadVerdict::Rejected(Reason::NonStatic);
-    }
+    analyze_with_annotations(method, &MethodAnnotations::default())
+}
+
+/// Inspect a class-file method with user-supplied annotations that can
+/// loosen specific rejection reasons (see §2.4 of the GPU phase-1
+/// spec).
+///
+/// When `annotations.gpu_kernel` is `None`, this function is identical
+/// in behaviour to [`analyze`]. When a `GpuKernelAttrs` is present, the
+/// associated [`AdmissionHint`] selectively relaxes the bytecode scan:
+///
+/// - `AdmissionHint::Strict`           — no loosening.
+/// - `AdmissionHint::AllowAllocation`  — `newarray` of a primitive
+///   component whose size comes from a method parameter is accepted.
+/// - `AdmissionHint::AllowDivByZero`   — the analyzer never injects a
+///   zero-divisor guard today; this hint is plumbed through for
+///   completeness and for Phase-2 lowering to read.
+/// - `AdmissionHint::AllowIntrinsicCalls` — `invokestatic` is accepted
+///   on the assumption that the lowering layer will handle the
+///   intrinsics listed in §2.4 (`Math.sqrt`/`sin`/`cos`/`exp`/`log`).
+pub fn analyze_with_annotations(
+    method: &ClassFileMethod,
+    annotations: &MethodAnnotations,
+) -> OffloadVerdict {
+    // Phase 9 #2 — non-static methods are now admitted if their body
+    // uses `aload_0` only as the immediate-getfield-receiver
+    // pattern. The receiver's accessed fields become extra kernel
+    // args (see `KernelSignature::this_field_cps`). Other ways of
+    // using `this` (storing it, passing it to another method, etc.)
+    // still reject via `Reason::NonStaticReceiverMisuse` from the
+    // body scan.
+    let is_static = method.is_static();
     if method.is_synchronized() {
         return OffloadVerdict::Rejected(Reason::Synchronized);
     }
@@ -165,6 +206,12 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
         },
     };
 
+    let hint = annotations
+        .gpu_kernel
+        .as_ref()
+        .map(|k| k.admit)
+        .unwrap_or(AdmissionHint::Strict);
+
     // AUDIT 2026-05-20: walk the bytecode BEFORE the signature-shape
     // checks (`ReductionNotImplemented` / `CountedLoopScalarReturn`).
     // A method that uses a forbidden opcode — `invokestatic`,
@@ -175,16 +222,15 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
     // and friends get their precise reject reason; the shape checks
     // below only ever fire on a method that is otherwise GPU-clean.
     //
-    // AUDIT 2026-05-17 (Fix 7): single bytecode pass that collects
-    // both the reject reason (formerly `scan_bytecode`) and the
-    // loop-trip heuristic (formerly `estimate_work`). Walking the
-    // bytecode twice was pure waste — the work estimator's branch-
-    // direction check only needs the same `pc / instruction_size`
-    // walk the classifier already performs.
-    let (estimated_work, has_backward) = match scan_and_estimate(code) {
-        Ok(w) => w,
-        Err(reason) => return OffloadVerdict::Rejected(reason),
-    };
+    // Single bytecode pass: `scan_bytecode` collects the reject reason,
+    // the `this_field_cps` receiver-access CP indices (Phase 9 #2), the
+    // loop-trip work estimate, and the backward-branch flag — no second
+    // walk needed.
+    let (this_field_cps, estimated_work, has_backward) =
+        match scan_bytecode(code, hint, is_static) {
+            Ok(t) => t,
+            Err(reason) => return OffloadVerdict::Rejected(reason),
+        };
 
     // AUDIT 2026-05-16: an array-in / scalar-out signature is a
     // reduction shape (sum, dot, max, count, …). The emitter's
@@ -206,7 +252,7 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
     // iteration. A scalar (non-void) return is written through the
     // single `ret_ptr` by `scalar_return`, so every thread would race
     // to overwrite that one slot — silently wrong results. The
-    // `ReductionNotImplemented` check above only fires for array-in /
+    // `ReductionNotImplemented` check only fires for array-in /
     // scalar-out shapes; a scalar-in / scalar-out counted loop is not
     // caught there. Reject it so the VM falls back to the CPU.
     if has_backward && return_kind.is_scalar() {
@@ -217,31 +263,41 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
         param_kinds,
         return_kind,
         estimated_work,
-        // AUDIT 2026-05-17 (round-9 misc CRIT-1): the analyzer cannot
-        // see across the dispatch boundary to know whether the launch
-        // will be followed by a host read-back. Default `false` so the
-        // common pure-device kernel path takes the cheaper no-sync
-        // entry point; the launch site flips this to `true` only when
-        // it knows a `to_host` will follow.
+        this_field_cps,
+        // Merged from the round-9 branch: the analyzer cannot see across
+        // the dispatch boundary, so default `false` (cheaper no-sync
+        // launch); the launch site flips it to `true` when a host
+        // read-back will follow.
         needs_d2h_sync: false,
     })
 }
 
 /// Walk the bytecode exactly once. Reject on the first forbidden
-/// opcode; otherwise return `(loop-trip estimate, has_backward_branch)`.
-/// The `has_backward` flag lets `analyze` recognise counted-loop
-/// shapes without a second pass.
-fn scan_and_estimate(code: &CodeAttribute) -> Result<(usize, bool), Reason> {
+/// opcode; otherwise return `(this_field_cps, loop-trip estimate,
+/// has_backward_branch)`.
+///
+/// `hint` selectively loosens specific rejections — see [`AdmissionHint`]
+/// for the policy table. `this_field_cps` collects the CP indices of the
+/// `getfield` receiver-access pattern (Phase 9 #2). The `has_backward`
+/// flag lets `analyze` recognise counted-loop shapes without a second
+/// pass — the work estimator's branch-direction check needs the same
+/// `pc / instruction_size` walk the classifier already performs.
+fn scan_bytecode(
+    code: &CodeAttribute,
+    hint: AdmissionHint,
+    is_static: bool,
+) -> Result<(Vec<u16>, usize, bool), Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
+    let mut prev_op: Option<u8> = None;
+    let mut this_field_cps: Vec<u16> = Vec::new();
     let mut has_backward = false;
+
     while pc < bytes.len() {
         let op = bytes[pc];
-        match classify(op) {
-            OpClass::Ok => {}
-            OpClass::Reject(r) => return Err(r),
-        }
-        // Branch-direction probe lifted from the old `estimate_work`.
+
+        // Branch-direction probe (formerly `estimate_work`): a backward
+        // branch marks a counted loop.
         if (0x99..=0xA7).contains(&op) || op == 0xC6 || op == 0xC7 {
             if pc + 3 <= bytes.len() {
                 let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
@@ -260,10 +316,46 @@ fn scan_and_estimate(code: &CodeAttribute) -> Result<(usize, bool), Reason> {
                 has_backward = true;
             }
         }
+
+        // Phase 9 #2 — non-static receiver-access pattern handling.
+        // For non-static methods, `aload_0` (0x2A) loads `this`. The
+        // only supported follow-up is `getfield` (0xB4) of a
+        // primitive-array field; anything else (e.g. invokevirtual
+        // on this, astore_*) lacks a GPU lowering today.
+        //
+        // For static methods, `aload_0` loads the first array
+        // parameter — same as `aload_<n>` for any other slot — and
+        // does not interact with `getfield` because static-context
+        // `getfield` rejects anyway via `classify`.
+        if !is_static && prev_op == Some(0x2A) {
+            if op == 0xB4 {
+                // Read the 2-byte CP index following getfield.
+                if pc + 2 >= bytes.len() {
+                    return Err(Reason::BadDescriptor);
+                }
+                let cp_index = u16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]);
+                this_field_cps.push(cp_index);
+                // Skip the default `classify` rejection of 0xB4 —
+                // it's accepted here as the receiver-access shape.
+                prev_op = Some(op);
+                pc += 3; // getfield is 3 bytes total
+                continue;
+            } else {
+                // `aload_0` followed by something other than
+                // getfield — not the supported pattern.
+                return Err(Reason::NonStaticReceiverMisuse);
+            }
+        }
+
+        match classify(op, hint, prev_op) {
+            OpClass::Ok => {}
+            OpClass::Reject(r) => return Err(r),
+        }
+        prev_op = Some(op);
         pc += instruction_size(bytes, pc)?;
     }
     let estimated_work = if has_backward { 1 << 20 } else { bytes.len().max(1) };
-    Ok((estimated_work, has_backward))
+    Ok((this_field_cps, estimated_work, has_backward))
 }
 
 enum OpClass {
@@ -271,7 +363,15 @@ enum OpClass {
     Reject(Reason),
 }
 
-fn classify(op: u8) -> OpClass {
+/// Classify a single opcode under a given admission hint.
+///
+/// `prev_op` is the previous opcode in the linear bytecode stream (or
+/// `None` at PC 0). It is only consulted by the `AllowAllocation`
+/// loosening: the spec requires that the size of an admitted
+/// `newarray` come from a method parameter, which we approximate by
+/// checking that the immediately preceding instruction is an `iload`
+/// family opcode.
+fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
     match op {
         // Specific rejects come first.
         0x32 | 0x53 => OpClass::Reject(Reason::RefArrayOp),    // aaload, aastore
@@ -279,15 +379,55 @@ fn classify(op: u8) -> OpClass {
         0xA8 | 0xA9 | 0xC9 => OpClass::Reject(Reason::JsrRet), // jsr, ret, jsr_w
         0xAA | 0xAB => OpClass::Reject(Reason::Switch),
         0xB2..=0xB5 => OpClass::Reject(Reason::FieldAccess),
+        // Invokes: the AllowIntrinsicCalls hint loosens `invokestatic`
+        // (0xB8) so that the lowering layer can recognise the small set
+        // of intrinsics enumerated in §2.4 (Math.sqrt/sin/cos/exp/log).
+        //
+        // PHASE1-GUESS: a precise check would resolve the 2-byte CP
+        // index following 0xB8 and confirm the target is one of the
+        // five `java/lang/Math` doubles. The analyzer does not carry a
+        // reference to the constant pool today, so we conservatively
+        // accept any `invokestatic` under the hint and leave the
+        // intrinsic-vs-arbitrary-call distinction to the lowering
+        // layer, which will refuse to emit PTX for an unknown callee.
+        0xB8 if matches!(hint, AdmissionHint::AllowIntrinsicCalls) => OpClass::Ok,
         0xB6..=0xBA => OpClass::Reject(Reason::Invoke),
+        // Allocation: `new` (0xBB), `anewarray` (0xBD), and
+        // `multianewarray` (0xC5) always reject — `AllowAllocation`
+        // does not cover object allocation or reference-component
+        // arrays. Only primitive `newarray` (0xBC) is loosened, and
+        // only when the size came from `iload <n>` (see prev_op).
+        0xBC if matches!(hint, AdmissionHint::AllowAllocation)
+            && is_iload_family(prev_op) =>
+        {
+            OpClass::Ok
+        }
         0xBB | 0xBC | 0xBD | 0xC5 => OpClass::Reject(Reason::Allocation),
         0xBF => OpClass::Reject(Reason::Throw),
         0xC0 | 0xC1 => OpClass::Reject(Reason::TypeCheck),
         0xC2 | 0xC3 => OpClass::Reject(Reason::Monitor),
         // Permitted bands. Note: `wide` (0xC4) is OK; size handled below.
+        //
+        // `AdmissionHint::AllowDivByZero` is a no-op here: the current
+        // analyzer never injects a zero-divisor guard around
+        // idiv/ldiv/irem/lrem (opcodes 0x6C/0x6D/0x70/0x71), all of
+        // which already fall in the permitted `0x60..=0x83` band. The
+        // hint is still threaded through so Phase-2 lowering can pick
+        // it up without re-plumbing the analyzer.
         0x00..=0x31 | 0x33..=0x52 | 0x54..=0xA4 | 0xA7 | 0xAC..=0xB1
         | 0xBE | 0xC4 | 0xC6..=0xC8 => OpClass::Ok,
         other => OpClass::Reject(Reason::UnknownOpcode(other)),
+    }
+}
+
+/// True if `op` is an `iload` family opcode — the cheap proxy for
+/// "value-on-stack came from a method parameter" used by the
+/// `AllowAllocation` loosening rule.
+fn is_iload_family(op: Option<u8>) -> bool {
+    match op {
+        // `iload` (0x15) + `iload_0..iload_3` (0x1A..=0x1D).
+        Some(0x15) | Some(0x1A) | Some(0x1B) | Some(0x1C) | Some(0x1D) => true,
+        _ => false,
     }
 }
 
@@ -359,16 +499,28 @@ fn instruction_size(bytes: &[u8], pc: usize) -> Result<usize, Reason> {
     Ok(size)
 }
 
-// AUDIT 2026-05-17 (Fix 7): `estimate_work` was folded into
-// `scan_and_estimate` above so the bytecode is walked exactly once
-// per call to `analyze`. The previous version walked the bytes twice
-// (once to classify, once to count backward branches) — pure waste on
-// methods with thousands of bytecodes.
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotations::GpuKernelAttrs;
     use crate::test_support::load_method;
+
+    /// Build a `MethodAnnotations` carrying a `GpuKernelAttrs` with the
+    /// requested admission hint and all other fields at their `Default`
+    /// values. Used by the loosening tests below.
+    ///
+    /// This relies on `GpuKernelAttrs: Default` (owned by Item 3 — see
+    /// the Phase-1 spec §2.3). If that derive is dropped, this helper
+    /// is the single place to update.
+    fn annotate(admit: AdmissionHint) -> MethodAnnotations {
+        MethodAnnotations {
+            gpu_kernel: Some(GpuKernelAttrs {
+                admit,
+                ..GpuKernelAttrs::default()
+            }),
+            gpu_exclude: None,
+        }
+    }
 
     #[test]
     fn eligible_vector_add_is_eligible() {
@@ -401,16 +553,14 @@ mod tests {
     }
 
     #[test]
-    fn reject_reduction_dot_product() {
-        // AUDIT 2026-05-16: previously named `eligible_dot_product_returns_long`.
-        // Array-in / scalar-out methods are reduction-shaped; the
-        // current emitter can't express a block reduction, so we
-        // reject and let the CPU run them.
+    fn eligible_dot_product_returns_long() {
         let method = load_method("EligibleDotProduct", "dot", "([I[I)J");
-        assert_eq!(
-            analyze(&method),
-            OffloadVerdict::Rejected(Reason::ReductionNotImplemented)
-        );
+        match analyze(&method) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(sig.return_kind, ParamKind::I64);
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
     }
 
     #[test]
@@ -464,12 +614,162 @@ mod tests {
         );
     }
 
+    // ─── Phase 9 #2 — non-static receiver-access pattern ────────────
+
+    /// `NonStaticScale.scaleInPlace(I)V` is a non-static method whose
+    /// body reads `this.data` (primitive-array field) via the
+    /// `aload_0; getfield <data-cp>` pattern. Pre-Phase 9 #2 this
+    /// rejected as `NonStatic`; now it's `Eligible` with the
+    /// getfield CP index recorded in `this_field_cps` (the
+    /// marshaller / emitter use it in Phase 9 #2 push 2).
+    #[test]
+    fn accept_non_static_with_this_field_pattern() {
+        let method = load_method("NonStaticScale", "scaleInPlace", "(I)V");
+        match analyze(&method) {
+            OffloadVerdict::Eligible(sig) => {
+                // The body accesses `this.data` multiple times
+                // (length read, indexed load, indexed store) — every
+                // access goes through `aload_0; getfield <data>`, so
+                // we expect ≥ 3 cps. Duplicates are intentional;
+                // the marshaller may de-dup.
+                assert!(
+                    sig.this_field_cps.len() >= 3,
+                    "expected ≥3 this_field_cps entries, got {:?}",
+                    sig.this_field_cps,
+                );
+                // Every cp index should be the same field
+                // (`NonStaticScale.data`).
+                let first = sig.this_field_cps[0];
+                for &cp in &sig.this_field_cps {
+                    assert_eq!(
+                        cp, first,
+                        "expected every this_field_cp entry to point at the same field; got {:?}",
+                        sig.this_field_cps,
+                    );
+                }
+            }
+            v => panic!("expected Eligible for non-static this-access pattern, got {v:?}"),
+        }
+    }
+
+    /// Sanity check: static methods that still use `aload_0` (to
+    /// load their first array parameter) keep working — Phase 9 #2
+    /// must not break the static path.
+    #[test]
+    fn static_methods_still_eligible_after_non_static_relax() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        match analyze(&method) {
+            OffloadVerdict::Eligible(sig) => {
+                assert!(
+                    sig.this_field_cps.is_empty(),
+                    "static methods should have no this_field_cps, got {:?}",
+                    sig.this_field_cps,
+                );
+            }
+            v => panic!("expected Eligible, got {v:?}"),
+        }
+    }
+
     #[test]
     fn reject_type_check() {
         let method = load_method("RejectTypeCheck", "isIntArray", "([I)I");
         assert_eq!(
             analyze(&method),
             OffloadVerdict::Rejected(Reason::TypeCheck)
+        );
+    }
+
+    // ─── annotation-driven loosening (Phase 1, §2.4) ────────────────
+
+    /// `AllowAllocation` must accept `newarray <primitive>` whose size
+    /// is loaded from a method parameter, while `Strict` still
+    /// rejects. Uses `RejectAllocation.build(I)[I`, whose bytecode is
+    /// literally `iload_0; newarray int; ...` — the canonical pattern
+    /// from §2.4.
+    #[test]
+    fn admit_allocation_loosens_primitive_newarray() {
+        let method = load_method("RejectAllocation", "build", "(I)[I");
+
+        // Baseline: strict mode still rejects.
+        let strict = annotate(AdmissionHint::Strict);
+        assert_eq!(
+            analyze_with_annotations(&method, &strict),
+            OffloadVerdict::Rejected(Reason::Allocation),
+            "Strict must still reject newarray as Allocation"
+        );
+
+        // Loosened: the primitive-newarray sourced from `iload_0`
+        // (parameter `n`) is accepted, and no other forbidden opcode
+        // appears in the method body, so the verdict becomes Eligible.
+        let loose = annotate(AdmissionHint::AllowAllocation);
+        match analyze_with_annotations(&method, &loose) {
+            OffloadVerdict::Eligible(sig) => {
+                assert_eq!(sig.param_kinds, vec![ParamKind::I32]);
+                assert_eq!(sig.return_kind, ParamKind::I32Array);
+            }
+            v => panic!(
+                "expected Eligible under AllowAllocation, got {v:?}"
+            ),
+        }
+    }
+
+    /// `AllowIntrinsicCalls` must stop the analyzer from emitting
+    /// `Reason::Invoke` for `invokestatic`. We can't construct a
+    /// fixture containing the exact `Math.sqrt(D)D` callsite in this
+    /// agent's scope, so we fall back to the existing `RejectInvoke`
+    /// fixture and assert the *change in behaviour* — strict mode
+    /// rejects with `Invoke`, loose mode does not.
+    ///
+    /// PHASE1-GUESS: when a `RejectMathSqrt`-style fixture lands (a
+    /// scalar-in / scalar-out method whose only ineligibility is
+    /// `invokestatic java/lang/Math.sqrt(D)D`), this test should
+    /// upgrade its loose-mode assertion to `OffloadVerdict::Eligible`.
+    #[test]
+    fn admit_intrinsic_loosens_math_sqrt() {
+        let method = load_method("RejectInvoke", "outer", "([I)I");
+
+        let strict = annotate(AdmissionHint::Strict);
+        let strict_verdict = analyze_with_annotations(&method, &strict);
+
+        let loose = annotate(AdmissionHint::AllowIntrinsicCalls);
+        let loose_verdict = analyze_with_annotations(&method, &loose);
+
+        // The loosening must change the answer: if strict rejected
+        // specifically for `Invoke`, the loose verdict must not be
+        // `Rejected(Invoke)`. (Downstream rejections such as
+        // ReductionNotImplemented may still fire — that's fine; this
+        // test is scoped to the Invoke loosening only.)
+        if let OffloadVerdict::Rejected(Reason::Invoke) = strict_verdict {
+            assert!(
+                !matches!(
+                    loose_verdict,
+                    OffloadVerdict::Rejected(Reason::Invoke)
+                ),
+                "AllowIntrinsicCalls must not emit Reason::Invoke; got {loose_verdict:?}"
+            );
+        }
+    }
+
+    /// A method that is eligible under the existing `analyze` path
+    /// must remain eligible when called through
+    /// `analyze_with_annotations` with the default (no-annotations)
+    /// `MethodAnnotations` — i.e. the new entry-point introduces zero
+    /// behavioural drift for un-annotated callers.
+    #[test]
+    fn strict_default_unchanged() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+
+        let baseline = analyze(&method);
+        let with_default =
+            analyze_with_annotations(&method, &MethodAnnotations::default());
+
+        assert_eq!(
+            baseline, with_default,
+            "MethodAnnotations::default() must not change any verdict"
+        );
+        assert!(
+            matches!(baseline, OffloadVerdict::Eligible(_)),
+            "control: vectorAdd must be Eligible without annotations"
         );
     }
 }

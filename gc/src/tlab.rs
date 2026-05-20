@@ -284,7 +284,7 @@ impl Tlab {
     ///
     /// `class_id` must be a class id that the heap walker will treat as a
     /// well-formed `int[]`. Use [`tlab_filler_class_id`] to pick one.
-    pub unsafe fn install_tail_filler(&mut self, class_id: rustjvm_types::ClassId) {
+    pub unsafe fn install_tail_filler(&mut self, class_id: cratonvm_types::ClassId) {
         if self.cursor.is_null() || self.end.is_null() {
             return;
         }
@@ -404,8 +404,8 @@ pub fn max_tlab_size() -> usize {
 /// "synthetic VM" class-id range (matches the convention used by
 /// `AUTOBOX_CLASS_ID` = 0xAB00_0000) so it cannot collide with a
 /// classloader-issued id.
-pub const TLAB_FILLER_CLASS_ID: rustjvm_types::ClassId =
-    rustjvm_types::ClassId::new(0xF111_E700);
+pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId =
+    cratonvm_types::ClassId::new(0xF111_E700);
 
 /// Round-5 #9 / round-7 #9 — class id every TLAB tail filler should use.
 ///
@@ -414,7 +414,7 @@ pub const TLAB_FILLER_CLASS_ID: rustjvm_types::ClassId =
 /// `int[]` so even walkers that do not recognise the sentinel will skip
 /// past it correctly using the normal array-size formula.
 #[inline]
-pub fn tlab_filler_class_id() -> rustjvm_types::ClassId {
+pub fn tlab_filler_class_id() -> cratonvm_types::ClassId {
     TLAB_FILLER_CLASS_ID
 }
 

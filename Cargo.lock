@@ -447,6 +447,239 @@ dependencies = [
 ]
 
 [[package]]
+name = "craton-gpu"
+version = "0.2.0"
+
+[[package]]
+name = "cratonvm-classloading"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-jit",
+ "cratonvm-jit-api",
+ "cratonvm-native-api",
+ "cratonvm-reader",
+ "cratonvm-types",
+ "hashbrown 0.14.5",
+ "memmap2",
+ "parking_lot",
+ "rustc-hash",
+ "tracing",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "cratonvm-cli"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cratonvm-native-api",
+ "cratonvm-native-builtins",
+ "cratonvm-vm",
+ "cuda-bridge",
+ "mimalloc",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cratonvm-gc"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-jit",
+ "cratonvm-types",
+ "parking_lot",
+ "rustc-hash",
+ "tracing",
+]
+
+[[package]]
+name = "cratonvm-jfr"
+version = "0.2.0"
+dependencies = [
+ "parking_lot",
+ "rustc-hash",
+ "smallvec",
+]
+
+[[package]]
+name = "cratonvm-jit"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-gc",
+ "cratonvm-jit-api",
+ "cratonvm-reader",
+ "cratonvm-types",
+ "parking_lot",
+ "rustc-hash",
+]
+
+[[package]]
+name = "cratonvm-jit-api"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-reader",
+ "cratonvm-types",
+]
+
+[[package]]
+name = "cratonvm-native-api"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-types",
+ "native-tls",
+ "parking_lot",
+ "rustc-hash",
+ "socket2",
+]
+
+[[package]]
+name = "cratonvm-native-awt"
+version = "0.2.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "cratonvm-native-api",
+ "cratonvm-types",
+ "fontdue",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "parking_lot",
+ "rustc-hash",
+ "tracing",
+ "windows",
+ "x11rb",
+]
+
+[[package]]
+name = "cratonvm-native-builtins"
+version = "0.2.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "cbc",
+ "chacha20poly1305",
+ "cratonvm-classloading",
+ "cratonvm-native-api",
+ "cratonvm-native-collections",
+ "cratonvm-reader",
+ "cratonvm-types",
+ "ctr",
+ "ed25519-dalek",
+ "fancy-regex",
+ "flate2",
+ "getrandom 0.2.17",
+ "httparse",
+ "libc",
+ "libffi",
+ "native-tls",
+ "p12",
+ "parking_lot",
+ "quick-xml",
+ "regex",
+ "rusqlite",
+ "rustc-hash",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "sha1",
+ "sha3",
+ "socket2",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "unicode-normalization",
+ "zip 0.6.6",
+]
+
+[[package]]
+name = "cratonvm-native-collections"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-native-api",
+ "cratonvm-types",
+ "parking_lot",
+]
+
+[[package]]
+name = "cratonvm-native-io"
+version = "0.2.0"
+dependencies = [
+ "cratonvm-native-api",
+ "cratonvm-types",
+ "libc",
+ "memmap2",
+ "notify",
+ "parking_lot",
+ "regex",
+ "rustc-hash",
+ "tempfile",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "cratonvm-reader"
+version = "0.2.0"
+dependencies = [
+ "bitflags 2.11.0",
+ "cesu8",
+ "cratonvm-types",
+ "parking_lot",
+ "rustc-hash",
+ "strum",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cratonvm-types"
+version = "0.2.0"
+dependencies = [
+ "parking_lot",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
+name = "cratonvm-vm"
+version = "0.2.0"
+dependencies = [
+ "bitfield-struct",
+ "bytemuck",
+ "cratonvm-classloading",
+ "cratonvm-gc",
+ "cratonvm-jfr",
+ "cratonvm-jit",
+ "cratonvm-jit-api",
+ "cratonvm-native-api",
+ "cratonvm-native-awt",
+ "cratonvm-native-builtins",
+ "cratonvm-native-collections",
+ "cratonvm-native-io",
+ "cratonvm-reader",
+ "cratonvm-types",
+ "criterion",
+ "cuda-bridge",
+ "indexmap",
+ "jit-cuda",
+ "libc",
+ "libloading",
+ "parking_lot",
+ "regex",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "zip 2.4.2",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,9 +1245,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jit-cuda"
 version = "0.2.0"
 dependencies = [
- "rustjvm-jit-api",
- "rustjvm-reader",
- "rustjvm-types",
+ "craton-gpu",
+ "cratonvm-jit-api",
+ "cratonvm-reader",
+ "cratonvm-types",
  "thiserror",
 ]
 
@@ -1783,234 +2017,6 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rustjvm-classloading"
-version = "0.2.0"
-dependencies = [
- "hashbrown 0.14.5",
- "memmap2",
- "parking_lot",
- "rustc-hash",
- "rustjvm-jit",
- "rustjvm-jit-api",
- "rustjvm-native-api",
- "rustjvm-reader",
- "rustjvm-types",
- "tracing",
- "zip 2.4.2",
-]
-
-[[package]]
-name = "rustjvm-cli"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "cuda-bridge",
- "mimalloc",
- "rustjvm-native-api",
- "rustjvm-native-builtins",
- "rustjvm-vm",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rustjvm-gc"
-version = "0.2.0"
-dependencies = [
- "parking_lot",
- "rustc-hash",
- "rustjvm-jit",
- "rustjvm-types",
- "tracing",
-]
-
-[[package]]
-name = "rustjvm-jfr"
-version = "0.2.0"
-dependencies = [
- "parking_lot",
- "rustc-hash",
- "smallvec",
-]
-
-[[package]]
-name = "rustjvm-jit"
-version = "0.2.0"
-dependencies = [
- "parking_lot",
- "rustc-hash",
- "rustjvm-gc",
- "rustjvm-jit-api",
- "rustjvm-reader",
- "rustjvm-types",
-]
-
-[[package]]
-name = "rustjvm-jit-api"
-version = "0.2.0"
-dependencies = [
- "rustjvm-reader",
- "rustjvm-types",
-]
-
-[[package]]
-name = "rustjvm-native-api"
-version = "0.2.0"
-dependencies = [
- "native-tls",
- "parking_lot",
- "rustc-hash",
- "rustjvm-types",
- "socket2",
-]
-
-[[package]]
-name = "rustjvm-native-awt"
-version = "0.2.0"
-dependencies = [
- "bitflags 2.11.0",
- "fontdue",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "parking_lot",
- "rustc-hash",
- "rustjvm-native-api",
- "rustjvm-types",
- "tracing",
- "windows",
- "x11rb",
-]
-
-[[package]]
-name = "rustjvm-native-builtins"
-version = "0.2.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "cbc",
- "chacha20poly1305",
- "ctr",
- "ed25519-dalek",
- "fancy-regex",
- "flate2",
- "getrandom 0.2.17",
- "httparse",
- "libc",
- "libffi",
- "native-tls",
- "p12",
- "parking_lot",
- "quick-xml",
- "regex",
- "rusqlite",
- "rustc-hash",
- "rustjvm-classloading",
- "rustjvm-native-api",
- "rustjvm-native-collections",
- "rustjvm-reader",
- "rustjvm-types",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "rustls-pki-types",
- "sha1",
- "sha3",
- "socket2",
- "tempfile",
- "thiserror",
- "tracing",
- "unicode-normalization",
- "zip 0.6.6",
-]
-
-[[package]]
-name = "rustjvm-native-collections"
-version = "0.2.0"
-dependencies = [
- "parking_lot",
- "rustjvm-native-api",
- "rustjvm-types",
-]
-
-[[package]]
-name = "rustjvm-native-io"
-version = "0.2.0"
-dependencies = [
- "libc",
- "memmap2",
- "notify",
- "parking_lot",
- "regex",
- "rustc-hash",
- "rustjvm-native-api",
- "rustjvm-types",
- "tempfile",
- "zip 2.4.2",
-]
-
-[[package]]
-name = "rustjvm-reader"
-version = "0.2.0"
-dependencies = [
- "bitflags 2.11.0",
- "cesu8",
- "parking_lot",
- "rustc-hash",
- "rustjvm-types",
- "strum",
- "thiserror",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rustjvm-types"
-version = "0.2.0"
-dependencies = [
- "parking_lot",
- "rustc-hash",
- "thiserror",
-]
-
-[[package]]
-name = "rustjvm-vm"
-version = "0.2.0"
-dependencies = [
- "bitfield-struct",
- "criterion",
- "cuda-bridge",
- "indexmap",
- "jit-cuda",
- "libc",
- "libloading",
- "parking_lot",
- "regex",
- "rustc-hash",
- "rustjvm-classloading",
- "rustjvm-gc",
- "rustjvm-jfr",
- "rustjvm-jit",
- "rustjvm-jit-api",
- "rustjvm-native-api",
- "rustjvm-native-awt",
- "rustjvm-native-builtins",
- "rustjvm-native-collections",
- "rustjvm-native-io",
- "rustjvm-reader",
- "rustjvm-types",
- "serde",
- "serde_json",
- "smallvec",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "zip 2.4.2",
 ]
 
 [[package]]

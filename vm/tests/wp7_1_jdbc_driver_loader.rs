@@ -17,7 +17,7 @@
 //! `native-builtins/src/jdbc.rs` that walk the classpath directly.
 //!
 //! Strategy:
-//!   1. Compile the fixture `vm/tests/resources/rustjvm/Wp71JdbcSpi.java`
+//!   1. Compile the fixture `vm/tests/resources/cratonvm/Wp71JdbcSpi.java`
 //!      via the existing `build.rs` pipeline.
 //!   2. At test time, materialize a fresh temp dir containing
 //!      `META-INF/services/java.sql.Driver` whose single line names
@@ -31,9 +31,9 @@
 //! See `native-builtins/src/jdbc.rs::register_jdbc_driver_natives`
 //! for the registration that makes this test pass.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 /// Path to the test resources directory (matches `interpreter_tests.rs`).
 fn test_resources_dir() -> String {
@@ -47,7 +47,7 @@ fn test_resources_dir() -> String {
 /// across `vm/tests/wp*.rs`).
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    let class_path = format!("{dir}/rustjvm/Wp71JdbcSpi.class");
+    let class_path = format!("{dir}/cratonvm/Wp71JdbcSpi.class");
     std::path::Path::new(&class_path).exists()
 }
 
@@ -62,9 +62,9 @@ fn make_spi_classpath_dir() -> std::path::PathBuf {
     std::fs::create_dir_all(&services_dir).expect("create META-INF/services");
     let descriptor = services_dir.join("java.sql.Driver");
     // The SPI-spec line is the binary class name. The driver's enclosing
-    // class is `rustjvm/Wp71JdbcSpi`; the inner class is suffixed with
-    // `$FakeDriver` (binary name `rustjvm.Wp71JdbcSpi$FakeDriver`).
-    std::fs::write(&descriptor, "rustjvm.Wp71JdbcSpi$FakeDriver\n")
+    // class is `cratonvm/Wp71JdbcSpi`; the inner class is suffixed with
+    // `$FakeDriver` (binary name `cratonvm.Wp71JdbcSpi$FakeDriver`).
+    std::fs::write(&descriptor, "cratonvm.Wp71JdbcSpi$FakeDriver\n")
         .expect("write META-INF/services/java.sql.Driver descriptor");
     // Persist the TempDir guard so the directory survives until process
     // exit. The OS reclaims temp space at reboot in the worst case.
@@ -99,7 +99,7 @@ fn fake_driver_class_loads() {
     }
     let spi_dir = make_spi_classpath_dir();
     let mut vm = test_vm_with_spi(&spi_dir);
-    let result = vm.invoke("rustjvm/Wp71JdbcSpi", "instantiateDirectly", "()I", &[]);
+    let result = vm.invoke("cratonvm/Wp71JdbcSpi", "instantiateDirectly", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!(
@@ -123,7 +123,7 @@ fn service_loader_discovers_driver_on_classpath() {
     }
     let spi_dir = make_spi_classpath_dir();
     let mut vm = test_vm_with_spi(&spi_dir);
-    let result = vm.invoke("rustjvm/Wp71JdbcSpi", "discoverFakeDriver", "()I", &[]);
+    let result = vm.invoke("cratonvm/Wp71JdbcSpi", "discoverFakeDriver", "()I", &[]);
     match result {
         Ok(Some(Value::Int(1))) => {}
         other => panic!(
@@ -148,7 +148,7 @@ fn first_discovered_provider_matches_descriptor() {
     let spi_dir = make_spi_classpath_dir();
     let mut vm = test_vm_with_spi(&spi_dir);
     let result = vm.invoke(
-        "rustjvm/Wp71JdbcSpi",
+        "cratonvm/Wp71JdbcSpi",
         "firstDiscoveredProvider",
         "()Ljava/lang/String;",
         &[],
@@ -183,9 +183,9 @@ fn first_discovered_provider_matches_descriptor() {
 /// would still answer `ServiceLoader.load` at runtime.
 #[test]
 fn jdbc_driver_natives_export_service_loader() {
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
+    cratonvm_native_builtins::jdbc::register_jdbc_driver_natives(&mut r);
     assert!(
         r.find(
             "java/util/ServiceLoader",
@@ -206,7 +206,7 @@ fn jdbc_driver_natives_export_service_loader() {
     );
     assert!(
         r.find(
-            "rustjvm/Wp71JdbcSpi",
+            "cratonvm/Wp71JdbcSpi",
             "findDriverProviderNative",
             "(Ljava/lang/String;)I",
         )

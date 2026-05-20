@@ -29,12 +29,12 @@
 //!    providers returns >0 when a `META-INF/services/java.sql.Driver`
 //!    is on the classpath.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::native::register_builtins;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::native::register_builtins;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
-const FIXTURE_CLASS: &str = "rustjvm/Wp18ServiceLoaderE2E";
+const FIXTURE_CLASS: &str = "cratonvm/Wp18ServiceLoaderE2E";
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -43,7 +43,7 @@ fn test_resources_dir() -> String {
 
 fn fixture_compiled() -> bool {
     let path = format!(
-        "{}/rustjvm/Wp18ServiceLoaderE2E.class",
+        "{}/cratonvm/Wp18ServiceLoaderE2E.class",
         test_resources_dir()
     );
     std::path::Path::new(&path).exists()
@@ -60,7 +60,7 @@ fn make_spi_classpath_dir() -> std::path::PathBuf {
     let descriptor = services_dir.join("java.sql.Driver");
     std::fs::write(
         &descriptor,
-        "rustjvm.Wp18ServiceLoaderE2E$FakeDriver\n",
+        "cratonvm.Wp18ServiceLoaderE2E$FakeDriver\n",
     )
     .expect("write META-INF/services/java.sql.Driver");
     let path = dir.path().to_path_buf();
@@ -93,7 +93,7 @@ fn vm_no_spi() -> Vm {
 /// the synthetic stub with no fallback.
 #[test]
 fn class_for_name_string_native_registered() {
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
     let mut r = NativeMethodRegistry::new();
     register_builtins(&mut r);
     assert!(

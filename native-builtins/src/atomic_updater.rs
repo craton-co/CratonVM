@@ -6,7 +6,7 @@
 //! "next")` from a `<clinit>`. The real JDK implementation reaches into
 //! `java.lang.reflect.Field` via `Reflection.getCallerClass()` and performs
 //! a strict access + type-equality check that uses cached
-//! `Class<?>` references on the synthetic Field. RustJVM's synthetic
+//! `Class<?>` references on the synthetic Field. CratonVM's synthetic
 //! Field mirror does not preserve the exact JDK private layout, so the
 //! reflective cast trips a `ClassCastException` in `<clinit>`, which is
 //! silently swallowed but leaves the static `next` slot pointing at a
@@ -67,9 +67,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::lang_class::mirror_class_id;
 
@@ -86,7 +86,7 @@ const CLS_LONG_FIELD_UPDATER: &str = "java/util/concurrent/atomic/AtomicLongFiel
 /// Synthetic concrete classes returned by `newUpdater`.  Method natives
 /// dispatch on these names; the JDK has its own private impl classes
 /// with similar names, but we avoid colliding with the real ones by
-/// using the rustjvm-internal `$RustJvmImpl` suffix.
+/// using the cratonvm-internal `$RustJvmImpl` suffix.
 pub(crate) const CLS_REF_FIELD_UPDATER_IMPL: &str =
     "java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl";
 pub(crate) const CLS_INT_FIELD_UPDATER_IMPL: &str =
@@ -261,7 +261,7 @@ fn build_updater(
     })?;
 
     // Find the named field on tclass (and any superclass).
-    let mut found: Option<rustjvm_native_api::FieldMetadata> = None;
+    let mut found: Option<cratonvm_native_api::FieldMetadata> = None;
     let mut cursor = Some(tclass_id);
     while let Some(cid) = cursor {
         let fields = ctx.declared_fields(cid);
@@ -448,7 +448,7 @@ fn native_arfu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 fn native_arfu_lazy_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // lazySet has weaker memory ordering on real HotSpot; on rustjvm we
+    // lazySet has weaker memory ordering on real HotSpot; on cratonvm we
     // bind it to the volatile path for correctness, accepting a
     // micro-perf cost rather than risk a re-ordering bug.
     native_arfu_set(ctx, args)
@@ -1030,7 +1030,7 @@ mod tests {
     /// Since the mock doesn't currently expose declared_fields override,
     /// we wrap by sub-classing in a dedicated sub-mock for these tests.
     /// To keep the diff minimal, the tests use a bypass mock.
-    use rustjvm_native_api::FieldMetadata;
+    use cratonvm_native_api::FieldMetadata;
     use std::cell::UnsafeCell;
     use std::collections::HashMap;
 
@@ -1103,13 +1103,13 @@ mod tests {
         fn capture_stack_trace(
             &mut self,
             throwable_hash: i32,
-        ) -> Vec<rustjvm_native_api::StackTraceEntry> {
+        ) -> Vec<cratonvm_native_api::StackTraceEntry> {
             self.inner.capture_stack_trace(throwable_hash)
         }
         fn get_stack_trace(
             &self,
             throwable_hash: i32,
-        ) -> Option<&[rustjvm_native_api::StackTraceEntry]> {
+        ) -> Option<&[cratonvm_native_api::StackTraceEntry]> {
             self.inner.get_stack_trace(throwable_hash)
         }
         fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
@@ -1132,7 +1132,7 @@ mod tests {
         }
         fn new_array(
             &mut self,
-            element_type: rustjvm_types::ArrayElementType,
+            element_type: cratonvm_types::ArrayElementType,
             length: usize,
         ) -> ObjectRef {
             self.inner.new_array(element_type, length)
@@ -1149,10 +1149,10 @@ mod tests {
         fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
             self.inner.set_array_element(obj, index, value)
         }
-        fn heap_kind_of(&self, obj: ObjectRef) -> rustjvm_types::ObjectKind {
+        fn heap_kind_of(&self, obj: ObjectRef) -> cratonvm_types::ObjectKind {
             self.inner.heap_kind_of(obj)
         }
-        fn heap_element_type_of(&self, obj: ObjectRef) -> rustjvm_types::ArrayElementType {
+        fn heap_element_type_of(&self, obj: ObjectRef) -> cratonvm_types::ArrayElementType {
             self.inner.heap_element_type_of(obj)
         }
         fn create_string(&mut self, text: &str) -> ObjectRef {
@@ -1276,7 +1276,7 @@ mod tests {
         fn declared_methods(
             &self,
             class_id: ClassId,
-        ) -> Vec<rustjvm_native_api::MethodMetadata> {
+        ) -> Vec<cratonvm_native_api::MethodMetadata> {
             self.inner.declared_methods(class_id)
         }
         fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
@@ -1299,7 +1299,7 @@ mod tests {
         fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
             self.inner.primitive_class_mirror(name)
         }
-        fn fd_table(&self) -> &rustjvm_native_api::fd_table::FileDescriptorTable {
+        fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
             self.inner.fd_table()
         }
         fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
@@ -1329,7 +1329,7 @@ mod tests {
         fn class_annotations(
             &self,
             class_id: ClassId,
-        ) -> Vec<rustjvm_native_api::AnnotationData> {
+        ) -> Vec<cratonvm_native_api::AnnotationData> {
             self.inner.class_annotations(class_id)
         }
         fn method_annotations(
@@ -1337,14 +1337,14 @@ mod tests {
             class_id: ClassId,
             m: &str,
             d: &str,
-        ) -> Vec<rustjvm_native_api::AnnotationData> {
+        ) -> Vec<cratonvm_native_api::AnnotationData> {
             self.inner.method_annotations(class_id, m, d)
         }
         fn field_annotations(
             &self,
             class_id: ClassId,
             f: &str,
-        ) -> Vec<rustjvm_native_api::AnnotationData> {
+        ) -> Vec<cratonvm_native_api::AnnotationData> {
             self.inner.field_annotations(class_id, f)
         }
         fn method_parameter_annotations(
@@ -1352,7 +1352,7 @@ mod tests {
             class_id: ClassId,
             m: &str,
             d: &str,
-        ) -> Vec<Vec<rustjvm_native_api::AnnotationData>> {
+        ) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
             self.inner.method_parameter_annotations(class_id, m, d)
         }
         fn class_signature(&self, class_id: ClassId) -> Option<String> {
@@ -1374,7 +1374,7 @@ mod tests {
             class_id: ClassId,
             m: &str,
             d: &str,
-        ) -> Option<rustjvm_native_api::AnnotationElementValue> {
+        ) -> Option<cratonvm_native_api::AnnotationElementValue> {
             self.inner.method_annotation_default(class_id, m, d)
         }
         fn invoke_virtual(
@@ -1419,7 +1419,7 @@ mod tests {
         }
         fn register_upcall(
             &mut self,
-            entry: rustjvm_native_api::ffi::UpcallEntry,
+            entry: cratonvm_native_api::ffi::UpcallEntry,
         ) -> usize {
             self.inner.register_upcall(entry)
         }
@@ -1493,6 +1493,36 @@ mod tests {
         }
         fn force_gc(&mut self) {
             self.inner.force_gc()
+        }
+        fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
+            self.inner.is_package_exported_unqualified(module_name, pkg)
+        }
+        fn is_package_exported_to(
+            &self,
+            module_name: &str,
+            pkg: &str,
+            to_module: &str,
+        ) -> bool {
+            self.inner.is_package_exported_to(module_name, pkg, to_module)
+        }
+        fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
+            self.inner.is_package_open_unqualified(module_name, pkg)
+        }
+        fn is_package_open_to(
+            &self,
+            module_name: &str,
+            pkg: &str,
+            to_module: &str,
+        ) -> bool {
+            self.inner.is_package_open_to(module_name, pkg, to_module)
+        }
+        fn check_deep_reflection_access(
+            &self,
+            accessor_class_id: ClassId,
+            target_class_id: ClassId,
+        ) -> Result<(), String> {
+            self.inner
+                .check_deep_reflection_access(accessor_class_id, target_class_id)
         }
     }
 
@@ -1637,7 +1667,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IllegalArgumentException { message },
             )) => {
                 assert!(message.contains("no such field"), "{message}");
@@ -1663,7 +1693,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IllegalArgumentException { .. }
             ))
         ));
@@ -1687,7 +1717,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::ClassCastException { .. },
             )) => {}
             other => panic!("expected ClassCastException, got {other:?}"),
@@ -1732,7 +1762,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IllegalArgumentException { .. }
             ))
         ));
@@ -1756,7 +1786,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IllegalArgumentException { .. }
             ))
         ));
@@ -1799,7 +1829,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::IllegalArgumentException { .. }
             ))
         ));
@@ -2064,7 +2094,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            MethodCallFailed::InternalError(rustjvm_types::error::VmError::Runtime(
+            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
                 RuntimeError::NullPointerException { .. }
             ))
         ));

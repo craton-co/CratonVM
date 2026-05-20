@@ -1,4 +1,4 @@
-//! # rustjvm-jfr — Java Flight Recorder support for RustJVM
+//! # cratonvm-jfr — Java Flight Recorder support for CratonVM
 //!
 //! ## Per-thread event rings
 //!

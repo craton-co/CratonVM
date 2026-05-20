@@ -19,7 +19,7 @@
 
 use crate::class::ClassLoaderId;
 use crate::class_path::ClassPath;
-use rustjvm_types::error::ClassFileError;
+use cratonvm_types::error::ClassFileError;
 
 /// Round 5 audit fix (LOW #11) / Round 7 carry-over: the built-in
 /// loader hierarchy is fixed at process start

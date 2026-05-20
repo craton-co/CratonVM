@@ -99,9 +99,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -895,7 +895,7 @@ pub fn spawn_io_thread_with_ctx(
     // `classloading::class_manager::synthetic_field_count`):
     // `name=0, priority=1, tid=2, target=3, virtualFlag=4`.
     if vm_tid != 0 {
-        let mirror = ctx.alloc_object(rustjvm_types::ClassId::new(0), 5);
+        let mirror = ctx.alloc_object(cratonvm_types::ClassId::new(0), 5);
         let name_obj = ctx.create_string(&name);
         ctx.set_field(mirror, 0, Value::Object(Some(name_obj)));
         ctx.set_field(mirror, 2, Value::Long(vm_tid as i64));

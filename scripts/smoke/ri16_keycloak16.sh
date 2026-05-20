@@ -13,7 +13,7 @@ if [[ ! -d "$KC_DIR" ]]; then
     tar -C "$FIXTURE_CACHE" -xzf "$TGZ"
 fi
 
-SMOKE_TIMEOUT=180 smoke_run_rustjvm \
+SMOKE_TIMEOUT=180 smoke_run_cratonvm \
     --Xmx 2g \
     --jar "$KC_DIR/jboss-modules.jar" \
     -- -mp "$KC_DIR/modules" org.jboss.as.standalone "-Djboss.home.dir=$KC_DIR"

@@ -121,19 +121,16 @@ impl Recording {
                 return;
             }
         }
-        // Clone the inner up front when we are not the unique owner.
-        // `Arc::strong_count` is approximate but a `> 1` answer is reliable
-        // for "must clone": even if another ref drops between the check and
-        // `into_inner`, that races a benign single-Arc fast path. We avoid
-        // the CAS-style probe of `try_unwrap` either way.
-        let owned = if Arc::strong_count(&event) == 1 {
-            // Unique — `into_inner` succeeds without a clone.
-            Arc::into_inner(event).expect("strong_count==1 implies into_inner succeeds")
-        } else {
-            // Shared — clone the inner directly. This is the cost we pay
-            // when M recordings fan out the same event.
-            (*event).clone()
-        };
+        // Take ownership of the inner value without a TOCTOU race.
+        // `Arc::unwrap_or_clone` performs a single atomic ownership check:
+        // it moves the inner value out when this caller holds the unique
+        // Arc (the no-clone fast path), and otherwise clones the inner
+        // directly. The old code probed `strong_count` first and then
+        // `into_inner(...).expect(...)` — but another thread could clone
+        // the Arc between the check and `into_inner`, making `into_inner`
+        // return `None` and panicking on the `.expect`. `unwrap_or_clone`
+        // decides atomically, so there is no window for that race.
+        let owned: EventInstance = Arc::unwrap_or_clone(event);
         self.repository.push(owned);
     }
 

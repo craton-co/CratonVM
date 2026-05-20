@@ -102,7 +102,7 @@ impl ConstructorAccess {
     /// `setAccessible(true)` to be invoked from an arbitrary caller.
     /// The JDK's reflection layer collapses package/protected/private
     /// into "needs override" once the `caller != declaringClass`
-    /// (which is the rust-jvm reflection case — the native is invoked
+    /// (which is the cratonvm reflection case — the native is invoked
     /// by `Method.invoke` from arbitrary user code).
     pub fn requires_setaccessible(self) -> bool {
         !matches!(self, Self::Public)

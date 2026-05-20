@@ -16,11 +16,7 @@
 
 use thiserror::Error;
 
-// AUDIT 2026-05-16: `#[non_exhaustive]` — variants (e.g. `OutOfMemory`,
-// `InvalidLayout`, `StreamSync`)Z may be added as the cudarc backend
-// matures; we don't want a downstream `match` to break.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum DeviceError {
     #[error("no CUDA driver available (crate built without the `cuda` feature, or driver not installed)")]
     NoDriver,
@@ -39,12 +35,7 @@ pub enum DeviceError {
 pub type Result<T> = std::result::Result<T, DeviceError>;
 
 /// Static description of an attached GPU. Returned by [`probe`].
-///
-/// AUDIT 2026-05-16: `#[non_exhaustive]` — fields may be added (e.g.
-/// `pci_bus_id`, `multi_processor_count`, `clock_rate_khz`). Construct
-/// via this crate's APIs rather than struct literals.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct DeviceCaps {
     pub ordinal: u32,
     pub name: String,
@@ -64,49 +55,14 @@ pub struct LaunchConfig {
 impl LaunchConfig {
     /// One-dimensional launch sized to cover `n` elements with the
     /// default block size of 256 threads.
-    ///
-    /// 256 is a portable "good enough" pick — it divides cleanly into the
-    /// warp size (32) on every CUDA arch and fits in shared-memory budgets
-    /// up to Hopper. For per-kernel autotune (which can beat 256 on
-    /// register-pressure or smem-bound kernels) call
-    /// [`LaunchConfig::elementwise_for_kernel`] with the resolved
-    /// `DeviceModule` and kernel name.
     pub fn elementwise(n: u32) -> Self {
-        Self::elementwise_with_block(n, 256)
-    }
-
-    /// One-dimensional launch sized to cover `n` elements with the given
-    /// `block` size (rounded down to a positive value if zero is passed).
-    ///
-    /// Shared between [`Self::elementwise`] and the kernel-aware
-    /// [`Self::elementwise_for_kernel`] path so they agree on grid sizing.
-    pub fn elementwise_with_block(n: u32, block: u32) -> Self {
-        let block = block.max(1);
+        let block = 256u32;
         let grid = n.div_ceil(block).max(1);
         Self {
             grid: (grid, 1, 1),
             block: (block, 1, 1),
             shared_bytes: 0,
         }
-    }
-
-    /// Like [`Self::elementwise`] but queries the driver's
-    /// `cuOccupancyMaxPotentialBlockSize` (via cudarc) for the named
-    /// kernel and uses the returned block size. Falls back to 256 if the
-    /// query fails or the bridge was built without the `cuda` feature.
-    ///
-    /// Round-8 fix for the "hardcoded block=256" TODO. The autotune cost
-    /// is a single driver call at launch site; for kernels launched in
-    /// tight loops, hoist this above the loop and reuse the returned
-    /// `LaunchConfig`.
-    pub fn elementwise_for_kernel(
-        module: &DeviceModule,
-        ctx: &DeviceContext,
-        kernel: &str,
-        n: u32,
-    ) -> Self {
-        let block = module.0.optimal_block_size(&ctx.0, kernel).unwrap_or(256);
-        Self::elementwise_with_block(n, block)
     }
 }
 
@@ -116,21 +72,6 @@ impl LaunchConfig {
 /// or when the crate was built without the `cuda` feature.
 pub fn probe() -> Result<DeviceCaps> {
     backend::probe()
-}
-
-/// Number of CUDA-capable devices visible to the driver.
-///
-/// Returns `Ok(0)` when no driver is loaded or no GPU is attached, and
-/// `Err(DeviceError::Driver)` only for genuine driver errors (e.g.
-/// version mismatch). Stub builds always return `Ok(0)` so callers
-/// can branch on the count without special-casing the no-driver case.
-///
-/// Round-10 multi-GPU enumeration entry point. The current offload
-/// pipeline binds to `gpu_device_ordinal` (a single device) — this
-/// helper lets a future scheduler enumerate over `0..device_count()`
-/// to pick the least-loaded ordinal at startup.
-pub fn device_count() -> Result<u32> {
-    backend::device_count()
 }
 
 /// A CUDA context bound to one device. Cheap to clone; the underlying
@@ -144,9 +85,32 @@ impl DeviceContext {
         backend::DeviceContextInner::new(device_ordinal).map(Self)
     }
 
+    /// Probe-and-attach helper used by Phase 2 integration tests.
+    ///
+    /// Equivalent to [`DeviceContext::new(0)`][Self::new]. In stub
+    /// mode this returns `Err(DeviceError::NoDriver)`, which is the
+    /// signal `tests/stub_op_log.rs` uses to skip its body on hosts
+    /// without a driver. Named to mirror the spec wording so the
+    /// integration tests read naturally even when the underlying
+    /// backend is stubbed.
+    pub fn probe() -> Result<Self> {
+        Self::new(0)
+    }
+
     /// Synchronize: wait for all in-flight work on this context to drain.
     pub fn synchronize(&self) -> Result<()> {
         self.0.synchronize()
+    }
+
+    /// Crate-internal accessor used by `stream.rs` / `event.rs` /
+    /// `async_memcpy.rs` to reach the backend handle without exposing
+    /// it publicly. PHASE2-CUDA-TODO: today the cuda backend handle is
+    /// an opaque placeholder; once `backend_cuda.rs` is migrated to
+    /// cudarc 0.13 this is where stream/event constructors will pull
+    /// the `Arc<CudaDevice>` from.
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> &backend::DeviceContextInner {
+        &self.0
     }
 }
 
@@ -217,15 +181,6 @@ impl DeviceModule {
     /// layout must match the kernel's PTX parameter declarations
     /// exactly — the bridge does no type checking; the
     /// [`KernelArgs`] helper builds correct buffers from Rust types.
-    ///
-    /// **Sync default.** This entry point records a post-launch event on
-    /// the compute stream and makes the D→H copy stream wait on it, so a
-    /// subsequent [`DeviceBuffer::to_host`] is correctly stream-ordered
-    /// behind the kernel. Callers that know no `to_host` follows (e.g.
-    /// fire-and-forget kernels, or back-to-back launches on the compute
-    /// stream where the next launch already orders behind this one) should
-    /// prefer [`Self::launch_raw_no_sync`] to skip the event-pool
-    /// bookkeeping (~3µs of CPU-side driver overhead per launch).
     pub fn launch_raw(
         &self,
         ctx: &DeviceContext,
@@ -234,30 +189,6 @@ impl DeviceModule {
         args: KernelArgs,
     ) -> Result<()> {
         self.0.launch_raw(&ctx.0, kernel, cfg, args)
-    }
-
-    /// Launch a kernel without recording the post-launch D→H sync event.
-    ///
-    /// Use this when the caller knows no [`DeviceBuffer::to_host`] reads
-    /// the result of this launch. Skipping the event-record/wait pair
-    /// saves a cudarc per-context event-pool allocation per launch
-    /// (~3µs CPU-side), which is measurable on tight back-to-back
-    /// microkernel loops.
-    ///
-    /// **Safety contract (logical, not memory).** If a `to_host` call on
-    /// any buffer this kernel wrote runs after a launch made through
-    /// this entry point — without an intervening [`Self::launch_raw`] or
-    /// [`DeviceContext::synchronize`] — the host may read stale bytes.
-    /// The compute stream still serialises back-to-back launches on
-    /// itself, so the only failure mode is host read-back.
-    pub fn launch_raw_no_sync(
-        &self,
-        ctx: &DeviceContext,
-        kernel: &str,
-        cfg: &LaunchConfig,
-        args: KernelArgs,
-    ) -> Result<()> {
-        self.0.launch_raw_no_d2h_sync(&ctx.0, kernel, cfg, args)
     }
 }
 
@@ -348,7 +279,7 @@ pub(crate) enum KernelArg {
 /// `f32`, `f64`, `u8`, `i16`). The bridge does no bounds checking on
 /// the host side — the kernel is responsible for staying within
 /// `len()`.
-pub struct DeviceBuffer<T>(backend::DeviceBufferInner<T>);
+pub struct DeviceBuffer<T>(pub(crate) backend::DeviceBufferInner<T>);
 
 #[cfg(feature = "cuda")]
 impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBuffer<T> {
@@ -374,10 +305,38 @@ impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cud
         backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
     }
 
+    /// Allocate and upload from `host` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::from_host`] but submits the H→D copy
+    /// against an explicit [`Stream`] (Phase 2). The transfer is
+    /// recorded as a [`StreamOp::UploadAsync`] on `stream` so stub-mode
+    /// callers can inspect the op log; in `cuda` mode `record_op` is a
+    /// no-op (the driver owns the queue).
+    pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        let buf = backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)?;
+        stream.record_op(StreamOp::UploadAsync {
+            bytes: std::mem::size_of_val(host),
+        });
+        Ok(buf)
+    }
+
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
         self.0.to_host(dst)
+    }
+
+    /// Copy `len()` elements back into `dst` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::to_host`] but submits the D→H copy
+    /// against an explicit [`Stream`] (Phase 2), recorded as a
+    /// [`StreamOp::DownloadAsync`] on `stream`.
+    pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        let bytes = std::mem::size_of_val(dst);
+        self.0.to_host(dst)?;
+        stream.record_op(StreamOp::DownloadAsync { bytes });
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -406,9 +365,34 @@ impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
         backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
     }
 
+    /// Allocate and upload from `host` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::from_host`] but records the H→D copy as
+    /// a [`StreamOp::UploadAsync`] on `stream`. The op is recorded
+    /// before the (stub-mode) allocation is attempted so the op log
+    /// reflects the submitted work even though the stub backend
+    /// returns `Err(DeviceError::NoDriver)` for the allocation itself.
+    pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        stream.record_op(StreamOp::UploadAsync {
+            bytes: std::mem::size_of_val(host),
+        });
+        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+    }
+
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
+        self.0.to_host(dst)
+    }
+
+    /// Copy `len()` elements back into `dst` ordered against `stream`.
+    ///
+    /// Mirrors [`DeviceBuffer::to_host`] but records the D→H copy as a
+    /// [`StreamOp::DownloadAsync`] on `stream`.
+    pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        stream.record_op(StreamOp::DownloadAsync {
+            bytes: std::mem::size_of_val(dst),
+        });
         self.0.to_host(dst)
     }
 
@@ -433,10 +417,16 @@ mod backend_stub;
 #[cfg(not(feature = "cuda"))]
 use backend_stub as backend;
 
+pub mod event;
+pub mod launch;
+pub mod stream;
+
 // We need a trivial Pod-trait shim because cudarc requires
 // `bytemuck::Pod` for safe transfer. Re-export so callers don't have
 // to add bytemuck themselves.
 pub use bytemuck;
+pub use event::Event;
+pub use stream::{Stream, StreamOp};
 
 #[cfg(all(test, not(feature = "cuda")))]
 mod stub_tests {
@@ -462,14 +452,6 @@ mod stub_tests {
             Err(other) => panic!("expected NoDriver, got {other:?}"),
             Ok(_) => panic!("expected NoDriver, got Ok(DeviceContext)"),
         }
-    }
-
-    #[test]
-    fn device_count_returns_zero_in_stub_mode() {
-        // Round-10 multi-GPU helper: in no-driver mode we always
-        // report zero devices so callers can branch on the count
-        // without a NoDriver special-case.
-        assert_eq!(device_count().unwrap(), 0);
     }
 
     #[test]

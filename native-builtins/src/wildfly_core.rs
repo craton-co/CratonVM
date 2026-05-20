@@ -52,9 +52,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::Value;
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 use crate::jboss_msc::ServiceName;
@@ -1174,10 +1174,10 @@ fn native_exec_builder_set_keep_alive_long(
 // AFTER the bootstrap task body has run end-to-end.
 // ---------------------------------------------------------------------------
 
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ObjectRef;
 
 /// Per-EQE pending-Runnable queue. Keyed by the EQE `this` ObjectRef.
-/// `RUSTJVM_EQE_SYNC_EXECUTE=1` reverts to the Round-69 sync-on-caller
+/// `CRATONVM_EQE_SYNC_EXECUTE=1` reverts to the Round-69 sync-on-caller
 /// behaviour (escape hatch for Keycloak in case the deferral regresses it).
 static EQE_PENDING: OnceLock<Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>>> = OnceLock::new();
 
@@ -1234,7 +1234,7 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
             None => break,
         }
     }
-    if std::env::var_os("RUSTJVM_DBG_EQE").is_some() {
+    if std::env::var_os("CRATONVM_DBG_EQE").is_some() {
         eprintln!("[eqe] drained {} runnables", iterations);
     }
     let _ = iterations;
@@ -1268,7 +1268,7 @@ fn native_exec_execute(
     // Submit a bookkeeping marker so pool stats reflect activity.
     let _ = pool.submit(|| {});
 
-    if std::env::var_os("RUSTJVM_EQE_SYNC_EXECUTE").is_some() {
+    if std::env::var_os("CRATONVM_EQE_SYNC_EXECUTE").is_some() {
         // Round-69 behaviour (sync on caller). Escape hatch.
         let _ = ctx.invoke_virtual(runnable_ref, "run", "()V", &[]);
         return Ok(None);
@@ -1281,7 +1281,7 @@ fn native_exec_execute(
             Err(p) => p.into_inner(),
         };
         map.entry(this).or_insert_with(VecDeque::new).push_back(runnable_ref);
-        if std::env::var_os("RUSTJVM_DBG_EQE").is_some() {
+        if std::env::var_os("CRATONVM_DBG_EQE").is_some() {
             eprintln!("[eqe] enqueue pool={} pending_keys={}", name, map.len());
         }
     }
@@ -1377,9 +1377,9 @@ fn native_async_future_task_await(
         // result is still null. For Keycloak compatibility (which discards
         // the result regardless), keep the COMPLETE flip behind an opt-out
         // env. Default behavior remains COMPLETE-flip to avoid regressing
-        // Keycloak; set RUSTJVM_AWAIT_NO_SHORTCIRCUIT=1 to surface the real
+        // Keycloak; set CRATONVM_AWAIT_NO_SHORTCIRCUIT=1 to surface the real
         // WildFly hang (Object.wait) so it can be diagnosed.
-        if std::env::var_os("RUSTJVM_AWAIT_NO_SHORTCIRCUIT").is_some() {
+        if std::env::var_os("CRATONVM_AWAIT_NO_SHORTCIRCUIT").is_some() {
             // Return current WAITING status. AsyncFutureTask.get() loops on
             // status==WAITING calling await(); with a non-Java native we
             // would normally Object.wait() here, but the surrounding

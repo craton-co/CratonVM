@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use rustjvm_types::ClassId;
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, ObjectKind};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectKind};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Reflection metadata types
@@ -49,7 +49,7 @@ pub struct MethodMetadata {
 
 /// WP2.3 — defineClass options carried through `NativeContext::define_class_full`.
 ///
-/// Mirrors `rustjvm_classloading::DefineClassOptions` but without the
+/// Mirrors `cratonvm_classloading::DefineClassOptions` but without the
 /// crate dependency, so native-builtins can construct it without
 /// importing classloading directly. The VM's `NativeContext`
 /// implementation translates this into a `DefineClassOptions` and
@@ -123,6 +123,105 @@ fn fnv1a_hash(class: &str, method: &str, descriptor: &str, basis: u64) -> u64 {
 pub trait NativeContext {
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
+
+    /// Phase 5 escape hatch for GPU offload — dispatch the named method
+    /// asynchronously on the GPU and return the submission handle. The
+    /// default impl returns `None` (no GPU offload). The VM's
+    /// `NativeContextImpl` overrides under `#[cfg(feature = "gpu-offload")]`
+    /// to resolve `class_name`/`method_name`/`descriptor` against the
+    /// class manager, marshal `java_args` into `KernelArgs`, and call
+    /// `OffloadCache::dispatch_async`. The returned handle is what the
+    /// Java `GpuFutureImpl` wraps; pass it back to
+    /// `Native.futureSynchronize` / `Native.futureGetResult` to drive
+    /// the future.
+    ///
+    /// `java_args` follows the same convention as the JVM stack: each
+    /// `Value::Object(Some(...))` is a Java array reference, each
+    /// `Value::Int/Long/Float/Double` is a primitive scalar.
+    fn gpu_dispatch_method(
+        &mut self,
+        _class_name: &str,
+        _method_name: &str,
+        _descriptor: &str,
+        _java_args: &[Value],
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Phase 6 #4 — query the real GPU submission registry for the
+    /// future at `handle`. Returns:
+    ///   * `Some(0)` — Running
+    ///   * `Some(1)` — Completed
+    ///   * `Some(2)` — Failed
+    ///   * `None`    — the handle is not in the real registry
+    ///                 (caller should fall back to the synthetic
+    ///                 future state in native-builtins).
+    /// Default impl returns None (no GPU offload).
+    fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
+        None
+    }
+
+    /// Phase 6 #4 — block until the real GPU submission at `handle`
+    /// completes (via its recorded event). Returns:
+    ///   * `Some(Ok(()))`    — completed
+    ///   * `Some(Err(msg))`  — submission failed; `msg` carries the reason
+    ///   * `None`            — handle not in the real registry
+    /// Default impl returns None.
+    fn gpu_future_synchronize(&self, _handle: u64) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// Phase 8 #1 — evict the device-side buffer cache entry for
+    /// the given `GpuArray` handle. Called by
+    /// `Native.releaseArray` so a long-running Java program that
+    /// churns through GpuArrays doesn't accumulate device memory.
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override
+    /// calls `runtime::offload::device_cache::release(handle)`.
+    fn gpu_release_array_cache(&mut self, _handle: u64) {}
+
+    /// Phase 9 #1 — materialise the device-side buffer's contents
+    /// into host bytes if (and only if) the cache entry is dirty
+    /// from a prior kernel's writes. Returns
+    /// `Some(little-endian-bytes)` when a download happened (and
+    /// the caller should write them into the resident store
+    /// before reading the Java array), or `None` when the entry
+    /// is unknown or clean (host bytes are already current).
+    ///
+    /// Default impl returns None (no GPU offload). The VM
+    /// override calls
+    /// `runtime::offload::device_cache::download_into_bytes_if_dirty(handle)`.
+    fn gpu_array_download_if_dirty(&self, _handle: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
+    /// `GpuFunction` lambda's target method.
+    ///
+    /// When the user writes
+    ///
+    /// ```ignore
+    /// executor.submit(() -> Pipeline.vectorAdd(a, b, out));
+    /// ```
+    ///
+    /// the lambda is materialised as a proxy object whose class is
+    /// recorded in `shared.lambda_proxies`. This method looks the
+    /// proxy up and returns
+    /// `Some((target_class, target_method, target_descriptor,
+    ///        captured_values))` so the dispatcher can route through
+    /// `gpu_dispatch_method`.
+    ///
+    /// Returns `None` for any of:
+    ///   * `callable` is not a lambda proxy
+    ///   * the impl method handle is not InvokeStatic (instance
+    ///     methods cannot run on the GPU)
+    ///   * gpu-offload feature is off (default impl)
+    fn gpu_resolve_lambda_target(
+        &self,
+        _callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        None
+    }
 
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
@@ -376,7 +475,7 @@ pub trait NativeContext {
     fn ensure_class_initialized(
         &mut self,
         name: &str,
-    ) -> Result<ClassId, rustjvm_types::error::MethodCallFailed>;
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
 
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
@@ -445,16 +544,16 @@ pub trait NativeContext {
         &mut self,
         obj: ObjectRef,
         timeout_ms: Option<u64>,
-    ) -> rustjvm_types::error::MethodCallResult;
+    ) -> cratonvm_types::error::MethodCallResult;
 
     /// Perform Object.notify() on the given object's monitor.
-    fn monitor_notify(&mut self, obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn monitor_notify(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// Perform Object.notifyAll() on the given object's monitor.
-    fn monitor_notify_all(&mut self, obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn monitor_notify_all(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// Spawn a new OS thread to run Thread.run() on the given Java Thread object.
-    fn thread_start(&mut self, thread_obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn thread_start(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// T19_K2 — Register a native-spawned OS thread with the VM's
     /// `ThreadRegistry`.
@@ -582,7 +681,7 @@ pub trait NativeContext {
     }
 
     /// Block until the target thread (identified by Java Thread object) finishes.
-    fn thread_join(&mut self, thread_obj: ObjectRef) -> rustjvm_types::error::MethodCallResult;
+    fn thread_join(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
 
     /// Check if the target thread (identified by Java Thread object) is alive.
     fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool;
@@ -848,44 +947,50 @@ pub trait NativeContext {
     /// field. Returns the *previous* value (matching `AtomicInteger.getAndAdd`
     /// / `AtomicI32::fetch_add` semantics).
     ///
-    /// Default implementation is a `compare_and_swap_field` retry loop —
-    /// existing trait implementors keep working unchanged. The VM override
-    /// should map this to a single `LOCK XADD` (one trait dispatch, no
-    /// CAS spin under contention).
-    fn atomic_fetch_add_int(&mut self, obj: ObjectRef, index: usize, delta: i32) -> i32 {
+    /// Default implementation is a `compare_and_swap_field` retry loop. The
+    /// VM override should map this to a single `LOCK XADD` (one trait
+    /// dispatch, no CAS spin under contention).
+    ///
+    /// On a field-type mismatch this returns `Err(MethodCallFailed)` wrapping
+    /// an `IllegalArgumentException` rather than panicking: a panic crossing
+    /// the native/Java boundary is unsound (it may unwind through JIT-compiled
+    /// frames that are not unwind-safe).
+    fn atomic_fetch_add_int(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i32,
+    ) -> Result<i32, MethodCallFailed> {
         loop {
             let current = self.get_field_volatile(obj, index);
             // Bug 3 (CRIT type corruption): the previous default impl
             // silently fell back to old=0 for non-Int slots, then
             // CAS-wrote `Value::Int(delta)` over the existing slot —
             // corrupting both the numeric value and the field's type
-            // tag (a Long field would become Int). A type mismatch here
-            // means the caller mis-dispatched (a Long/Reference field
-            // routed through the int accessor). We must NOT `panic!` —
-            // this runs across the native boundary, where an unwind
-            // aborts the whole VM. Instead `debug_assert!` so the
-            // mis-dispatch is caught loudly in debug builds, and in
-            // release builds return the current value unchanged
-            // (no CAS write) so the corrupt-slot scenario can't happen.
-            // The Long → atomic_fetch_add_long delegation is intentionally
+            // tag (a Long field would become Int). Surface the
+            // caller's mis-dispatch as a catchable Java exception
+            // instead of panicking across the native boundary. The
+            // Long → atomic_fetch_add_long delegation is intentionally
             // NOT done here because the int-variant's i32 return type
-            // cannot losslessly carry a Long previous value; callers must
-            // route via the correct accessor.
+            // cannot losslessly carry a Long previous value; callers
+            // must route via the correct accessor.
             let old = match current {
                 Value::Int(v) => v,
                 other => {
-                    debug_assert!(
-                        false,
-                        "atomic_fetch_add_int: field {} on object is not Int: {:?} \
-                         (native dispatch bug — caller used the wrong accessor)",
-                        index, other
-                    );
-                    return 0;
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_int: field {} on object is not Int: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
                 }
             };
             let new_val = Value::Int(old.wrapping_add(delta));
             if self.compare_and_swap_field(obj, index, current, new_val) {
-                return old;
+                return Ok(old);
             }
         }
     }
@@ -893,7 +998,16 @@ pub trait NativeContext {
     /// audit-round5 fix #9 (HIGH): atomic `fetch_add` on a `long` instance
     /// field — `AtomicLong.getAndAdd` / `AtomicI64::fetch_add` analogue.
     /// See `atomic_fetch_add_int` for the default-impl rationale.
-    fn atomic_fetch_add_long(&mut self, obj: ObjectRef, index: usize, delta: i64) -> i64 {
+    ///
+    /// As with `atomic_fetch_add_int`, a field-type mismatch yields
+    /// `Err(MethodCallFailed)` (`IllegalArgumentException`) instead of a
+    /// panic that could unwind through JIT frames.
+    fn atomic_fetch_add_long(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        delta: i64,
+    ) -> Result<i64, MethodCallFailed> {
         loop {
             let current = self.get_field_volatile(obj, index);
             // Bug 3 (CRIT type corruption): refuse to silently rewrite a
@@ -908,18 +1022,20 @@ pub trait NativeContext {
             let old = match current {
                 Value::Long(v) => v,
                 other => {
-                    debug_assert!(
-                        false,
-                        "atomic_fetch_add_long: field {} on object is not Long: {:?} \
-                         (native dispatch bug — caller used the wrong accessor)",
-                        index, other
-                    );
-                    return 0;
+                    return Err(MethodCallFailed::InternalError(
+                        RuntimeError::IllegalArgumentException {
+                            message: format!(
+                                "atomic_fetch_add_long: field {} on object is not Long: {:?}",
+                                index, other
+                            ),
+                        }
+                        .into(),
+                    ));
                 }
             };
             let new_val = Value::Long(old.wrapping_add(delta));
             if self.compare_and_swap_field(obj, index, current, new_val) {
-                return old;
+                return Ok(old);
             }
         }
     }
@@ -1113,7 +1229,7 @@ pub trait NativeContext {
     fn free_native_memory(&mut self, alloc_id: i64);
 
     /// Load a native library. Returns library index or error.
-    fn load_native_library(&mut self, path: &str) -> Result<i64, rustjvm_types::error::MethodCallFailed>;
+    fn load_native_library(&mut self, path: &str) -> Result<i64, cratonvm_types::error::MethodCallFailed>;
 
     /// Find a symbol in a loaded library. Returns the symbol address.
     /// lib_index -1 means search the default/system library.

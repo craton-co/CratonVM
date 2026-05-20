@@ -254,11 +254,11 @@ pub fn dispatch(
 
 fn handle_vm_version() -> CommandResult {
     let mut pw = PayloadWriter::new();
-    pw.put_string("RustJVM JDWP Debug Server"); // description
+    pw.put_string("CratonVM JDWP Debug Server"); // description
     pw.put_u32_be(1); // jdwpMajor
     pw.put_u32_be(8); // jdwpMinor
     pw.put_string("1.8.0"); // vmVersion
-    pw.put_string("RustJVM"); // vmName
+    pw.put_string("CratonVM"); // vmName
     CommandResult::ok(pw.into_bytes())
 }
 
@@ -1537,9 +1537,9 @@ mod tests {
         let res = dispatch(CS_VM, CMD_VM_VERSION, &[], &mut st);
         assert_eq!(res.error_code, ERR_NONE);
 
-        // The payload should contain "RustJVM" somewhere.
+        // The payload should contain "CratonVM" somewhere.
         let payload = String::from_utf8_lossy(&res.data);
-        assert!(payload.contains("RustJVM"));
+        assert!(payload.contains("CratonVM"));
     }
 
     #[test]
@@ -1723,7 +1723,7 @@ mod tests {
             JdwpPacket::Reply { id, error_code, data } => {
                 assert_eq!(id, 0xCAFEBABE);
                 assert_eq!(error_code, 0);
-                assert!(String::from_utf8_lossy(&data).contains("RustJVM"));
+                assert!(String::from_utf8_lossy(&data).contains("CratonVM"));
             }
             _ => panic!("expected reply"),
         }

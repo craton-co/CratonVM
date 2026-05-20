@@ -45,9 +45,9 @@ use std::time::Duration;
 use parking_lot::RwLock;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Socket option ID constants

@@ -79,7 +79,7 @@
 
 use std::collections::HashMap;
 
-use rustjvm_types::error::ClassFileError;
+use cratonvm_types::error::ClassFileError;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -133,7 +133,7 @@ pub struct ProxyMethod {
 
 /// Emit a JVMS §4 ClassFile for the given proxy spec. Returns the raw bytes.
 ///
-/// The result is intended to be consumed by `rustjvm_reader::read_class`
+/// The result is intended to be consumed by `cratonvm_reader::read_class`
 /// (round-trip) and `ClassManager::define_class_with_options`.
 ///
 /// v3 layout: emits a `static Method m_<i>` field per `ProxyMethod`,
@@ -326,6 +326,10 @@ pub fn descriptor_param_slots(desc: &str) -> Result<Vec<DescKind>, ClassFileErro
     while i < end {
         let (kind, advanced) = parse_one_field(desc, i)?;
         out.push(kind);
+        if advanced <= i {
+            // Defensive: a non-advancing parse would loop forever.
+            break;
+        }
         i = advanced;
     }
     Ok(out)
@@ -1148,6 +1152,9 @@ fn descriptor_param_byte_at(desc: &str, j: usize) -> u8 {
             // reference types we return `L`.
             return head;
         }
+        if next <= i {
+            break;
+        }
         i = next;
         k += 1;
     }
@@ -1215,6 +1222,9 @@ fn wrapper_for_int_letter(desc: &str, j: usize) -> &'static str {
             };
         }
         let _ = kind;
+        if next <= i {
+            break;
+        }
         i = next;
         k += 1;
     }
@@ -1265,7 +1275,7 @@ fn build_method_info(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_reader::read_class;
+    use cratonvm_reader::read_class;
 
     fn supplier_spec() -> ProxyClassSpec {
         ProxyClassSpec {
@@ -1499,7 +1509,7 @@ mod tests {
     /// empty.
     #[test]
     fn emitted_class_is_straight_line_no_handlers() {
-        use rustjvm_reader::attribute::Attribute;
+        use cratonvm_reader::attribute::Attribute;
 
         let specs = vec![
             // Reference return, no params.

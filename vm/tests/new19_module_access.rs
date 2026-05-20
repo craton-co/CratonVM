@@ -26,10 +26,10 @@
 //! Prerequisites: `javac` on PATH so `build.rs` has compiled both test
 //! Java classes (`ModuleTarget.class`, `TckModule.class`).
 
-use rustjvm_vm::classloading::module::{ModuleDescriptor, UNNAMED_MODULE};
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::classloading::module::{ModuleDescriptor, UNNAMED_MODULE};
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -38,8 +38,8 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!("{dir}/rustjvm/ModuleTarget.class")).exists()
-        && std::path::Path::new(&format!("{dir}/rustjvm/TckModule.class")).exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/ModuleTarget.class")).exists()
+        && std::path::Path::new(&format!("{dir}/cratonvm/TckModule.class")).exists()
 }
 
 fn test_vm() -> Vm {
@@ -64,9 +64,9 @@ fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
     let mut cm = vm.shared.class_manager.write();
 
     // Load both test classes.
-    cm.load_class("rustjvm/ModuleTarget")
+    cm.load_class("cratonvm/ModuleTarget")
         .expect("ModuleTarget must load");
-    cm.load_class("rustjvm/TckModule")
+    cm.load_class("cratonvm/TckModule")
         .expect("TckModule must load");
 
     // Register the synthetic named module.
@@ -93,13 +93,13 @@ fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
     // unnamed. Both mutations are no-ops if the classes happen to already
     // match the expected state.
     let target_cid = cm
-        .find_class_by_name("rustjvm/ModuleTarget")
+        .find_class_by_name("cratonvm/ModuleTarget")
         .expect("ModuleTarget loaded above");
     if let Some(class) = cm.get_class_mut(target_cid) {
         class.module_name = Some("test.named".to_string());
     }
     let caller_cid = cm
-        .find_class_by_name("rustjvm/TckModule")
+        .find_class_by_name("cratonvm/TckModule")
         .expect("TckModule loaded above");
     if let Some(class) = cm.get_class_mut(caller_cid) {
         class.module_name = None;
@@ -140,8 +140,8 @@ fn new19_direct_deny_cross_module_without_opens() {
     let mut vm = test_vm();
     setup_modules(&mut vm, &[]);
 
-    let accessor_mod = module_name_of(&vm, "rustjvm/TckModule");
-    let target_mod = module_name_of(&vm, "rustjvm/ModuleTarget");
+    let accessor_mod = module_name_of(&vm, "cratonvm/TckModule");
+    let target_mod = module_name_of(&vm, "cratonvm/ModuleTarget");
     assert_eq!(
         accessor_mod, UNNAMED_MODULE,
         "TckModule must remain unnamed"
@@ -154,7 +154,7 @@ fn new19_direct_deny_cross_module_without_opens() {
     let cm = vm.shared.class_manager.read();
     let result =
         cm.module_registry
-            .check_deep_reflection_access(&accessor_mod, &target_mod, "rustjvm");
+            .check_deep_reflection_access(&accessor_mod, &target_mod, "cratonvm");
     assert!(
         result.is_err(),
         "JEP 403: unnamed accessor must be denied deep reflection into a \
@@ -166,16 +166,16 @@ fn new19_direct_deny_cross_module_without_opens() {
 fn new19_direct_allow_cross_module_with_add_opens_unqualified() {
     require_classes!();
     let mut vm = test_vm();
-    // --add-opens test.named/rustjvm=ALL-UNNAMED  (empty target = unqualified)
-    setup_modules(&mut vm, &[("test.named", "rustjvm", "")]);
+    // --add-opens test.named/cratonvm=ALL-UNNAMED  (empty target = unqualified)
+    setup_modules(&mut vm, &[("test.named", "cratonvm", "")]);
 
-    let accessor_mod = module_name_of(&vm, "rustjvm/TckModule");
-    let target_mod = module_name_of(&vm, "rustjvm/ModuleTarget");
+    let accessor_mod = module_name_of(&vm, "cratonvm/TckModule");
+    let target_mod = module_name_of(&vm, "cratonvm/ModuleTarget");
 
     let cm = vm.shared.class_manager.read();
     let result =
         cm.module_registry
-            .check_deep_reflection_access(&accessor_mod, &target_mod, "rustjvm");
+            .check_deep_reflection_access(&accessor_mod, &target_mod, "cratonvm");
     assert!(
         result.is_ok(),
         "--add-opens ...=ALL-UNNAMED must grant the deny, got {result:?}"
@@ -189,11 +189,11 @@ fn new19_direct_allow_same_module() {
     setup_modules(&mut vm, &[]);
 
     // TckModule → TckModule (same module: UNNAMED → UNNAMED).
-    let m = module_name_of(&vm, "rustjvm/TckModule");
+    let m = module_name_of(&vm, "cratonvm/TckModule");
     let cm = vm.shared.class_manager.read();
     assert!(cm
         .module_registry
-        .check_deep_reflection_access(&m, &m, "rustjvm")
+        .check_deep_reflection_access(&m, &m, "cratonvm")
         .is_ok());
 }
 
@@ -201,23 +201,23 @@ fn new19_direct_allow_same_module() {
 fn new19_direct_allow_named_accessor_with_qualified_opens() {
     require_classes!();
     let mut vm = test_vm();
-    // Give the unnamed module's rustjvm package qualified opens to a
+    // Give the unnamed module's cratonvm package qualified opens to a
     // different accessor; the TckModule → ModuleTarget edge should still
     // be denied because our accessor is unnamed, not "other.mod".
-    setup_modules(&mut vm, &[("test.named", "rustjvm", "other.mod")]);
+    setup_modules(&mut vm, &[("test.named", "cratonvm", "other.mod")]);
 
     let cm = vm.shared.class_manager.read();
     // Unnamed accessor → still denied (opens is qualified to other.mod).
     assert!(
         cm.module_registry
-            .check_deep_reflection_access(UNNAMED_MODULE, "test.named", "rustjvm")
+            .check_deep_reflection_access(UNNAMED_MODULE, "test.named", "cratonvm")
             .is_err(),
         "qualified opens to other.mod must not leak to unnamed accessor"
     );
     // other.mod accessor → allowed.
     assert!(
         cm.module_registry
-            .check_deep_reflection_access("other.mod", "test.named", "rustjvm")
+            .check_deep_reflection_access("other.mod", "test.named", "cratonvm")
             .is_ok(),
         "qualified opens must permit the named target accessor"
     );
@@ -232,7 +232,7 @@ fn new19_direct_classpath_only_mode_allows_everything() {
     let vm = test_vm();
     {
         let mut cm = vm.shared.class_manager.write();
-        cm.load_class("rustjvm/ModuleTarget")
+        cm.load_class("cratonvm/ModuleTarget")
             .expect("must load");
     }
     let cm = vm.shared.class_manager.read();
@@ -246,7 +246,7 @@ fn new19_direct_classpath_only_mode_allows_everything() {
 // ===========================================================================
 
 fn invoke_tck(vm: &mut Vm, method: &str) -> i32 {
-    match vm.invoke("rustjvm/TckModule", method, "()I", &[]) {
+    match vm.invoke("cratonvm/TckModule", method, "()I", &[]) {
         Ok(Some(Value::Int(v))) => v,
         other => panic!("TckModule::{method} — unexpected result: {other:?}"),
     }
@@ -293,7 +293,7 @@ fn new19_java_allow_self_reflection() {
 fn new19_java_add_opens_grants_field_access() {
     require_classes!();
     let mut vm = test_vm();
-    setup_modules(&mut vm, &[("test.named", "rustjvm", "")]);
+    setup_modules(&mut vm, &[("test.named", "cratonvm", "")]);
     assert_eq!(invoke_tck(&mut vm, "denySetAccessibleField"), 0);
 }
 
@@ -302,7 +302,7 @@ fn new19_java_add_opens_grants_field_access() {
 fn new19_java_add_opens_grants_method_access() {
     require_classes!();
     let mut vm = test_vm();
-    setup_modules(&mut vm, &[("test.named", "rustjvm", "")]);
+    setup_modules(&mut vm, &[("test.named", "cratonvm", "")]);
     assert_eq!(invoke_tck(&mut vm, "denySetAccessibleMethod"), 0);
 }
 
@@ -311,7 +311,7 @@ fn new19_java_add_opens_grants_method_access() {
 fn new19_java_add_opens_grants_constructor_access() {
     require_classes!();
     let mut vm = test_vm();
-    setup_modules(&mut vm, &[("test.named", "rustjvm", "")]);
+    setup_modules(&mut vm, &[("test.named", "cratonvm", "")]);
     assert_eq!(invoke_tck(&mut vm, "denySetAccessibleConstructor"), 0);
 }
 

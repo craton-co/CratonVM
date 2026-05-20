@@ -68,9 +68,9 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -501,7 +501,7 @@ fn arg_obj(args: &[Value], idx: usize) -> Option<ObjectRef> {
 
 /// Read a Class mirror argument and recover the ClassKey it represents.
 ///
-/// Class mirrors in RustJVM hold the ClassId in slot 0 (int-encoded) and
+/// Class mirrors in CratonVM hold the ClassId in slot 0 (int-encoded) and
 /// the name as a Java String in slot 1 - but the mock context doesn't
 /// wire those consistently, so we prefer the high-level accessors
 /// (`class_id_of_object` / `class_name_of_id`) when available and fall
@@ -1202,7 +1202,7 @@ fn native_injectable_bean_get_bean_class(
 mod tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     /// Test fixture - tests that touch the container singleton serialize
     /// on this mutex so one test's state doesn't leak into another.

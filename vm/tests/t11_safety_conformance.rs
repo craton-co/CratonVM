@@ -1,10 +1,10 @@
 //! T11 — Safety & Hardening conformance test suite.
 //!
-//! Verifies that RustJVM satisfies all T11 safety requirements from
+//! Verifies that CratonVM satisfies all T11 safety requirements from
 //! `docs/roadmap-100.md`.  Each test checks a specific structural or
 //! behavioral invariant rather than exercising runtime semantics.
 //!
-//!     cargo test -p rustjvm-vm --test t11_safety_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test t11_safety_conformance -- --nocapture
 
 use std::path::{Path, PathBuf};
 

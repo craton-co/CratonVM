@@ -47,7 +47,7 @@ pub mod x500;
 // of its own — exists as a compile-time module for x500.rs to depend on.
 pub mod asn1;
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 /// Wire every JCA native override needed by `DigestProbe.java`,
 /// `SigProbe.java`, and any other JDK 25 client that goes through

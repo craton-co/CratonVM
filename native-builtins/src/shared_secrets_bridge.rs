@@ -41,9 +41,9 @@
 //! * `JavaLangReflectAccess.copyMethod` / `copyField` /
 //!   `copyConstructor` — delegate to existing lang_class natives.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
@@ -82,7 +82,7 @@ const FACTORIES: &[(&str, &str, &str)] = &[
     (
         "getJavaIORandomAccessFileAccess",
         "Ljdk/internal/access/JavaIORandomAccessFileAccess;",
-        "rustjvm/internal/ss/JavaIORandomAccessFileAccess$1",
+        "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
     ),
     (
         "getJavaNetInetAddressAccess",
@@ -92,7 +92,7 @@ const FACTORIES: &[(&str, &str, &str)] = &[
     (
         "getJavaNetUriAccess",
         "Ljdk/internal/access/JavaNetUriAccess;",
-        "rustjvm/internal/ss/JavaNetUriAccess$1",
+        "cratonvm/internal/ss/JavaNetUriAccess$1",
     ),
     (
         "getJavaNioAccess",
@@ -107,7 +107,7 @@ const FACTORIES: &[(&str, &str, &str)] = &[
     (
         "getJavaUtilJarAccess",
         "Ljdk/internal/access/JavaUtilJarAccess;",
-        "rustjvm/internal/ss/JavaUtilJarAccess$1",
+        "cratonvm/internal/ss/JavaUtilJarAccess$1",
     ),
     (
         "getJavaUtilZipFileAccess",
@@ -117,7 +117,7 @@ const FACTORIES: &[(&str, &str, &str)] = &[
     (
         "getJavaNetHttpCookieAccess",
         "Ljdk/internal/access/JavaNetHttpCookieAccess;",
-        "rustjvm/internal/ss/JavaNetHttpCookieAccess$1",
+        "cratonvm/internal/ss/JavaNetHttpCookieAccess$1",
     ),
     (
         "getJavaObjectInputStreamAccess",
@@ -161,7 +161,7 @@ fn alloc_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef 
             // Class did not exist; use ClassId(0) as a placeholder —
             // the invokeinterface resolution still routes through
             // the stored class name in the native registry.
-            ctx.alloc_object(rustjvm_types::ClassId::new(0), 1)
+            ctx.alloc_object(cratonvm_types::ClassId::new(0), 1)
         }
     }
 }
@@ -177,7 +177,7 @@ fn register_factories(registry: &mut NativeMethodRegistry) {
         let full_desc = format!("(){}", ret_desc);
         let owner_name: &'static str = owner;
 
-        let cb: rustjvm_native_api::NativeCallback =
+        let cb: cratonvm_native_api::NativeCallback =
             make_factory_callback(owner_name);
         registry.register(
             "jdk/internal/access/SharedSecrets",
@@ -186,7 +186,7 @@ fn register_factories(registry: &mut NativeMethodRegistry) {
             cb,
         );
         // Legacy package alias.
-        let cb2: rustjvm_native_api::NativeCallback =
+        let cb2: cratonvm_native_api::NativeCallback =
             make_factory_callback(owner_name);
         registry.register(
             "jdk/internal/misc/SharedSecrets",
@@ -201,7 +201,7 @@ fn register_factories(registry: &mut NativeMethodRegistry) {
 /// given owner class.  Wrapping in a helper avoids closure
 /// lifetime gymnastics — `NativeCallback` is a `fn` pointer, so
 /// we dispatch through a small lookup table keyed by owner class.
-fn make_factory_callback(owner_class: &'static str) -> rustjvm_native_api::NativeCallback {
+fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::NativeCallback {
     // Because NativeCallback is a fn pointer (not a closure) we
     // can't capture `owner_class`.  Instead, encode the owner
     // via a match in a generated fn, one per entry in
@@ -225,17 +225,17 @@ fn make_factory_callback(owner_class: &'static str) -> rustjvm_native_api::Nativ
     gen_factory!(f_jioa, "java/io/Console$1");
     gen_factory!(
         f_jiorafa,
-        "rustjvm/internal/ss/JavaIORandomAccessFileAccess$1"
+        "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1"
     );
     gen_factory!(f_jniaa, "java/net/InetAddress$1");
-    gen_factory!(f_jnuri, "rustjvm/internal/ss/JavaNetUriAccess$1");
+    gen_factory!(f_jnuri, "cratonvm/internal/ss/JavaNetUriAccess$1");
     gen_factory!(f_jnio, "java/nio/Buffer$1");
     gen_factory!(f_jsec, "java/security/AccessController$1");
-    gen_factory!(f_jujar, "rustjvm/internal/ss/JavaUtilJarAccess$1");
+    gen_factory!(f_jujar, "cratonvm/internal/ss/JavaUtilJarAccess$1");
     gen_factory!(f_juzf, "java/util/zip/ZipFile$1");
     gen_factory!(
         f_jnhc,
-        "rustjvm/internal/ss/JavaNetHttpCookieAccess$1"
+        "cratonvm/internal/ss/JavaNetHttpCookieAccess$1"
     );
     gen_factory!(f_jois, "java/io/ObjectInputStream$1");
     gen_factory!(f_jurb, "java/util/ResourceBundle$1");
@@ -246,14 +246,14 @@ fn make_factory_callback(owner_class: &'static str) -> rustjvm_native_api::Nativ
         "java/lang/ref/Reference$1" => f_jlra,
         "java/lang/reflect/ReflectAccess" => f_jlrefa,
         "java/io/Console$1" => f_jioa,
-        "rustjvm/internal/ss/JavaIORandomAccessFileAccess$1" => f_jiorafa,
+        "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1" => f_jiorafa,
         "java/net/InetAddress$1" => f_jniaa,
-        "rustjvm/internal/ss/JavaNetUriAccess$1" => f_jnuri,
+        "cratonvm/internal/ss/JavaNetUriAccess$1" => f_jnuri,
         "java/nio/Buffer$1" => f_jnio,
         "java/security/AccessController$1" => f_jsec,
-        "rustjvm/internal/ss/JavaUtilJarAccess$1" => f_jujar,
+        "cratonvm/internal/ss/JavaUtilJarAccess$1" => f_jujar,
         "java/util/zip/ZipFile$1" => f_juzf,
-        "rustjvm/internal/ss/JavaNetHttpCookieAccess$1" => f_jnhc,
+        "cratonvm/internal/ss/JavaNetHttpCookieAccess$1" => f_jnhc,
         "java/io/ObjectInputStream$1" => f_jois,
         "java/util/ResourceBundle$1" => f_jurb,
         _ => panic!("SharedSecrets bridge: unknown owner class {owner_class}"),
@@ -574,7 +574,7 @@ fn jlia_make_class_value_map(
     _args: &[Value],
 ) -> MethodCallResult {
     // `makeClassValueMap()` returns a weak map keyed by Class.  We
-    // back it with a simple HashMap — rustjvm doesn't currently
+    // back it with a simple HashMap — cratonvm doesn't currently
     // have weak Class references, but the map is only used for
     // caching and the leak surface is bounded by the number of
     // loaded classes (GC eventually evicts both).
@@ -746,7 +746,7 @@ fn register_java_lang_reflect_access(registry: &mut NativeMethodRegistry) {
 // JavaIOAccess ----------------------------------------------------------------
 
 fn jioa_console(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // No attached console (rustjvm runs non-interactively by default).
+    // No attached console (cratonvm runs non-interactively by default).
     // Returning null matches HotSpot behaviour when stdin is not a tty.
     Ok(Some(Value::Object(None)))
 }
@@ -808,7 +808,7 @@ fn jiorafa_open_as_channel(
 }
 
 fn register_java_io_raf_access(registry: &mut NativeMethodRegistry) {
-    let owner = "rustjvm/internal/ss/JavaIORandomAccessFileAccess$1";
+    let owner = "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1";
     registry.register(
         owner,
         "open",
@@ -907,7 +907,7 @@ fn jnuri_create(
 }
 
 fn register_java_net_uri_access(registry: &mut NativeMethodRegistry) {
-    let owner = "rustjvm/internal/ss/JavaNetUriAccess$1";
+    let owner = "cratonvm/internal/ss/JavaNetUriAccess$1";
     registry.register(
         owner,
         "create",
@@ -1072,7 +1072,7 @@ fn jsec_do_intersection_privilege(
 ) -> MethodCallResult {
     // (PrivilegedAction action, AccessControlContext stack,
     //  AccessControlContext context) -> Object
-    // Invokes action.run() ignoring the contexts (rustjvm has no
+    // Invokes action.run() ignoring the contexts (cratonvm has no
     // real SecurityManager — AC natives already degrade to
     // "always allow").
     if let Some(Value::Object(Some(action))) = args.first() {
@@ -1100,7 +1100,7 @@ fn jsec_get_protect_domains(
         let pd = ctx.new_object("java/security/ProtectionDomain")?;
         let arr = ctx.new_ref_array(
             ctx.class_id_by_name("java/security/ProtectionDomain")
-                .unwrap_or(rustjvm_types::ClassId::new(0)),
+                .unwrap_or(cratonvm_types::ClassId::new(0)),
             1,
         );
         if let Some(Value::Object(Some(pd_ref))) = pd {
@@ -1147,7 +1147,7 @@ fn jujar_ensure_initialization(
 }
 
 fn register_java_util_jar_access(registry: &mut NativeMethodRegistry) {
-    let owner = "rustjvm/internal/ss/JavaUtilJarAccess$1";
+    let owner = "cratonvm/internal/ss/JavaUtilJarAccess$1";
     registry.register(
         owner,
         "jarFileHasClassPathAttribute",
@@ -1243,7 +1243,7 @@ fn jnhc_parse_cookie(
 }
 
 fn register_java_net_http_cookie_access(registry: &mut NativeMethodRegistry) {
-    let owner = "rustjvm/internal/ss/JavaNetHttpCookieAccess$1";
+    let owner = "cratonvm/internal/ss/JavaNetHttpCookieAccess$1";
     registry.register(
         owner,
         "parseCookie",
@@ -1259,7 +1259,7 @@ fn jois_check_array(
     _args: &[Value],
 ) -> MethodCallResult {
     // (ObjectInputStream ois, Class<?> arrayType, int length) -> void
-    // No-op: rustjvm does not impose a `maxArrayLength` limit
+    // No-op: cratonvm does not impose a `maxArrayLength` limit
     // separate from the normal heap allocator; the allocation
     // itself will surface any OOM condition.
     Ok(None)
@@ -1439,7 +1439,7 @@ mod tests {
             ),
             ("java/io/Console$1", "console", "()Ljava/io/Console;"),
             (
-                "rustjvm/internal/ss/JavaIORandomAccessFileAccess$1",
+                "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
                 "open",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/RandomAccessFile;",
             ),
@@ -1449,7 +1449,7 @@ mod tests {
                 "(Ljava/net/InetAddress;Z)Ljava/lang/String;",
             ),
             (
-                "rustjvm/internal/ss/JavaNetUriAccess$1",
+                "cratonvm/internal/ss/JavaNetUriAccess$1",
                 "create",
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/URI;",
             ),
@@ -1464,7 +1464,7 @@ mod tests {
                 "(Ljava/security/AccessControlContext;)[Ljava/security/ProtectionDomain;",
             ),
             (
-                "rustjvm/internal/ss/JavaUtilJarAccess$1",
+                "cratonvm/internal/ss/JavaUtilJarAccess$1",
                 "jarFileHasClassPathAttribute",
                 "(Ljava/util/jar/JarFile;)Z",
             ),
@@ -1474,7 +1474,7 @@ mod tests {
                 "(Ljava/util/zip/ZipEntry;)Z",
             ),
             (
-                "rustjvm/internal/ss/JavaNetHttpCookieAccess$1",
+                "cratonvm/internal/ss/JavaNetHttpCookieAccess$1",
                 "parseCookie",
                 "(Ljava/lang/String;)Ljava/util/List;",
             ),

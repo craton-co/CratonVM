@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
 use crate::lang_class::{create_constructor_object, create_method_object};
 
@@ -2233,7 +2233,7 @@ fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // --- Protocol constants ---
 
@@ -3183,8 +3183,8 @@ mod serialization_tests {
 mod wp02_tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
-    use rustjvm_native_api::{FieldMetadata, MethodMetadata};
-    use rustjvm_types::ClassId;
+    use cratonvm_native_api::{FieldMetadata, MethodMetadata};
+    use cratonvm_types::ClassId;
 
     const ACC_PUBLIC: u16 = 0x0001;
     const ACC_PROTECTED: u16 = 0x0004;

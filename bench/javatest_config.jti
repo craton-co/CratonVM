@@ -1,12 +1,12 @@
-#JavaTest Interviewer Configuration Template for RustJVM
+#JavaTest Interviewer Configuration Template for CratonVM
 #
 # This file is a template for configuring the JCK JavaTest harness to run
-# against the RustJVM vm-cli binary. Copy this file and adjust paths before
+# against the CratonVM vm-cli binary. Copy this file and adjust paths before
 # use.
 #
 # Prerequisites:
 #   - JCK downloaded under OCTLA or TCK Community License (see docs/legal.md)
-#   - RustJVM built: cargo build --release -p vm-cli
+#   - CratonVM built: cargo build --release -p vm-cli
 #   - JAVA_HOME pointing to a JDK 25 installation (for reference comparison)
 #
 # Usage:
@@ -21,11 +21,11 @@ TESTSUITE=$JCK_HOME
 
 # --- Test Platform (the VM under test) ---
 # The command to invoke the VM under test.
-# Replace /path/to/rustjvm with the actual path to the built vm-cli binary.
-TESTPLATFORM.command=/path/to/rustjvm/target/release/vm-cli
+# Replace /path/to/cratonvm with the actual path to the built vm-cli binary.
+TESTPLATFORM.command=/path/to/cratonvm/target/release/vm-cli
 
 # The display name for the platform under test.
-TESTPLATFORM.name=RustJVM
+TESTPLATFORM.name=CratonVM
 
 # --- Classpath ---
 # The JCK tests directory containing compiled test classes.

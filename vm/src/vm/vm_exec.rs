@@ -420,7 +420,7 @@ pub fn safe_native_call(
                 tracing::debug!("Native method panic (bootstrap): {}", msg);
                 if crate::runtime::env_cache::strict_swallows() {
                     tracing::error!(
-                        "RUSTJVM_STRICT_SWALLOWS=1: safe_native_call bootstrap panic: {}",
+                        "CRATONVM_STRICT_SWALLOWS=1: safe_native_call bootstrap panic: {}",
                         msg,
                     );
                     std::process::abort();
@@ -993,6 +993,175 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.heap.class_id_of(obj)
     }
 
+    /// Phase 5: override the GPU dispatch escape hatch. Delegates
+    /// to `crate::runtime::offload::dispatch_method_from_native`
+    /// when the gpu-offload feature is on; otherwise returns None
+    /// (the trait's default).
+    fn gpu_dispatch_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(crate::runtime::offload::dispatch_method_from_native(
+                self.shared,
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+            ))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (class_name, method_name, descriptor, java_args);
+            None
+        }
+    }
+
+    /// Phase 6 #4: query the real GPU submission registry.
+    fn gpu_future_status(&self, handle: u64) -> Option<i32> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            let status = sub.status.lock();
+            Some(match *status {
+                crate::runtime::offload::SubmissionStatus::Running => 0,
+                crate::runtime::offload::SubmissionStatus::Completed { .. } => 1,
+                crate::runtime::offload::SubmissionStatus::Failed { .. } => 2,
+            })
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 8 #1: evict the device-buffer cache entry for a
+    /// GpuArray handle. Called from `Native.releaseArray` when Java
+    /// drops the wrapper.
+    fn gpu_release_array_cache(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// Phase 9 #1: materialise dirty device-side bytes into a
+    /// host buffer. The caller (the `Native.arrayToHost` shim)
+    /// stamps the returned bytes into the resident store before
+    /// rebuilding the Java array. None means "no download
+    /// needed" — either the entry is unknown or already-clean.
+    fn gpu_array_download_if_dirty(&self, handle: u64) -> Option<Vec<u8>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::download_into_bytes_if_dirty(handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 6 #5 + Phase 9 #2 push 2: resolve a lambda proxy back to
+    /// its target method + captured values for GPU dispatch.
+    ///
+    /// Non-static targets (`InvokeVirtual` / `InvokeSpecial`) are
+    /// admitted when the captured-value list begins with a non-null
+    /// receiver — the receiver becomes `java_args[0]` to
+    /// [`dispatch_method_from_native`], which extracts the analyzer's
+    /// recorded `this_field_cps` from the receiver before processing
+    /// remaining captures as kernel args.
+    ///
+    /// Still rejected:
+    /// - `InvokeInterface` (no fixture today)
+    /// - `NewInvokeSpecial` (heap construction on the device — no GPU
+    ///   semantics)
+    /// - `GetField` / `PutField` / `GetStatic` / `PutStatic` method
+    ///   handles (no GPU semantics for arbitrary field access)
+    fn gpu_resolve_lambda_target(
+        &self,
+        callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::classloading::resolution::MethodHandleKind;
+            let cid = self.shared.heap.class_id_of(callable);
+            let proxies = self.shared.lambda_proxies.read();
+            let lcs = proxies.get(&cid)?;
+            // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
+            // InvokeSpecial. The analyzer's non-static relaxation
+            // means a virtual/special call's target can be admitted
+            // when its body uses the `aload_0; getfield <field>`
+            // shape; the marshaller extracts those fields from the
+            // receiver. Other handle kinds remain CPU-only.
+            let kind_admitted = matches!(
+                lcs.impl_handle.kind,
+                MethodHandleKind::InvokeStatic
+                    | MethodHandleKind::InvokeVirtual
+                    | MethodHandleKind::InvokeSpecial
+            );
+            if !kind_admitted {
+                tracing::debug!(
+                    target: "gpu.offload",
+                    handle_kind = ?lcs.impl_handle.kind,
+                    target_class = %lcs.impl_handle.class_name,
+                    target_member = %lcs.impl_handle.member_name,
+                    "lambda target rejected: handle kind has no GPU lowering",
+                );
+                return None;
+            }
+            // Merge bridge: `impl_handle` fields are `Arc<str>` in the
+            // current reader; the GPU lambda-resolver tuple is typed
+            // `String`. Convert explicitly.
+            let class_name = lcs.impl_handle.class_name.to_string();
+            let member_name = lcs.impl_handle.member_name.to_string();
+            let descriptor = lcs.impl_handle.descriptor.to_string();
+            let n_captures = lcs.capture_types.len();
+            drop(proxies);
+            let mut captures = Vec::with_capacity(n_captures);
+            for i in 0..n_captures {
+                captures.push(self.shared.heap.get_field(callable, i));
+            }
+            Some((class_name, member_name, descriptor, captures))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = callable;
+            None
+        }
+    }
+
+    /// Phase 6 #4 + Phase 7 #1: block on the GPU submission and
+    /// run its deferred writebacks. If the submission still carries
+    /// a FinalizeState (the kernel may still be running on the GPU),
+    /// this is the call that:
+    ///   1. waits on the recorded event,
+    ///   2. drains all the device-to-host writebacks,
+    ///   3. drops the SafepointToken (releases GC).
+    /// Idempotent — subsequent calls find FinalizeState already
+    /// taken and return the cached terminal status.
+    fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            Some(crate::runtime::offload::finalize_submission(self.shared, &sub))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         match self.shared.load_class_concurrent(class_name) {
             Ok(class_id) => self
@@ -1006,7 +1175,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
-        use rustjvm_types::ClassLoaderId;
+        use cratonvm_types::ClassLoaderId;
         let cm = self.shared.class_manager.read();
         match cm.get_loader_id(class_id) {
             Some(ClassLoaderId::Bootstrap) => 0,
@@ -1736,7 +1905,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .as_nanos() as u64;
             let timeout_ns = timeout_ms.map(|ms| ms as i64 * 1_000_000).unwrap_or(0);
             let mut jfr = self.shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_monitor_wait_event(
+            cratonvm_jfr::builtin::emit_monitor_wait_event(
                 &mut jfr,
                 "java/lang/Object",
                 "unknown",
@@ -1852,7 +2021,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Round-9 HIGH-5: build the Arc once and hand ownership to the
             // `_arc` variant so the emit doesn't reallocate from `&str`.
             let name_arc: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
-            rustjvm_jfr::builtin::emit_thread_start_event_arc(
+            cratonvm_jfr::builtin::emit_thread_start_event_arc(
                 &mut jfr,
                 name_arc,
                 if is_virtual { "virtual" } else { "platform" },
@@ -2020,7 +2189,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let mut jfr = shared_arc.flight_recorder.lock();
                 // Round-9 HIGH-5: prefer the `_arc` variant.
                 let name_arc: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
-                rustjvm_jfr::builtin::emit_thread_end_event_arc(
+                cratonvm_jfr::builtin::emit_thread_end_event_arc(
                     &mut jfr, name_arc, tid.0, now_ns,
                 );
             }
@@ -2201,7 +2370,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // classloader_real) rather than the synthetic one, so
                 // JDK bytecode reading ClassLoader fields by name sees
                 // valid values rather than our synthetic Int(LOADER_APP=2).
-                if let Some(loader) = rustjvm_native_builtins::classloader_real::get_or_create_system_cl(self) {
+                if let Some(loader) = cratonvm_native_builtins::classloader_real::get_or_create_system_cl(self) {
                     self.shared
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(loader)));
@@ -2324,7 +2493,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // for JFR classification — what matters is the `pin_reason` string.
         let vt_id = carrier_id;
         let mut jfr = self.shared.flight_recorder.lock();
-        rustjvm_jfr::builtin::emit_virtual_thread_pinned_event(
+        cratonvm_jfr::builtin::emit_virtual_thread_pinned_event(
             &mut jfr,
             &self.thread.name,
             reason,
@@ -2517,7 +2686,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .attributes
                     .iter()
                     .find_map(|a| match a.as_decoded() {
-                        Some(rustjvm_reader::attribute::Attribute::Exceptions {
+                        Some(cratonvm_reader::attribute::Attribute::Exceptions {
                             exception_indices,
                         }) => Some(
                             exception_indices
@@ -2565,7 +2734,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         name: &str,
         descriptor: &str,
     ) -> Option<(ClassId, u32)> {
-        use rustjvm_classloading::resolution::ResolvedMember;
+        use cratonvm_classloading::resolution::ResolvedMember;
         match self.shared.link_resolver.get(class_id, name, descriptor)? {
             ResolvedMember::Method { declaring_class_id, index } => {
                 Some((declaring_class_id, index))
@@ -2593,11 +2762,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         declaring: ClassId,
         index: u32,
     ) {
-        use rustjvm_classloading::resolution::ResolvedMember;
+        use cratonvm_classloading::resolution::ResolvedMember;
         self.shared.link_resolver.insert(
             class_id,
-            rustjvm_types::intern_arc(name),
-            rustjvm_types::intern_arc(descriptor),
+            cratonvm_types::intern_arc(name),
+            cratonvm_types::intern_arc(descriptor),
             ResolvedMember::Method {
                 declaring_class_id: declaring,
                 index,
@@ -2611,7 +2780,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         name: &str,
         descriptor: &str,
     ) -> Option<(ClassId, u32, bool)> {
-        use rustjvm_classloading::resolution::ResolvedMember;
+        use cratonvm_classloading::resolution::ResolvedMember;
         match self.shared.link_resolver.get(class_id, name, descriptor)? {
             ResolvedMember::Field { declaring_class_id, absolute_index, is_static } => {
                 Some((declaring_class_id, absolute_index, is_static))
@@ -2630,11 +2799,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         absolute_index: u32,
         is_static: bool,
     ) {
-        use rustjvm_classloading::resolution::ResolvedMember;
+        use cratonvm_classloading::resolution::ResolvedMember;
         self.shared.link_resolver.insert(
             class_id,
-            rustjvm_types::intern_arc(name),
-            rustjvm_types::intern_arc(descriptor),
+            cratonvm_types::intern_arc(name),
+            cratonvm_types::intern_arc(descriptor),
             ResolvedMember::Field {
                 declaring_class_id: declaring,
                 absolute_index,
@@ -2722,7 +2891,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     ) -> bool {
         // T19_H6: descriptor-aware CAS read+write so a long instance field
         // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
-        let is_array = self.shared.heap.kind_of(obj) == rustjvm_types::ObjectKind::Array;
+        let is_array = self.shared.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
         let class_id = self.shared.heap.class_id_of(obj);
         let descriptor = if is_array {
             None
@@ -2777,7 +2946,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .map(|c| c.name.to_string())
                     .unwrap_or_else(|| format!("cid={}", class_id.as_u32()));
                 tracing::debug!(
-                    target: "rustjvm::t19_h7_cas",
+                    target: "cratonvm::t19_h7_cas",
                     "CAS FAIL #{n} class={cn} slot={index} desc={:?} expected={:?} new={:?}",
                     descriptor.map(|b| b as char), expected, new_val,
                 );
@@ -2816,7 +2985,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let mut jfr = self.shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_virtual_thread_pinned_event(
+            cratonvm_jfr::builtin::emit_virtual_thread_pinned_event(
                 &mut jfr,
                 &self.thread.name,
                 reason,
@@ -2848,7 +3017,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .as_nanos() as u64;
             let timeout_ns = timeout.map(|d| d.as_nanos() as i64).unwrap_or(0);
             let mut jfr = self.shared.flight_recorder.lock();
-            rustjvm_jfr::builtin::emit_thread_park_event(
+            cratonvm_jfr::builtin::emit_thread_park_event(
                 &mut jfr,
                 "java/util/concurrent/locks/LockSupport",
                 timeout_ns,
@@ -3068,7 +3237,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // `java/lang/Object` here, matching the parallel logic in
             // `invoke_or_native` and `try_stackless_invoke`.
             let class_name = if self.shared.heap.kind_of(receiver)
-                == rustjvm_types::ObjectKind::Array
+                == cratonvm_types::ObjectKind::Array
             {
                 "java/lang/Object".to_string()
             } else {
@@ -3178,7 +3347,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let Some(rustjvm_reader::attribute::Attribute::Signature(s)) =
+                    if let Some(cratonvm_reader::attribute::Attribute::Signature(s)) =
                         attr.as_decoded()
                     {
                         // `s: &Arc<str>` (round 4 reader). Caller wants
@@ -3206,7 +3375,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let Some(rustjvm_reader::attribute::Attribute::MethodParameters(params)) =
+                    if let Some(cratonvm_reader::attribute::Attribute::MethodParameters(params)) =
                         attr.as_decoded()
                     {
                         // JVMS 4.7.24: name_index == 0 means an anonymous /
@@ -3241,7 +3410,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for f in &class.fields {
             if &*f.name == field_name {
                 for attr in &f.attributes {
-                    if let Some(rustjvm_reader::attribute::Attribute::Signature(s)) =
+                    if let Some(cratonvm_reader::attribute::Attribute::Signature(s)) =
                         attr.as_decoded()
                     {
                         // `s: &Arc<str>` (round 4 reader). Caller wants
@@ -3288,7 +3457,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let Some(rustjvm_reader::attribute::Attribute::AnnotationDefault(ev)) =
+                    if let Some(cratonvm_reader::attribute::Attribute::AnnotationDefault(ev)) =
                         attr.as_decoded()
                     {
                         return convert_element_value(ev, &class.constant_pool);
@@ -3314,7 +3483,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
                 for attr in &m.attributes {
-                    if let Some(rustjvm_reader::attribute::Attribute::Exceptions {
+                    if let Some(cratonvm_reader::attribute::Attribute::Exceptions {
                         exception_indices,
                     }) = attr.as_decoded()
                     {
@@ -3353,7 +3522,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn push_scoped_value_with_key(
         &mut self,
         key_id: u64,
-        key_ref: Option<rustjvm_types::ObjectRef>,
+        key_ref: Option<cratonvm_types::ObjectRef>,
         value: Value,
     ) {
         self.thread.scoped_values.push((key_id, key_ref, value));
@@ -3394,7 +3563,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Safety: JNI_OnLoad has a fixed, well-known signature.
         //
         // Windows: Apache `tcnative-*.dll` and Netty `*tcnative*.dll` often fault
-        // inside `JNI_OnLoad` / `RegisterNatives` when paired with RustJVM. We keep
+        // inside `JNI_OnLoad` / `RegisterNatives` when paired with CratonVM. We keep
         // the DLL loaded (classpath / Tomcat may probe for its presence) but skip
         // `JNI_OnLoad` — Java entry points are satisfied via Rust stubs and
         // `find_jni_native` / `resolve_jni_native_in_libraries` blocks for
@@ -3688,7 +3857,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         name: &str,
         bytes: &[u8],
     ) -> Option<ClassId> {
-        use rustjvm_types::ClassLoaderId;
+        use cratonvm_types::ClassLoaderId;
         let mut cm = self.shared.class_manager.write();
         match cm.define_class(name, bytes, ClassLoaderId::Application) {
             Ok(cid) => {
@@ -3723,8 +3892,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         stored_name: &str,
         bytes: &[u8],
     ) -> Result<ClassId, String> {
-        use rustjvm_types::ClassLoaderId;
-        use rustjvm_classloading::DefineClassOptions;
+        use cratonvm_types::ClassLoaderId;
+        use cratonvm_classloading::DefineClassOptions;
         let mut cm = self.shared.class_manager.write();
         let options = DefineClassOptions {
             override_name: Some(stored_name.to_string()),
@@ -3763,7 +3932,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         bytes: &[u8],
         loader_id: u32,
     ) -> Option<ClassId> {
-        use rustjvm_types::ClassLoaderId;
+        use cratonvm_types::ClassLoaderId;
         let mut cm = self.shared.class_manager.write();
         match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
             Ok(cid) => {
@@ -3789,7 +3958,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
-        use rustjvm_types::ClassLoaderId;
+        use cratonvm_types::ClassLoaderId;
         let cm = self.shared.class_manager.read();
         cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
     }
@@ -3799,13 +3968,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         name: &str,
         bytes: &[u8],
         loader_id: u32,
-        opts: rustjvm_native_api::DefineClassFull,
+        opts: cratonvm_native_api::DefineClassFull,
     ) -> Result<ClassId, String> {
         // WP2.3: single backend for all four entry points
         // (Unsafe.defineClass, jdk.internal.misc.Unsafe.defineClass,
         // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
-        use rustjvm_classloading::{CodeSource, DefineClassOptions};
-        use rustjvm_types::ClassLoaderId;
+        use cratonvm_classloading::{CodeSource, DefineClassOptions};
+        use cratonvm_types::ClassLoaderId;
         let cl_id = if loader_id == 0 {
             ClassLoaderId::Application
         } else {
@@ -3874,7 +4043,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // (keyed on the original ClassId) never observed a generation
         // bump.  The route below makes the in-place swap semantics
         // observable end-to-end.
-        use rustjvm_classloading::RedefineOptions;
+        use cratonvm_classloading::RedefineOptions;
         let name = {
             let cm = self.shared.class_manager.read();
             let cls = cm
@@ -3903,7 +4072,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
-        use rustjvm_types::ClassLoaderId;
+        use cratonvm_types::ClassLoaderId;
         let cl_id = if loader_id == 0 {
             ClassLoaderId::Application
         } else {
@@ -3930,7 +4099,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         referent: ObjectRef,
         queue: Option<ObjectRef>,
     ) {
-        use rustjvm_gc::ReferenceType;
+        use cratonvm_gc::ReferenceType;
         let rt = match ref_type {
             0 => ReferenceType::Weak,
             1 => ReferenceType::Soft,
@@ -3968,7 +4137,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or_default()
             .as_nanos() as u64;
         let mut jfr = self.shared.flight_recorder.lock();
-        rustjvm_jfr::builtin::emit_thread_sleep_event(
+        cratonvm_jfr::builtin::emit_thread_sleep_event(
             &mut jfr,
             sleep_nanos,
             self.thread.thread_id.0 as u64,
@@ -3984,7 +4153,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .as_nanos() as u64;
         let path = format!("fd:{}", fd);
         let mut jfr = self.shared.flight_recorder.lock();
-        rustjvm_jfr::builtin::emit_file_read_event(
+        cratonvm_jfr::builtin::emit_file_read_event(
             &mut jfr,
             &path,
             bytes_read,
@@ -4002,7 +4171,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .as_nanos() as u64;
         let path = format!("fd:{}", fd);
         let mut jfr = self.shared.flight_recorder.lock();
-        rustjvm_jfr::builtin::emit_file_write_event(
+        cratonvm_jfr::builtin::emit_file_write_event(
             &mut jfr,
             &path,
             bytes_written,
@@ -4042,10 +4211,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
 /// Extract annotation data from a list of attributes.
 pub(super) fn extract_annotations_from_attributes(
-    attributes: &[rustjvm_reader::attribute::LazyAttribute],
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
 ) -> Vec<crate::native::registry::AnnotationData> {
-    use rustjvm_reader::attribute::Attribute;
+    use cratonvm_reader::attribute::Attribute;
     let mut result = Vec::new();
     for lazy in attributes {
         let attr = match lazy.as_decoded() {
@@ -4069,10 +4238,10 @@ pub(super) fn extract_annotations_from_attributes(
 
 /// Extract parameter annotation data from a list of attributes.
 pub(super) fn extract_parameter_annotations(
-    attributes: &[rustjvm_reader::attribute::LazyAttribute],
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
 ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
-    use rustjvm_reader::attribute::Attribute;
+    use cratonvm_reader::attribute::Attribute;
     for lazy in attributes {
         let attr = match lazy.as_decoded() {
             Some(a) => a,
@@ -4098,8 +4267,8 @@ pub(super) fn extract_parameter_annotations(
 
 /// Convert a reader Annotation to our AnnotationData.
 pub(super) fn convert_annotation(
-    ann: &rustjvm_reader::attribute::Annotation,
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    ann: &cratonvm_reader::attribute::Annotation,
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
 ) -> Option<crate::native::registry::AnnotationData> {
     use crate::native::registry::AnnotationData;
     let type_desc = cp.get_utf8(ann.type_index)?.to_string();
@@ -4117,12 +4286,12 @@ pub(super) fn convert_annotation(
 
 /// Convert a reader ElementValue to our AnnotationElementValue.
 pub(super) fn convert_element_value(
-    ev: &rustjvm_reader::attribute::ElementValue,
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    ev: &cratonvm_reader::attribute::ElementValue,
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
 ) -> Option<crate::native::registry::AnnotationElementValue> {
     use crate::native::registry::AnnotationElementValue;
-    use rustjvm_reader::attribute::ElementValue;
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::attribute::ElementValue;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
     match ev {
         ElementValue::Const {
             tag,
@@ -4662,7 +4831,7 @@ fn proxy_method_set_field_by_name(
     }
 }
 
-/// S111r11 — write the RustJVM extra metadata slots on a synthetic
+/// S111r11 — write the CratonVM extra metadata slots on a synthetic
 /// proxy `Method` object so that
 /// `native-builtins/.../lang_class.rs::native_method_invoke` finds the
 /// descriptor + parameter-count when it later reflects through.
@@ -4810,7 +4979,7 @@ pub(super) fn proxy_invoke_handler(
     proxy_method_set_field_by_name(ctx.shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(ctx.shared, method_obj, "signature", Value::Object(Some(desc_str)));
     proxy_method_set_field_by_name(ctx.shared, method_obj, "slot", Value::Int(0));
-    // S111r11: also populate the RustJVM extra-slot descriptor +
+    // S111r11: also populate the CratonVM extra-slot descriptor +
     // parameter-count cache so `native_method_invoke` (which reads via
     // `read_method_descriptor`, NOT `signature`) sees a non-empty
     // descriptor when the proxy fallback path reflectively re-invokes
@@ -5207,14 +5376,14 @@ fn annotation_proxy_as_map(
                         "org/springframework/core/annotation/AnnotationAttributes",
                     )
                     .or_else(|_| shared.load_class_concurrent("java/util/LinkedHashMap"))
-                    .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+                    .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
                 shared.heap.alloc_object(cid, 4)
             }
         }
     } else {
         let cid = shared
             .load_class_concurrent("java/util/LinkedHashMap")
-            .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+            .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
         shared.heap.alloc_object(cid, 4)
     };
 
@@ -5341,10 +5510,10 @@ fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
             let n = shared.heap.array_length(obj);
             let str_cid = shared
                 .load_class_concurrent("java/lang/String")
-                .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+                .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
             let new_arr = shared.heap.alloc_array(
                 str_cid,
-                rustjvm_types::ArrayElementType::Reference,
+                cratonvm_types::ArrayElementType::Reference,
                 n,
             );
             for i in 0..n {
@@ -5437,10 +5606,10 @@ fn adapt_annotation_value_for_map(
         if any_proxy {
             let aa_cid = shared
                 .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
-                .unwrap_or_else(|_| rustjvm_types::ClassId::new(0));
+                .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
             let new_arr = shared
                 .heap
-                .alloc_array(aa_cid, rustjvm_types::ArrayElementType::Reference, len);
+                .alloc_array(aa_cid, cratonvm_types::ArrayElementType::Reference, len);
             for i in 0..len {
                 let elem = shared
                     .heap
@@ -6421,7 +6590,7 @@ fn invoke_on_class_shared_inner(
                         // during Spring Boot's `ApplicationConversionService.<clinit>`
                         // (and our minimal CR repro on `ArrayList.class`). Our
                         // native `getGenericInterfaces` parses the Signature
-                        // attribute via `rustjvm_reader::signature` and builds
+                        // attribute via `cratonvm_reader::signature` and builds
                         // synthetic `ParameterizedType` mirrors directly, so
                         // force the override and bypass the broken JDK path.
                         // GENS-1: Class.getGenericInterfaces / getGenericSuperclass
@@ -6434,7 +6603,7 @@ fn invoke_on_class_shared_inner(
                         // `ApplicationConversionService.<clinit>` (and the
                         // minimal `CR` repro on `ArrayList.class`). Our native
                         // parses the Signature attribute via
-                        // `rustjvm_reader::signature` directly and builds
+                        // `cratonvm_reader::signature` directly and builds
                         // `ParameterizedType` mirrors, so force the override and
                         // bypass the broken JDK parse path. Registered
                         // unconditionally below in
@@ -7685,7 +7854,7 @@ fn invoke_on_class_shared_inner(
                         // Tomcat `SessionIdGeneratorBase.<clinit>` calls
                         // `Security.getAlgorithms("SecureRandom")`. Real-JDK
                         // `Security` bytecode walks an incomplete provider graph
-                        // in rust-jvm; force the native registered in
+                        // in cratonvm; force the native registered in
                         // `register_essential_natives` (`native_security_get_algorithms`).
                         || (class_name == "java/security/Security"
                             && method_name == "getAlgorithms"
@@ -7861,6 +8030,79 @@ fn invoke_on_class_shared_inner(
                                 | "getShowModules"
                                 | "getModuleGraphFilename"
                                 | "getClasspath"
+                            ))
+                        // SigProbe / WP6.4 / WP6.6: real-JDK
+                        // `java.security.KeyPairGenerator.getInstance(String)`
+                        // is a concrete static that routes through
+                        // `sun.security.jca.GetInstance.getService(...)` →
+                        // `Provider.Service.newInstance(...)` and ultimately
+                        // returns a `KeyPairGenerator$Delegate` whose
+                        // `generateKeyPair` delegates to a `KeyPairGeneratorSpi`
+                        // we don't wire up. The native registered in
+                        // `native-builtins/src/jca/key_factory.rs` allocates a
+                        // synthetic KPG carrying the algorithm index and key
+                        // size in slots 0/1, but the bytecode is non-abstract
+                        // so `check_override` stays false. Force the override
+                        // for `getInstance` / `initialize` / `generateKeyPair`
+                        // / `getAlgorithm` so our natives see the receiver
+                        // they populated.
+                        || (class_name == "java/security/KeyPairGenerator"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "initialize"
+                                | "generateKeyPair"
+                                | "genKeyPair"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: same rationale as KeyPairGenerator for
+                        // `java.security.Signature` (`getInstance` returns a
+                        // `Signature$Delegate` whose SPI we don't implement).
+                        // Natives in `native-builtins/src/jca/signature.rs`.
+                        || (class_name == "java/security/Signature"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "initSign"
+                                | "initVerify"
+                                | "update"
+                                | "sign"
+                                | "verify"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: `java.security.KeyFactory.getInstance` /
+                        // `generatePublic` / `generatePrivate` — natives in
+                        // `native-builtins/src/jca/key_factory.rs`.
+                        || (class_name == "java/security/KeyFactory"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "generatePublic"
+                                | "generatePrivate"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: `java.security.KeyPair` accessors are
+                        // backed by synthetic-slot natives in key_factory.rs;
+                        // the JDK bytecode reads private fields that our
+                        // allocation path never populates.
+                        || (class_name == "java/security/KeyPair"
+                            && matches!(method_name, "getPublic" | "getPrivate"))
+                        // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
+                        // string / DER round-trip. JDK 25 routes through
+                        // `sun.security.x509.X500Name` whose parser depends
+                        // on `sun.security.util.DerInputStream` natives we
+                        // don't implement. Natives in
+                        // `native-builtins/src/jca/x500.rs` re-implement the
+                        // RFC 4514 ↔ DER round-trip directly.
+                        || (class_name == "javax/security/auth/x500/X500Principal"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getEncoded"
+                                | "getName"
+                                | "toString"
+                                | "hashCode"
+                                | "equals"
                             ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
@@ -8099,7 +8341,7 @@ fn invoke_on_class_shared_inner(
                                     cand, method_name, descriptor,
                                 ) {
                                     tracing::warn!(
-                                        target: "rustjvm_vm::dispatch::synth_rescue",
+                                        target: "cratonvm_vm::dispatch::synth_rescue",
                                         rescued_via = %cand,
                                         method = %format!("{method_name}{descriptor}"),
                                         "RECEIVER-IS-OBJECT synth rescue fired",
@@ -8398,7 +8640,7 @@ fn invoke_on_class_shared_inner(
 
         // `tcnative-*.dll` / `netty_tcnative*.dll` may RegisterNatives for Tomcat
         // `org/apache/tomcat/jni/*` or Netty `io/netty/internal/tcnative/*`. Those
-        // function pointers are not ABI-compatible with RustJVM's libffi
+        // function pointers are not ABI-compatible with CratonVM's libffi
         // `dispatch_jni_native` on Windows — using `find_jni_native` / dlsym
         // resolution here would bypass the Rust stub registry and fault with
         // 0xC0000005 during Spring Boot startup.
@@ -9302,7 +9544,7 @@ mod tests {
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
             let mut cm = shared.class_manager.write();
-            cm.ensure_synthetic_class("rustjvm/test/SyntheticStubProbe", 2)
+            cm.ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
         };
         // Sanity: that class is a stub.
         {
@@ -9333,12 +9575,12 @@ mod tests {
         shared: &SharedVm,
         class_name: &str,
         descriptors: &[&str],
-    ) -> (rustjvm_types::ClassId, usize) {
-        use rustjvm_classloading::{Class, ClassLoaderId, ClassState};
-        use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-        use rustjvm_reader::field::ClassFileField;
+    ) -> (cratonvm_types::ClassId, usize) {
+        use cratonvm_classloading::{Class, ClassLoaderId, ClassState};
+        use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::field::ClassFileField;
 
         let fields: Vec<ClassFileField> = descriptors
             .iter()
@@ -9439,7 +9681,7 @@ mod tests {
         let shared = test_shared();
         let (cid, _n) = add_real_class_with_field_descriptors(
             &shared,
-            "rustjvm/test/T19H6_LongField",
+            "cratonvm/test/T19H6_LongField",
             &["J"],
         );
         let obj = shared.heap.alloc_object(cid, 1);
@@ -9472,7 +9714,7 @@ mod tests {
         let shared = test_shared();
         let (cid, _n) = add_real_class_with_field_descriptors(
             &shared,
-            "rustjvm/test/T19H6_DoubleField",
+            "cratonvm/test/T19H6_DoubleField",
             &["D"],
         );
         let obj = shared.heap.alloc_object(cid, 1);
@@ -9500,7 +9742,7 @@ mod tests {
         let shared = test_shared();
         let (cid, _n) = add_real_class_with_field_descriptors(
             &shared,
-            "rustjvm/test/T19H6_IntField",
+            "cratonvm/test/T19H6_IntField",
             &["I"],
         );
         let obj = shared.heap.alloc_object(cid, 1);
@@ -9537,7 +9779,7 @@ mod tests {
         let shared = test_shared();
         let (cid, _n) = add_real_class_with_field_descriptors(
             &shared,
-            "rustjvm/test/T19H6_LongFieldDoubleExpected",
+            "cratonvm/test/T19H6_LongFieldDoubleExpected",
             &["J"],
         );
         let obj = shared.heap.alloc_object(cid, 1);

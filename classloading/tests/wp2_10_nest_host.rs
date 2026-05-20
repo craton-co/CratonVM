@@ -11,7 +11,7 @@
 //! The end-to-end native plumbing (via `NativeContext::nest_host_name` etc.)
 //! is exercised by `vm/tests/t13_class_conformance.rs` and the
 //! `apps/nesthost_probe` Java fixture under
-//! `cargo test -p rustjvm-vm --test wp2_10_*`.
+//! `cargo test -p cratonvm-vm --test wp2_10_*`.
 //!
 //! Background (`docs/wildfly-ejbca-roadmap.md` WP2.10):
 //! `Class.getNestHost` reflects anonymous-class relationships;
@@ -19,11 +19,11 @@
 //! `Lookup.defineHiddenClass`); `Class.forName(hiddenName)` throws
 //! `ClassNotFoundException` per JDK 25 spec.
 
-use rustjvm_classloading::{Class, ClassManager, ClassState};
-use rustjvm_reader::class_access_flags::ClassAccessFlags;
-use rustjvm_reader::class_file_version::ClassFileVersion;
-use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-use rustjvm_types::{ClassId, ClassLoaderId};
+use cratonvm_classloading::{Class, ClassManager, ClassState};
+use cratonvm_reader::class_access_flags::ClassAccessFlags;
+use cratonvm_reader::class_file_version::ClassFileVersion;
+use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+use cratonvm_types::{ClassId, ClassLoaderId};
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -220,7 +220,7 @@ fn make_minimal_class(name: &str, id: ClassId) -> Class {
     Class {
         id,
         loader_id: ClassLoaderId::Bootstrap,
-        name: rustjvm_types::intern_arc(name),
+        name: cratonvm_types::intern_arc(name),
         source_file: None,
         version: ClassFileVersion::JAVA_8,
         state: ClassState::Initialized,

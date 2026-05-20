@@ -14,7 +14,7 @@ pub enum ConstantPoolEntry {
     ///
     /// Stored as `Arc<str>` so identical UTF-8 content shares a single backing
     /// allocation across every constant pool that references it. See
-    /// [`rustjvm_types::intern_arc`] — the class-reader hot path funnels every
+    /// [`cratonvm_types::intern_arc`] — the class-reader hot path funnels every
     /// UTF-8 entry through the global string pool so the same class/method
     /// name loaded via many class files occupies memory exactly once.
     Utf8(Arc<str>),
@@ -130,7 +130,7 @@ impl ConstantPool {
     /// to hold onto the string beyond the lifetime of the constant pool
     /// should use this instead of [`get_utf8`]. No re-allocation occurs; the
     /// clone is a single refcount bump. Originates from
-    /// [`rustjvm_types::intern_arc`] at parse time.
+    /// [`cratonvm_types::intern_arc`] at parse time.
     pub fn get_utf8_arc(&self, index: u16) -> Option<Arc<str>> {
         match self.get(index) {
             Some(ConstantPoolEntry::Utf8(s)) => Some(Arc::clone(s)),

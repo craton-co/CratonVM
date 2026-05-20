@@ -44,9 +44,9 @@
 
 use std::sync::atomic::Ordering;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::obj_arg;
 
@@ -68,7 +68,7 @@ fn decode_byte_array(
     ctx: &mut dyn NativeContext,
     val: Option<&Value>,
     err_prefix: &str,
-) -> Result<Vec<u8>, rustjvm_types::error::MethodCallFailed> {
+) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
     let arr = match val {
         Some(Value::Object(Some(a))) => *a,
         Some(Value::Object(None)) => {
@@ -241,7 +241,7 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Application namespace and CGLIB's WeakCacheKey lookup misses.
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         skip_verification: true,
         code_source_url,
         ..Default::default()
@@ -319,7 +319,7 @@ fn lk_define_hidden_class_full(
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         override_name: Some(hidden_name.clone()),
         hidden: true,
         skip_verification: true,
@@ -473,7 +473,7 @@ fn lk_define_hidden_class_with_class_data(
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 
-    let opts = rustjvm_native_api::DefineClassFull {
+    let opts = cratonvm_native_api::DefineClassFull {
         override_name: Some(hidden_name.clone()),
         hidden: true,
         skip_verification: true,
@@ -539,7 +539,7 @@ fn class_data_store() -> &'static Mutex<HashMap<u32, ObjectRef>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn store_class_data(cid: rustjvm_types::ClassId, data: ObjectRef) {
+fn store_class_data(cid: cratonvm_types::ClassId, data: ObjectRef) {
     let mut g = class_data_store().lock();
     g.insert(cid.as_u32(), data);
 }
@@ -548,7 +548,7 @@ fn store_class_data(cid: rustjvm_types::ClassId, data: ObjectRef) {
 /// natives in `lang_invoke.rs` / `phases_late.rs`. Returns the stored
 /// `Object` reference for the given hidden class, or `None` if no
 /// `defineHiddenClassWithClassData` ever attached one.
-pub fn get_class_data(cid: rustjvm_types::ClassId) -> Option<ObjectRef> {
+pub fn get_class_data(cid: cratonvm_types::ClassId) -> Option<ObjectRef> {
     class_data_store()
         .lock()
         .get(&cid.as_u32())
@@ -598,7 +598,7 @@ pub fn register_lookup_define_class(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
-    use rustjvm_types::ClassId;
+    use cratonvm_types::ClassId;
 
     fn dummy_this() -> Value {
         Value::Object(None)
@@ -638,7 +638,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let lookup = ctx.alloc_object(ClassId::new(1), 4);
         // Allocate a byte[] with bad magic.
-        let bytes = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 4);
+        let bytes = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
         for i in 0..4 {
             ctx.set_array_element(bytes, i, Value::Int(0));
         }
@@ -658,7 +658,7 @@ mod tests {
         let lookup = ctx.alloc_object(ClassId::new(1), 4);
         let class_bytes = cafebabe_minimal();
         let bytes = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -682,7 +682,7 @@ mod tests {
         let lookup = ctx.alloc_object(ClassId::new(1), 4);
         let class_bytes = cafebabe_minimal();
         let bytes = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -708,7 +708,7 @@ mod tests {
         let payload = ctx.alloc_object(ClassId::new(1), 1);
         let class_bytes = cafebabe_minimal();
         let bytes = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -730,7 +730,6 @@ mod tests {
         // we can assert at least one entry exists.
         let any_entry = class_data_store()
             .lock()
-            .unwrap()
             .values()
             .any(|v| *v == payload);
         assert!(any_entry, "expected payload to be stored");
@@ -796,7 +795,7 @@ mod tests {
 
     /// Build a `ClassOption[]` array containing the given ordinals.
     fn make_options_array(ctx: &mut MockNativeContext, ordinals: &[i32]) -> ObjectRef {
-        let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, ordinals.len());
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, ordinals.len());
         for (i, ord) in ordinals.iter().enumerate() {
             let opt = make_class_option(ctx, *ord);
             ctx.set_array_element(arr, i, Value::Object(Some(opt)));
@@ -832,7 +831,7 @@ mod tests {
 
         let class_bytes = cafebabe_minimal();
         let bytes_arr = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -953,7 +952,7 @@ mod tests {
 
         let class_bytes = cafebabe_minimal();
         let bytes_arr = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -1026,7 +1025,7 @@ mod tests {
 
         let class_bytes = cafebabe_minimal();
         let bytes_arr = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -1060,7 +1059,7 @@ mod tests {
 
             let class_bytes = cafebabe_minimal();
             let bytes_arr = ctx.new_array(
-                rustjvm_types::ArrayElementType::Byte,
+                cratonvm_types::ArrayElementType::Byte,
                 class_bytes.len(),
             );
             for (i, b) in class_bytes.iter().enumerate() {
@@ -1093,7 +1092,7 @@ mod tests {
 
         let class_bytes = cafebabe_minimal();
         let bytes_arr = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {
@@ -1129,7 +1128,7 @@ mod tests {
 
         let class_bytes = cafebabe_minimal();
         let bytes_arr = ctx.new_array(
-            rustjvm_types::ArrayElementType::Byte,
+            cratonvm_types::ArrayElementType::Byte,
             class_bytes.len(),
         );
         for (i, b) in class_bytes.iter().enumerate() {

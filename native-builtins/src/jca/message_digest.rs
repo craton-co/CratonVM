@@ -32,9 +32,9 @@
 //! implementations and the `sha3` crate for SHA-3.  Verified output
 //! matches HotSpot 25.0.1 for the probe's six algorithms.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, compute_digest, obj_arg};
 
@@ -107,7 +107,7 @@ fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
 
 /// Materialise a Java byte[] populated with `bytes`.
 fn make_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
@@ -136,7 +136,7 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         .into());
     }
     if !algorithm_supported(&algo_raw) {
-        // The JDK throws NoSuchAlgorithmException; rustjvm's nearest
+        // The JDK throws NoSuchAlgorithmException; cratonvm's nearest
         // mapping is SecurityException (we don't carry NSAE).  Use an
         // illegal-argument message that spells out the bad algorithm so
         // callers see a useful trace.
@@ -284,7 +284,7 @@ fn md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 8);
     let name = ctx.create_string("SUN");
-    let info = ctx.create_string("SUN security provider (rust-jvm)");
+    let info = ctx.create_string("SUN security provider (cratonvm)");
     let ver_str = ctx.create_string("25");
     ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
     ctx.set_field_by_name(p, "version", Value::Double(25.0));

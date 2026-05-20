@@ -33,9 +33,9 @@ use std::time::Duration;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -128,11 +128,11 @@ fn shared_legacy_config() -> Arc<ClientConfig> {
 // Errors / helpers
 // ---------------------------------------------------------------------------
 
-fn ioex<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IOException { message: message.into() }.into()
 }
 
-fn iae<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IllegalArgumentException { message: message.into() }.into()
 }
 
@@ -231,7 +231,7 @@ fn build_request(
         let _ = write!(&mut out, "{k}: {v}\r\n");
     }
     if !has_user_agent {
-        out.extend_from_slice(b"User-Agent: Java/RustJVM\r\n");
+        out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
     }
     if !has_content_length && (!body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH")) {
         let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());
@@ -1194,7 +1194,7 @@ mod http_url_connection_tests {
         let s = String::from_utf8(req).unwrap();
         assert!(s.starts_with("GET /foo HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
-        assert!(s.contains("User-Agent: Java/RustJVM\r\n"));
+        assert!(s.contains("User-Agent: Java/CratonVM\r\n"));
         assert!(s.contains("Connection: close\r\n"));
     }
 
@@ -1267,8 +1267,8 @@ mod http_url_connection_tests {
     #[test]
     fn test_huc_init_sets_defaults() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 12);
-        let url_obj = ctx.alloc_object(rustjvm_types::ClassId::new(0), 1);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
+        let url_obj = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
         let url_str = ctx.create_string("http://example.com/");
         ctx.set_field(url_obj, 0, Value::Object(Some(url_str)));
         let _ = huc_init(
@@ -1283,7 +1283,7 @@ mod http_url_connection_tests {
     #[test]
     fn test_huc_set_request_method_normalizes() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 12);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
         let _ = huc_init(&mut ctx, &[Value::Object(Some(this))]);
         let post = ctx.create_string("post");
         let _ = huc_set_request_method(
@@ -1300,7 +1300,7 @@ mod http_url_connection_tests {
     #[test]
     fn test_huc_set_request_method_rejects_bogus() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 12);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
         let _ = huc_init(&mut ctx, &[Value::Object(Some(this))]);
         let bad = ctx.create_string("FROBNICATE");
         let result = huc_set_request_method(
@@ -1313,7 +1313,7 @@ mod http_url_connection_tests {
     #[test]
     fn test_huc_disconnect_clears_state() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 12);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
         let _ = huc_init(&mut ctx, &[Value::Object(Some(this))]);
         let _ = huc_disconnect(&mut ctx, &[Value::Object(Some(this))]);
         assert_eq!(ctx.get_field(this, HUC_CONN_ID), Value::Int(-1));
@@ -1324,7 +1324,7 @@ mod http_url_connection_tests {
     fn test_huc_get_response_message_known_codes() {
         // Build a fake state and run get_response_message via the pipeline.
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 12);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
         let _ = huc_init(&mut ctx, &[Value::Object(Some(this))]);
         // Cannot run ensure_connected without a real network — just exercise
         // the code-name table directly.
@@ -1347,7 +1347,7 @@ mod http_url_connection_tests {
     #[test]
     fn test_huc_set_connect_timeout_negative_rejected() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 12);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 12);
         let _ = huc_init(&mut ctx, &[Value::Object(Some(this))]);
         let res = huc_set_connect_timeout(
             &mut ctx,

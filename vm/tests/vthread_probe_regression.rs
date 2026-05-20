@@ -1,7 +1,7 @@
 //! Virtual-thread probe regression test.
 //!
 //! Pins the runtime behavior of `Thread.ofVirtual().start(...)` end-to-end
-//! through the `rustjvm.exe` CLI binary against the probes in
+//! through the `cratonvm.exe` CLI binary against the probes in
 //! `apps/vthread_probe/`:
 //!
 //!   * `Counter.java`     — 1 virtual thread incrementing an `AtomicInteger`,
@@ -18,7 +18,7 @@
 //!                          Thread.join() round-trip including the
 //!                          `Joined OK` final line.
 //!
-//! The binary path is resolved via `RUSTJVM_BIN` env var, then the cargo
+//! The binary path is resolved via `CRATONVM_BIN` env var, then the cargo
 //! `target/{release,debug}` fallback. Class files are produced on-demand via
 //! `javac --release 21` if absent. If neither the binary nor `javac` is
 //! available the test reports `skipped` rather than failing.
@@ -45,8 +45,8 @@ fn probe_classes_dir() -> PathBuf {
     probe_dir().join("classes")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -54,7 +54,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -96,7 +96,7 @@ fn ensure_probes_compiled() -> bool {
     }
 }
 
-/// Run a single probe class through the rustjvm binary. Returns
+/// Run a single probe class through the cratonvm binary. Returns
 /// `Some((stdout, stderr))` on successful spawn (regardless of exit code, so
 /// callers can examine output even when the VM exits non-zero), `None` when
 /// pre-requisites are unavailable so the caller can `return` and report skip.
@@ -107,12 +107,12 @@ fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
         );
         return None;
     }
-    let bin = match rustjvm_binary() {
+    let bin = match cratonvm_binary() {
         Some(b) => b,
         None => {
             eprintln!(
-                "[vthread_probe_regression] rustjvm binary not found; \
-                 build with `cargo build --release -p rustjvm-cli`"
+                "[vthread_probe_regression] cratonvm binary not found; \
+                 build with `cargo build --release -p cratonvm-cli`"
             );
             return None;
         }
@@ -131,7 +131,7 @@ fn run_probe(class_name: &str, timeout: Duration) -> Option<(String, String)> {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[vthread_probe_regression] failed to spawn rustjvm: {e}");
+            eprintln!("[vthread_probe_regression] failed to spawn cratonvm: {e}");
             return None;
         }
     };

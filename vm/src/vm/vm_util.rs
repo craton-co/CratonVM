@@ -5,8 +5,8 @@ use crate::classloading::{Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::Value;
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::ObjectRef;
 
 use super::SharedVm;
 
@@ -130,32 +130,6 @@ pub fn ensure_class_initialized_shared(
                 // other thread, then release LC and block the current thread
                 // until informed that the in-progress initialization has
                 // completed."
-                //
-                // BUGFIX (Spring Boot multi-thread hang): the previous
-                // implementation called `cvar.wait_for(...)` UNCONDITIONALLY
-                // without first checking the `*done` predicate. That is a
-                // textbook missed-notification race:
-                //
-                //   Thread A (initializer)         Thread B (waiter)
-                //   --                             cm.read(): state=Initializing
-                //   --                             class_init_waiters.lock(),
-                //                                     clone Arc, release
-                //   cm.write(): state=Initialized
-                //   class_init_waiters.lock(),
-                //     remove(class_id), release
-                //   waiter.lock(); *done=true;
-                //     notify_all(); drop lock
-                //   --                             waiter.lock() (uncontended)
-                //   --                             cvar.wait_for(30s)
-                //                                     ← BLOCKS FOR 30 SECONDS
-                //
-                // Because Thread B did not check `*done` before waiting, the
-                // notification fired before Thread B was parked, and the wait
-                // does not wake until the 30-second timer expires. Spring
-                // Boot's BackgroundPreinitializer + main thread can stack
-                // several of these cascading misses, easily hanging the boot
-                // for >60s. The fix is the canonical predicate-checked
-                // condvar idiom: lock, then `while !*done` wait.
                 let waiter = shared
                     .class_init_waiters
                     .lock()
@@ -167,34 +141,9 @@ pub fn ensure_class_initialized_shared(
                     // poison handling, wait_for returns a WaitTimeoutResult
                     // (no Result wrapper) since it cannot fail.
                     let mut guard = lock.lock();
-                    // Predicate-checked wait. `*guard` is the `done` flag set
-                    // by `finalize_init`. If the initializer already finished
-                    // (and dropped the lock) between our Arc-clone above and
-                    // this lock acquisition, we observe `*guard == true` and
-                    // skip the wait entirely, going straight back to the
-                    // state re-check at the top of the loop.
-                    //
-                    // The 1-second timeout is a safety net — even if the
-                    // notification is somehow missed (e.g. the waiter Arc was
-                    // removed from the map before we cloned it, but that
-                    // shouldn't be possible given the insert-before-state-
-                    // change ordering), we loop back and re-read the
-                    // ClassManager state at most once per second. This keeps
-                    // perceived latency low while still letting the wait
-                    // park the thread efficiently on the common path.
-                    while !*guard {
-                        let result = cvar.wait_for(
-                            &mut guard,
-                            std::time::Duration::from_secs(1),
-                        );
-                        if result.timed_out() {
-                            // Loop back to re-check ClassManager state.
-                            // The class may have finished initializing while
-                            // we were waiting — even on timeout we want to
-                            // re-check rather than spin.
-                            break;
-                        }
-                    }
+                    // Wait with timeout to avoid deadlock on misconfigured init
+                    let _result = cvar
+                        .wait_for(&mut guard, std::time::Duration::from_secs(30));
                     // Loop back to re-check state (might be Initialized or Error)
                     continue;
                 }
@@ -280,7 +229,7 @@ pub fn ensure_class_initialized_shared(
 #[inline]
 pub fn is_class_initialized_fast(class: &Class) -> bool {
     class.init_state.load(std::sync::atomic::Ordering::Acquire)
-        == rustjvm_classloading::CLASS_INIT_INITIALIZED
+        == cratonvm_classloading::CLASS_INIT_INITIALIZED
 }
 
 /// Round-9 vm CRIT-1 fix: convenience wrapper that takes a
@@ -548,7 +497,7 @@ fn initialize_class_shared(
             if matches!(new_state, ClassState::Initialized) {
                 cm.set_class_init_state(
                     class_id,
-                    rustjvm_classloading::CLASS_INIT_INITIALIZED,
+                    cratonvm_classloading::CLASS_INIT_INITIALIZED,
                 );
             }
         }
@@ -608,37 +557,35 @@ fn initialize_class_shared(
                 if matches!(&*class_name_for_jfr, "java/nio/file/attribute/PosixFilePermission") {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
-                // R15 (WildFly): some real-JDK / WildFly classes complete
-                // <clinit> normally yet leave a critical static field null
-                // because the metafactory-driven Stream/IntFunction lambda
-                // chain that should have populated it produced an empty
-                // result.  org/jboss/modules/Module.systemPaths is the case
-                // that crashes WildFly boot at
-                // ConcurrentClassLoader.getResources -> arraylength null.
-                // Run the fixup so it can backfill the field with an empty
-                // String[].  Idempotent: every arm checks for null before
-                // writing.
-                if matches!(&*class_name_for_jfr, "org/jboss/modules/Module") {
+                // (Removed) R15 WildFly Module.<clinit> post-success fixup.
+                // The earlier band-aid unconditionally overwrote
+                // `BOOT_MODULE_LOADER` (and conditionally backfilled
+                // `systemPaths`/`systemPackages`) after a successful
+                // `<clinit>`. Verified via instrumentation (2026-05-19) that
+                // all of those statics are populated correctly by the real
+                // JDK bytecode in `org/jboss/modules/Module.<clinit>`. The
+                // band-aid was clobbering a real AtomicReference with a
+                // fresh empty one, potentially desynchronizing module-loader
+                // state. The synthetic-stubs policy forbids this kind of
+                // overwrite; the Module arm is removed here and the matching
+                // arm in `post_clinit_fixup` for `"org/jboss/modules/Module"`
+                // is also gone.
+                //
+                // KC26: Keycloak `Profile` / `FeatureOptions` may finish
+                // <clinit> nominally, yet their lazy cache static stays
+                // null because the populating Stream pipeline drained to
+                // nothing (no-op LambdaMetafactory CallSite). Fire the
+                // fixup so the cache is pre-populated with an empty
+                // container of the matching collection type; this short-
+                // circuits the infinite-loop getter call from
+                // `Profile.getOrderedFeatures` / `FeatureOptions.getFeatureValues`.
+                // (Kept — distinct from the removed Module band-aid above.)
+                if matches!(
+                    &*class_name_for_jfr,
+                    "org/keycloak/common/Profile" | "org/keycloak/config/FeatureOptions"
+                ) {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
-                // KC26: previously we ran a post-clinit fixup that pre-
-                // populated `Profile.FEATURES` with an empty `HashMap` to
-                // avoid a (then-suspected) infinite Stream pipeline in
-                // `Profile.getOrderedFeatures`. That suspicion no longer
-                // holds — Stream/Lambda support now works, and the lazy
-                // cache populates correctly on first call. The empty-
-                // HashMap pre-fill was actively harmful: `Profile.configure`
-                // iterates `getOrderedFeatures()` (which returns the cached
-                // value when non-null) and builds the per-instance features
-                // map from it, so an empty cache yields an empty `features`
-                // map and `Profile.isFeatureEnabled(CLUSTERLESS)` NPEs on
-                // `features.get(...).booleanValue()`. Leaving `FEATURES`
-                // null after `<clinit>` (real-JDK behaviour) lets the
-                // accessor's `ifnonnull` branch populate it from the real
-                // `Feature.values()` array. Same reasoning for
-                // `FeatureOptions` — its `FEATURES`/`FEATURES_DISABLED`
-                // statics are `Option` finals, not lazy caches; no fixup
-                // is appropriate.
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -648,7 +595,7 @@ fn initialize_class_shared(
                 // Round-9 HIGH-5 fix (2026-05-17): use `_arc` to skip the
                 // per-event `Arc::from(&str)` clone — `class_name_for_jfr`
                 // is already `Arc<str>` (cloned from `Class.name`).
-                rustjvm_jfr::builtin::emit_class_load_event_arc(
+                cratonvm_jfr::builtin::emit_class_load_event_arc(
                     &mut jfr, class_name_for_jfr.clone(), "app", "app",
                     now_ns.saturating_sub(duration_ns), duration_ns,
                 );
@@ -803,7 +750,7 @@ fn initialize_class_shared(
                     // operator-visible "BigDecimal swallow" log line that the
                     // KC16 boot map calls out as a blocker simply disappears.
                     // The swallow counter is still incremented so
-                    // `RUSTJVM_STRICT_SWALLOWS=1` continues to escalate (the
+                    // `CRATONVM_STRICT_SWALLOWS=1` continues to escalate (the
                     // gate is preserved for callers actively triaging this
                     // path) and the "main() completed with N swallowed VM
                     // error(s)" tally remains accurate.
@@ -815,7 +762,7 @@ fn initialize_class_shared(
                         );
                         if crate::runtime::env_cache::strict_swallows() {
                             panic!(
-                                "RUSTJVM_STRICT_SWALLOWS=1: swallow at <clinit> [non-critical-exception]: class={} exc={}",
+                                "CRATONVM_STRICT_SWALLOWS=1: swallow at <clinit> [non-critical-exception]: class={} exc={}",
                                 class_name_for_jfr, exc_detail
                             );
                         }
@@ -1113,7 +1060,7 @@ fn initialize_class_shared(
         let mut jfr = shared.flight_recorder.lock();
         // Round-9 HIGH-5 fix (2026-05-17): use `_arc` variant — name is
         // already `Arc<str>` from `Class.name.clone()`.
-        rustjvm_jfr::builtin::emit_class_load_event_arc(
+        cratonvm_jfr::builtin::emit_class_load_event_arc(
             &mut jfr, class_name_for_jfr.clone(), "app", "app",
             now_ns.saturating_sub(duration_ns), duration_ns,
         );
@@ -1133,7 +1080,7 @@ fn initialize_class_shared(
 /// - `String`  в†’ resolves the Utf8, allocates a Java String via the VM's
 ///   string pool, and stores the reference in the slot.
 fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmError> {
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     // Gather static field info with read lock. For each static field, capture
     // the descriptor and (if present) the resolved ConstantValue: either a
@@ -1214,10 +1161,10 @@ pub fn default_value_for_descriptor(descriptor: &str) -> Value {
 
 /// Resolve a `ConstantValue` attribute index into a `Value`.
 pub fn resolve_constant_value(
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
     index: u16,
 ) -> Option<Value> {
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
     match cp.get(index)? {
         ConstantPoolEntry::Integer(v) => Some(Value::Int(*v)),
         ConstantPoolEntry::Float(v) => Some(Value::Float(*v)),
@@ -1368,115 +1315,19 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     };
 
     match class_name {
-        "org/jboss/modules/Module" => {
-            // R15 (WildFly): The static fields `systemPaths` and
-            // `systemPackages` are populated in `<clinit>` via a
-            // `Stream.toArray(String[]::new)` chain. In our VM that pipeline
-            // sometimes leaves the static slot null (the lambda metafactory
-            // for `IntFunction<String[]>` does not always produce a real
-            // typed array — investigation pending). Result: every call to
-            // `ConcurrentClassLoader.getResources` (and other system-path
-            // checks) NPEs at the leading `arraylength` instruction with
-            // `systemPaths == null`. The downstream effect is that log4j's
-            // `PropertyFilePropertySource.loadPropertiesFile` throws an NPE
-            // mid-`SimpleLoggerContext.<init>`, propagating up as
-            // ExceptionInInitializerError -> ServerLogger.<clinit> ->
-            // SystemExiter -> System.exit(1). Backfill empty arrays so the
-            // system-path scan loop in getResources/findClass produces zero
-            // hits and falls through to `findResources` / `loadClass`.
-            // This matches the production behavior on a JDK where the
-            // `jboss.modules.system.pkgs` system property is unset (the
-            // common case): both arrays end up empty.
-            let read_static = |field_name: &str| -> Option<Value> {
-                let cm = shared.class_manager.read();
-                let cls = cm.get_class(class_id)?;
-                let mut idx = 0usize;
-                for f in &cls.fields {
-                    if f.is_static() {
-                        if &*f.name == field_name {
-                            return Some(super::vm_object::get_static_shared(
-                                shared, class_id, idx,
-                            ));
-                        }
-                        idx += 1;
-                    }
-                }
-                None
-            };
-            for fname in ["systemPaths", "systemPackages"] {
-                let cur = read_static(fname);
-                let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
-                if needs_fix {
-                    let arr = shared.heap.alloc_array(
-                        ClassId::new(0),
-                        ArrayElementType::Reference,
-                        0,
-                    );
-                    if set_static_by_name(fname, Value::Object(Some(arr))) {
-                        tracing::warn!(
-                            "Post-clinit fixup: org/jboss/modules/Module.{} backfilled with empty String[]",
-                            fname
-                        );
-                    }
-                }
-            }
-            // WildFly / JBoss Modules: `MAIN_METHOD_TYPE = MethodType.methodType(...)`
-            // is a static *field initializer* that runs before the `<clinit>` block
-            // assigns `BOOT_MODULE_LOADER = new AtomicReference<>()`. If the
-            // MethodType initializer throws (common on partial `MethodHandles`
-            // support), `BOOT_MODULE_LOADER` stays null and
-            // `Module.initBootModuleLoader` dies on `BOOT_MODULE_LOADER.set(...)`.
-            let mut boot_loader_static_idx: Option<usize> = None;
-            {
-                let cm = shared.class_manager.read();
-                if let Some(cls) = cm.get_class(class_id) {
-                    let mut static_idx = 0usize;
-                    for f in &cls.fields {
-                        if f.is_static() {
-                            if &*f.name == "BOOT_MODULE_LOADER" {
-                                boot_loader_static_idx = Some(static_idx);
-                                break;
-                            }
-                            static_idx += 1;
-                        }
-                    }
-                }
-            }
-            if let Some(idx) = boot_loader_static_idx {
-                // Do not gate on `get_static_shared`: missing storage maps to
-                // `Int(0)` (see `vm_object::get_static_shared`), and a partial
-                // `<clinit>` may leave garbage. After a swallowed failure we
-                // always publish a fresh empty `AtomicReference`.
-                match shared.load_class_concurrent("java/util/concurrent/atomic/AtomicReference") {
-                    Ok(ar_id) => {
-                    if let Some(ar_obj) = shared.heap.try_alloc_object(ar_id, 1) {
-                        super::vm_object::set_static_shared(
-                            shared,
-                            class_id,
-                            idx,
-                            Value::Object(Some(ar_obj)),
-                        );
-                        tracing::warn!(
-                            "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference"
-                        );
-                    } else {
-                        tracing::warn!(
-                            "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER — try_alloc_object(AtomicReference) failed"
-                        );
-                    }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER — failed to load AtomicReference: {e:?}"
-                        );
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER — static field not found in class metadata"
-                );
-            }
-        }
+        // (Removed) "org/jboss/modules/Module" arm.
+        //
+        // Earlier this arm unconditionally overwrote `BOOT_MODULE_LOADER`
+        // (and conditionally backfilled `systemPaths`/`systemPackages`)
+        // with synthetic empty objects after a swallowed `<clinit>`.
+        // Instrumentation (see 2026-05-19 diag run) confirmed that on the
+        // current interpreter Module.<clinit> succeeds end-to-end and every
+        // one of those statics is populated with a real heap object by the
+        // JDK bytecode itself, so the synthetic backfill was both
+        // unnecessary and actively harmful (it clobbered the real
+        // `AtomicReference` published by `<clinit>`). Removed per the
+        // synthetic-stubs policy. The B6 silent-swallow path that calls
+        // this function is still in place — it is just a no-op for Module.
         "java/util/logging/LogManager" => {
             // LogManager.manager must be non-null for getLogManager()
             if let Some(mgr) = shared.heap.try_alloc_object(class_id, 4) {
@@ -2203,15 +2054,26 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
         }
-        // KC26: Keycloak `Profile`/`FeatureOptions` pre-population was
-        // removed. See the call-site comment in `init_class_with_id` for
-        // the full rationale; the short version is that the empty-cache
-        // pre-fill caused `Profile.configure` to build an empty per-
-        // instance `features` map, leading to a NPE in
-        // `Profile.isFeatureEnabled`. `keycloak_prepopulate_cache_statics`
-        // is retained below in case it's needed for a future Keycloak
-        // edition that genuinely loops on a broken Stream pipeline, but
-        // it's no longer invoked from the dispatch path.
+        // KC26: Keycloak 26 (Quarkus) — `org/keycloak/common/Profile`
+        // and `org/keycloak/config/FeatureOptions`. Both classes cache
+        // the result of a Stream pipeline in a static field. When our
+        // LambdaMetafactory produces a no-op CallSite, the lambdas
+        // (`lambda$getOrderedFeatures$2/$3`, `lambda$getFeatureValues$1`)
+        // collect into a perpetually-non-terminating source and the CLI
+        // blows past the 60s watchdog with rc=124.
+        //
+        // We pre-populate any plausibly-named static cache field with
+        // an empty container of the matching collection type (HashSet
+        // for Set descriptors, HashMap for Map descriptors, ArrayList
+        // for List descriptors). The accessor returns the cached value
+        // immediately and never enters the broken Stream pipeline. If
+        // no candidate field name matches, we log all static fields on
+        // the class so the next iteration can refine the candidate set
+        // without rebuilding. Each arm only writes a fresh value when
+        // the existing slot is null — never clobber a successful clinit.
+        "org/keycloak/common/Profile" | "org/keycloak/config/FeatureOptions" => {
+            keycloak_prepopulate_cache_statics(shared, class_id, class_name);
+        }
         "org/jboss/msc/service/ServiceLogger" => {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {
@@ -2286,7 +2148,6 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
 /// ArrayList needs `elementData` so `get(i)` doesn't trip arraylength
 /// on null; HashSet's backing `HashMap` field can stay null because
 /// Keycloak's accessor only returns the cached Set reference.
-#[allow(dead_code)] // retained for potential future Keycloak edition; see dispatch-site comment
 fn keycloak_prepopulate_cache_statics(
     shared: &SharedVm,
     class_id: ClassId,
@@ -2589,7 +2450,7 @@ mod tests {
 
     #[test]
     fn resolve_integer() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Integer(42)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Int(42)));
@@ -2597,7 +2458,7 @@ mod tests {
 
     #[test]
     fn resolve_float() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Float(1.5)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Float(1.5)));
@@ -2605,7 +2466,7 @@ mod tests {
 
     #[test]
     fn resolve_long() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Long(9999999),
@@ -2617,7 +2478,7 @@ mod tests {
 
     #[test]
     fn resolve_double() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Double(3.25),
@@ -2629,7 +2490,7 @@ mod tests {
 
     #[test]
     fn resolve_string_ref_returns_none() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![
             ConstantPoolEntry::Tombstone,
             ConstantPoolEntry::Utf8("hello".into()),
@@ -2641,7 +2502,7 @@ mod tests {
 
     #[test]
     fn resolve_out_of_bounds() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 99), None);
@@ -2649,7 +2510,7 @@ mod tests {
 
     #[test]
     fn resolve_negative_integer() {
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
         let entries = vec![ConstantPoolEntry::Tombstone, ConstantPoolEntry::Integer(-1)];
         let cp = ConstantPool::new(entries);
         assert_eq!(resolve_constant_value(&cp, 1), Some(Value::Int(-1)));
@@ -2734,11 +2595,11 @@ mod tests {
     #[test]
     fn prepare_class_shared_applies_constant_values_for_all_supported_types() {
         use crate::classloading::{Class, ClassLoaderId, ClassState};
-        use rustjvm_reader::attribute::Attribute;
-        use rustjvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
-        use rustjvm_reader::class_file_version::ClassFileVersion;
-        use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
-        use rustjvm_reader::field::ClassFileField;
+        use cratonvm_reader::attribute::Attribute;
+        use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+        use cratonvm_reader::field::ClassFileField;
 
         // Constant pool layout (1-based):
         //   #1 Integer(42)         -> for IConst
@@ -2767,7 +2628,7 @@ mod tests {
                 | FieldAccessFlags::FINAL,
             name: std::sync::Arc::from(name),
             descriptor: std::sync::Arc::from(descriptor),
-            attributes: vec![rustjvm_reader::attribute::LazyAttribute::new_decoded(
+            attributes: vec![cratonvm_reader::attribute::LazyAttribute::new_decoded(
                 Attribute::ConstantValue {
                     constant_value_index: cv_index,
                 },

@@ -24,11 +24,11 @@
 use std::sync::Arc;
 use std::thread;
 
-use rustjvm_vm::classloading::ClassId;
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::runtime::serialization::OscCache;
-use rustjvm_vm::types::ObjectRef;
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_vm::classloading::ClassId;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::runtime::serialization::OscCache;
+use cratonvm_vm::types::ObjectRef;
+use cratonvm_vm::vm::SharedVm;
 
 // ---------------------------------------------------------------------------
 // Fake ObjectRef helper

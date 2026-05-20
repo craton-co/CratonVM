@@ -5,7 +5,7 @@
 //! was `Path.getFileSystem()` abstract dispatch — these tests ensure
 //! complete coverage.
 //!
-//!     cargo test -p rustjvm-vm --test kc26_path_conformance -- --nocapture
+//!     cargo test -p cratonvm-vm --test kc26_path_conformance -- --nocapture
 
 use std::path::{Path, PathBuf};
 

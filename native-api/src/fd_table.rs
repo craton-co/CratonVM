@@ -29,8 +29,18 @@ enum FileEntry {
     UdpSocket(Mutex<std::net::UdpSocket>),
     /// TCP stream socket (SocketChannel)
     TcpStream(Mutex<std::net::TcpStream>),
-    /// TCP listener socket (ServerSocketChannel)
-    TcpListener(Mutex<std::net::TcpListener>),
+    /// TCP listener socket (ServerSocketChannel).
+    ///
+    /// The `pending` queue holds connections that have already been
+    /// `accept()`-ed off the OS backlog but not yet handed to a Java-level
+    /// `tcp_accept` caller. `poll_ready` accepts a connection to test
+    /// readiness; rather than discarding the accepted stream (which would
+    /// consume and reset a real peer connection), it stashes it here so the
+    /// next `tcp_accept` returns it instead of calling `accept()` again.
+    TcpListener {
+        listener: Mutex<std::net::TcpListener>,
+        pending: Mutex<VecDeque<(std::net::TcpStream, std::net::SocketAddr)>>,
+    },
     /// Read end of an in-memory pipe
     PipeRead(Arc<Mutex<VecDeque<u8>>>),
     /// Write end of an in-memory pipe
@@ -85,13 +95,33 @@ impl FileDescriptorTable {
         self.entries.read().get(&fd).cloned()
     }
 
-    /// Open a file for reading. Returns the fd_id.
-    pub fn open_read(&self, path: &str) -> Result<FdId, io::Error> {
-        // Reserve fd first, before opening the file
+    /// Allocate a fresh fd from the counter, guarding against wraparound.
+    ///
+    /// `Result`-returning openers (`open_read`, `open_write`, …) check the
+    /// `u32::MAX - 16` ceiling themselves and surface an `io::Error`. The
+    /// infallible `insert_*` / `open_pipe` paths cannot return an error, so
+    /// they call this helper: on a (practically unreachable, ~4-billion-fd)
+    /// overflow it aborts the process rather than letting the counter wrap
+    /// and alias the reserved stdin/stdout/stderr fds (0/1/2) — silent fd
+    /// aliasing would corrupt unrelated streams. `abort` is used instead of
+    /// `panic!` so the failure cannot unwind through JIT/native frames.
+    fn alloc_fd_or_abort(&self) -> FdId {
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            // Roll back the counter since we won't use this fd
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
+            eprintln!("fatal: file descriptor counter overflow — aborting to avoid aliasing stdin/stdout/stderr");
+            std::process::abort();
+        }
+        fd
+    }
+
+    /// Open a file for reading. Returns the fd_id.
+    pub fn open_read(&self, path: &str) -> Result<FdId, io::Error> {
+        // Reserve fd first, before opening the file.
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
+        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        if fd >= u32::MAX - 16 {
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let file = fs::File::open(path)?;
@@ -104,11 +134,12 @@ impl FileDescriptorTable {
 
     /// Open a file for writing (optionally appending). Returns the fd_id.
     pub fn open_write(&self, path: &str, append: bool) -> Result<FdId, io::Error> {
-        // Reserve fd first, before opening the file
+        // Reserve fd first, before opening the file.
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            // Roll back the counter since we won't use this fd
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let file = fs::OpenOptions::new()
@@ -659,7 +690,7 @@ impl FileDescriptorTable {
 
     /// Wrap an existing TcpStream (e.g. from accept). Returns the fd_id.
     pub fn insert_tcp_stream(&self, stream: std::net::TcpStream) -> FdId {
-        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let fd = self.alloc_fd_or_abort();
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::TcpStream(Mutex::new(stream))));
@@ -670,7 +701,7 @@ impl FileDescriptorTable {
     /// The JDK-side `FileInputStream` wrapping this fd gets bytes from the
     /// child process's standard output.
     pub fn insert_child_stdout(&self, stream: std::process::ChildStdout) -> FdId {
-        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let fd = self.alloc_fd_or_abort();
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::ChildStdoutPipe(Mutex::new(stream))));
@@ -679,7 +710,7 @@ impl FileDescriptorTable {
 
     /// WP1.12 — wrap a subprocess's `ChildStderr` pipe and return the fd_id.
     pub fn insert_child_stderr(&self, stream: std::process::ChildStderr) -> FdId {
-        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let fd = self.alloc_fd_or_abort();
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::ChildStderrPipe(Mutex::new(stream))));
@@ -689,7 +720,7 @@ impl FileDescriptorTable {
     /// WP1.12 — wrap a subprocess's `ChildStdin` pipe and return the fd_id.
     /// Writing bytes to this fd pipes them into the child's standard input.
     pub fn insert_child_stdin(&self, stream: std::process::ChildStdin) -> FdId {
-        let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let fd = self.alloc_fd_or_abort();
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::ChildStdinPipe(Mutex::new(stream))));
@@ -698,15 +729,20 @@ impl FileDescriptorTable {
 
     /// Open a TCP listener bound to the given address. Returns the fd_id.
     pub fn open_tcp_listener(&self, addr: &str) -> Result<FdId, io::Error> {
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back.
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let listener = std::net::TcpListener::bind(addr)?;
-        self.entries
-            .write()
-            .insert(fd, Arc::new(FileEntry::TcpListener(Mutex::new(listener))));
+        self.entries.write().insert(
+            fd,
+            Arc::new(FileEntry::TcpListener {
+                listener: Mutex::new(listener),
+                pending: Mutex::new(VecDeque::new()),
+            }),
+        );
         Ok(fd)
     }
 
@@ -714,8 +750,13 @@ impl FileDescriptorTable {
     pub fn tcp_accept(&self, fd: FdId) -> Result<(FdId, String), io::Error> {
         let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp accept"))?;
         match &*entry {
-            FileEntry::TcpListener(listener) => {
-                let (stream, addr) = listener.lock().accept()?;
+            FileEntry::TcpListener { listener, pending } => {
+                // Drain any connection that `poll_ready` already accepted
+                // off the OS backlog before touching the listener itself.
+                let (stream, addr) = match pending.lock().pop_front() {
+                    Some(conn) => conn,
+                    None => listener.lock().accept()?,
+                };
                 let new_fd = self.insert_tcp_stream(stream);
                 Ok((new_fd, addr.to_string()))
             }
@@ -752,7 +793,7 @@ impl FileDescriptorTable {
         let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
         match &*entry {
             FileEntry::TcpStream(stream) => stream.lock().set_nonblocking(nonblocking),
-            FileEntry::TcpListener(listener) => listener.lock().set_nonblocking(nonblocking),
+            FileEntry::TcpListener { listener, .. } => listener.lock().set_nonblocking(nonblocking),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
@@ -762,7 +803,7 @@ impl FileDescriptorTable {
         let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
         match &*entry {
             FileEntry::TcpStream(stream) => Ok(stream.lock().local_addr()?.to_string()),
-            FileEntry::TcpListener(listener) => Ok(listener.lock().local_addr()?.to_string()),
+            FileEntry::TcpListener { listener, .. } => Ok(listener.lock().local_addr()?.to_string()),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
         }
     }
@@ -813,12 +854,21 @@ impl FileDescriptorTable {
                 let _ = s.set_nonblocking(false);
                 (readable, true) // TCP streams are generally writable
             }
-            FileEntry::TcpListener(listener) => {
+            FileEntry::TcpListener { listener, pending } => {
+                // A connection already stashed by a prior poll counts as
+                // readable without touching the OS backlog.
+                if !pending.lock().is_empty() {
+                    return (true, false);
+                }
                 let l = listener.lock();
                 let _ = l.set_nonblocking(true);
                 let readable = match l.accept() {
-                    Ok((stream, _)) => {
-                        drop(stream); // we peeked; actual accept will happen later
+                    Ok((stream, addr)) => {
+                        // Don't discard the accepted connection — that would
+                        // consume a real pending peer and reset it. Stash it
+                        // so the next `tcp_accept` returns it.
+                        let _ = stream.set_nonblocking(false);
+                        pending.lock().push_back((stream, addr));
                         true
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
@@ -1005,8 +1055,8 @@ impl FileDescriptorTable {
     pub fn tcp_set_reuse_address(&self, fd: FdId, reuse: bool) -> Result<(), io::Error> {
         let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
         match &*entry {
-            FileEntry::TcpListener(l) => {
-                let listener = l.lock();
+            FileEntry::TcpListener { listener, .. } => {
+                let listener = listener.lock();
                 let sock = socket2::SockRef::from(&*listener);
                 sock.set_reuse_address(reuse)
             }
@@ -1118,8 +1168,8 @@ impl FileDescriptorTable {
     /// Create an in-memory pipe. Returns (read_fd, write_fd).
     pub fn open_pipe(&self) -> (FdId, FdId) {
         let buf = Arc::new(Mutex::new(VecDeque::with_capacity(8192)));
-        let read_fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
-        let write_fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
+        let read_fd = self.alloc_fd_or_abort();
+        let write_fd = self.alloc_fd_or_abort();
         let mut entries = self.entries.write();
         entries.insert(read_fd, Arc::new(FileEntry::PipeRead(buf.clone())));
         entries.insert(write_fd, Arc::new(FileEntry::PipeWrite(buf)));
@@ -1252,7 +1302,7 @@ mod tests {
     fn temp_file_with(content: &str) -> String {
         let id = TEST_COUNTER.fetch_add(1, AtomOrd::Relaxed);
         let dir = std::env::temp_dir();
-        let name = format!("rustjvm_fdtest_{}_{}.txt", std::process::id(), id);
+        let name = format!("cratonvm_fdtest_{}_{}.txt", std::process::id(), id);
         let path = dir.join(name);
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -1265,7 +1315,7 @@ mod tests {
     fn temp_path(suffix: &str) -> String {
         let id = TEST_COUNTER.fetch_add(1, AtomOrd::Relaxed);
         let dir = std::env::temp_dir();
-        let name = format!("rustjvm_fdtest_{}_{}_{}.txt", std::process::id(), id, suffix);
+        let name = format!("cratonvm_fdtest_{}_{}_{}.txt", std::process::id(), id, suffix);
         dir.join(name).to_string_lossy().into_owned()
     }
 
@@ -1309,7 +1359,7 @@ mod tests {
     #[test]
     fn open_read_nonexistent_file_errors() {
         let table = FileDescriptorTable::new();
-        let result = table.open_read("/tmp/rustjvm_fdtest_nonexistent_xyzzy.txt");
+        let result = table.open_read("/tmp/cratonvm_fdtest_nonexistent_xyzzy.txt");
         assert!(result.is_err());
     }
 

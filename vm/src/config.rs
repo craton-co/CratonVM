@@ -131,8 +131,8 @@ pub struct VmConfig {
     /// Aggressive JIT compilation policy.
     ///
     /// When `false` (default), the JIT static skip list applies broad
-    /// blanket bans on `java/util/`, `java/lang/`, `rustjvm/Tck*`, and
-    /// `rustjvm/*` classes — these correspond to known JIT correctness gaps
+    /// blanket bans on `java/util/`, `java/lang/`, `cratonvm/Tck*`, and
+    /// `cratonvm/*` classes — these correspond to known JIT correctness gaps
     /// (instanceof codegen, GC stack maps, hash-table-loop miscompiles).
     ///
     /// When `true`, the blanket package bans are lifted and the JIT will
@@ -222,7 +222,7 @@ pub enum AotMode {
 ///                  `sun/`, `com/sun/`). This is HotSpot's default.
 ///   - **All**    — verify boot classes too. Useful for compliance testing.
 ///
-/// rust-jvm currently runs Pass 2 (structural) on every class and Pass 3
+/// cratonvm currently runs Pass 2 (structural) on every class and Pass 3
 /// (typestate) on non-boot classes by default; selecting `All` is honoured
 /// by the verifier dispatcher in `vm/src/vm/vm_util.rs`. `None` is wired
 /// through `skip_verification` for backward compatibility with the existing
@@ -670,14 +670,14 @@ pub fn resolve_java_home_public(explicit: Option<&str>) -> Option<PathBuf> {
 ///
 /// Resolution order:
 ///   1. Explicit value passed via `--java-home` CLI flag
-///   2. `RUSTJVM_JAVA_HOME` environment variable (real JDK when `JAVA_HOME`
-///      is a rustjvm shim directory)
+///   2. `CRATONVM_JAVA_HOME` environment variable (real JDK when `JAVA_HOME`
+///      is a cratonvm shim directory)
 ///   3. `JAVA_HOME` environment variable
 ///   4. Locate `java` on PATH, then walk up to find the JDK root
 ///      (handles both `$JDK/bin/java` and symlink wrappers like
 ///       `C:\Program Files\Common Files\Oracle\Java\javapath\java.exe`).
 ///      Skips this step when the first `java` on PATH is the current
-///      executable (rustjvm masquerading as `java.exe`).
+///      executable (cratonvm masquerading as `java.exe`).
 ///
 /// Returns `None` if no valid JDK installation can be found.
 fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
@@ -693,9 +693,9 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    // 2. RUSTJVM_JAVA_HOME — used when JAVA_HOME points at a rustjvm shim
+    // 2. CRATONVM_JAVA_HOME — used when JAVA_HOME points at a cratonvm shim
     // tree (Maven, Gradle) but boot modules must come from a real JDK.
-    if let Ok(val) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(val) = std::env::var("CRATONVM_JAVA_HOME") {
         let p = PathBuf::from(val.trim());
         if p.is_dir() {
             return Some(p);
@@ -739,9 +739,9 @@ fn first_java_executable_on_path() -> Option<PathBuf> {
 }
 
 fn detect_java_home_from_path() -> Option<PathBuf> {
-    // If the first `java` on PATH is this process (e.g. rustjvm installed as
+    // If the first `java` on PATH is this process (e.g. cratonvm installed as
     // `java.exe` for Maven Surefire), probing it would recurse or yield a
-    // bogus java.home — skip and force explicit JAVA_HOME / RUSTJVM_JAVA_HOME.
+    // bogus java.home — skip and force explicit JAVA_HOME / CRATONVM_JAVA_HOME.
     if let (Ok(this), Some(first)) = (
         std::env::current_exe().and_then(|p| std::fs::canonicalize(p)),
         first_java_executable_on_path(),
@@ -1129,7 +1129,7 @@ mod tests {
     // ── Boot classpath auto-discovery integration tests ───────────────
     // These tests require a JDK installation on the host. They are ignored
     // by default so CI without a JDK doesn't fail. Run with:
-    //   cargo test -p rustjvm-vm -- --ignored
+    //   cargo test -p cratonvm-vm -- --ignored
 
     /// Helper: find a real JDK installation on this machine, or return None.
     fn find_local_jdk() -> Option<PathBuf> {

@@ -30,9 +30,9 @@
 //! fields) and return a sentinel anchor / count compatible with the
 //! real `AbstractStackWalker.Decoder` ring-buffer protocol.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry, StackTraceEntry};
-use rustjvm_types::Value;
-use rustjvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry, StackTraceEntry};
+use cratonvm_types::Value;
+use cratonvm_types::error::MethodCallResult;
 
 use crate::alloc_concurrent_synthetic;
 
@@ -67,8 +67,8 @@ const SF_DECL_INTERNAL: usize = 5;
 /// Populate a StackFrameInfo from a `StackTraceEntry`.
 fn populate_sfi(
     ctx: &mut dyn NativeContext,
-    entry: &rustjvm_native_api::StackTraceEntry,
-) -> rustjvm_types::ObjectRef {
+    entry: &cratonvm_native_api::StackTraceEntry,
+) -> cratonvm_types::ObjectRef {
     let sf = alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
     // Reuse the shared `dotted_class_name` cache (lang_class) so repeat
     // frames for the same class do not re-run `.replace('/', '.')` and
@@ -224,7 +224,7 @@ pub(crate) fn native_call_stack_walk(
     };
 
     let trace = ctx.capture_stack_trace(0);
-    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!(
             "[SW-DBG] callStackWalk capture len={} skip={} batch={}",
             trace.len(),
@@ -240,7 +240,7 @@ pub(crate) fn native_call_stack_walk(
     let capacity = if batch == 0 { slack } else { slack.min(batch) };
 
     let ordered = ordered_stack_walk_frames(&trace);
-    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!("[SW-DBG] ordered len={}", ordered.len());
         for (i, e) in ordered.iter().enumerate() {
             eprintln!("  ord[{}] {}.{}", i, e.class_name, e.method_name);
@@ -274,7 +274,7 @@ pub(crate) fn native_call_stack_walk(
     // the SpringApplication banner never fires.
     let end_index = (start_index + written) as i32;
     let _ = mode_long;
-    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!(
             "[SW-DBG] callStackWalk consumed={} written={} end_index={}",
             consumed, written, end_index
@@ -363,7 +363,7 @@ pub(crate) fn native_fetch_stack_frames(
         None => return Ok(Some(Value::Int(0))),
     };
 
-    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!(
             "[SW-DBG] fetchStackFrames parsed anchor={} start_index={}",
             anchor, start_index
@@ -373,7 +373,7 @@ pub(crate) fn native_fetch_stack_frames(
     let cursor = anchor.max(0) as usize;
     let trace = ctx.capture_stack_trace(0);
     let ordered = ordered_stack_walk_frames(&trace);
-    if std::env::var_os("RUSTJVM_DEBUG_STACKWALK").is_some() {
+    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!(
             "[SW-DBG] fetchStackFrames anchor={} start_index={} ordered_len={} trace_len={}",
             cursor,
@@ -737,7 +737,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
             if !internal.is_empty() {
-                if std::env::var_os("RUSTJVM_DEBUG_SFI").is_some()
+                if std::env::var_os("CRATONVM_DEBUG_SFI").is_some()
                     && internal.contains("InsuranceProjectApplication")
                 {
                     eprintln!(
@@ -822,7 +822,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     #[test]
     fn register_lang_stackwalker_adds_natives() {

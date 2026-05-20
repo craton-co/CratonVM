@@ -10,7 +10,7 @@ if [[ ! -d "$KC_DIR" ]]; then
     tar -C "$FIXTURE_CACHE" -xzf "$TGZ"
 fi
 
-SMOKE_TIMEOUT=300 smoke_run_rustjvm \
+SMOKE_TIMEOUT=300 smoke_run_cratonvm \
     --Xmx 2g \
     --jar "$KC_DIR/lib/quarkus-run.jar" \
     -- start-dev --http-port=0 &

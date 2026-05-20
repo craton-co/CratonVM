@@ -1,10 +1,10 @@
 //! T2.11 — Real-app smoke tests.
 //!
-//! These tests verify that RustJVM can load and partially boot real-world
+//! These tests verify that CratonVM can load and partially boot real-world
 //! Java applications. They require external JAR files and/or a JDK 25
 //! installation, so they are marked `#[ignore]` by default. Run them with:
 //!
-//!     cargo test -p rustjvm-vm --test t2_11_smoke_tests -- --ignored
+//!     cargo test -p cratonvm-vm --test t2_11_smoke_tests -- --ignored
 //!
 //! Environment variables:
 //! - `JAVA_HOME`: path to JDK 25+ installation (for jimage/modules)
@@ -18,8 +18,8 @@
 
 use std::sync::Arc;
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::vm::SharedVm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::vm::SharedVm;
 
 /// Helper: create a SharedVm with a classpath and attempt to load a class.
 /// Returns Ok(()) if class loading succeeds, Err with the failure message.

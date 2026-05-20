@@ -169,7 +169,7 @@ impl Win32Backend {
         if self.class_registered {
             return Ok(());
         }
-        let class_name = w!("RustJVMAWTWindow");
+        let class_name = w!("CratonVMAWTWindow");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
@@ -330,7 +330,7 @@ impl PlatformBackend for Win32Backend {
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
-                w!("RustJVMAWTWindow"),
+                w!("CratonVMAWTWindow"),
                 PCWSTR(tw.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
                 x,
@@ -797,8 +797,13 @@ impl PlatformBackend for Win32Backend {
                 if ptr.is_null() {
                     return None;
                 }
+                // GetClipboardData returns a borrowed handle whose buffer may
+                // be corrupt or missing the wide-char NUL terminator. Cap the
+                // scan so an un-terminated buffer is treated as truncated
+                // rather than reading unbounded out-of-bounds memory.
+                const MAX_CLIP_WCHARS: usize = 16 * 1024 * 1024;
                 let mut len = 0;
-                while *ptr.add(len) != 0 {
+                while len < MAX_CLIP_WCHARS && *ptr.add(len) != 0 {
                     len += 1;
                 }
                 let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));

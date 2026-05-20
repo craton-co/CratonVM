@@ -4,9 +4,9 @@
 //! ExceptionInInitializerError wrapping, return-from-try/catch,
 //! exception-in-finally, cross-interface exceptions, and more.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::Vm;
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::Vm;
 
 fn test_resources_dir() -> String {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -15,7 +15,7 @@ fn test_resources_dir() -> String {
 
 fn class_files_available() -> bool {
     let dir = test_resources_dir();
-    std::path::Path::new(&format!("{dir}/rustjvm/ExceptionEdgeCases.class")).exists()
+    std::path::Path::new(&format!("{dir}/cratonvm/ExceptionEdgeCases.class")).exists()
 }
 
 fn test_vm() -> Vm {
@@ -49,7 +49,7 @@ fn test_finally_on_normal_return() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testFinallyOnNormalReturn",
         "()V",
         &[],
@@ -63,7 +63,7 @@ fn test_finally_on_exception() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testFinallyOnException",
         "()V",
         &[],
@@ -77,7 +77,7 @@ fn test_exception_in_finally() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testExceptionInFinally",
         "()V",
         &[],
@@ -91,7 +91,7 @@ fn test_deep_unwinding() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testDeepUnwinding",
         "()V",
         &[],
@@ -105,7 +105,7 @@ fn test_catch_superclass() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testCatchSuperclass",
         "()V",
         &[],
@@ -119,7 +119,7 @@ fn test_first_matching_catch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testFirstMatchingCatch",
         "()V",
         &[],
@@ -133,7 +133,7 @@ fn test_return_from_try_with_finally() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testReturnFromTryWithFinally",
         "()I",
         &[],
@@ -150,7 +150,7 @@ fn test_return_from_catch_with_finally() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testReturnFromCatchWithFinally",
         "()I",
         &[],
@@ -167,7 +167,7 @@ fn test_catch_all_after_specific() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testCatchAllAfterSpecific",
         "()V",
         &[],
@@ -181,7 +181,7 @@ fn test_null_check_in_catch() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testNullCheckInCatch",
         "()V",
         &[],
@@ -195,7 +195,7 @@ fn test_rethrow_preserves_identity() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testRethrowPreservesIdentity",
         "()V",
         &[],
@@ -209,7 +209,7 @@ fn test_clinit_exception() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testClinitException",
         "()V",
         &[],
@@ -223,7 +223,7 @@ fn test_finally_in_loop() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testFinallyInLoop",
         "()V",
         &[],
@@ -237,7 +237,7 @@ fn test_chained_exceptions() {
     require_class_files!();
     let mut vm = test_vm();
     let result = vm.invoke(
-        "rustjvm/ExceptionEdgeCases",
+        "cratonvm/ExceptionEdgeCases",
         "testChainedExceptions",
         "()V",
         &[],
@@ -252,10 +252,10 @@ fn test_chained_exceptions() {
 
 #[test]
 fn test_refs_equal_same_object() {
-    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let vm = test_vm();
     let obj = vm.shared.heap.alloc_object(
-        rustjvm_vm::classloading::ClassId::new(0),
+        cratonvm_vm::classloading::ClassId::new(0),
         0,
     );
     let a = Value::Object(Some(obj));
@@ -265,14 +265,14 @@ fn test_refs_equal_same_object() {
 
 #[test]
 fn test_refs_equal_different_objects() {
-    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let vm = test_vm();
     let obj1 = vm.shared.heap.alloc_object(
-        rustjvm_vm::classloading::ClassId::new(0),
+        cratonvm_vm::classloading::ClassId::new(0),
         0,
     );
     let obj2 = vm.shared.heap.alloc_object(
-        rustjvm_vm::classloading::ClassId::new(0),
+        cratonvm_vm::classloading::ClassId::new(0),
         0,
     );
     let a = Value::Object(Some(obj1));
@@ -282,7 +282,7 @@ fn test_refs_equal_different_objects() {
 
 #[test]
 fn test_refs_equal_both_null() {
-    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let a = Value::Object(None);
     let b = Value::Object(None);
     assert!(test_refs_equal(&a, &b), "both null should be equal");
@@ -290,10 +290,10 @@ fn test_refs_equal_both_null() {
 
 #[test]
 fn test_refs_equal_null_vs_nonnull() {
-    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let vm = test_vm();
     let obj = vm.shared.heap.alloc_object(
-        rustjvm_vm::classloading::ClassId::new(0),
+        cratonvm_vm::classloading::ClassId::new(0),
         0,
     );
     let a = Value::Object(None);
@@ -304,7 +304,7 @@ fn test_refs_equal_null_vs_nonnull() {
 
 #[test]
 fn test_refs_equal_int_zero_vs_null() {
-    use rustjvm_vm::runtime::interpreter::test_refs_equal;
+    use cratonvm_vm::runtime::interpreter::test_refs_equal;
     let a = Value::Int(0);
     let b = Value::Object(None);
     assert!(test_refs_equal(&a, &b), "Int(0) should equal null in autoboxed context");

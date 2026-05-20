@@ -16,15 +16,15 @@
 //!   8. Annotation member iteration over the parsed `element_value_pairs`
 //!      preserves declaration order (the order the proxy stores them in).
 
-use rustjvm_classloading::annotations::{
+use cratonvm_classloading::annotations::{
     annotation_descriptor_to_class_name, annotation_type_matches,
     class_name_to_annotation_descriptor, field_annotations, method_annotations, AnnotationsView,
 };
-use rustjvm_reader::attribute::{
+use cratonvm_reader::attribute::{
     Annotation, ElementValue, ElementValuePair, LazyAttribute,
 };
-use rustjvm_reader::class_file::ClassFile;
-use rustjvm_reader::read_class;
+use cratonvm_reader::class_file::ClassFile;
+use cratonvm_reader::read_class;
 use std::path::PathBuf;
 
 fn load_probe_class(short_name: &str) -> Option<ClassFile> {

@@ -8,7 +8,7 @@ use crate::types::{jlong_bits_as_aligned_object_ptr, CompactTag, CompactValue, O
 // Diagnostic instrumentation (K1 stack-tag mismatch hunt).
 //
 // Compiled only in `debug_assertions` builds, and further gated at runtime by
-// RUSTJVM_DEBUG_STACK_TAG=1.  Release builds see a pure no-op stub that the
+// CRATONVM_DEBUG_STACK_TAG=1.  Release builds see a pure no-op stub that the
 // optimizer strips entirely.  The machinery remains in tree so future stack-
 // tag regressions can be diagnosed without re-deriving the harness — reverse
 // the `cfg(debug_assertions)` pair below to re-enable for release profiling.
@@ -26,7 +26,7 @@ static DIAG_INIT: std::sync::Once = std::sync::Once::new();
 #[inline(always)]
 fn stack_diag_enabled() -> bool {
     DIAG_INIT.call_once(|| {
-        if std::env::var("RUSTJVM_DEBUG_STACK_TAG").ok().as_deref() == Some("1") {
+        if std::env::var("CRATONVM_DEBUG_STACK_TAG").ok().as_deref() == Some("1") {
             DIAG_ENABLED.store(true, Ordering::Relaxed);
         }
     });
@@ -65,7 +65,7 @@ impl StackDiagCtx {
 
 /// Update the per-thread diagnostic context just before each opcode dispatch.
 /// Release builds compile to an empty function; debug builds early-return
-/// unless `RUSTJVM_DEBUG_STACK_TAG=1` is set.
+/// unless `CRATONVM_DEBUG_STACK_TAG=1` is set.
 ///
 /// SAFETY: the pointers stored here reference Arc<str> data owned by the
 /// current Frame; the Cell is only read inside the same interpreter tick
@@ -123,7 +123,7 @@ fn log_tag_mismatch(expected: &str, cv: CompactValue, stack_len: usize) {
         String::from("<unknown>")
     };
     tracing::error!(
-        target: "rustjvm_stack_tag_error",
+        target: "cratonvm_stack_tag_error",
         expected = expected,
         actual = ?cv.tag(),
         raw_bits = format!("{:#018x}", cv.to_bits()).as_str(),
@@ -531,7 +531,12 @@ impl ValueStack {
     pub fn pop_int(&mut self) -> Result<i32, RuntimeError> {
         match self.pop()? {
             Value::Int(v) => Ok(v),
-            Value::Long(v) => Ok(v as i32),
+            // A Long where an int is expected indicates a verifier/codegen
+            // bug.  Silently truncating to i32 masks the real defect, so
+            // surface it as an error instead of coercing.
+            Value::Long(_) => Err(RuntimeError::NotImplemented {
+                feature: "expected int on stack, got Long".to_string(),
+            }),
             // Coerce a null reference to zero.  Null is the only safe
             // conversion — an actual object pointer must NOT be treated as
             // an int, since downstream code often branches on bitwise

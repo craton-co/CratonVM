@@ -11,7 +11,7 @@
 //! pc=29 is `this.engineDescription = knownEngines.get(type);` in OpenJDK
 //! 21+ bytecode. `knownEngines` is null because the inner-class clinit
 //! chain (`Provider$ServiceKey` / `EngineDescription`) doesn't fully wire
-//! under rust-jvm's real-JDK class loading. The fix in
+//! under cratonvm's real-JDK class loading. The fix in
 //! `native-builtins/src/jca/provider_chain.rs` registers a native
 //! `<init>` shim that copies the six argument references straight into
 //! the receiver fields (bypassing the bytecode entirely) plus
@@ -28,14 +28,14 @@
 //! ## Acceptance
 //!
 //! - All four pins below pass.
-//! - `cargo test --release -p rustjvm-vm --test wp2_5_proxy` still 21/21.
+//! - `cargo test --release -p cratonvm-vm --test wp2_5_proxy` still 21/21.
 //!
 //! Run:
 //! ```
-//! cargo test --release -p rustjvm-vm --test wp6_5_provider_service_init
+//! cargo test --release -p cratonvm-vm --test wp6_5_provider_service_init
 //! ```
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 /// Pin 1: the `<init>` native is registered on the exact JDK 21+
 /// 6-arg descriptor that BouncyCastle's `addAlgorithm` chain reaches
@@ -45,7 +45,7 @@ use rustjvm_native_api::NativeMethodRegistry;
 #[test]
 fn wp6_5_provider_service_init_registered_via_jca() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     let cb = r.find(
         "java/security/Provider$Service",
@@ -70,7 +70,7 @@ fn wp6_5_provider_service_init_registered_via_jca() {
 #[test]
 fn wp6_5_inner_class_clinits_registered_via_jca() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     assert!(
         r.find(
@@ -101,9 +101,9 @@ fn wp6_5_inner_class_clinits_registered_via_jca() {
 #[test]
 fn wp6_5_double_register_does_not_panic() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
     let count_after_first = r.len();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
     assert_eq!(
         r.len(),
         count_after_first,
@@ -134,7 +134,7 @@ fn wp6_5_double_register_does_not_panic() {
 #[test]
 fn wp6_5_provider_service_and_security_addprovider_coexist() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::jca::register_jca_natives(&mut r);
+    cratonvm_native_builtins::jca::register_jca_natives(&mut r);
 
     assert!(
         r.find(

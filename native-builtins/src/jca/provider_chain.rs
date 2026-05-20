@@ -34,9 +34,9 @@
 //! formats it as `"<int(version)>"` to match JDK 25's HotSpot output
 //! (`"25"` not `"25.0"`).
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ObjectRef, Value};
 
 use rustc_hash::FxHashMap;
 
@@ -144,7 +144,7 @@ fn make_provider(ctx: &mut dyn NativeContext, name: &str, version: f64) -> Objec
     // path below so existing fixtures keep working.
     let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 8);
     let n = ctx.create_string(name);
-    let info_str = format!("{} security provider (rust-jvm)", name);
+    let info_str = format!("{} security provider (cratonvm)", name);
     let info = ctx.create_string(&info_str);
     let ver_str_text = if version.fract() == 0.0 {
         format!("{}", version as i64)
@@ -314,7 +314,7 @@ fn provider_get_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let chain = snapshot();
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, chain.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, chain.len());
     for (i, (name, ver)) in chain.iter().enumerate() {
         let p = make_provider(ctx, name, *ver);
         ctx.set_array_element(arr, i, Value::Object(Some(p)));
@@ -456,7 +456,7 @@ fn security_set_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 // static `Map<String,EngineDescription>` populated by `Provider.<clinit>`
 // — but the populating sequence depends on the inner classes
 // `Provider$ServiceKey` and `EngineDescription` resolving cleanly under
-// real-JDK loading, which the rust-jvm class manager doesn't fully wire
+// real-JDK loading, which the cratonvm class manager doesn't fully wire
 // today.  Result: `knownEngines` stays null, every BC `addAlgorithm`
 // call constructs a `Provider$Service` and the constructor NPEs on the
 // `.get(...)` call before BC finishes registering its ~500 algorithm
@@ -1132,7 +1132,7 @@ mod tests {
     fn alloc_service(ctx: &mut MockNativeContext) -> ObjectRef {
         // Synthetic mode: alloc 7 slots (0..6) so writes via set_field
         // never overflow.
-        ctx.alloc_object(rustjvm_types::ClassId::new(0), 7)
+        ctx.alloc_object(cratonvm_types::ClassId::new(0), 7)
     }
 
     #[test]
@@ -1183,8 +1183,8 @@ mod tests {
         let svc_type = ctx.create_string("MessageDigest");
         let algorithm = ctx.create_string("SHA-256");
         let class_name = ctx.create_string("org.bouncycastle.jcajce.provider.digest.SHA256$Digest");
-        let aliases = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
-        let attributes = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+        let aliases = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+        let attributes = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
 
         let args = [
             Value::Object(Some(this)),
@@ -1399,7 +1399,7 @@ mod tests {
         let _lock = reset_service_state_for_tests();
         let mut ctx = MockNativeContext::new();
         // Build a Provider receiver with `name="BC"` populated.
-        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let prov = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
         let name = ctx.create_string("BC");
         ctx.set_field(prov, 0, Value::Object(Some(name)));
         ctx.set_field(prov, 1, Value::Double(1.80));
@@ -1428,7 +1428,7 @@ mod tests {
     fn parse_legacy_put_native_alias_round_trip() {
         let _lock = reset_service_state_for_tests();
         let mut ctx = MockNativeContext::new();
-        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let prov = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
         let name = ctx.create_string("BC");
         ctx.set_field(prov, 0, Value::Object(Some(name)));
         ctx.set_field(prov, 1, Value::Double(1.80));
@@ -1465,7 +1465,7 @@ mod tests {
     fn get_service_native_returns_null_for_unknown_algo() {
         let _lock = reset_service_state_for_tests();
         let mut ctx = MockNativeContext::new();
-        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let prov = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
         let name = ctx.create_string("BC");
         ctx.set_field(prov, 0, Value::Object(Some(name)));
         ctx.set_field(prov, 1, Value::Double(1.80));
@@ -1495,7 +1495,7 @@ mod tests {
             "org.bouncycastle.jcajce.provider.symmetric.AES$GCM",
         );
         let mut ctx = MockNativeContext::new();
-        let prov = ctx.alloc_object(rustjvm_types::ClassId::new(0), 8);
+        let prov = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
         let name = ctx.create_string("BC");
         ctx.set_field(prov, 0, Value::Object(Some(name)));
         ctx.set_field(prov, 1, Value::Double(1.80));

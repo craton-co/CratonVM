@@ -1,4 +1,4 @@
-//! RustJVM — A Java Virtual Machine implemented in Rust.
+//! CratonVM — A Java Virtual Machine implemented in Rust.
 //!
 //! This crate provides the core VM implementation including:
 //!
@@ -49,7 +49,7 @@ pub use vm::{SharedVm, StackTraceFrame, Vm};
 //
 // ## Root cause
 //
-// On Windows, `cargo test -p rustjvm-vm --lib` crashes with
+// On Windows, `cargo test -p cratonvm-vm --lib` crashes with
 // `STATUS_ACCESS_VIOLATION (0xC0000005)` *after* every test has
 // reported `ok` but *before* libtest can emit the final
 // `test result: ok. ... passed; ...` line. The crash fires inside

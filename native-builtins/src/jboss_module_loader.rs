@@ -66,9 +66,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
-use rustjvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 use crate::jboss_module_xml::{parse_module_xml, ModuleXml};
@@ -173,11 +173,11 @@ static MP_ROOT_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// the time `loadModule` is called the value has been parsed but
 /// not stored anywhere our native code can see.  Instead, we scan
 /// `std::env::args()`, which still contains the raw CLI arguments
-/// (the rustjvm CLI captures positional args via `trailing_var_arg`,
+/// (the cratonvm CLI captures positional args via `trailing_var_arg`,
 /// so they remain in the process argv).
 ///
 /// Resolution order (first match wins):
-///   1. `RUSTJVM_JBOSS_MP_ROOT` environment variable — used by external
+///   1. `CRATONVM_JBOSS_MP_ROOT` environment variable — used by external
 ///      integration tests (`vm/tests/wp8_10_jboss_modules_smoke.rs`)
 ///      that need to inject a `-mp` value without touching the process
 ///      argv (which is owned by the test harness, not our test).
@@ -186,7 +186,7 @@ static MP_ROOT_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
 ///
 /// Returns `None` if neither source is present.
 fn find_mp_argument() -> Option<String> {
-    if let Ok(root) = std::env::var("RUSTJVM_JBOSS_MP_ROOT") {
+    if let Ok(root) = std::env::var("CRATONVM_JBOSS_MP_ROOT") {
         if !root.is_empty() {
             return Some(root);
         }
@@ -440,7 +440,7 @@ pub(crate) fn resolve_module_in_roots(
 /// `loadModule(name)` from multiple threads always returns the same
 /// `Module` instance — JBoss's contract.
 ///
-/// We don't track per-loader caches because rustjvm only has one
+/// We don't track per-loader caches because cratonvm only has one
 /// `LocalModuleLoader` instance (the boot holder).  When/if a second
 /// loader appears, the cache keys can be promoted to
 /// `(loader_object_ref, name)`.
@@ -551,7 +551,7 @@ fn build_resource_root_array(
     ctx: &mut dyn NativeContext,
     paths: &[PathBuf],
 ) -> ObjectRef {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, paths.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
     for (i, p) in paths.iter().enumerate() {
         let s = ctx.create_string(&p.to_string_lossy());
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -873,10 +873,10 @@ pub(crate) fn native_loader_load_module(
     // The walk runs at most ONCE per `(root, module_name)` pair (tracked in
     // `BRUTE_FORCED_ROOTS`) and is capped at `MAX_BRUTE_FORCE_JARS` so a
     // pathological deep tree cannot stall startup.
-    let dbg_wf = std::env::var_os("RUSTJVM_DBG_WF").is_some();
+    let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
     if is_brute_force_trigger(&name) {
         // RKC19/WF39 Task A — always-on eprintln so the brute-force walk
-        // is observable without `RUSTJVM_DBG_WF`.  These lines confirm
+        // is observable without `CRATONVM_DBG_WF`.  These lines confirm
         // (a) the walk runs for the expected trigger modules and (b) how
         // many jars it physically located on disk.
         let brute_jars = brute_force_collect_layered_jars(&roots, &name);
@@ -975,12 +975,12 @@ pub(crate) fn native_loader_load_module(
         // without booting WildFly.
         //
         // The loop body is left intact so future debugging can re-enable
-        // it via `RUSTJVM_USE_WILDFLY_SYNTH_BYTECODE=1`, but the default
+        // it via `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE=1`, but the default
         // behavior is to run the real bytecode for every entry candidate
         // that loaded via `ensure_class_initialized` above, and to fail
         // loudly (rather than fake-out) for any that didn't.
         let allow_synth_bytecode =
-            std::env::var("RUSTJVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() == Ok("1");
+            std::env::var("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() == Ok("1");
         if !allow_synth_bytecode {
             // Skip the entire synthesis pass. Suppress dead-code warning
             // on the synthesis helper since it is now only called from
@@ -1587,7 +1587,7 @@ fn brute_force_collect_layered_jars(
     roots: &[PathBuf],
     module_name: &str,
 ) -> Vec<PathBuf> {
-    let dbg_wf = std::env::var_os("RUSTJVM_DBG_WF").is_some();
+    let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
     let mut jars: Vec<PathBuf> = Vec::new();
     for root in roots {
         let key = format!("{}|{}", root.to_string_lossy(), module_name);
@@ -1889,7 +1889,7 @@ pub(crate) fn native_module_classloader_load_class(
     };
     let class_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
-    let dbg = std::env::var_os("RUSTJVM_DBG_MCL").is_some();
+    let dbg = std::env::var_os("CRATONVM_DBG_MCL").is_some();
     if dbg {
         eprintln!("[mcl.loadClass] entry name={class_name:?}");
     }
@@ -2166,7 +2166,7 @@ pub(crate) fn native_module_classloader_find_resources(
         urls.extend(system_urls);
     }
 
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, urls.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
         let url_obj = build_synthetic_url(ctx, u);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
@@ -2178,7 +2178,7 @@ pub(crate) fn native_module_classloader_find_resources(
 }
 
 fn build_empty_enumeration(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     ctx.set_field(enm, 0, Value::Object(Some(arr)));
     ctx.set_field(enm, 1, Value::Int(0));
@@ -2213,7 +2213,7 @@ pub(crate) fn native_module_classloader_get_resource_as_stream(
         None => Ok(Some(Value::Object(None))),
         Some(bytes) => {
             let len = bytes.len();
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, len);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -2311,7 +2311,7 @@ pub(crate) fn native_module_get_property_names(
     // Return an empty ArrayList — this matches the "no properties set"
     // case the boot path expects.
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(list))))
@@ -2571,7 +2571,7 @@ fn native_wildfly_main_noop(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    if std::env::var_os("RUSTJVM_DBG_WF").is_some() {
+    if std::env::var_os("CRATONVM_DBG_WF").is_some() {
         eprintln!(
             "[wildfly-main-noop] synthetic main invoked — WildFly boot short-circuited (rc=0)"
         );
@@ -2768,12 +2768,12 @@ mod tests {
     // find_mp_argument — env-var fallback
     // -----------------------------------------------------------------
 
-    /// WP8.10.5 — `RUSTJVM_JBOSS_MP_ROOT` environment variable provides a
+    /// WP8.10.5 — `CRATONVM_JBOSS_MP_ROOT` environment variable provides a
     /// `-mp` value when the process argv is owned by the test harness
     /// (and therefore can't carry `-mp <path>`).  External integration
     /// tests like `vm/tests/wp8_10_jboss_modules_smoke.rs` need this path
     /// to point `LocalModuleLoader` at a fixture-built modules tree
-    /// without going through the rustjvm CLI.
+    /// without going through the cratonvm CLI.
     ///
     /// Acceptance: setting the env var causes `find_mp_argument()` to
     /// return its value verbatim, taking precedence over any argv `-mp`
@@ -2783,32 +2783,32 @@ mod tests {
     fn wp8_10_find_mp_argument_honours_env_var() {
         let _g = TEST_LOCK.lock();
         // Start from a clean slate.
-        let prev = std::env::var("RUSTJVM_JBOSS_MP_ROOT").ok();
-        std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", "/tmp/wp8_10_fixture_mp");
+        let prev = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        std::env::set_var("CRATONVM_JBOSS_MP_ROOT", "/tmp/wp8_10_fixture_mp");
         let v = find_mp_argument();
         assert_eq!(v.as_deref(), Some("/tmp/wp8_10_fixture_mp"));
         // Restore prior state.
         match prev {
-            Some(p) => std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", p),
-            None => std::env::remove_var("RUSTJVM_JBOSS_MP_ROOT"),
+            Some(p) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", p),
+            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
         }
     }
 
-    /// Empty `RUSTJVM_JBOSS_MP_ROOT` must be ignored — we should fall
+    /// Empty `CRATONVM_JBOSS_MP_ROOT` must be ignored — we should fall
     /// through to argv resolution rather than treating "" as a valid
     /// (and dangerous) module-path root.
     #[test]
     fn wp8_10_find_mp_argument_ignores_empty_env_var() {
         let _g = TEST_LOCK.lock();
-        let prev = std::env::var("RUSTJVM_JBOSS_MP_ROOT").ok();
-        std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", "");
+        let prev = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        std::env::set_var("CRATONVM_JBOSS_MP_ROOT", "");
         let v = find_mp_argument();
         // With an empty env var and the cargo test harness's argv (which
         // never carries `-mp`), find_mp_argument() must return None.
         assert!(v.is_none(), "empty env var must be treated as unset; got {:?}", v);
         match prev {
-            Some(p) => std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", p),
-            None => std::env::remove_var("RUSTJVM_JBOSS_MP_ROOT"),
+            Some(p) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", p),
+            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
         }
     }
 
@@ -3319,7 +3319,7 @@ mod tests {
     fn t19_h4_get_property_with_default_returns_default() {
         let _g = TEST_LOCK.lock();
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
         let key = ctx.create_string("foo");
         let default = ctx.create_string("bar");
         let result = native_module_get_property_with_default(
@@ -3344,7 +3344,7 @@ mod tests {
     fn t19_h4_get_property_returns_null() {
         let _g = TEST_LOCK.lock();
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
         let key = ctx.create_string("foo");
         let result = native_module_get_property(
             &mut ctx,
@@ -3359,7 +3359,7 @@ mod tests {
     fn t19_h4_get_property_names_returns_empty_list() {
         let _g = TEST_LOCK.lock();
         let mut ctx = MockNativeContext::new();
-        let this = ctx.alloc_object(rustjvm_types::ClassId::new(0), 4);
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
         let result = native_module_get_property_names(
             &mut ctx,
             &[Value::Object(Some(this))],

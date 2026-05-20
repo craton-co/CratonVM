@@ -583,14 +583,34 @@ pub struct SoftwareRenderer {
     composite_mode: CompositeMode,
 }
 
+/// Computes the pixel-buffer length for a `width x height` surface.
+///
+/// `BufferedImage.<init>` (and hence Graphics2D backing buffers) only floors
+/// dimensions at 1, never caps them, so Java-controlled sizes can reach
+/// ~2^31 per axis. `width * height` as a plain `u32` multiply then overflows
+/// and panics for surfaces larger than ~65535x65535. This uses
+/// `u32::checked_mul`; on overflow the surface is clamped to a degenerate
+/// 1x1 buffer so the renderer fails gracefully instead of panicking.
+///
+/// Returns `(safe_width, safe_height, pixel_count)` — `pixel_count` always
+/// equals `safe_width * safe_height`, preserving the renderer invariant that
+/// `pixels.len() == width * height`.
+fn safe_buffer_dims(width: u32, height: u32) -> (u32, u32, usize) {
+    match width.checked_mul(height) {
+        Some(len) => (width, height, len as usize),
+        // Overflow: cannot represent `width * height` pixels. Degrade to a
+        // 1x1 surface rather than aborting the whole VM.
+        None => (1, 1, 1),
+    }
+}
+
 impl SoftwareRenderer {
     /// Creates a new renderer with a buffer filled with transparent black.
+    ///
+    /// If `width * height` overflows `usize` the surface is clamped to 1x1
+    /// (see [`safe_buffer_dims`]); allocation never panics.
     pub fn new(width: u32, height: u32) -> Self {
-        // `checked_mul` widened to usize — a plain `u32` multiply can wrap and
-        // silently produce an undersized buffer for large dimensions.
-        let len = (width as usize)
-            .checked_mul(height as usize)
-            .expect("SoftwareRenderer pixel count overflows usize");
+        let (width, height, len) = safe_buffer_dims(width, height);
         Self {
             pixels: vec![0x00000000; len],
             width,
@@ -605,11 +625,11 @@ impl SoftwareRenderer {
     }
 
     /// Reallocates the pixel buffer.
+    ///
+    /// If `width * height` overflows `usize` the surface is clamped to 1x1
+    /// (see [`safe_buffer_dims`]); reallocation never panics.
     pub fn resize(&mut self, width: u32, height: u32) {
-        // `checked_mul` — see `new`: avoid a wrapped, undersized allocation.
-        let len = (width as usize)
-            .checked_mul(height as usize)
-            .expect("SoftwareRenderer pixel count overflows usize");
+        let (width, height, len) = safe_buffer_dims(width, height);
         self.width = width;
         self.height = height;
         self.pixels = vec![0x00000000; len];
@@ -962,13 +982,34 @@ impl SoftwareRenderer {
         let arc_rad = (arc_angle as f64) * PI / 180.0;
         let dt = arc_rad / steps as f64;
 
-        let mut prev_x = cx as f64 + rx as f64 * start_rad.cos();
-        let mut prev_y = cy as f64 - ry as f64 * start_rad.sin();
+        // Incremental rotation: instead of calling cos()/sin() per step,
+        // advance the unit direction vector by a fixed rotation of `dt`
+        // using one complex multiply (2 mul + 2 add fma-ish). The 2x2
+        // rotation matrix has bounded relative error; to avoid any visible
+        // drift on long arcs we re-sync to an exact cos()/sin() every
+        // `RESYNC` steps.
+        const RESYNC: usize = 64;
+        let (sin_dt, cos_dt) = dt.sin_cos();
+        let (mut s, mut c) = start_rad.sin_cos();
+
+        let mut prev_x = cx as f64 + rx as f64 * c;
+        let mut prev_y = cy as f64 - ry as f64 * s;
 
         for i in 1..=steps {
-            let t = start_rad + i as f64 * dt;
-            let cur_x = cx as f64 + rx as f64 * t.cos();
-            let cur_y = cy as f64 - ry as f64 * t.sin();
+            if i % RESYNC == 0 {
+                let t = start_rad + i as f64 * dt;
+                let (rs, rc) = t.sin_cos();
+                s = rs;
+                c = rc;
+            } else {
+                // Rotate (c, s) by dt: complex multiply (c + i s)*(cos_dt + i sin_dt).
+                let nc = c * cos_dt - s * sin_dt;
+                let ns = s * cos_dt + c * sin_dt;
+                c = nc;
+                s = ns;
+            }
+            let cur_x = cx as f64 + rx as f64 * c;
+            let cur_y = cy as f64 - ry as f64 * s;
             // Draw line segment in logical coords, then transform
             let (tx1, ty1) = self.tx(prev_x, prev_y);
             let (tx2, ty2) = self.tx(cur_x, cur_y);
@@ -997,10 +1038,30 @@ impl SoftwareRenderer {
 
         let mut points = Vec::with_capacity(steps + 2);
         points.push((cx, cy));
+
+        // Incremental rotation (see `draw_arc`): advance the unit direction
+        // vector by a fixed rotation of `dt` with one complex multiply per
+        // step instead of a cos()/sin() pair. Re-sync to exact trig every
+        // `RESYNC` steps to bound drift on long arcs.
+        const RESYNC: usize = 64;
+        let (sin_dt, cos_dt) = dt.sin_cos();
+        let (mut s, mut c) = start_rad.sin_cos();
         for i in 0..=steps {
-            let t = start_rad + i as f64 * dt;
-            let px = (cx as f64 + rx as f64 * t.cos()).round() as i32;
-            let py = (cy as f64 - ry as f64 * t.sin()).round() as i32;
+            if i != 0 {
+                if i % RESYNC == 0 {
+                    let t = start_rad + i as f64 * dt;
+                    let (rs, rc) = t.sin_cos();
+                    s = rs;
+                    c = rc;
+                } else {
+                    let nc = c * cos_dt - s * sin_dt;
+                    let ns = s * cos_dt + c * sin_dt;
+                    c = nc;
+                    s = ns;
+                }
+            }
+            let px = (cx as f64 + rx as f64 * c).round() as i32;
+            let py = (cy as f64 - ry as f64 * s).round() as i32;
             points.push((px, py));
         }
 
@@ -1953,6 +2014,18 @@ mod tests {
         assert_eq!(r.pixels().len(), 100);
         // Should be cleared
         assert_eq!(r.pixels()[0], 0);
+    }
+
+    #[test]
+    fn test_pixel_count_overflow_is_clamped() {
+        // 70000 x 70000 overflows a u32 pixel count. Construction and
+        // resize must clamp gracefully rather than panic in the multiply.
+        let r = SoftwareRenderer::new(70_000, 70_000);
+        assert_eq!(r.pixels().len(), (r.width() as usize) * (r.height() as usize));
+
+        let mut r2 = SoftwareRenderer::new(4, 4);
+        r2.resize(0xFFFF_FFFF, 0xFFFF_FFFF);
+        assert_eq!(r2.pixels().len(), (r2.width() as usize) * (r2.height() as usize));
     }
 
     #[test]

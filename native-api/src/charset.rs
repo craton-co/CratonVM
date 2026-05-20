@@ -3,7 +3,7 @@
 //! `StreamEncoder` shims.
 //!
 //! The engine accepts a canonical charset name (as produced by
-//! `normalize_charset_name` in `rustjvm-native-builtins`) and transcodes
+//! `normalize_charset_name` in `cratonvm-native-builtins`) and transcodes
 //! between UTF-16 code units — the representation used internally by our
 //! Java `String` objects — and arbitrary byte sequences.
 //!
@@ -508,7 +508,55 @@ fn push_code_point(out: &mut Vec<u16>, cp: u32) {
 macro_rules! sb_table {
     ($name:ident, $map:expr) => {
         const $name: [u16; 128] = $map;
+        // Companion lazily-built reverse map for `encode_sb`. Without
+        // this, encoding does an O(128) linear scan of the forward
+        // table per character. The reverse map turns that into an O(1)
+        // array index. It is built once, on first use, per charset.
+        //
+        // `0` is used as the "no mapping" sentinel: byte 0 is a control
+        // character that always lives in the `< 0x80` ASCII range and
+        // is therefore never a valid high-byte (0x80..=0xFF) encoding
+        // target, so it can never collide with a real entry.
+        paste_sb_rev!($name);
     };
+}
+
+/// Generates the per-charset `OnceLock`-backed reverse-lookup map. Each
+/// charset gets a private `OnceLock` static and an accessor function
+/// that builds the map on first use.
+macro_rules! paste_sb_rev {
+    (CP1252_HIGH) => { sb_rev_cell!(CP1252_REV_CELL, cp1252_rev, CP1252_HIGH); };
+    (CP1251_HIGH) => { sb_rev_cell!(CP1251_REV_CELL, cp1251_rev, CP1251_HIGH); };
+    (KOI8R_HIGH) => { sb_rev_cell!(KOI8R_REV_CELL, koi8r_rev, KOI8R_HIGH); };
+    (ISO_8859_2_HIGH) => { sb_rev_cell!(ISO_8859_2_REV_CELL, iso_8859_2_rev, ISO_8859_2_HIGH); };
+    (ISO_8859_15_HIGH) => { sb_rev_cell!(ISO_8859_15_REV_CELL, iso_8859_15_rev, ISO_8859_15_HIGH); };
+}
+
+macro_rules! sb_rev_cell {
+    ($cell:ident, $accessor:ident, $fwd:ident) => {
+        static $cell: std::sync::OnceLock<Box<[u8; 65536]>> =
+            std::sync::OnceLock::new();
+        fn $accessor() -> &'static [u8; 65536] {
+            $cell.get_or_init(|| build_sb_rev(&$fwd))
+        }
+    };
+}
+
+/// Build a `u16 -> u8` reverse-lookup table from a single-byte charset's
+/// forward `0x80..=0xFF` table. Row order is preserved so the result is
+/// "first row wins" for duplicate code points, exactly matching the
+/// linear scan in [`encode_sb`]. Entries equal to the replacement
+/// character `0xFFFD` are not mappable and are skipped. Unmapped slots
+/// stay `0` (the "no mapping" sentinel — see `sb_table!`).
+fn build_sb_rev(table: &[u16; 128]) -> Box<[u8; 65536]> {
+    let mut rev = Box::new([0u8; 65536]);
+    // Iterate high to low so the lowest row "wins" any duplicate.
+    for (row, &u) in table.iter().enumerate().rev() {
+        if u != 0xFFFD {
+            rev[u as usize] = 0x80 + row as u8;
+        }
+    }
+    rev
 }
 
 sb_table!(CP1252_HIGH, [
@@ -630,22 +678,24 @@ fn iso_8859_15_to_u16(b: u8) -> u16 {
     sb_to_u16(b, &ISO_8859_15_HIGH)
 }
 
+/// Encode UTF-16 code units into a single-byte charset using a prebuilt
+/// `u16 -> u8` reverse-lookup table (`rev`, see `build_sb_rev`). This is
+/// O(1) per character; a `0` slot means the code point is unmappable.
 fn encode_sb(
     chars: &[u16],
-    table: &[u16; 128],
+    rev: &[u8; 65536],
     charset: &'static str,
 ) -> Result<Vec<u8>, CodingError> {
     let mut out = Vec::with_capacity(chars.len());
-    'outer: for (i, &c) in chars.iter().enumerate() {
+    for (i, &c) in chars.iter().enumerate() {
         if c < 0x80 {
             out.push(c as u8);
             continue;
         }
-        for (row, &u) in table.iter().enumerate() {
-            if u == c && u != 0xFFFD {
-                out.push(0x80 + row as u8);
-                continue 'outer;
-            }
+        let b = rev[c as usize];
+        if b != 0 {
+            out.push(b);
+            continue;
         }
         return Err(CodingError {
             offset: i,
@@ -658,19 +708,19 @@ fn encode_sb(
 }
 
 fn encode_cp1252(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
-    encode_sb(chars, &CP1252_HIGH, "windows-1252")
+    encode_sb(chars, cp1252_rev(), "windows-1252")
 }
 fn encode_cp1251(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
-    encode_sb(chars, &CP1251_HIGH, "windows-1251")
+    encode_sb(chars, cp1251_rev(), "windows-1251")
 }
 fn encode_koi8r(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
-    encode_sb(chars, &KOI8R_HIGH, "KOI8-R")
+    encode_sb(chars, koi8r_rev(), "KOI8-R")
 }
 fn encode_iso_8859_2(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
-    encode_sb(chars, &ISO_8859_2_HIGH, "ISO-8859-2")
+    encode_sb(chars, iso_8859_2_rev(), "ISO-8859-2")
 }
 fn encode_iso_8859_15(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
-    encode_sb(chars, &ISO_8859_15_HIGH, "ISO-8859-15")
+    encode_sb(chars, iso_8859_15_rev(), "ISO-8859-15")
 }
 
 /// Returns a static-lifetime copy of `name` if we recognise it.  This

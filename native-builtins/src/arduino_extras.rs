@@ -5,9 +5,9 @@
 //! a static-init chain that calls `System.exit(1)`). We short-circuit `main`
 //! and the `<clinit>` to land at rc=0 for the boot smoke test.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 fn arduino_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[arduino-shim] entry short-circuited (boot-test mode)");
@@ -15,11 +15,11 @@ fn arduino_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 }
 
 pub fn register_arduino_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when RUSTJVM_ARDUINO_REAL=1, skip all short-circuits so
+    // Diagnostic gate: when CRATONVM_ARDUINO_REAL=1, skip all short-circuits so
     // the real Arduino entry classes execute under CratonVM. Used to measure
     // how far the real boot path gets without our shims masking failures.
-    if std::env::var("RUSTJVM_ARDUINO_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[arduino-shim] RUSTJVM_ARDUINO_REAL=1 — skipping shim registration, running real Arduino");
+    if std::env::var("CRATONVM_ARDUINO_REAL").as_deref() == Ok("1") {
+        tracing::warn!("[arduino-shim] CRATONVM_ARDUINO_REAL=1 — skipping shim registration, running real Arduino");
         return;
     }
     // Primary boot entry.

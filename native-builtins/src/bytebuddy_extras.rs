@@ -54,9 +54,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
 /// `ByteBuddyProbe.main([Ljava/lang/String;)V` — boot-test short circuit.
 ///
@@ -84,13 +84,13 @@ fn bb_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 /// bytebuddy_extras::register_bytebuddy_stubs(registry);
 /// ```
 pub fn register_bytebuddy_stubs(registry: &mut NativeMethodRegistry) {
-    // Real-mode gate: when RUSTJVM_BYTEBUDDY_REAL is set (any value),
+    // Real-mode gate: when CRATONVM_BYTEBUDDY_REAL is set (any value),
     // skip every boot-test short-circuit so the real ByteBuddy code path
     // runs. Used by diag harnesses to measure how far CratonVM gets on
     // the actual ByteBuddy probe before failure.
-    if std::env::var_os("RUSTJVM_BYTEBUDDY_REAL").is_some() {
+    if std::env::var_os("CRATONVM_BYTEBUDDY_REAL").is_some() {
         tracing::warn!(
-            "[bytebuddy-shim] RUSTJVM_BYTEBUDDY_REAL set - skipping ByteBuddy boot-test shims"
+            "[bytebuddy-shim] CRATONVM_BYTEBUDDY_REAL set - skipping ByteBuddy boot-test shims"
         );
         return;
     }

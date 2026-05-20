@@ -34,9 +34,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::collections::HashMap;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Pipe handle representation

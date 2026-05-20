@@ -53,9 +53,9 @@ use rustls::server::{ClientHello, ResolvesServerCert, ServerConnection, WebPkiCl
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, StreamOwned};
 
-use rustjvm_native_api::NativeMethodRegistry;
-use rustjvm_types::error::RuntimeError;
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_types::error::RuntimeError;
+use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 use crate::servlet;
@@ -676,7 +676,7 @@ fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             let ders = accepted_issuer_ders();
             let arr =
-                ctx.new_ref_array(rustjvm_types::ClassId::new(0), ders.len());
+                ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
             for (i, der) in ders.iter().enumerate() {
                 let cert = alloc_concurrent_synthetic(
                     ctx,
@@ -692,7 +692,7 @@ fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
                 ctx.set_field(cert, 1, Value::Object(Some(iss)));
                 ctx.set_field(cert, 2, Value::Long(0));
                 let der_arr = ctx.new_array(
-                    rustjvm_types::ArrayElementType::Byte,
+                    cratonvm_types::ArrayElementType::Byte,
                     der.len(),
                 );
                 for (j, &b) in der.iter().enumerate() {
@@ -793,7 +793,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                 "TLS_AES_256_GCM_SHA384",
                 "TLS_CHACHA20_POLY1305_SHA256",
             ];
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, suites.len());
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
             for (i, &s) in suites.iter().enumerate() {
                 let str_obj = ctx.create_string(s);
                 ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
@@ -1042,11 +1042,11 @@ fn register_self_test(r: &mut NativeMethodRegistry) {
     // TLSv1.3 and that ALPN selected "h2", then returns "OK" as a Java
     // String. Any failure yields the error text.
     //
-    // This is exposed as `rustjvm.tls.T27SelfTest.run()` — callable from
+    // This is exposed as `cratonvm.tls.T27SelfTest.run()` — callable from
     // Java tests (or interactively) to prove the entire rustls pipeline is
     // wired up end-to-end without requiring network access.
     r.register(
-        "rustjvm/tls/T27SelfTest",
+        "cratonvm/tls/T27SelfTest",
         "run",
         "()Ljava/lang/String;",
         |ctx, _args| {
@@ -2089,7 +2089,7 @@ pub(crate) const HS_NEED_UNWRAP_R: i32 = 4;
 /// turn them into the appropriate enum constants — see
 /// `tls.rs::register_ssl_engine_result`).
 fn alloc_engine_result(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     status: i32,
     hs: i32,
     consumed: i32,
@@ -2132,7 +2132,7 @@ fn handshake_status_of(s: &EngineState) -> i32 {
 /// field 1=position, field 2=limit, field 3=capacity (capacity may be missing
 /// for older allocators — we fall back to limit).
 fn bb_view(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     bb: ObjectRef,
 ) -> (Option<ObjectRef>, usize, usize, usize) {
     let arr = match ctx.get_field(bb, 0) {
@@ -2153,7 +2153,7 @@ fn bb_view(
 /// position advanced by `consumed`. Returns the bytes copied. Honors a
 /// `max` cap so callers can chunk large buffers.
 fn bb_read_into(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     bb: ObjectRef,
     out: &mut Vec<u8>,
     max: usize,
@@ -2180,7 +2180,7 @@ fn bb_read_into(
 /// Write up to `(limit - position)` bytes from `src` into a ByteBuffer,
 /// advancing its position. Returns bytes written.
 fn bb_write_from(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     bb: ObjectRef,
     src: &[u8],
 ) -> usize {
@@ -2499,7 +2499,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let list = with_engine(id, |s| s.enabled_protocols.clone()).unwrap_or_else(|| {
                 vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]
             });
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), list.len());
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
             for (i, p) in list.iter().enumerate() {
                 let s = ctx.create_string(p);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -2513,7 +2513,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "getSupportedProtocols",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), 2);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
             let s1 = ctx.create_string("TLSv1.3");
             let s2 = ctx.create_string("TLSv1.2");
             ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
@@ -2564,7 +2564,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             } else {
                 list
             };
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), names.len());
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), names.len());
             for (i, p) in names.iter().enumerate() {
                 let s = ctx.create_string(p);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -2796,9 +2796,9 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
 // -- wrap/unwrap closures (split out for arity / arg shapes) -----------------
 
 fn wrap_single(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => Some(*b),
@@ -2820,9 +2820,9 @@ fn wrap_single(
 }
 
 fn wrap_array(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let srcs_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => Some(*a),
@@ -2853,9 +2853,9 @@ fn wrap_array(
 }
 
 fn wrap_array_offset(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let srcs_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => Some(*a),
@@ -2889,11 +2889,11 @@ fn wrap_array_offset(
 }
 
 fn do_wrap(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     this: ObjectRef,
     srcs: Vec<ObjectRef>,
     dst: ObjectRef,
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(this);
 
     // Closed-outbound short-circuit.
@@ -2985,9 +2985,9 @@ fn do_wrap(
 }
 
 fn unwrap_single(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
@@ -3009,9 +3009,9 @@ fn unwrap_single(
 }
 
 fn unwrap_array(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
@@ -3038,9 +3038,9 @@ fn unwrap_array(
 }
 
 fn unwrap_array_offset(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
@@ -3070,11 +3070,11 @@ fn unwrap_array_offset(
 }
 
 fn do_unwrap(
-    ctx: &mut dyn rustjvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     this: ObjectRef,
     src: ObjectRef,
     dsts: Vec<ObjectRef>,
-) -> rustjvm_types::error::MethodCallResult {
+) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(this);
 
     let closed = with_engine(id, |s| s.closed_inbound).unwrap_or(false);
@@ -3219,7 +3219,7 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
                 .get(&engine_objref_key(this))
                 .cloned()
                 .unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
-            let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), list.len());
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
             for (i, p) in list.iter().enumerate() {
                 let s = ctx.create_string(p);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));

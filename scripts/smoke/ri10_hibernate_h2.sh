@@ -84,6 +84,6 @@ JAVA
 
 "$JAVA_HOME_FOR_SMOKE/bin/javac" -cp "$CP" -d "$FIX_DIR" "$FIX_DIR/Note.java" "$FIX_DIR/HibernateSmoke.java"
 
-SMOKE_TIMEOUT=600 smoke_run_rustjvm --Xmx 1g --classpath "$FIX_DIR:$CP" -- HibernateSmoke
+SMOKE_TIMEOUT=600 smoke_run_cratonvm --Xmx 1g --classpath "$FIX_DIR:$CP" -- HibernateSmoke
 
 smoke_require_signal "HIB_SMOKE_OK text=hello"

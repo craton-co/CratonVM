@@ -12,18 +12,18 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use rustjvm_reader::attribute::Attribute;
-use rustjvm_reader::class_file_version::ClassFileVersion;
-use rustjvm_reader::constant_pool::ConstantPool;
-use rustjvm_reader::instruction::Instruction;
-use rustjvm_reader::method::ClassFileMethod;
-use rustjvm_reader::stack_map::StackMapTable;
+use cratonvm_reader::attribute::Attribute;
+use cratonvm_reader::class_file_version::ClassFileVersion;
+use cratonvm_reader::constant_pool::ConstantPool;
+use cratonvm_reader::instruction::Instruction;
+use cratonvm_reader::method::ClassFileMethod;
+use cratonvm_reader::stack_map::StackMapTable;
 
 use super::class::Class;
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{ClassHierarchy, VType};
-use rustjvm_types::error::LinkageError;
+use cratonvm_types::error::LinkageError;
 
 /// Verify all methods in a class using the bytecode type-checking verifier.
 ///
@@ -481,7 +481,7 @@ fn build_declared_frames(
 fn verify_by_inference(
     class_name: &str,
     method: &ClassFileMethod,
-    code_attr: &rustjvm_reader::attribute::CodeAttribute,
+    code_attr: &cratonvm_reader::attribute::CodeAttribute,
     cp: &ConstantPool,
     hierarchy: &dyn ClassHierarchy,
 ) -> Result<(), LinkageError> {
@@ -677,10 +677,10 @@ fn merge_inference_frame(
 mod tests {
     use super::*;
     use crate::class::{Class, ClassId, ClassLoaderId, ClassState};
-    use rustjvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
-    use rustjvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
-    use rustjvm_reader::class_file_version::ClassFileVersion;
-    use rustjvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute, LazyAttribute};
+    use cratonvm_reader::class_access_flags::{ClassAccessFlags, MethodAccessFlags};
+    use cratonvm_reader::class_file_version::ClassFileVersion;
+    use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
     struct MockHierarchy;
 
@@ -751,7 +751,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -772,7 +772,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x03, 0xAC]), // iconst_0, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x03, 0xAC]), // iconst_0, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -821,7 +821,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x03, 0x60, 0xAC]), // iconst_0, iadd, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x03, 0x60, 0xAC]), // iconst_0, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -843,7 +843,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x04, 0x05, 0x60, 0xAC]), // iconst_1, iconst_2, iadd, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x04, 0x05, 0x60, 0xAC]), // iconst_1, iconst_2, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -864,7 +864,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -886,7 +886,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 1,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x03, 0x3B, 0x1A, 0xAC]), // iconst_0, istore_0, iload_0, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x03, 0x3B, 0x1A, 0xAC]), // iconst_0, istore_0, iload_0, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -910,7 +910,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![]),
+                code: cratonvm_reader::ByteView::from_vec(vec![]),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -931,7 +931,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x57, 0xB1]), // pop, return
+                code: cratonvm_reader::ByteView::from_vec(vec![0x57, 0xB1]), // pop, return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -952,7 +952,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x59, 0xB1]), // dup, return
+                code: cratonvm_reader::ByteView::from_vec(vec![0x59, 0xB1]), // dup, return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -973,7 +973,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x04, 0x59, 0x60, 0xAC]), // iconst_1, dup, iadd, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x04, 0x59, 0x60, 0xAC]), // iconst_1, dup, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -994,7 +994,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x09, 0xAD]), // lconst_0, lreturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x09, 0xAD]), // lconst_0, lreturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1015,7 +1015,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x0B, 0xAE]), // fconst_0, freturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x0B, 0xAE]), // fconst_0, freturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1036,7 +1036,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x0E, 0xAF]), // dconst_0, dreturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x0E, 0xAF]), // dconst_0, dreturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1057,7 +1057,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x01, 0xB0]), // aconst_null, areturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x01, 0xB0]), // aconst_null, areturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1078,7 +1078,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x04, 0x64, 0xAC]), // iconst_1, isub, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x04, 0x64, 0xAC]), // iconst_1, isub, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1099,7 +1099,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x10, 0x2A, 0xAC]), // bipush 42, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x10, 0x2A, 0xAC]), // bipush 42, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1120,7 +1120,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x11, 0x03, 0xE8, 0xAC]), // sipush 1000, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x11, 0x03, 0xE8, 0xAC]), // sipush 1000, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1142,7 +1142,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                    code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
                 }))],
@@ -1154,7 +1154,7 @@ mod tests {
                 attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 0,
-                    code: rustjvm_reader::ByteView::from_vec(vec![0x03, 0x60, 0xAC]), // iconst_0, iadd (underflow), ireturn
+                    code: cratonvm_reader::ByteView::from_vec(vec![0x03, 0x60, 0xAC]), // iconst_0, iadd (underflow), ireturn
                     exception_table: vec![],
                     attributes: vec![],
                 }))],
@@ -1217,7 +1217,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![
+                code: cratonvm_reader::ByteView::from_vec(vec![
                     0x03,             // 0: iconst_0
                     0x99, 0x00, 0x05, // 1: ifeq +5 (jump to offset 6)
                     0x04,             // 4: iconst_1
@@ -1263,7 +1263,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack,
                 max_locals,
-                code,
+                code: code.into(),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1406,7 +1406,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![
+                code: cratonvm_reader::ByteView::from_vec(vec![
                     0x03,             // iconst_0
                     0x99, 0x00, 0x05, // ifeq +5
                     0x04, 0xAC,       // iconst_1, ireturn
@@ -1690,7 +1690,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x03, 0x04, 0x60, 0xAC]), // iconst_0, iconst_1, iadd, ireturn
+                code: cratonvm_reader::ByteView::from_vec(vec![0x03, 0x04, 0x60, 0xAC]), // iconst_0, iconst_1, iadd, ireturn
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1710,7 +1710,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 1,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x03, 0xAF]), // iconst_0; dreturn (needs double)
+                code: cratonvm_reader::ByteView::from_vec(vec![0x03, 0xAF]), // iconst_0; dreturn (needs double)
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1824,7 +1824,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0x04, 0x05, 0x60, 0xAC]),
+                code: cratonvm_reader::ByteView::from_vec(vec![0x04, 0x05, 0x60, 0xAC]),
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1842,7 +1842,7 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 0,
-                code: rustjvm_reader::ByteView::from_vec(vec![0xB1]), // return
+                code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                 exception_table: vec![],
                 attributes: vec![],
             }))],
@@ -1894,10 +1894,10 @@ mod tests {
             attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
                 max_stack: 2,
                 max_locals: 1,
-                code: rustjvm_reader::ByteView::from_vec(code),
+                code: cratonvm_reader::ByteView::from_vec(code),
                 exception_table: vec![],
                 attributes: vec![Attribute::StackMapTable {
-                    entries: rustjvm_reader::ByteView::from_vec(stack_map_bytes),
+                    entries: cratonvm_reader::ByteView::from_vec(stack_map_bytes),
                 }],
             }))],
         }]);

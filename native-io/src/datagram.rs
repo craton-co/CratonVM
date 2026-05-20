@@ -38,9 +38,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket}
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{OnceLock, RwLock};
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Local UDP registry (parallel to nio_native::udp_registry)

@@ -17,6 +17,12 @@ it, or extend the feature, read on.
 | [`plan.md`](plan.md) | The original execution plan with per-part status, deviations from spec, and known follow-ups. |
 | [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) | Why [cuda-oxide](https://nvlabs.github.io/cuda-oxide/) (the project that prompted this work) is not on the critical path, and the precise conditions under which we would re-evaluate. |
 | [`first-results.md`](first-results.md) | Acceptance-criteria scaffold for the GPU-equipped verification machine. Empty results table until real numbers land. |
+| [`annotations.md`](annotations.md) | Phase 1 reference: `@GpuKernel`, `@GpuExclude`, `@EnableGpuAsync` directives for user-facing offload control. |
+| [`streams-events.md`](streams-events.md) | Phase 2 reference: `Stream`, `Event`, async memcpy, `launch_on_stream`, stub op log for tests. |
+| [`async-api.md`](async-api.md) | Phase 3 reference: `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload. |
+| [`phase7-summary.md`](phase7-summary.md) | Phase 7 wrap-up: real async overlap, device-buffer caching, lambda SAM args. What landed vs. what was deferred for Phase 8. |
+| [`phase8-summary.md`](phase8-summary.md) | Phase 8 wrap-up: device-cache eviction, benchmark scaffold, multi-arg SAMs. What landed vs. what was deferred for Phase 9+. |
+| [`phase9-summary.md`](phase9-summary.md) | Phase 9 wrap-up: deferred-writeback (lazy D→H). Non-static lambdas and CUDA Graph capture remain deferred with more-detailed rationale. |
 
 ## At a glance
 
@@ -52,8 +58,8 @@ levels:**
 | `cargo build --features gpu-driver` | Above, plus real `cudarc` bindings to `libcuda` / `nvcuda.dll`. Requires CUDA Toolkit 12.x. |
 
 The features compose: `gpu-driver` implies `gpu`, which (when applied
-to `rustjvm-cli`) propagates `rustjvm-vm/gpu-offload`, which in turn
-propagates `rustjvm-gc/gpu-offload`. Pulling on the CLI's `gpu`
+to `cratonvm-cli`) propagates `cratonvm-vm/gpu-offload`, which in turn
+propagates `cratonvm-gc/gpu-offload`. Pulling on the CLI's `gpu`
 feature drags the entire stack in; pulling on nothing leaves the CPU
 path pristine.
 
@@ -70,7 +76,7 @@ path pristine.
 When `--gpu` is requested but the driver is missing:
 
 ```
-[rustjvm-cli] --gpu requested but no CUDA driver available (no CUDA driver available …); running on CPU
+[cratonvm-cli] --gpu requested but no CUDA driver available (no CUDA driver available …); running on CPU
 ```
 
 The flag is silently demoted; the program continues on CPU.
@@ -85,7 +91,7 @@ The flag is silently demoted; the program continues on CPU.
                     └────────────────┬─────────────┘
                                      │
                 ┌────────────────────▼─────────────────────┐
-                │   rustjvm-vm (cfg gpu-offload)            │
+                │   cratonvm-vm (cfg gpu-offload)            │
                 │                                          │
                 │  execute_invokestatic() hook ─────────┐  │
                 │       │                                │ │
@@ -110,7 +116,7 @@ The flag is silently demoted; the program continues on CPU.
                 └────────────────────┬───────────────────┘
                                      │
                 ┌────────────────────▼─────────────────────┐
-                │   rustjvm-gc (cfg gpu-offload)            │
+                │   cratonvm-gc (cfg gpu-offload)            │
                 │   SafepointToken + Heap::pin_ref          │
                 │   GC delays while any token is alive      │
                 └──────────────────────────────────────────┘
@@ -246,10 +252,10 @@ Imagine `EligibleVectorAdd.vectorAdd(int[] a, int[] b, int[] out)` is invoked wi
 | --- | --- | --- |
 | `cargo test -p cuda-bridge` | 3 | `NoDriver` contract holds when the `cuda` feature is off. |
 | `cargo test -p jit-cuda` | 23 (+2 `#[ignore]`) | Real `.class` fixtures lower to non-trivial PTX; all `Reject*` fixtures classify correctly; non-canonical control flow returns `Unsupported`. The 2 `#[ignore]` tests require `ptxas` and an attached GPU. |
-| `cargo test -p rustjvm-jit-api` | 24 | Unchanged from before GPU work; `GpuLowering` trait compiles under `--features gpu-lowering`. |
-| `cargo test -p rustjvm-gc --features gpu-offload` | 678 (= 672 pre-existing + 6 new) | Token increment/decrement, nested tokens, GC blocks while a token is held, pinned refs survive a real GC cycle (uses `Heap::alloc_array`), root walker visits pinned refs. |
-| `cargo test -p rustjvm-vm --features gpu-offload --lib gpu_marshal` | 9 | Round-trip every primitive array type through a real `Heap`. |
-| `cargo test -p rustjvm-vm --features gpu-offload --lib offload` | 6 | Cache skips on no-device, classifies eligible / ineligible methods from real `.class` files, disabled-config returns `Skip`. |
+| `cargo test -p cratonvm-jit-api` | 24 | Unchanged from before GPU work; `GpuLowering` trait compiles under `--features gpu-lowering`. |
+| `cargo test -p cratonvm-gc --features gpu-offload` | 678 (= 672 pre-existing + 6 new) | Token increment/decrement, nested tokens, GC blocks while a token is held, pinned refs survive a real GC cycle (uses `Heap::alloc_array`), root walker visits pinned refs. |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib gpu_marshal` | 9 | Round-trip every primitive array type through a real `Heap`. |
+| `cargo test -p cratonvm-vm --features gpu-offload --lib offload` | 6 | Cache skips on no-device, classifies eligible / ineligible methods from real `.class` files, disabled-config returns `Skip`. |
 
 **All tests run on machines without an NVIDIA GPU.** Real-kernel verification on GPU hardware happens against `Benchmark.java` per [`first-results.md`](first-results.md).
 
@@ -289,7 +295,7 @@ cuda-bridge/                         New crate. Optional dep of vm-cli.
     backend_cuda.rs                  cudarc backend (feature = "cuda")
     backend_stub.rs                  No-driver backend (default)
 
-jit-cuda/                            New crate. Used by rustjvm-vm under gpu-offload.
+jit-cuda/                            New crate. Used by cratonvm-vm under gpu-offload.
   Cargo.toml, build.rs               build.rs compiles test_classes/gpu/*.java
   src/
     lib.rs
@@ -365,16 +371,16 @@ A: Implement the `jit_api::gpu_lowering::GpuLowering` trait. Wire it into `Offlo
 
 ```
 $ cargo check --workspace                                 ✔ clean
-$ cargo check --workspace --features rustjvm-cli/gpu      ✔ clean
+$ cargo check --workspace --features cratonvm-cli/gpu      ✔ clean
 $ cargo test -p cuda-bridge                               ✔ 3 passed
 $ cargo test -p jit-cuda                                  ✔ 23 passed, 2 ignored
-$ cargo test -p rustjvm-jit-api                           ✔ 24 passed
-$ cargo test -p rustjvm-gc --features gpu-offload         ✔ 678 passed
-$ cargo test -p rustjvm-vm --features gpu-offload \
+$ cargo test -p cratonvm-jit-api                           ✔ 24 passed
+$ cargo test -p cratonvm-gc --features gpu-offload         ✔ 678 passed
+$ cargo test -p cratonvm-vm --features gpu-offload \
       --lib gpu_marshal                                   ✔ 9 passed
-$ cargo test -p rustjvm-vm --features gpu-offload \
+$ cargo test -p cratonvm-vm --features gpu-offload \
       --lib offload                                       ✔ 6 passed
-$ ./target/debug/rustjvm.exe --help | grep -i gpu         (no matches — clean)
-$ ./target/debug/rustjvm.exe --gpu-info                   error: unexpected argument '--gpu-info' found
+$ ./target/debug/cratonvm.exe --help | grep -i gpu         (no matches — clean)
+$ ./target/debug/cratonvm.exe --gpu-info                   error: unexpected argument '--gpu-info' found
                                                           (correct — gpu feature is off)
 ```

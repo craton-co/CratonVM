@@ -41,9 +41,9 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 

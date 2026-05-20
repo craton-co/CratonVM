@@ -1,15 +1,16 @@
 [workspace]
-members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "gc", "vm", "vm-cli", "jfr"]
+members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu", "gc", "vm", "vm-cli", "jfr"]
 resolver = "2"
 
 [workspace.package]
 publish = false
+authors = ["Craton Software Company"]
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
-repository = "https://github.com/craton-co/rust-jvm"
-homepage = "https://github.com/craton-co/rust-jvm"
+repository = "https://github.com/craton-co/cratonvm"
+homepage = "https://github.com/craton-co/cratonvm"
 description = "A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler"
 keywords = ["jvm", "java", "virtual-machine", "interpreter", "jit"]
 categories = ["compilers", "emulators"]
@@ -89,7 +90,7 @@ smallvec = { version = "1", features = ["union"] }
 # releases.
 #
 # Round-9 MED-8 / round-10 / round-11 audits all concur: no [patch] this
-# round, revisit in round-12. Issue tracker: #2317 (cratonvm/internal).
+# round, revisit in round-12.
 
 # RJ.4 — silence lints that do not represent real defects so
 # `cargo doc --workspace --no-deps` stays at zero warnings (the

@@ -1,10 +1,11 @@
 [package]
-name = "rustjvm-native-builtins"
+name = "cratonvm-native-builtins"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Java core native methods for RustJVM (java.lang.*)"
+description = "Java core native methods for CratonVM (java.lang.*)"
+readme = "../README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -23,12 +24,15 @@ legacy-synthetic-crypto = []
 experimental-jmx = []
 experimental-serialization = []
 experimental-aot = []
+# Phase 3 — Java-side GPU surface (craton.gpu.internal.Native shims).
+# When off, native-builtins emits no GPU code; the registrar is a no-op.
+gpu-offload = []
 
 [dependencies]
-rustjvm-types = { path = "../types" }
-rustjvm-native-api = { path = "../native-api" }
-rustjvm-native-collections = { path = "../native-collections" }
-rustjvm-reader = { path = "../reader" }
+cratonvm-types = { path = "../types" }
+cratonvm-native-api = { path = "../native-api" }
+cratonvm-native-collections = { path = "../native-collections" }
+cratonvm-reader = { path = "../reader" }
 regex = "1"
 # Fallback regex engine for Java patterns that use features the `regex` crate
 # does not support: lookaround `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`,
@@ -100,7 +104,7 @@ thiserror.workspace = true
 # T19_H10: real `Class.getPackage()` reads the source jar's manifest via the
 # launcher's ClassPath::read_jar_manifest API. Was previously a dev-dep but
 # the production code path needs it at runtime.
-rustjvm-classloading = { path = "../classloading" }
+cratonvm-classloading = { path = "../classloading" }
 
 [dev-dependencies]
 # Used by AOT + GraalVM tests for per-test tempdir isolation so

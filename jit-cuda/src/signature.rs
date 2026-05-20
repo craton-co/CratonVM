@@ -26,4 +26,19 @@ pub struct KernelSignature {
     /// `DeviceBuffer::to_host` will follow without an intervening
     /// `synchronize` or another sync-mode launch.
     pub needs_d2h_sync: bool,
+
+    /// Phase 9 #2 — constant-pool indices of `this.<field>` accesses
+    /// the body makes via the `aload_0; getfield <cp_index>` pattern.
+    /// Empty for static methods (the standard `getfield` opcode is
+    /// rejected outside the receiver-access pattern). For non-static
+    /// methods this is the ordered list of fields the marshaller must
+    /// extract from the receiver and pass as extra kernel args; the
+    /// lowering layer maps each `aload_0; getfield <cp_index>` pair
+    /// to the matching arg slot.
+    ///
+    /// Duplicates are preserved in body-encounter order; the
+    /// dispatcher / emitter can de-dup if it wants but that's
+    /// optimisation. The simplest implementation passes each access
+    /// as a distinct kernel arg.
+    pub this_field_cps: Vec<u16>,
 }

@@ -1,10 +1,10 @@
 //! JMX (Java Management Extensions) native method implementations.
 //! Provides MBeanServer and platform MXBeans for runtime monitoring.
 
-use rustjvm_types::ClassId;
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::ClassId;
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 use std::time::Instant;
 use std::sync::OnceLock;
 
@@ -108,7 +108,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "getVmArguments0",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -569,7 +569,7 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
         "getMemoryPools0",
         "()[Ljava/lang/management/MemoryPoolMXBean;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -767,7 +767,7 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
         "getAllFlagNames",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Reference, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -901,9 +901,9 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
 fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10);
     let pid = std::process::id();
-    let name = ctx.create_string(&format!("rustjvm@{}", pid));
+    let name = ctx.create_string(&format!("cratonvm@{}", pid));
     ctx.set_field(obj, 0, Value::Object(Some(name)));
-    let vm_name = ctx.create_string("RustJVM");
+    let vm_name = ctx.create_string("CratonVM");
     ctx.set_field(obj, 1, Value::Object(Some(vm_name)));
     let vm_version = ctx.create_string("0.1.0");
     ctx.set_field(obj, 2, Value::Object(Some(vm_version)));
@@ -1238,7 +1238,7 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
     r.register(cls, "getAllThreadIds", "()[J", |ctx, _args| {
-        use rustjvm_types::ArrayElementType;
+        use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Long, 1);
         ctx.set_array_element(arr, 0, Value::Long(1)); // main thread
         Ok(Some(Value::Object(Some(arr))))
@@ -1434,7 +1434,7 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         "java/lang/management/CompilationMXBean",
         3,
     );
-    let name = ctx.create_string("RustJVM JIT");
+    let name = ctx.create_string("CratonVM JIT");
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     ctx.set_field(obj, 1, Value::Long(0));   // totalCompilationTime
     ctx.set_field(obj, 2, Value::Int(0));    // isCompilationTimeMonitoringSupported
@@ -1476,7 +1476,7 @@ fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         "java/lang/management/GarbageCollectorMXBean",
         4,
     );
-    let name = ctx.create_string("RustJVM GC");
+    let name = ctx.create_string("CratonVM GC");
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     let gc_count = ctx.gc_collection_count() as i64;
     ctx.set_field(obj, 1, Value::Long(gc_count)); // collectionCount (real)
@@ -1613,7 +1613,7 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod jmx_tests {
     use super::*;
-    use rustjvm_native_api::NativeMethodRegistry;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     #[test]
     fn test_management_factory_registration() {

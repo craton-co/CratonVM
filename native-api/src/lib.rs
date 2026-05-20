@@ -1,4 +1,4 @@
-//! Native method API for RustJVM.
+//! Native method API for CratonVM.
 //!
 //! Provides the NativeContext trait, NativeMethodRegistry, FFI types,
 //! and FileDescriptorTable used by all native method crates.

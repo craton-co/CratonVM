@@ -1,4 +1,4 @@
-//! Shared types for the RustJVM project.
+//! Shared types for the CratonVM project.
 //!
 //! This crate contains foundational types used by all subsystems:
 //! value representation, class identifiers, heap layout constants,

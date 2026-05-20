@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::gc::GcResult;
 use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Volatile field atomicity — striped locks

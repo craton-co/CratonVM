@@ -1,7 +1,7 @@
 # JavaFX Status — Out-of-Tree Module
 
 **Status**: JavaFX is documented as an **out-of-tree** dependency, not shipped
-as part of RustJVM's core distribution.
+as part of CratonVM's core distribution.
 
 ## Background
 
@@ -11,7 +11,7 @@ as a set of platform-specific JAR files plus native libraries (`libglass`,
 `libprism`, `libjavafx_font`, etc.) that talk directly to the OS graphics
 stack.
 
-## How JavaFX works with RustJVM
+## How JavaFX works with CratonVM
 
 JavaFX does **not** use AWT peers. It has its own rendering pipeline:
 
@@ -21,27 +21,27 @@ JavaFX does **not** use AWT peers. It has its own rendering pipeline:
 4. **WebView** — embedded Chromium (jfxwebkit.dll)
 
 Because these are JNI native libraries (`.dll`/`.so`/`.dylib`), they work
-with any JVM that supports standard JNI — including RustJVM, since RustJVM
+with any JVM that supports standard JNI — including CratonVM, since CratonVM
 implements JNI via `libloading` (see `native/jni.rs`).
 
-## Running JavaFX apps on RustJVM
+## Running JavaFX apps on CratonVM
 
 ```bash
 # Download JavaFX SDK from https://gluonhq.com/products/javafx/
 # Set the module path to point at the JavaFX lib directory:
-rustjvm --module-path /path/to/javafx-sdk/lib \
+cratonvm --module-path /path/to/javafx-sdk/lib \
         --add-modules javafx.controls,javafx.fxml \
         -jar my-fx-app.jar
 ```
 
-RustJVM's JNI layer (`vm/src/native/jni.rs`) loads the native Glass/Prism
+CratonVM's JNI layer (`vm/src/native/jni.rs`) loads the native Glass/Prism
 libraries through `libloading`. The only requirement is that the JavaFX SDK
 matches the target platform and architecture.
 
 ## Known limitations
 
 - **GPU acceleration**: Prism's D3D/Metal backends require real GPU drivers.
-  RustJVM does not emulate GPU state — the host GPU driver handles rendering.
+  CratonVM does not emulate GPU state — the host GPU driver handles rendering.
 - **WebView**: The embedded Chromium component (`jfxwebkit`) requires
   additional native libraries not included in the base JavaFX SDK download
   on some platforms.
@@ -57,10 +57,10 @@ matches the target platform and architecture.
 3. **Maintenance**: Gluon ships quarterly releases. In-tree would require
    tracking their release cycle.
 4. **AWT sufficiency**: Most Java desktop apps (IntelliJ, NetBeans, DBeaver,
-   JMeter, etc.) use Swing/AWT, which RustJVM implements natively via the
+   JMeter, etc.) use Swing/AWT, which CratonVM implements natively via the
    `native-awt` crate. JavaFX apps are a smaller fraction of the ecosystem.
 
 ## T7.4.1 compliance
 
 This document satisfies T7.4.1 ("Document the FX module as out-of-tree
-(Gluon-supplied)") of the RustJVM roadmap.
+(Gluon-supplied)") of the CratonVM roadmap.

@@ -4,11 +4,11 @@
 //! infrastructure already present in [`crate::aot`] and [`crate::cds`]:
 //!
 //! * T5.7.1 — AOT pipeline wiring: serializes method profiles and compiled
-//!   JIT machine code to `~/.rustjvm/aot-cache/<hash>.profile` at shutdown,
+//!   JIT machine code to `~/.cratonvm/aot-cache/<hash>.profile` at shutdown,
 //!   restores them on startup when `--aot-cache` is set, and refuses a cache
 //!   entry whose class file SHA-256 no longer matches.
 //! * T5.7.2 — CDS via `.jsa` archive: serializes in-memory `java.base` class
-//!   bytes to `~/.rustjvm/cds/core.jsa` at shutdown (on `--cds-dump`) and
+//!   bytes to `~/.cratonvm/cds/core.jsa` at shutdown (on `--cds-dump`) and
 //!   memory-maps that file on startup (on `--cds`). A JDK build ID read
 //!   from `$JAVA_HOME/release` is included in the archive header, and the
 //!   archive is refused if the build ID differs on a later run.
@@ -28,10 +28,10 @@ use std::sync::Mutex;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Sub-directory under `~/.rustjvm` that holds all AOT profile/JIT caches.
+/// Sub-directory under `~/.cratonvm` that holds all AOT profile/JIT caches.
 pub const AOT_CACHE_DIR: &str = "aot-cache";
 
-/// Sub-directory under `~/.rustjvm` that holds the CDS archive(s).
+/// Sub-directory under `~/.cratonvm` that holds the CDS archive(s).
 pub const CDS_DIR: &str = "cds";
 
 /// Default name of the CDS archive file.
@@ -53,13 +53,13 @@ pub const SHA256_LEN: usize = 32;
 /// CLI flags passed through from vm-cli.
 #[derive(Debug, Clone, Default)]
 pub struct AotPipelineConfig {
-    /// `--aot-cache` — load/save AOT profile+JIT cache from `~/.rustjvm/aot-cache/`.
+    /// `--aot-cache` — load/save AOT profile+JIT cache from `~/.cratonvm/aot-cache/`.
     pub aot_cache: bool,
-    /// `--cds` — memory-map `~/.rustjvm/cds/core.jsa` at boot if present.
+    /// `--cds` — memory-map `~/.cratonvm/cds/core.jsa` at boot if present.
     pub cds_enabled: bool,
-    /// `--cds-dump` — write `~/.rustjvm/cds/core.jsa` at shutdown.
+    /// `--cds-dump` — write `~/.cratonvm/cds/core.jsa` at shutdown.
     pub cds_dump: bool,
-    /// Overrides the default `~/.rustjvm` root (used by integration tests).
+    /// Overrides the default `~/.cratonvm` root (used by integration tests).
     pub root_override: Option<PathBuf>,
     /// Overrides `$JAVA_HOME` for build-ID discovery (used by integration tests).
     pub java_home_override: Option<PathBuf>,
@@ -70,12 +70,12 @@ impl AotPipelineConfig {
         Self::default()
     }
 
-    /// Compute the root directory (`~/.rustjvm` by default).
+    /// Compute the root directory (`~/.cratonvm` by default).
     pub fn root(&self) -> PathBuf {
         if let Some(ref r) = self.root_override {
             return r.clone();
         }
-        dirs_home().join(".rustjvm")
+        dirs_home().join(".cratonvm")
     }
 
     /// Absolute path of the AOT cache sub-directory (not created).
@@ -756,7 +756,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        d.push(format!("rustjvm_cp12_{tag}_{pid}_{ns}"));
+        d.push(format!("cratonvm_cp12_{tag}_{pid}_{ns}"));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

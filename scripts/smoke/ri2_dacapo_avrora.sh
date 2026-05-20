@@ -9,7 +9,7 @@ URL="https://downloads.sourceforge.net/project/dacapobench/9.12-bach-MR1/dacapo-
 
 smoke_download "$URL" "$JAR"
 
-SMOKE_TIMEOUT=600 smoke_run_rustjvm --Xmx 1500m --jar "$JAR" -- avrora -s small -n 1
+SMOKE_TIMEOUT=600 smoke_run_cratonvm --Xmx 1500m --jar "$JAR" -- avrora -s small -n 1
 
 # DaCapo prints "===== DaCapo 9.12-MR1 avrora PASSED in <N> msec ====="
 smoke_require_signal "PASSED in [0-9]+ msec"

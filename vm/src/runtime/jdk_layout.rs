@@ -1,6 +1,6 @@
 //! JDK home layout generator.
 //!
-//! Generates the directory tree and metadata files that make a RustJVM
+//! Generates the directory tree and metadata files that make a CratonVM
 //! installation recognizable as a JDK to Maven, Gradle, IntelliJ IDEA,
 //! Eclipse, and the VS Code Java Extension Pack.
 //!
@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 
 const JAVA_VERSION: &str = "25";
 const JAVA_VERSION_DATE: &str = "2025-09-16";
-const IMPLEMENTOR: &str = "RustJVM";
-const IMPLEMENTOR_VERSION: &str = "RustJVM 0.2.0";
-const SOURCE: &str = ".:git:rustjvm";
+const IMPLEMENTOR: &str = "CratonVM";
+const IMPLEMENTOR_VERSION: &str = "CratonVM 0.2.0";
+const SOURCE: &str = ".:git:cratonvm";
 
 /// Complete module list matching a full JDK 25 install.
 const MODULES: &[&str] = &[
@@ -190,8 +190,8 @@ SOURCE=\"{SOURCE}\"\n"
         let path = bin.join(name);
         let content = format!(
             "#!/bin/sh\n\
-             # RustJVM stub for {name}\n\
-             exec rustjvm --tool {name} \"$@\"\n"
+             # CratonVM stub for {name}\n\
+             exec cratonvm --tool {name} \"$@\"\n"
         );
         std::fs::write(&path, content)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
@@ -203,8 +203,8 @@ SOURCE=\"{SOURCE}\"\n"
         let path = bin.join(format!("{name}.cmd"));
         let content = format!(
             "@echo off\r\n\
-             REM RustJVM stub for {name}\r\n\
-             rustjvm --tool {name} %*\r\n"
+             REM CratonVM stub for {name}\r\n\
+             cratonvm --tool {name} %*\r\n"
         );
         std::fs::write(&path, content)?;
         Ok(())
@@ -230,12 +230,12 @@ SOURCE=\"{SOURCE}\"\n"
         // lib/modules — marker file (real JDKs have a jimage here)
         std::fs::write(
             lib.join("modules"),
-            b"RUSTJVM_MODULES_MARKER\n",
+            b"CRATONVM_MODULES_MARKER\n",
         )?;
 
         // lib/security/default.policy
         let default_policy = "\
-// RustJVM default security policy\n\
+// CratonVM default security policy\n\
 grant {\n\
     permission java.security.AllPermission;\n\
 };\n";
@@ -243,7 +243,7 @@ grant {\n\
 
         // conf/security/java.security
         let java_security = "\
-# RustJVM java.security properties\n\
+# CratonVM java.security properties\n\
 security.provider.1=sun.security.provider.Sun\n\
 securerandom.source=file:/dev/urandom\n\
 keystore.type=pkcs12\n";
@@ -261,7 +261,7 @@ keystore.type=pkcs12\n";
         std::fs::create_dir_all(&include)?;
 
         let jni_h = "\
-/* RustJVM JNI header stub */\n\
+/* CratonVM JNI header stub */\n\
 #ifndef _JAVASOFT_JNI_H_\n\
 #define _JAVASOFT_JNI_H_\n\
 \n\
@@ -290,7 +290,7 @@ typedef void*    JavaVM;\n\
         std::fs::write(include.join("jni.h"), jni_h)?;
 
         let jvmti_h = "\
-/* RustJVM JVMTI header stub */\n\
+/* CratonVM JVMTI header stub */\n\
 #ifndef _JAVASOFT_JVMTI_H_\n\
 #define _JAVASOFT_JVMTI_H_\n\
 \n\
@@ -403,8 +403,8 @@ mod tests {
 
         let content = fs::read_to_string(layout.jdk_home().join("release")).unwrap();
         assert!(content.contains("JAVA_VERSION=\"25\""));
-        assert!(content.contains("IMPLEMENTOR=\"RustJVM\""));
-        assert!(content.contains("IMPLEMENTOR_VERSION=\"RustJVM 0.2.0\""));
+        assert!(content.contains("IMPLEMENTOR=\"CratonVM\""));
+        assert!(content.contains("IMPLEMENTOR_VERSION=\"CratonVM 0.2.0\""));
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
             layout.jdk_home().join("bin/java.cmd")
         };
         let content = fs::read_to_string(path).unwrap();
-        // The stub forwards "--tool java" to rustjvm so that `-version` is
+        // The stub forwards "--tool java" to cratonvm so that `-version` is
         // dispatched correctly.
         assert!(
             content.contains("--tool java"),
@@ -566,7 +566,7 @@ mod tests {
             bin.join("java.cmd")
         };
         let content = fs::read_to_string(path).unwrap();
-        assert!(content.contains("rustjvm"));
+        assert!(content.contains("cratonvm"));
         assert!(content.contains("java"));
     }
 

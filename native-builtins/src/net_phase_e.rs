@@ -100,16 +100,16 @@ fn cached_nested_jar(outer: &str, inner_entry: &str) -> std::io::Result<Arc<Vec<
 /// Returns true if the Spring fat-jar debug prints (`URLRES-DBG`, `OSTR-DBG`,
 /// `CCE-DBG`) should be emitted. Off by default — these printlns themselves
 /// dominate startup time for Spring Boot fat JARs (hundreds of lines per
-/// second).  Enable by setting `RUSTJVM_SPRING_DBG=1`.
+/// second).  Enable by setting `CRATONVM_SPRING_DBG=1`.
 #[inline]
 fn spring_dbg_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("RUSTJVM_SPRING_DBG").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SPRING_DBG").is_some())
 }
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
-use rustjvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
@@ -240,16 +240,16 @@ const HS_PORT: usize = 4;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ioex<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IOException { message: message.into() }.into()
 }
-fn npe<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn npe<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::NullPointerException {
         message: Some(message.into()),
     }
     .into()
 }
-fn iae<S: Into<String>>(message: S) -> rustjvm_types::error::MethodCallFailed {
+fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IllegalArgumentException { message: message.into() }.into()
 }
 
@@ -277,7 +277,7 @@ fn value_or_string(ctx: &dyn NativeContext, v: Value, default: &str) -> String {
 fn read_inet_socket_address(
     ctx: &dyn NativeContext,
     sa: ObjectRef,
-) -> Result<(String, i32), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(String, i32), cratonvm_types::error::MethodCallFailed> {
     // Wave 3-B² (RE.4): the real JDK `InetSocketAddress` stores all of its
     // logical state in a private inner `InetSocketAddressHolder` reachable
     // through slot 0 (`holder`). The holder layout is:
@@ -367,7 +367,7 @@ fn java_byte_array_to_vec(
     arr: ObjectRef,
     offset: i32,
     length: i32,
-) -> Result<Vec<u8>, rustjvm_types::error::MethodCallFailed> {
+) -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed> {
     if offset < 0 || length < 0 {
         return Err(iae(format!("bad byte[] slice: off={offset} len={length}")));
     }
@@ -396,7 +396,7 @@ fn copy_bytes_into_java_array(
     arr: ObjectRef,
     offset: i32,
     data: &[u8],
-) -> Result<usize, rustjvm_types::error::MethodCallFailed> {
+) -> Result<usize, cratonvm_types::error::MethodCallFailed> {
     if offset < 0 {
         return Err(iae(format!("negative offset {offset}")));
     }
@@ -460,7 +460,7 @@ fn alloc_inet_socket_address(
     isa
 }
 
-fn resolve_host(host: &str) -> Result<IpAddr, rustjvm_types::error::MethodCallFailed> {
+fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallFailed> {
     if host.is_empty() || host == "localhost" {
         return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
@@ -953,7 +953,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             );
             let msg = ctx.create_string(&format!("unknown protocol: {proto_lc}"));
             ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
-            return Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
                 exc,
             ));
         }
@@ -2019,7 +2019,7 @@ fn http_build_request(
         let _ = write!(&mut out, "{k}: {v}\r\n");
     }
     if !has_user_agent {
-        out.extend_from_slice(b"User-Agent: rustjvm-phaseE/1.0\r\n");
+        out.extend_from_slice(b"User-Agent: cratonvm-phaseE/1.0\r\n");
     }
     if !has_connection {
         out.extend_from_slice(b"Connection: close\r\n");
@@ -2756,15 +2756,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // return a proper reference so the caller's `astore`/`if_acmpeq`
             // sequence does not retain an unrooted jlong handle (Letsgo AV).
             let cls = match cls {
-                rustjvm_types::Value::Long(bits) => {
+                cratonvm_types::Value::Long(bits) => {
                     if let Some(p) =
-                        rustjvm_types::jlong_bits_as_aligned_object_ptr(bits as u64)
+                        cratonvm_types::jlong_bits_as_aligned_object_ptr(bits as u64)
                     {
-                        rustjvm_types::Value::Object(Some(unsafe {
-                            rustjvm_types::ObjectRef::from_raw(p as *mut u8)
+                        cratonvm_types::Value::Object(Some(unsafe {
+                            cratonvm_types::ObjectRef::from_raw(p as *mut u8)
                         }))
                     } else {
-                        rustjvm_types::Value::Object(None)
+                        cratonvm_types::Value::Object(None)
                     }
                 }
                 other => other,
@@ -2811,7 +2811,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // Spring Boot's default config uses AUTOWIRE_NO; the bug only
             // surfaces because the spurious non-zero read drives setter
             // injection where none was requested.
-            Ok(Some(rustjvm_types::Value::Int(0)))
+            Ok(Some(cratonvm_types::Value::Int(0)))
         },
     );
     // K4 follow-up: also register on subclasses in case the bytecode binds
@@ -2823,7 +2823,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/beans/factory/support/ChildBeanDefinition",
     ] {
         r.register(sub, "getResolvedAutowireMode", "()I", |_ctx, _args| {
-            Ok(Some(rustjvm_types::Value::Int(0)))
+            Ok(Some(cratonvm_types::Value::Int(0)))
         });
     }
 
@@ -3197,7 +3197,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "isFileURL",
         "(Ljava/net/URL;)Z",
         |ctx, args| {
-            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
                 eprintln!("[DBG_SBLOAD] ResourceUtils.isFileURL native override");
             }
             let url = match args.get(0) {
@@ -3217,7 +3217,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "isJarURL",
         "(Ljava/net/URL;)Z",
         |ctx, args| {
-            if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
                 eprintln!("[DBG_SBLOAD] ResourceUtils.isJarURL native override");
             }
             let url = match args.get(0) {
@@ -4504,7 +4504,7 @@ fn parse_http_request(mut stream: TcpStream) -> Option<PendingRequest> {
 fn re10_dispatch_pending(
     ctx: &mut dyn NativeContext,
     server_id: i32,
-) -> Result<usize, rustjvm_types::error::MethodCallFailed> {
+) -> Result<usize, cratonvm_types::error::MethodCallFailed> {
     let mut drained = 0usize;
     loop {
         let req_opt = {
@@ -4655,7 +4655,7 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
     };
     let state_cl = state.clone();
     std::thread::Builder::new()
-        .name(format!("rustjvm-httpserver-{server_id}"))
+        .name(format!("cratonvm-httpserver-{server_id}"))
         .spawn(move || {
             listener.set_nonblocking(true).ok();
             while state_cl.running.load(Ordering::SeqCst) {
@@ -4989,7 +4989,7 @@ mod tests {
     fn re9_iae_helper_reachable() {
         assert!(matches!(
             iae(""),
-            rustjvm_types::error::MethodCallFailed::InternalError(_)
+            cratonvm_types::error::MethodCallFailed::InternalError(_)
         ));
     }
 

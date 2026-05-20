@@ -1,5 +1,5 @@
 ﻿# bench/maven/diff-baseline.ps1
-# WP8.7 — compare the last rust-jvm run against bench-baseline.json.
+# WP8.7 — compare the last cratonvm run against bench-baseline.json.
 # Schema-v1 identical to bench/wildfly/. Windows PowerShell 5.1.
 
 $ErrorActionPreference = 'Stop'
@@ -13,7 +13,7 @@ $RcFile    = Join-Path $Here 'last-run.rc'
 
 if (-not (Test-Path $Baseline))  { Write-Error "diff-baseline(maven): $Baseline missing"; exit 2 }
 foreach ($f in @($StdoutLog, $StderrLog, $RcFile)) {
-    if (-not (Test-Path $f)) { Write-Error "diff-baseline(maven): $f missing; run run-under-rustjvm.ps1 first"; exit 2 }
+    if (-not (Test-Path $f)) { Write-Error "diff-baseline(maven): $f missing; run run-under-cratonvm.ps1 first"; exit 2 }
 }
 
 $ActualRc = (Get-Content $RcFile -Raw).Trim()

@@ -111,7 +111,7 @@ jobs:
             server VM).
 
             This unblocks the T10.8.2 geomean gate: once merged,
-            `bench-hotspot-compare` compares RustJVM's
+            `bench-hotspot-compare` compares CratonVM's
             `bench/baseline.json` against live C2 medians instead of
             the all-zero placeholder.
           branch: hotspot-baseline-refresh

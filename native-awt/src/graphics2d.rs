@@ -353,8 +353,8 @@ impl Graphics2DState {
         if self.disposed || w < 0 || h < 0 {
             return;
         }
-        let cx = x + w / 2;
-        let cy = y + h / 2;
+        let cx = x.saturating_add(w / 2);
+        let cy = y.saturating_add(h / 2);
         let rx = (w / 2) as u32;
         let ry = (h / 2) as u32;
         self.renderer.draw_ellipse(cx, cy, rx, ry);
@@ -364,8 +364,8 @@ impl Graphics2DState {
         if self.disposed || w < 0 || h < 0 {
             return;
         }
-        let cx = x + w / 2;
-        let cy = y + h / 2;
+        let cx = x.saturating_add(w / 2);
+        let cy = y.saturating_add(h / 2);
         let rx = (w / 2) as u32;
         let ry = (h / 2) as u32;
         self.renderer.fill_ellipse(cx, cy, rx, ry);
@@ -379,8 +379,8 @@ impl Graphics2DState {
         if self.disposed || w < 0 || h < 0 {
             return;
         }
-        let cx = x + w / 2;
-        let cy = y + h / 2;
+        let cx = x.saturating_add(w / 2);
+        let cy = y.saturating_add(h / 2);
         let rx = (w / 2) as u32;
         let ry = (h / 2) as u32;
         self.renderer.draw_arc(cx, cy, rx, ry, start as f32, extent as f32);
@@ -394,8 +394,8 @@ impl Graphics2DState {
         if self.disposed || w < 0 || h < 0 {
             return;
         }
-        let cx = x + w / 2;
-        let cy = y + h / 2;
+        let cx = x.saturating_add(w / 2);
+        let cy = y.saturating_add(h / 2);
         let rx = (w / 2) as u32;
         let ry = (h / 2) as u32;
         self.renderer.fill_arc(cx, cy, rx, ry, start as f32, extent as f32);
@@ -575,8 +575,10 @@ impl Graphics2DState {
             color1, color2, cyclic,
         } = &self.paint
         {
-            let mid_x = (x1 + x2) as f64 / 2.0;
-            let mid_y = (y1 + y2) as f64 / 2.0;
+            // Widen to i64 before summing so extreme coordinates cannot
+            // overflow i32 (which would panic in debug / wrap in release).
+            let mid_x = (x1 as i64 + x2 as i64) as f64 / 2.0;
+            let mid_y = (y1 as i64 + y2 as i64) as f64 / 2.0;
             let c = gradient_color_at(
                 *gx1, *gy1, *gx2, *gy2,
                 *color1, *color2, *cyclic,
@@ -645,17 +647,43 @@ impl Graphics2DState {
             return;
         }
 
+        // `gradient_color_at` recomputes `dx`, `dy`, `len_sq` and the
+        // `(py-gy1)*dy` term on every call. All of those are row-invariant
+        // (or fully invariant), so hoist them out of the loops. The inner
+        // loop keeps the exact same per-pixel arithmetic the old code did
+        // (`(px-gx1)*dx`, an add, and a divide by `len_sq`) so the result is
+        // bit-identical to the previous `gradient_color_at(...)` path — only
+        // the redundant recomputation is removed.
+        //
+        // NOTE: a per-pixel *colour* delta-add is intentionally NOT used —
+        // `lerp_argb`'s per-channel `.round()` and the cyclic triangle-wave
+        // make the colour non-affine in screen space, so a colour-add would
+        // not be bit-exact. Only the redundant scalar work is hoisted.
+        let degenerate = len_sq < 1e-12;
         for py in y0..y1 {
             let fy = py as f64;
             let row_base = (py as usize) * buf_w_usize;
-            // Precompute color per pixel within the row. The hot work is the
-            // gradient math (a dot product and a lerp) — the row-direct write
-            // eliminates per-pixel transform/clip/bounds re-checks.
+            // Row-invariant y-component of the gradient dot product.
+            let row_term = (fy - gy1) * dy_g;
             let row = &mut pixels[row_base + x0 as usize..row_base + x1 as usize];
+            if degenerate {
+                row.fill(color1);
+                continue;
+            }
             for (i, dst) in row.iter_mut().enumerate() {
                 let fx = (x0 + i as i32) as f64;
-                let c = gradient_color_at(gx1, gy1, gx2, gy2, color1, color2, cyclic, fx, fy);
-                *dst = c;
+                // Same expression as gradient_color_at, just with the
+                // row-invariant term and len_sq hoisted.
+                let mut t = ((fx - gx1) * dx_g + row_term) / len_sq;
+                if cyclic {
+                    t = t.rem_euclid(2.0);
+                    if t > 1.0 {
+                        t = 2.0 - t;
+                    }
+                } else {
+                    t = t.clamp(0.0, 1.0);
+                }
+                *dst = lerp_argb(color1, color2, t);
             }
         }
     }

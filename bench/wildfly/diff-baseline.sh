@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bench/wildfly/diff-baseline.sh
-# WP0.5 — compare the last rust-jvm run against bench-baseline.json.
+# WP0.5 — compare the last cratonvm run against bench-baseline.json.
 # Exits 0 if the run matches (including expected failure mode), non-zero if
 # anything drifted. Designed for CI nightly-regression detection.
 #
@@ -27,7 +27,7 @@ if [[ ! -f "$BASELINE" ]]; then
 fi
 for f in "$STDOUT_LOG" "$STDERR_LOG" "$RC_FILE"; do
     if [[ ! -f "$f" ]]; then
-        echo "diff-baseline: ERROR $f missing; run run-under-rustjvm.sh first" >&2
+        echo "diff-baseline: ERROR $f missing; run run-under-cratonvm.sh first" >&2
         exit 2
     fi
 done

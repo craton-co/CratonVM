@@ -1,9 +1,9 @@
 //! WP8.10 — JBoss Modules boot smoke test.
 //!
 //! This is the *deterministic* unit-test version of
-//! `bench/wildfly-boot/run-under-rustjvm.sh` — it exercises just enough
+//! `bench/wildfly-boot/run-under-cratonvm.sh` — it exercises just enough
 //! of the JBoss Modules `Main.main` chain to surface the *first*
-//! failure under rust-jvm, without needing the 150 MB WildFly tarball.
+//! failure under cratonvm, without needing the 150 MB WildFly tarball.
 //!
 //! Failure mapping (each probe pinpoints one Wave 1-7 WP):
 //!
@@ -34,7 +34,7 @@
 //!
 //! `vm/tests/wildfly_boot_fixtures/`
 //!   ├── JBossModulesProbe.java              # the probe source
-//!   ├── rustjvm/wildfly/JBossModulesProbe.class
+//!   ├── cratonvm/wildfly/JBossModulesProbe.class
 //!   ├── stubs/org/jboss/modules/*.java      # compile-time stubs
 //!   └── modules/                            # built at test runtime
 //!       └── system/layers/base/.../module.xml
@@ -46,11 +46,11 @@
 //! declared in `classloading/src/class_manager.rs:3811+` whose field
 //! layout matches what `jboss_module_loader.rs` natives expect.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{create_java_string, Vm};
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{create_java_string, Vm};
 
-const FIXTURE_CLASS: &str = "rustjvm/wildfly/JBossModulesProbe";
+const FIXTURE_CLASS: &str = "cratonvm/wildfly/JBossModulesProbe";
 
 fn fixture_dir() -> std::path::PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -59,7 +59,7 @@ fn fixture_dir() -> std::path::PathBuf {
 
 fn probe_compiled() -> bool {
     fixture_dir()
-        .join("rustjvm/wildfly/JBossModulesProbe.class")
+        .join("cratonvm/wildfly/JBossModulesProbe.class")
         .exists()
 }
 
@@ -90,20 +90,20 @@ fn write_fixture_module(root: &std::path::Path, module_name: &str) {
 }
 
 /// Per-test setup: build a fresh `modules/` tree containing the named
-/// module(s), point `RUSTJVM_JBOSS_MP_ROOT` at it, and return a Vm
+/// module(s), point `CRATONVM_JBOSS_MP_ROOT` at it, and return a Vm
 /// whose classpath includes the JBossModulesProbe class.
 fn vm_with_modules_tree(modules: &[&str]) -> (Vm, tempfile::TempDir) {
     // tempfile::TempDir is dropped when this function returns —
     // Vm holds no reference to the root, so as long as we return the
     // TempDir alongside the Vm the dir lives at least as long as
-    // `RUSTJVM_JBOSS_MP_ROOT` is read (i.e. through every subsequent
+    // `CRATONVM_JBOSS_MP_ROOT` is read (i.e. through every subsequent
     // vm.invoke() call).
     let tmp = tempfile::TempDir::new().expect("tempdir for fixture modules tree");
     for m in modules {
         write_fixture_module(tmp.path(), m);
     }
     let mp_root = tmp.path().to_string_lossy().into_owned();
-    std::env::set_var("RUSTJVM_JBOSS_MP_ROOT", &mp_root);
+    std::env::set_var("CRATONVM_JBOSS_MP_ROOT", &mp_root);
 
     // Classpath contains ONLY the probe — NOT the stubs/ directory,
     // so org/jboss/modules/* resolves to the synthetic stub layout
@@ -287,8 +287,8 @@ fn probe2_boot_holder_is_local_module_loader() {
 // Probe 3 — loadModule succeeds for a fixture-built module
 // =========================================================================
 
-/// Acceptance: with a `module.xml` for "rustjvm.wp8.fixture" present
-/// under `<RUSTJVM_JBOSS_MP_ROOT>/system/layers/base/...`, the native
+/// Acceptance: with a `module.xml` for "cratonvm.wp8.fixture" present
+/// under `<CRATONVM_JBOSS_MP_ROOT>/system/layers/base/...`, the native
 /// `LocalModuleLoader.loadModule(name)` returns a non-null Module.
 /// First-failure ranking:
 ///   a. ModuleNotFoundException — fixture not laid out correctly.
@@ -311,7 +311,7 @@ fn probe3_load_module_succeeds() {
     if !require_probe() {
         return;
     }
-    const MODULE_NAME: &str = "rustjvm.wp8.fixture";
+    const MODULE_NAME: &str = "cratonvm.wp8.fixture";
     let (mut vm, _tmp) = vm_with_modules_tree(&[MODULE_NAME]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe3: SKIPPED — gated on probe0 fix");
@@ -353,7 +353,7 @@ fn probe4_loaded_module_name_roundtrips() {
     if !require_probe() {
         return;
     }
-    const MODULE_NAME: &str = "rustjvm.wp8.fixture";
+    const MODULE_NAME: &str = "cratonvm.wp8.fixture";
     let (mut vm, _tmp) = vm_with_modules_tree(&[MODULE_NAME]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe4: SKIPPED — gated on probe0 fix");
@@ -391,7 +391,7 @@ fn probe5_module_classloader_resolves() {
     if !require_probe() {
         return;
     }
-    const MODULE_NAME: &str = "rustjvm.wp8.fixture";
+    const MODULE_NAME: &str = "cratonvm.wp8.fixture";
     let (mut vm, _tmp) = vm_with_modules_tree(&[MODULE_NAME]);
     if !jboss_synthetic_stubs_reachable(&mut vm) {
         eprintln!("probe5: SKIPPED — gated on probe0 fix");

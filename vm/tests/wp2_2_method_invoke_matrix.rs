@@ -5,7 +5,7 @@
 //! getModifiers). The probe at `apps/method_invoke_probe/MethodInvokeProbe.java`
 //! defines 50 cases each printing a `PASS-N: ...` or `FAIL-N: ...` line plus
 //! a final `OK 50/50` / `FAIL` summary. We drive that probe through the
-//! `rustjvm.exe` CLI binary and assert on the captured stdout.
+//! `cratonvm.exe` CLI binary and assert on the captured stdout.
 //!
 //! The test layout is:
 //! - 9 registry-gate tests (carried over from the staging contract): these
@@ -22,7 +22,7 @@
 //! still regress so triage can be focused. We do NOT mark the failing
 //! sub-categories `#[ignore]` — they are the acceptance gates for the WP.
 
-use rustjvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::NativeMethodRegistry;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 #[test]
 fn method_invoke_native_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(
         r.find(
             "java/lang/reflect/Method",
@@ -50,7 +50,7 @@ fn method_invoke_native_registered() {
 #[test]
 fn method_introspection_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     let m = "java/lang/reflect/Method";
     let cases: &[(&str, &str)] = &[
         ("getName", "()Ljava/lang/String;"),
@@ -72,7 +72,7 @@ fn method_introspection_natives_registered() {
 #[test]
 fn class_get_declared_method_natives_registered() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     let public_get = r.find(
         "java/lang/Class",
         "getDeclaredMethod",
@@ -146,7 +146,7 @@ fn boxed_wrapper_class_names_complete() {
 #[test]
 fn essential_natives_register_no_duplicates() {
     let mut r = NativeMethodRegistry::new();
-    rustjvm_native_builtins::register_essential_natives(&mut r);
+    cratonvm_native_builtins::register_essential_natives(&mut r);
     assert!(r.len() > 200, "registry too small, got {}", r.len());
 }
 
@@ -232,10 +232,10 @@ fn probe_source_file() -> PathBuf {
         .join("MethodInvokeProbe.java")
 }
 
-/// Resolve the rustjvm CLI binary. Prefer release (faster), fall back to
-/// debug; honor the `RUSTJVM_BIN` env var for hermetic CI builds.
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+/// Resolve the cratonvm CLI binary. Prefer release (faster), fall back to
+/// debug; honor the `CRATONVM_BIN` env var for hermetic CI builds.
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
@@ -243,7 +243,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = manifest.parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -291,10 +291,10 @@ fn run_probe_once() -> Option<String> {
                 eprintln!("[wp2_2] probe class files unavailable; skipping");
                 return None;
             }
-            let bin = match rustjvm_binary() {
+            let bin = match cratonvm_binary() {
                 Some(b) => b,
                 None => {
-                    eprintln!("[wp2_2] rustjvm binary not found; build with `cargo build --release -p rustjvm-cli`");
+                    eprintln!("[wp2_2] cratonvm binary not found; build with `cargo build --release -p cratonvm-cli`");
                     return None;
                 }
             };
@@ -314,7 +314,7 @@ fn run_probe_once() -> Option<String> {
                     Some(format!("{stdout}\n--- STDERR ---\n{stderr}"))
                 }
                 Err(e) => {
-                    eprintln!("[wp2_2] failed to spawn rustjvm: {e}");
+                    eprintln!("[wp2_2] failed to spawn cratonvm: {e}");
                     None
                 }
             }

@@ -1,5 +1,5 @@
 [package]
-name = "rustjvm-fuzz"
+name = "cratonvm-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.11"
-rustjvm-reader = { path = "../reader" }
+cratonvm-reader = { path = "../reader" }
 
 [[bin]]
 name = "fuzz_classfile"

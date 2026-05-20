@@ -1,5 +1,5 @@
 [package]
-name = "rustjvm-reader"
+name = "cratonvm-reader"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,11 +7,11 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Java .class file parser for the RustJVM project"
+description = "Java .class file parser for the CratonVM project"
 readme = "../README.md"
 
 [dependencies]
-rustjvm-types = { path = "../types" }
+cratonvm-types = { path = "../types" }
 thiserror.workspace = true
 tracing.workspace = true
 bitflags = "2"

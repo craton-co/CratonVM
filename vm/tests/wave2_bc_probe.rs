@@ -47,7 +47,7 @@
 //!
 //! ## RBC.1 (Session 109) — JIT-disabled path now reaches first println
 //!
-//! Diagnostic narrowing showed that with `RUSTJVM_DISABLE_JIT=1` the
+//! Diagnostic narrowing showed that with `CRATONVM_DISABLE_JIT=1` the
 //! Windows `STATUS_ACCESS_VIOLATION` disappears entirely and BcProbe
 //! emits its first println `bc.added providers=14` before failing
 //! later in `DirectoryStream.iterator()` (a separate, JIT-independent
@@ -56,7 +56,7 @@
 //! ~thousand-class `<clinit>` avalanche, not a heap or native shim
 //! bug. The complement test
 //! `bc_probe_reaches_first_println_with_jit_disabled` runs the probe
-//! with `RUSTJVM_DISABLE_JIT=1` and asserts the first println.
+//! with `CRATONVM_DISABLE_JIT=1` and asserts the first println.
 //!
 //! The targeted JIT-skip-list extensions in
 //! `vm/src/jit/skip_list.rs::is_known_miscompile` for
@@ -86,15 +86,15 @@ fn probe_dir() -> PathBuf {
         .join("bc_probe")
 }
 
-fn rustjvm_binary() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("RUSTJVM_BIN") {
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
         let p = PathBuf::from(&bin);
         if p.exists() {
             return Some(p);
         }
     }
     let target = manifest_dir().parent().unwrap().join("target");
-    let exe = if cfg!(windows) { "rustjvm.exe" } else { "rustjvm" };
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
     for profile in &["release", "debug"] {
         let candidate = target.join(profile).join(exe);
         if candidate.exists() {
@@ -105,7 +105,7 @@ fn rustjvm_binary() -> Option<PathBuf> {
 }
 
 fn java_home() -> Option<String> {
-    if let Ok(h) = std::env::var("RUSTJVM_JAVA_HOME") {
+    if let Ok(h) = std::env::var("CRATONVM_JAVA_HOME") {
         return Some(h);
     }
     if let Ok(h) = std::env::var("JAVA_HOME") {
@@ -127,7 +127,7 @@ fn classpath() -> Option<String> {
     if !bc_jar.exists() {
         return None;
     }
-    // Windows uses ';' as classpath separator; the rustjvm CLI accepts
+    // Windows uses ';' as classpath separator; the cratonvm CLI accepts
     // either ':' or ';' on either platform. Use ';' to match the prompt.
     let sep = if cfg!(windows) { ";" } else { ":" };
     Some(format!("{}{}{}", probe.display(), sep, bc_jar.display()))
@@ -141,7 +141,7 @@ fn run_probe_with_env(
     timeout: Duration,
     env_vars: &[(&str, &str)],
 ) -> Option<(String, String, Option<i32>)> {
-    let bin = rustjvm_binary()?;
+    let bin = cratonvm_binary()?;
     let cp = classpath()?;
     let mut cmd = Command::new(&bin);
     if let Some(home) = java_home() {
@@ -156,7 +156,7 @@ fn run_probe_with_env(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[wave2_bc] failed to spawn rustjvm: {e}");
+            eprintln!("[wave2_bc] failed to spawn cratonvm: {e}");
             return None;
         }
     };
@@ -236,17 +236,17 @@ fn bc_probe_reaches_provider_init_without_segfault() {
         );
     }
 
-    // Sanity: the rustjvm logger must have started (proves we got
+    // Sanity: the cratonvm logger must have started (proves we got
     // past argument parsing and into the VM bootstrap). The
     // BigInteger fixup line is a stable RBIGDEC.1 marker that fires
     // during BC's ASN.1 OID parsing — useful evidence that BC's
     // `<clinit>` chain ran far enough to trigger BigInteger init.
-    let bootstrap_started = stderr.contains("Starting RustJVM")
+    let bootstrap_started = stderr.contains("Starting CratonVM")
         || stderr.contains("stack-dump watchdog armed")
         || stderr.contains("Post-clinit fixup");
     assert!(
         bootstrap_started,
-        "wave2_bc: rustjvm bootstrap did not produce any expected stderr \
+        "wave2_bc: cratonvm bootstrap did not produce any expected stderr \
          marker. stderr={:?}",
         stderr
     );
@@ -266,10 +266,10 @@ fn bc_probe_reaches_provider_init_without_segfault() {
 }
 
 /// RBC.1 (Session 109) — pin the diagnostic finding that
-/// `RUSTJVM_DISABLE_JIT=1` clears the Windows `STATUS_ACCESS_VIOLATION`
+/// `CRATONVM_DISABLE_JIT=1` clears the Windows `STATUS_ACCESS_VIOLATION`
 /// and lets BcProbe reach its first println.
 ///
-/// Today: with `RUSTJVM_DISABLE_JIT=1` the probe prints
+/// Today: with `CRATONVM_DISABLE_JIT=1` the probe prints
 /// `bc.added providers=14` and then exits non-zero on
 /// `DirectoryStream.iterator()` (a separate, JIT-independent gap that
 /// does not block this test). Without the env var the probe segfaults
@@ -284,7 +284,7 @@ fn bc_probe_reaches_provider_init_without_segfault() {
 fn bc_probe_reaches_first_println_with_jit_disabled() {
     let (stdout, _stderr, rc) = match run_probe_with_env(
         Duration::from_secs(45),
-        &[("RUSTJVM_DISABLE_JIT", "1")],
+        &[("CRATONVM_DISABLE_JIT", "1")],
     ) {
         Some(o) => o,
         None => {
@@ -307,14 +307,14 @@ fn bc_probe_reaches_first_println_with_jit_disabled() {
     );
     assert!(
         !is_segfault_exit_code,
-        "wave2_bc: BcProbe segfaulted even with RUSTJVM_DISABLE_JIT=1 \
+        "wave2_bc: BcProbe segfaulted even with CRATONVM_DISABLE_JIT=1 \
          (rc={:?}). The interpreter-only path must be SIGSEGV-free.",
         rc
     );
 
     assert!(
         stdout.contains("bc.added providers="),
-        "wave2_bc: with RUSTJVM_DISABLE_JIT=1, BcProbe must reach the \
+        "wave2_bc: with CRATONVM_DISABLE_JIT=1, BcProbe must reach the \
          first println `bc.added providers=`. Got stdout={:?}",
         stdout
     );

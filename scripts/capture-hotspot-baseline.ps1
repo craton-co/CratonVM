@@ -152,7 +152,7 @@ $metrics = @(
 
 # --- Emit + compile harness -------------------------------------------------
 $tmpRoot = if ($env:TEMP) { $env:TEMP } else { [System.IO.Path]::GetTempPath() }
-$tmp = Join-Path "$tmpRoot" ('rustjvm-hotspot-' + [guid]::NewGuid())
+$tmp = Join-Path "$tmpRoot" ('cratonvm-hotspot-' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path "$tmp" -Force | Out-Null
 try {
     $javaSrc = @'

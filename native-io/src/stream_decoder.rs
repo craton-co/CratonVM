@@ -21,11 +21,11 @@
 //! trailing incomplete bytes (UTF-8 leading or continuation bytes,
 //! UTF-16 odd dangling byte) between calls.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use rustjvm_native_api::charset as engine;
+use cratonvm_native_api::charset as engine;
 
 /// Slot indices.
 const SD_INPUT: usize = 0;
@@ -68,7 +68,7 @@ pub(crate) fn alloc_stream_decoder(
 ) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized("sun/nio/cs/StreamDecoder") {
         Ok(c) => c,
-        Err(_) => rustjvm_types::ClassId::new(0),
+        Err(_) => cratonvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(cid, SD_NUM_FIELDS);
     let name = ctx.create_string(charset_name);
@@ -149,13 +149,13 @@ fn resolve_name(
 }
 
 fn normalize(n: &str) -> String {
-    rustjvm_native_builtins_normalize(n)
+    cratonvm_native_builtins_normalize(n)
 }
 
-/// Thin wrapper so we don't pull in the full `rustjvm-native-builtins`
+/// Thin wrapper so we don't pull in the full `cratonvm-native-builtins`
 /// crate from native-io (it would create a cycle). The rule set is
 /// intentionally the strict subset our engine understands.
-fn rustjvm_native_builtins_normalize(name: &str) -> String {
+fn cratonvm_native_builtins_normalize(name: &str) -> String {
     match name.to_uppercase().replace(['-', '_'], "").as_str() {
         "UTF8" => "UTF-8".to_string(),
         "UTF16" => "UTF-16".to_string(),
@@ -255,7 +255,7 @@ fn refill_and_copy(
     out: ObjectRef,
     off: usize,
     len: usize,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     let mut produced = 0usize;
     while produced < len {
         let pos = ctx.get_field(this, SD_POS).as_int().unwrap_or(0) as usize;
@@ -310,7 +310,7 @@ fn refill_and_copy(
 fn refill(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-) -> Result<usize, rustjvm_types::error::MethodCallFailed> {
+) -> Result<usize, cratonvm_types::error::MethodCallFailed> {
     let is = match ctx.get_field(this, SD_INPUT) {
         Value::Object(Some(s)) => s,
         _ => return Ok(0),

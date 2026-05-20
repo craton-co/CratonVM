@@ -497,9 +497,9 @@ pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
     }
     let parsed = SigParser::new(sig).parse_class_sig();
     let mut cache = signature_cache().lock();
-    match &parsed {
+    match parsed {
         Some(c) => {
-            let arc = Arc::new(c.clone());
+            let arc = Arc::new(c);
             cache.insert(Arc::clone(sig), ParsedSignature::Class(Arc::clone(&arc)));
             Some(arc)
         }
@@ -520,9 +520,9 @@ pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
     }
     let parsed = SigParser::new(sig).parse_method_sig();
     let mut cache = signature_cache().lock();
-    match &parsed {
+    match parsed {
         Some(m) => {
-            let arc = Arc::new(m.clone());
+            let arc = Arc::new(m);
             cache.insert(Arc::clone(sig), ParsedSignature::Method(Arc::clone(&arc)));
             Some(arc)
         }
@@ -543,9 +543,9 @@ pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
     }
     let parsed = SigParser::new(sig).parse_type_sig();
     let mut cache = signature_cache().lock();
-    match &parsed {
+    match parsed {
         Some(t) => {
-            let arc = Arc::new(t.clone());
+            let arc = Arc::new(t);
             cache.insert(Arc::clone(sig), ParsedSignature::Field(Arc::clone(&arc)));
             Some(arc)
         }
@@ -590,6 +590,26 @@ mod tests {
         let sig = parse_method_signature("()V").unwrap();
         assert!(sig.param_types.is_empty());
         assert!(matches!(sig.return_type, TypeSig::Base('V')));
+    }
+
+    #[test]
+    fn deeply_nested_signature_is_rejected_not_overflow() {
+        // A pathological array signature `[[[...I` nested far past the
+        // depth cap must fail to parse rather than overflow the stack.
+        let bomb = format!("{}I", "[".repeat(100_000));
+        assert!(parse_field_signature(&bomb).is_none());
+
+        // Deeply-nested generic type arguments are also bounded: build
+        // `Lp<Lp<Lp<...>;>;>;` to a hostile depth and confirm no overflow.
+        let mut nested = String::new();
+        for _ in 0..100_000 {
+            nested.push_str("Lp<");
+        }
+        nested.push_str("Lp;");
+        for _ in 0..100_000 {
+            nested.push_str(">;");
+        }
+        assert!(parse_field_signature(&nested).is_none());
     }
 
     #[test]

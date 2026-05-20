@@ -66,7 +66,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rustjvm_types::ObjectRef;
+use cratonvm_types::ObjectRef;
 
 use crate::memory::vm_heap::VmHeap;
 
@@ -110,7 +110,7 @@ pub(crate) struct JitFrameChainEntry {
 /// precise root enumeration via [`JitEntryGuard::enter_with_compiled`].
 #[derive(Clone, Copy)]
 pub(crate) struct PreciseFrameInfo {
-    /// Raw pointer to the [`rustjvm_jit::CompiledMethod`] whose code
+    /// Raw pointer to the [`cratonvm_jit::CompiledMethod`] whose code
     /// is currently executing in this frame. The pointer is borrowed
     /// — callers guarantee the CompiledMethod outlives the JIT call,
     /// which holds trivially because the guard is scoped to a single
@@ -122,7 +122,7 @@ pub(crate) struct PreciseFrameInfo {
     ///      the CM cannot be dropped while a call is in flight.
     ///   2. The chain entry is popped the moment the JIT call returns
     ///      or unwinds — there is no stale-pointer window.
-    pub compiled_method: *const rustjvm_jit::CompiledMethod,
+    pub compiled_method: *const cratonvm_jit::CompiledMethod,
     /// Base address of the frame (the RBP value captured at the
     /// start of the prologue). Oop-map slot offsets are added to
     /// this value to obtain the absolute address of each oop slot.
@@ -170,7 +170,7 @@ static GLOBAL_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// `gc::gc_quiescence`) because the GC must consult it from inside its own
 /// collection cycles, which would create a circular dependency if the flag
 /// lived in the vm crate.
-pub use rustjvm_gc::gc_quiescence::is_active as gc_must_defer;
+pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 
 /// Capture the current native stack pointer.
 ///
@@ -229,7 +229,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
     // tracker, so conservative fallback entries remain possible. The
     // defer guard can only be lifted once every entry in flight is
     // guaranteed precise (a later follow-up under NEW-12).
-    rustjvm_gc::gc_quiescence::enter();
+    cratonvm_gc::gc_quiescence::enter();
     depth
 }
 
@@ -252,7 +252,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     let popped = JIT_ENTRY_CHAIN.with(|c| c.borrow_mut().pop());
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
-        rustjvm_gc::gc_quiescence::leave();
+        cratonvm_gc::gc_quiescence::leave();
         Some(entry.entry_sp)
     } else {
         None
@@ -307,7 +307,7 @@ impl JitEntryGuard {
     /// holding, so even after the borrow ends the pointer remains
     /// valid for any in-flight GC walker.
     #[inline(always)]
-    pub fn enter_with_compiled(cm: &rustjvm_jit::CompiledMethod) -> Self {
+    pub fn enter_with_compiled(cm: &cratonvm_jit::CompiledMethod) -> Self {
         if !cm.has_precise_oop_maps() {
             // No maps populated — fall back to conservative. This is
             // the default path today because the JIT compiler does
@@ -318,7 +318,7 @@ impl JitEntryGuard {
         let entry = JitFrameChainEntry {
             entry_sp: sp,
             precise: Some(PreciseFrameInfo {
-                compiled_method: cm as *const rustjvm_jit::CompiledMethod,
+                compiled_method: cm as *const cratonvm_jit::CompiledMethod,
                 frame_base: sp,
                 entry_ptr: cm.entry_ptr(),
             }),
@@ -446,7 +446,7 @@ fn scan_one_frame_precise(
     // the borrow ends. The JIT cache also keeps the CompiledMethod
     // alive via Arc for the duration of the call. Reading through
     // the pointer is valid for the lifetime of this function.
-    let cm: &rustjvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+    let cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
 
     // Without call-frame introspection we can't directly recover the
     // "current" native PC inside the active JIT frame. Two approaches
@@ -537,7 +537,7 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     }
     // Bound the scan to a sane upper limit so a stale `high_sp` (e.g. from a
     // recycled stack region after a thread tear-down) cannot send us into
-    // unmapped pages. 8 MiB matches the default `RUSTJVM_STACK` size and is
+    // unmapped pages. 8 MiB matches the default `CRATONVM_STACK` size and is
     // generously above any realistic JIT spill region.
     const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
     let span = high_sp.saturating_sub(aligned_low);
@@ -669,7 +669,7 @@ mod tests {
     /// [`OopMapEntry::new`] starts empty and the slot count accumulates.
     #[test]
     fn new12_oop_map_entry_basics() {
-        let mut entry = rustjvm_jit::OopMapEntry::new(0x1000);
+        let mut entry = cratonvm_jit::OopMapEntry::new(0x1000);
         assert_eq!(entry.slot_count(), 0);
         entry.frame_slot_offsets.push(-16);
         entry.frame_slot_offsets.push(-24);
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(entry.native_pc_offset, 0x1000);
     }
 
-    /// [`rustjvm_jit::CompiledMethod::find_oop_map_for_pc`] returns the
+    /// [`cratonvm_jit::CompiledMethod::find_oop_map_for_pc`] returns the
     /// exact match when present and `None` otherwise, and sorts on
     /// first-use so out-of-order pushes work.
     #[test]
@@ -685,21 +685,21 @@ mod tests {
         // We need a real CompiledMethod to exercise the lookup. The
         // executable-buffer path requires a live buffer, so we
         // construct one from a minimal sequence.
-        let mut buf = rustjvm_jit::ExecutableBuffer::new(64)
+        let mut buf = cratonvm_jit::ExecutableBuffer::new(64)
             .expect("executable buffer alloc must succeed in tests");
         buf.emit_byte(0xC3); // ret
-        let mut cm = rustjvm_jit::CompiledMethod::new(buf);
+        let mut cm = cratonvm_jit::CompiledMethod::new(buf);
 
         // Push out-of-order entries.
-        cm.push_oop_map(rustjvm_jit::OopMapEntry {
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x40,
             frame_slot_offsets: vec![-8],
         });
-        cm.push_oop_map(rustjvm_jit::OopMapEntry {
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
             frame_slot_offsets: vec![-16, -24],
         });
-        cm.push_oop_map(rustjvm_jit::OopMapEntry {
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
             frame_slot_offsets: vec![],
         });
@@ -727,9 +727,9 @@ mod tests {
     /// conservative guard.
     #[test]
     fn new12_enter_with_compiled_empty_maps_falls_back_to_conservative() {
-        let buf = rustjvm_jit::ExecutableBuffer::new(64)
+        let buf = cratonvm_jit::ExecutableBuffer::new(64)
             .expect("executable buffer alloc must succeed in tests");
-        let cm = rustjvm_jit::CompiledMethod::new(buf);
+        let cm = cratonvm_jit::CompiledMethod::new(buf);
         assert!(!cm.has_precise_oop_maps());
 
         let local_before = current_thread_jit_depth();
@@ -751,10 +751,10 @@ mod tests {
     /// chain entry that carries the metadata the walker needs.
     #[test]
     fn new12_enter_with_compiled_with_maps_registers_precise() {
-        let buf = rustjvm_jit::ExecutableBuffer::new(64)
+        let buf = cratonvm_jit::ExecutableBuffer::new(64)
             .expect("executable buffer alloc must succeed in tests");
-        let mut cm = rustjvm_jit::CompiledMethod::new(buf);
-        cm.push_oop_map(rustjvm_jit::OopMapEntry {
+        let mut cm = cratonvm_jit::CompiledMethod::new(buf);
+        cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0,
             frame_slot_offsets: vec![-16],
         });

@@ -38,15 +38,15 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::Value;
 
-/// Diagnostic gate — `RUSTJVM_FREEMIND_REAL=1` skips shim registration
+/// Diagnostic gate — `CRATONVM_FREEMIND_REAL=1` skips shim registration
 /// so the real bytecode runs under CratonVM (used to measure how far the
 /// partial bootstrap can drive FreeMind's Swing init).
 fn freemind_real_mode() -> bool {
-    std::env::var("RUSTJVM_FREEMIND_REAL")
+    std::env::var("CRATONVM_FREEMIND_REAL")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
@@ -76,7 +76,7 @@ fn freemind_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 pub fn register_freemind_stubs(registry: &mut NativeMethodRegistry) {
     if freemind_real_mode() {
         tracing::warn!(
-            "[freemind-shim] RUSTJVM_FREEMIND_REAL=1 — shim DISABLED, running real bytecode"
+            "[freemind-shim] CRATONVM_FREEMIND_REAL=1 — shim DISABLED, running real bytecode"
         );
         return;
     }

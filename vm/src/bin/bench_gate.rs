@@ -487,7 +487,7 @@ fn parse_args<I: IntoIterator<Item = String>>(it: I) -> Result<CliArgs, GateErro
 }
 
 const USAGE: &str = "\
-bench-gate — RustJVM benchmark regression gate
+bench-gate — CratonVM benchmark regression gate
 
 USAGE:
     bench-gate [--baseline FILE] [--threshold F] [--update-baseline]
@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn baseline_save_load_round_trip() {
-        let dir = std::env::temp_dir().join("rustjvm-bench-gate-test");
+        let dir = std::env::temp_dir().join("cratonvm-bench-gate-test");
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("baseline.json");
         let r = run(&[("a", 1.0), ("b", 2.0)]);
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn corrupt_baseline_returns_error() {
-        let dir = std::env::temp_dir().join("rustjvm-bench-gate-corrupt");
+        let dir = std::env::temp_dir().join("cratonvm-bench-gate-corrupt");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("baseline.json");
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     fn parse_estimates_reads_criterion_format() {
-        let dir = std::env::temp_dir().join("rustjvm-bench-gate-parse");
+        let dir = std::env::temp_dir().join("cratonvm-bench-gate-parse");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("estimates.json");
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn collect_run_walks_criterion_layout() {
-        let dir = std::env::temp_dir().join("rustjvm-bench-gate-walk");
+        let dir = std::env::temp_dir().join("cratonvm-bench-gate-walk");
         let _ = fs::remove_dir_all(&dir);
         // target/criterion/<group>/<id>/new/estimates.json
         let bench_a = dir.join("vm_startup").join("new");
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn collect_run_errors_when_directory_missing() {
-        let p = std::env::temp_dir().join("rustjvm-bench-gate-missing-xyz");
+        let p = std::env::temp_dir().join("cratonvm-bench-gate-missing-xyz");
         let _ = fs::remove_dir_all(&p);
         let err = collect_run(&p).unwrap_err();
         matches!(err, GateError::NoData(_));

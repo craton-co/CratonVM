@@ -13,8 +13,8 @@
 //! see `test_jit_scan_rejects_frem_drem`) and stick to add/sub/mul/div
 //! and conversions.
 
-use rustjvm_jit::x64::{compile, is_jit_compatible};
-use rustjvm_jit_api::JitRuntimeHelpers;
+use cratonvm_jit::x64::{compile, is_jit_compatible};
+use cratonvm_jit_api::JitRuntimeHelpers;
 use std::collections::{HashMap, HashSet};
 
 /// Dummy runtime helpers — none of the FP tests invoke heap allocation,

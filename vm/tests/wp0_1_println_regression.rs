@@ -28,9 +28,9 @@
 //! `populate_virtual_invoke_cache` and `try_stackless_invoke`: native
 //! override has priority over class-file bytecode.
 
-use rustjvm_vm::config::VmConfig;
-use rustjvm_vm::types::Value;
-use rustjvm_vm::vm::{create_java_string, SharedVm};
+use cratonvm_vm::config::VmConfig;
+use cratonvm_vm::types::Value;
+use cratonvm_vm::vm::{create_java_string, SharedVm};
 use std::sync::Arc;
 
 /// Synthetic-only smoke: in pure-synthetic mode the real JDK is never
@@ -78,7 +78,7 @@ fn test_println_multi_line_no_npe() {
             "fd tag must remain a valid Int(1|2) after allocation round {text}"
         );
         let read_back =
-            rustjvm_vm::vm::read_java_string(&shared.heap, s).unwrap_or_default();
+            cratonvm_vm::vm::read_java_string(&shared.heap, s).unwrap_or_default();
         assert_eq!(
             read_back, *text,
             "create_java_string round-trip must survive between println calls"

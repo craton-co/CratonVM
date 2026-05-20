@@ -17,7 +17,7 @@
 //! exists at a stable path under apps/. We use those bytes directly
 //! (they're already known to parse).
 
-use rustjvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions};
+use cratonvm_classloading::{ClassLoaderId, ClassManager, DefineClassOptions};
 use std::path::PathBuf;
 
 /// Load the compiled `Hello` fixture's raw bytes.
@@ -197,7 +197,7 @@ fn hidden_class_uses_override_name_and_skips_dup_check() {
 
 #[test]
 fn code_source_url_threads_to_class() {
-    use rustjvm_classloading::CodeSource;
+    use cratonvm_classloading::CodeSource;
     let bytes = match load_hello_bytes() {
         Some(b) => b,
         None => return,
@@ -346,7 +346,7 @@ fn code_source_defaults_to_runtime_url_when_unsupplied() {
 /// PD's CodeSource carries a real URL.
 #[test]
 fn supplied_code_source_takes_precedence_over_default() {
-    use rustjvm_classloading::CodeSource;
+    use cratonvm_classloading::CodeSource;
     let bytes = match load_hello_bytes() {
         Some(b) => b,
         None => return,
@@ -487,7 +487,7 @@ fn hidden_class_repeated_mangling_remains_unique() {
 /// hidden emission: each one gets its OWN CodeSource (no aliasing).
 #[test]
 fn hidden_classes_carry_independent_code_sources() {
-    use rustjvm_classloading::CodeSource;
+    use cratonvm_classloading::CodeSource;
     let bytes = match load_hello_bytes() {
         Some(b) => b,
         None => return,

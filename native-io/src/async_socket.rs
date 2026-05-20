@@ -32,9 +32,9 @@
 //! All public surface is registered via `register_async_socket_real`.
 
 use parking_lot::{Mutex, RwLock};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use rustjvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -242,7 +242,7 @@ fn start_pool() -> crossbeam_compat::Sender<Job> {
     for i in 0..pool_size {
         let rx = rx.clone();
         std::thread::Builder::new()
-            .name(format!("rustjvm-aio-{i}"))
+            .name(format!("cratonvm-aio-{i}"))
             .spawn(move || worker_main(rx))
             .expect("aio worker spawn");
     }

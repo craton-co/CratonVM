@@ -18,7 +18,7 @@ const PREALLOC_CAP: usize = 1024;
 // once per process (instead of being function-local statics that, while
 // also initialized once, lived inside the body and bloated the
 // function-scope namespace). Identical semantics — these are still
-// `LazyLock<Arc<str>>` populated by `rustjvm_types::intern_arc(...)` and
+// `LazyLock<Arc<str>>` populated by `cratonvm_types::intern_arc(...)` and
 // match the constant-pool-interned `Arc<str>` the lazy decode path
 // hands us — but now the symbols are visible to the whole module and
 // don't need re-declaring if we add another dispatch site.
@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 macro_rules! canon {
     ($name:ident, $s:expr) => {
         static $name: LazyLock<Arc<str>> =
-            LazyLock::new(|| rustjvm_types::intern_arc($s));
+            LazyLock::new(|| cratonvm_types::intern_arc($s));
     };
 }
 canon!(CANON_CODE, "Code");
@@ -81,7 +81,7 @@ pub enum Attribute {
     /// The `SourceFile` attribute (4.7.10): the source file name.
     ///
     /// Stored as `Arc<str>` — the constant-pool Utf8 entry is already
-    /// interned via `rustjvm_types::intern_arc`, so this is a refcount-bump
+    /// interned via `cratonvm_types::intern_arc`, so this is a refcount-bump
     /// clone of the pool's backing allocation (no per-class String alloc).
     SourceFile(Arc<str>),
 
@@ -468,7 +468,7 @@ pub struct MethodParameter {
 /// [`new_decoded`] to bypass parsing entirely.
 ///
 /// The `name` is an `Arc<str>` rather than a `String` because UTF-8 entries
-/// in the constant pool are already interned via `rustjvm_types::intern_arc`
+/// in the constant pool are already interned via `cratonvm_types::intern_arc`
 /// at parse time (see T10.2); cloning the name is a single refcount bump
 /// rather than a new allocation.
 ///
@@ -663,7 +663,7 @@ pub fn decode_attribute(
     // forms. The eager API takes `&str` for back-compat, so intern it
     // here once. The intern table is a global `Mutex<HashMap>` lookup;
     // amortised over the per-attribute parse work it's negligible.
-    let name_arc = rustjvm_types::intern_arc(name);
+    let name_arc = cratonvm_types::intern_arc(name);
     decode_attribute_with_source_arc(&name_arc, &source, 0..source.len(), cp)
 }
 
@@ -689,7 +689,7 @@ pub fn decode_attribute_with_source(
     // names. Eager `&str` callers pay one intern lookup; the lazy
     // hot-path caller already has an interned `Arc<str>` and uses
     // [`decode_attribute_with_source_arc`] directly.
-    let name_arc = rustjvm_types::intern_arc(name);
+    let name_arc = cratonvm_types::intern_arc(name);
     decode_attribute_with_source_arc(&name_arc, source, range, cp)
 }
 
@@ -1424,6 +1424,9 @@ fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassR
     decode_annotation_depth(buf, 0)
 }
 
+/// Depth-tracking implementation of [`decode_annotation`]. `depth` counts
+/// the annotation/array nesting so far; it is checked against
+/// [`MAX_ANNOTATION_DEPTH`] here and inside [`decode_element_value_depth`].
 fn decode_annotation_depth(
     buf: &mut ClassFileBuffer<'_>,
     depth: usize,
@@ -1458,6 +1461,10 @@ fn decode_element_value(
     decode_element_value_depth(buf, 0)
 }
 
+/// Depth-tracking implementation of [`decode_element_value`]. The `[`
+/// (array) and `@` (nested annotation) tags recurse; each recursion
+/// increments `depth`, and exceeding [`MAX_ANNOTATION_DEPTH`] returns
+/// an error instead of descending further.
 fn decode_element_value_depth(
     buf: &mut ClassFileBuffer<'_>,
     depth: usize,
@@ -1744,6 +1751,25 @@ mod tests {
             }
             other => panic!("Expected LineNumberTable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deeply_nested_element_value_array_is_rejected() {
+        // Build an element_value that is a 300-deep stack of `[` arrays
+        // (each array tag followed by a u16 count of 1). This exceeds the
+        // MAX_ANNOTATION_DEPTH cap and must return an error rather than
+        // recursing into a native stack overflow.
+        let mut data = Vec::new();
+        for _ in 0..300 {
+            data.push(b'[');
+            data.extend_from_slice(&1u16.to_be_bytes());
+        }
+        // Innermost value: a constant int (`I`) + u16 const index.
+        data.push(b'I');
+        data.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut buf = ClassFileBuffer::new(&data);
+        assert!(decode_element_value(&mut buf).is_err());
     }
 
     #[test]
@@ -2865,7 +2891,7 @@ mod tests {
         // CP: [0]=Tombstone, [1]=Utf8("StackMapTable")
         let cp = ConstantPool::new(vec![
                 ConstantPoolEntry::Tombstone,
-                ConstantPoolEntry::Utf8(rustjvm_types::intern_arc("StackMapTable")),
+                ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("StackMapTable")),
         ]);
 
         // Build the Code body bytes:
@@ -2933,7 +2959,7 @@ mod tests {
     fn nested_stack_map_table_lands_at_correct_absolute_offset() {
         let cp = ConstantPool::new(vec![
                 ConstantPoolEntry::Tombstone,
-                ConstantPoolEntry::Utf8(rustjvm_types::intern_arc("StackMapTable")),
+                ConstantPoolEntry::Utf8(cratonvm_types::intern_arc("StackMapTable")),
         ]);
 
         // Build the Code body bytes (same shape as above), but place it

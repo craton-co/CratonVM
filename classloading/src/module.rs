@@ -850,11 +850,11 @@ impl ModuleRegistry {
 ///
 /// Returns `None` if the attribute is not a Module attribute.
 pub fn descriptor_from_module_attribute(
-    attr: &rustjvm_reader::attribute::Attribute,
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    attr: &cratonvm_reader::attribute::Attribute,
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
 ) -> Option<ModuleDescriptor> {
-    use rustjvm_reader::attribute::Attribute;
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::attribute::Attribute;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     let (name_index, flags, version_index, requires_raw, exports_raw, opens_raw, uses_raw, provides_raw) =
         match attr {
@@ -975,11 +975,11 @@ pub fn descriptor_from_module_attribute(
 ///
 /// Returns the packages as slash-format strings (e.g. `"java/lang"`).
 pub fn packages_from_module_packages_attribute(
-    attr: &rustjvm_reader::attribute::Attribute,
-    cp: &rustjvm_reader::constant_pool::ConstantPool,
+    attr: &cratonvm_reader::attribute::Attribute,
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
 ) -> Option<Vec<String>> {
-    use rustjvm_reader::attribute::Attribute;
-    use rustjvm_reader::constant_pool::ConstantPoolEntry;
+    use cratonvm_reader::attribute::Attribute;
+    use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     if let Attribute::ModulePackages { packages } = attr {
         let names: Vec<String> = packages
@@ -1415,7 +1415,7 @@ mod tests {
         // JEP 403 (JDK 17+): classpath code CANNOT deep-reflect into a
         // named module's non-opened package by default. Pre-JEP-403 JDKs
         // treated unnamed accessors as unconditionally allowed — that is
-        // the behavior RustJVM explicitly rejects here.
+        // the behavior CratonVM explicitly rejects here.
         let mut reg = ModuleRegistry::new();
         reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
         reg.build_readability_graph();

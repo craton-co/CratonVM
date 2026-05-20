@@ -45,9 +45,9 @@
 //! same issue with `ThreadLocalRandom` and solves it by using a per-thread
 //! field, which is an option if memory ever becomes a concern.
 
-use rustjvm_types::error::{MethodCallResult};
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallResult};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::{ObjectRef, Value};
 
 // Round-9 MED-3: migrated `SEED_TABLE` from `std::sync::RwLock` to
 // `parking_lot::RwLock` — removes poison handling (which the file already
@@ -339,7 +339,7 @@ pub(crate) fn native_random_next_int_bound(
         _ => 1,
     };
     if bound <= 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "bound must be positive".to_string(),
         }
         .into());
@@ -528,7 +528,7 @@ pub(crate) fn native_secure_random_next_int_bound(
         _ => 1,
     };
     if bound <= 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "bound must be positive".to_string(),
         }
         .into());
@@ -574,7 +574,7 @@ pub(crate) fn native_secure_random_next_bytes(
         // Don't silently return zeros.  Surface the failure as a
         // SecurityException so the caller sees the entropy source
         // is broken.
-        return Err(rustjvm_types::error::RuntimeError::SecurityException {
+        return Err(cratonvm_types::error::RuntimeError::SecurityException {
             message: "OS entropy source unavailable".to_string(),
         }
         .into());
@@ -629,19 +629,19 @@ pub(crate) fn native_secure_random_generate_seed(
         _ => 0,
     };
     if n < 0 {
-        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
             message: "numBytes must be non-negative".to_string(),
         }
         .into());
     }
     let n = n as usize;
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, n);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
     if n == 0 {
         return Ok(Some(Value::Object(Some(arr))));
     }
     let mut buf = vec![0u8; n];
     if !os_random_bytes(&mut buf) {
-        return Err(rustjvm_types::error::RuntimeError::SecurityException {
+        return Err(cratonvm_types::error::RuntimeError::SecurityException {
             message: "OS entropy source unavailable".to_string(),
         }
         .into());

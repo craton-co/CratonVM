@@ -1,7 +1,7 @@
-//! Java I/O native methods for RustJVM.
+//! Java I/O native methods for CratonVM.
 //!
 //! Contains native method implementations for java.io and java.nio I/O classes.
-//! The FileDescriptorTable is provided by rustjvm-native-api.
+//! The FileDescriptorTable is provided by cratonvm-native-api.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,11 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
-use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use rustjvm_types::ArrayElementType;
-use rustjvm_types::{ClassId, ObjectRef, Value};
-use rustjvm_native_api::fd_table::FdId;
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
+use cratonvm_types::ArrayElementType;
+use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_native_api::fd_table::FdId;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
 pub mod random_access_file;
 pub mod nio_native;
@@ -112,29 +112,119 @@ fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
         return Ok(path.to_string());
     }
 
-    // Reject path traversal sequences — only reject `..` as a path
-    // segment, not as a substring. `foo..bar.txt` is a perfectly legal
-    // filename.
-    if Path::new(path)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // AUDIT 2026-05-19: TOCTOU / canonicalize-after-check fix.
+    //
+    // The previous implementation rejected `..` only as a literal path
+    // *component* and then canonicalized AFTER the traversal check. That
+    // is unsound: a symlink whose target escapes the sandbox contains no
+    // `..` component, so it passed the textual check, and the canonical
+    // (symlink-resolved) result was never re-validated. An attacker could
+    // therefore reach any file the host process can see.
+    //
+    // The sound order is: canonicalize FIRST (resolving every symlink and
+    // `..`/`.` segment against the real filesystem), THEN check that the
+    // fully-resolved path is contained within the sandbox root. The
+    // sandbox root is the process current working directory — the same
+    // boundary the old `..` check was implicitly trying to enforce.
+    let sandbox_root = match fs::canonicalize(std::env::current_dir().unwrap_or_default()) {
+        Ok(r) => r,
+        Err(_) => {
+            // Can't establish a sandbox root — fall back to the textual
+            // `..`-component rejection so we never silently accept a
+            // traversal.
+            if Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::SecurityException {
+                        message: format!("Path traversal detected: {}", path),
+                    },
+                )));
+            }
+            return Ok(path.to_string());
+        }
+    };
+
+    // Resolve the path against the real filesystem. If the path itself
+    // exists, canonicalize it directly. If it does not yet exist (e.g.
+    // `createNewFile`, `FileOutputStream` of a new file), canonicalize the
+    // deepest existing ancestor — typically the parent directory — and
+    // re-attach the not-yet-existing trailing components. This still
+    // resolves any symlink in the existing portion of the path.
+    let canonical = match fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => {
+            let p = Path::new(path);
+            match p.parent() {
+                Some(parent) => {
+                    let parent_for_canon = if parent.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        parent
+                    };
+                    match fs::canonicalize(parent_for_canon) {
+                        Ok(canon_parent) => match p.file_name() {
+                            Some(name) => canon_parent.join(name),
+                            // No file name (e.g. trailing `/`) — use the
+                            // canonical parent directly.
+                            None => canon_parent,
+                        },
+                        Err(_) => {
+                            // Parent does not exist either. Reject any
+                            // `..` segment textually as a last resort
+                            // rather than accept an unresolvable path.
+                            if p.components()
+                                .any(|c| matches!(c, std::path::Component::ParentDir))
+                            {
+                                return Err(MethodCallFailed::InternalError(
+                                    VmError::Runtime(RuntimeError::SecurityException {
+                                        message: format!(
+                                            "Path traversal detected: {}",
+                                            path
+                                        ),
+                                    }),
+                                ));
+                            }
+                            // Best-effort resolution against the sandbox
+                            // root so the containment check below is still
+                            // meaningful.
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                sandbox_root.join(p)
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        sandbox_root.join(p)
+                    }
+                }
+            }
+        }
+    };
+
+    // Re-validate: the fully-resolved path must stay inside the sandbox
+    // root. This is the check that catches a symlink whose target escapes
+    // the sandbox, as well as any `..`-based escape that canonicalization
+    // collapsed into a real out-of-sandbox path.
+    if !canonical.starts_with(&sandbox_root) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::SecurityException {
-                message: format!("Path traversal detected: {}", path),
+                message: format!(
+                    "Path traversal detected: {} resolves outside sandbox {}",
+                    path,
+                    sandbox_root.display()
+                ),
             },
         )));
     }
 
-    // Canonicalize the path if it exists on disk; otherwise just return it validated
-    match fs::canonicalize(path) {
-        Ok(canonical) => Ok(canonical.to_string_lossy().into_owned()),
-        Err(_) => {
-            // Path doesn't exist yet (e.g. createNewFile) — that's fine,
-            // we've already rejected ".." and null bytes.
-            Ok(path.to_string())
-        }
-    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 /// Convenience: validate and return path, or an IO-style error.
@@ -172,15 +262,53 @@ fn default_whitespace_regex() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"\s+").unwrap())
 }
 
+/// Bounded LRU cache of compiled delimiter regexes, keyed by pattern string.
+///
+/// `regex::Regex::new` is comparatively expensive; user-supplied Scanner
+/// delimiters tend to repeat (the same `useDelimiter(...)` value is used for
+/// every token). The cache holds the most-recently-used `REGEX_CACHE_CAP`
+/// entries. `regex::Regex` is internally reference-counted, so cloning a
+/// cached entry is cheap and the returned value is behavior-identical to a
+/// freshly compiled regex.
+const REGEX_CACHE_CAP: usize = 32;
+
+fn regex_cache() -> &'static Mutex<Vec<(String, regex::Regex)>> {
+    static CACHE: OnceLock<Mutex<Vec<(String, regex::Regex)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(REGEX_CACHE_CAP)))
+}
+
 /// Small cache for recently-used delimiter regexes.
 fn cached_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     // Fast path: default whitespace delimiter
     if pattern == r"\s+" {
         return Ok(default_whitespace_regex().clone());
     }
-    // For user-supplied patterns, compile on demand.
-    // A production implementation could add an LRU cache here.
-    regex::Regex::new(pattern)
+    // Cache lookup for repeated user-supplied delimiters.
+    {
+        let mut cache = regex_cache().lock();
+        if let Some(pos) = cache.iter().position(|(p, _)| p == pattern) {
+            // Move the hit to the back to mark it most-recently-used.
+            let entry = cache.remove(pos);
+            let re = entry.1.clone();
+            cache.push(entry);
+            return Ok(re);
+        }
+    }
+    // Miss: compile (outside the lock to avoid holding it during the
+    // potentially slow `Regex::new`), then insert with LRU eviction.
+    let re = regex::Regex::new(pattern)?;
+    {
+        let mut cache = regex_cache().lock();
+        // Another thread may have inserted the same pattern meanwhile;
+        // only insert if still absent so we don't grow with duplicates.
+        if !cache.iter().any(|(p, _)| p == pattern) {
+            if cache.len() >= REGEX_CACHE_CAP {
+                cache.remove(0); // evict least-recently-used
+            }
+            cache.push((pattern.to_string(), re.clone()));
+        }
+    }
+    Ok(re)
 }
 
 /// Get a compiled regex for the given delimiter pattern, falling back to
@@ -198,7 +326,7 @@ const AL_FIELD_SIZE: usize = 1;
 const AL_DEFAULT_CAPACITY: usize = 10;
 
 fn al_init(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let buf = ctx.new_ref_array(rustjvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
+    let buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
     ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AL_FIELD_SIZE, Value::Int(0));
 }
@@ -211,7 +339,7 @@ fn al_add(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
     let buf = match ctx.get_field(this, AL_FIELD_DATA) {
         Value::Object(Some(a)) => a,
         _ => {
-            let new_buf = ctx.new_ref_array(rustjvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
+            let new_buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), AL_DEFAULT_CAPACITY);
             ctx.set_field(this, AL_FIELD_DATA, Value::Object(Some(new_buf)));
             new_buf
         }
@@ -219,7 +347,7 @@ fn al_add(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
     let cap = ctx.array_length(buf);
     let buf = if size >= cap {
         let new_cap = (cap * 2).max(size + 1);
-        let new_buf = ctx.new_ref_array(rustjvm_types::ClassId::new(0), new_cap);
+        let new_buf = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
         for i in 0..size {
             let v = ctx.get_array_element(buf, i);
             ctx.set_array_element(new_buf, i, v);
@@ -256,6 +384,33 @@ fn file_not_found(path: &str) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::FileNotFoundException {
         path: path.to_string(),
     }))
+}
+
+/// Validate caller-supplied `(off, len)` against a byte array of length
+/// `arr_len`, matching the JDK's `Objects.checkFromIndexSize` contract
+/// used by `FileInputStream`/`FileOutputStream`/`RandomAccessFile`.
+///
+/// Returns `Err(IndexOutOfBoundsException)` if `off` or `len` is negative
+/// or if `off + len` exceeds `arr_len`. Uses checked arithmetic so a
+/// caller-supplied `off + len` cannot overflow `usize` and wrap past the
+/// bounds check. `off`/`len` are the *raw* Java `int` values.
+fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCallFailed> {
+    if off < 0 || len < 0 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { len },
+            },
+        )));
+    }
+    let end = (off as usize).checked_add(len as usize);
+    match end {
+        Some(end) if end <= arr_len => Ok(()),
+        _ => Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: off.saturating_add(len),
+            },
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -506,7 +661,7 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Err(_) => return Ok(Some(Value::Object(None))),
     };
     // Create a String[] array
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), entries.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), entries.len());
     for (i, name) in entries.iter().enumerate() {
         let s = ctx.create_string(name);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -521,8 +676,19 @@ fn native_file_can_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
     let path = validated_path(&path)?;
-    // Simple check: file exists and is readable
-    let ok = fs::metadata(&path).is_ok();
+    // `fs::metadata` succeeding only proves the path exists and is
+    // stat-able — it says nothing about whether *this* process may
+    // read the contents. Perform a real readability probe:
+    //   * For directories, `read_dir` is the analogous "can read".
+    //   * For regular files, opening for reading is the authoritative
+    //     check across platforms (it consults the OS permission model,
+    //     ACLs, mandatory locks, etc.).
+    let p = Path::new(&path);
+    let ok = match fs::metadata(&path) {
+        Ok(m) if m.is_dir() => fs::read_dir(p).is_ok(),
+        Ok(_) => fs::File::open(p).is_ok(),
+        Err(_) => false,
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -811,11 +977,29 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(fd) => fd,
         None => return Ok(Some(Value::Long(0))),
     };
-    // Read and discard `n` bytes
-    let to_skip = n.min(8192) as usize;
-    let mut buf = vec![0u8; to_skip];
-    let skipped = ctx.fd_table().read_bytes(fd, &mut buf).unwrap_or(0);
-    Ok(Some(Value::Long(skipped as i64)))
+    // Read and discard up to `n` bytes. `read_bytes` is not guaranteed
+    // to fill the whole buffer in a single call (and we cap the scratch
+    // buffer at a sane chunk size to bound memory), so loop until `n`
+    // bytes have been skipped or EOF is reached. Return the actual
+    // number of bytes skipped, matching `java.io.FileInputStream.skip`.
+    const CHUNK: usize = 8192;
+    let mut remaining = n as u64;
+    let mut total_skipped: u64 = 0;
+    let mut buf = vec![0u8; CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(CHUNK as u64) as usize;
+        let read = match ctx.fd_table().read_bytes(fd, &mut buf[..want]) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        if read == 0 {
+            // EOF.
+            break;
+        }
+        total_skipped += read as u64;
+        remaining -= read as u64;
+    }
+    Ok(Some(Value::Long(total_skipped as i64)))
 }
 
 /// `java.io.FileDescriptor.close0()V` — the real-JDK `close()` bytecode path.
@@ -1134,14 +1318,19 @@ fn native_fos_write_bytes_ignore_append(ctx: &mut dyn NativeContext, args: &[Val
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    // Bounds-check caller-supplied off/len against the array before
+    // handing them to the bulk-read intrinsic (mirrors JDK FOS.writeBytes).
+    check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
     let fd = match fos_get_fd(ctx, this) {
         Some(fd) => fd,
         None => return Ok(None),
@@ -1423,7 +1612,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // `remaining_chars` bytes + slack for multi-byte continuations.
     let want = (len - written).saturating_add(3);
     if !eof_seen {
-        let bytes_arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, want);
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, want);
         let read_result = ctx.invoke_virtual(
             in_stream, "read", "([BII)I",
             &[Value::Object(Some(bytes_arr)), Value::Int(0), Value::Int(want as i32)],
@@ -2932,7 +3121,7 @@ fn native_scanner_use_delimiter_string(
     // Create a Pattern synthetic: 2 fields (source=0, flags=1)
     let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
         Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     ctx.set_field(pat, 0, Value::Object(Some(pattern_str)));
     ctx.set_field(pat, 1, Value::Int(0));
@@ -2987,7 +3176,7 @@ fn native_scanner_delimiter(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let src = ctx.create_string(SCAN_DEFAULT_DELIM);
         let pat = match ctx.ensure_class_initialized("java/util/regex/Pattern") {
             Ok(cid) => ctx.alloc_object(cid, 2),
-            Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+            Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
         };
         ctx.set_field(pat, 0, Value::Object(Some(src)));
         ctx.set_field(pat, 1, Value::Int(0));
@@ -3712,7 +3901,7 @@ fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -3725,7 +3914,7 @@ fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             _ => break,
         }
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b));
     }
@@ -3737,7 +3926,7 @@ fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, 0);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -3754,7 +3943,7 @@ fn native_is_read_n_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             _ => break,
         }
     }
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b));
     }
@@ -4033,7 +4222,7 @@ fn buf_read_mark(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
 fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), BB_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -5164,7 +5353,7 @@ fn native_bb_duplicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let mark = buf_read_mark(ctx, this);
     let dup = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), BB_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
     };
     ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(arr))); // shares backing array
     ctx.set_field_by_name(dup, "hb", Value::Object(Some(arr)));
@@ -5227,7 +5416,7 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     let fc = match ctx.ensure_class_initialized("java/nio/channels/FileChannel") {
         Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     ctx.set_field(fc, FC_FIELD_FD, Value::Int(fd_id as i32));
     ctx.set_field(fc, FC_FIELD_POS, Value::Long(0));
@@ -5654,7 +5843,7 @@ fn native_sw_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, 32);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 32);
     ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(buf)));
     ctx.set_field(this, SW_FIELD_COUNT, Value::Int(0));
     Ok(None)
@@ -5669,7 +5858,7 @@ fn native_sw_init_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(v)) => *v as usize,
         _ => 32,
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, cap.max(1));
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap.max(1));
     ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(buf)));
     ctx.set_field(this, SW_FIELD_COUNT, Value::Int(0));
     Ok(None)
@@ -5687,7 +5876,7 @@ fn sw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usiz
     };
     if count + needed > cap {
         let new_cap = (cap * 2).max(count + needed);
-        let new_buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, new_cap);
+        let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
         for i in 0..count {
             let v = ctx.get_array_element(buf, i);
             ctx.set_array_element(new_buf, i, v);
@@ -5941,7 +6130,7 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
 fn dis_read_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-) -> Result<i32, rustjvm_types::error::MethodCallFailed> {
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
         _ => return Ok(-1),
@@ -6152,7 +6341,7 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 bytes.push(b as u8);
             }
             let s = decode_modified_utf8(&bytes)
-                .map_err(|e| rustjvm_types::error::RuntimeError::IOException {
+                .map_err(|e| cratonvm_types::error::RuntimeError::IOException {
                     message: format!("readUTF: {e}"),
                 })?;
             let result = ctx.create_string(&s);
@@ -6192,7 +6381,7 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         bytes.push(b as u8);
     }
     let s = decode_modified_utf8(&bytes)
-        .map_err(|e| rustjvm_types::error::RuntimeError::IOException {
+        .map_err(|e| cratonvm_types::error::RuntimeError::IOException {
             message: format!("readUTF: {e}"),
         })?;
     let result = ctx.create_string(&s);
@@ -6479,7 +6668,7 @@ fn dos_write_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     b: i32,
-) -> Result<(), rustjvm_types::error::MethodCallFailed> {
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, DOS_FIELD_OUT) {
         Value::Object(Some(s)) => s,
         _ => return Ok(()),
@@ -6631,7 +6820,7 @@ fn native_dos_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let bytes = encode_modified_utf8(&s);
     if bytes.len() > 65535 {
-        return Err(rustjvm_types::error::RuntimeError::IOException {
+        return Err(cratonvm_types::error::RuntimeError::IOException {
             message: format!(
                 "writeUTF: encoded string too long ({} bytes, max 65535)",
                 bytes.len()
@@ -6887,7 +7076,7 @@ fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
             let n = real.max(1);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
     let s = ctx.create_string(path_str);
     ctx.set_field(path, PATH_FIELD_STR, Value::Object(Some(s)));
@@ -7162,7 +7351,7 @@ fn native_path_to_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let s = read_path_str(ctx, this);
     let file = match ctx.ensure_class_initialized("java/io/File") {
         Ok(cid) => ctx.alloc_object(cid, 1),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
     let path_str = ctx.create_string(&s);
     ctx.set_field(file, 0, Value::Object(Some(path_str)));
@@ -7346,7 +7535,7 @@ fn native_files_create_directories(
 fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = files_path_str(ctx, args);
     let bytes = std::fs::read(&s).map_err(io_err)?;
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Byte, bytes.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
@@ -7394,7 +7583,7 @@ fn native_files_read_all_lines(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Return as ArrayList
     let list = match ctx.ensure_class_initialized("java/util/ArrayList") {
         Ok(cid) => ctx.alloc_object(cid, 2),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 2),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
     al_init(ctx, list);
     for line in &lines {
@@ -7942,7 +8131,7 @@ fn native_caw_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, 32);
+    let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 32);
     ctx.set_field(this, CAW_FIELD_BUF, Value::Object(Some(buf)));
     ctx.set_field(this, CAW_FIELD_COUNT, Value::Int(0));
     Ok(None)
@@ -7958,7 +8147,7 @@ fn caw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
         return;
     }
     let new_cap = std::cmp::max(needed, cap * 2);
-    let new_buf = ctx.new_array(rustjvm_types::ArrayElementType::Char, new_cap);
+    let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
     let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
         Value::Int(v) => v as usize,
         _ => 0,
@@ -8064,7 +8253,7 @@ fn native_caw_to_char_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Value::Int(v) => v as usize,
         _ => 0,
     };
-    let arr = ctx.new_array(rustjvm_types::ArrayElementType::Char, count);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, count);
     for i in 0..count {
         let v = ctx.get_array_element(buf, i);
         ctx.set_array_element(arr, i, v);
@@ -8665,7 +8854,7 @@ fn alloc_typed_buffer(
             (ctx.alloc_object(cid, n), n)
         }
         Err(_) => (
-            ctx.alloc_object(rustjvm_types::ClassId::new(0), BB_NUM_FIELDS),
+            ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
             BB_NUM_FIELDS,
         ),
     };
@@ -9787,14 +9976,14 @@ fn mmap_next_id() -> i64 {
 fn alloc_file_lock(ctx: &mut dyn NativeContext) -> ObjectRef {
     match ctx.ensure_class_initialized("java/nio/channels/FileLock") {
         Ok(cid) => ctx.alloc_object(cid, FL_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), FL_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), FL_NUM_FIELDS),
     }
 }
 
 fn alloc_mapped_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
     let obj = match ctx.ensure_class_initialized("java/nio/MappedByteBuffer") {
         Ok(cid) => ctx.alloc_object(cid, MBB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), MBB_NUM_FIELDS),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), MBB_NUM_FIELDS),
     };
     let array = ctx.new_array(ArrayElementType::Byte, capacity);
     ctx.set_field(obj, BB_FIELD_ARRAY, Value::Object(Some(array)));
@@ -10429,9 +10618,9 @@ fn collect_dir_entries_inner(
 fn make_path_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallResult {
     let stream = match ctx.ensure_class_initialized("java/util/stream/Stream") {
         Ok(cid) => ctx.alloc_object(cid, 1),
-        Err(_) => ctx.alloc_object(rustjvm_types::ClassId::new(0), 1),
+        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 1),
     };
-    let arr = ctx.new_ref_array(rustjvm_types::ClassId::new(0), elements.len());
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
     for (i, val) in elements.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
@@ -12080,7 +12269,7 @@ fn native_sel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 #[cfg(test)]
 mod io_tests {
     use super::*;
-    use rustjvm_native_api::fd_table::FileDescriptorTable;
+    use cratonvm_native_api::fd_table::FileDescriptorTable;
     use std::io::Write;
 
     // -----------------------------------------------------------------------
@@ -12829,8 +13018,24 @@ mod io_tests {
     #[test]
     fn path_validation_rejects_dotdot() {
         set_path_validation_enabled(true);
-        let result = validate_path("/etc/../passwd");
+        // A `..` segment that escapes the sandbox (cwd) is rejected.
+        // The canonicalize-first logic resolves `..` against the real
+        // filesystem and the containment check then fails.
+        let result = validate_path("../escapes-sandbox.txt");
         assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains("Path traversal detected"), "err = {err}");
+    }
+
+    /// AUDIT 2026-05-19: a path that resolves (after canonicalization)
+    /// outside the sandbox root is rejected even with no literal `..`
+    /// segment. This is the canonicalize-after-check / symlink-escape
+    /// regression guard.
+    #[test]
+    fn path_validation_rejects_out_of_sandbox_absolute() {
+        set_path_validation_enabled(true);
+        let result = validate_path("/etc/passwd");
+        assert!(result.is_err(), "out-of-sandbox path accepted: {result:?}");
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
     }
@@ -12847,8 +13052,11 @@ mod io_tests {
     #[test]
     fn path_validation_accepts_normal_path() {
         set_path_validation_enabled(true);
-        let result = validate_path("/tmp/test.txt");
-        assert!(result.is_ok());
+        // A plain not-yet-existing file inside the sandbox (cwd) is
+        // accepted: the parent (cwd) canonicalizes and the result stays
+        // within the sandbox root.
+        let result = validate_path("path_validation_normal_test.txt");
+        assert!(result.is_ok(), "rejected in-sandbox path: {result:?}");
     }
 
     #[test]
@@ -12862,10 +13070,11 @@ mod io_tests {
 
     /// AUDIT 2026-05-17: legitimate filenames that contain `..` as a
     /// literal substring (but not as a path segment) must be accepted.
+    /// AUDIT 2026-05-19: must also stay inside the sandbox root.
     #[test]
     fn path_validation_accepts_literal_dotdot_in_filename() {
         set_path_validation_enabled(true);
-        let result = validate_path("/tmp/foo..bar.txt");
+        let result = validate_path("foo..bar.txt");
         assert!(result.is_ok(), "rejected legitimate filename: {result:?}");
     }
 
@@ -13403,7 +13612,7 @@ mod t2_mutf8_tests {
 
     #[test]
     fn t2_round_trip_complex_string() {
-        let input = "RustJVM ✨ 中文 \0 end";
+        let input = "CratonVM ✨ 中文 \0 end";
         let encoded = encode_modified_utf8(input);
         let decoded = decode_modified_utf8(&encoded).unwrap();
         assert_eq!(decoded, input);

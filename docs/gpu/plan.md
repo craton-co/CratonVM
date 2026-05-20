@@ -1,4 +1,4 @@
-# Plan — GPU offload for CratonVM (RustJVM)
+# Plan — GPU offload for CratonVM (CratonVM)
 
 ## Context
 
@@ -106,7 +106,7 @@ The plan said "lower from the existing JIT IR." After reading [jit-api/src/lib.r
 
 ### Steps
 
-- [x] Create crate `jit-cuda/` with `Cargo.toml`. Add to workspace. Depends on `rustjvm-reader`, `rustjvm-types`, `rustjvm-jit-api`.
+- [x] Create crate `jit-cuda/` with `Cargo.toml`. Add to workspace. Depends on `cratonvm-reader`, `cratonvm-types`, `cratonvm-jit-api`.
 - [x] Define `PtxModule { sm_major, sm_minor, kernels }`, `PtxKernel { name, params, body, reg_decls }`, `PtxParam`, `RegDecl`, `RegKind`. All in [jit-cuda/src/emitter.rs](jit-cuda/src/emitter.rs).
 - [x] Emit PTX `.version 7.5`, `.target sm_<major><minor>`, `.address_size 64` headers and `.visible .entry` per kernel.
 - [x] Parameter-list builder: each Java primitive-array parameter becomes a `(ptr, len)` pair; scalars are single `.param`s; the return shape adds `ret_ptr`(+`ret_len` for arrays); every kernel ends with a `failure_flag: .u64` ptr for deopt signalling.
@@ -138,7 +138,7 @@ The plan said "lower from the existing JIT IR." After reading [jit-api/src/lib.r
 
 - The new module declaration in [vm/src/runtime/mod.rs](vm/src/runtime/mod.rs) (or wherever the module list is) MUST be `#[cfg(feature = "gpu-offload")] mod gpu_marshal;`.
 - All public items in `gpu_marshal.rs` are reachable only when the feature is on; no shim re-exports.
-- The default `cargo build` of `rustjvm-vm` does not compile this file.
+- The default `cargo build` of `cratonvm-vm` does not compile this file.
 
 ### Steps
 
@@ -150,10 +150,10 @@ The plan said "lower from the existing JIT IR." After reading [jit-api/src/lib.r
 
 ### Verification
 
-- [x] `cargo check -p rustjvm-vm` (default) — clean. CPU path unchanged.
-- [x] `cargo check -p rustjvm-vm --features gpu-offload` — clean.
-- [x] `cargo test -p rustjvm-vm --features gpu-offload --lib gpu_marshal` — **9 tests pass**, each using a real `Heap` and real `Heap::alloc_array` (no synthesised objects).
-- [x] `cargo test -p rustjvm-vm` (default) — full pre-existing suite still passes (2007 tests).
+- [x] `cargo check -p cratonvm-vm` (default) — clean. CPU path unchanged.
+- [x] `cargo check -p cratonvm-vm --features gpu-offload` — clean.
+- [x] `cargo test -p cratonvm-vm --features gpu-offload --lib gpu_marshal` — **9 tests pass**, each using a real `Heap` and real `Heap::alloc_array` (no synthesised objects).
+- [x] `cargo test -p cratonvm-vm` (default) — full pre-existing suite still passes (2007 tests).
 
 ---
 
@@ -187,15 +187,15 @@ The plan said "lower from the existing JIT IR." After reading [jit-api/src/lib.r
 
 This Part is the highest risk for coupling. The implementation MUST:
 
-1. Introduce a Cargo feature `gpu-offload` on `rustjvm-vm` that, when off, removes every line of code Part E adds from the compiled binary.
+1. Introduce a Cargo feature `gpu-offload` on `cratonvm-vm` that, when off, removes every line of code Part E adds from the compiled binary.
 2. Wrap every new import, every new field on `Vm` / `VmConfig`, every new function call site, and the entire `OffloadCache`-lookup hook in `#[cfg(feature = "gpu-offload")]`.
-3. After landing, verify: `cargo expand -p rustjvm-vm` with the feature off has the same `execute_invokestatic()` body as the pre-Part-E commit. The CPU hot path takes zero extra branches.
-4. `rustjvm-cli`'s existing `gpu` feature gains `"rustjvm-vm/gpu-offload"` so building the CLI with `--features gpu` automatically pulls the VM hook in.
+3. After landing, verify: `cargo expand -p cratonvm-vm` with the feature off has the same `execute_invokestatic()` body as the pre-Part-E commit. The CPU hot path takes zero extra branches.
+4. `cratonvm-cli`'s existing `gpu` feature gains `"cratonvm-vm/gpu-offload"` so building the CLI with `--features gpu` automatically pulls the VM hook in.
 
 ### Steps
 
-- [x] `gpu-offload` Cargo feature on [vm/Cargo.toml](vm/Cargo.toml) — optional `cuda-bridge` and `jit-cuda` deps, propagates `rustjvm-gc/gpu-offload`.
-- [x] `vm-cli`'s `gpu` feature now propagates `rustjvm-vm/gpu-offload`; `gpu-driver` adds `cuda-bridge/cuda`.
+- [x] `gpu-offload` Cargo feature on [vm/Cargo.toml](vm/Cargo.toml) — optional `cuda-bridge` and `jit-cuda` deps, propagates `cratonvm-gc/gpu-offload`.
+- [x] `vm-cli`'s `gpu` feature now propagates `cratonvm-vm/gpu-offload`; `gpu-driver` adds `cuda-bridge/cuda`.
 - [x] [vm/src/runtime/offload.rs](vm/src/runtime/offload.rs) created (whole file `#[cfg(feature = "gpu-offload")]`): `OffloadCache`, `CompiledKernel`, `LookupOutcome::{Hit, Skip, Blacklisted}`, `DispatchOutcome::{Handled, FallThrough}`, `output_array_index()`, and the entry-point `try_dispatch(shared, thread, frame_idx, class, method, descriptor, args) -> Result<DispatchOutcome, MethodCallFailed>`.
 - [x] [vm/src/runtime/gpu_marshal.rs](vm/src/runtime/gpu_marshal.rs) updated by the parallel agent: every public `host_view_*` / `write_back_*` now takes `_token: &SafepointToken<'_>` (marker-only).
 - [x] [vm/src/vm/vm_init.rs](vm/src/vm/vm_init.rs) `SharedVm` has a new `#[cfg(feature = "gpu-offload")] pub offload_cache: Arc<OffloadCache>` field, constructed in `SharedVm::new`.
@@ -206,7 +206,7 @@ This Part is the highest risk for coupling. The implementation MUST:
 
 - The marshal+launch glue inside `try_dispatch`'s `LookupOutcome::Hit` arm. Today it logs `tracing::debug!` and returns `FallThrough`. The `OffloadCache` itself fully analyzes, lowers, and (on a real GPU) calls `DeviceModule::from_ptx` — so the lookup side already works end-to-end. Only the launch side is stubbed. This is deliberate: validating a real `cuLaunchKernel` requires actual NVIDIA hardware, and the surrounding cfg-gated wiring is most safely landed before adding the deopt-and-write-back complexity. The function signature and call-site contract is **final**; the next iteration only grows the `Hit` arm.
 - [ ] On cache miss, call `jit_cuda::analyzer::analyze(&class, &method)`. On `Eligible`, compile-and-cache:
-  1. lower the method through the existing IR (`jit/src/ir.rs`) → already produces `rustjvm-jit-api::IrGraph`
+  1. lower the method through the existing IR (`jit/src/ir.rs`) → already produces `cratonvm-jit-api::IrGraph`
   2. hand the `IrGraph` to `jit_cuda::lower(&graph) -> PtxModule`
   3. `cuda_bridge::DeviceModule::from_ptx(ptx, &[kernel_name])` (Part A)
   4. store `CompiledKernel { module, signature, kernel_name }` in `OffloadCache` keyed by `(ClassId, method_index)`
@@ -238,7 +238,7 @@ This Part is the highest risk for coupling. The implementation MUST:
 
 - `SafepointToken` and `enter_gpu_critical()` MUST be `#[cfg(feature = "gpu-offload")]` on the `Heap` impl.
 - The check inside `safepoint_check()` that delays GC for the GPU also gated. With the feature off, GC behaviour is identical to today.
-- `rustjvm-gc` gains an optional `gpu-offload` feature mirroring `rustjvm-vm`'s.
+- `cratonvm-gc` gains an optional `gpu-offload` feature mirroring `cratonvm-vm`'s.
 
 ### Steps
 
@@ -251,10 +251,10 @@ This Part is the highest risk for coupling. The implementation MUST:
 
 ### Verification
 
-- [x] `cargo check -p rustjvm-gc` — clean, default features.
-- [x] `cargo check -p rustjvm-gc --features gpu-offload` — clean.
-- [x] `cargo test -p rustjvm-gc` — pre-existing 672 lib tests pass.
-- [x] `cargo test -p rustjvm-gc --features gpu-offload` — **678 lib tests pass** (672 pre-existing + 6 new gpu_offload). Tests cover: counter inc/dec on token construction/drop, nested tokens, `collect_garbage` blocked-while-token-held, real `Heap::alloc_array` pinning surviving GC, root walker visiting pinned refs.
+- [x] `cargo check -p cratonvm-gc` — clean, default features.
+- [x] `cargo check -p cratonvm-gc --features gpu-offload` — clean.
+- [x] `cargo test -p cratonvm-gc` — pre-existing 672 lib tests pass.
+- [x] `cargo test -p cratonvm-gc --features gpu-offload` — **678 lib tests pass** (672 pre-existing + 6 new gpu_offload). Tests cover: counter inc/dec on token construction/drop, nested tokens, `collect_garbage` blocked-while-token-held, real `Heap::alloc_array` pinning surviving GC, root walker visiting pinned refs.
 
 ---
 
@@ -275,7 +275,7 @@ This Part is the highest risk for coupling. The implementation MUST:
 ### Verification
 
 - [x] `javac` runs cleanly during `cargo build -p jit-cuda` (`.class` files appear alongside sources).
-- [x] `cargo test -p jit-cuda` finds the fixtures via `test_support::load_method` and the four analyzer tests load real bytecode through `rustjvm_reader::read_class`.
+- [x] `cargo test -p jit-cuda` finds the fixtures via `test_support::load_method` and the four analyzer tests load real bytecode through `cratonvm_reader::read_class`.
 - [x] `grep -R "fn make_class\|ClassFile::synthetic\|0xCA, 0xFE, 0xBA, 0xBE" jit-cuda/ cuda-bridge/ test_classes/gpu/` returns no hits in code authored by this initiative.
 
 ---
@@ -288,14 +288,14 @@ This Part is the highest risk for coupling. The implementation MUST:
 
 - [x] `--gpu`, `--gpu-device <N>`, `--gpu-min-work <N>`, `--print-gpu-decisions`, `--gpu-info` added to `Args` in [vm-cli/src/main.rs](vm-cli/src/main.rs).
 - [x] `--gpu-info` is an early-exit: calls `cuda_bridge::probe()`, prints device name + sm_X.Y + memory, returns. With the `cuda` feature off (default), prints `no CUDA device available: no CUDA driver available (crate built without the \`cuda\` feature, or driver not installed)`. Either way, exit code 0 — no JVM bootstrap.
-- [x] `--gpu` probes early; if no driver, prints a single `[rustjvm-cli] --gpu requested but no CUDA driver available …; running on CPU` and continues with `args.gpu = false`.
+- [x] `--gpu` probes early; if no driver, prints a single `[cratonvm-cli] --gpu requested but no CUDA driver available …; running on CPU` and continues with `args.gpu = false`.
 - [x] `cuda-bridge` is a hard dependency of `vm-cli`. Default-features-off keeps the workspace stub-only; `cargo build --features gpu` flips on the `cuda` Cargo feature on `cuda-bridge`.
 - [ ] Plumbing the flags into `VmConfig` and reading them from the interpreter — pending Part E (which is the natural owner of that integration; the flags exist on `Args` ready to forward).
 
 ### Verification
 
-- [x] `cargo check -p rustjvm-cli` passes with the new flags.
-- [ ] `cargo run -p rustjvm-cli -- --gpu-info` on the dev box — pending a real GPU + `--features gpu`. With default features it prints the no-driver line.
+- [x] `cargo check -p cratonvm-cli` passes with the new flags.
+- [ ] `cargo run -p cratonvm-cli -- --gpu-info` on the dev box — pending a real GPU + `--features gpu`. With default features it prints the no-driver line.
 - [ ] `--print-gpu-decisions` is parsed but reads no decisions until Part E lands.
 
 ---
@@ -313,7 +313,7 @@ This Part is the highest risk for coupling. The implementation MUST:
 ### Verification
 
 - [x] Doc exists and is linked from the top-level [README.md](README.md).
-- [x] `cargo build -p rustjvm-jit-api` succeeds with the new module.
+- [x] `cargo build -p cratonvm-jit-api` succeeds with the new module.
 - [x] `grep -R "CudaOxide" jit-cuda/ cuda-bridge/ vm/` returns zero matches in code.
 
 ---

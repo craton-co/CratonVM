@@ -1,6 +1,6 @@
 //! Build tool compatibility checks for Maven and Gradle.
 //!
-//! Provides checkers that verify a RustJVM installation can be used by
+//! Provides checkers that verify a CratonVM installation can be used by
 //! Maven and Gradle as a JDK, and helpers that generate the configuration
 //! snippets needed for toolchain integration.
 
@@ -105,7 +105,7 @@ impl MavenCompatChecker {
   <type>jdk</type>\n\
   <provides>\n\
     <version>25</version>\n\
-    <vendor>RustJVM</vendor>\n\
+    <vendor>CratonVM</vendor>\n\
   </provides>\n\
   <configuration>\n\
     <jdkHome>{home}</jdkHome>\n\
@@ -172,7 +172,7 @@ impl GradleCompatChecker {
 java {\n\
     toolchain {\n\
         languageVersion.set(JavaLanguageVersion.of(25))\n\
-        vendor.set(JvmVendorSpec.matching(\"RustJVM\"))\n\
+        vendor.set(JvmVendorSpec.matching(\"CratonVM\"))\n\
     }\n\
 }\n"
         .to_string()
@@ -285,12 +285,12 @@ mod tests {
 
     #[test]
     fn maven_settings_snippet_format() {
-        let checker = MavenCompatChecker::new("/opt/rustjvm");
+        let checker = MavenCompatChecker::new("/opt/cratonvm");
         let snippet = checker.generate_settings_snippet();
         assert!(snippet.contains("<toolchain>"));
         assert!(snippet.contains("<version>25</version>"));
-        assert!(snippet.contains("<vendor>RustJVM</vendor>"));
-        assert!(snippet.contains("/opt/rustjvm"));
+        assert!(snippet.contains("<vendor>CratonVM</vendor>"));
+        assert!(snippet.contains("/opt/cratonvm"));
     }
 
     /// Minimal structural XML validator.  Parses a string and verifies:
@@ -376,7 +376,7 @@ mod tests {
     /// the result parses cleanly and exposes the expected tags.
     #[test]
     fn maven_snippet_is_parseable_xml_roundtrip() {
-        let checker = MavenCompatChecker::new("/opt/rustjvm");
+        let checker = MavenCompatChecker::new("/opt/cratonvm");
         let snippet = checker.generate_settings_snippet();
 
         // Maven reads `<toolchains>...</toolchains>`; the snippet is one
@@ -406,7 +406,7 @@ mod tests {
 
         // And the round-tripped document must still contain the JDK home
         // path the user passed in (no escaping corruption).
-        assert!(doc.contains("/opt/rustjvm"));
+        assert!(doc.contains("/opt/cratonvm"));
     }
 
     /// Paths with characters that would break naive string concatenation
@@ -414,7 +414,7 @@ mod tests {
     /// minimum, the resulting snippet should still be well-formed XML.
     #[test]
     fn maven_snippet_wellformed_for_windows_path() {
-        let checker = MavenCompatChecker::new("C:\\Program Files\\rustjvm");
+        let checker = MavenCompatChecker::new("C:\\Program Files\\cratonvm");
         let snippet = checker.generate_settings_snippet();
         let doc = format!("<toolchains>\n{snippet}</toolchains>\n");
         validate_xml_wellformed(&doc).expect("well-formed XML with Windows path");
@@ -467,17 +467,17 @@ mod tests {
 
     #[test]
     fn gradle_properties_format() {
-        let checker = GradleCompatChecker::new("/opt/rustjvm");
+        let checker = GradleCompatChecker::new("/opt/cratonvm");
         let props = checker.generate_gradle_properties();
-        assert!(props.contains("org.gradle.java.home=/opt/rustjvm"));
+        assert!(props.contains("org.gradle.java.home=/opt/cratonvm"));
     }
 
     #[test]
     fn gradle_properties_normalizes_backslashes() {
-        let checker = GradleCompatChecker::new("C:\\Program Files\\rustjvm");
+        let checker = GradleCompatChecker::new("C:\\Program Files\\cratonvm");
         let props = checker.generate_gradle_properties();
         assert!(
-            props.contains("C:/Program Files/rustjvm"),
+            props.contains("C:/Program Files/cratonvm"),
             "backslashes should be normalized: {props}"
         );
         assert!(!props.contains('\\'), "no backslashes expected: {props}");
@@ -485,10 +485,10 @@ mod tests {
 
     #[test]
     fn gradle_toolchain_spec() {
-        let checker = GradleCompatChecker::new("/opt/rustjvm");
+        let checker = GradleCompatChecker::new("/opt/cratonvm");
         let spec = checker.generate_toolchain_spec();
         assert!(spec.contains("languageVersion.set(JavaLanguageVersion.of(25))"));
-        assert!(spec.contains("RustJVM"));
+        assert!(spec.contains("CratonVM"));
     }
 
     #[test]
