@@ -12683,6 +12683,81 @@ fn tm_obj_key(this: ObjectRef) -> usize {
     this.as_ptr() as usize
 }
 
+/// Address-keyed TreeMap array-mode state side-table — `(data array, size,
+/// comparator)` keyed by the receiver's address.
+///
+/// Why a side-table instead of object fields: in real-JDK mode `TreeMap`
+/// instances have the *real* JDK field layout (`comparator`, `root`,
+/// `size`, `modCount`, ...), and subclasses such as Felix's `StringMap
+/// extends TreeMap` add their own fields on top. Writing to the synthetic
+/// slots 0/1/2 lands in unrelated real fields — silently losing the data
+/// array and size, and (worse) writing an `Int` into a reference slot
+/// corrupts the heap for the GC. Keying state by the object's address is
+/// layout-independent and works for arbitrary subclasses.
+#[derive(Clone)]
+struct TmArrayState {
+    data: Option<ObjectRef>,
+    size: i32,
+    comparator: Value,
+}
+impl Default for TmArrayState {
+    fn default() -> Self {
+        TmArrayState {
+            data: None,
+            size: 0,
+            comparator: Value::Object(None),
+        }
+    }
+}
+fn tm_array_table() -> &'static Mutex<StdHashMap<usize, TmArrayState>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TmArrayState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+/// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
+/// address-keyed side-table. Returns layout-independent defaults when no
+/// entry exists yet. The object's own fields are never consulted.
+fn tm_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    let tbl = tm_array_table().lock().unwrap();
+    if let Some(st) = tbl.get(&tm_obj_key(this)) {
+        return match slot {
+            TM_FIELD_DATA => Value::Object(st.data),
+            TM_FIELD_SIZE => Value::Int(st.size),
+            TM_FIELD_COMPARATOR => st.comparator,
+            _ => Value::Object(None),
+        };
+    }
+    match slot {
+        TM_FIELD_SIZE => Value::Int(0),
+        _ => Value::Object(None),
+    }
+}
+
+/// Write a TreeMap "slot" into the address-keyed side-table (creating the
+/// entry on first write). The object's own fields are never touched — the
+/// side-table is the sole authoritative store (see `TmArrayState`).
+fn tm_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+    let mut tbl = tm_array_table().lock().unwrap();
+    let st = tbl.entry(tm_obj_key(this)).or_default();
+    match slot {
+        TM_FIELD_DATA => {
+            st.data = match v {
+                Value::Object(o) => o,
+                _ => None,
+            }
+        }
+        TM_FIELD_SIZE => {
+            st.size = match v {
+                Value::Int(n) => n,
+                _ => 0,
+            }
+        }
+        TM_FIELD_COMPARATOR => st.comparator = v,
+        _ => {}
+    }
+}
+
 /// Returns true if this TreeMap is currently using the BTreeMap fast path.
 /// Determined by:
 ///   1. comparator field is null/absent (custom Comparator → array path), AND
@@ -12725,79 +12800,6 @@ fn tm_force_array_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 }
 fn tm_set_force_array(_ctx: &dyn NativeContext, this: ObjectRef) {
     tm_force_array_set().lock().unwrap().insert(tm_obj_key(this), ());
-}
-
-/// Array-mode state side-table — `(data array, size, comparator)` keyed by
-/// the receiver's address.
-///
-/// Why a side-table instead of object fields: in real-JDK mode the
-/// `TreeMap` instances have the *real* JDK field layout (`root`, `size`,
-/// `modCount`, `comparator`, ...), and subclasses such as Felix's
-/// `StringMap extends TreeMap` add their own fields on top. Writing to the
-/// synthetic slots 0/1/2 lands in unrelated real fields, so the array-mode
-/// store silently lost its data array and size. Keying state by ObjectRef
-/// pointer is layout-independent and works for arbitrary subclasses.
-#[derive(Clone)]
-struct TmArrayState {
-    data: Option<ObjectRef>,
-    size: i32,
-    comparator: Value,
-}
-impl Default for TmArrayState {
-    fn default() -> Self {
-        TmArrayState {
-            data: None,
-            size: 0,
-            comparator: Value::Object(None),
-        }
-    }
-}
-fn tm_array_table() -> &'static Mutex<StdHashMap<usize, TmArrayState>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TmArrayState>>> =
-        std::sync::OnceLock::new();
-    T.get_or_init(|| Mutex::new(StdHashMap::new()))
-}
-
-/// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`). Reads the
-/// array-mode side-table; falls back to the object field only if no
-/// side-table entry exists yet (e.g. a TreeMap produced by another path
-/// that wrote the synthetic slots directly).
-fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
-    let tbl = tm_array_table().lock().unwrap();
-    if let Some(st) = tbl.get(&tm_obj_key(this)) {
-        return match slot {
-            TM_FIELD_DATA => Value::Object(st.data),
-            TM_FIELD_SIZE => Value::Int(st.size),
-            TM_FIELD_COMPARATOR => st.comparator,
-            _ => Value::Object(None),
-        };
-    }
-    drop(tbl);
-    ctx.get_field(this, slot)
-}
-
-/// Write a TreeMap "slot" into the array-mode side-table (creating the
-/// entry on first write). The synthetic object field is also written as a
-/// best-effort mirror so any non-overridden JDK reader still sees a
-/// plausible value, but the side-table is authoritative.
-fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
-    {
-        let mut tbl = tm_array_table().lock().unwrap();
-        let st = tbl.entry(tm_obj_key(this)).or_default();
-        match slot {
-            TM_FIELD_DATA => st.data = match v {
-                Value::Object(o) => o,
-                _ => None,
-            },
-            TM_FIELD_SIZE => st.size = match v {
-                Value::Int(n) => n,
-                _ => 0,
-            },
-            TM_FIELD_COMPARATOR => st.comparator = v,
-            _ => {}
-        }
-    }
-    ctx.set_field(this, slot, v);
 }
 
 /// Migrate any fast-mode entries to the array store, then remove the
@@ -12876,6 +12878,74 @@ const TS_FIELD_SIZE: usize = 1; // Int: number of elements
 const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
 const TS_NUM_FIELDS: usize = 3;
 const TS_DEFAULT_CAPACITY: usize = 16;
+
+/// Address-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
+/// real-JDK mode `java.util.TreeSet` (and any subclass) has the real JDK
+/// field layout, so the synthetic slots 0/1/2 do not exist. All state —
+/// backing data array, size, comparator — lives here, keyed by the
+/// receiver's address, so it is layout-independent.
+#[derive(Clone)]
+struct TsArrayState {
+    data: Option<ObjectRef>,
+    size: i32,
+    comparator: Value,
+}
+impl Default for TsArrayState {
+    fn default() -> Self {
+        TsArrayState {
+            data: None,
+            size: 0,
+            comparator: Value::Object(None),
+        }
+    }
+}
+fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TsArrayState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+/// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
+/// address-keyed side-table. Returns layout-independent defaults when no
+/// entry exists yet.
+fn ts_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    let tbl = ts_array_table().lock().unwrap();
+    if let Some(st) = tbl.get(&tm_obj_key(this)) {
+        return match slot {
+            TS_FIELD_DATA => Value::Object(st.data),
+            TS_FIELD_SIZE => Value::Int(st.size),
+            TS_FIELD_COMPARATOR => st.comparator,
+            _ => Value::Object(None),
+        };
+    }
+    match slot {
+        TS_FIELD_SIZE => Value::Int(0),
+        _ => Value::Object(None),
+    }
+}
+
+/// Write a TreeSet "slot" into the address-keyed side-table. The object's
+/// own fields are never touched (see `tm_set_slot`).
+fn ts_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+    let mut tbl = ts_array_table().lock().unwrap();
+    let st = tbl.entry(tm_obj_key(this)).or_default();
+    match slot {
+        TS_FIELD_DATA => {
+            st.data = match v {
+                Value::Object(o) => o,
+                _ => None,
+            }
+        }
+        TS_FIELD_SIZE => {
+            st.size = match v {
+                Value::Int(n) => n,
+                _ => 0,
+            }
+        }
+        TS_FIELD_COMPARATOR => st.comparator = v,
+        _ => {}
+    }
+}
 
 // ----- comparison helper -----
 
@@ -13018,15 +13088,15 @@ fn tm_remove_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: us
 // ----- TreeSet helpers -----
 
 fn ts_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, Value) {
-    let data = match ctx.get_field(this, TS_FIELD_DATA) {
+    let data = match ts_get_slot(ctx, this, TS_FIELD_DATA) {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
-    let size = match ctx.get_field(this, TS_FIELD_SIZE) {
+    let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
-    let comparator = ctx.get_field(this, TS_FIELD_COMPARATOR);
+    let comparator = ts_get_slot(ctx, this, TS_FIELD_COMPARATOR);
     (data, size, comparator)
 }
 
@@ -13047,7 +13117,7 @@ fn ts_ensure_capacity(
         let v = ctx.get_array_element(data, i);
         ctx.set_array_element(new_arr, i, v);
     }
-    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(new_arr)));
     new_arr
 }
 
@@ -13122,7 +13192,7 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     let old = bt.insert(tk, value).unwrap_or(Value::Object(None));
                     (old, bt.len() as i32)
                 });
-                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(new_size));
                 return Ok(Some(old));
             }
         } else {
@@ -13200,7 +13270,7 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 let old = bt.remove(&tk).unwrap_or(Value::Object(None));
                 (old, bt.len() as i32)
             });
-            ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+            tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(new_size));
             return Ok(Some(old));
         }
         return Ok(Some(Value::Object(None)));
@@ -13272,35 +13342,16 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(Value::Int(0)))
 }
 
-/// Authoritative entry count for a TreeMap regardless of backing store.
-///
-/// In real-JDK mode the synthetic `TM_FIELD_SIZE` slot does not map to the
-/// real `TreeMap.size` field (real JDK `TreeMap` has a different field
-/// layout: `root`/`size`/`modCount`/`comparator`/...), so a slot-1 mirror
-/// write lands in an unrelated field and `size()` reads garbage / zero.
-/// The fast-mode `BTreeMap` side-table is keyed by the receiver's address
-/// and is therefore layout-independent — it is the source of truth when
-/// fast mode is active. Array mode falls back to the slot mirror (only
-/// reached for custom-Comparator maps, which are layout-correct only in
-/// synthetic mode).
-fn tm_entry_count(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if tm_is_fast_mode(ctx, this) {
-        return tm_fast_with(this, |bt| bt.len() as i32);
-    }
-    // Array mode: read the layout-independent side-table (falls back to the
-    // synthetic field only when no side-table entry exists yet).
-    match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
-        Value::Int(v) => v,
-        _ => 0,
-    }
-}
-
 fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(tm_entry_count(ctx, this))))
+    let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(size)))
 }
 
 fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13308,7 +13359,11 @@ fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    Ok(Some(Value::Int(i32::from(tm_entry_count(ctx, this) == 0))))
+    let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i32::from(size == 0))))
 }
 
 fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13615,7 +13670,7 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         });
         match removed {
             Some((tk, v, new_size)) => {
-                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(new_size));
                 let k = tree_key_to_value(ctx, &tk);
                 let entry = tm_make_entry(ctx, k, v);
                 return Ok(Some(Value::Object(Some(entry))));
@@ -13649,7 +13704,7 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         });
         match removed {
             Some((tk, v, new_size)) => {
-                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(new_size));
                 let k = tree_key_to_value(ctx, &tk);
                 let entry = tm_make_entry(ctx, k, v);
                 return Ok(Some(Value::Object(Some(entry))));
@@ -13684,10 +13739,10 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     for (i, (k, _)) in pairs.iter().enumerate() {
         ctx.set_array_element(buf, i, *k);
     }
-    ctx.set_field(ts, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(ts, TS_FIELD_SIZE, Value::Int(size));
-    let comparator = ctx.get_field(this, TM_FIELD_COMPARATOR);
-    ctx.set_field(ts, TS_FIELD_COMPARATOR, comparator);
+    ts_set_slot(ctx, ts, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, ts, TS_FIELD_SIZE, Value::Int(size));
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, comparator);
     Ok(Some(Value::Object(Some(ts))))
 }
 
@@ -13826,7 +13881,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                         }
                     }
                 });
-                ctx.set_field(this, TM_FIELD_SIZE, Value::Int(new_size));
+                tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(new_size));
                 return Ok(Some(existing.unwrap_or(Value::Object(None))));
             }
         } else {
@@ -13869,6 +13924,16 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // TreeMap / TreeMap-subclass source: its state lives in the
+    // address-keyed side-tables, not object fields — copy via the
+    // sorted-pairs snapshot rather than reading raw slots.
+    if is_tree_map_receiver(ctx, source) {
+        let pairs = tm_collect_pairs(ctx, source);
+        for (k, v) in pairs {
+            native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
+        }
+        return Ok(None);
+    }
     // Read entries from source map (try HashMap layout first, then TreeMap)
     let src_f0 = ctx.get_field(source, 0);
     let src_f1 = ctx.get_field(source, 1);
@@ -14113,9 +14178,9 @@ fn native_ts_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, TS_FIELD_COMPARATOR, Value::Object(None));
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
     Ok(None)
 }
 
@@ -14126,9 +14191,9 @@ fn native_ts_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, TS_FIELD_COMPARATOR, cmp);
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, cmp);
     Ok(None)
 }
 
@@ -14141,16 +14206,16 @@ fn native_ts_init_collection(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-            ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
-            ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
-            ctx.set_field(this, TS_FIELD_COMPARATOR, Value::Object(None));
+            ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+            ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
+            ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
             return Ok(None);
         }
     };
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(this, TS_FIELD_COMPARATOR, Value::Object(None));
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, Value::Object(None));
     // Add elements from source
     let elems = collect_collection_elements(ctx, source);
     for e in elems {
@@ -14170,7 +14235,7 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(d) => d,
         None => {
             let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-            ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
+            ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
             buf
         }
     };
@@ -14180,7 +14245,7 @@ fn native_ts_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Err(pos) => {
             let data = ts_ensure_capacity(ctx, this, size, data);
             ts_insert_at(ctx, data, size, pos, elem);
-            ctx.set_field(this, TS_FIELD_SIZE, Value::Int(size + 1));
+            ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size + 1));
             Ok(Some(Value::Int(1)))
         }
     }
@@ -14200,7 +14265,7 @@ fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     match ts_binary_search(ctx, data, size, &comparator, &elem)? {
         Ok(idx) => {
             ts_remove_at(ctx, data, size, idx);
-            ctx.set_field(this, TS_FIELD_SIZE, Value::Int(size - 1));
+            ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
             Ok(Some(Value::Int(1)))
         }
         Err(_) => Ok(Some(Value::Int(0))),
@@ -14227,7 +14292,7 @@ fn native_ts_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let size = match ctx.get_field(this, TS_FIELD_SIZE) {
+    let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -14239,7 +14304,7 @@ fn native_ts_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
-    let size = match ctx.get_field(this, TS_FIELD_SIZE) {
+    let size = match ts_get_slot(ctx, this, TS_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -14252,8 +14317,8 @@ fn native_ts_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(this, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(this, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
     Ok(None)
 }
 
@@ -14486,7 +14551,7 @@ fn native_ts_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, TS_FIELD_COMPARATOR)))
+    Ok(Some(ts_get_slot(ctx, this, TS_FIELD_COMPARATOR)))
 }
 
 fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14498,9 +14563,9 @@ fn native_ts_head_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (data_opt, size, comparator) = ts_state(ctx, this);
     let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(result, TS_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(result, TS_FIELD_COMPARATOR, comparator);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
@@ -14523,9 +14588,9 @@ fn native_ts_tail_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (data_opt, size, comparator) = ts_state(ctx, this);
     let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(result, TS_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(result, TS_FIELD_COMPARATOR, comparator);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
@@ -14548,9 +14613,9 @@ fn native_ts_sub_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let (data_opt, size, comparator) = ts_state(ctx, this);
     let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
-    ctx.set_field(result, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(result, TS_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(result, TS_FIELD_COMPARATOR, comparator);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, comparator);
     if let Some(data) = data_opt {
         for i in 0..(size as usize) {
             let e = ctx.get_array_element(data, i);
@@ -18597,9 +18662,9 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             ctx.set_array_element(buf, i, k);
         }
     }
-    ctx.set_field(ts, TS_FIELD_DATA, Value::Object(Some(buf)));
-    ctx.set_field(ts, TS_FIELD_SIZE, Value::Int(size));
-    ctx.set_field(ts, TS_FIELD_COMPARATOR, Value::Object(None));
+    ts_set_slot(ctx, ts, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, ts, TS_FIELD_SIZE, Value::Int(size));
+    ts_set_slot(ctx, ts, TS_FIELD_COMPARATOR, Value::Object(None));
     Ok(Some(Value::Object(Some(ts))))
 }
 
