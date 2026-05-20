@@ -1033,21 +1033,27 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
     });
 
-    // create(String) — static factory
+    // create(String) — static factory.
+    //
+    // Must produce a fully-parsed URI with its `scheme`/`path`/`authority`/…
+    // fields populated BY NAME, exactly like every other URI constructor.
+    // The previous body wrote the *whole* raw string into instance-field
+    // slot index 6 ("raw-string cache" in the legacy synthetic 7-slot URI
+    // layout). In real-JDK mode `java.net.URI`'s actual field 6 is `path`,
+    // so `URI.getPath()` read back the full `file:/C:/…!/entry` string
+    // instead of just `/C:/…!/entry`. SmallRye's
+    // `AbstractLocationConfigSourceLoader.addProfileName` then re-wrapped
+    // that already-`file:`-prefixed value, yielding the malformed
+    // `jar:file:file:/…!/application-<profile>.properties` URL that aborts
+    // Keycloak/Quarkus boot with `SRCFG00035`. `make_uri` parses the string
+    // and sets all components by name (slot-order safe).
     r.register(uri, "create", "(Ljava/lang/String;)Ljava/net/URI;", |ctx, args| {
         let s_obj = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
         let s = ctx.read_string(s_obj).unwrap_or_default();
-        let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
-        let raw_s = ctx.create_string(&s);
-        ctx.set_field(uri_obj, 6, Value::Object(Some(raw_s)));
-        if let Some(colon) = s.find(':') {
-            let scheme = ctx.create_string(&s[..colon]);
-            ctx.set_field(uri_obj, 0, Value::Object(Some(scheme)));
-        }
-        Ok(Some(Value::Object(Some(uri_obj))))
+        Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
     });
 }
 

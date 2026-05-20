@@ -25930,6 +25930,13 @@ fn native_uri_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
     url_parse(ctx, uri, &url_str);
+    // `url_parse` populates the synthetic *URL* slot layout (by index).
+    // `java.net.URI` getters (`getScheme`/`getPath`/`getRawSchemeSpecificPart`)
+    // read by FIELD NAME (`scheme`/`path`/`string`), so also store the parsed
+    // components by name for consistency with the other `URI` constructors.
+    // (In practice `URI.create` is routed to the parser in `net_phase_e`,
+    // which registers later; this keeps the fallback path consistent.)
+    uri_store_named(ctx, uri, &url_str);
     Ok(Some(Value::Object(Some(uri))))
 }
 
