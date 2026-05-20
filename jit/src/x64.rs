@@ -6065,10 +6065,16 @@ impl Compiler {
     /// analysis (`bounds_safe_pcs`) or a speculative BCE guard.
     fn emit_simd_int_array_element_wise(&mut self, op: ElementWiseOp) {
         // --- Compute chunk_count = (n - i) >> 3 into R8D ---
-        self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
-        self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
-        self.buf.emit(&[0xC1, 0xE8, 0x03]); // SHR EAX, 3
-        self.buf.emit(&[0x41, 0x89, 0xC0]); // MOV R8D, EAX
+        //
+        // This must NOT route through EAX: the caller leaves array A's base
+        // pointer in RAX (B in RCX, OUT in RDX), and that base is read by
+        // the preheader's `ADD R9, RAX` below and by the scalar-remainder
+        // `MOV EAX, [RAX + R10*4 + H]`. Using EAX as scratch here would
+        // overwrite A's base with the chunk count, so `&A[i]` degenerates to
+        // `i*4 + chunk_count + H` and the first VMOVDQU faults.
+        self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
+        self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
+        self.buf.emit(&[0x41, 0xC1, 0xE8, 0x03]); // SHR R8D, 3
         self.buf.emit(&[0x45, 0x85, 0xC0]); // TEST R8D, R8D
         // JZ to scalar remainder (patch later)
         self.buf.emit_byte(0x0F);
@@ -6154,10 +6160,13 @@ impl Compiler {
         self.emit_vzeroupper();
 
         // Advance R10D by chunks_consumed * 8 = ((n - i) & ~7).
-        self.buf.emit(&[0x44, 0x89, 0xD8]); // MOV EAX, R11D
-        self.buf.emit(&[0x44, 0x29, 0xD0]); // SUB EAX, R10D
-        self.buf.emit(&[0x83, 0xE0, 0xF8]); // AND EAX, ~7
-        self.buf.emit(&[0x41, 0x01, 0xC2]); // ADD R10D, EAX
+        // Scratch via R8D (chunk counter, decremented to zero by the loop
+        // above and now dead) — RAX still holds array A's base, which the
+        // scalar remainder below dereferences.
+        self.buf.emit(&[0x45, 0x89, 0xD8]); // MOV R8D, R11D
+        self.buf.emit(&[0x45, 0x29, 0xD0]); // SUB R8D, R10D
+        self.buf.emit(&[0x41, 0x83, 0xE0, 0xF8]); // AND R8D, ~7
+        self.buf.emit(&[0x45, 0x01, 0xC2]); // ADD R10D, R8D
 
         // Restore R13, R12 before falling into scalar cleanup.
         // POP R13 (41 5D), POP R12 (41 5C)

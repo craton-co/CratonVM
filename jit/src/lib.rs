@@ -1056,8 +1056,14 @@ unsafe fn osr_trampoline(
     // emitted body is correct for every call at this PC.
     let tramp_arc: Arc<ExecutableBuffer> = {
         let cache = osr_trampoline_cache();
-        // Fast path: read-only lookup.
-        if let Some(existing) = cache.lock().get(&target_addr).cloned() {
+        // Fast path: read-only lookup. The result is bound to a local so the
+        // `MutexGuard` temporary is dropped at the end of this statement.
+        // Under edition 2021 a guard created directly in an `if let`
+        // scrutinee stays live through the `else` arm, so the `cache.lock()`
+        // in the slow path below would re-lock the same non-reentrant
+        // `parking_lot::Mutex` on this thread and deadlock.
+        let existing = cache.lock().get(&target_addr).cloned();
+        if let Some(existing) = existing {
             existing
         } else {
             // Slow path: emit outside the lock, then insert under it. If another
