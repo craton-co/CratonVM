@@ -286,8 +286,19 @@ impl DeviceModuleInner {
         // pointers we must point at a stable 8-byte slot holding the
         // device address: `ptr_h` provides that storage and is kept live
         // (not moved or dropped) until after `launch_on_stream` returns.
+        //
+        // LIFETIME INVARIANT (enforced below): every pointer in
+        // `launch_args` borrows INTO either `args.raw`'s backing store or
+        // `ptr_h`'s backing store. Both `args` and `ptr_h` MUST stay live
+        // and un-reallocated until `launch_on_stream` has returned. We
+        // bind `arg_store` as an explicit `&Vec<KernelArg>` reference so
+        // the borrow checker pins `args` for at least the span of that
+        // reference, and we add a `_keep_alive` anchor after the launch
+        // so any future refactor that drops `args`/`ptr_h` early fails to
+        // compile.
+        let arg_store: &Vec<KernelArg> = &args.raw;
         let mut ip = 0usize;
-        let mut launch_args: Vec<*mut std::ffi::c_void> = args.raw.iter().map(|a| {
+        let mut launch_args: Vec<*mut std::ffi::c_void> = arg_store.iter().map(|a| {
             match a {
                 KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
                 KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
@@ -308,14 +319,45 @@ impl DeviceModuleInner {
         // `Copy`, and `self.functions` only lends a `&CudaFunction`, so
         // we clone it for the launch — the clone is cheap (it wraps an
         // `Arc<CudaModule>` plus a raw `CUfunction` handle).
+        //
+        // SAFETY: `launch_on_stream` reads, for every entry of
+        // `launch_args`, the bytes the entry points at. Those bytes live
+        // in two backing stores that MUST remain allocated, un-moved, and
+        // un-reallocated for the full duration of this call:
+        //   * `args.raw` (aliased here as `arg_store`) — holds every
+        //     scalar `KernelArg` value; the scalar pointers in
+        //     `launch_args` point directly at those `Vec` elements.
+        //   * `ptr_h` — the thread-local-rented `Vec<u64>` of device-
+        //     address slots; the `DevicePtr` pointers in `launch_args`
+        //     point at its elements.
+        // `launch_on_stream` is synchronous on the host side w.r.t.
+        // argument marshalling: it copies the pointed-at parameter bytes
+        // into the driver before returning, so the pointers only need to
+        // be valid until this call returns (not until the kernel runs).
+        // `func.clone()` does not touch either store. Neither `args` nor
+        // `ptr_h` is mutated, moved, or reallocated between building
+        // `launch_args` and this call. The `_keep_alive` binding after
+        // the launch ties both objects' lifetimes past this point so the
+        // contract is compiler-enforced against future refactors.
         let launch_result = unsafe {
             func.clone()
                 .launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
                 .map_err(map_err("kernel launch"))
         };
+        // Liveness anchor: `launch_on_stream` has returned, so the raw
+        // pointers in `launch_args` are no longer dereferenced by the
+        // driver. Borrowing `args` and `ptr_h` here forces the borrow
+        // checker to keep both alive across the `unsafe` launch above —
+        // a future refactor that drops/moves either before this point
+        // will fail to compile rather than silently introduce UB.
+        let _keep_alive: (&KernelArgs, &Vec<u64>) = (&args, &ptr_h);
+        // `launch_args` itself can be dropped now — it is only borrowed
+        // for the duration of the launch call.
+        drop(launch_args);
         // Restore the scratch vec into the thread-local with its
         // (possibly grown) capacity intact, regardless of launch
-        // outcome.
+        // outcome. Safe to consume `ptr_h` now: the launch has returned
+        // and `_keep_alive` has already pinned it across the launch.
         PTR_SCRATCH.with(|cell| {
             ptr_h.clear();
             *cell.borrow_mut() = ptr_h;
