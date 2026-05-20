@@ -6182,8 +6182,19 @@ impl Compiler {
         //
         // for (; i < n; i++) OUT[i] = A[i] OP B[i]
         //
-        // Uses only volatile GPRs RAX/RCX/R9 so the caller's register
-        // state is unaffected (the AVX2 phase already saved R12/R13).
+        // The A and B base pointers arrive in RAX/RCX, but the loop body's
+        // `MOV EAX, [base+...]` / `MOV ECX, [base+...]` loads overwrite
+        // EAX/ECX — the low halves of the very RAX/RCX registers used as
+        // the base. After the first iteration the base is destroyed and
+        // the next load faults (any tail length >= 2 segfaults). Stash the
+        // bases into R8/R9, which are both dead here (R8 was the chunk
+        // counter, R9 the SIMD A-pointer), and address off those. RDX (OUT
+        // base) is only ever a store base, never clobbered, so it stays.
+        // This runs on both the SIMD-taken and SIMD-skipped paths since it
+        // is emitted at the `after_simd` join point.
+        self.buf.emit(&[0x49, 0x89, 0xC0]); // MOV R8, RAX  (A base)
+        self.buf.emit(&[0x49, 0x89, 0xC9]); // MOV R9, RCX  (B base)
+
         let scalar_loop_start = self.buf.pos();
         // CMP R10D, R11D — 45 39 DA
         self.buf.emit(&[0x45, 0x39, 0xDA]);
@@ -6193,21 +6204,14 @@ impl Compiler {
         let scalar_end_patch = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
-        // Save RDX (out base) across the scalar body's RDX clobber for
-        // IMUL EAX, [...], only Mul clobbers RDX on 32-bit multiply of
-        // EAX*ECX the result goes to EAX and EDX is not written. So
-        // saving is not needed — but be defensive for clarity.
-
-        // EAX = A[i] = [RAX + R10*4 + H]
-        //   42 8B 84 90 <disp32>  — MOV EAX, [RAX + R10*4 + disp32]
-        //   ModRM 84 = mod=10, reg=EAX(0), rm=100 (SIB)
-        //   SIB 90 = scale=10(×4), index=010(R10 lo-3), base=000(RAX)
-        self.buf.emit(&[0x42, 0x8B, 0x84, 0x90]);
+        // EAX = A[i] = [R8 + R10*4 + H]
+        //   43 8B 84 90 <disp32> — REX.B selects R8 as the SIB base
+        self.buf.emit(&[0x43, 0x8B, 0x84, 0x90]);
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
-        // ECX = B[i] = [RCX + R10*4 + H]
-        //   42 8B 8C 91 <disp32>
-        self.buf.emit(&[0x42, 0x8B, 0x8C, 0x91]);
+        // ECX = B[i] = [R9 + R10*4 + H]
+        //   43 8B 8C 91 <disp32> — REX.B selects R9 as the SIB base
+        self.buf.emit(&[0x43, 0x8B, 0x8C, 0x91]);
         self.buf.emit(&(HEADER_SIZE as i32).to_le_bytes());
 
         // EAX = EAX OP ECX
