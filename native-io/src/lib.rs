@@ -2026,6 +2026,43 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(to_read as i32)))
 }
 
+/// `ByteArrayInputStream.read(byte[])` / `InputStream.read(byte[])`.
+///
+/// The JDK contract is `read(b, 0, b.length)`. In real-JDK mode the
+/// boot `java.io.InputStream` bytecode would normally provide this
+/// (it is `read(b,0,b.length)`), and `ByteArrayInputStream` does not
+/// override the single-arg form. But SmallRye's copy of the JDK
+/// `Properties$LineReader` calls `inStream.read(inByteBuf)` against a
+/// `ByteArrayInputStream` we synthesised for `URL.openStream()`; if the
+/// single-arg `read([B)I` is not served here it falls through to a
+/// path that never reports EOF, so `LineReader.readLine()` spins
+/// forever (KC26 `show-config` hang). Serving it directly — with the
+/// correct `-1`-at-EOF contract — keeps the loop terminating.
+fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let buf = match args.get(1) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let buf_len = ctx.array_length(buf) as i32;
+    // Delegate to the (off=0, len=b.length) three-arg form. This
+    // dispatches to the BAIS-specific `read([BII)I` native and so
+    // honours the `-1`-at-EOF contract for the synthetic streams
+    // produced by `URL.openStream` / `Class.getResourceAsStream`.
+    native_bais_read_bytes(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Object(Some(buf)),
+            Value::Int(0),
+            Value::Int(buf_len),
+        ],
+    )
+}
+
 fn native_bais_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3532,6 +3569,7 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register(bais, "<init>", "([B)V", native_bais_init);
     registry.register(bais, "<init>", "([BII)V", native_bais_init_offset);
     registry.register(bais, "read", "()I", native_bais_read);
+    registry.register(bais, "read", "([B)I", native_bais_read_byte_array);
     registry.register(bais, "read", "([BII)I", native_bais_read_bytes);
     registry.register(bais, "available", "()I", native_bais_available);
     registry.register(bais, "skip", "(J)J", native_bais_skip);
@@ -3565,6 +3603,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java.io.InputStream (base class fallback) ---
     registry.register("java/io/InputStream", "read", "()I", native_bais_read);
+    registry.register(
+        "java/io/InputStream",
+        "read",
+        "([B)I",
+        native_bais_read_byte_array,
+    );
     registry.register(
         "java/io/InputStream",
         "read",

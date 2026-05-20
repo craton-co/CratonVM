@@ -1496,6 +1496,39 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
             "org/apache/felix/framework/util/SecureAction",
             "lambda$getAccessor$0",
         )
+        // KC26.LR (current session) — `apps/keycloak-26.2.4` with
+        // `quarkus-run.jar … show-config` HANGS (rc=124) inside SmallRye
+        // Config's copy of the JDK `Properties$LineReader`. SmallRye ships
+        // its own `io/smallrye/config/ConfigValueConfigSource$ConfigValueProperties`
+        // whose `load0(LineReader)` drives `LineReader.readLine()` in a
+        // bytecode loop until `readLine` returns -1 (EOF). The
+        // `application.properties` resource is served as a synthetic
+        // `ByteArrayInputStream` (from `URL.openStream`); a standalone
+        // `RUSTJVM_FRAME_TRACE=1` capture shows `readLine` returning a
+        // non-negative value forever — `load0` never sees EOF, so it
+        // re-`put`s the same lines indefinitely.
+        //
+        // The InputStream EOF contract itself is correct: a structural
+        // copy of `LineReader` (`apps`-style probe) terminates cleanly,
+        // and `ByteArrayInputStream.read([BII)I` returns -1 at EOF as
+        // verified by direct probes. The hang only reproduces in the full
+        // KC26 run, and `RUSTJVM_DISABLE_JIT=1` makes it vanish — `read`
+        // is then called multiple times and the boot advances past the
+        // LineReader to a later, unrelated gap. Classic JIT-miscompile
+        // signature (NETTY.1 / W2-CHM archetype): `readLine` is a hot
+        // counted loop (`while (inOff < inLimit) { … inByteBuf[inOff++] … }`)
+        // whose `iinc inOff` / bounds compare is miscompiled under OSR,
+        // so the loop's index never advances and EOF is never reached.
+        // The companion `load0` (outer loop) is skip-listed for symmetry.
+        // Liftable via `RUSTJVM_JIT_ALLOW_PACKAGES=io/smallrye/config/`.
+        | (
+            "io/smallrye/config/ConfigValueConfigSource$ConfigValueProperties$LineReader",
+            "readLine",
+        )
+        | (
+            "io/smallrye/config/ConfigValueConfigSource$ConfigValueProperties",
+            "load0",
+        )
     )
 }
 
