@@ -3192,6 +3192,87 @@ mod tests {
         }
     }
 
+    /// Non-moving young-gen sweep (the JIT-frames-active path).
+    ///
+    /// With `gc_quiescence` active the collector must run a non-moving
+    /// mark-sweep: survivors keep their exact addresses, dead objects
+    /// are reclaimed into the free list, and a subsequent allocation
+    /// reuses a reclaimed hole. This is the fix for the
+    /// "GC skipped: JIT frames are active → OOM" blocker.
+    #[test]
+    fn non_moving_sweep_when_jit_active() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        // Build a live chain a→b plus a dead object in between.
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let dead = heap.alloc_object(ClassId::new(9), 1);
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Int(4242));
+        heap.set_field(dead, 0, Value::Int(-1));
+
+        let a_ptr = obj_a.as_ptr();
+        let b_ptr = obj_b.as_ptr();
+        let dead_ptr = dead.as_ptr();
+
+        // Simulate "a JIT frame is active" so the collector takes the
+        // non-moving path. The guard is paired with a `leave()` below.
+        crate::gc_quiescence::enter();
+        assert!(crate::gc_quiescence::is_active());
+
+        // `roots` carries only `obj_a`; `obj_b` is reached transitively,
+        // `dead` is unreachable.
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+
+        crate::gc_quiescence::leave();
+
+        // Non-moving: nothing was copied, the pointer map is empty, and
+        // the root's address is UNCHANGED.
+        assert_eq!(result.stats.objects_copied, 0);
+        assert!(result.pointer_map.is_empty());
+        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+
+        // Live chain intact at its original addresses.
+        assert_eq!(obj_a.as_ptr(), a_ptr);
+        match heap.get_field(obj_a, 0) {
+            Value::Object(Some(b)) => {
+                assert_eq!(b.as_ptr(), b_ptr, "B must not move");
+                assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
+            }
+            other => panic!("A's field should still reference B, got {other:?}"),
+        }
+
+        // Dead object's memory was reclaimed (zeroed + on the free list).
+        assert!(result.stats.bytes_freed > 0, "dead object must be reclaimed");
+        // The reclaimed region was zeroed by the sweep.
+        // SAFETY: `dead_ptr` is inside the young arena; reading its
+        // (now-freed, zeroed) header is a valid in-bounds read.
+        let dead_header = unsafe { &*(dead_ptr as *const ObjectHeader) };
+        assert_eq!(dead_header.class_id, ClassId::new(0), "freed hole must be zeroed");
+
+        // A fresh allocation must succeed and reuse the reclaimed hole
+        // (it lands at the dead object's old address since that's the
+        // first free block).
+        let reused = heap.alloc_object(ClassId::new(7), 1);
+        assert_eq!(
+            reused.as_ptr(),
+            dead_ptr,
+            "new allocation should reuse the swept hole",
+        );
+        heap.set_field(reused, 0, Value::Int(555));
+        assert_eq!(heap.get_field(reused, 0).as_int(), Some(555));
+
+        // And the live chain is STILL intact after reusing the hole.
+        match heap.get_field(obj_a, 0) {
+            Value::Object(Some(b)) => {
+                assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
+            }
+            other => panic!("live chain corrupted after hole reuse: {other:?}"),
+        }
+    }
+
     #[test]
     fn promotion_after_enough_gcs() {
         let heap = small_gen_heap();
