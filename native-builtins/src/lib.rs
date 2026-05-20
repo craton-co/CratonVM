@@ -15927,13 +15927,51 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let abs_end = offset + m.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
-        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
+        // Java `Matcher.find()` semantics: the next search starts at the end
+        // of this match. But for a **zero-width** match (`abs_end == abs_start`)
+        // the next search MUST advance by one position — otherwise `find()`
+        // re-matches the same empty string forever (Tomcat's `Bootstrap.getPaths`
+        // loops `Matcher.find()` over `(\"[^\"]*\")|(([^,])*)`, whose second
+        // branch matches empty, and hangs the whole VM). HotSpot's `Matcher`
+        // does this via `if (nextSearchIndex == first) nextSearchIndex++`.
+        let next_offset = if abs_end == abs_start {
+            advance_one_char(&input, abs_end)
+        } else {
+            abs_end
+        };
+        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(next_offset as i32));
         Ok(Some(Value::Int(1)))
     } else {
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
         Ok(Some(Value::Int(0)))
     }
+}
+
+/// Advance a byte offset into `text` past exactly one UTF-8 scalar value.
+///
+/// Used by `Matcher.find()` to step past a zero-width match. A bare
+/// `offset + 1` could land in the middle of a multi-byte character and panic
+/// on the next `&text[offset..]` slice, so when `offset` is inside the string
+/// we round up to the next char boundary.
+///
+/// When `offset` is already at the end of the string (a valid zero-width
+/// match position — e.g. `$` or `x*` matching `[len,len]`), we return
+/// `text.len() + 1`. That is deliberately one past the end so the *next*
+/// `find()` trips its `offset > input.len()` guard and cleanly reports "no
+/// match" — mirroring HotSpot's `Matcher.find()`, which advances
+/// `nextSearchIndex` past `to` and then returns `false`. Returning `text.len()`
+/// here instead would let `find()` re-match the empty string at the end
+/// forever.
+fn advance_one_char(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len() + 1;
+    }
+    let mut next = offset + 1;
+    while next < text.len() && !text.is_char_boundary(next) {
+        next += 1;
+    }
+    next
 }
 
 /// `Matcher.find(int start)` — reset the search position to `start` and look
@@ -15967,7 +16005,15 @@ fn native_matcher_find_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         let abs_end = offset + m.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
-        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
+        // Zero-width match: advance the stored offset so a following no-arg
+        // `find()` does not re-match the empty string in place. See
+        // `native_matcher_find` for the full rationale.
+        let next_offset = if abs_end == abs_start {
+            advance_one_char(&input, abs_end)
+        } else {
+            abs_end
+        };
+        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(next_offset as i32));
         Ok(Some(Value::Int(1)))
     } else {
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
