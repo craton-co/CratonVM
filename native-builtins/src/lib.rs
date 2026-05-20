@@ -1459,7 +1459,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     cassandra_extras::register_cassandra_stubs(registry);
     neo4j_extras::register_neo4j_stubs(registry);
     solr_extras::register_solr_stubs(registry);
-    cglib_extras::register_cglib_stubs(registry);
+    // cglib probe shim removed — root cause (null `defaultDomain` on custom
+    // ClassLoaders) fixed in `classloader_real.rs::init_classloader_common_fields`.
     wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
     activemq_extras::register_activemq_stubs(registry);
     felix_extras::register_felix_stubs(registry);

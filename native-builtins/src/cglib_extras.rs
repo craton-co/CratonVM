@@ -1,56 +1,25 @@
-//! cglib_probe boot-test shims — comprehensive coverage.
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+//! cglib_probe — formerly a boot-test shim, now neutered.
+//!
+//! The cglib probe used to be short-circuited because a `ClassLoader`
+//! subclass calling `defineClass` NPE'd with "Cannot invoke getCodeSource
+//! on null" inside the real JDK `ClassLoader.preDefineClass` bytecode.
+//!
+//! Root cause (fixed): the simplified real-JDK `ClassLoader.<init>`
+//! natives in `classloader_real.rs` only stored the `parent` field and
+//! skipped the real ctor's `defaultDomain = new ProtectionDomain(...)`
+//! field initialiser, leaving `defaultDomain` null. `preDefineClass`
+//! then read that null field and NPE'd. `classloader_real.rs` now calls
+//! `init_classloader_common_fields`, which builds a non-null
+//! `defaultDomain` (plus `classes` / `packages` / etc.), so the real
+//! cglib `Enhancer.create()` → `defineClass` path runs cleanly.
+//!
+//! This registration body is intentionally empty — no synthetic stubs.
+use rustjvm_native_api::NativeMethodRegistry;
 
-fn cglib_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[cglib-shim] short-circuited (SEGV avoidance)");
-    Ok(None)
+pub fn register_cglib_stubs(_registry: &mut NativeMethodRegistry) {
+    // Neutered: the underlying VM bug (null `defaultDomain` on custom
+    // ClassLoaders) is fixed in `classloader_real.rs`. No shims here.
 }
-
-pub fn register_cglib_stubs(registry: &mut NativeMethodRegistry) {
-    // Real-mode gate: when RUSTJVM_CGLIB_REAL is set (any value),
-    // skip every boot-test short-circuit so the real cglib code path
-    // runs. Used by diag harnesses to measure how far CratonVM gets on
-    // the actual cglib probe before failure.
-    if std::env::var_os("RUSTJVM_CGLIB_REAL").is_some() {
-        tracing::warn!("[cglib-shim] RUSTJVM_CGLIB_REAL set - skipping cglib boot-test shims");
-        return;
-    }
-    // Comprehensive ASM + cglib clinit no-ops to prevent SEGV.
-    for class in [
-        // ASM internals
-        "org/objectweb/asm/ClassReader",
-        "org/objectweb/asm/ClassWriter",
-        "org/objectweb/asm/MethodVisitor",
-        "org/objectweb/asm/ClassVisitor",
-        "org/objectweb/asm/Opcodes",
-        "org/objectweb/asm/Type",
-        "org/objectweb/asm/Frame",
-        "org/objectweb/asm/Label",
-        // cglib internals (different package names across versions)
-        "net/sf/cglib/proxy/Enhancer$EnhancerKey",
-        "net/sf/cglib/proxy/MethodInterceptor",
-        "net/sf/cglib/proxy/Callback",
-        "net/sf/cglib/proxy/CallbackHelper",
-        "net/sf/cglib/proxy/Factory",
-        "net/sf/cglib/core/CodeGenerationException",
-        "net/sf/cglib/core/KeyFactory",
-        "net/sf/cglib/core/NamingPolicy",
-        "net/sf/cglib/core/DefaultNamingPolicy",
-        // Spring cglib (alternate package name)
-        "org/springframework/cglib/proxy/Enhancer",
-        "org/springframework/cglib/core/AbstractClassGenerator",
-    ] {
-        registry.register(class, "<clinit>", "()V", cglib_noop);
-    }
-    // CglibProbe.main again as safety net.
-    for probe_class in ["CglibProbe", "org/test/CglibProbe"] {
-        registry.register(probe_class, "main", "([Ljava/lang/String;)V", cglib_noop);
-        registry.register(probe_class, "<clinit>", "()V", cglib_noop);
-    }
-}
-// Wired in `lib.rs::register_essential_natives`.
 
 #[cfg(test)]
 mod tests {
