@@ -9553,6 +9553,14 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     let c = "java/util/LinkedList";
     registry.register(c, "<init>", "()V", native_ll_init);
     registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ll_add);
+    // Positional insert/removal — required so the overlay LinkedList stays the
+    // single source of truth. Without these, real-JDK `add(int,E)` /
+    // `remove(int)` bytecode runs against the JDK field layout (`first`/`last`)
+    // that our synthetic `<init>` never populates, silently desyncing the list
+    // (e.g. Felix's resolver permutation queue: add(0,perm) writes one
+    // structure, isEmpty()/remove(0) read the overlay → permutation lost).
+    registry.register(c, "add", "(ILjava/lang/Object;)V", native_ll_add_at);
+    registry.register(c, "remove", "(I)Ljava/lang/Object;", native_ll_remove_at);
     registry.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ll_add_first);
     registry.register(c, "addLast", "(Ljava/lang/Object;)V", native_ll_add_last);
     registry.register(c, "get", "(I)Ljava/lang/Object;", native_ll_get);
@@ -9899,6 +9907,109 @@ fn native_ll_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let element = args.get(1).copied().unwrap_or(Value::Object(None));
     ll_link_last(ctx, this, element);
     Ok(None)
+}
+
+/// Insert `element` into a fresh node positioned immediately before `succ`.
+/// Mirrors real-JDK `LinkedList.linkBefore`. `succ` must be a live node of
+/// `this`. Updates `head`/`size` as needed; `tail` is unaffected because the
+/// new node is never the last.
+fn ll_link_before(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value, succ: ObjectRef) {
+    let node = ll_alloc_node(ctx, element);
+    let pred = ctx.get_field(succ, LL_NODE_PREV);
+    ctx.set_field(node, LL_NODE_PREV, pred);
+    ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(succ)));
+    ctx.set_field(succ, LL_NODE_PREV, Value::Object(Some(node)));
+    match pred {
+        Value::Object(Some(pred_node)) => {
+            ctx.set_field(pred_node, LL_NODE_NEXT, Value::Object(Some(node)));
+        }
+        _ => {
+            // succ was the head — node becomes the new head.
+            ll_set(this, "head", Value::Object(Some(node)));
+        }
+    }
+    let size = ll_size(ctx, this);
+    ll_set(this, "size", Value::Int(size + 1));
+}
+
+/// Unlink a live node, returning its element. Mirrors `LinkedList.unlink`.
+fn ll_unlink_node(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) -> Value {
+    let element = ctx.get_field(node, LL_NODE_ELEM);
+    let prev = ctx.get_field(node, LL_NODE_PREV);
+    let next = ctx.get_field(node, LL_NODE_NEXT);
+    match prev {
+        Value::Object(Some(prev_node)) => {
+            ctx.set_field(prev_node, LL_NODE_NEXT, next);
+        }
+        _ => {
+            // node was the head.
+            ll_set(this, "head", next);
+        }
+    }
+    match next {
+        Value::Object(Some(next_node)) => {
+            ctx.set_field(next_node, LL_NODE_PREV, prev);
+        }
+        _ => {
+            // node was the tail.
+            ll_set(this, "tail", prev);
+        }
+    }
+    let size = ll_size(ctx, this);
+    ll_set(this, "size", Value::Int((size - 1).max(0)));
+    element
+}
+
+/// `LinkedList.add(int index, E element)` — positional insert.
+fn native_ll_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let element = args.get(2).copied().unwrap_or(Value::Object(None));
+    let size = ll_size(ctx, this);
+    if index < 0 || index > size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
+    }
+    if index == size {
+        ll_link_last(ctx, this, element);
+    } else {
+        match ll_node_at(ctx, this, index) {
+            Some(succ) => ll_link_before(ctx, this, element, succ),
+            None => ll_link_last(ctx, this, element),
+        }
+    }
+    Ok(None)
+}
+
+/// `LinkedList.remove(int index)` — positional removal, returns the element.
+fn native_ll_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let size = ll_size(ctx, this);
+    if index < 0 || index >= size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
+    }
+    match ll_node_at(ctx, this, index) {
+        Some(node) => Ok(Some(ll_unlink_node(ctx, this, node))),
+        None => Ok(Some(Value::Object(None))),
+    }
 }
 
 /// Traverse to the node at the given index
