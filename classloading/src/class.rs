@@ -602,17 +602,36 @@ impl Class {
         None
     }
 
-    /// Get the field at a given absolute index.
+    /// Get the **instance** field at a given absolute index.
     ///
     /// If `index < first_field_index`, the field belongs to a superclass and
     /// this method returns `None` — the caller should look it up from the
     /// superclass via `ClassStore`.
+    ///
+    /// `index - first_field_index` is the position of the field among this
+    /// class's *instance* fields. `self.fields` holds static **and** instance
+    /// fields interleaved in declaration order, so we cannot index `self.fields`
+    /// directly: a class such as `java.util.regex.Matcher` declares two static
+    /// constants (`ENDANCHOR`, `NOANCHOR`) in the middle of its instance fields,
+    /// which would shift every instance field declared after them. We must walk
+    /// `self.fields` counting only non-static entries — this is the inverse of
+    /// the `first_field_index + instance_idx` mapping in [`Self::find_own_field`].
     pub fn field_at_index(&self, index: usize) -> Option<&ClassFileField> {
         if index < self.first_field_index {
-            None // belongs to a superclass
-        } else {
-            self.fields.get(index - self.first_field_index)
+            return None; // belongs to a superclass
         }
+        let target_instance_idx = index - self.first_field_index;
+        let mut instance_idx = 0usize;
+        for field in &self.fields {
+            if field.is_static() {
+                continue;
+            }
+            if instance_idx == target_instance_idx {
+                return Some(field);
+            }
+            instance_idx += 1;
+        }
+        None
     }
 
     // ----- Subclass / interface checking -----------------------------------
@@ -992,6 +1011,15 @@ mod tests {
         }
     }
 
+    fn make_static_field(name: &str) -> ClassFileField {
+        ClassFileField {
+            access_flags: FieldAccessFlags::STATIC,
+            name: rustjvm_types::intern_arc(name),
+            descriptor: rustjvm_types::intern_arc("I"),
+            attributes: vec![],
+        }
+    }
+
     fn make_method(name: &str, descriptor: &str) -> ClassFileMethod {
         ClassFileMethod {
             access_flags: MethodAccessFlags::empty(),
@@ -1108,6 +1136,44 @@ mod tests {
         assert!(class.field_at_index(2).is_none());
         // Index 5 → out of bounds → None
         assert!(class.field_at_index(5).is_none());
+    }
+
+    /// Regression: `java.util.regex.Matcher` declares two static constants
+    /// (`ENDANCHOR`, `NOANCHOR`) interleaved between its instance fields.
+    /// `field_at_index` must map an absolute instance index back to the
+    /// N-th *instance* field, skipping the interleaved statics — otherwise
+    /// every instance field declared after a static is misresolved, which
+    /// caused `Matcher.find()` to loop forever on zero-width matches.
+    #[test]
+    fn field_at_index_skips_interleaved_statics() {
+        let id = ClassId::new(0);
+        // Declaration order: i0, i1, S(static), i2, S(static), i3
+        let fields = vec![
+            make_field("i0"),
+            make_field("i1"),
+            make_static_field("S_A"),
+            make_field("i2"),
+            make_static_field("S_B"),
+            make_field("i3"),
+        ];
+        // first_field_index = 0, 4 instance fields total.
+        let class = make_class(id, "Matcher", None, vec![], fields, vec![], 0, 4);
+
+        // find_own_field gives the absolute index; field_at_index must invert it.
+        for name in ["i0", "i1", "i2", "i3"] {
+            let (abs, _) = class.find_own_field(name).unwrap();
+            assert_eq!(
+                &*class.field_at_index(abs).unwrap().name,
+                name,
+                "field_at_index({abs}) should round-trip back to {name}"
+            );
+        }
+        // Direct index checks: instance fields are 0..4 regardless of statics.
+        assert_eq!(&*class.field_at_index(0).unwrap().name, "i0");
+        assert_eq!(&*class.field_at_index(1).unwrap().name, "i1");
+        assert_eq!(&*class.field_at_index(2).unwrap().name, "i2");
+        assert_eq!(&*class.field_at_index(3).unwrap().name, "i3");
+        assert!(class.field_at_index(4).is_none());
     }
 
     #[test]
