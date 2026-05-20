@@ -927,7 +927,7 @@ impl Arm64Backend {
                 // sipush
                 0x11 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let val = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as i32;
+                    let val = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as i32;
                     pc += 2;
                     self.emit_iconst(val);
                 }
@@ -972,7 +972,7 @@ impl Arm64Backend {
                 // if_icmpeq
                 0x9f => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Eq, target);
@@ -980,7 +980,7 @@ impl Arm64Backend {
                 // if_icmpne
                 0xa0 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Ne, target);
@@ -988,7 +988,7 @@ impl Arm64Backend {
                 // if_icmplt
                 0xa1 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Lt, target);
@@ -996,7 +996,7 @@ impl Arm64Backend {
                 // if_icmpge
                 0xa2 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Ge, target);
@@ -1004,7 +1004,7 @@ impl Arm64Backend {
                 // if_icmpgt
                 0xa3 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Gt, target);
@@ -1012,7 +1012,7 @@ impl Arm64Backend {
                 // if_icmple
                 0xa4 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Le, target);
@@ -1020,7 +1020,7 @@ impl Arm64Backend {
                 // goto
                 0xa7 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1124,7 +1124,7 @@ impl Arm64Backend {
                 0x99 => { // ifeq
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1133,7 +1133,7 @@ impl Arm64Backend {
                 0x9a => { // ifne
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1143,7 +1143,7 @@ impl Arm64Backend {
                 0x9b => {
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1154,7 +1154,7 @@ impl Arm64Backend {
                 0x9c => {
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1165,7 +1165,7 @@ impl Arm64Backend {
                 0x9d => {
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1176,7 +1176,7 @@ impl Arm64Backend {
                 0x9e => {
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1187,7 +1187,7 @@ impl Arm64Backend {
                 0xc6 => {
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1197,7 +1197,7 @@ impl Arm64Backend {
                 0xc7 => {
                     let val = self.pop_operand();
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc+1] as i16) as i32;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc+1]]) as i32;
                     pc += 2;
                     let target = (start_pc as i32 + offset) as usize;
                     let label = self.label_for_pc(target);
@@ -1609,14 +1609,14 @@ impl Arm64Backend {
                 // -- if_acmpeq (0xa5), if_acmpne (0xa6) --
                 0xa5 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Eq, target);
                 }
                 0xa6 => {
                     if pc + 1 >= bytecode.len() { success = false; break; }
-                    let offset = ((bytecode[pc] as i16) << 8 | bytecode[pc + 1] as i16) as isize;
+                    let offset = i16::from_be_bytes([bytecode[pc], bytecode[pc + 1]]) as isize;
                     pc += 2;
                     let target = (start_pc as isize + offset) as usize;
                     self.emit_if_icmp(Arm64Condition::Ne, target);
@@ -2403,7 +2403,7 @@ pub fn detect_neon_patterns(bytecode: &[u8], _num_locals: usize) -> Vec<NeonVect
         };
 
         if is_branch && offset_pos + 1 < code_len {
-            let offset = ((bytecode[offset_pos] as i16) << 8 | bytecode[offset_pos + 1] as i16) as i32;
+            let offset = i16::from_be_bytes([bytecode[offset_pos], bytecode[offset_pos + 1]]) as i32;
             if offset < 0 {
                 // This is a backward branch — potential loop
                 let loop_start = (pc as i32 + offset) as usize;

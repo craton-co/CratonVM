@@ -1126,13 +1126,35 @@ impl FileDescriptorTable {
         (read_fd, write_fd)
     }
 
-    /// Read from the read end of a pipe. Returns bytes read (0 if empty).
+    /// Read from the read end of a pipe.
+    ///
+    /// Returns the number of bytes read. An empty buffer is NOT unconditionally
+    /// reported as EOF: `Ok(0)` (true EOF) is only returned once the write end
+    /// has been closed. While a writer is still open and the buffer is empty,
+    /// this returns `ErrorKind::WouldBlock` so a `FileInputStream` reader does
+    /// not mistake "no data yet" for end-of-stream.
+    ///
+    /// The pipe buffer is shared via `Arc`: `PipeRead` holds one clone and each
+    /// open `PipeWrite` holds another. So a `strong_count` of exactly 1 means
+    /// only this read end remains — every writer has been dropped/closed.
     pub fn pipe_read(&self, fd: FdId, buf: &mut [u8]) -> Result<usize, io::Error> {
         let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for pipe read"))?;
         match &*entry {
             FileEntry::PipeRead(pipe) => {
                 let mut p = pipe.lock();
                 let n = buf.len().min(p.len());
+                if n == 0 {
+                    // Buffer empty: distinguish a still-open writer from true EOF.
+                    let writer_open = Arc::strong_count(pipe) > 1;
+                    drop(p);
+                    if writer_open {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "pipe empty, writer still open",
+                        ));
+                    }
+                    return Ok(0);
+                }
                 for (i, b) in p.drain(..n).enumerate() {
                     buf[i] = b;
                 }

@@ -267,7 +267,15 @@ impl DeviceModuleInner {
                 ptr_h.push(*addr);
             }
         }
-        // Build the argument tuple for cudarc 0.13 launch API
+        // Build the argument tuple for cudarc 0.13 launch API.
+        //
+        // The CUDA kernel-parameter ABI (and cudarc's `launch_on_stream`)
+        // requires each entry to be a pointer TO the argument value, not
+        // the value itself. For scalars `&value as *const _` is taken
+        // from `args.raw`, which lives for the whole function. For device
+        // pointers we must point at a stable 8-byte slot holding the
+        // device address: `ptr_h` provides that storage and is kept live
+        // (not moved or dropped) until after `launch_on_stream` returns.
         let mut ip = 0usize;
         let launch_args: Vec<*mut std::ffi::c_void> = args.raw.iter().map(|a| {
             match a {
@@ -276,13 +284,15 @@ impl DeviceModuleInner {
                 KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
                 KernelArg::F64(v) => v as *const f64 as *mut std::ffi::c_void,
                 KernelArg::DevicePtr { .. } => {
-                    let addr = ptr_h[ip] as *mut std::ffi::c_void;
+                    // Pointer to the device-address slot in `ptr_h`, not
+                    // the device address cast to a pointer.
+                    let slot = &ptr_h[ip] as *const u64 as *mut std::ffi::c_void;
                     ip += 1;
-                    addr
+                    slot
                 }
             }
         }).collect();
-        
+
         let launch_result = unsafe {
             func.launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
                 .map_err(map_err("kernel launch"))
@@ -343,6 +353,14 @@ pub(crate) struct DeviceBufferInner<T> {
 
 impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBufferInner<T> {
     pub(crate) fn uninit(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
+        // Reject element counts whose byte size overflows `usize` before
+        // handing `len` to the driver, which would otherwise allocate a
+        // wrapped (too-small) buffer.
+        len.checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| DeviceError::Driver(
+                format!("alloc uninit: size overflow ({len} elements of {} bytes)",
+                    std::mem::size_of::<T>())
+            ))?;
         // Output buffers are bound to the compute stream — the kernel
         // launch that fills them already runs there.
         let slice = unsafe {
@@ -410,6 +428,17 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         // NOTE: relies on stream-level ordering — the wait-on-compute
         // event was recorded inside `launch_raw`, so we do not need to
         // re-record here.
+        //
+        // Reject a `dst` shorter than the device buffer before the copy:
+        // cudarc's `dtoh_sync_copy_into` would otherwise either panic or
+        // (depending on version) read out of bounds on the host side.
+        let src_len = self.len();
+        if dst.len() < src_len {
+            return Err(DeviceError::Memcpy(format!(
+                "device→host: dst too small ({} elements, need {src_len})",
+                dst.len()
+            )));
+        }
         self.dev
             .dtoh_sync_copy_into(&self.slice, dst)
             .map_err(map_err("memcpy device→host"))

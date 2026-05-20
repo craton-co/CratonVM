@@ -2213,7 +2213,9 @@ impl ClassPath {
     ) -> Option<Vec<u8>> {
         let mut guard = archive.lock();
         let result = guard.by_name(name).and_then(|mut zip_entry| {
-            let mut data = Vec::with_capacity(zip_entry.size() as usize);
+            // Audit-fix (zip-bomb): the central-directory `size()` is
+            // attacker-controlled; clamp it like every other read path.
+            let mut data = Vec::with_capacity(safe_with_capacity(zip_entry.size()));
             zip_entry.read_to_end(&mut data)?;
             Ok(data)
         });
@@ -2300,7 +2302,9 @@ impl ClassPath {
             if let Some(relative) = name.strip_prefix("classes/") {
                 if !relative.is_empty() && !relative.ends_with('/') {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        let mut buf = Vec::with_capacity(entry.size() as usize);
+                        // Audit-fix (zip-bomb): clamp the attacker-controlled
+                        // central-directory `size()` like every other path.
+                        let mut buf = Vec::with_capacity(safe_with_capacity(entry.size()));
                         if entry.read_to_end(&mut buf).is_ok() {
                             classes_cache.insert(relative.to_string(), buf);
                         }

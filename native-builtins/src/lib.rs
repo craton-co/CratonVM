@@ -31859,7 +31859,7 @@ fn define_or_get_proxy_class(
     let _ = ctx.ensure_class_initialized("java/lang/reflect/Proxy$Instance");
 
     let (gen_name, spec) = build_proxy_spec_for(ctx, &sorted)?;
-    let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec);
+    let bytes = rustjvm_classloading::proxy_gen::emit_proxy_classfile(&spec).ok()?;
     let opts = rustjvm_native_api::DefineClassFull {
         // WP2.5-v3 item 4 — every method body emitted by `proxy_gen`
         // (constructor super-delegate, per-method dispatch shim, and

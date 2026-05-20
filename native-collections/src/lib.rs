@@ -659,7 +659,13 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        return Ok(Some(Value::Object(None))); // IndexOutOfBoundsException (simplified)
+        // JDK contract: out-of-range index throws IndexOutOfBoundsException
+        // (ArrayIndexOutOfBoundsException is a subclass, so `catch
+        // (IndexOutOfBoundsException)` still catches it).
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -681,7 +687,11 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        return Ok(Some(Value::Object(None)));
+        // JDK contract: out-of-range index throws IndexOutOfBoundsException.
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -711,16 +721,22 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Parse as i32 and reject negatives BEFORE casting to usize — a negative
+    // Java int would otherwise wrap to a huge usize and pass the `> size` check.
     let index = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
     let elem = args.get(2).copied().unwrap_or(Value::Object(None));
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
-    if index > size {
-        return Ok(None); // IndexOutOfBoundsException (simplified)
+    if index < 0 || index as usize > size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
+    let index = index as usize;
     let buf = al_ensure_capacity(ctx, this, size + 1);
     // Shift elements right
     for i in (index..size).rev() {
@@ -743,7 +759,11 @@ pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        return Ok(Some(Value::Object(None)));
+        // JDK contract: out-of-range index throws IndexOutOfBoundsException.
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -1104,16 +1124,29 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Parse as i32 and validate BEFORE casting to usize — a negative Java int
+    // would otherwise wrap to a huge usize, and `to.saturating_sub(from)`
+    // would silently mask a `from > to` range.
     let from = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
     let to = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let (data, _size) = al_state(ctx, this);
-    let sub_size = to.saturating_sub(from);
+    let (data, size) = al_state(ctx, this);
+    if from < 0 || to > size || from > to {
+        // JDK List.subList contract: fromIndex/toIndex out of range or
+        // fromIndex > toIndex throws IndexOutOfBoundsException.
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if from < 0 || from > to { from } else { to },
+        }
+        .into());
+    }
+    let from = from as usize;
+    let to = to as usize;
+    let sub_size = to - from;
     let __al_n_fields = al_slots(ctx).2;
     let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let new_buf = alloc_ref_array(ctx, std::cmp::max(sub_size, AL_DEFAULT_CAPACITY));
@@ -1141,11 +1174,8 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Some(d) = data {
         for i in 0..size {
             let val = ctx.get_array_element(d, i);
-            let elem_hash = match val {
-                Value::Object(Some(obj)) => ctx.identity_hash_code(obj),
-                Value::Int(v) => v,
-                _ => 0,
-            };
+            // List.hashCode contract: 31*acc + e.hashCode() (0 for null).
+            let elem_hash = element_hash_code(ctx, &val);
             hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
         }
     }
@@ -1352,6 +1382,48 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
         _ => ctx.identity_hash_code(key),
     };
     h ^ (h >> 16)
+}
+
+/// Compute the *raw* Java `hashCode()` of an element `Value` — i.e. the value
+/// returned by `Object.hashCode()` with NO HashMap bit-spreading applied.
+///
+/// This is what the `List`/`Set`/`Map` `hashCode` contracts require (unlike
+/// `map_hash_key`, which additionally spreads via `h ^ h>>>16` for bucket
+/// distribution). `null` hashes to 0. Strings and primitive wrappers are
+/// hashed by value to match the JDK; arbitrary objects dispatch to their
+/// virtual `hashCode()`.
+fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
+    match v {
+        Value::Object(None) => 0,
+        Value::Int(x) => *x,
+        Value::Long(x) => (*x ^ (*x >> 32)) as i32,
+        Value::Float(x) => x.to_bits() as i32,
+        Value::Double(x) => {
+            let bits = x.to_bits() as i64;
+            (bits ^ (bits >> 32)) as i32
+        }
+        Value::Object(Some(obj)) => {
+            // String hashCode by value (UTF-16 code units, wrapping mul+add).
+            if let Some(s) = ctx.read_string(*obj) {
+                let mut h: i32 = 0;
+                for cu in s.encode_utf16() {
+                    h = h.wrapping_mul(31).wrapping_add(cu as i32);
+                }
+                return h;
+            }
+            // Primitive wrapper types hash by their boxed primitive value.
+            if let Some(prim) = unbox_wrapper(ctx, *obj) {
+                return element_hash_code(ctx, &prim);
+            }
+            // Arbitrary objects: honour the contract via their virtual hashCode().
+            match ctx.invoke_virtual(*obj, "hashCode", "()I", &[]) {
+                Ok(Some(Value::Int(h))) => h,
+                _ => ctx.identity_hash_code(*obj),
+            }
+        }
+        // Internal VM values that cannot legitimately be collection elements.
+        Value::ReturnAddress(_) | Value::Uninitialized => 0,
+    }
 }
 
 /// Check if two keys are equal.
@@ -2700,16 +2772,10 @@ fn native_map_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let entries = map_collect_entries(ctx, this);
     let mut hash: i32 = 0;
     for (key, value) in &entries {
-        let kh = match key {
-            Value::Object(Some(obj)) => ctx.identity_hash_code(*obj),
-            Value::Int(v) => *v,
-            _ => 0,
-        };
-        let vh = match value {
-            Value::Object(Some(obj)) => ctx.identity_hash_code(*obj),
-            Value::Int(v) => *v,
-            _ => 0,
-        };
+        // Map.hashCode contract: sum of Map.Entry hashes,
+        // where Entry hash = keyHash ^ valueHash.
+        let kh = element_hash_code(ctx, key);
+        let vh = element_hash_code(ctx, value);
         hash = hash.wrapping_add(kh ^ vh);
     }
     Ok(Some(Value::Int(hash)))
@@ -3094,12 +3160,8 @@ fn native_hs_hash_code(
     let keys = map_collect_keys(ctx, backing);
     let mut h: i32 = 0;
     for k in &keys {
-        let kh = match k {
-            Value::Object(Some(o)) => ctx.identity_hash_code(*o),
-            Value::Int(v) => *v,
-            _ => 0,
-        };
-        h = h.wrapping_add(kh);
+        // Set.hashCode contract: sum of element hashCode()s (0 for null).
+        h = h.wrapping_add(element_hash_code(ctx, k));
     }
     Ok(Some(Value::Int(h)))
 }
@@ -4156,7 +4218,21 @@ fn native_collections_unmodifiable_list(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Pragmatic: return a defensive copy (regular ArrayList)
+    // FIXME(reviewer finding 4): this returns a MUTABLE defensive copy
+    // (a plain java/util/ArrayList). Mutating the result therefore does NOT
+    // throw UnsupportedOperationException, violating the JDK contract for
+    // Collections.unmodifiableList.
+    //
+    // A correct fix needs a true unmodifiable view, but the infrastructure
+    // does not exist in this crate: there is no immutable collection type,
+    // and the sibling APIs (unmodifiableMap/Set/Collection at ~line 16532)
+    // are all wired to `native_collections_identity` — equally mutable.
+    // The proper resolution is to allocate a real `java/util/Collections$
+    // UnmodifiableList` (whose JDK mutator methods already throw), wrapping
+    // the source in field `c` — which `collect_collection_elements`
+    // (~line 12143) already knows how to unwrap. That requires changes
+    // beyond this function, so it is left as a known missing feature
+    // rather than being papered over with a fake stub.
     let src = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),

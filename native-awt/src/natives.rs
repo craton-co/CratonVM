@@ -992,11 +992,29 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
 // BufferedImage natives
 // ---------------------------------------------------------------------------
 
+/// Maximum width/height accepted for a BufferedImage. Mirrors the practical
+/// per-dimension cap of the reference JDK's raster (a positive 16-bit value)
+/// and bounds the backing allocation to `MAX_IMAGE_DIM^2 * 4` bytes (~4 GiB
+/// worst case) — large requests are rejected instead of aborting the process.
+const MAX_IMAGE_DIM: i32 = 32767;
+
 fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "<init>", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
-            let w = get_int(args, 1).max(1) as u32;
-            let h = get_int(args, 2).max(1) as u32;
+            // Validate the raw signed dimensions before any `as u32` cast so a
+            // negative or absurdly large request cannot reach the allocator.
+            let w_raw = get_int(args, 1);
+            let h_raw = get_int(args, 2);
+            if w_raw <= 0 || h_raw <= 0 || w_raw > MAX_IMAGE_DIM || h_raw > MAX_IMAGE_DIM {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "BufferedImage dimensions {w_raw}x{h_raw} out of range (1..={MAX_IMAGE_DIM})"
+                    ),
+                }
+                .into());
+            }
+            let w = w_raw as u32;
+            let h = h_raw as u32;
             let it = match get_int(args, 3) { 1 => ImageType::IntRgb, 3 => ImageType::IntArgbPre, _ => ImageType::IntArgb };
             let img_id = image::image_registry().create(w, h, it);
             ctx.set_field_by_name(this, "imageId", Value::Long(img_id.0 as i64));
@@ -1019,11 +1037,20 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/awt/image/BufferedImage", "getRGB", "(II)I", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
-            let (x, y) = (get_int(args, 1) as u32, get_int(args, 2) as u32);
+            // Compare as signed `i32` before the `as u32` cast — a negative
+            // Java coordinate would otherwise wrap to ~4 billion and index OOB.
+            let (x_raw, y_raw) = (get_int(args, 1), get_int(args, 2));
             if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
                 let reg = image::image_registry();
                 if let Some(img) = reg.get(image::ImageId(id as u64)) {
-                    return int_ok(img.get_rgb(x, y) as i32);
+                    let (iw, ih) = (img.width() as i32, img.height() as i32);
+                    if x_raw < 0 || x_raw >= iw || y_raw < 0 || y_raw >= ih {
+                        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                            index: if x_raw < 0 || x_raw >= iw { x_raw } else { y_raw },
+                        }
+                        .into());
+                    }
+                    return int_ok(img.get_rgb(x_raw as u32, y_raw as u32) as i32);
                 }
             }
         }
@@ -1031,10 +1058,21 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/awt/image/BufferedImage", "setRGB", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
-            let (x, y, argb) = (get_int(args, 1) as u32, get_int(args, 2) as u32, get_int(args, 3) as u32);
+            // Compare as signed `i32` before the `as u32` cast — see getRGB.
+            let (x_raw, y_raw) = (get_int(args, 1), get_int(args, 2));
+            let argb = get_int(args, 3) as u32;
             if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
                 let mut reg = image::image_registry();
-                if let Some(img) = reg.get_mut(image::ImageId(id as u64)) { img.set_rgb(x, y, argb); }
+                if let Some(img) = reg.get_mut(image::ImageId(id as u64)) {
+                    let (iw, ih) = (img.width() as i32, img.height() as i32);
+                    if x_raw < 0 || x_raw >= iw || y_raw < 0 || y_raw >= ih {
+                        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                            index: if x_raw < 0 || x_raw >= iw { x_raw } else { y_raw },
+                        }
+                        .into());
+                    }
+                    img.set_rgb(x_raw as u32, y_raw as u32, argb);
+                }
             }
         }
         void_ok()

@@ -164,7 +164,9 @@ impl JitRuntimeHelpers {
     /// the unconditional `new_object` call when either is zero).
     pub fn validate(&self) -> bool {
         let ptrs = self.all_pointers();
-        ptrs.iter().all(|&p| p != 0)
+        // Each helper pointer must be non-null AND at least 2-byte aligned
+        // (minimum code alignment) — matches the documented contract above.
+        ptrs.iter().all(|&p| p != 0 && p % 2 == 0)
     }
 
     /// Return a list of field names whose pointer value is null (zero).

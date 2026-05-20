@@ -2780,15 +2780,6 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     exc_pc =
                                         thread.frames[frame_idx].last_instr_pc;
                                 } else {
-                                    let exc_class = shared.class_manager.read()
-                                        .get_class(shared.heap.class_id_of(current_exc))
-                                        .map(|c| c.name.to_string())
-                                        .unwrap_or_default();
-                                    let caller = shared.class_manager.read()
-                                        .get_class(thread.frames[frame_idx].class_id)
-                                        .map(|c| c.name.to_string())
-                                        .unwrap_or_default();
-                                    let mname = thread.frames[frame_idx].method_name().to_string();
                                     return Err(MethodCallFailed::ExceptionThrown(
                                         current_exc,
                                     ));

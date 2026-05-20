@@ -353,6 +353,54 @@ fn read_string_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<String>
     out
 }
 
+/// Tokenize a single command-line string into argv, respecting double
+/// quotes so that quoted programs and paths containing spaces (such as
+/// `C:\Program Files\...`) stay intact.
+///
+/// Splitting rules (a pragmatic subset of the Win32 `CommandLineToArgvW`
+/// behavior, sufficient for the strings the JDK's `ProcessImpl` builds):
+///   * Unquoted runs of whitespace separate tokens.
+///   * A `"` toggles "inside-quote" state; whitespace inside quotes is
+///     literal and does not split.
+///   * A `""` while already inside a quoted section emits a literal `"`
+///     (the standard escaping for an embedded double quote).
+/// The surrounding quote characters themselves are not kept in the token.
+fn tokenize_command_line(cmd_line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    let mut chars = cmd_line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_quotes && chars.peek() == Some(&'"') {
+                    // `""` inside a quoted section -> literal quote.
+                    chars.next();
+                    cur.push('"');
+                } else {
+                    in_quotes = !in_quotes;
+                }
+                has_token = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        out.push(cur);
+    }
+    out
+}
+
 /// Return the process-table handle stored in a `java/lang/Process` synthetic,
 /// or 0 if the field is missing (unknown / reaped).
 fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
@@ -389,10 +437,12 @@ fn native_process_impl_create(
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Simple cmd-line splitter: on Windows, arguments are usually
-    // quoted; we support bare whitespace splitting (matches JDK behavior
-    // when the caller already passed an array into Runtime.exec).
-    let parts: Vec<String> = cmd_line.split_whitespace().map(String::from).collect();
+    // The JDK passes a single pre-built command string here; on Windows
+    // its arguments are double-quoted whenever they contain spaces (e.g.
+    // `"C:\Program Files\Java\bin\java.exe" -cp "a b"`). Naive whitespace
+    // splitting would tear quoted programs/paths apart, so tokenize with
+    // double-quote handling instead.
+    let parts: Vec<String> = tokenize_command_line(&cmd_line);
     if parts.is_empty() {
         return Ok(Some(Value::Long(0)));
     }
@@ -1029,5 +1079,35 @@ mod tests {
         let _ = wait_for_handle(handle);
         // pid should still be retrievable post-wait.
         assert_eq!(pid_for_handle(handle), pid);
+    }
+
+    #[test]
+    fn tokenize_keeps_quoted_paths_intact() {
+        // A quoted program path with spaces must stay a single argv[0].
+        let argv = tokenize_command_line(r#""C:\Program Files\Java\bin\java.exe" -version"#);
+        assert_eq!(
+            argv,
+            vec![r"C:\Program Files\Java\bin\java.exe".to_string(), "-version".to_string()]
+        );
+    }
+
+    #[test]
+    fn tokenize_plain_and_quoted_args() {
+        assert_eq!(
+            tokenize_command_line("prog -cp \"a b\" Main"),
+            vec!["prog".to_string(), "-cp".to_string(), "a b".to_string(), "Main".to_string()]
+        );
+        // Embedded "" inside a quoted section -> literal quote.
+        assert_eq!(
+            tokenize_command_line(r#"prog "say ""hi""""#),
+            vec!["prog".to_string(), r#"say "hi""#.to_string()]
+        );
+        // Empty / whitespace-only input yields no tokens.
+        assert!(tokenize_command_line("   ").is_empty());
+        // An explicit empty quoted argument is preserved.
+        assert_eq!(
+            tokenize_command_line(r#"prog """#),
+            vec!["prog".to_string(), String::new()]
+        );
     }
 }

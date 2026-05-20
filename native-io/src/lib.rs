@@ -88,6 +88,14 @@ pub fn is_path_validation_enabled() -> bool {
 ///     filenames such as `foo..bar.txt` (which contain `..` as a literal
 ///     substring but no `..` segment) are accepted. We reject only paths
 ///     containing a `ParentDir` component (`..` as a path segment).
+///   * SCOPE LIMITATION: this crate has no configured sandbox root, so the
+///     canonicalized path is NOT confined to any directory — `canonicalize`
+///     output is returned as-is. The `..`-segment rejection above stops
+///     traversal expressed in the path string, but an absolute path or a
+///     symlink that resolves outside an intended root is still accepted.
+///     Confining to a root would require a sandbox-root concept that does
+///     not exist here; that is a deployment decision, intentionally not
+///     made in this function.
 fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // Reject null bytes (security check — runs even when validation
     // is otherwise disabled, since a NUL truncates the path at the
@@ -646,13 +654,27 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Int(-1))),
     };
     let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    // JDK contract: reject negative off/len and a range past the array end
+    // with IndexOutOfBoundsException before allocating the buffer — a
+    // negative `len` cast to usize would otherwise abort the process in
+    // `vec![0u8; len]`. Mirrors the bounds check in `pipe.rs`.
+    let arr_len = ctx.array_length(arr) as i32;
+    if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.saturating_add(len) },
+            },
+        )));
+    }
+    let off = off as usize;
+    let len = len as usize;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(Some(Value::Int(-1))),
@@ -866,13 +888,27 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(None),
     };
     let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
+        Some(Value::Int(l)) => *l,
         _ => 0,
     };
+    // JDK contract: reject negative off/len and a range past the array end
+    // with IndexOutOfBoundsException before allocating the buffer — a
+    // negative `len` cast to usize would otherwise abort the process in
+    // `vec![0u8; len]`. Mirrors the bounds check in `pipe.rs`.
+    let arr_len = ctx.array_length(arr) as i32;
+    if off < 0 || len < 0 || off.checked_add(len).map_or(true, |end| end > arr_len) {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::ArrayIndexOutOfBoundsException {
+                index: if off < 0 { off } else { off.saturating_add(len) },
+            },
+        )));
+    }
+    let off = off as usize;
+    let len = len as usize;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),

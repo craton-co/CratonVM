@@ -586,24 +586,29 @@ impl JImageReader {
         &self.data[self.resources_offset..]
     }
 
-    fn read_redirect(&self, index: usize) -> i32 {
-        let off = index * 4;
-        let bytes = &self.redirect_table()[off..off + 4];
-        if self.header.little_endian {
+    /// Read a 4-byte redirect-table entry. Returns `None` if `index` is out
+    /// of range — the redirect/offset tables come from an untrusted jimage,
+    /// so an unchecked slice would panic on a malformed file.
+    fn read_redirect(&self, index: usize) -> Option<i32> {
+        let off = index.checked_mul(4)?;
+        let bytes = self.redirect_table().get(off..off + 4)?;
+        Some(if self.header.little_endian {
             i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         } else {
             i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        }
+        })
     }
 
-    fn read_offset_entry(&self, index: usize) -> u32 {
-        let off = index * 4;
-        let bytes = &self.offset_table()[off..off + 4];
-        if self.header.little_endian {
+    /// Read a 4-byte offset-table entry. Returns `None` if `index` is out of
+    /// range — see [`Self::read_redirect`].
+    fn read_offset_entry(&self, index: usize) -> Option<u32> {
+        let off = index.checked_mul(4)?;
+        let bytes = self.offset_table().get(off..off + 4)?;
+        Some(if self.header.little_endian {
             u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         } else {
             u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        }
+        })
     }
 
     /// Resolve `path` through the perfect-hash tables and return the
@@ -616,7 +621,12 @@ impl JImageReader {
 
         let h = jimage_hash(path, HASH_MULTIPLIER);
         let bucket = (h as usize) % n;
-        let redirect = self.read_redirect(bucket);
+        // `bucket < n`, but the redirect table may itself be truncated —
+        // treat an out-of-range entry as "not present".
+        let redirect = match self.read_redirect(bucket) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
         if redirect == 0 {
             return Ok(None);
         }
@@ -634,7 +644,10 @@ impl JImageReader {
         if index >= n {
             return Ok(None);
         }
-        let loc_offset = self.read_offset_entry(index) as usize;
+        let loc_offset = match self.read_offset_entry(index) {
+            Some(o) => o as usize,
+            None => return Ok(None),
+        };
         if loc_offset >= self.locations_buffer().len() {
             return Ok(None);
         }
@@ -721,7 +734,10 @@ impl JImageReader {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for i in 0..n {
-            let loc_offset = self.read_offset_entry(i) as usize;
+            let loc_offset = match self.read_offset_entry(i) {
+                Some(o) => o as usize,
+                None => continue,
+            };
             if loc_offset == 0 || !seen.insert(loc_offset) {
                 continue;
             }

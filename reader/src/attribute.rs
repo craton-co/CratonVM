@@ -1413,15 +1413,33 @@ fn decode_code_body(
     }))
 }
 
+/// Maximum nesting depth for the `decode_annotation` ⇄ `decode_element_value`
+/// mutual recursion. An untrusted annotation can nest `@`/`[` element values
+/// arbitrarily deep; without a cap that overflows the stack. 256 far exceeds
+/// anything a real compiler emits.
+const MAX_ANNOTATION_DEPTH: usize = 256;
+
 /// Decode a single annotation structure (JVM spec 4.7.16).
 fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassReaderError> {
+    decode_annotation_depth(buf, 0)
+}
+
+fn decode_annotation_depth(
+    buf: &mut ClassFileBuffer<'_>,
+    depth: usize,
+) -> Result<Annotation, ClassReaderError> {
+    if depth >= MAX_ANNOTATION_DEPTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: "annotation nesting depth exceeds limit".to_string(),
+        });
+    }
     let type_index = buf.read_u16()?;
     let num_element_value_pairs = buf.read_u16()?;
     let mut element_value_pairs =
         Vec::with_capacity((num_element_value_pairs as usize).min(PREALLOC_CAP));
     for _ in 0..num_element_value_pairs {
         let element_name_index = buf.read_u16()?;
-        let value = decode_element_value(buf)?;
+        let value = decode_element_value_depth(buf, depth + 1)?;
         element_value_pairs.push(ElementValuePair {
             element_name_index,
             value,
@@ -1437,6 +1455,18 @@ fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassR
 fn decode_element_value(
     buf: &mut ClassFileBuffer<'_>,
 ) -> Result<ElementValue, ClassReaderError> {
+    decode_element_value_depth(buf, 0)
+}
+
+fn decode_element_value_depth(
+    buf: &mut ClassFileBuffer<'_>,
+    depth: usize,
+) -> Result<ElementValue, ClassReaderError> {
+    if depth >= MAX_ANNOTATION_DEPTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: "annotation element_value nesting depth exceeds limit".to_string(),
+        });
+    }
     let tag = buf.read_u8()?;
     match tag {
         b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
@@ -1459,14 +1489,14 @@ fn decode_element_value(
             Ok(ElementValue::Class { class_info_index })
         }
         b'@' => {
-            let annotation = decode_annotation(buf)?;
+            let annotation = decode_annotation_depth(buf, depth + 1)?;
             Ok(ElementValue::AnnotationValue(annotation))
         }
         b'[' => {
             let num_values = buf.read_u16()?;
             let mut values = Vec::with_capacity((num_values as usize).min(PREALLOC_CAP));
             for _ in 0..num_values {
-                values.push(decode_element_value(buf)?);
+                values.push(decode_element_value_depth(buf, depth + 1)?);
             }
             Ok(ElementValue::Array(values))
         }

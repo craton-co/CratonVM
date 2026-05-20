@@ -390,7 +390,14 @@ unsafe impl Send for SpscEventRing {}
 impl SpscEventRing {
     /// Create a new ring with capacity rounded up to the next power of two
     /// (minimum 1).
-    pub fn new(requested_capacity: usize) -> Self {
+    ///
+    /// `pub(crate)`: the `unsafe impl Sync` is sound only because the producer
+    /// is unique per ring (enforced by the thread-local `THREAD_REGISTERED_RING`
+    /// in `ThreadRingRegistry::register_current_thread`). Exposing construction
+    /// to other crates would let callers create rings outside that discipline
+    /// and `push` from two threads → data race UB. External code must obtain
+    /// rings via `ThreadRingRegistry`.
+    pub(crate) fn new(requested_capacity: usize) -> Self {
         let capacity = next_power_of_two(requested_capacity);
         let mut slots: Vec<UnsafeCell<MaybeUninit<EventInstance>>> = Vec::with_capacity(capacity);
         for _ in 0..capacity {
@@ -417,7 +424,12 @@ impl SpscEventRing {
     ///
     /// SAFETY contract (caller-upheld): must be called from a single producer
     /// thread per ring. Multiple concurrent producers would race on `head`.
-    pub fn push(&self, ev: EventInstance) -> Result<(), EventInstance> {
+    ///
+    /// `pub(crate)`: this is the producer half of the SPSC contract that the
+    /// `unsafe impl Sync` relies on. Keeping it crate-private prevents external
+    /// code from pushing concurrently from two threads (data race UB). The
+    /// single-producer invariant is enforced by `THREAD_REGISTERED_RING`.
+    pub(crate) fn push(&self, ev: EventInstance) -> Result<(), EventInstance> {
         // The producer is the only writer to `head`, so a Relaxed self-load
         // is fine — we already observe our own prior stores.
         let head = self.head.load(Ordering::Relaxed);

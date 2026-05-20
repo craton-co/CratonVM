@@ -221,6 +221,35 @@ fn ioex(msg: impl Into<String>) -> MethodCallFailed {
     RuntimeError::IOException { message: msg.into() }.into()
 }
 
+/// Upper bound on a single read0/write0 transfer. The JDK's NIO socket
+/// paths chunk I/O well below this; any `len` larger than this from Java
+/// is treated as corrupt input rather than honored. 1 GiB is comfortably
+/// above any legitimate DirectByteBuffer-backed socket transfer.
+const NET_MAX_TRANSFER: i64 = 1 << 30;
+
+/// Validate the `(address, len)` pair handed to `read0` / `write0` before
+/// it is used as the target/source of a raw `ptr::copy_nonoverlapping`.
+///
+/// RESIDUAL TRUST: this crate has no reachable registry of live native
+/// buffer addresses+sizes (the DirectByteBuffer/Unsafe allocation tables
+/// in `direct_buffer.rs` are module-private and the Unsafe table is
+/// consumed destructively on free), so we cannot prove `address` points
+/// inside a live allocation. We do the strongest bounded check available:
+/// reject a null/negative address and a non-positive or absurdly large
+/// `len`. A caller passing a valid-but-undersized buffer is still trusted.
+fn validate_native_range(ctx: &str, address: i64, len: i32) -> Result<usize, MethodCallFailed> {
+    if address <= 0 {
+        return Err(ioex(format!("{ctx}: null or invalid native address")));
+    }
+    if len <= 0 {
+        return Err(ioex(format!("{ctx}: non-positive length {len}")));
+    }
+    if (len as i64) > NET_MAX_TRANSFER {
+        return Err(ioex(format!("{ctx}: length {len} exceeds maximum transfer size")));
+    }
+    Ok(len as usize)
+}
+
 /// Extract an int from a `FileDescriptor` object. The `fd` field holds the
 /// Net-allocated id. Falls back to the Windows `handle` long field if `fd`
 /// is not populated. Returns `None` if the FileDescriptor is null or both
@@ -499,13 +528,11 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         _ => 0,
     };
     let len = int_arg(args, 2);
-    if addr == 0 || len <= 0 {
-        return Err(ioex("read0: bad addr/len"));
-    }
+    let len_usize = validate_native_range("read0", addr, len)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("read0: FileDescriptor has no fd id"))?;
 
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; len_usize];
     // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
     // brief read-lock, drop the map lock, then perform the blocking read
     // on the per-socket Mutex. Otherwise the global map lock serializes
@@ -528,8 +555,10 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return Ok(Some(Value::Int(-1)));
     }
     // SAFETY: `addr` is a native pointer allocated by the JDK's Unsafe /
-    // DirectByteBuffer. The caller asserts at least `len` bytes are valid;
-    // we copy at most `n <= len`.
+    // DirectByteBuffer. `validate_native_range` rejected a null/negative
+    // address and an out-of-range `len`; we copy at most `n <= len`. The
+    // caller is still trusted that `len` bytes at `addr` are writable
+    // (see `validate_native_range` for the residual trust assumption).
     unsafe {
         std::ptr::copy_nonoverlapping(buf.as_ptr(), addr as *mut u8, n);
     }
@@ -544,17 +573,16 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         _ => 0,
     };
     let len = int_arg(args, 2);
-    if addr == 0 || len < 0 {
-        return Err(ioex("write0: bad addr/len"));
-    }
+    let len_usize = validate_native_range("write0", addr, len)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("write0: FileDescriptor has no fd id"))?;
 
-    let mut buf = vec![0u8; len as usize];
-    // SAFETY: `addr` is a native buffer allocated by the JDK; caller guarantees
-    // `len` bytes are valid to read.
+    let mut buf = vec![0u8; len_usize];
+    // SAFETY: `addr` is a native buffer allocated by the JDK; `validate_native_range`
+    // has rejected a null/negative address and an out-of-range `len`. We still
+    // trust the caller that `len` bytes at `addr` are live (see that fn's doc).
     unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len as usize);
+        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len_usize);
     }
     // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
     // brief read-lock, drop the map lock, then perform the blocking write

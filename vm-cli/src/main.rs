@@ -621,9 +621,51 @@ fn run() -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                let tmp = std::env::temp_dir()
-                    .join(format!("rustjvm-{pid}-{now_ms}-{stem}.jar"));
-                std::fs::copy(jar_path, &tmp).with_context(|| {
+                // Create the staged file with exclusive-create semantics
+                // (`create_new`): if a file/symlink already sits at this
+                // predictable path, the open fails instead of `fs::copy`
+                // following/clobbering it (a local-attacker arbitrary-write
+                // vector). On collision, retry with a fresh counter suffix
+                // so concurrent VMs don't fail spuriously.
+                let dir = std::env::temp_dir();
+                let mut tmp = dir.join(format!("rustjvm-{pid}-{now_ms}-{stem}.jar"));
+                let mut dst_file = None;
+                for attempt in 0..16 {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&tmp)
+                    {
+                        Ok(f) => {
+                            dst_file = Some(f);
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            tmp = dir.join(format!(
+                                "rustjvm-{pid}-{now_ms}-{attempt}-{stem}.jar"
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "failed to stage {} as {} for classpath registration",
+                                jar_path.display(),
+                                tmp.display()
+                            )));
+                        }
+                    }
+                }
+                let mut dst_file = dst_file.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "failed to stage {} for classpath registration: \
+                         could not create a unique temp file in {}",
+                        jar_path.display(),
+                        dir.display()
+                    )
+                })?;
+                let mut src_file = std::fs::File::open(jar_path).with_context(|| {
+                    format!("failed to open {} for staging", jar_path.display())
+                })?;
+                std::io::copy(&mut src_file, &mut dst_file).with_context(|| {
                     format!(
                         "failed to stage {} as {} for classpath registration",
                         jar_path.display(),
@@ -777,7 +819,14 @@ fn run() -> Result<()> {
         "on" => rustjvm_vm::config::CdsMode::On,
         "auto" => rustjvm_vm::config::CdsMode::Auto,
         "dump" => rustjvm_vm::config::CdsMode::Dump,
-        _ => rustjvm_vm::config::CdsMode::Off,
+        "off" => rustjvm_vm::config::CdsMode::Off,
+        other => {
+            // Warn on a typo rather than silently defaulting to Off.
+            eprintln!(
+                "Warning: ignoring unknown -Xshare mode {other:?}; expected on|auto|dump|off"
+            );
+            rustjvm_vm::config::CdsMode::Off
+        }
     };
 
     // Synthetic JDK mode: default to real JDK when a JDK is available.
@@ -797,7 +846,15 @@ fn run() -> Result<()> {
     config.aot_mode = match args.aot_mode.as_str() {
         "training" => rustjvm_vm::config::AotMode::Training,
         "production" => rustjvm_vm::config::AotMode::Production,
-        _ => rustjvm_vm::config::AotMode::Off,
+        "off" => rustjvm_vm::config::AotMode::Off,
+        other => {
+            // Warn on a typo rather than silently defaulting to Off.
+            eprintln!(
+                "Warning: ignoring unknown -XX:AOTMode value {other:?}; \
+                 expected off|training|production"
+            );
+            rustjvm_vm::config::AotMode::Off
+        }
     };
     if let Some(cache_path) = &args.aot_cache {
         // AOTCache serves as input in production mode and output in training mode
@@ -2218,7 +2275,15 @@ fn parse_size(s: &str) -> Option<usize> {
         _ => (s, 1),
     };
 
-    num_str.parse::<usize>().ok().map(|n| n * multiplier)
+    // Use checked_mul so a huge value (e.g. `99999999999g`) fails the parse
+    // rather than wrapping silently in release / panicking in debug. A parsed
+    // size of 0 is also rejected as invalid (a 0-byte heap is meaningless).
+    let n = num_str.parse::<usize>().ok()?;
+    let bytes = n.checked_mul(multiplier)?;
+    if bytes == 0 {
+        return None;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
