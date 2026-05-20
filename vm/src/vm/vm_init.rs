@@ -803,6 +803,50 @@ impl SharedVm {
             }
         }
 
+        // Unmodifiable collection-view wrappers (native-collections):
+        // `Collections.unmodifiableList/Set/Map/Collection` and
+        // `List.of` / `Set.of` / `Map.of` allocate these synthetic classes,
+        // each with one field holding the backing collection. Native read
+        // methods delegate to the backing object; native mutators throw
+        // `UnsupportedOperationException`. They MUST declare `Object` as
+        // superclass and the matching `java/util/*` interface so the
+        // implicit checkcast at the API boundary (and `instanceof`) succeed
+        // and `invokeinterface` retargets to the concrete receiver where the
+        // natives are bound.
+        {
+            let collection_id = class_manager
+                .load_class("java/util/Collection")
+                .expect("java/util/Collection must be loadable");
+            let list_id = class_manager
+                .load_class("java/util/List")
+                .expect("java/util/List must be loadable");
+            let set_id = class_manager
+                .load_class("java/util/Set")
+                .expect("java/util/Set must be loadable");
+            let map_id = class_manager
+                .load_class("java/util/Map")
+                .expect("java/util/Map must be loadable");
+            // (synthetic class name, list of interface ClassIds it implements)
+            let unmod_specs: [(&str, &[ClassId]); 5] = [
+                ("rustjvm/internal/UnmodifiableCollection", &[collection_id]),
+                ("rustjvm/internal/UnmodifiableList", &[list_id, collection_id]),
+                ("rustjvm/internal/UnmodifiableSet", &[set_id, collection_id]),
+                ("rustjvm/internal/UnmodifiableMap", &[map_id]),
+                ("rustjvm/internal/UnmodifiableItr", &[iterator_id]),
+            ];
+            for (name, ifaces) in unmod_specs {
+                let cid = class_manager.ensure_synthetic_class(name, 1);
+                if let Some(cls) = class_manager.get_class_mut(cid) {
+                    cls.superclass = Some(object_id);
+                    for iface in ifaces {
+                        if !cls.interfaces.contains(iface) {
+                            cls.interfaces.push(*iface);
+                        }
+                    }
+                }
+            }
+        }
+
         let gc_backend = match config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
             crate::config::GcAlgorithm::G1 => GcBackend::G1,

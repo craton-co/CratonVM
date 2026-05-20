@@ -66,6 +66,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_concurrent_hashmap_natives(registry);
     register_properties_natives(registry);
     register_collections_extras_natives(registry);
+    register_unmodifiable_natives(registry);
     // BlockingQueue family (LinkedBlockingQueue, ArrayBlockingQueue,
     // ConcurrentLinkedQueue, ConcurrentLinkedDeque) is overridden with a
     // synthetic 4-field layout (head/tail/size/capacity) that conflicts with
@@ -1845,7 +1846,28 @@ fn properties_backing_chm(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Ob
     }
 }
 
+/// If `obj` is one of CratonVM's unmodifiable wrapper views, return the
+/// backing collection it wraps (recursing through nested wrappers); otherwise
+/// return `obj` unchanged. Lets the bucket-walking map helpers transparently
+/// see through `Collections.unmodifiableMap` / `Map.of` results.
+fn unwrap_unmod(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
+    let cid = ctx.class_id_of_object(obj);
+    if let Some(name) = ctx.class_name_of_id(cid) {
+        if name == UNMOD_MAP_CLASS
+            || name == UNMOD_LIST_CLASS
+            || name == UNMOD_SET_CLASS
+            || name == UNMOD_COLLECTION_CLASS
+        {
+            if let Value::Object(Some(inner)) = ctx.get_field(obj, UNMOD_FIELD_BACKING) {
+                return unwrap_unmod(ctx, inner);
+            }
+        }
+    }
+    obj
+}
+
 fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let this = unwrap_unmod(ctx, this);
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_keys(ctx, chm);
     }
@@ -1866,6 +1888,7 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 /// Collect all values from a HashMap into a Vec.
 fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let this = unwrap_unmod(ctx, this);
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_values(ctx, chm);
     }
@@ -1886,6 +1909,7 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 
 /// Collect all key-value pairs as (key, value) from a HashMap.
 fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
+    let this = unwrap_unmod(ctx, this);
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_entries(ctx, chm);
     }
@@ -4218,39 +4242,15 @@ fn native_collections_unmodifiable_list(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // FIXME(reviewer finding 4): this returns a MUTABLE defensive copy
-    // (a plain java/util/ArrayList). Mutating the result therefore does NOT
-    // throw UnsupportedOperationException, violating the JDK contract for
-    // Collections.unmodifiableList.
-    //
-    // A correct fix needs a true unmodifiable view, but the infrastructure
-    // does not exist in this crate: there is no immutable collection type,
-    // and the sibling APIs (unmodifiableMap/Set/Collection at ~line 16532)
-    // are all wired to `native_collections_identity` — equally mutable.
-    // The proper resolution is to allocate a real `java/util/Collections$
-    // UnmodifiableList` (whose JDK mutator methods already throw), wrapping
-    // the source in field `c` — which `collect_collection_elements`
-    // (~line 12143) already knows how to unwrap. That requires changes
-    // beyond this function, so it is left as a known missing feature
-    // rather than being papered over with a fake stub.
+    // Wrap the source list in a live `UnmodifiableList` view: reads delegate
+    // to the backing list (so later mutations of the backing list are
+    // visible), and every mutator throws `UnsupportedOperationException`.
     let src = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data, size) = al_state(ctx, src);
-    let len = size as usize;
-    let __al_n_fields = al_slots(ctx).2;
-    let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-    let new_arr = alloc_ref_array(ctx, len);
-    if let Some(src_data) = data {
-        for i in 0..len {
-            let val = ctx.get_array_element(src_data, i);
-            ctx.set_array_element(new_arr, i, val);
-        }
-    }
-    al_set_data(ctx, new_list, new_arr);
-    al_set_size(ctx, new_list, size);
-    Ok(Some(Value::Object(Some(new_list))))
+    let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, src);
+    Ok(Some(Value::Object(Some(w))))
 }
 
 // ===========================================================================
@@ -5001,6 +5001,90 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
         native_map_entry,
     );
+
+    // Higher-arity `List.of` / `Set.of` / `Map.of` overloads (real JDK
+    // declares fixed-arity variants up to 10). Without these, e.g.
+    // `Set.of("a","b","c")` falls through to real-JDK bytecode and the
+    // result is not one of our immutable wrappers — its mutators would not
+    // throw. Register a generic handler for every fixed arity so all of
+    // them produce a frozen wrapper.
+    for n in 4..=10 {
+        let elem_obj = "Ljava/lang/Object;";
+        let list_desc = format!("({})Ljava/util/List;", elem_obj.repeat(n));
+        r.register("java/util/List", "of", &list_desc, native_list_of_varargs);
+        let set_desc = format!("({})Ljava/util/Set;", elem_obj.repeat(n));
+        r.register("java/util/Set", "of", &set_desc, native_set_of_varargs);
+    }
+    // `Set.of` 3-arg (List.of 1..3 already covered above; Set.of only had
+    // 0..2 fixed variants registered).
+    r.register(
+        "java/util/Set",
+        "of",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
+        native_set_of_varargs,
+    );
+    // `Map.of` 3..10 entries (each entry is two Object args).
+    for n in 3..=10 {
+        let map_desc = format!("({})Ljava/util/Map;", "Ljava/lang/Object;".repeat(n * 2));
+        r.register("java/util/Map", "of", &map_desc, native_map_of_varargs);
+    }
+    // `Map.ofEntries(Map$Entry...)`.
+    r.register(
+        "java/util/Map",
+        "ofEntries",
+        "([Ljava/util/Map$Entry;)Ljava/util/Map;",
+        native_map_of_entries,
+    );
+}
+
+/// Generic `List.of` for fixed-arity overloads: every positional arg is an
+/// element. Produces a frozen (unmodifiable) list.
+fn native_list_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let elems: Vec<Value> = args.to_vec();
+    let r = make_list_of(ctx, &elems);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
+}
+
+/// Generic `Set.of` for fixed-arity overloads. Produces a frozen set.
+fn native_set_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let elems: Vec<Value> = args.to_vec();
+    let r = make_set_of(ctx, &elems);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
+}
+
+/// Generic `Map.of` for fixed-arity overloads: args are k0,v0,k1,v1,...
+fn native_map_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(args.len() / 2);
+    let mut i = 0;
+    while i + 1 < args.len() {
+        pairs.push((args[i], args[i + 1]));
+        i += 2;
+    }
+    let r = make_map_of(ctx, &pairs);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
+}
+
+/// `Map.ofEntries(Map$Entry...)` — each array element is a Map.Entry whose
+/// key/value live at slots 0/1 (see `native_map_entry`).
+fn native_map_of_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let arr = match args.first() {
+        Some(Value::Object(Some(a))) => *a,
+        _ => {
+            let r = make_map_of(ctx, &[]);
+            return freeze_result(ctx, UNMOD_MAP_CLASS, r);
+        }
+    };
+    let len = ctx.array_length(arr);
+    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Value::Object(Some(entry)) = ctx.get_array_element(arr, i) {
+            let k = ctx.get_field(entry, 0);
+            let v = ctx.get_field(entry, 1);
+            pairs.push((k, v));
+        }
+    }
+    let r = make_map_of(ctx, &pairs);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
 /// Helper: create an ArrayList from a slice of values.
@@ -5066,77 +5150,112 @@ fn make_map_of(ctx: &mut dyn NativeContext, pairs: &[(Value, Value)]) -> MethodC
     Ok(Some(Value::Object(Some(map))))
 }
 
+/// Wrap a `MethodCallResult` holding a collection ObjectRef in an
+/// unmodifiable view of `wrapper_class`. Used by the `List.of` / `Set.of` /
+/// `Map.of` immutable factories — the backing collection is private so the
+/// snapshot can never be mutated, and every mutator throws.
+fn freeze_result(
+    ctx: &mut dyn NativeContext,
+    wrapper_class: &str,
+    result: MethodCallResult,
+) -> MethodCallResult {
+    match result? {
+        Some(Value::Object(Some(backing))) => {
+            let w = alloc_unmod_wrapper(ctx, wrapper_class, backing);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        other => Ok(other),
+    }
+}
+
 fn native_list_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    make_list_of(ctx, &[])
+    let r = make_list_of(ctx, &[]);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
 }
 
-fn native_list_of_1(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_list_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
-    make_list_of(_ctx, &[e1])
+    let r = make_list_of(ctx, &[e1]);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
 }
 
-fn native_list_of_2(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_list_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
-    make_list_of(_ctx, &[e1, e2])
+    let r = make_list_of(ctx, &[e1, e2]);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
 }
 
-fn native_list_of_3(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_list_of_3(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
     let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
-    make_list_of(_ctx, &[e1, e2, e3])
+    let r = make_list_of(ctx, &[e1, e2, e3]);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
 }
 
 fn native_list_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return make_list_of(ctx, &[]),
+        _ => {
+            let r = make_list_of(ctx, &[]);
+            return freeze_result(ctx, UNMOD_LIST_CLASS, r);
+        }
     };
     let len = ctx.array_length(arr);
     let mut elems = Vec::with_capacity(len);
     for i in 0..len {
         elems.push(ctx.get_array_element(arr, i));
     }
-    make_list_of(ctx, &elems)
+    let r = make_list_of(ctx, &elems);
+    freeze_result(ctx, UNMOD_LIST_CLASS, r)
 }
 
 fn native_set_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    make_set_of(ctx, &[])
+    let r = make_set_of(ctx, &[]);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
 }
 
 fn native_set_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
-    make_set_of(ctx, &[e1])
+    let r = make_set_of(ctx, &[e1]);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
 }
 
 fn native_set_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let e1 = args.first().copied().unwrap_or(Value::Object(None));
     let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
-    make_set_of(ctx, &[e1, e2])
+    let r = make_set_of(ctx, &[e1, e2]);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
 }
 
 fn native_set_of_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let arr = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
-        _ => return make_set_of(ctx, &[]),
+        _ => {
+            let r = make_set_of(ctx, &[]);
+            return freeze_result(ctx, UNMOD_SET_CLASS, r);
+        }
     };
     let len = ctx.array_length(arr);
     let mut elems = Vec::with_capacity(len);
     for i in 0..len {
         elems.push(ctx.get_array_element(arr, i));
     }
-    make_set_of(ctx, &elems)
+    let r = make_set_of(ctx, &elems);
+    freeze_result(ctx, UNMOD_SET_CLASS, r)
 }
 
 fn native_map_of_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    make_map_of(ctx, &[])
+    let r = make_map_of(ctx, &[]);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
 fn native_map_of_1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let k = args.first().copied().unwrap_or(Value::Object(None));
     let v = args.get(1).copied().unwrap_or(Value::Object(None));
-    make_map_of(ctx, &[(k, v)])
+    let r = make_map_of(ctx, &[(k, v)]);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
 fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5144,7 +5263,8 @@ fn native_map_of_2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let v1 = args.get(1).copied().unwrap_or(Value::Object(None));
     let k2 = args.get(2).copied().unwrap_or(Value::Object(None));
     let v2 = args.get(3).copied().unwrap_or(Value::Object(None));
-    make_map_of(ctx, &[(k1, v1), (k2, v2)])
+    let r = make_map_of(ctx, &[(k1, v1), (k2, v2)]);
+    freeze_result(ctx, UNMOD_MAP_CLASS, r)
 }
 
 fn native_map_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8162,10 +8282,18 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
             al_set_size(ctx, this, 0);
         }
     } else {
-        // Source might not be an ArrayList — init empty
-        let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+        // Source is not an ArrayList-shaped object (e.g. an unmodifiable
+        // view, HashSet, LinkedList, ...). Walk it generically so
+        // `new ArrayList<>(List.of(...))` / `new ArrayList<>(unmodList)`
+        // copy the real elements instead of producing an empty list.
+        let elems = collect_collection_elements(ctx, source);
+        let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
+        let buf = alloc_ref_array(ctx, cap);
+        for (i, val) in elems.iter().enumerate() {
+            ctx.set_array_element(buf, i, *val);
+        }
         al_set_data(ctx, this, buf);
-        al_set_size(ctx, this, 0);
+        al_set_size(ctx, this, elems.len() as i32);
     }
 
     Ok(None)
@@ -8244,6 +8372,9 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(None);
         }
     };
+    // See through `Collections.unmodifiableMap` / `Map.of` wrappers so
+    // `new HashMap<>(Map.of(...))` copies the real entries.
+    let source = unwrap_unmod(ctx, source);
 
     // Init this map
     let cap = MAP_DEFAULT_CAPACITY;
@@ -12156,6 +12287,17 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // zero elements and the auto-configuration pipeline collapses.
     let cid = ctx.class_id_of_object(coll);
     if let Some(cls_name) = ctx.class_name_of_id(cid) {
+        // CratonVM's own unmodifiable-view wrappers store the backing
+        // collection at slot 0 — recurse into it so `new HashSet(unmodList)`
+        // and friends see the wrapped elements.
+        if cls_name == UNMOD_LIST_CLASS
+            || cls_name == UNMOD_SET_CLASS
+            || cls_name == UNMOD_COLLECTION_CLASS
+        {
+            if let Value::Object(Some(inner)) = ctx.get_field(coll, UNMOD_FIELD_BACKING) {
+                return collect_collection_elements(ctx, inner);
+            }
+        }
         if cls_name.starts_with("java/util/Collections$Unmodifiable")
             || cls_name.starts_with("java/util/Collections$Synchronized")
             || cls_name.starts_with("java/util/Collections$Checked")
@@ -16660,6 +16802,451 @@ fn native_props_string_property_names(
 }
 
 // ===========================================================================
+// Unmodifiable collection views
+// ===========================================================================
+//
+// `Collections.unmodifiableList/Set/Map/Collection(...)` return wrapper views
+// that delegate every read to the backing collection and throw
+// `UnsupportedOperationException` from every mutator. `List.of` / `Set.of` /
+// `Map.of` produce fully immutable snapshots (the backing collection is
+// private, so it can never be mutated).
+//
+// Each wrapper is a dedicated synthetic class with a single field (slot 0)
+// holding the backing collection's ObjectRef. Read methods forward to the
+// backing object via `invoke_virtual`, so dispatch lands on whatever native
+// implements the concrete backing type (ArrayList / HashMap / HashSet / ...).
+// Mutators are registered natives that unconditionally throw.
+
+/// Synthetic class names for the unmodifiable wrappers.
+const UNMOD_LIST_CLASS: &str = "rustjvm/internal/UnmodifiableList";
+const UNMOD_SET_CLASS: &str = "rustjvm/internal/UnmodifiableSet";
+const UNMOD_MAP_CLASS: &str = "rustjvm/internal/UnmodifiableMap";
+const UNMOD_COLLECTION_CLASS: &str = "rustjvm/internal/UnmodifiableCollection";
+const UNMOD_ITR_CLASS: &str = "rustjvm/internal/UnmodifiableItr";
+
+/// Slot 0 of every wrapper holds the backing collection / iterator.
+const UNMOD_FIELD_BACKING: usize = 0;
+
+/// Build an `UnsupportedOperationException` error for a blocked mutator.
+fn unsupported_op() -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: String::new(),
+    }
+    .into()
+}
+
+/// Allocate an unmodifiable wrapper of `class_name` around `backing`.
+fn alloc_unmod_wrapper(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    backing: ObjectRef,
+) -> ObjectRef {
+    let wrapper = alloc_synthetic(ctx, class_name, 1);
+    ctx.set_field(wrapper, UNMOD_FIELD_BACKING, Value::Object(Some(backing)));
+    wrapper
+}
+
+/// Read the backing collection out of a wrapper. Recurses if the backing is
+/// itself a wrapper (e.g. `unmodifiableList(unmodifiableList(x))`).
+fn unmod_backing(ctx: &mut dyn NativeContext, wrapper: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field(wrapper, UNMOD_FIELD_BACKING) {
+        Value::Object(Some(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// Forward a read-only call to the backing collection. If the wrapper's
+/// backing is missing, returns a benign default.
+fn unmod_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let backing = match unmod_backing(ctx, this) {
+        Some(b) => b,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke_virtual(backing, method, descriptor, &args[1..])
+}
+
+fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
+    // ---- UnmodifiableCollection (also the shared base for List/Set) -------
+    for c in [UNMOD_COLLECTION_CLASS, UNMOD_LIST_CLASS, UNMOD_SET_CLASS] {
+        r.register(c, "size", "()I", native_unmod_size);
+        r.register(c, "isEmpty", "()Z", native_unmod_is_empty);
+        r.register(
+            c,
+            "contains",
+            "(Ljava/lang/Object;)Z",
+            native_unmod_contains,
+        );
+        r.register(
+            c,
+            "containsAll",
+            "(Ljava/util/Collection;)Z",
+            native_unmod_contains_all,
+        );
+        r.register(c, "iterator", "()Ljava/util/Iterator;", native_unmod_iterator);
+        r.register(c, "toArray", "()[Ljava/lang/Object;", native_unmod_to_array);
+        r.register(
+            c,
+            "toArray",
+            "([Ljava/lang/Object;)[Ljava/lang/Object;",
+            native_unmod_to_array_typed,
+        );
+        r.register(c, "toString", "()Ljava/lang/String;", native_unmod_to_string);
+        r.register(c, "hashCode", "()I", native_unmod_hash_code);
+        r.register(c, "equals", "(Ljava/lang/Object;)Z", native_unmod_equals);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/Consumer;)V",
+            native_unmod_for_each,
+        );
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_unmod_stream);
+        r.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_unmod_spliterator,
+        );
+        // Mutators — all throw UnsupportedOperationException.
+        r.register(c, "add", "(Ljava/lang/Object;)Z", native_unmod_throw);
+        r.register(c, "remove", "(Ljava/lang/Object;)Z", native_unmod_throw);
+        r.register(c, "clear", "()V", native_unmod_throw);
+        r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_unmod_throw);
+        r.register(c, "removeAll", "(Ljava/util/Collection;)Z", native_unmod_throw);
+        r.register(c, "retainAll", "(Ljava/util/Collection;)Z", native_unmod_throw);
+        r.register(
+            c,
+            "removeIf",
+            "(Ljava/util/function/Predicate;)Z",
+            native_unmod_throw,
+        );
+    }
+
+    // ---- UnmodifiableList — adds positional reads + list mutators ---------
+    {
+        let c = UNMOD_LIST_CLASS;
+        r.register(c, "get", "(I)Ljava/lang/Object;", native_unmod_get);
+        r.register(c, "indexOf", "(Ljava/lang/Object;)I", native_unmod_index_of);
+        r.register(
+            c,
+            "lastIndexOf",
+            "(Ljava/lang/Object;)I",
+            native_unmod_last_index_of,
+        );
+        r.register(c, "subList", "(II)Ljava/util/List;", native_unmod_sub_list);
+        // List mutators.
+        r.register(
+            c,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(c, "add", "(ILjava/lang/Object;)V", native_unmod_throw);
+        r.register(c, "remove", "(I)Ljava/lang/Object;", native_unmod_throw);
+        r.register(
+            c,
+            "addAll",
+            "(ILjava/util/Collection;)Z",
+            native_unmod_throw,
+        );
+        r.register(c, "sort", "(Ljava/util/Comparator;)V", native_unmod_throw);
+        r.register(
+            c,
+            "replaceAll",
+            "(Ljava/util/function/UnaryOperator;)V",
+            native_unmod_throw,
+        );
+    }
+
+    // ---- UnmodifiableMap --------------------------------------------------
+    {
+        let c = UNMOD_MAP_CLASS;
+        r.register(c, "size", "()I", native_unmod_size);
+        r.register(c, "isEmpty", "()Z", native_unmod_is_empty);
+        r.register(
+            c,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_map_get,
+        );
+        r.register(
+            c,
+            "getOrDefault",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_map_get_or_default,
+        );
+        r.register(
+            c,
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            native_unmod_map_contains_key,
+        );
+        r.register(
+            c,
+            "containsValue",
+            "(Ljava/lang/Object;)Z",
+            native_unmod_map_contains_value,
+        );
+        r.register(c, "keySet", "()Ljava/util/Set;", native_unmod_map_key_set);
+        r.register(
+            c,
+            "values",
+            "()Ljava/util/Collection;",
+            native_unmod_map_values,
+        );
+        r.register(c, "entrySet", "()Ljava/util/Set;", native_unmod_map_entry_set);
+        r.register(c, "toString", "()Ljava/lang/String;", native_unmod_to_string);
+        r.register(c, "hashCode", "()I", native_unmod_hash_code);
+        r.register(c, "equals", "(Ljava/lang/Object;)Z", native_unmod_equals);
+        r.register(
+            c,
+            "forEach",
+            "(Ljava/util/function/BiConsumer;)V",
+            native_unmod_map_for_each,
+        );
+        // Map mutators.
+        r.register(
+            c,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(c, "clear", "()V", native_unmod_throw);
+        r.register(c, "putAll", "(Ljava/util/Map;)V", native_unmod_throw);
+        r.register(
+            c,
+            "putIfAbsent",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "replace",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "computeIfAbsent",
+            "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "compute",
+            "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "computeIfPresent",
+            "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "merge",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+            native_unmod_throw,
+        );
+        r.register(
+            c,
+            "replaceAll",
+            "(Ljava/util/function/BiFunction;)V",
+            native_unmod_throw,
+        );
+    }
+
+    // ---- UnmodifiableItr — read-only iterator -----------------------------
+    {
+        let c = UNMOD_ITR_CLASS;
+        r.register(c, "hasNext", "()Z", native_unmod_itr_has_next);
+        r.register(c, "next", "()Ljava/lang/Object;", native_unmod_itr_next);
+        r.register(c, "remove", "()V", native_unmod_throw);
+    }
+}
+
+/// Universal mutator: throws `UnsupportedOperationException`.
+fn native_unmod_throw(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Err(unsupported_op())
+}
+
+fn native_unmod_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "size", "()I")
+}
+
+fn native_unmod_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "isEmpty", "()Z")
+}
+
+fn native_unmod_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "contains", "(Ljava/lang/Object;)Z")
+}
+
+fn native_unmod_contains_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "containsAll", "(Ljava/util/Collection;)Z")
+}
+
+fn native_unmod_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "get", "(I)Ljava/lang/Object;")
+}
+
+fn native_unmod_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "indexOf", "(Ljava/lang/Object;)I")
+}
+
+fn native_unmod_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "lastIndexOf", "(Ljava/lang/Object;)I")
+}
+
+fn native_unmod_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "toArray", "()[Ljava/lang/Object;")
+}
+
+fn native_unmod_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(
+        ctx,
+        args,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+    )
+}
+
+fn native_unmod_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "toString", "()Ljava/lang/String;")
+}
+
+fn native_unmod_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "hashCode", "()I")
+}
+
+fn native_unmod_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "equals", "(Ljava/lang/Object;)Z")
+}
+
+fn native_unmod_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "forEach", "(Ljava/util/function/Consumer;)V")
+}
+
+fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "stream", "()Ljava/util/stream/Stream;")
+}
+
+fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
+}
+
+/// `subList` returns another unmodifiable view over the backing sub-list.
+fn native_unmod_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let sub = unmod_delegate(ctx, args, "subList", "(II)Ljava/util/List;")?;
+    if let Some(Value::Object(Some(inner))) = sub {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, inner);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(sub)
+}
+
+/// `iterator()` returns a read-only iterator wrapping the backing iterator.
+fn native_unmod_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let inner = unmod_delegate(ctx, args, "iterator", "()Ljava/util/Iterator;")?;
+    if let Some(Value::Object(Some(itr))) = inner {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_ITR_CLASS, itr);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(inner)
+}
+
+fn native_unmod_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "hasNext", "()Z")
+}
+
+fn native_unmod_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "next", "()Ljava/lang/Object;")
+}
+
+// ---- Map delegations ------------------------------------------------------
+
+fn native_unmod_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "get", "(Ljava/lang/Object;)Ljava/lang/Object;")
+}
+
+fn native_unmod_map_get_or_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    unmod_delegate(
+        ctx,
+        args,
+        "getOrDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    )
+}
+
+fn native_unmod_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "containsKey", "(Ljava/lang/Object;)Z")
+}
+
+fn native_unmod_map_contains_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    unmod_delegate(ctx, args, "containsValue", "(Ljava/lang/Object;)Z")
+}
+
+fn native_unmod_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(
+        ctx,
+        args,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+    )
+}
+
+/// `keySet()` returns an unmodifiable Set view of the backing map's key set.
+fn native_unmod_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let ks = unmod_delegate(ctx, args, "keySet", "()Ljava/util/Set;")?;
+    if let Some(Value::Object(Some(inner))) = ks {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(ks)
+}
+
+/// `values()` returns an unmodifiable Collection view of the backing values.
+fn native_unmod_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let vs = unmod_delegate(ctx, args, "values", "()Ljava/util/Collection;")?;
+    if let Some(Value::Object(Some(inner))) = vs {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, inner);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(vs)
+}
+
+/// `entrySet()` returns an unmodifiable Set view of the backing entry set.
+fn native_unmod_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let es = unmod_delegate(ctx, args, "entrySet", "()Ljava/util/Set;")?;
+    if let Some(Value::Object(Some(inner))) = es {
+        let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, inner);
+        return Ok(Some(Value::Object(Some(w))));
+    }
+    Ok(es)
+}
+
+// ===========================================================================
 // Phase 39: Collections extras — unmodifiableMap/Set, emptyMap/Set/Iterator,
 //           frequency, disjoint, singleton, Enumeration stubs
 // ===========================================================================
@@ -16700,31 +17287,43 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "unmodifiableMap",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        native_collections_identity,
+        native_collections_unmodifiable_map,
     );
     r.register(
         c,
         "unmodifiableSet",
         "(Ljava/util/Set;)Ljava/util/Set;",
-        native_collections_identity,
+        native_collections_unmodifiable_set,
     );
     r.register(
         c,
         "unmodifiableSortedMap",
         "(Ljava/util/SortedMap;)Ljava/util/SortedMap;",
-        native_collections_identity,
+        native_collections_unmodifiable_map,
     );
     r.register(
         c,
         "unmodifiableSortedSet",
         "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
-        native_collections_identity,
+        native_collections_unmodifiable_set,
+    );
+    r.register(
+        c,
+        "unmodifiableNavigableMap",
+        "(Ljava/util/NavigableMap;)Ljava/util/NavigableMap;",
+        native_collections_unmodifiable_map,
+    );
+    r.register(
+        c,
+        "unmodifiableNavigableSet",
+        "(Ljava/util/NavigableSet;)Ljava/util/NavigableSet;",
+        native_collections_unmodifiable_set,
     );
     r.register(
         c,
         "unmodifiableCollection",
         "(Ljava/util/Collection;)Ljava/util/Collection;",
-        native_collections_identity,
+        native_collections_unmodifiable_collection,
     );
     r.register(
         c,
@@ -16846,9 +17445,52 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// Identity — just returns the first argument (used for unmodifiable/synchronized wrappers)
+/// Identity — just returns the first argument (used for synchronized wrappers)
 fn native_collections_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
+}
+
+/// `Collections.unmodifiableMap` — wrap the source map in a live read-only view.
+fn native_collections_unmodifiable_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(Some(src))) => {
+            let w = alloc_unmod_wrapper(ctx, UNMOD_MAP_CLASS, *src);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Collections.unmodifiableSet` — wrap the source set in a live read-only view.
+fn native_collections_unmodifiable_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(Some(src))) => {
+            let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, *src);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Collections.unmodifiableCollection` — wrap the source collection in a
+/// live read-only view.
+fn native_collections_unmodifiable_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(Some(src))) => {
+            let w = alloc_unmod_wrapper(ctx, UNMOD_COLLECTION_CLASS, *src);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
 }
 
 fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
