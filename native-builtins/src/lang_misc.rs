@@ -152,6 +152,31 @@ fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Va
     write_throwable_field_cached(ctx, &THROWABLE_CAUSE_INDEX, "cause", this, cause);
 }
 
+/// Capture the current call stack for a freshly-constructed throwable.
+///
+/// These `native_exc_init_*` natives SHADOW the JDK `Throwable.<init>`
+/// bytecode (registered per-class by `register_throwable_subclass_natives`).
+/// The JDK constructor is the only thing that calls `fillInStackTrace()` —
+/// so when our native replaces it, nothing records the stack trace, and a
+/// later `printStackTrace()` / `getStackTrace()` (which read the trace store
+/// keyed by identity hash) come back empty. That hid the origin of every
+/// exception built via `new SomeException(...)` bytecode.
+///
+/// We mirror `fillInStackTrace` here: capture the current frames into the
+/// thread-local trace store keyed by the throwable's identity hash, and set
+/// the `backtrace`/`depth` fields so the real-JDK `getOurStackTrace()` path
+/// also works for callers that hit it directly.
+fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let hash = ctx.identity_hash_code(this);
+    let trace = ctx.capture_stack_trace(hash);
+    let depth = trace.len() as i32;
+    // `getOurStackTrace()` only materialises frames when `backtrace != null`;
+    // park a self-reference as the non-null marker (the real frame data lives
+    // in the identity-hash-keyed trace store).
+    ctx.set_field_by_name(this, "backtrace", Value::Object(Some(this)));
+    ctx.set_field_by_name(this, "depth", Value::Int(depth));
+}
+
 /// Exception <init>(Ljava/lang/String;)V — sets detailMessage.
 ///
 /// JDK semantics: `Throwable.cause` is declared `private Throwable cause = this;`
@@ -169,6 +194,7 @@ pub(crate) fn native_exc_init_message(ctx: &mut dyn NativeContext, args: &[Value
         }
         // Initialize cause to self-sentinel so a later initCause() succeeds.
         write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
+        capture_throwable_trace(ctx, *this);
     }
     Ok(None)
 }
@@ -182,6 +208,7 @@ pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &
         if let Some(cause) = args.get(2) {
             write_throwable_cause(ctx, *this, *cause);
         }
+        capture_throwable_trace(ctx, *this);
     }
     Ok(None)
 }
@@ -190,6 +217,7 @@ pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &
 pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(cause)) = (args.first(), args.get(1)) {
         write_throwable_cause(ctx, *this, *cause);
+        capture_throwable_trace(ctx, *this);
     }
     Ok(None)
 }
@@ -199,6 +227,7 @@ pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value])
 pub(crate) fn native_exc_init_noargs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
         write_throwable_cause(ctx, *this, Value::Object(Some(*this)));
+        capture_throwable_trace(ctx, *this);
     }
     Ok(None)
 }
@@ -222,11 +251,73 @@ pub(crate) fn native_throwable_fill_in_stack_trace(
         }
     };
 
-    let hash = ctx.identity_hash_code(this);
-    let _trace = ctx.capture_stack_trace(hash);
+    capture_throwable_trace(ctx, this);
 
     // Return `this` (Throwable.fillInStackTrace returns the Throwable itself)
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// `StackTraceElement.initStackTraceElements([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V`
+///
+/// Real-JDK `Throwable.getOurStackTrace()` allocates a `StackTraceElement[]`
+/// of length `depth` and hands it, the opaque `backtrace` object, and `depth`
+/// to this native to populate. Our `backtrace` marker is the throwable
+/// itself, so we look up its captured trace (thread-local store keyed by
+/// identity hash) and fill each STE. Previously registered as a no-op, so
+/// real-JDK `printStackTrace()` / `getStackTrace()` produced empty traces.
+pub(crate) fn native_init_stack_trace_elements(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let elements = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let backtrace = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+
+    let hash = ctx.identity_hash_code(backtrace);
+    // Clone trace data to release the immutable borrow before allocating.
+    let trace_data: Vec<(std::sync::Arc<str>, std::sync::Arc<str>, Option<std::sync::Arc<str>>, i32)> =
+        ctx.get_stack_trace(hash)
+            .map(|t| {
+                t.iter()
+                    .map(|e| {
+                        (
+                            std::sync::Arc::clone(&e.class_name),
+                            std::sync::Arc::clone(&e.method_name),
+                            e.source_file.as_ref().map(std::sync::Arc::clone),
+                            e.line_number,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+    let cap = ctx.array_length(elements);
+    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().take(cap).enumerate() {
+        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
+        let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
+            Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
+            None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
+        };
+        let cls_str = ctx.create_string(&cls_dotted);
+        let meth_str = ctx.create_string(meth);
+        ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
+        ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
+        match file {
+            Some(f) => {
+                let file_str = ctx.create_string(f);
+                ctx.set_field(ste, 2, Value::Object(Some(file_str)));
+            }
+            None => ctx.set_field(ste, 2, Value::Object(None)),
+        }
+        ctx.set_field(ste, 3, Value::Int(*line));
+        ctx.set_array_element(elements, i, Value::Object(Some(ste)));
+    }
+    Ok(None)
 }
 
 pub(crate) fn native_throwable_get_stack_trace_depth(

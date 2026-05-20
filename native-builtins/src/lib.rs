@@ -4227,9 +4227,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // --- Throwable additional signatures ---
     // JDK 9+: Throwable.getStackTraceDepth / getStackTraceElement are used
-    // by Throwable.getOurStackTrace() when a backtrace object exists.
-    registry.register("java/lang/Throwable", "getStackTraceDepth", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    registry.register("java/lang/Throwable", "getStackTraceElement", "(I)Ljava/lang/StackTraceElement;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // by Throwable.getOurStackTrace() on older JDKs when a backtrace object
+    // exists. Use the real implementations (which read the identity-hash-keyed
+    // trace store) rather than null-stubs — the stubs forced depth 0 / null
+    // frames in real-JDK mode, where `register_synthetic_overrides` (the only
+    // other place these were wired correctly) is never called.
+    registry.register("java/lang/Throwable", "getStackTraceDepth", "()I", native_throwable_get_stack_trace_depth);
+    registry.register("java/lang/Throwable", "getStackTraceElement", "(I)Ljava/lang/StackTraceElement;", native_throwable_get_stack_trace_element);
 
     // =======================================================================
     // Session 10: Native Method Bridging — register all remaining ACC_NATIVE
@@ -4634,7 +4638,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java/lang/StackTraceElement ---
     registry.register("java/lang/StackTraceElement", "initStackTraceElement", "(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V", native_noop_with_this);
-    registry.register("java/lang/StackTraceElement", "initStackTraceElements", "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V", native_noop);
+    // `initStackTraceElements` MUST populate the array — real-JDK
+    // `Throwable.getOurStackTrace()` calls `StackTraceElement.of(backtrace,
+    // depth)` which allocates the STE[] and delegates here. A no-op left
+    // every real-JDK `printStackTrace()` / `getStackTrace()` empty.
+    registry.register("java/lang/StackTraceElement", "initStackTraceElements", "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V", native_init_stack_trace_elements);
 
     // --- java/lang/reflect/Executable + Field ---
     registry.register("java/lang/reflect/Executable", "getParameters0", "()[Ljava/lang/reflect/Parameter;", |_ctx, _args| Ok(Some(Value::Object(None))));
