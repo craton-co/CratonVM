@@ -176,6 +176,12 @@ pub struct ExecutableBuffer {
     ptr: *mut u8,
     len: usize,
     capacity: usize,
+    /// Set when an `emit`/`emit_byte` call could not fit in the buffer.
+    /// `estimated_size` in the x64 backend is a heuristic, so a pathological
+    /// method can exceed it. Rather than panicking the whole process, the
+    /// emit hot path records overflow here and the compile driver bails to
+    /// the interpreter (returns `None`) after codegen.
+    overflowed: bool,
 }
 
 // Safety: ExecutableBuffer is effectively a unique owned allocation, like Vec<u8>.
@@ -195,18 +201,22 @@ impl ExecutableBuffer {
             ptr,
             len: 0,
             capacity,
+            overflowed: false,
         })
     }
 
     /// Write bytes into the buffer at the current position.
+    ///
+    /// If the write would exceed capacity the buffer is marked
+    /// [`overflowed`](Self::overflowed) and the write is skipped instead of
+    /// panicking. `len` is never advanced past `capacity`, so the buffer
+    /// stays safe to slice/patch; the compile driver is expected to check
+    /// `overflowed()` and discard the result.
     pub fn emit(&mut self, bytes: &[u8]) {
-        assert!(
-            self.len + bytes.len() <= self.capacity,
-            "JIT buffer overflow: {} + {} > {}",
-            self.len,
-            bytes.len(),
-            self.capacity
-        );
+        if self.len + bytes.len() > self.capacity {
+            self.overflowed = true;
+            return;
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
@@ -227,13 +237,26 @@ impl ExecutableBuffer {
     }
 
     /// Emit a single byte.
+    ///
+    /// Marks the buffer [`overflowed`](Self::overflowed) and skips the write
+    /// instead of panicking when capacity is exhausted.
     #[inline]
     pub fn emit_byte(&mut self, b: u8) {
-        assert!(self.len < self.capacity, "JIT buffer overflow");
+        if self.len >= self.capacity {
+            self.overflowed = true;
+            return;
+        }
         unsafe {
             *self.ptr.add(self.len) = b;
         }
         self.len += 1;
+    }
+
+    /// Returns `true` if any `emit`/`emit_byte` call exceeded capacity.
+    /// When set, the emitted code is incomplete and must be discarded.
+    #[inline]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
     }
 
     /// Current write position (offset from start).
@@ -254,7 +277,15 @@ impl ExecutableBuffer {
 
     /// Patch 4 bytes (little-endian i32) at the given offset.
     pub fn patch_i32(&mut self, offset: usize, value: i32) {
-        assert!(offset + 4 <= self.len, "patch out of bounds");
+        // After an emit overflow some recorded patch sites can point past the
+        // truncated buffer; skip them rather than panicking since the result
+        // is going to be discarded anyway.
+        if offset + 4 > self.len {
+            if self.overflowed {
+                return;
+            }
+            panic!("patch out of bounds");
+        }
         let bytes = value.to_le_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), 4);
@@ -263,7 +294,12 @@ impl ExecutableBuffer {
 
     /// Patch 1 byte at the given offset.
     pub fn patch_byte(&mut self, offset: usize, value: u8) {
-        assert!(offset < self.len, "patch_byte out of bounds");
+        if offset >= self.len {
+            if self.overflowed {
+                return;
+            }
+            panic!("patch_byte out of bounds");
+        }
         unsafe {
             *self.ptr.add(offset) = value;
         }
@@ -941,6 +977,12 @@ unsafe fn emit_osr_trampoline(
     tramp.emit(&[0x48, 0xB8]);
     tramp.emit(&(target_addr as i64).to_le_bytes());
     tramp.emit(&[0xFF, 0xE0]);
+
+    // Defensive: if the trampoline somehow exceeded its sizing heuristic the
+    // emitted code is truncated and unsafe to run — discard it.
+    if tramp.overflowed() {
+        return None;
+    }
 
     // Transition trampoline buffer from writable to executable.
     tramp.finalize();
@@ -3179,10 +3221,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "JIT buffer overflow")]
-    fn test_executable_buffer_emit_overflow_panics() {
+    fn test_executable_buffer_emit_overflow_marks_flag() {
+        // An emit past capacity must NOT panic: it records `overflowed` and
+        // skips the write so the compile driver can bail gracefully.
         let mut buf = ExecutableBuffer::new(4).expect("alloc failed");
+        assert!(!buf.overflowed());
         buf.emit(&[1, 2, 3, 4, 5]); // 5 bytes into 4-capacity buffer
+        assert!(buf.overflowed());
+        assert_eq!(buf.pos(), 0, "overflowing emit must not advance len");
+        buf.emit_byte(0xCC);
+        assert_eq!(buf.pos(), 0, "overflowing emit_byte must not advance len");
     }
 
     #[test]

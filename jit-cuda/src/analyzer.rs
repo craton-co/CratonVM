@@ -110,6 +110,17 @@ pub enum Reason {
     /// shape so the VM falls back to CPU execution until a proper
     /// reduction lowering is implemented.
     ReductionNotImplemented,
+    /// AUDIT 2026-05-19: the method has a counted loop (a backward
+    /// branch) and a scalar (non-void) return. The counted-loop
+    /// lowering dispatches one CUDA thread per loop iteration, but
+    /// `scalar_return` writes the result through the single `ret_ptr`;
+    /// every thread races to overwrite that one slot with its own
+    /// per-iteration value — silently wrong results. The
+    /// `ReductionNotImplemented` check above only catches array-in /
+    /// scalar-out shapes, so a scalar-in / scalar-out counted loop
+    /// (e.g. `(II)I` that loops) slips through. Reject it here until a
+    /// guarded single-writer or block-reduction lowering exists.
+    CountedLoopScalarReturn,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,10 +182,23 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
     // bytecode twice was pure waste — the work estimator's branch-
     // direction check only needs the same `pc / instruction_size`
     // walk the classifier already performs.
-    let estimated_work = match scan_and_estimate(code) {
+    let (estimated_work, has_backward) = match scan_and_estimate(code) {
         Ok(w) => w,
         Err(reason) => return OffloadVerdict::Rejected(reason),
     };
+
+    // AUDIT 2026-05-19: a method with a backward branch is a counted
+    // loop; the counted-loop lowering runs one CUDA thread per
+    // iteration. A scalar (non-void) return is written through the
+    // single `ret_ptr` by `scalar_return`, so every thread would race
+    // to overwrite that one slot — silently wrong results. The
+    // `ReductionNotImplemented` check above only fires for array-in /
+    // scalar-out shapes; a scalar-in / scalar-out counted loop is not
+    // caught there. Reject it so the VM falls back to the CPU.
+    if has_backward && return_kind.is_scalar() {
+        return OffloadVerdict::Rejected(Reason::CountedLoopScalarReturn);
+    }
+
     OffloadVerdict::Eligible(KernelSignature {
         param_kinds,
         return_kind,
@@ -190,8 +214,10 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
 }
 
 /// Walk the bytecode exactly once. Reject on the first forbidden
-/// opcode; otherwise return the loop-trip estimate.
-fn scan_and_estimate(code: &CodeAttribute) -> Result<usize, Reason> {
+/// opcode; otherwise return `(loop-trip estimate, has_backward_branch)`.
+/// The `has_backward` flag lets `analyze` recognise counted-loop
+/// shapes without a second pass.
+fn scan_and_estimate(code: &CodeAttribute) -> Result<(usize, bool), Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
     let mut has_backward = false;
@@ -222,7 +248,8 @@ fn scan_and_estimate(code: &CodeAttribute) -> Result<usize, Reason> {
         }
         pc += instruction_size(bytes, pc)?;
     }
-    Ok(if has_backward { 1 << 20 } else { bytes.len().max(1) })
+    let estimated_work = if has_backward { 1 << 20 } else { bytes.len().max(1) };
+    Ok((estimated_work, has_backward))
 }
 
 enum OpClass {

@@ -21,9 +21,12 @@ use crate::recording::FlightRecorder;
 // emit_* function, the disabled-path cost drops from ~30-100 ns (HashMap probe
 // + Vec alloc) to ~2-3 ns (one relaxed atomic load + branch).
 //
-// The cache uses `EventTypeId::INVALID` as a sentinel when the named type is
-// not registered (which shouldn't happen for built-in events but is handled
-// defensively). Subsequent calls hit the cached sentinel without re-probing.
+// The cache is populated ONLY on a successful lookup. An unsuccessful lookup
+// (registry not yet initialised, or type genuinely absent) must NOT be cached:
+// `OnceLock` is write-once, so caching the `INVALID` sentinel would
+// permanently drop every later emit of that event type even after the type is
+// registered. On a miss we return `None` for this call and leave the cache
+// unset so a subsequent call can still succeed.
 
 /// Look up an event-type ID by name, caching the result in the supplied
 /// `OnceLock`. Returns `None` if the registry has no such type.
@@ -33,13 +36,15 @@ fn cached_event_id(
     recorder: &FlightRecorder,
     name: &str,
 ) -> Option<EventTypeId> {
-    let id = *cache.get_or_init(|| {
-        recorder
-            .type_registry
-            .find_by_name(name)
-            .unwrap_or(EventTypeId::INVALID)
-    });
-    if id.is_invalid() { None } else { Some(id) }
+    if let Some(&id) = cache.get() {
+        // Only valid ids are ever stored, so a hit is always usable.
+        return Some(id);
+    }
+    let id = recorder.type_registry.find_by_name(name)?;
+    // Successful lookup — populate the cache. `set` may fail if another thread
+    // raced us here; that is harmless since both threads resolved the same id.
+    let _ = cache.set(id);
+    Some(id)
 }
 
 /// Register all built-in JVM event types into the given registry.

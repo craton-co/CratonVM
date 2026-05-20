@@ -341,6 +341,18 @@ impl<'a> Emitter<'a> {
             }
             let op = self.bytes[pc];
             let size = instr_size(self.bytes, pc)?;
+            // The `Code` attribute may end mid-instruction (truncated or
+            // malformed class file). `emit_op` reads operand bytes via
+            // raw `self.bytes[pc + 1..]` indexing, so verify the whole
+            // instruction fits before dispatching — otherwise a short
+            // method panics with an out-of-bounds slice index.
+            if pc + size > self.bytes.len() {
+                return Err(LoweringError::UnsupportedNode(format!(
+                    "instruction at pc={pc} (op 0x{op:02x}, size {size}) runs past \
+                     the end of the bytecode ({} bytes) — truncated Code attribute",
+                    self.bytes.len()
+                )));
+            }
             self.emit_op(op, pc, loop_info)?;
             pc += size;
         }
@@ -570,11 +582,19 @@ impl<'a> Emitter<'a> {
             0x92 => self.conv_truncate_i32(16)?,                               // i2c (unsigned 16)
             0x93 => self.conv_truncate_i32(16)?,                               // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
-            // AUDIT 2026-05-16: only `lcmp` is wired; the four float/double
-            // compares (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`) were routed to
-            // `cmp_long_or_float` which always errors out — pure dead code.
-            // Let them fall through to the default `UnsupportedNode` arm.
-            0x94 => self.cmp_long_or_float(RegKind::S64, false)?,
+            // AUDIT 2026-05-19: `lcmp` (0x94) was dispatched to
+            // `cmp_long_or_float`, which unconditionally returned `Err`.
+            // That made `lcmp` *look* supported at the dispatch site
+            // while never succeeding. Reject it explicitly here — same
+            // as `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`, which fall through to
+            // the default `UnsupportedNode` arm. `*cmp*` opcodes only
+            // appear paired with a following `if*`, which the canonical
+            // counted-loop subset never emits inside the body.
+            0x94 => {
+                return Err(LoweringError::UnsupportedNode(
+                    "lcmp is not supported in the element-wise lowering".into(),
+                ));
+            }
             // ── branches ────────────────────────────────────────────
             0x99..=0xA4 => {
                 // if* / if_icmp* — we accept these only at the loop
@@ -1063,18 +1083,9 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn cmp_long_or_float(
-        &mut self,
-        _kind: RegKind,
-        _is_float: bool,
-    ) -> Result<(), LoweringError> {
-        // JVM `*cmp*` pushes -1/0/+1 on the int stack. We never expect
-        // these inside the canonical-loop subset (they appear with the
-        // following if*); reject so the caller falls back.
-        Err(LoweringError::UnsupportedNode(
-            "*cmp* opcodes are not supported in the element-wise lowering".into(),
-        ))
-    }
+    // AUDIT 2026-05-19: `cmp_long_or_float` was removed — it always
+    // returned `Err`, so every `*cmp*` opcode now rejects explicitly at
+    // the `emit_op` dispatch site instead of routing through dead code.
 
     // ─────────────────── array ops ──────────────────────────────────
 
@@ -1405,8 +1416,18 @@ pub(crate) fn locate_bound(
     let mut prev_ops = Vec::new();
     let mut pc = loop_info.header_pc;
     while pc < loop_info.exit_if_pc {
+        let size = instr_size(bytes, pc)?;
+        // Reject a truncated `Code` attribute before any raw operand
+        // read below indexes past the end of `bytes`.
+        if pc + size > bytes.len() {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "instruction at pc={pc} runs past the end of the bytecode \
+                 ({} bytes) — truncated Code attribute",
+                bytes.len()
+            )));
+        }
         prev_ops.push(pc);
-        pc += instr_size(bytes, pc)?;
+        pc += size;
     }
     if prev_ops.len() < 2 {
         return Err(LoweringError::UnsupportedNode(
@@ -1466,6 +1487,15 @@ fn pre_loop_bound_source(
     while pc < header_pc {
         let op = bytes[pc];
         let size = instr_size(bytes, pc)?;
+        // Reject a truncated `Code` attribute before the raw operand
+        // reads in the match arms below index past the end of `bytes`.
+        if pc + size > bytes.len() {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "instruction at pc={pc} runs past the end of the bytecode \
+                 ({} bytes) — truncated Code attribute",
+                bytes.len()
+            )));
+        }
         match op {
             0x2A..=0x2D => last_aload_local = Some((op - 0x2A) as u16),
             0x19 => last_aload_local = Some(bytes[pc + 1] as u16),

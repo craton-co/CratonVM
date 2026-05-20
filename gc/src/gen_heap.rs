@@ -333,7 +333,30 @@ impl GenerationalHeap {
 
     /// Allocate a new Java object in the young generation.
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+        // Checked arithmetic — an overflowed `total_size` would size the
+        // allocation incorrectly. Mirrors `try_alloc_object`'s checked path.
+        let total_size = num_fields
+            .checked_mul(SLOT_SIZE)
+            .and_then(|fields_size| HEADER_SIZE.checked_add(fields_size))
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "FATAL: object size overflow in gen_heap alloc_object \
+                     (num_fields={})",
+                    num_fields
+                );
+                std::process::abort();
+            });
+        // The slot count MUST fit the `u32` header field. Clamping to
+        // `u32::MAX` would write a count that disagrees with `total_size`,
+        // causing later GC scans to walk off the end of the object.
+        let num_slots_u32 = u32::try_from(num_fields).unwrap_or_else(|_| {
+            eprintln!(
+                "FATAL: object field count exceeds u32 in gen_heap alloc_object \
+                 (num_fields={})",
+                num_fields
+            );
+            std::process::abort();
+        });
         let ptr = self.alloc_young(total_size);
 
         let header = ObjectHeader::new(
@@ -342,7 +365,7 @@ impl GenerationalHeap {
             ArrayElementType::Reference,
             self.next_hash(),
             0,
-            u32::try_from(num_fields).unwrap_or(u32::MAX),
+            num_slots_u32,
         );
 
         // SAFETY: `ptr` was just bump-allocated from the young arena with sufficient
@@ -416,7 +439,23 @@ impl GenerationalHeap {
     ) -> ObjectRef {
         let data_size = array_data_size(length, element_type)
             .unwrap_or_else(|_| { eprintln!("FATAL: array data size overflow in gen_heap alloc_array (length={}, element_type={:?})", length, element_type); std::process::abort(); });
-        let total_size = HEADER_SIZE + data_size;
+        let total_size = HEADER_SIZE.checked_add(data_size).unwrap_or_else(|| {
+            eprintln!(
+                "FATAL: array size overflow in gen_heap alloc_array (length={}, element_type={:?})",
+                length, element_type
+            );
+            std::process::abort();
+        });
+        // The length MUST fit the `u32` header field. Clamping to `u32::MAX`
+        // would record a length that disagrees with the allocated `data_size`,
+        // causing later GC scans to walk off the end of the array.
+        let length_u32 = u32::try_from(length).unwrap_or_else(|_| {
+            eprintln!(
+                "FATAL: array length exceeds u32 in gen_heap alloc_array (length={}, element_type={:?})",
+                length, element_type
+            );
+            std::process::abort();
+        });
         let ptr = self.alloc_young(total_size);
 
         let header = ObjectHeader::new(
@@ -424,8 +463,8 @@ impl GenerationalHeap {
             ObjectKind::Array,
             element_type,
             self.next_hash(),
-            u32::try_from(length).unwrap_or(u32::MAX),
-            u32::try_from(length).unwrap_or(u32::MAX),
+            length_u32,
+            length_u32,
         );
 
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
@@ -703,6 +742,18 @@ impl GenerationalHeap {
             return;
         }
         if index >= num_slots {
+            // Out-of-bounds writes are dropped rather than corrupting the
+            // neighboring object, but log first — silently swallowing this
+            // masks real layout-mismatch bugs in the caller.
+            tracing::error!(
+                target: "rustjvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "gen_heap::set_field: out-of-bounds field write dropped",
+            );
             return;
         }
         debug_assert!(index < self.get_header(obj_ref).num_slots as usize);
@@ -2494,8 +2545,13 @@ impl GenerationalHeap {
         pointer_map: &mut FxHashMap<usize, usize>,
         promoted_worklist: &mut Vec<*mut u8>,
     ) -> *mut u8 {
-        // SAFETY: `old_ptr` points to a live young-gen object; its header is valid.
-        let header = unsafe { &*(old_ptr as *const ObjectHeader) };
+        // SAFETY: `old_ptr` points to a live young-gen object; its header is
+        // valid. Read an owned *copy* of the header rather than holding a
+        // shared `&ObjectHeader`: later in this function we install the
+        // forwarding pointer through a `&mut`/raw write to the same address,
+        // and a live `&` aliasing that write would be undefined behavior.
+        let header: ObjectHeader = unsafe { std::ptr::read(old_ptr as *const ObjectHeader) };
+        let header = &header;
 
         // KC16 SIGSEGV audit: sanity-check header before using it. A corrupted
         // header (e.g., slot tag mis-identified a non-pointer bit-pattern as an
@@ -2660,10 +2716,14 @@ impl GenerationalHeap {
             new_header.gc_age = new_header.gc_age.saturating_add(1);
         }
 
-        // Install forwarding pointer in the old header
-        // SAFETY: `old_ptr` is a valid young-gen object; writing the forwarding pointer into its header is safe.
-        let old_header = unsafe { &mut *(old_ptr as *mut ObjectHeader) };
-        old_header.forwarding_ptr = new_ptr;
+        // Install forwarding pointer in the old header.
+        // SAFETY: `old_ptr` is a valid young-gen object; writing the forwarding
+        // pointer into its header is safe. Written through a raw pointer so no
+        // `&mut ObjectHeader` is ever live alongside another reference to this
+        // header (we earlier read an owned copy rather than borrowing it).
+        unsafe {
+            std::ptr::addr_of_mut!((*(old_ptr as *mut ObjectHeader)).forwarding_ptr).write(new_ptr);
+        }
 
         pointer_map.insert(old_ptr as usize, new_ptr as usize);
         *objects_copied += 1;

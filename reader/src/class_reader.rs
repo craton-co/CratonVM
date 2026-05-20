@@ -175,7 +175,10 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
         });
     }
     validate_count("constant_pool", count, MAX_CP_SIZE)?;
-    let mut entries: Vec<ConstantPoolEntry> = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
+    // `count` is a u16 read from the file, so it is already bounded at
+    // 65535 — there is no preallocation-DoS risk. Reserve the exact size
+    // up front to avoid reallocations while parsing large classes.
+    let mut entries: Vec<ConstantPoolEntry> = Vec::with_capacity(count as usize);
     entries.push(ConstantPoolEntry::Tombstone); // Index 0
 
     let mut i = 1u16;
@@ -210,6 +213,17 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
             }
             5 => {
                 // CONSTANT_Long (takes 2 slots)
+                // JVMS §4.4.5: a Long/Double occupies two slots, so it must
+                // not start at the last valid index (count-1) — its second
+                // slot would overflow past the pool. Reject untrusted input
+                // that places one there instead of silently growing the pool.
+                if i + 1 >= count {
+                    return Err(ClassReaderError::InvalidConstantPool {
+                        index: i,
+                        message: "CONSTANT_Long must not occupy the last constant pool slot"
+                            .to_string(),
+                    });
+                }
                 let value = buf.read_i64()?;
                 entries.push(ConstantPoolEntry::Long(value));
                 entries.push(ConstantPoolEntry::Tombstone);
@@ -217,7 +231,14 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
                 continue;
             }
             6 => {
-                // CONSTANT_Double (takes 2 slots)
+                // CONSTANT_Double (takes 2 slots) — see CONSTANT_Long above.
+                if i + 1 >= count {
+                    return Err(ClassReaderError::InvalidConstantPool {
+                        index: i,
+                        message: "CONSTANT_Double must not occupy the last constant pool slot"
+                            .to_string(),
+                    });
+                }
                 let value = buf.read_f64()?;
                 entries.push(ConstantPoolEntry::Double(value));
                 entries.push(ConstantPoolEntry::Tombstone);
@@ -319,6 +340,20 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
 
         entries.push(entry);
         i += 1;
+    }
+
+    // The 0-th sentinel plus `count - 1` real entries must total exactly
+    // `count`. A Long/Double straddling the end would have grown the Vec
+    // past `count`; that case is now rejected above, but verify the
+    // invariant defensively before handing the pool to the rest of the VM.
+    if entries.len() != count as usize {
+        return Err(ClassReaderError::InvalidConstantPool {
+            index: count,
+            message: format!(
+                "constant pool entry count mismatch: expected {count}, got {}",
+                entries.len()
+            ),
+        });
     }
 
     Ok(ConstantPool::new(entries))

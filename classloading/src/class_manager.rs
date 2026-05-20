@@ -54,19 +54,32 @@ pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
 
 /// Adapter implementing [`ClassHierarchy`] over the `ClassManager`'s
 /// `ClassStore` + name-to-id index. Used by the verifier (Pass 2 / Pass 3)
-/// during `define_class_with_options`. Each query is name-keyed and walks
-/// the loaded-class indexes; if a referenced class hasn't been loaded yet
-/// the query falls back to conservative defaults that keep verification
-/// permissive (treat unknown classes as `java/lang/Object` subclasses, not
-/// interfaces) — matching HotSpot's "subclass of nothing else" tolerance
-/// for unresolved references during Pass 3.
+/// during `define_class_with_options`.
+///
+/// Audit fix (HIGH #1) — verify-before-store ordering: the class being
+/// defined is verified *before* it is inserted into `class_store`, so any
+/// hierarchy query about the class-under-verification (its own name, its
+/// own `ClassId`) would otherwise miss. `in_flight` carries that class so
+/// self-references resolve during verification without having to register
+/// a not-yet-verified class in the store. This is the lower-risk option:
+/// no partially-registered class is ever visible, and a class that fails
+/// verification is simply dropped.
 struct ClassStoreHierarchy<'a> {
     class_store: &'a ClassStore,
     loaded_classes: &'a FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
+    /// The class currently being verified (not yet in `class_store`).
+    in_flight: Option<&'a Class>,
 }
 
 impl<'a> ClassStoreHierarchy<'a> {
     fn lookup(&self, name: &str) -> Option<ClassId> {
+        // The class-under-verification is not yet in `loaded_classes`;
+        // resolve self-references to its reserved id.
+        if let Some(inflight) = self.in_flight {
+            if &*inflight.name == name {
+                return Some(inflight.id);
+            }
+        }
         // Probe with `Arc<str>` to match the storage map's key type.
         let probe: Arc<str> = Arc::from(name);
         // Round 9 audit fix (HIGH #6): iterate over the canonical
@@ -87,6 +100,17 @@ impl<'a> ClassStoreHierarchy<'a> {
         }
         None
     }
+
+    /// Resolve a `ClassId` to its `Class`, transparently returning the
+    /// in-flight (not-yet-stored) class when the id matches it.
+    fn class_for(&self, id: ClassId) -> Option<&Class> {
+        if let Some(inflight) = self.in_flight {
+            if inflight.id == id {
+                return Some(inflight);
+            }
+        }
+        self.class_store.get(id)
+    }
 }
 
 impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
@@ -94,14 +118,21 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         if child == parent || parent == "java/lang/Object" {
             return true;
         }
+        // Audit fix (HIGH #2): a missing class must NOT be reported as a
+        // subtype. Returning `true` for unresolved references silently
+        // bypassed Pass-3 type-assignability checks for untrusted classes.
+        // `java/lang/Object` is already short-circuited above, so a
+        // genuine supertype check still resolves correctly; for every
+        // other unresolved reference we return the conservative answer
+        // (`false` — "not proven a subtype"). The verifier's interface
+        // relaxation (`is_interface` / `is_known_jdk_interface` in
+        // `vtype.rs`) still handles legitimate interface targets.
         let (Some(child_id), Some(parent_id)) = (self.lookup(child), self.lookup(parent)) else {
-            // Either class isn't loaded yet — be permissive so the
-            // verifier doesn't reject legitimate forward references.
-            return true;
+            return false;
         };
-        match self.class_store.get(child_id) {
+        match self.class_for(child_id) {
             Some(c) => c.is_subclass_of(parent_id, self.class_store),
-            None => true,
+            None => false,
         }
     }
 
@@ -112,7 +143,7 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         let (Some(a_id), Some(b_id)) = (self.lookup(a), self.lookup(b)) else {
             return "java/lang/Object".to_string();
         };
-        let a_cls = match self.class_store.get(a_id) {
+        let a_cls = match self.class_for(a_id) {
             Some(c) => c,
             None => return "java/lang/Object".to_string(),
         };
@@ -124,7 +155,7 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             }
             depth += 1;
             let cls_id = cls.id;
-            if let Some(b_cls) = self.class_store.get(b_id) {
+            if let Some(b_cls) = self.class_for(b_id) {
                 if b_cls.is_subclass_of(cls_id, self.class_store) {
                     return cls.name.to_string();
                 }
@@ -135,7 +166,7 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
     }
 
     fn is_interface(&self, name: &str) -> bool {
-        match self.lookup(name).and_then(|id| self.class_store.get(id)) {
+        match self.lookup(name).and_then(|id| self.class_for(id)) {
             Some(c) => c.is_interface(),
             None => false,
         }
@@ -2430,6 +2461,10 @@ impl ClassManager {
             let hierarchy = ClassStoreHierarchy {
                 class_store: &self.class_store,
                 loaded_classes: &self.loaded_classes,
+                // Audit fix (HIGH #1): the class being verified is not yet
+                // in `class_store`; pass it explicitly so self-references
+                // (its own name / id) resolve during verification.
+                in_flight: Some(&class),
             };
             if let Err(verify_err) = crate::verifier::verify_class(
                 &class,
@@ -3589,6 +3624,9 @@ impl ClassManager {
                 let hierarchy = ClassStoreHierarchy {
                     class_store: &self.class_store,
                     loaded_classes: &self.loaded_classes,
+                    // Redefine verifies a class already resident in the
+                    // store (in-place mutation), so no in-flight class.
+                    in_flight: None,
                 };
                 // SAFETY-shape: the class we just mutated is at
                 // `class_id` in `self.class_store`. `get` returns `Some`

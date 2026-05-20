@@ -586,8 +586,13 @@ pub struct SoftwareRenderer {
 impl SoftwareRenderer {
     /// Creates a new renderer with a buffer filled with transparent black.
     pub fn new(width: u32, height: u32) -> Self {
+        // `checked_mul` widened to usize — a plain `u32` multiply can wrap and
+        // silently produce an undersized buffer for large dimensions.
+        let len = (width as usize)
+            .checked_mul(height as usize)
+            .expect("SoftwareRenderer pixel count overflows usize");
         Self {
-            pixels: vec![0x00000000; (width * height) as usize],
+            pixels: vec![0x00000000; len],
             width,
             height,
             clip: None,
@@ -601,9 +606,13 @@ impl SoftwareRenderer {
 
     /// Reallocates the pixel buffer.
     pub fn resize(&mut self, width: u32, height: u32) {
+        // `checked_mul` — see `new`: avoid a wrapped, undersized allocation.
+        let len = (width as usize)
+            .checked_mul(height as usize)
+            .expect("SoftwareRenderer pixel count overflows usize");
         self.width = width;
         self.height = height;
-        self.pixels = vec![0x00000000; (width * height) as usize];
+        self.pixels = vec![0x00000000; len];
     }
 
     pub fn pixels(&self) -> &[u32] {
@@ -1120,8 +1129,20 @@ impl SoftwareRenderer {
             for row in 0..(dst_y1 - dst_y0) as usize {
                 let dst_row = (dst_y0 as usize + row) * dst_stride + dst_x0 as usize;
                 let src_row = (src_off_y as usize + row) * src_stride + src_off_x as usize;
-                let dst_slice = &mut self.pixels[dst_row..dst_row + row_w];
-                let src_slice = &src[src_row..src_row + row_w];
+                // `eff_src_h` only caps the row *count*; the final row can still
+                // be partially populated when `src.len()` is not a multiple of
+                // `src_stride`. Use `get` and skip/clamp instead of an
+                // unchecked slice that would panic past `src.len()`.
+                let src_slice = match src.get(src_row..src_row + row_w) {
+                    Some(s) => s,
+                    None => match src.get(src_row..) {
+                        // Partial last row: composite only the populated prefix.
+                        Some(s) if !s.is_empty() => s,
+                        _ => break,
+                    },
+                };
+                let eff_w = src_slice.len();
+                let dst_slice = &mut self.pixels[dst_row..dst_row + eff_w];
 
                 match mode {
                     CompositeMode::Src => {

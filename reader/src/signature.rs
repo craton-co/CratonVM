@@ -101,9 +101,18 @@ pub struct MethodSig {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Maximum nesting depth for type signatures. Nested generics and array
+/// dimensions recurse in the parser; an untrusted `Signature` attribute of
+/// nothing but `[` (or deeply nested `<...>`) would otherwise overflow the
+/// stack. 256 comfortably exceeds anything a real compiler emits.
+const MAX_SIG_DEPTH: usize = 256;
+
 struct SigParser<'a> {
     input: &'a [u8],
     pos: usize,
+    /// Current recursion depth — incremented when descending into a nested
+    /// type signature, decremented on the way back out.
+    depth: usize,
 }
 
 impl<'a> SigParser<'a> {
@@ -111,6 +120,7 @@ impl<'a> SigParser<'a> {
         SigParser {
             input: s.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -214,6 +224,18 @@ impl<'a> SigParser<'a> {
     }
 
     fn parse_type_sig(&mut self) -> Option<TypeSig> {
+        // Bound recursion on untrusted input — nested generics and array
+        // dimensions both descend through this function.
+        if self.depth >= MAX_SIG_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let result = self.parse_type_sig_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_type_sig_inner(&mut self) -> Option<TypeSig> {
         match self.peek()? {
             b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => {
                 let ch = self.advance()? as char;

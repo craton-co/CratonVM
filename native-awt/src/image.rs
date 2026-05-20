@@ -67,8 +67,15 @@ pub struct BufferedImageData {
 impl BufferedImageData {
     /// Create a new image filled with transparent black (or opaque black for
     /// non-alpha types).
+    ///
+    /// The caller (the `BufferedImage.<init>` native) is responsible for
+    /// rejecting absurd dimensions before reaching here; the `checked_mul`
+    /// below is a defence-in-depth guard so an arithmetic overflow surfaces
+    /// as a clear panic rather than a wrapped (too-small) allocation.
     pub fn new(width: u32, height: u32, image_type: ImageType) -> Self {
-        let len = (width as usize) * (height as usize);
+        let len = (width as usize)
+            .checked_mul(height as usize)
+            .expect("BufferedImage pixel count overflows usize");
         let fill = if image_type.has_alpha() {
             0x0000_0000 // transparent
         } else {
@@ -134,8 +141,14 @@ impl BufferedImageData {
 
     /// Bulk-read a rectangular region as a Vec of ARGB values (row-major).
     pub fn get_rgb_region(&self, x: u32, y: u32, w: u32, h: u32) -> Vec<u32> {
+        // `checked_add` — a plain `x + w` on `u32` can wrap (e.g. x=u32::MAX,
+        // w=2) and spuriously pass the `<= width` comparison.
+        let in_bounds = x
+            .checked_add(w)
+            .zip(y.checked_add(h))
+            .is_some_and(|(x1, y1)| x1 <= self.width && y1 <= self.height);
         assert!(
-            x + w <= self.width && y + h <= self.height,
+            in_bounds,
             "region ({},{} {}x{}) exceeds image ({}x{})",
             x,
             y,
@@ -154,8 +167,14 @@ impl BufferedImageData {
 
     /// Bulk-write a rectangular region from a slice of ARGB values (row-major).
     pub fn set_rgb_region(&mut self, x: u32, y: u32, w: u32, h: u32, pixels: &[u32]) {
+        // `checked_add` — see `get_rgb_region`: a plain `u32` add can wrap and
+        // spuriously pass the bounds check for a crafted (x, w) pair.
+        let in_bounds = x
+            .checked_add(w)
+            .zip(y.checked_add(h))
+            .is_some_and(|(x1, y1)| x1 <= self.width && y1 <= self.height);
         assert!(
-            x + w <= self.width && y + h <= self.height,
+            in_bounds,
             "region ({},{} {}x{}) exceeds image ({}x{})",
             x,
             y,

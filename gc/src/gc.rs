@@ -234,14 +234,24 @@ fn forward_object(
 ) -> *mut u8 {
     // SAFETY: old_ptr is a valid heap object in from_space (verified by caller's
     // from_space.contains() check). The header is readable for the duration of GC.
-    let header = unsafe { &*(old_ptr as *const ObjectHeader) };
+    //
+    // Aliasing-safety fix: access the old header exclusively through raw
+    // pointers. Holding a shared `&ObjectHeader` here while later taking a
+    // `&mut ObjectHeader` to the same address (to install the forwarding
+    // pointer) would be two live references — one mutable — to overlapping
+    // memory, which is undefined behavior under Rust's aliasing rules.
+    let old_header_ptr = old_ptr as *const ObjectHeader;
 
     // Already forwarded?
-    if header.is_forwarded() {
-        return header.forwarding_address();
+    // SAFETY: `old_header_ptr` points at a valid, fully initialized header.
+    if unsafe { (*old_header_ptr).is_forwarded() } {
+        return unsafe { (*old_header_ptr).forwarding_address() };
     }
 
-    let total_size = object_total_size(header);
+    // SAFETY: read a copy of the header so `object_total_size` operates on an
+    // owned value rather than a borrow that would alias the later `&mut`.
+    let header_copy = unsafe { std::ptr::read(old_header_ptr) };
+    let total_size = object_total_size(&header_copy);
 
     // Allocate in to-space
     let new_ptr = to_space.alloc(total_size, 8).unwrap_or_else(|| {
@@ -288,14 +298,21 @@ fn forward_object(
     }
 
     // SAFETY: new_ptr was just allocated in to_space with at least HEADER_SIZE bytes.
-    // Clear the forwarding pointer in the NEW copy (it's a fresh object)
-    let new_header = unsafe { &mut *(new_ptr as *mut ObjectHeader) };
-    new_header.forwarding_ptr = std::ptr::null_mut();
+    // Clear the forwarding pointer in the NEW copy (it's a fresh object).
+    // Write through a raw pointer so no `&mut ObjectHeader` is ever live
+    // alongside any other reference to this header.
+    unsafe {
+        std::ptr::addr_of_mut!((*(new_ptr as *mut ObjectHeader)).forwarding_ptr)
+            .write(std::ptr::null_mut());
+    }
 
     // SAFETY: old_ptr is still valid in from_space (not freed yet) and we have
-    // exclusive access during STW GC. Install forwarding pointer for future lookups.
-    let old_header = unsafe { &mut *(old_ptr as *mut ObjectHeader) };
-    old_header.forwarding_ptr = new_ptr;
+    // exclusive access during STW GC. Install forwarding pointer for future
+    // lookups. Written through a raw pointer to avoid aliasing the shared
+    // header view used earlier in this function.
+    unsafe {
+        std::ptr::addr_of_mut!((*(old_ptr as *mut ObjectHeader)).forwarding_ptr).write(new_ptr);
+    }
 
     // Track the mapping
     pointer_map.insert(old_ptr as usize, new_ptr as usize);

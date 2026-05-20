@@ -79,6 +79,8 @@
 
 use std::collections::HashMap;
 
+use rustjvm_types::error::ClassFileError;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,7 +140,7 @@ pub struct ProxyMethod {
 /// populated by a generated `<clinit>` that resolves each method via
 /// `Class.forName(iface).getMethod(name, paramTypes)`. Each method body
 /// then uses `GETSTATIC m_<i>` instead of recreating a `Method` per call.
-pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Vec<u8> {
+pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileError> {
     let mut cp = CpBuilder::new();
 
     // Resolve all class/method/string CP indices we'll need up-front.
@@ -190,7 +192,7 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Vec<u8> {
     ));
 
     // 2) `<clinit>` — populate every `m_<i>` static slot.
-    method_blobs.push(emit_clinit(spec, &mut cp, code_attr_name_idx, &m_field_refs));
+    method_blobs.push(emit_clinit(spec, &mut cp, code_attr_name_idx, &m_field_refs)?);
 
     // 3) One body per declared method.
     for (i, m) in spec.methods.iter().enumerate() {
@@ -201,7 +203,7 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Vec<u8> {
             dispatch_ref,
             object_class_idx,
             m_field_refs[i],
-        ));
+        )?);
     }
 
     // ── Assemble ClassFile (JVMS §4.1) ───────────────────────────────────
@@ -256,7 +258,7 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Vec<u8> {
     // class attributes[] — empty.
     out.extend_from_slice(&0_u16.to_be_bytes());
 
-    out
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -299,72 +301,102 @@ pub enum ReturnKind {
 
 /// Parse the parameter list of a method descriptor (the part between `(`
 /// and `)`).
-pub fn descriptor_param_slots(desc: &str) -> Vec<DescKind> {
+///
+/// Audit fix (MED): malformed descriptors from loaded classes surface as
+/// [`ClassFileError::InvalidClassFile`] instead of panicking.
+pub fn descriptor_param_slots(desc: &str) -> Result<Vec<DescKind>, ClassFileError> {
     let bytes = desc.as_bytes();
     let mut out = Vec::new();
     let start = bytes
         .iter()
         .position(|&b| b == b'(')
-        .expect("descriptor must start with '('")
+        .ok_or_else(|| ClassFileError::InvalidClassFile {
+            class_name: String::new(),
+            message: format!("method descriptor '{desc}' missing '('"),
+        })?
         + 1;
     let end = bytes
         .iter()
         .position(|&b| b == b')')
-        .expect("descriptor must contain ')'");
+        .ok_or_else(|| ClassFileError::InvalidClassFile {
+            class_name: String::new(),
+            message: format!("method descriptor '{desc}' missing ')'"),
+        })?;
     let mut i = start;
     while i < end {
-        let (kind, advanced) = parse_one_field(desc, i);
+        let (kind, advanced) = parse_one_field(desc, i)?;
         out.push(kind);
         i = advanced;
     }
-    out
+    Ok(out)
 }
 
 /// Parse the return type of a method descriptor.
-pub fn descriptor_return(desc: &str) -> ReturnKind {
+///
+/// Audit fix (MED): malformed descriptors from loaded classes surface as
+/// [`ClassFileError::InvalidClassFile`] instead of panicking.
+pub fn descriptor_return(desc: &str) -> Result<ReturnKind, ClassFileError> {
     let bytes = desc.as_bytes();
     let close = bytes
         .iter()
         .position(|&b| b == b')')
-        .expect("descriptor must contain ')'");
+        .ok_or_else(|| ClassFileError::InvalidClassFile {
+            class_name: String::new(),
+            message: format!("method descriptor '{desc}' missing ')'"),
+        })?;
     let after = close + 1;
     if after >= bytes.len() {
-        return ReturnKind::Void;
+        return Ok(ReturnKind::Void);
     }
     if bytes[after] == b'V' {
-        return ReturnKind::Void;
+        return Ok(ReturnKind::Void);
     }
-    let (kind, _) = parse_one_field(desc, after);
-    match kind {
+    let (kind, _) = parse_one_field(desc, after)?;
+    Ok(match kind {
         DescKind::Reference(s) => ReturnKind::Reference(s),
         other => ReturnKind::Prim(other),
-    }
+    })
 }
 
 /// Parse a single field-type (JVMS §4.3.2) at `desc[i..]`. Returns
 /// `(kind, next_index)`.
-fn parse_one_field(desc: &str, i: usize) -> (DescKind, usize) {
+///
+/// Audit fix (MED): descriptors can originate from loaded — and therefore
+/// potentially malformed — classes. A bad descriptor byte or an `L`-type
+/// missing its `;` terminator must surface as a typed
+/// [`ClassFileError::InvalidClassFile`] rather than panicking the VM.
+fn parse_one_field(desc: &str, i: usize) -> Result<(DescKind, usize), ClassFileError> {
     let bytes = desc.as_bytes();
-    match bytes[i] {
-        b'B' | b'C' | b'I' | b'S' | b'Z' => (DescKind::Int, i + 1),
-        b'J' => (DescKind::Long, i + 1),
-        b'F' => (DescKind::Float, i + 1),
-        b'D' => (DescKind::Double, i + 1),
+    let byte = *bytes.get(i).ok_or_else(|| ClassFileError::InvalidClassFile {
+        class_name: String::new(),
+        message: format!("descriptor '{desc}' truncated at index {i}"),
+    })?;
+    match byte {
+        b'B' | b'C' | b'I' | b'S' | b'Z' => Ok((DescKind::Int, i + 1)),
+        b'J' => Ok((DescKind::Long, i + 1)),
+        b'F' => Ok((DescKind::Float, i + 1)),
+        b'D' => Ok((DescKind::Double, i + 1)),
         b'L' => {
-            let semi = i + 1
-                + desc[i + 1..]
-                    .find(';')
-                    .expect("L-type missing terminator ';'");
+            let rel = desc[i + 1..]
+                .find(';')
+                .ok_or_else(|| ClassFileError::InvalidClassFile {
+                    class_name: String::new(),
+                    message: format!("L-type missing terminator ';' in descriptor '{desc}'"),
+                })?;
+            let semi = i + 1 + rel;
             let raw = &desc[i..=semi];
-            (DescKind::Reference(raw.to_string()), semi + 1)
+            Ok((DescKind::Reference(raw.to_string()), semi + 1))
         }
         b'[' => {
-            let (inner, next) = parse_one_field(desc, i + 1);
+            let (inner, next) = parse_one_field(desc, i + 1)?;
             let _ = inner;
             let raw = &desc[i..next];
-            (DescKind::Reference(raw.to_string()), next)
+            Ok((DescKind::Reference(raw.to_string()), next))
         }
-        other => panic!("unsupported descriptor byte: 0x{other:02X} in '{desc}'"),
+        other => Err(ClassFileError::InvalidClassFile {
+            class_name: String::new(),
+            message: format!("unsupported descriptor byte: 0x{other:02X} in '{desc}'"),
+        }),
     }
 }
 
@@ -794,11 +826,11 @@ fn emit_proxy_method(
     dispatch_ref: u16,
     object_class_idx: u16,
     m_field_ref: u16,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ClassFileError> {
     let _ = m.is_default; // currently informational only; same body either way
 
-    let params = descriptor_param_slots(&m.descriptor);
-    let ret = descriptor_return(&m.descriptor);
+    let params = descriptor_param_slots(&m.descriptor)?;
+    let ret = descriptor_return(&m.descriptor)?;
 
     let mut code = CodeBuilder::new();
 
@@ -938,7 +970,7 @@ fn emit_proxy_method(
     // ACC_PUBLIC | ACC_FINAL (proxy methods are non-overridable).
     let access_flags: u16 = 0x0001 | 0x0010;
 
-    build_method_info(
+    Ok(build_method_info(
         access_flags,
         name_idx,
         desc_idx,
@@ -946,7 +978,7 @@ fn emit_proxy_method(
         max_stack,
         max_locals,
         code.bytes,
-    )
+    ))
 }
 
 /// Emit `<clinit>()V` populating each `m_<i>` static slot via
@@ -975,7 +1007,7 @@ fn emit_clinit(
     cp: &mut CpBuilder,
     code_attr_name_idx: u16,
     m_field_refs: &[u16],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ClassFileError> {
     // Up-front constants used across every method.
     let class_class_idx = cp.add_class("java/lang/Class");
     let get_method_ref = cp.add_methodref(
@@ -997,7 +1029,7 @@ fn emit_clinit(
 
         // 3) Build parameter Class[] (length = descriptor param count,
         //    NOT JVM slot count — long/double count once each).
-        let params = descriptor_param_slots(&m.descriptor);
+        let params = descriptor_param_slots(&m.descriptor)?;
         let param_count = params.len();
         code.emit_iconst(param_count as i32);
         code.emit_anewarray(class_class_idx);
@@ -1077,7 +1109,7 @@ fn emit_clinit(
     let desc_idx = cp.add_utf8("()V");
     let access_flags: u16 = 0x0008; // ACC_STATIC
 
-    build_method_info(
+    Ok(build_method_info(
         access_flags,
         name_idx,
         desc_idx,
@@ -1085,7 +1117,7 @@ fn emit_clinit(
         max_stack,
         max_locals,
         code.bytes,
-    )
+    ))
 }
 
 /// Find the actual descriptor byte for the parameter at logical index
@@ -1104,7 +1136,12 @@ fn descriptor_param_byte_at(desc: &str, j: usize) -> u8 {
     let mut k = 0usize;
     while i < end {
         let head = bytes[i];
-        let (_, next) = parse_one_field(desc, i);
+        // A malformed descriptor stops the walk; callers fall back to the
+        // `b'I'` default below. `parse_one_field` no longer panics.
+        let next = match parse_one_field(desc, i) {
+            Ok((_, next)) => next,
+            Err(_) => break,
+        };
         if k == j {
             // Walk past array dimensions for the reporting byte. For
             // primitives `head` already is the canonical letter; for
@@ -1160,7 +1197,13 @@ fn wrapper_for_int_letter(desc: &str, j: usize) -> &'static str {
     let mut i = start;
     let mut k = 0usize;
     while i < end {
-        let (kind, next) = parse_one_field(desc, i);
+        // A malformed descriptor stops the walk; the caller falls back to
+        // the `java/lang/Integer` default. `parse_one_field` no longer
+        // panics.
+        let (kind, next) = match parse_one_field(desc, i) {
+            Ok(parsed) => parsed,
+            Err(_) => break,
+        };
         if k == j {
             return match bytes[i] {
                 b'B' => "java/lang/Byte",
@@ -1242,7 +1285,7 @@ mod tests {
 
     #[test]
     fn emits_supplier_proxy_with_get_method() {
-        let bytes = emit_proxy_classfile(&supplier_spec());
+        let bytes = emit_proxy_classfile(&supplier_spec()).expect("emitter must succeed");
         let cf = read_class(&bytes).expect("emitted class file must round-trip through reader");
         assert_eq!(&*cf.this_class, "java/lang/reflect/$Proxy0");
         assert_eq!(
@@ -1292,7 +1335,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = emit_proxy_classfile(&spec);
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
         let cf = read_class(&bytes).expect("two-iface emitted class file must parse");
         assert!(cf
             .interfaces
@@ -1330,7 +1373,8 @@ mod tests {
 
     #[test]
     fn descriptor_param_parsing_handles_mixed() {
-        let p = descriptor_param_slots("(IJLjava/lang/String;[BD)V");
+        let p = descriptor_param_slots("(IJLjava/lang/String;[BD)V")
+            .expect("well-formed descriptor must parse");
         assert_eq!(p.len(), 5);
         assert_eq!(p[0], DescKind::Int);
         assert_eq!(p[1], DescKind::Long);
@@ -1341,12 +1385,25 @@ mod tests {
 
     #[test]
     fn descriptor_return_parsing_handles_void_and_ref() {
-        assert_eq!(descriptor_return("()V"), ReturnKind::Void);
-        assert_eq!(descriptor_return("()I"), ReturnKind::Prim(DescKind::Int));
+        assert_eq!(descriptor_return("()V").unwrap(), ReturnKind::Void);
+        assert_eq!(
+            descriptor_return("()I").unwrap(),
+            ReturnKind::Prim(DescKind::Int)
+        );
         assert!(matches!(
-            descriptor_return("()Ljava/lang/Object;"),
+            descriptor_return("()Ljava/lang/Object;").unwrap(),
             ReturnKind::Reference(ref s) if s == "Ljava/lang/Object;"
         ));
+    }
+
+    #[test]
+    fn malformed_descriptor_yields_error_not_panic() {
+        // Audit fix (MED): unknown descriptor byte and an unterminated
+        // L-type must surface as a typed error, never panic.
+        assert!(descriptor_param_slots("(Q)V").is_err());
+        assert!(descriptor_param_slots("(Ljava/lang/String)V").is_err());
+        assert!(descriptor_return("()Q").is_err());
+        assert!(descriptor_return("()Ljava/lang/String").is_err());
     }
 
     #[test]
@@ -1364,7 +1421,7 @@ mod tests {
                 exception_types: vec![],
             }],
         };
-        let bytes = emit_proxy_classfile(&spec);
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
         let cf = read_class(&bytes).expect("int-return emitted class file must parse");
         let m = cf
             .methods
@@ -1391,7 +1448,7 @@ mod tests {
                 exception_types: vec![],
             }],
         };
-        let bytes = emit_proxy_classfile(&spec);
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
         let cf = read_class(&bytes).expect("void-return emitted class file must parse");
         assert!(cf
             .methods
@@ -1405,7 +1462,7 @@ mod tests {
     /// of type `Ljava/lang/reflect/Method;` per the v3 layout (item 3).
     #[test]
     fn emits_clinit_with_static_method_fields() {
-        let bytes = emit_proxy_classfile(&supplier_spec());
+        let bytes = emit_proxy_classfile(&supplier_spec()).expect("emitter must succeed");
         let cf = read_class(&bytes).expect("v3 supplier proxy must round-trip");
 
         // `<clinit>` exists and is static + void.
@@ -1510,7 +1567,7 @@ mod tests {
         ];
 
         for spec in &specs {
-            let bytes = emit_proxy_classfile(spec);
+            let bytes = emit_proxy_classfile(spec).expect("emitter must succeed");
             let cf = read_class(&bytes).expect("emitted class file must round-trip");
             for m in &cf.methods {
                 let code = m

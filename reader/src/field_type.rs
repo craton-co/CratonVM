@@ -38,8 +38,17 @@ impl FieldType {
         Ok(field_type)
     }
 
+    /// JVMS §4.3.2: an array type may have at most 255 dimensions. The cap
+    /// also bounds recursion in `parse_partial`, preventing a stack-overflow
+    /// DoS from an untrusted descriptor of nothing but `[` bytes.
+    const MAX_ARRAY_DIMENSIONS: usize = 255;
+
     /// Parse a field type descriptor, returning the parsed type and the remaining unparsed string.
     pub fn parse_partial(descriptor: &str) -> Result<(Self, &str), ClassReaderError> {
+        Self::parse_partial_depth(descriptor, 0)
+    }
+
+    fn parse_partial_depth(descriptor: &str, dimensions: usize) -> Result<(Self, &str), ClassReaderError> {
         let bytes = descriptor.as_bytes();
         if bytes.is_empty() {
             return Err(ClassReaderError::InvalidTypeDescriptor {
@@ -69,7 +78,13 @@ impl FieldType {
                 ))
             }
             b'[' => {
-                let (component_type, remaining) = Self::parse_partial(&descriptor[1..])?;
+                if dimensions >= Self::MAX_ARRAY_DIMENSIONS {
+                    return Err(ClassReaderError::InvalidTypeDescriptor {
+                        descriptor: descriptor.to_string(),
+                    });
+                }
+                let (component_type, remaining) =
+                    Self::parse_partial_depth(&descriptor[1..], dimensions + 1)?;
                 Ok((FieldType::Array(Box::new(component_type)), remaining))
             }
             _ => Err(ClassReaderError::InvalidTypeDescriptor {
