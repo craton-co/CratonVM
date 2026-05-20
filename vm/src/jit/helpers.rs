@@ -1043,6 +1043,22 @@ pub unsafe extern "C" fn jit_putfield_object(
     } else {
         Value::Object(Some(ObjectRef::from_raw(val as usize as *mut u8)))
     };
+    // Bounds check against the object's declared slot count. The
+    // interpreter's `GenHeap::set_field` silently drops a write whose
+    // index falls past the object's layout (synthetic/real-JDK layout
+    // drift); the JIT helper previously did a raw unchecked
+    // `obj + HEADER + index*SLOT` write, so an out-of-range `field_index`
+    // overflowed into the *neighbouring* heap object — silent corruption
+    // that surfaced as a delayed SIGSEGV far from the offending putfield
+    // (observed in Tomcat: JIT-compiled `Catalina.setParentClassLoader`).
+    // Match the interpreter: drop the write instead of corrupting the heap.
+    {
+        let heap = heap_from_vm(vm_ptr);
+        let num_slots = heap.num_fields(obj_ref);
+        if field_index < 0 || field_index as usize >= num_slots {
+            return;
+        }
+    }
     let ptr = obj_ref
         .as_ptr()
         .add(HEADER_SIZE + field_index as usize * SLOT_SIZE);

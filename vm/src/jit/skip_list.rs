@@ -324,6 +324,60 @@ fn should_skip_jit_internal(
     allow_packages: &[&str],
     skip_init_check: bool,
 ) -> Option<SkipReason> {
+    // Bisection hook (development only): `RUSTJVM_JIT_BISECT_SKIP` is a
+    // comma-separated list of `Class.method` entries (slash-separated
+    // class names, e.g. `java/util/Locale.hashCode`). Any listed method
+    // is forced to skip the JIT. Used to binary-search a miscompiling
+    // method without recompiling.
+    {
+        use std::sync::OnceLock;
+        static BISECT: OnceLock<Vec<(String, String)>> = OnceLock::new();
+        let list = BISECT.get_or_init(|| {
+            std::env::var("RUSTJVM_JIT_BISECT_SKIP")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|e| {
+                            let e = e.trim();
+                            e.rfind('.').map(|i| {
+                                (e[..i].to_string(), e[i + 1..].to_string())
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        if list
+            .iter()
+            .any(|(c, m)| c == class_name && m == method_name)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+    }
+
+    // Inverse bisection hook: `RUSTJVM_JIT_BISECT_ONLY` is a comma-
+    // separated list of class-name prefixes. When set, ANY method whose
+    // class does not start with one of the prefixes is forced to skip
+    // the JIT — i.e. only the listed packages stay JIT-eligible. Used to
+    // binary-search which package contains a miscompiling method.
+    {
+        use std::sync::OnceLock;
+        static ONLY: OnceLock<Option<Vec<String>>> = OnceLock::new();
+        let only = ONLY.get_or_init(|| {
+            std::env::var("RUSTJVM_JIT_BISECT_ONLY").ok().map(|s| {
+                s.split(',')
+                    .map(|e| e.trim().to_string())
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            })
+        });
+        if let Some(prefixes) = only {
+            if !prefixes.iter().any(|p| class_name.starts_with(p.as_str())) {
+                return Some(SkipReason::RustJvmTestFixture);
+            }
+        }
+    }
+
     // Targeted bans — these correspond to *reproducible* JIT crashes and
     // apply under both policies. Removed bans (JavaLangCore, TckClass,
     // FinalizerTest) are intentionally not checked here — see module docs.
