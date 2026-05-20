@@ -165,17 +165,16 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
         },
     };
 
-    // AUDIT 2026-05-16: an array-in / scalar-out signature is a
-    // reduction shape (sum, dot, max, count, …). The emitter's
-    // `scalar_return` lowering writes the value through `ret_ptr`
-    // from every CUDA thread, so each thread races to overwrite the
-    // single scalar with its per-element term — silently wrong
-    // results. Until a proper block-reduction lowering exists, refuse
-    // the shape and let the VM run the method on the CPU.
-    if return_kind.is_scalar() && param_kinds.iter().any(|k| k.is_array()) {
-        return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
-    }
-
+    // AUDIT 2026-05-20: walk the bytecode BEFORE the signature-shape
+    // checks (`ReductionNotImplemented` / `CountedLoopScalarReturn`).
+    // A method that uses a forbidden opcode — `invokestatic`,
+    // `instanceof`, `athrow`, … — must be rejected for THAT specific
+    // reason, not the coarse `ReductionNotImplemented` shape reason
+    // that also happens to match its `[I…)scalar` descriptor. Running
+    // the opcode scan first means `reject_invoke`, `reject_type_check`
+    // and friends get their precise reject reason; the shape checks
+    // below only ever fire on a method that is otherwise GPU-clean.
+    //
     // AUDIT 2026-05-17 (Fix 7): single bytecode pass that collects
     // both the reject reason (formerly `scan_bytecode`) and the
     // loop-trip heuristic (formerly `estimate_work`). Walking the
@@ -186,6 +185,21 @@ pub fn analyze(method: &ClassFileMethod) -> OffloadVerdict {
         Ok(w) => w,
         Err(reason) => return OffloadVerdict::Rejected(reason),
     };
+
+    // AUDIT 2026-05-16: an array-in / scalar-out signature is a
+    // reduction shape (sum, dot, max, count, …). The emitter's
+    // `scalar_return` lowering writes the value through `ret_ptr`
+    // from every CUDA thread, so each thread races to overwrite the
+    // single scalar with its per-element term — silently wrong
+    // results. Until a proper block-reduction lowering exists, refuse
+    // the shape and let the VM run the method on the CPU.
+    //
+    // This shape check runs AFTER the opcode scan above so a method
+    // that is rejected for a more specific opcode reason keeps that
+    // reason.
+    if return_kind.is_scalar() && param_kinds.iter().any(|k| k.is_array()) {
+        return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
+    }
 
     // AUDIT 2026-05-19: a method with a backward branch is a counted
     // loop; the counted-loop lowering runs one CUDA thread per
