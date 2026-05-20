@@ -31129,144 +31129,25 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
 // 1-field synthetic (daemon=0 Int)
 // =============================================================================
 
-// Cleaner synthetic layout (see docs/plans/new17-cleaner.md):
-//   field 0 : Object[]  — backing list pinning Cleanable entries alive
-//   field 1 : Int       — number of live cleanables
-//
-// Cleaner$Cleanable synthetic layout:
-//   field 0 : Object (Runnable) — the action to run on referent death
-//   field 1 : Int               — cleaned flag (0 = pending, 1 = done)
-//   field 2 : Int               — index of this cleanable in its owner's array
-const CLEANER_ARR: usize = 0;
-const CLEANER_LEN: usize = 1;
-const CLEANABLE_ACTION: usize = 0;
-const CLEANABLE_FLAG: usize = 1;
-const CLEANABLE_IDX: usize = 2;
-const CLEANER_INITIAL_CAP: i32 = 16;
-/// Cleaner ref-type discriminator expected by
-/// `NativeContext::discover_reference` / `vm_exec::discover_reference`.
-const REF_TYPE_CLEANER: u8 = 3;
+// P69-Cleaner-realfix: the synthetic `java.lang.ref.Cleaner` model
+// (backing-array layout + `alloc_cleaner`) has been removed.  Real-JDK
+// `Cleaner.create()` now runs unmodified once Thread `holder` is
+// populated — see `register_p69_cleaner` for the full rationale.
 
-fn alloc_cleaner(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", 2);
-    let arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
-        CLEANER_INITIAL_CAP as usize,
-    );
-    ctx.set_field(obj, CLEANER_ARR, Value::Object(Some(arr)));
-    ctx.set_field(obj, CLEANER_LEN, Value::Int(0));
-    obj
-}
-
-pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
-    let c = "java/lang/ref/Cleaner";
-    r.register(c, "create", "()Ljava/lang/ref/Cleaner;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(alloc_cleaner(ctx)))))
-    });
-    r.register(
-        c,
-        "create",
-        "(Ljava/util/concurrent/ThreadFactory;)Ljava/lang/ref/Cleaner;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_cleaner(ctx))))),
-    );
-    r.register(
-        c,
-        "register",
-        "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let referent = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => {
-                    // Null referent: return a dead cleanable so the caller's
-                    // control flow still works (JDK throws NPE here, but we
-                    // soft-fail to stay consistent with other synthetic paths).
-                    let cleanable = alloc_concurrent_synthetic(
-                        ctx, "java/lang/ref/Cleaner$Cleanable", 3,
-                    );
-                    ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(None));
-                    ctx.set_field(cleanable, CLEANABLE_FLAG, Value::Int(1));
-                    ctx.set_field(cleanable, CLEANABLE_IDX, Value::Int(-1));
-                    return Ok(Some(Value::Object(Some(cleanable))));
-                }
-            };
-            let action = match args.get(2) {
-                Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
-                _ => Value::Object(None),
-            };
-
-            // Allocate the cleanable synthetic.
-            let cleanable = alloc_concurrent_synthetic(
-                ctx, "java/lang/ref/Cleaner$Cleanable", 3,
-            );
-            ctx.set_field(cleanable, CLEANABLE_ACTION, action);
-            ctx.set_field(cleanable, CLEANABLE_FLAG, Value::Int(0));
-
-            // Append into the Cleaner's backing array, growing by doubling if full.
-            let mut arr = match ctx.get_field(this, CLEANER_ARR) {
-                Value::Object(Some(a)) => a,
-                _ => {
-                    let a = ctx.new_array(
-                        rustjvm_types::ArrayElementType::Reference,
-                        CLEANER_INITIAL_CAP as usize,
-                    );
-                    ctx.set_field(this, CLEANER_ARR, Value::Object(Some(a)));
-                    a
-                }
-            };
-            let mut len = ctx.get_field(this, CLEANER_LEN).as_int().unwrap_or(0);
-            let cap = ctx.array_length(arr) as i32;
-            if len >= cap {
-                let new_cap = (cap.max(1) * 2) as usize;
-                let new_arr = ctx.new_array(
-                    rustjvm_types::ArrayElementType::Reference,
-                    new_cap,
-                );
-                for i in 0..cap as usize {
-                    let v = ctx.get_array_element(arr, i);
-                    ctx.set_array_element(new_arr, i, v);
-                }
-                ctx.set_field(this, CLEANER_ARR, Value::Object(Some(new_arr)));
-                arr = new_arr;
-            }
-            ctx.set_array_element(arr, len as usize, Value::Object(Some(cleanable)));
-            ctx.set_field(cleanable, CLEANABLE_IDX, Value::Int(len));
-            len += 1;
-            ctx.set_field(this, CLEANER_LEN, Value::Int(len));
-
-            // Register with the ref processor as a Cleaner phantom.
-            // The *cleanable* is the "reference object" — when the
-            // referent dies, the GC pushes the cleanable's address into
-            // `cleaner_actions`, which `run_cleaner_actions` drains.
-            ctx.discover_reference(REF_TYPE_CLEANER, cleanable, referent, None);
-
-            Ok(Some(Value::Object(Some(cleanable))))
-        },
-    );
-
-    // Cleanable.clean() — synchronous user-triggered cleanup.
-    // Guarded by the cleaned flag so GC-triggered + user-triggered are idempotent.
-    let cl = "java/lang/ref/Cleaner$Cleanable";
-    r.register(cl, "clean", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let already = matches!(ctx.get_field(this, CLEANABLE_FLAG), Value::Int(1));
-        if already {
-            return Ok(None);
-        }
-        ctx.set_field(this, CLEANABLE_FLAG, Value::Int(1));
-        let action = match ctx.get_field(this, CLEANABLE_ACTION) {
-            Value::Object(Some(o)) => o,
-            _ => return Ok(None),
-        };
-        // Clear the slot so the action can drop naturally on the next GC.
-        ctx.set_field(this, CLEANABLE_ACTION, Value::Object(None));
-        // Per Cleaner contract, exceptions thrown by run() are caught.
-        // NOTE: invoke_virtual adds the receiver itself — passing the receiver
-        // again in `args` makes the call 2-arg against a 1-arg Runnable.run()V
-        // and silently fails. Use an empty args slice.
-        let _ = ctx.invoke_virtual(action, "run", "()V", &[]);
-        Ok(None)
-    });
+pub(crate) fn register_p69_cleaner(_r: &mut NativeMethodRegistry) {
+    // P69-Cleaner-realfix: the synthetic `Cleaner.create`/`register`/
+    // `Cleaner$Cleanable.clean` overrides have been removed.  They existed
+    // only to dodge an `InnocuousThread.setPriority` NPE inside the real
+    // `Cleaner.create()` bytecode — that NPE was caused by VM-constructed
+    // Thread objects whose `holder:Thread$FieldHolder` field was left null
+    // (the `Thread.<init>` natives in `register_essential_natives` skipped
+    // it).  `populate_real_thread_holder` now builds a genuine
+    // `FieldHolder` for every real-JDK Thread, so the real
+    // `java.lang.ref.Cleaner` / `jdk.internal.ref.CleanerImpl` bytecode
+    // runs unmodified and yields a real `CleanerImpl` in `Cleaner.impl`.
+    // That in turn fixes `jdk.internal.ref.CleanerImpl.getCleanerImpl`
+    // (the `checkcast jdk/internal/ref/CleanerImpl` no longer throws),
+    // so `FileCleanable.register` and `PhantomCleanable.<init>` work.
 }
 
 // =============================================================================
