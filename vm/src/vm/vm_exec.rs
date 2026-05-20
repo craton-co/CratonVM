@@ -993,6 +993,175 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.heap.class_id_of(obj)
     }
 
+    /// Phase 5: override the GPU dispatch escape hatch. Delegates
+    /// to `crate::runtime::offload::dispatch_method_from_native`
+    /// when the gpu-offload feature is on; otherwise returns None
+    /// (the trait's default).
+    fn gpu_dispatch_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(crate::runtime::offload::dispatch_method_from_native(
+                self.shared,
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+            ))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (class_name, method_name, descriptor, java_args);
+            None
+        }
+    }
+
+    /// Phase 6 #4: query the real GPU submission registry.
+    fn gpu_future_status(&self, handle: u64) -> Option<i32> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            let status = sub.status.lock();
+            Some(match *status {
+                crate::runtime::offload::SubmissionStatus::Running => 0,
+                crate::runtime::offload::SubmissionStatus::Completed { .. } => 1,
+                crate::runtime::offload::SubmissionStatus::Failed { .. } => 2,
+            })
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 8 #1: evict the device-buffer cache entry for a
+    /// GpuArray handle. Called from `Native.releaseArray` when Java
+    /// drops the wrapper.
+    fn gpu_release_array_cache(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// Phase 9 #1: materialise dirty device-side bytes into a
+    /// host buffer. The caller (the `Native.arrayToHost` shim)
+    /// stamps the returned bytes into the resident store before
+    /// rebuilding the Java array. None means "no download
+    /// needed" — either the entry is unknown or already-clean.
+    fn gpu_array_download_if_dirty(&self, handle: u64) -> Option<Vec<u8>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::download_into_bytes_if_dirty(handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 6 #5 + Phase 9 #2 push 2: resolve a lambda proxy back to
+    /// its target method + captured values for GPU dispatch.
+    ///
+    /// Non-static targets (`InvokeVirtual` / `InvokeSpecial`) are
+    /// admitted when the captured-value list begins with a non-null
+    /// receiver — the receiver becomes `java_args[0]` to
+    /// [`dispatch_method_from_native`], which extracts the analyzer's
+    /// recorded `this_field_cps` from the receiver before processing
+    /// remaining captures as kernel args.
+    ///
+    /// Still rejected:
+    /// - `InvokeInterface` (no fixture today)
+    /// - `NewInvokeSpecial` (heap construction on the device — no GPU
+    ///   semantics)
+    /// - `GetField` / `PutField` / `GetStatic` / `PutStatic` method
+    ///   handles (no GPU semantics for arbitrary field access)
+    fn gpu_resolve_lambda_target(
+        &self,
+        callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::classloading::resolution::MethodHandleKind;
+            let cid = self.shared.heap.class_id_of(callable);
+            let proxies = self.shared.lambda_proxies.read();
+            let lcs = proxies.get(&cid)?;
+            // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
+            // InvokeSpecial. The analyzer's non-static relaxation
+            // means a virtual/special call's target can be admitted
+            // when its body uses the `aload_0; getfield <field>`
+            // shape; the marshaller extracts those fields from the
+            // receiver. Other handle kinds remain CPU-only.
+            let kind_admitted = matches!(
+                lcs.impl_handle.kind,
+                MethodHandleKind::InvokeStatic
+                    | MethodHandleKind::InvokeVirtual
+                    | MethodHandleKind::InvokeSpecial
+            );
+            if !kind_admitted {
+                tracing::debug!(
+                    target: "gpu.offload",
+                    handle_kind = ?lcs.impl_handle.kind,
+                    target_class = %lcs.impl_handle.class_name,
+                    target_member = %lcs.impl_handle.member_name,
+                    "lambda target rejected: handle kind has no GPU lowering",
+                );
+                return None;
+            }
+            // Merge bridge: `impl_handle` fields are `Arc<str>` in the
+            // current reader; the GPU lambda-resolver tuple is typed
+            // `String`. Convert explicitly.
+            let class_name = lcs.impl_handle.class_name.to_string();
+            let member_name = lcs.impl_handle.member_name.to_string();
+            let descriptor = lcs.impl_handle.descriptor.to_string();
+            let n_captures = lcs.capture_types.len();
+            drop(proxies);
+            let mut captures = Vec::with_capacity(n_captures);
+            for i in 0..n_captures {
+                captures.push(self.shared.heap.get_field(callable, i));
+            }
+            Some((class_name, member_name, descriptor, captures))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = callable;
+            None
+        }
+    }
+
+    /// Phase 6 #4 + Phase 7 #1: block on the GPU submission and
+    /// run its deferred writebacks. If the submission still carries
+    /// a FinalizeState (the kernel may still be running on the GPU),
+    /// this is the call that:
+    ///   1. waits on the recorded event,
+    ///   2. drains all the device-to-host writebacks,
+    ///   3. drops the SafepointToken (releases GC).
+    /// Idempotent — subsequent calls find FinalizeState already
+    /// taken and return the cached terminal status.
+    fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            Some(crate::runtime::offload::finalize_submission(self.shared, &sub))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         match self.shared.load_class_concurrent(class_name) {
             Ok(class_id) => self
@@ -7821,6 +7990,79 @@ fn invoke_on_class_shared_inner(
                                 | "getShowModules"
                                 | "getModuleGraphFilename"
                                 | "getClasspath"
+                            ))
+                        // SigProbe / WP6.4 / WP6.6: real-JDK
+                        // `java.security.KeyPairGenerator.getInstance(String)`
+                        // is a concrete static that routes through
+                        // `sun.security.jca.GetInstance.getService(...)` →
+                        // `Provider.Service.newInstance(...)` and ultimately
+                        // returns a `KeyPairGenerator$Delegate` whose
+                        // `generateKeyPair` delegates to a `KeyPairGeneratorSpi`
+                        // we don't wire up. The native registered in
+                        // `native-builtins/src/jca/key_factory.rs` allocates a
+                        // synthetic KPG carrying the algorithm index and key
+                        // size in slots 0/1, but the bytecode is non-abstract
+                        // so `check_override` stays false. Force the override
+                        // for `getInstance` / `initialize` / `generateKeyPair`
+                        // / `getAlgorithm` so our natives see the receiver
+                        // they populated.
+                        || (class_name == "java/security/KeyPairGenerator"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "initialize"
+                                | "generateKeyPair"
+                                | "genKeyPair"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: same rationale as KeyPairGenerator for
+                        // `java.security.Signature` (`getInstance` returns a
+                        // `Signature$Delegate` whose SPI we don't implement).
+                        // Natives in `native-builtins/src/jca/signature.rs`.
+                        || (class_name == "java/security/Signature"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "initSign"
+                                | "initVerify"
+                                | "update"
+                                | "sign"
+                                | "verify"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: `java.security.KeyFactory.getInstance` /
+                        // `generatePublic` / `generatePrivate` — natives in
+                        // `native-builtins/src/jca/key_factory.rs`.
+                        || (class_name == "java/security/KeyFactory"
+                            && matches!(
+                                method_name,
+                                "getInstance"
+                                | "generatePublic"
+                                | "generatePrivate"
+                                | "getAlgorithm"
+                            ))
+                        // SigProbe: `java.security.KeyPair` accessors are
+                        // backed by synthetic-slot natives in key_factory.rs;
+                        // the JDK bytecode reads private fields that our
+                        // allocation path never populates.
+                        || (class_name == "java/security/KeyPair"
+                            && matches!(method_name, "getPublic" | "getPrivate"))
+                        // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
+                        // string / DER round-trip. JDK 25 routes through
+                        // `sun.security.x509.X500Name` whose parser depends
+                        // on `sun.security.util.DerInputStream` natives we
+                        // don't implement. Natives in
+                        // `native-builtins/src/jca/x500.rs` re-implement the
+                        // RFC 4514 ↔ DER round-trip directly.
+                        || (class_name == "javax/security/auth/x500/X500Principal"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getEncoded"
+                                | "getName"
+                                | "toString"
+                                | "hashCode"
+                                | "equals"
                             ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;

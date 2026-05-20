@@ -36,7 +36,7 @@ experimental-t19-diag = []
 # GPU offload — Part C marshalling + (future Parts E/F) interpreter hook and
 # safepoint coordination. Off by default. With this feature off, the VM crate
 # compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
-gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "rustjvm-gc/gpu-offload"]
+gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "rustjvm-gc/gpu-offload", "rustjvm-native-builtins/gpu-offload", "dep:bytemuck"]
 
 [dependencies]
 rustjvm-reader = { path = "../reader" }
@@ -55,6 +55,7 @@ rustjvm-native-awt = { path = "../native-awt" }
 # table above. With `gpu-offload` off, these crates are not linked.
 cuda-bridge = { path = "../cuda-bridge", optional = true }
 jit-cuda = { path = "../jit-cuda", optional = true }
+bytemuck = { version = "1.16", optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 indexmap = "2"

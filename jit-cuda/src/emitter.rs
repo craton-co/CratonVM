@@ -163,12 +163,12 @@ mod tests {
     fn render_empty_module() {
         let m = PtxModule {
             sm_major: 7,
-            sm_minor: 0,
+            sm_minor: 5,
             kernels: vec![],
         };
         let s = m.render();
         assert!(s.contains(".version 7.5"));
-        assert!(s.contains(".target sm_70"));
+        assert!(s.contains(".target sm_75"));
     }
 
     #[test]

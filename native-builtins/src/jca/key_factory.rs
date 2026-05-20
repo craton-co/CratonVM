@@ -65,6 +65,48 @@ const KPG_FIELD_ALGO: usize = 0;
 const KPG_FIELD_KEYSIZE: usize = 1;
 const KPG_FIELD_STATE: usize = 2;
 
+// ---------------------------------------------------------------------------
+// SigProbe fix: process-wide side tables for KPG / KeyFactory algorithm +
+// key size.  Real-JDK class layouts make raw-slot writes of `Value::Int`
+// silently turn into `Value::Object(None)` (the inherited slot 0 is an
+// object reference, not an int), so the raw-slot path is unreliable across
+// the `getInstance` → `initialize` → `generateKeyPair` chain.  Side tables
+// keyed on the receiver `ObjectRef` survive layout changes — same proven
+// pattern as `message_digest::accumulators`.
+// ---------------------------------------------------------------------------
+
+fn kpg_algo_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn kpg_keysize_table()
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn set_kpg_algo(this: ObjectRef, idx: i32) {
+    kpg_algo_table().lock().insert(this, idx);
+}
+
+fn get_kpg_algo(this: ObjectRef) -> Option<i32> {
+    kpg_algo_table().lock().get(&this).copied()
+}
+
+fn set_kpg_keysize(this: ObjectRef, bits: i32) {
+    kpg_keysize_table().lock().insert(this, bits);
+}
+
+fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
+    kpg_keysize_table().lock().get(&this).copied()
+}
+
 const KEY_FIELD_ALGO: usize = 0;
 const KEY_FIELD_BITS: usize = 1;
 const KEY_FIELD_ENCLEN: usize = 2;
@@ -193,8 +235,25 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
     let kpg = alloc_concurrent_synthetic(ctx, "java/security/KeyPairGenerator", 3);
-    ctx.set_field(kpg, KPG_FIELD_ALGO, Value::Int(idx));
+    // SigProbe fix: the JDK 25 `KeyPairGenerator` class declares
+    // `String algorithm` at the inherited `KeyPairGeneratorSpi` layout
+    // boundary, so raw slot 0 in real-JDK mode is an Object slot — writing
+    // `Value::Int(idx)` there is silently coerced to `Object(None)` and
+    // `generateKeyPair` later sees "no algorithm set". Use the process-wide
+    // side table (keyed on the receiver ObjectRef) to carry the algorithm
+    // index reliably across the call chain, mirroring the proven pattern
+    // in `message_digest::accumulators`.
+    set_kpg_algo(kpg, idx);
     let default_bits = if idx == ALGO_RSA { 2048 } else if idx == ALGO_EC { 256 } else { 0 };
+    set_kpg_keysize(kpg, default_bits);
+    // Also write the algorithm string to the real-JDK named field so the
+    // bytecode-side `getAlgorithm()` (if ever reached on this receiver)
+    // sees the expected value.
+    let algo_str = ctx.create_string(&alg);
+    ctx.set_field_by_name(kpg, "algorithm", Value::Object(Some(algo_str)));
+    // Synthetic-mode slot path: harmless even when slot 0 is an Object slot;
+    // the real read path is the side table above.
+    ctx.set_field(kpg, KPG_FIELD_ALGO, Value::Int(idx));
     ctx.set_field(kpg, KPG_FIELD_KEYSIZE, Value::Int(default_bits));
     ctx.set_field(kpg, KPG_FIELD_STATE, Value::Int(0));
     Ok(Some(Value::Object(Some(kpg))))
@@ -206,6 +265,7 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(n)) => *n,
         _ => 2048,
     };
+    set_kpg_keysize(this, bits);
     ctx.set_field(this, KPG_FIELD_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, KPG_FIELD_STATE, Value::Int(1));
     Ok(None)
@@ -220,15 +280,16 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // P-256, so any spec sets bits=256.  RSA spec keysize is at slot 0,
     // but we just leave whatever was previously set / the default.
     let this = this_arg(args)?;
-    let cur = match ctx.get_field(this, KPG_FIELD_KEYSIZE) {
+    let cur = get_kpg_keysize(this).unwrap_or_else(|| match ctx.get_field(this, KPG_FIELD_KEYSIZE) {
         Value::Int(n) => n,
         _ => 0,
-    };
-    let algo = match ctx.get_field(this, KPG_FIELD_ALGO) {
+    });
+    let algo = get_kpg_algo(this).unwrap_or_else(|| match ctx.get_field(this, KPG_FIELD_ALGO) {
         Value::Int(i) => i,
         _ => -1,
-    };
+    });
     let bits = if algo == ALGO_EC { 256 } else if cur == 0 { 2048 } else { cur };
+    set_kpg_keysize(this, bits);
     ctx.set_field(this, KPG_FIELD_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, KPG_FIELD_STATE, Value::Int(1));
     Ok(None)
@@ -240,17 +301,27 @@ fn kpg_initialize_spec_random(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let algo = match ctx.get_field(this, KPG_FIELD_ALGO) {
-        Value::Int(i) => i,
-        _ => return Err(RuntimeError::NotImplemented {
+    // SigProbe fix: prefer the side-table read (survives real-JDK class
+    // layouts where slot 0 collides with an inherited Object field).
+    let algo = get_kpg_algo(this).or_else(|| match ctx.get_field(this, KPG_FIELD_ALGO) {
+        Value::Int(i) => Some(i),
+        _ => None,
+    });
+    let algo = match algo {
+        Some(i) => i,
+        None => return Err(RuntimeError::NotImplemented {
             feature: "KeyPairGenerator with no algorithm".into(),
         }
         .into()),
     };
-    let bits = match ctx.get_field(this, KPG_FIELD_KEYSIZE) {
-        Value::Int(n) if n > 0 => n as usize,
-        _ => 2048,
-    };
+    let bits = get_kpg_keysize(this)
+        .filter(|n| *n > 0)
+        .or_else(|| match ctx.get_field(this, KPG_FIELD_KEYSIZE) {
+            Value::Int(n) if n > 0 => Some(n),
+            _ => None,
+        })
+        .map(|n| n as usize)
+        .unwrap_or(2048);
 
     if algo == ALGO_RSA {
         let (pk, sk) = crypto_impl::Rsa::generate_keypair(bits);

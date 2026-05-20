@@ -1,0 +1,224 @@
+//! Build script for craton-gpu.
+//!
+//! Compiles the Java annotation source files under `src/main/java/`
+//! using `javac` (if available) and packages them into a jar via
+//! `jar` (if available). The resulting paths are surfaced to the
+//! Rust crate via two `cargo:rustc-env=` variables:
+//!
+//! * `CRATON_GPU_ANNOTATIONS_JAR` — absolute path to the produced
+//!   jar, or empty string when the jar could not be produced.
+//! * `CRATON_GPU_ANNOTATIONS_DIR` — absolute path to a directory
+//!   that either contains the compiled `.class` files or is empty
+//!   (the directory is always created so `env!()` in lib.rs has a
+//!   valid value).
+//!
+//! The same two paths are *also* emitted as cargo build-script
+//! metadata via the `links = "craton-gpu-annotations"` declaration
+//! in `Cargo.toml`:
+//!
+//! * `cargo:annotations_dir=...`
+//! * `cargo:annotations_jar=...`
+//!
+//! Cargo exposes these to dependents' build scripts as env vars
+//! `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_DIR` /
+//! `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_JAR`. The `rustc-env` form
+//! alone is not enough — cargo intentionally does NOT propagate
+//! `rustc-env=` vars to dependents' build scripts.
+//!
+//! The build script is intentionally resilient: a missing `javac`,
+//! a missing `jar`, or a complete absence of `.java` sources only
+//! produces a `cargo:warning=`. It never fails the build.
+
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn main() {
+    // Java sources moved to a standalone Maven project at
+    // C:/craton/craton-gpu-java/ — see that repo's README.md.
+    // Locate them via, in priority order:
+    //   1. $CRATON_GPU_JAVA_SRC env var (full absolute path to a
+    //      directory containing `craton/gpu/*.java`),
+    //   2. ../craton-gpu-java/src/main/java (works from main repo),
+    //   3. C:/craton/craton-gpu-java/src/main/java (default install).
+    // If none exists, the build script emits empty paths and a warning
+    // — same fallback behaviour as before the move.
+    println!("cargo:rerun-if-env-changed=CRATON_GPU_JAVA_SRC");
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let out_dir = PathBuf::from(
+        std::env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"),
+    );
+    let classes_dir = out_dir.join("classes");
+    let jar_path = out_dir.join("craton-gpu-annotations.jar");
+
+    // Always (re)create the classes dir so the env! in lib.rs has a
+    // valid path even when nothing got compiled.
+    if let Err(e) = fs::create_dir_all(&classes_dir) {
+        println!(
+            "cargo:warning=craton-gpu: failed to create {}: {}",
+            classes_dir.display(),
+            e
+        );
+    }
+
+    let java_root = resolve_java_root();
+    // Tell cargo to rerun when the chosen source tree changes.
+    println!("cargo:rerun-if-changed={}", java_root.display());
+
+    // Helper: emit ALL four lines (two rustc-env, two cargo metadata)
+    // and return. The rustc-env lines feed `env!()` in this crate's
+    // own `src/lib.rs`; the `cargo:annotations_*` lines feed
+    // `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*` in dependents'
+    // build.rs (via the `links` key in Cargo.toml).
+    let emit_env = |jar: &str, dir: &Path| {
+        println!("cargo:rustc-env=CRATON_GPU_ANNOTATIONS_JAR={}", jar);
+        println!(
+            "cargo:rustc-env=CRATON_GPU_ANNOTATIONS_DIR={}",
+            dir.display()
+        );
+        // Build-script metadata for dependents (see Cargo.toml `links`).
+        // Empty strings are fine — dependents must tolerate them.
+        println!("cargo:annotations_jar={}", jar);
+        println!("cargo:annotations_dir={}", dir.display());
+    };
+
+    // 1. Is javac on PATH?
+    if !javac_available() {
+        println!(
+            "cargo:warning=javac not found; craton-gpu annotations will not be compiled"
+        );
+        emit_env("", &classes_dir);
+        return;
+    }
+
+    // 2. Collect .java sources.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if java_root.is_dir() {
+        if let Err(e) = collect_java(&java_root, &mut sources) {
+            println!(
+                "cargo:warning=craton-gpu: walking {} failed: {}",
+                java_root.display(),
+                e
+            );
+        }
+    }
+
+    if sources.is_empty() {
+        println!(
+            "cargo:warning=javac not found; craton-gpu annotations will not be compiled"
+        );
+        emit_env("", &classes_dir);
+        return;
+    }
+
+    // 3. Compile with javac.
+    let mut javac = Command::new("javac");
+    javac.arg("-d").arg(&classes_dir);
+    for src in &sources {
+        javac.arg(src);
+    }
+    let javac_status = javac.status();
+    match javac_status {
+        Ok(status) if status.success() => { /* fall through to jar */ }
+        Ok(status) => {
+            println!(
+                "cargo:warning=craton-gpu: javac exited with {}; annotations not packaged",
+                status
+            );
+            emit_env("", &classes_dir);
+            return;
+        }
+        Err(e) => {
+            println!("cargo:warning=craton-gpu: failed to invoke javac: {}", e);
+            emit_env("", &classes_dir);
+            return;
+        }
+    }
+
+    // 4. Package with jar (optional).
+    let jar_str = match build_jar(&classes_dir, &jar_path) {
+        Ok(()) => jar_path.display().to_string(),
+        Err(e) => {
+            println!(
+                "cargo:warning=craton-gpu: jar packaging skipped: {} (classes dir is the fallback)",
+                e
+            );
+            String::new()
+        }
+    };
+
+    emit_env(&jar_str, &classes_dir);
+}
+
+/// Resolve the Java source root, in priority order:
+/// 1. `$CRATON_GPU_JAVA_SRC` (treated as an absolute path to a
+///    directory containing `craton/gpu/*.java`).
+/// 2. `../craton-gpu-java/src/main/java` (sibling of CratonVM repo).
+/// 3. `C:/craton/craton-gpu-java/src/main/java` (default install).
+///
+/// Returns the first path that exists; if none exists, returns the
+/// final default — the caller (`main`) will discover the absence and
+/// emit a `cargo:warning=` instead of failing the build.
+fn resolve_java_root() -> PathBuf {
+    if let Some(v) = std::env::var_os("CRATON_GPU_JAVA_SRC") {
+        let p = PathBuf::from(v);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    let candidates: [PathBuf; 2] = [
+        PathBuf::from("../craton-gpu-java/src/main/java"),
+        PathBuf::from("C:/craton/craton-gpu-java/src/main/java"),
+    ];
+    for c in &candidates {
+        if c.is_dir() {
+            return c.clone();
+        }
+    }
+    candidates[1].clone()
+}
+
+/// Probe for `javac` on PATH by running `javac -version`. Both
+/// stdout and stderr are discarded; only the exit status matters.
+fn javac_available() -> bool {
+    let mut cmd = Command::new("javac");
+    cmd.arg("-version");
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    matches!(cmd.status(), Ok(s) if s.success())
+}
+
+/// Recursively collect `*.java` files under `root` into `out`.
+fn collect_java(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ftype = entry.file_type()?;
+        if ftype.is_dir() {
+            collect_java(&path, out)?;
+        } else if ftype.is_file() {
+            if path.extension().map(|e| e == "java").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Invoke `jar --create --file <jar> -C <classes_dir> .`.
+fn build_jar(classes_dir: &Path, jar_path: &Path) -> Result<(), String> {
+    let mut cmd = Command::new("jar");
+    cmd.arg("--create");
+    cmd.arg("--file");
+    cmd.arg(OsString::from(jar_path));
+    cmd.arg("-C");
+    cmd.arg(OsString::from(classes_dir));
+    cmd.arg(".");
+    match cmd.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("jar exited with {}", status)),
+        Err(e) => Err(format!("failed to invoke jar: {}", e)),
+    }
+}

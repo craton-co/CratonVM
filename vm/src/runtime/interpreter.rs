@@ -8404,11 +8404,44 @@ fn push_invoke_return_value(
 /// JNI-style handles sometimes surface as `Value::Long` on the operand stack.
 /// When popping `invoke*` arguments, coerce reference-typed parameters (and
 /// the receiver) so downstream bytecode and natives see `Value::Object`.
+///
+/// Phase 9 #1 follow-up — also coerce `J` / `D` primitives so a long that
+/// landed on the operand stack as an untagged 64-bit slot (e.g. via
+/// `CompactValue::long`, whose raw bits coincide with the NaN-tag-free
+/// region for any "normal" long value) is forwarded as `Value::Long`
+/// rather than `Value::Double`. The bug surfaced as
+/// `Native.futureSynchronize(1L)` arriving in the shim as
+/// `Double(5e-324)` (the f64 reinterpretation of bit pattern 0x1),
+/// which `arg_long` then quietly read as 0 — so `f.get()` queried a
+/// non-existent submission, never ran the kernel, and left output
+/// arrays at their pre-launch zero values.
 #[inline]
 fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
     let b = param_desc.as_bytes().first().copied().unwrap_or(b'L');
     match b {
         b'L' | b'[' => coerce_value_for_return(v, b),
+        b'J' => match v {
+            // Already a Long — fast path.
+            Value::Long(_) => v,
+            // Untagged-long-as-Double: reinterpret the bit pattern. This
+            // is the common case for "normal" longs (any value whose
+            // upper 16 bits aren't all 1s).
+            Value::Double(d) => Value::Long(d.to_bits() as i64),
+            // i2l widening for upstream bytecode that forgot the cast.
+            Value::Int(i) => Value::Long(i as i64),
+            // Null / Uninitialized → JVMS §2.3 default 0L.
+            Value::Object(None) | Value::Uninitialized => Value::Long(0),
+            _ => v,
+        },
+        b'D' => match v {
+            Value::Double(_) => v,
+            // A long that hit `Self::Long(x)` via descriptor-aware decode
+            // path elsewhere would have raw bits — reinterpret.
+            Value::Long(x) => Value::Double(f64::from_bits(x as u64)),
+            Value::Int(i) => Value::Double(i as f64),
+            Value::Object(None) | Value::Uninitialized => Value::Double(0.0),
+            _ => v,
+        },
         _ => v,
     }
 }
@@ -10644,6 +10677,43 @@ fn execute_invokestatic(
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
+    }
+
+    // GPU offload hook (Part E). Behind `gpu-offload`: with the
+    // feature off, the entire block is removed by the preprocessor
+    // and `execute_invokestatic` falls through to the existing CPU
+    // path unchanged. On Hit we consult the OffloadCache; the actual
+    // marshal-and-launch glue is deliberately scoped to a separate
+    // follow-up because it needs real GPU hardware to validate — see
+    // `crate::runtime::offload::try_dispatch` for the contract.
+    #[cfg(feature = "gpu-offload")]
+    {
+        if shared.config.gpu_offload_enabled
+            && shared
+                .offload_registry
+                .get_or_create(shared.config.gpu_device_ordinal, &shared.config)
+                .has_device()
+        {
+            match crate::runtime::offload::try_dispatch(
+                shared,
+                thread,
+                frame_idx,
+                &method_class_name,
+                &method_name,
+                &method_descriptor,
+                &args,
+            )? {
+                crate::runtime::offload::DispatchOutcome::Handled => {
+                    populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
+                    return Ok(CachedCallResult::Handled);
+                }
+                crate::runtime::offload::DispatchOutcome::FallThrough => {
+                    // Method is ineligible / blacklisted / launch
+                    // deopted. Run the CPU path below; the operand
+                    // stack and locals are untouched.
+                }
+            }
+        }
     }
 
     // Try stackless frame push for bytecode methods

@@ -228,15 +228,19 @@ pub struct SharedVm {
     /// VM configuration (immutable after construction).
     pub config: VmConfig,
 
-    /// GPU offload cache (Part E). Holds the CUDA `DeviceContext` and
-    /// per-method compiled-kernel cache. Cheap when offload is off:
-    /// constructed with `ctx = None` and every lookup short-circuits
-    /// to `LookupOutcome::Skip`.
+    /// GPU offload cache registry (Part E, Phase 3). Owns one
+    /// [`OffloadCache`](crate::runtime::offload::OffloadCache) per
+    /// CUDA device ordinal — each cache holds its own
+    /// `DeviceContext` and per-method compiled-kernel map. Cheap when
+    /// offload is off: no `OffloadCache` is constructed until the
+    /// first `get_or_create` call, and absent that call the registry
+    /// is just an empty `FxHashMap`.
     ///
     /// Behind the `gpu-offload` Cargo feature — the field does not
     /// exist on the CPU-only build.
     #[cfg(feature = "gpu-offload")]
-    pub offload_cache: std::sync::Arc<crate::runtime::offload::OffloadCache>,
+    pub offload_registry:
+        std::sync::Arc<crate::runtime::offload::OffloadCacheRegistry>,
 
     /// Class loader and cache, protected by an RwLock.
     pub class_manager: RwLock<ClassManager>,
@@ -1858,18 +1862,19 @@ impl SharedVm {
             }
         }
 
-        // Build the GPU offload cache from the config *before* moving
-        // `config` into the struct literal. With the feature off, this
-        // block does not exist.
+        // Build the GPU offload cache registry. With the feature off,
+        // this block does not exist. The registry itself is empty until
+        // the first `get_or_create` call constructs a per-device
+        // `OffloadCache`, so this is effectively free at startup.
         #[cfg(feature = "gpu-offload")]
-        let offload_cache = std::sync::Arc::new(
-            crate::runtime::offload::OffloadCache::new(&config),
+        let offload_registry = std::sync::Arc::new(
+            crate::runtime::offload::OffloadCacheRegistry::new(),
         );
 
         let vm = Self {
             config,
             #[cfg(feature = "gpu-offload")]
-            offload_cache,
+            offload_registry,
             class_manager: RwLock::new(class_manager),
             heap,
             native_methods,
@@ -2791,6 +2796,26 @@ impl SharedVm {
             let _evicted_by_cha = self.invalidate_jit_for_class(name);
             if let Some(sup) = superclass {
                 let _evicted_sup = self.invalidate_jit_for_class(&sup);
+            }
+
+            // Phase 1 — Item 6: `@EnableGpuAsync(warmup = N)` class-load
+            // warmup. If the class is annotated, eagerly pre-compile up
+            // to `N` `@GpuKernel`-annotated methods so the first call
+            // does not pay the analyzer + PTX lowering cost. Cheap when
+            // offload is off — `maybe_warmup_gpu` short-circuits on the
+            // `gpu_offload_enabled` flag.
+            //
+            // The class manager read-lock is held for the duration of
+            // the warmup; the inner `lookup_or_compile` only touches
+            // the `OffloadCache`'s own locks (`kernels`, `blacklist`)
+            // so there is no re-entrancy risk against the manager.
+            #[cfg(feature = "gpu-offload")]
+            {
+                let class_id = *class_id;
+                let cm = self.class_manager.read();
+                if let Some(class) = cm.get_class(class_id) {
+                    crate::runtime::offload::maybe_warmup_gpu(self, class, class_id);
+                }
             }
         }
 

@@ -154,7 +154,9 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
     // Try to construct a REAL StandardEnvironment first. Its <init> calls
     // customizePropertySources which uses System.getProperties()/getenv() — both
     // of which CratonVM supports. If this succeeds we get a fully functional
-    // environment with proper MutablePropertySources backing.
+    // environment with proper MutablePropertySources backing: the canonical
+    // `systemProperties` and `systemEnvironment` PropertySources are added by
+    // `StandardEnvironment.customizePropertySources` invoked from AbstractEnvironment.<init>.
     let real_env = (|| -> Option<ObjectRef> {
         let env = match ctx.new_object(env_class) {
             Ok(Some(Value::Object(Some(o)))) => o,
@@ -170,13 +172,16 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
     } else {
         // Fallback: synthetic allocation + inject a real MutablePropertySources
         // into its `propertySources` field so MPS.get() / addFirst() work.
+        // NOTE: this fallback path leaves systemEnvironment/systemProperties
+        // EMPTY — Spring Boot's SystemEnvironmentPropertySourceEnvironmentPostProcessor
+        // will then trip "PropertySource named 'systemEnvironment' does not exist".
+        // The real-env path above is strongly preferred.
         let env = crate::alloc_concurrent_synthetic(ctx, env_class, 32);
 
         // Try to create a real MutablePropertySources (its <init> just creates
         // a CopyOnWriteArrayList — should always succeed).
         if let Ok(Some(Value::Object(Some(mps)))) = ctx.new_object(mps_class) {
             let _ = ctx.invoke(mps_class, "<init>", "()V", &[Value::Object(Some(mps))]);
-            // Store it in both possible field names used by Spring versions.
             ctx.set_field_by_name(env, "propertySources", Value::Object(Some(mps)));
         }
 
@@ -193,6 +198,253 @@ fn get_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 
 fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MutablePropertySources native re-implementations.
+//
+// Spring's `MutablePropertySources.replace/addBefore/addAfter(name, source)`
+// dispatch through `assertPresentAndGetIndex(name)`, which calls
+// `propertySourceList.indexOf(PropertySource.named(name))`.  That `indexOf`
+// requires the placeholder PropertySource (named-only) and the real
+// `SystemEnvironmentPropertySource` entry stored in the COWAL to compare equal
+// via `PropertySource.equals(Object)` (compares names).
+//
+// In CratonVM's partial bootstrap, `List.indexOf` + virtual dispatch on
+// `PropertySource.equals` does not match — likely because the bytecode-side
+// equality runs against placeholder/element pairs whose runtime classes have
+// not had `equals` linked to the override on `PropertySource`.  The list IS
+// populated (we can see `systemProperties` / `systemEnvironment` entries via
+// `get(name)` which iterates by name), but `assertPresentAndGetIndex` still
+// fails, producing `IllegalArgumentException: PropertySource named
+// 'systemEnvironment' does not exist`.
+//
+// Fix: re-implement `replace`, `addBefore`, `addAfter` natively — iterate the
+// COWAL's `array` by name (the same logic Spring's `get(name)` uses, which
+// works), then replace / insert at the appropriate index via a copy-on-write
+// new array. This sidesteps the broken `indexOf(PropertySource.named(name))`
+// path entirely.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn mps_replace_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let name = args.get(1).and_then(|v| {
+        if let Value::Object(Some(s)) = v {
+            ctx.read_string(*s)
+        } else { None }
+    }).unwrap_or_default();
+    let source = args.get(2).copied().unwrap_or(Value::Object(None));
+    mps_replace_impl(ctx, this, &name, source)
+}
+
+fn mps_add_before_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let name = args.get(1).and_then(|v| {
+        if let Value::Object(Some(s)) = v {
+            ctx.read_string(*s)
+        } else { None }
+    }).unwrap_or_default();
+    let source = args.get(2).copied().unwrap_or(Value::Object(None));
+    mps_add_at_offset_impl(ctx, this, &name, source, 0)
+}
+
+fn mps_add_after_traced(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let name = args.get(1).and_then(|v| {
+        if let Value::Object(Some(s)) = v {
+            ctx.read_string(*s)
+        } else { None }
+    }).unwrap_or_default();
+    let source = args.get(2).copied().unwrap_or(Value::Object(None));
+    mps_add_at_offset_impl(ctx, this, &name, source, 1)
+}
+
+/// Find the index of a property source by name in the MPS's COWAL.
+/// Returns (propertySourceList, array, idx-or-neg1-if-not-found, len).
+fn mps_find_index_by_name(
+    ctx: &mut dyn NativeContext,
+    mps: ObjectRef,
+    name: &str,
+) -> Option<(ObjectRef, ObjectRef, i32, usize)> {
+    let psl = match ctx.get_field_by_name(mps, "propertySourceList") {
+        Value::Object(Some(l)) => l,
+        _ => return None,
+    };
+    let arr = match ctx.get_field_by_name(psl, "array") {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        let elem = ctx.get_array_element(arr, i);
+        if let Value::Object(Some(e)) = elem {
+            let n = ctx.get_field_by_name(e, "name");
+            if let Value::Object(Some(s)) = n {
+                if ctx.read_string(s).as_deref() == Some(name) {
+                    return Some((psl, arr, i as i32, len));
+                }
+            }
+        }
+    }
+    Some((psl, arr, -1, len))
+}
+
+fn throw_iae_not_exist(ctx: &mut dyn NativeContext, name: &str) -> MethodCallResult {
+    let msg = format!("PropertySource named '{}' does not exist", name);
+    let exc = ctx
+        .new_object("java/lang/IllegalArgumentException")
+        .ok()
+        .flatten();
+    if let Some(Value::Object(Some(e))) = exc {
+        let m = ctx.create_string(&msg);
+        let _ = ctx.invoke(
+            "java/lang/IllegalArgumentException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(e)), Value::Object(Some(m))],
+        );
+        return Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(e));
+    }
+    Err(rustjvm_types::error::MethodCallFailed::InternalError(
+        rustjvm_types::error::VmError::Runtime(
+            rustjvm_types::error::RuntimeError::NullPointerException {
+                message: Some(msg),
+            },
+        ),
+    ))
+}
+
+fn mps_replace_impl(
+    ctx: &mut dyn NativeContext,
+    mps: ObjectRef,
+    name: &str,
+    source: Value,
+) -> MethodCallResult {
+    let (psl, arr, idx, _len) = match mps_find_index_by_name(ctx, mps, name) {
+        Some(t) => t,
+        None => return throw_iae_not_exist(ctx, name),
+    };
+    if idx < 0 {
+        return throw_iae_not_exist(ctx, name);
+    }
+    // Build a new array with the replaced element; COWAL is copy-on-write.
+    let len = ctx.array_length(arr);
+    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(rustjvm_types::ClassId::new(0));
+    let new_arr = ctx.new_ref_array(cid, len);
+    let idx_u = idx as usize;
+    for i in 0..len {
+        if i == idx_u {
+            ctx.set_array_element(new_arr, i, source);
+        } else {
+            let v = ctx.get_array_element(arr, i);
+            ctx.set_array_element(new_arr, i, v);
+        }
+    }
+    ctx.set_field_by_name(psl, "array", Value::Object(Some(new_arr)));
+    Ok(None)
+}
+
+fn mps_add_at_offset_impl(
+    ctx: &mut dyn NativeContext,
+    mps: ObjectRef,
+    name: &str,
+    source: Value,
+    offset: i32,
+) -> MethodCallResult {
+    // First, remove `source` if it's already present (assertLegalRelativeAddition
+    // would have already ensured the relative name != new name).
+    let new_src_name = if let Value::Object(Some(s)) = source {
+        let n = ctx.get_field_by_name(s, "name");
+        if let Value::Object(Some(ns)) = n {
+            ctx.read_string(ns)
+        } else { None }
+    } else { None };
+
+    let (psl, arr, target_idx, _len) = match mps_find_index_by_name(ctx, mps, name) {
+        Some(t) => t,
+        None => return throw_iae_not_exist(ctx, name),
+    };
+    if target_idx < 0 {
+        return throw_iae_not_exist(ctx, name);
+    }
+
+    // Build list of items minus the source (by identity OR by same name), then insert.
+    let len = ctx.array_length(arr);
+    let mut items: Vec<Value> = Vec::with_capacity(len + 1);
+    let mut adjusted_target = target_idx;
+    for i in 0..len {
+        let v = ctx.get_array_element(arr, i);
+        // Skip if same name as source (Spring's removeIfPresent removes by name-equality).
+        if let (Value::Object(Some(e)), Some(ref src_name)) = (v, &new_src_name) {
+            let n = ctx.get_field_by_name(e, "name");
+            if let Value::Object(Some(ns)) = n {
+                if ctx.read_string(ns).as_deref() == Some(src_name.as_str()) {
+                    if (i as i32) < target_idx {
+                        adjusted_target -= 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        items.push(v);
+    }
+    let insert_at = (adjusted_target + offset) as usize;
+    if insert_at <= items.len() {
+        items.insert(insert_at, source);
+    } else {
+        items.push(source);
+    }
+
+    let cid = ctx.class_id_by_name("java/lang/Object").unwrap_or(rustjvm_types::ClassId::new(0));
+    let new_arr = ctx.new_ref_array(cid, items.len());
+    for (i, v) in items.iter().enumerate() {
+        ctx.set_array_element(new_arr, i, *v);
+    }
+    ctx.set_field_by_name(psl, "array", Value::Object(Some(new_arr)));
+    Ok(None)
+}
+
+// `SpringApplication.getOrCreateEnvironment()` is normally where Spring Boot
+// builds its own `StandardServletEnvironment` / `StandardReactiveWebEnvironment`
+// via the application-context factory. In CratonVM's partial bootstrap, that
+// path can leave the resulting `MutablePropertySources` in a state where the
+// `systemEnvironment` source is present in iteration but invisible to
+// `assertPresentAndGetIndex`, which then trips
+// `IllegalArgumentException: PropertySource named 'systemEnvironment' does not exist`
+// inside `SystemEnvironmentPropertySourceEnvironmentPostProcessor`.
+//
+// Override `SpringApplication.getOrCreateEnvironment` to return the same shim
+// env used by `AbstractApplicationContext.getEnvironment()` — that env is
+// constructed via the real `StandardEnvironment.<init>()`, whose
+// `customizePropertySources` adds the canonical `systemProperties` /
+// `systemEnvironment` sources via the real bytecode path. Combined with the
+// native MPS.replace/addBefore/addAfter re-implementations above, the postprocessor
+// chain can locate and mutate those entries by name.
+//
+// Also stash the env on `SpringApplication.environment` so the field-read
+// fast path (`if (environment != null) return environment;`) finds it on
+// subsequent invocations.
+fn spring_app_get_or_create_environment(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let env = get_noop_environment(ctx);
+    // Cache on `this.environment` so future Spring code that reads the field
+    // directly (not via this method) sees the same env. Best-effort — if the
+    // field doesn't exist on this Spring version, the SET silently no-ops.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        ctx.set_field_by_name(*this, "environment", Value::Object(Some(env)));
+    }
+    Ok(Some(Value::Object(Some(env))))
 }
 
 // Environment.getProperty(String) → null (no properties in synthetic env, safe default)
@@ -829,6 +1081,40 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "createEnvironment",
         "()Lorg/springframework/core/env/ConfigurableEnvironment;",
         create_environment,
+    );
+
+    // DIAGNOSTIC: log MPS.replace/addBefore/addAfter so we can see which MPS
+    // is throwing IAE and what's actually inside it at the time of the call.
+    registry.register(
+        "org/springframework/core/env/MutablePropertySources",
+        "replace",
+        "(Ljava/lang/String;Lorg/springframework/core/env/PropertySource;)V",
+        mps_replace_traced,
+    );
+    registry.register(
+        "org/springframework/core/env/MutablePropertySources",
+        "addBefore",
+        "(Ljava/lang/String;Lorg/springframework/core/env/PropertySource;)V",
+        mps_add_before_traced,
+    );
+    registry.register(
+        "org/springframework/core/env/MutablePropertySources",
+        "addAfter",
+        "(Ljava/lang/String;Lorg/springframework/core/env/PropertySource;)V",
+        mps_add_after_traced,
+    );
+
+    // SpringApplication.getOrCreateEnvironment — return the same shim env that
+    // AbstractApplicationContext.getEnvironment() returns. Without this, Spring
+    // Boot's factory builds its own StandardServletEnvironment whose MPS lacks
+    // the `systemEnvironment` / `systemProperties` entries (CratonVM's partial
+    // bootstrap leaves it empty), and `SystemEnvironmentPropertySourceEnvironmentPostProcessor`
+    // then throws `IllegalArgumentException: PropertySource named 'systemEnvironment' does not exist`.
+    registry.register(
+        "org/springframework/boot/SpringApplication",
+        "getOrCreateEnvironment",
+        "()Lorg/springframework/core/env/ConfigurableEnvironment;",
+        spring_app_get_or_create_environment,
     );
 
     // Register property-access methods on StandardEnvironment, AbstractEnvironment,

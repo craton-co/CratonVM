@@ -12,13 +12,6 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
     Err(DeviceError::NoDriver)
 }
 
-/// No-driver counterpart to the cuda backend's `device_count`.
-/// Always reports zero devices so callers branching on the count
-/// don't need to special-case `NoDriver`.
-pub(crate) fn device_count() -> Result<u32> {
-    Ok(0)
-}
-
 #[derive(Clone)]
 pub(crate) struct DeviceContextInner;
 
@@ -52,31 +45,10 @@ impl DeviceModuleInner {
     ) -> Result<()> {
         Err(DeviceError::NoDriver)
     }
-
-    pub(crate) fn launch_raw_no_d2h_sync(
-        &self,
-        _ctx: &DeviceContextInner,
-        _kernel: &str,
-        _cfg: &LaunchConfig,
-        _args: KernelArgs,
-    ) -> Result<()> {
-        Err(DeviceError::NoDriver)
-    }
-
-    /// Stub-mode counterpart to the cuda backend's autotune helper.
-    /// Always returns `None` — `LaunchConfig::elementwise_for_kernel`
-    /// then falls back to the portable 256-thread default.
-    pub(crate) fn optimal_block_size(
-        &self,
-        _ctx: &DeviceContextInner,
-        _kernel: &str,
-    ) -> Option<u32> {
-        None
-    }
 }
 
 pub(crate) struct DeviceBufferInner<T> {
-    _phantom: PhantomData<T>,
+    pub(crate) _phantom: PhantomData<T>,
 }
 
 impl<T> DeviceBufferInner<T> {

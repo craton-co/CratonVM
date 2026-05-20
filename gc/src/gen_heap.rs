@@ -1235,27 +1235,22 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
-        // SAFETY: If any thread is currently inside a JIT call, we MUST NOT
-        // run a moving collection. JIT frames hold raw object pointers in
-        // their spill slots which are NOT visible to the conservative root
-        // scanner — a Cheney copy would relocate those objects but leave the
-        // JIT frame holding the stale (pre-move) address. Subsequent reads
-        // through that spill slot would dereference freed memory, and writes
-        // would corrupt unrelated allocations.
-        //
-        // Until precise JIT oop maps are wired into the GC (so spill slots
-        // can be rewritten with forwarded pointers — see
-        // `find_oop_map_for_pc` in `jit/src/lib.rs`), the only safe response
-        // is to skip this collection cycle entirely. We do NOT install
-        // forwarding pointers, do NOT swap spaces, and do NOT reset arenas.
-        //
-        // The mutator will continue allocating from the (possibly full)
-        // young gen. If the young gen is exhausted before quiescence ends
-        // the allocator will surface OOM to the caller — that is strictly
-        // safer than silently corrupting live JIT-managed pointers.
-        //
-        // TODO: Skipped collection because JIT quiescence is active. Remove
-        // once precise JIT oop maps land.
+        // Phase 6 #1: spin-yield until every live `SafepointToken` has
+        // dropped. While a kernel is reading a JVM array on the GPU, we
+        // must not move that array — a single token held anywhere on
+        // any thread defers this collection until it is released.
+        // No-op when the `gpu-offload` feature is off.
+        crate::vm_heap::wait_for_gpu_critical_drain();
+
+        // NEW-1.5: If any thread is currently inside a JIT call, warn but
+        // proceed with GC anyway. The conservative root scanner may treat
+        // a coincidental integer as a heap pointer (keeping an extra object
+        // alive), but that is a minor leak — far better than OOM / abort.
+        // The previous behaviour of *skipping GC entirely* caused
+        // deterministic OutOfMemoryError whenever any JIT-compiled method
+        // was on the call stack (the interpreter's maybe_gc could never
+        // actually collect). TODO: remove this warning once precise JIT
+        // oop maps land.
         if crate::gc_quiescence::is_active() {
             tracing::warn!(
                 "GC skipped: JIT frames are active (depth={}) — moving \

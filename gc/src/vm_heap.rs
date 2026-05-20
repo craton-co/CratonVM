@@ -23,6 +23,72 @@ pub enum GcBackend {
     G1,
 }
 
+// ─── GPU-offload coordination (Phase 6 item 1) ───────────────────────────
+//
+// Process-wide counter tracking the number of live SafepointTokens
+// (see `crate::safepoint`). While non-zero, every collect_garbage
+// entry point on `GenerationalHeap` / `G1Collector` spin-yields
+// instead of running a collection.
+//
+// Why process-wide rather than per-heap: there is always exactly one
+// VmHeap per CratonVM process, so the distinction is academic. A
+// `static` keeps the safepoint API zero-cost (no `&Heap` plumbed
+// through the `enter_gpu_critical` API).
+//
+// The legacy `Heap` struct in `heap.rs` keeps its own per-instance
+// counter for backwards compatibility with the Phase 1 tests — the
+// two paths are independent.
+
+/// Process-wide GPU-critical-section counter. Public so the VM
+/// crate can manage the count manually from `runtime::offload` for
+/// the Phase 7 deferred-finalize path (which crosses thread
+/// boundaries and therefore can't use the `!Send` `SafepointToken`).
+#[cfg(feature = "gpu-offload")]
+pub static GPU_CRITICAL_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Spin-yield until every live `SafepointToken` has been dropped.
+///
+/// Called from the GC entry points on `GenerationalHeap` and
+/// `G1Collector` before starting a collection cycle, so a kernel
+/// running under a token never observes its inputs being moved.
+///
+/// Emits a tracing warning after [`crate::safepoint::GPU_CRITICAL_DEADLINE_SECS`]
+/// seconds so an indefinitely-blocked collector still surfaces in logs.
+#[cfg(feature = "gpu-offload")]
+pub fn wait_for_gpu_critical_drain() {
+    use std::sync::atomic::Ordering;
+    if GPU_CRITICAL_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(
+        crate::safepoint::GPU_CRITICAL_DEADLINE_SECS,
+    );
+    let mut warned = false;
+    loop {
+        std::thread::yield_now();
+        let now = GPU_CRITICAL_COUNT.load(Ordering::Acquire);
+        if now == 0 {
+            return;
+        }
+        if !warned && start.elapsed() >= deadline {
+            tracing::warn!(
+                "GC delayed >{}s by GPU critical section — {} active tokens",
+                crate::safepoint::GPU_CRITICAL_DEADLINE_SECS,
+                now,
+            );
+            warned = true;
+        }
+    }
+}
+
+/// No-op when the gpu-offload feature is disabled. Callers in the
+/// GC entry points can use this unconditionally.
+#[cfg(not(feature = "gpu-offload"))]
+#[inline(always)]
+pub fn wait_for_gpu_critical_drain() {}
+
 /// Unified heap wrapping either GenerationalHeap or G1Collector.
 ///
 /// Provides the same API surface as `GenerationalHeap` so existing call sites
@@ -347,6 +413,33 @@ impl VmHeap {
         desc_byte: u8,
     ) {
         dispatch!(self, set_field_volatile_as(obj, index, value, desc_byte))
+    }
+
+    // =====================================================================
+    // GPU offload — safepoint coordination
+    // =====================================================================
+
+    /// Enter a GPU-critical section. Returns a `SafepointToken` whose
+    /// lifetime brackets a no-GC window for the calling thread.
+    ///
+    /// The counter is process-wide (a module-level `AtomicU32`), so
+    /// every `VmHeap` instance in the process shares the same gate.
+    /// In practice every CratonVM process has exactly one `VmHeap`,
+    /// so this is equivalent to per-heap.
+    ///
+    /// The GC entry points on both `GenerationalHeap` and
+    /// `G1Collector` call [`wait_for_gpu_critical_drain`] before
+    /// collecting, so a kernel running under this token will not
+    /// observe its inputs being moved.
+    #[cfg(feature = "gpu-offload")]
+    pub fn enter_gpu_critical(&self) -> crate::safepoint::SafepointToken<'static> {
+        crate::safepoint::SafepointToken::new(&GPU_CRITICAL_COUNT)
+    }
+
+    /// Current number of live `SafepointToken`s. Useful for tests.
+    #[cfg(feature = "gpu-offload")]
+    pub fn gpu_critical_count(&self) -> u32 {
+        GPU_CRITICAL_COUNT.load(std::sync::atomic::Ordering::Acquire)
     }
 
     // =====================================================================
@@ -710,5 +803,58 @@ impl VmHeap {
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
         dispatch!(self, walk_objects())
+    }
+}
+
+// ─── Phase 6 #1: GPU/GC coordination tests ───────────────────────────
+//
+// Verify that `enter_gpu_critical` increments/decrements the global
+// `GPU_CRITICAL_COUNT` and that `wait_for_gpu_critical_drain` blocks
+// while any token is alive.
+
+#[cfg(all(test, feature = "gpu-offload"))]
+mod gpu_coordination_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn token_lifecycle_drives_global_counter() {
+        let heap = VmHeap::new(GcBackend::Generational, 1 << 20);
+        let before = GPU_CRITICAL_COUNT.load(Ordering::Acquire);
+        {
+            let _t = heap.enter_gpu_critical();
+            assert_eq!(GPU_CRITICAL_COUNT.load(Ordering::Acquire), before + 1);
+            assert_eq!(heap.gpu_critical_count(), before + 1);
+            {
+                let _t2 = heap.enter_gpu_critical();
+                assert_eq!(GPU_CRITICAL_COUNT.load(Ordering::Acquire), before + 2);
+            }
+            assert_eq!(GPU_CRITICAL_COUNT.load(Ordering::Acquire), before + 1);
+        }
+        assert_eq!(GPU_CRITICAL_COUNT.load(Ordering::Acquire), before);
+    }
+
+    /// Hold a token on a worker thread for 200 ms; assert the
+    /// drain on the main thread blocks at least 150 ms.
+    #[test]
+    fn drain_blocks_until_every_token_dropped() {
+        let heap = std::sync::Arc::new(VmHeap::new(GcBackend::Generational, 1 << 20));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let heap2 = heap.clone();
+        let holder = std::thread::spawn(move || {
+            let _t = heap2.enter_gpu_critical();
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        started_rx.recv().unwrap();
+        let start = Instant::now();
+        wait_for_gpu_critical_drain();
+        let elapsed = start.elapsed();
+        holder.join().unwrap();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "drain returned in {elapsed:?} but the token was held for 200ms",
+        );
     }
 }

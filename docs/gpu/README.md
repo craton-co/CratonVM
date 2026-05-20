@@ -17,6 +17,12 @@ it, or extend the feature, read on.
 | [`plan.md`](plan.md) | The original execution plan with per-part status, deviations from spec, and known follow-ups. |
 | [`cuda-oxide-evaluation.md`](cuda-oxide-evaluation.md) | Why [cuda-oxide](https://nvlabs.github.io/cuda-oxide/) (the project that prompted this work) is not on the critical path, and the precise conditions under which we would re-evaluate. |
 | [`first-results.md`](first-results.md) | Acceptance-criteria scaffold for the GPU-equipped verification machine. Empty results table until real numbers land. |
+| [`annotations.md`](annotations.md) | Phase 1 reference: `@GpuKernel`, `@GpuExclude`, `@EnableGpuAsync` directives for user-facing offload control. |
+| [`streams-events.md`](streams-events.md) | Phase 2 reference: `Stream`, `Event`, async memcpy, `launch_on_stream`, stub op log for tests. |
+| [`async-api.md`](async-api.md) | Phase 3 reference: `GpuExecutor`, `GpuFuture<T>`, `GpuArray<T>`, `GpuStream` for explicit async offload. |
+| [`phase7-summary.md`](phase7-summary.md) | Phase 7 wrap-up: real async overlap, device-buffer caching, lambda SAM args. What landed vs. what was deferred for Phase 8. |
+| [`phase8-summary.md`](phase8-summary.md) | Phase 8 wrap-up: device-cache eviction, benchmark scaffold, multi-arg SAMs. What landed vs. what was deferred for Phase 9+. |
+| [`phase9-summary.md`](phase9-summary.md) | Phase 9 wrap-up: deferred-writeback (lazy D→H). Non-static lambdas and CUDA Graph capture remain deferred with more-detailed rationale. |
 
 ## At a glance
 

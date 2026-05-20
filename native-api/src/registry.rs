@@ -124,6 +124,105 @@ pub trait NativeContext {
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
+    /// Phase 5 escape hatch for GPU offload — dispatch the named method
+    /// asynchronously on the GPU and return the submission handle. The
+    /// default impl returns `None` (no GPU offload). The VM's
+    /// `NativeContextImpl` overrides under `#[cfg(feature = "gpu-offload")]`
+    /// to resolve `class_name`/`method_name`/`descriptor` against the
+    /// class manager, marshal `java_args` into `KernelArgs`, and call
+    /// `OffloadCache::dispatch_async`. The returned handle is what the
+    /// Java `GpuFutureImpl` wraps; pass it back to
+    /// `Native.futureSynchronize` / `Native.futureGetResult` to drive
+    /// the future.
+    ///
+    /// `java_args` follows the same convention as the JVM stack: each
+    /// `Value::Object(Some(...))` is a Java array reference, each
+    /// `Value::Int/Long/Float/Double` is a primitive scalar.
+    fn gpu_dispatch_method(
+        &mut self,
+        _class_name: &str,
+        _method_name: &str,
+        _descriptor: &str,
+        _java_args: &[Value],
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Phase 6 #4 — query the real GPU submission registry for the
+    /// future at `handle`. Returns:
+    ///   * `Some(0)` — Running
+    ///   * `Some(1)` — Completed
+    ///   * `Some(2)` — Failed
+    ///   * `None`    — the handle is not in the real registry
+    ///                 (caller should fall back to the synthetic
+    ///                 future state in native-builtins).
+    /// Default impl returns None (no GPU offload).
+    fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
+        None
+    }
+
+    /// Phase 6 #4 — block until the real GPU submission at `handle`
+    /// completes (via its recorded event). Returns:
+    ///   * `Some(Ok(()))`    — completed
+    ///   * `Some(Err(msg))`  — submission failed; `msg` carries the reason
+    ///   * `None`            — handle not in the real registry
+    /// Default impl returns None.
+    fn gpu_future_synchronize(&self, _handle: u64) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// Phase 8 #1 — evict the device-side buffer cache entry for
+    /// the given `GpuArray` handle. Called by
+    /// `Native.releaseArray` so a long-running Java program that
+    /// churns through GpuArrays doesn't accumulate device memory.
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override
+    /// calls `runtime::offload::device_cache::release(handle)`.
+    fn gpu_release_array_cache(&mut self, _handle: u64) {}
+
+    /// Phase 9 #1 — materialise the device-side buffer's contents
+    /// into host bytes if (and only if) the cache entry is dirty
+    /// from a prior kernel's writes. Returns
+    /// `Some(little-endian-bytes)` when a download happened (and
+    /// the caller should write them into the resident store
+    /// before reading the Java array), or `None` when the entry
+    /// is unknown or clean (host bytes are already current).
+    ///
+    /// Default impl returns None (no GPU offload). The VM
+    /// override calls
+    /// `runtime::offload::device_cache::download_into_bytes_if_dirty(handle)`.
+    fn gpu_array_download_if_dirty(&self, _handle: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
+    /// `GpuFunction` lambda's target method.
+    ///
+    /// When the user writes
+    ///
+    /// ```ignore
+    /// executor.submit(() -> Pipeline.vectorAdd(a, b, out));
+    /// ```
+    ///
+    /// the lambda is materialised as a proxy object whose class is
+    /// recorded in `shared.lambda_proxies`. This method looks the
+    /// proxy up and returns
+    /// `Some((target_class, target_method, target_descriptor,
+    ///        captured_values))` so the dispatcher can route through
+    /// `gpu_dispatch_method`.
+    ///
+    /// Returns `None` for any of:
+    ///   * `callable` is not a lambda proxy
+    ///   * the impl method handle is not InvokeStatic (instance
+    ///     methods cannot run on the GPU)
+    ///   * gpu-offload feature is off (default impl)
+    fn gpu_resolve_lambda_target(
+        &self,
+        _callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        None
+    }
+
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
     fn new_object(&mut self, class_name: &str) -> MethodCallResult;

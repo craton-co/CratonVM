@@ -650,28 +650,25 @@ fn run() -> Result<()> {
         // fully emulate that complex bootstrap, add all application jars to
         // the VM classpath so ClassLoader.loadClass can find them.
         //
-        // Round-7 fix (MED, misc): gate the dir scan on a cheap Quarkus
-        // heuristic so non-Quarkus `--jar` invocations don't pay for four
-        // pointless `read_dir` syscalls on every startup.
-        //
+        // Round-7/8 fix: gate the dir scan on a cheap Quarkus heuristic
+        // so non-Quarkus `--jar` invocations don't pay for the dir walk.
         // Detection ladder (cheapest first):
         //   1. Env override `RUSTJVM_QUARKUS=1` — force on (CI / test).
-        //   2. JAR filename contains `quarkus-` (e.g. `*-runner.jar` is
-        //      common but ambiguous; the canonical signal is the
-        //      `quarkus-` substring in the path or filename).
-        //   3. Manifest has any `Quarkus-` prefixed main attribute
-        //      (Quarkus runner JARs carry `Quarkus-App-Marker` /
-        //      `Quarkus-Build-Time`).
-        // Any miss skips the dir walk entirely.
+        //   2. JAR filename contains `quarkus-` or ends `-runner.jar`.
+        //   3. Manifest has any `Quarkus-` prefixed main attribute.
+        // KC26 fix: when it fires, canonicalise jar_path (so a bare
+        // basename — user cd'd into lib/ — still resolves a parent) and
+        // probe BOTH the jar's own dir AND its parent: Keycloak packs
+        // quarkus-run.jar in lib/ (one level deep), whereas the
+        // canonical Quarkus packaging puts it at the project root.
         let looks_quarkus = {
             let env_forced = std::env::var_os("RUSTJVM_QUARKUS")
                 .map(|v| !v.is_empty() && v != "0")
                 .unwrap_or(false);
-            // Round-8 fix: lowercase the filename once before matching so
+            // Lowercase the filename once before matching so
             // `Quarkus-App-1.0-Runner.jar`, `MyApp-RUNNER.jar`, etc. all
-            // trip the heuristic. Filesystems on macOS / Windows are
-            // case-insensitive and Maven-built JARs often capitalise the
-            // application name in the filename.
+            // trip the heuristic — macOS / Windows filesystems are
+            // case-insensitive and Maven JARs often capitalise the name.
             let filename_hit = jar_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -687,12 +684,27 @@ fn run() -> Result<()> {
             env_forced || filename_hit || manifest_hit
         };
         if looks_quarkus {
-            if let Some(parent) = jar_path.parent().and_then(|p| p.parent()) {
-                let app_dirs = ["lib/lib/main", "lib/lib/boot", "lib/quarkus", "lib/app"];
+            let canon_jar = std::fs::canonicalize(jar_path)
+                .unwrap_or_else(|_| jar_path.to_path_buf());
+            let jar_dir = canon_jar.parent().map(|p| p.to_path_buf());
+            let mut roots = Vec::new();
+            if let Some(d) = jar_dir.as_ref() {
+                roots.push(d.clone());
+                if let Some(pp) = d.parent() {
+                    roots.push(pp.to_path_buf());
+                }
+            }
+            let app_dirs = ["app", "quarkus", "lib/main", "lib/boot", "lib/deployment"];
+            let mut seen = std::collections::HashSet::new();
+            for root in &roots {
                 for dir_name in &app_dirs {
-                    let dir = parent.join(dir_name);
-                    if dir.is_dir() {
-                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                    let dir = root.join(dir_name);
+                    let canon_dir = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+                    if !seen.insert(canon_dir.clone()) {
+                        continue;
+                    }
+                    if canon_dir.is_dir() {
+                        if let Ok(entries) = std::fs::read_dir(&canon_dir) {
                             for entry in entries.flatten() {
                                 let p = entry.path();
                                 if p.extension().map_or(false, |e| e == "jar") {
@@ -760,6 +772,18 @@ fn run() -> Result<()> {
         config = config.with_boot_classpath(VmConfig::parse_classpath(bcp));
     }
     if let Some(jh) = &args.java_home {
+        // Fail fast when --java-home points at a path that doesn't exist.
+        // Without this, `resolve_java_home` silently returns None, the boot
+        // classpath ends up empty, and the first JDK-class reference (e.g.
+        // `INVOKESTATIC java/lang/Boolean.parseBoolean`) surfaces as a
+        // confusing `NoSuchMethodError` instead of a clear configuration error.
+        let p = std::path::Path::new(jh);
+        if !p.is_dir() {
+            anyhow::bail!(
+                "--java-home path does not exist or is not a directory: {jh}\n\
+                 Provide a valid JDK installation (must contain `jmods/` or `lib/modules`)."
+            );
+        }
         config = config.with_java_home(jh.clone());
     }
 
@@ -1676,6 +1700,178 @@ fn run() -> Result<()> {
                                 ));
                             }
                         }
+                    }
+                }
+                // When walking through PropertyBatchUpdateException, also
+                // surface the nested PropertyAccessExceptions array contents.
+                // The standard `getMessage()` joins their messages with ";",
+                // but Spring's BeanCreationException wrapper inlines that
+                // joined string before any per-sub-cause framing is rendered,
+                // so the actual offending property (and the IAE/NPE thrown by
+                // the setter) is lost in plain `Caused by:` chains.  Drill one
+                // level so each sub-cause's class + message + cause chain is
+                // visible — this is the only stable surface for diagnosing
+                // setter-injection failures because PBUE itself doesn't
+                // `initCause` the first sub-exception.
+                if cname == "org/springframework/beans/PropertyBatchUpdateException" {
+                    // Find the propertyAccessExceptions field by name.
+                    let arr_idx = {
+                        let cm = vm.shared.class_manager.read();
+                        let mut found: Option<usize> = None;
+                        let mut walk = Some(cid);
+                        while let Some(k) = walk {
+                            if let Some(cls) = cm.get_class(k) {
+                                let mut inst = 0usize;
+                                for f in &cls.fields {
+                                    if !f.is_static() {
+                                        let abs = cls.first_field_index + inst;
+                                        if &*f.name == "propertyAccessExceptions" && found.is_none() {
+                                            found = Some(abs);
+                                        }
+                                        inst += 1;
+                                    }
+                                }
+                                walk = cls.superclass;
+                            } else { break; }
+                        }
+                        found
+                    };
+                    if let Some(ai) = arr_idx {
+                        match vm.shared.heap.get_field(cur, ai) {
+                            Value::Object(Some(arr)) => {
+                                let n = vm.shared.heap.array_length(arr);
+                                lines.push(format!(
+                                    "[rustjvm-cli] PropertyBatchUpdateException.propertyAccessExceptions length={n}"
+                                ));
+                                for i in 0..n {
+                                    let elem = vm.shared.heap.get_array_element(arr, i).ok();
+                                    if let Some(Value::Object(Some(eref))) = elem {
+                                        let ecid = vm.shared.heap.class_id_of(eref);
+                                        let ename = vm.shared.class_manager.read()
+                                            .get_class(ecid).map(|c| c.name.to_string())
+                                            .unwrap_or_else(|| "?".to_string());
+                                        // Read detailMessage and cause from this sub-exception
+                                        let (smsg, scause, spname) = {
+                                            let cm = vm.shared.class_manager.read();
+                                            let mut mi: Option<usize> = None;
+                                            let mut ci: Option<usize> = None;
+                                            let mut pn: Option<usize> = None;
+                                            let mut walk = Some(ecid);
+                                            while let Some(k) = walk {
+                                                if let Some(cls) = cm.get_class(k) {
+                                                    let mut inst = 0usize;
+                                                    for f in &cls.fields {
+                                                        if !f.is_static() {
+                                                            let abs = cls.first_field_index + inst;
+                                                            match &*f.name {
+                                                                "detailMessage" if mi.is_none() => mi = Some(abs),
+                                                                "cause" if ci.is_none() => ci = Some(abs),
+                                                                "propertyName" if pn.is_none() => pn = Some(abs),
+                                                                _ => {}
+                                                            }
+                                                            inst += 1;
+                                                        }
+                                                    }
+                                                    walk = cls.superclass;
+                                                } else { break; }
+                                            }
+                                            let read_s = |idx: Option<usize>| -> String {
+                                                idx.and_then(|i| match vm.shared.heap.get_field(eref, i) {
+                                                    Value::Object(Some(s)) => rustjvm_vm::vm::read_java_string(&vm.shared.heap, s),
+                                                    _ => None,
+                                                }).unwrap_or_default()
+                                            };
+                                            (read_s(mi), ci, read_s(pn))
+                                        };
+                                        lines.push(format!(
+                                            "[rustjvm-cli]   [{i}] {ename} property='{spname}' message={smsg:?}"
+                                        ));
+                                        if let Some(frames) = vm.throwable_stack_for(eref) {
+                                            if !frames.is_empty() {
+                                                lines.push(format!("[rustjvm-cli]       ({} captured frames)", frames.len()));
+                                                for frame in frames.iter().take(12) {
+                                                    let loc = match (frame.file.as_deref(), frame.line) {
+                                                        (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                                        (Some(f), _) if !f.is_empty() => f.to_string(),
+                                                        _ => "Unknown Source".to_string(),
+                                                    };
+                                                    lines.push(format!("\t\tat {}.{}({})", frame.class, frame.method, loc));
+                                                }
+                                            }
+                                        }
+                                        // Follow cause(s) for this sub-exception (one level deep,
+                                        // up to 6 deep just in case).
+                                        let mut sub_cur = scause.and_then(|ci| {
+                                            if let Value::Object(Some(c)) = vm.shared.heap.get_field(eref, ci) {
+                                                if c != eref { Some(c) } else { None }
+                                            } else { None }
+                                        });
+                                        for _d in 0..6 {
+                                            let Some(sc) = sub_cur else { break };
+                                            let sc_cid = vm.shared.heap.class_id_of(sc);
+                                            let sc_name = vm.shared.class_manager.read()
+                                                .get_class(sc_cid).map(|c| c.name.to_string())
+                                                .unwrap_or_else(|| "?".to_string());
+                                            let (sc_msg, sc_cause_idx) = {
+                                                let cm = vm.shared.class_manager.read();
+                                                let mut mi: Option<usize> = None;
+                                                let mut ci: Option<usize> = None;
+                                                let mut walk = Some(sc_cid);
+                                                while let Some(k) = walk {
+                                                    if let Some(cls) = cm.get_class(k) {
+                                                        let mut inst = 0usize;
+                                                        for f in &cls.fields {
+                                                            if !f.is_static() {
+                                                                let abs = cls.first_field_index + inst;
+                                                                match &*f.name {
+                                                                    "detailMessage" if mi.is_none() => mi = Some(abs),
+                                                                    "cause" if ci.is_none() => ci = Some(abs),
+                                                                    _ => {}
+                                                                }
+                                                                inst += 1;
+                                                            }
+                                                        }
+                                                        walk = cls.superclass;
+                                                    } else { break; }
+                                                }
+                                                let m = mi.and_then(|i| match vm.shared.heap.get_field(sc, i) {
+                                                    Value::Object(Some(s)) => rustjvm_vm::vm::read_java_string(&vm.shared.heap, s),
+                                                    _ => None,
+                                                }).unwrap_or_default();
+                                                (m, ci)
+                                            };
+                                            lines.push(format!("[rustjvm-cli]       Caused by: {sc_name}: {sc_msg}"));
+                                            if let Some(frames) = vm.throwable_stack_for(sc) {
+                                                if !frames.is_empty() {
+                                                    lines.push(format!("[rustjvm-cli]         ({} captured frames)", frames.len()));
+                                                    for frame in frames.iter().take(16) {
+                                                        let loc = match (frame.file.as_deref(), frame.line) {
+                                                            (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                                            (Some(f), _) if !f.is_empty() => f.to_string(),
+                                                            _ => "Unknown Source".to_string(),
+                                                        };
+                                                        lines.push(format!("\t\t\tat {}.{}({})", frame.class, frame.method, loc));
+                                                    }
+                                                }
+                                            }
+                                            sub_cur = sc_cause_idx.and_then(|ci| {
+                                                if let Value::Object(Some(c)) = vm.shared.heap.get_field(sc, ci) {
+                                                    if c != sc { Some(c) } else { None }
+                                                } else { None }
+                                            });
+                                        }
+                                    } else {
+                                        lines.push(format!("[rustjvm-cli]   [{i}] <null>"));
+                                    }
+                                }
+                            }
+                            Value::Object(None) => {
+                                lines.push("[rustjvm-cli] PropertyBatchUpdateException.propertyAccessExceptions = null".into());
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        lines.push("[rustjvm-cli] PropertyBatchUpdateException.propertyAccessExceptions field NOT FOUND on class".into());
                     }
                 }
                 if let Some(c) = next_cause {

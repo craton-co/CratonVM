@@ -1,0 +1,377 @@
+# Phase 3 Java async API — `GpuExecutor`, `GpuFuture`, `GpuArray`, `GpuStream`
+
+Reference for the **explicit, async** Java surface introduced in Phase 3.
+Companion to the transparent `invokestatic` offload path already documented
+in [`README.md`](README.md).
+
+The two paths coexist:
+
+- **Transparent offload** (Phase 1/2) — `--gpu` on the command line; any
+  `@GpuKernel`-eligible static method called via `invokestatic` is silently
+  routed to the GPU. The user writes no async code.
+- **Explicit async API** (Phase 3, this document) — `GpuExecutor` lets the
+  application *schedule* offloaded work, chain kernels on the same device
+  stream, and read results back as `GpuFuture<T>`. No `--gpu` flag is
+  required; the executor probes the driver itself.
+
+Same lowering pipeline, same analyzer, same PTX cache. Different entry
+point.
+
+## Quick start
+
+Before — transparent offload of a single kernel via `invokestatic`:
+
+```java
+// Run on a JVM started with --gpu. The call below is dispatched to the
+// GPU by the interpreter hook with no application-visible asynchrony.
+int[] out = new int[n];
+Pipeline.vectorAdd(a, b, out);
+useResult(out);
+```
+
+After — explicit submission through `GpuExecutor`:
+
+```java
+try (GpuExecutor exec = GpuExecutor.open()) {
+    GpuFuture<int[]> f = exec.submit(() -> Pipeline.vectorAdd(a, b));
+    useResult(f.get());
+}
+```
+
+The explicit form is for code that wants to *overlap* host work with
+kernel execution, *chain* kernels on a single stream (one H2D, multiple
+launches, one D2H), or *fail soft* on machines that have no GPU.
+
+## `GpuExecutor`
+
+`GpuExecutor` owns a `DeviceContext`, a default `GpuStream`, and a
+reference to the per-VM `OffloadCache`. One executor binds to one CUDA
+device; cross-device traffic requires a second executor.
+
+### Opening
+
+| Constructor | What it does |
+| --- | --- |
+| `GpuExecutor.open()` | Probe device 0. Throws `GpuException` if the driver is missing **only on `gpu-driver` builds**; on `gpu` (stub) builds it returns a *stub executor* whose every submission yields an immediately-failed future. See [Stub-mode behavior](#stub-mode-behavior). |
+| `GpuExecutor.open(int deviceOrdinal)` | Attach to a specific CUDA device. Same fall-back behavior. |
+
+The executor is `AutoCloseable`. Always wrap it in try-with-resources.
+Closing the executor:
+
+1. Synchronises the default stream.
+2. Cancels any not-yet-launched submissions.
+3. Releases the `DeviceContext` and the underlying CUDA primary
+   context handle.
+
+### Submitting work
+
+| Method | Purpose |
+| --- | --- |
+| `<R> GpuFuture<R> submit(Supplier<R> kernel)` | Schedule a kernel for execution. The `Supplier` body **must be a static method reference** (e.g. `() -> Pipeline.vectorAdd(a, b)`); see [Limitations](#limitations). |
+| `<R> GpuFuture<R> launch(KernelHandle<R> handle, Object... args)` | Lower-level form. Skips lambda inspection; `handle` is a `CompiledKernel` returned by a previous `prepare(...)` call. |
+| `GpuStream newStream()` | Create an additional CUDA stream bound to the executor's context. The default stream is used implicitly if you never call this. |
+
+`submit` returns immediately. The analyzer runs synchronously on the
+calling thread *before* the future is returned, so any
+`AnalyzerRejection` is observable at submit time, not at `get()` time.
+
+### Ownership
+
+```java
+try (GpuExecutor exec = GpuExecutor.open()) {
+    GpuFuture<int[]> f = exec.submit(() -> Pipeline.vectorAdd(a, b));
+    int[] result = f.get();
+}
+```
+
+`GpuExecutor` is `AutoCloseable` and **not** thread-safe for `close()`;
+submissions are. Treat it like a `java.util.concurrent.ExecutorService`:
+one owner thread closes it, many threads may submit while it is open.
+
+## `GpuFuture<T>`
+
+Returned by every `submit` / `launch`. Modelled on
+`CompletableFuture` but bound to a CUDA stream — completion happens
+when the device finishes the launch.
+
+| Method | Semantics |
+| --- | --- |
+| `boolean isDone()` | True once the stream has reached the post-launch event for this future. Non-blocking. |
+| `T get()` | Block the calling thread until done. Throws `GpuException` if the kernel failed or the analyzer rejected the lambda. |
+| `T get(long timeout, TimeUnit unit)` | Bounded wait. Throws `TimeoutException` on expiry. |
+| `Optional<T> getNow()` | Non-blocking peek. Returns `Optional.empty()` if the future is still pending. |
+| `<R> GpuFuture<R> thenApplyGpu(Function<T, R> next)` | Chain a second kernel **on the same stream**. The result of this kernel stays on the device; no D2H copy is inserted between the two stages. |
+| `<R> CompletableFuture<R> thenApplyAsync(Function<T, R> next, Executor cpu)` | Standard CPU continuation. Inserts a D2H copy. |
+| `CompletableFuture<T> toCompletableFuture()` | Bridge into JDK async land. Inserts a D2H copy on the first read. |
+
+### Stream-resident chaining
+
+`thenApplyGpu` is the only continuation that **stays on the device**.
+For it to work, the function must itself be a `@GpuKernel`-eligible
+static method reference. The executor inspects the lambda's bootstrap
+method via the same code path the transparent dispatcher uses; if the
+referenced method is rejected by the analyzer, `thenApplyGpu` returns
+an *already-failed* future containing the rejection reason. This is
+detected synchronously at the call site — no half-issued kernel ever
+reaches the GPU.
+
+Mixing CPU continuations (`thenApplyAsync`) and GPU continuations
+(`thenApplyGpu`) on the same future is fine. Each CPU continuation
+forces a D2H copy at the boundary; each GPU continuation does not.
+
+## `GpuArray<T>`
+
+A `GpuArray<T>` is a typed handle to a primitive Java array whose
+**device residency** is managed by the executor. Wrapping a host array
+does **not** copy it immediately; the upload happens on the first
+kernel launch that consumes the array.
+
+| Method | Purpose |
+| --- | --- |
+| `static GpuArray<int[]> wrap(int[] host)` | Create a handle. Pins the host array (via `Heap::pin_ref` on the Rust side) so GC cannot move it while a kernel is in flight. Type parameter `T` is one of the supported primitive-array types. |
+| `static GpuArray<int[]> allocate(GpuExecutor exec, int len)` | Allocate a device-only array. `toHost()` materialises a fresh Java array on first call. |
+| `CompletableFuture<T> toHost()` | Schedule a D2H copy and return a future for the host array. **Always synchronises the stream.** Treat it as the expensive read-back operation it is. |
+| `int length()` | Element count. Free; does not touch the device. |
+| `void close()` | Release the device buffer. Idempotent. |
+
+### Residency across kernels
+
+The point of `GpuArray<T>` is that the array can sit on the device
+across many kernels with no intermediate H2D / D2H traffic. The first
+kernel that *writes* an array marks it dirty; subsequent kernels that
+*read* the array see the dirty version without a host round-trip. A
+`toHost()` call is the only operation that forces a D2H copy.
+
+```java
+GpuArray<int[]> img = GpuArray.wrap(image);
+GpuFuture<int[]> step1 = exec.submit(() -> Pipeline.convolve(img.toHost().get()));
+GpuFuture<int[]> step2 = step1.thenApplyGpu(c -> Pipeline.threshold(c, t));
+return step2.get();
+```
+
+The `step1` lambda above takes the wrapped image and runs a convolve
+kernel; `step2` chains a threshold kernel on the same stream. With
+`thenApplyGpu` the intermediate `int[]` never round-trips to the
+host. The final `step2.get()` is the single D2H copy.
+
+### Type erasure caveat
+
+`GpuArray<int[]>` and `GpuArray<float[]>` are distinct only at compile
+time. The runtime element type is recovered from the Java class of the
+*wrapped* array (`image.getClass().getComponentType()`). If you build a
+`GpuArray<Object>` via raw types and feed it to a kernel expecting
+`int[]`, the analyzer rejects the launch at submit time with
+`Reason::TypeMismatch`. There is no kernel-side casting.
+
+## `GpuStream`
+
+`GpuStream` exposes one CUDA stream. It is rarely needed; most users
+should rely on the executor's implicit default stream.
+
+| Method | Purpose |
+| --- | --- |
+| `<R> GpuFuture<R> submit(Supplier<R> kernel)` | Submit onto this specific stream instead of the executor's default. |
+| `void synchronize()` | Block until the stream is drained. |
+| `void close()` | Destroy the stream. Outstanding futures complete or fail before close returns. |
+
+Reasons to take a stream explicitly:
+
+- **Overlap**. Two streams + pinned host arrays = concurrent H2D, kernel,
+  and D2H across stages of a pipeline.
+- **Isolation**. Errors in one stream do not affect work queued on
+  another. The default stream is shared across all `submit` calls on the
+  executor; a misbehaving kernel will fail every queued future on it.
+- **Deterministic ordering**. Within a single stream, kernels execute
+  in submission order. Across streams there is no ordering guarantee
+  beyond what the application enforces.
+
+If you don't have a specific reason to call `newStream()`, don't.
+
+## Three-stage pipeline example
+
+A realistic image-processing pipeline: convolve → threshold → histogram.
+Two host arrays (`image`, `kernel`) are wrapped, three kernels are
+submitted, the final histogram comes back to the host. Note the device
+residency: one H2D for `image`, one D2H for `histogram`.
+
+```java
+import static cratonvm.gpu.GpuExecutor.open;
+
+int[] runPipeline(int[] image, int[] kernel, int threshold) {
+    try (GpuExecutor exec = open()) {
+        GpuArray<int[]> img = GpuArray.wrap(image);
+        GpuArray<int[]> ker = GpuArray.wrap(kernel);
+
+        // Stage 1: convolve. Stays on device.
+        GpuFuture<int[]> convolved = exec.submit(
+                () -> Pipeline.convolve(img.toHost().get(), ker.toHost().get()));
+
+        // Stage 2: threshold. Same stream as stage 1; no D2H.
+        GpuFuture<int[]> thresholded = convolved.thenApplyGpu(
+                c -> Pipeline.threshold(c, threshold));
+
+        // Stage 3: histogram. Same stream; no D2H.
+        GpuFuture<int[]> hist = thresholded.thenApplyGpu(
+                Pipeline::histogram);
+
+        // The first and only D2H copy:
+        return hist.get();
+    }
+}
+```
+
+The kernel methods themselves are ordinary static methods marked with
+`@GpuKernel`; the executor consults the analyzer to confirm that each
+one is offload-eligible before issuing the launch.
+
+If any stage's lambda fails analyzer admission (e.g. `Pipeline.histogram`
+contained an allocation), the `thenApplyGpu` call that referenced it
+returns an already-failed future and the downstream stages never reach
+the device. The earlier stages, already in flight, still drain on the
+stream and their results are dropped on executor close.
+
+## Stub-mode behavior
+
+On a `cargo build --features gpu` (stub) binary, or on a `gpu-driver`
+build run on a machine with no CUDA driver, `GpuExecutor.open()` does
+**not** throw. It returns a *stub executor* with three properties:
+
+1. Every `submit(...)` and `launch(...)` returns an **already-failed**
+   `GpuFuture<T>` whose `get()` throws
+   `GpuException("no CUDA device available")`.
+2. `thenApplyGpu(...)` on a failed future propagates the same failure
+   without invoking the function.
+3. `close()` is a no-op.
+
+This lets unit tests exercise the control flow — `try / catch`, future
+chaining, fallback paths — on hardware without a GPU. The stub futures
+are *immediately* in the failed state, so `isDone()` returns `true` and
+`getNow()` returns `Optional.empty()` instantly.
+
+Code that wants to fall back to a CPU path on stub builds:
+
+```java
+int[] result;
+try (GpuExecutor exec = GpuExecutor.open()) {
+    result = exec.submit(() -> Pipeline.vectorAdd(a, b)).get();
+} catch (GpuException e) {
+    result = Pipeline.vectorAddCpu(a, b);
+}
+```
+
+The `try-with-resources` close on a stub executor does not raise.
+
+## Error handling
+
+`GpuException` is **unchecked**. It is thrown by:
+
+| Site | Cause |
+| --- | --- |
+| `GpuExecutor.open(...)` (gpu-driver only) | Driver init failed for a reason other than "no driver" — e.g. CUDA returns `ERROR_OUT_OF_MEMORY` while creating the primary context. The stub path swallows `NoDriver`; everything else propagates. |
+| `submit(...)` | The lambda's referenced method failed analyzer admission. Wraps the analyzer's `Reason` (allocation, non-static, monitor, …). |
+| `GpuFuture.get()` | The kernel ran but wrote `1` to `failure_flag` (array bounds, future arithmetic). Or the kernel itself failed to launch (resource exhaustion). |
+| `GpuFuture.thenApplyGpu(...)` | The continuation's referenced method failed analyzer admission. Returned as a failed future, not thrown. `get()` on that future raises. |
+| `GpuArray.toHost()` | D2H copy failed mid-stream. Rare; usually indicates the kernel that wrote this array faulted. |
+
+`GpuException` carries:
+
+- `cause()` — the underlying Rust `DeviceError` rendered as a Java
+  exception chain. `DeviceError::NoDriver` surfaces as the *only*
+  exception that the stub executor produces.
+- `getKernel()` — the simple class/method name of the offending kernel,
+  or `null` for analyzer-time rejections that fire before a kernel was
+  ever bound.
+- `getReason()` — the analyzer's `Reason` enum value when applicable;
+  `null` for device-side failures.
+
+`GpuException` is intentionally **not** a `CompletionException`. It does
+not get wrapped twice when transiting `toCompletableFuture()`.
+
+## Cleanup
+
+`try-with-resources` is the only supported lifecycle. Specifically:
+
+```java
+try (GpuExecutor exec = GpuExecutor.open();
+     GpuArray<int[]> img = GpuArray.wrap(image)) {
+    // ... submit kernels ...
+}
+```
+
+The order matters: `GpuArray` closes first, unpinning its host array;
+then the executor closes, synchronising the stream and releasing the
+context.
+
+### `StreamCleaner` daemon
+
+If a `GpuExecutor` is abandoned without `close()`, the JVM will
+eventually collect it. A daemon thread named `gpu-stream-cleaner`
+holds `PhantomReference`s to all live executors and, on enqueue,
+releases the device handles. This is **a backup, not the contract**:
+
+- The cleaner runs at GC pace, which is unpredictable.
+- It cannot synchronise the stream from within itself (no JVM context),
+  so in-flight kernels may have their output buffers freed before they
+  complete on the device, producing CUDA `ERROR_ILLEGAL_ADDRESS` errors
+  surfaced on the *next* kernel launch in any executor.
+- It logs a `WARN` line "executor closed by cleaner; prefer
+  try-with-resources" so misuse is observable.
+
+Always `close()` explicitly. The cleaner exists so that one forgotten
+executor doesn't pin a CUDA context for the JVM's lifetime; it is not
+a substitute for resource management.
+
+## Limitations
+
+- **`thenApplyGpu` requires a static method reference.** Java's type
+  erasure prevents the executor from inspecting an arbitrary lambda's
+  body for `@GpuKernel` eligibility; the runtime can only identify the
+  target method when the lambda is a direct `MethodHandleInfo` with a
+  resolvable `REF_invokeStatic` kind. A non-method-reference lambda
+  body — `c -> { int[] r = new int[c.length]; … }` — falls back to a
+  CPU continuation with a D2H copy. The executor logs a `DEBUG` line
+  identifying which call site lost stream residency.
+- **No graph-capture API.** `cudaGraph` and friends are not exposed. The
+  three-stage example above is implemented as three discrete launches.
+  When a graph API arrives it will be a *new* surface on `GpuStream`,
+  not a retrofit of `thenApplyGpu`.
+- **No event timing.** `GpuStream` does not expose CUDA events to the
+  Java caller. Latency and throughput numbers are measured in Rust via
+  `tracing` spans (see [`first-results.md`](first-results.md)) or by the
+  application wrapping its `submit` calls in `System.nanoTime`. A
+  user-facing event timing API is deliberately deferred — the cost of
+  exposing it cleanly across the stub / driver builds is not yet
+  justified.
+- **Single device per executor.** Multi-GPU sharding is the application's
+  job: open one executor per device, partition the work.
+- **No cancellation mid-launch.** `GpuFuture.cancel(true)` only succeeds
+  if the kernel has not yet been issued to the stream. Once `cuLaunch`
+  has run, the kernel runs to completion.
+
+## What this is NOT
+
+- **Not a Java CUDA wrapper.** You cannot `cuMemAlloc` from Java. The
+  device-side surface is intentionally narrow — wrap an array, launch a
+  kernel, read it back. Anything more is the Rust side's concern.
+- **Not a replacement for the transparent `invokestatic` offload.**
+  Code that has been running fine under `--gpu` should keep running
+  fine; the explicit API is for *new* code that wants async semantics.
+- **Not a Project Babylon stand-in.** Babylon's Code Reflection is a
+  much broader Java-to-anywhere lowering effort. CratonVM's Phase 3 is
+  narrow on purpose: static methods over primitive arrays, async
+  scheduling, nothing more. If Babylon ships in mainline OpenJDK with a
+  PTX target, we will reconsider the surface. Today, we don't depend on
+  it.
+
+## See also
+
+- [`streams-events.md`](streams-events.md) — the Rust-side
+  `Stream` / `Event` primitives that back `GpuStream` and `GpuFuture`.
+  Required reading if you are extending the Java surface.
+- [`annotations.md`](annotations.md) — `@GpuKernel`, the marker the
+  analyzer looks for when admitting a method. Phase 3 lambdas resolve
+  to methods bearing this annotation.
+- [`README.md`](README.md) — top-level reference: build matrix
+  (`gpu` vs `gpu-driver`), CLI surface, file index.
+- [`plan.md`](plan.md) — per-part execution status, including the
+  Phase 3 milestones.

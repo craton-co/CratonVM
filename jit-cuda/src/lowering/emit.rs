@@ -114,6 +114,33 @@ impl Locals {
     }
 }
 
+/// Identifies an array-reference's backing kernel parameter — either a
+/// regular method parameter (`pN_ptr` / `pN_len`) or a `this.<field>`
+/// access (`pthis_<i>_ptr` / `pthis_<i>_len`).
+///
+/// Phase 9 #2 — non-static methods access primitive-array fields via
+/// the `aload_0; getfield <cp_index>` pattern. Each unique cp_index in
+/// the method body becomes one extra kernel parameter pair; the index
+/// here is the zero-based position of that cp_index in the dedup'd
+/// `this_field_cps` list (see [`Emitter::this_field_cps_unique`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ArrayKey {
+    /// `pN_ptr` / `pN_len` — a declared method parameter.
+    Param(usize),
+    /// `pthis_N_ptr` / `pthis_N_len` — a unique `this.<field>` access.
+    ThisField(usize),
+}
+
+impl ArrayKey {
+    /// PTX-side name of the matching `_len` parameter.
+    pub fn len_param_name(self) -> String {
+        match self {
+            ArrayKey::Param(i) => format!("p{i}_len"),
+            ArrayKey::ThisField(i) => format!("pthis_{i}_len"),
+        }
+    }
+}
+
 /// All state the emitter needs while walking a method.
 pub(crate) struct Emitter<'a> {
     pub bytes: &'a [u8],
@@ -127,6 +154,26 @@ pub(crate) struct Emitter<'a> {
     /// by `bind_param_locals`; used by `array_param_of` to map an
     /// `aload`'d array reference back to its parameter index.
     pub param_ptr_reg: Vec<String>,
+    /// Phase 9 #2 — whether the lowered method is non-static. When
+    /// true, slot 0 holds `this` (the [`Self::this_sentinel_name`]
+    /// register), and `aload_0; getfield <cp>` chains resolve through
+    /// [`Self::this_field_ptr_reg`].
+    pub is_static: bool,
+    /// Phase 9 #2 — name of the sentinel U64 register bound to slot 0
+    /// for non-static methods. Never written by the kernel — only
+    /// inspected to detect the `aload_0; getfield` shape. Empty
+    /// string for static methods.
+    pub this_sentinel_name: String,
+    /// Phase 9 #2 — dedup'd `this_field_cps`, in the body-encounter
+    /// order recorded by the analyzer. `this_field_cps_unique[i]` is
+    /// the cp_index whose ptr lives in `pthis_<i>_ptr`.
+    pub this_field_cps_unique: Vec<u16>,
+    /// Phase 9 #2 — for each unique cp_index, the U64 register we
+    /// pre-loaded `pthis_<i>_ptr` into. Key: cp_index; value: (the
+    /// dedup'd index, the register). `getfield <cp>` pushes the
+    /// matching register's clone onto the operand stack; from then on
+    /// it behaves identically to an array-parameter reference.
+    pub this_field_ptr_reg: std::collections::HashMap<u16, (usize, Reg)>,
     /// Local slot of the loop induction variable (if we are in a loop).
     pub iv_slot: Option<u16>,
     /// Loop-bound register; populated once we emit the prologue. Used
@@ -149,7 +196,17 @@ pub(crate) struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
-    pub fn new(bytes: &'a [u8], sig: &'a KernelSignature) -> Self {
+    pub fn new(bytes: &'a [u8], sig: &'a KernelSignature, is_static: bool) -> Self {
+        // Phase 9 #2 — dedup the analyzer's body-encounter order list.
+        // Each unique cp_index becomes one kernel parameter pair; we
+        // preserve first-encounter order so the kernel arg ordering
+        // is stable and matches the marshaller's iteration.
+        let mut this_field_cps_unique: Vec<u16> = Vec::new();
+        for &cp in &sig.this_field_cps {
+            if !this_field_cps_unique.contains(&cp) {
+                this_field_cps_unique.push(cp);
+            }
+        }
         Self {
             bytes,
             body: String::new(),
@@ -158,6 +215,10 @@ impl<'a> Emitter<'a> {
             locals: Locals::default(),
             sig,
             param_ptr_reg: vec![String::new(); sig.param_kinds.len()],
+            is_static,
+            this_sentinel_name: String::new(),
+            this_field_cps_unique,
+            this_field_ptr_reg: std::collections::HashMap::new(),
             iv_slot: None,
             bound_reg: None,
             tid_reg: None,
@@ -172,8 +233,37 @@ impl<'a> Emitter<'a> {
     /// param 0, slot 1 is param 1 (or slot 2 for a long/double param 0),
     /// etc. Each array parameter binds the slot to its `pN_ptr` U64 reg;
     /// each scalar parameter binds to a freshly-loaded value reg.
+    ///
+    /// Phase 9 #2 — for non-static methods, slot 0 is bound to a
+    /// sentinel U64 register that stands in for `this`. The sentinel
+    /// is never written by the kernel; subsequent `aload_0; getfield`
+    /// sequences resolve the sentinel back to the corresponding
+    /// `pthis_<i>_ptr` register pre-loaded here.
     pub fn bind_param_locals(&mut self) -> Result<(), LoweringError> {
         let mut slot = 0usize;
+        // Phase 9 #2 — slot 0 = `this` for non-static methods. Bind a
+        // sentinel U64 reg; `aload_0; getfield` recognises this name
+        // and rewrites the stack top to the matching this-field ptr.
+        if !self.is_static {
+            let sentinel = self.regs.fresh_reg(RegKind::U64);
+            // No `ld.param` is emitted — the sentinel is purely a
+            // type-system marker on the simulated operand stack.
+            // The marshaller does not pass `this` as a kernel arg;
+            // only the named fields are marshalled.
+            self.this_sentinel_name = sentinel.name.clone();
+            self.locals.set(slot, sentinel);
+            slot += 1;
+            // Pre-load each unique this-field array pointer into a
+            // fresh U64 register. `getfield <cp>` replaces the
+            // sentinel on the stack with a clone of this register;
+            // from that point on the array reference behaves
+            // identically to a method-parameter array reference.
+            for (i, &cp) in self.this_field_cps_unique.clone().iter().enumerate() {
+                let r = self.regs.fresh_reg(RegKind::U64);
+                writeln!(self.body, "    ld.param.u64 {}, [pthis_{i}_ptr];", r.name).unwrap();
+                self.this_field_ptr_reg.insert(cp, (i, r));
+            }
+        }
         for (i, k) in self.sig.param_kinds.iter().enumerate() {
             match k {
                 ParamKind::Void => {}
@@ -630,6 +720,37 @@ impl<'a> Emitter<'a> {
             0xB1 => {
                 writeln!(self.body, "    bra L_done;").unwrap();
             }
+            // ── getfield (Phase 9 #2 — receiver-access pattern) ─────
+            // Only the `aload_0; getfield <cp>` shape reaches this
+            // arm: the analyzer rejects other `getfield` shapes via
+            // `Reason::FieldAccess`, and the pre-`getfield` opcode is
+            // always `aload_0`. We pop the sentinel pushed by
+            // `aload_0` and replace it with the pre-loaded
+            // `pthis_<i>_ptr` register matching this cp_index.
+            0xB4 => {
+                let cp_index =
+                    u16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]);
+                let top = self.stack.pop()?;
+                if top.name != self.this_sentinel_name {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "getfield #{cp_index} at pc={pc} on an operand stack \
+                         value that is not the `this` sentinel — only \
+                         `aload_0; getfield <primitive-array>` is supported"
+                    )));
+                }
+                let (_, reg) = self
+                    .this_field_ptr_reg
+                    .get(&cp_index)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LoweringError::Internal(format!(
+                            "getfield #{cp_index} at pc={pc}: cp_index was not \
+                             pre-bound by `bind_param_locals` — analyzer/\
+                             emitter signature mismatch"
+                        ))
+                    })?;
+                self.stack.push(reg);
+            }
             // ── arraylength ─────────────────────────────────────────
             0xBE => self.arraylength()?,
             // ── wide ────────────────────────────────────────────────
@@ -1079,9 +1200,20 @@ impl<'a> Emitter<'a> {
     // ─────────────────── array ops ──────────────────────────────────
 
     /// Find the array param backing the top-of-stack array reference.
-    /// Returns (param_index, kind). The reference itself must have
-    /// been produced by an `aload` of a parameter local.
-    fn array_param_of(&self, array_reg: &Reg) -> Result<(usize, ParamKind), LoweringError> {
+    /// Returns (key, kind). The reference itself must have been
+    /// produced by either:
+    ///
+    /// - `aload` of an array-parameter local — returns
+    ///   `ArrayKey::Param(idx)`; the kind is the analyzer's
+    ///   `ParamKind` for that slot.
+    /// - Phase 9 #2: `aload_0; getfield <cp>` — returns
+    ///   `ArrayKey::ThisField(idx)` where `idx` is the dedup'd
+    ///   position of `cp` in `this_field_cps_unique`. The kind is
+    ///   `ParamKind::I32Array` today (the analyzer's
+    ///   `NonStaticReceiverMisuse` path only admits int[] fields in
+    ///   the first cut; widening to other primitive arrays is a
+    ///   follow-up that needs analyzer + marshaller coordination).
+    fn array_param_of(&self, array_reg: &Reg) -> Result<(ArrayKey, ParamKind), LoweringError> {
         // Each array-parameter binding recorded its U64 register name
         // in `param_ptr_reg[i]`. The reference flows through `aload`
         // unchanged (we just clone the local's Reg), so the runtime
@@ -1092,7 +1224,17 @@ impl<'a> Emitter<'a> {
                 continue;
             }
             if !self.param_ptr_reg[i].is_empty() && self.param_ptr_reg[i] == array_reg.name {
-                return Ok((i, *k));
+                return Ok((ArrayKey::Param(i), *k));
+            }
+        }
+        // Phase 9 #2 — `getfield` of a `this.<field>` primitive array.
+        // The `this_field_ptr_reg` map indexes by cp_index; iterate
+        // the entries and match by register name. The entry's
+        // `(this_field_index, _)` tuple gives us the `pthis_<i>_*`
+        // parameter index directly.
+        for (_cp, (idx, reg)) in &self.this_field_ptr_reg {
+            if reg.name == array_reg.name {
+                return Ok((ArrayKey::ThisField(*idx), ParamKind::I32Array));
             }
         }
         Err(LoweringError::UnsupportedNode(
@@ -1110,8 +1252,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1148,8 +1290,8 @@ impl<'a> Emitter<'a> {
     fn array_load_byte(&mut self) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1195,8 +1337,8 @@ impl<'a> Emitter<'a> {
     fn array_load_16(&mut self, is_char: bool) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
@@ -1243,8 +1385,8 @@ impl<'a> Emitter<'a> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1280,8 +1422,8 @@ impl<'a> Emitter<'a> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1311,8 +1453,8 @@ impl<'a> Emitter<'a> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
@@ -1346,11 +1488,12 @@ impl<'a> Emitter<'a> {
 
     fn arraylength(&mut self) -> Result<(), LoweringError> {
         let array_ref = self.stack.pop()?;
-        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = array_key.len_param_name();
         let r = self.regs.fresh_reg(RegKind::S32);
         writeln!(
             self.body,
-            "    ld.param.s32 {}, [p{param_idx}_len];",
+            "    ld.param.s32 {}, [{len_param}];",
             r.name
         )
         .unwrap();
@@ -1451,9 +1594,30 @@ pub(crate) fn locate_bound(
     )))
 }
 
+/// Source of a value sitting on the operand stack: either an `aload`
+/// of a parameter local, or (Phase 9 #2) the result of an
+/// `aload_0; getfield <cp>` chain accessing a `this.<field>`
+/// primitive array.
+#[derive(Clone, Copy, Debug)]
+enum ArraySrc {
+    /// `aload <slot>` of a parameter local. The marshaller-side
+    /// length lives at `pN_len` where N is computed from the slot.
+    ParamLocal(u16),
+    /// `aload_0; getfield <cp_index>`. The marshaller-side length
+    /// lives at `pthis_<i>_len` where `i` is the dedup'd position of
+    /// `cp_index` in `KernelSignature::this_field_cps`.
+    ThisField(u16),
+}
+
 /// Try to identify the source of a bound-local: scan the pre-loop
-/// bytecode for `aload K; arraylength; istore slot` where K is a
-/// parameter local. Returns the param's length name on success.
+/// bytecode for either:
+///
+///   - `aload K; arraylength; istore slot`  (static or non-static
+///     methods accessing an array parameter), or
+///   - `aload_0; getfield <cp>; arraylength; istore slot`  (Phase 9
+///     #2: non-static method's bound source is `this.<field>.length`).
+///
+/// Returns the matching `BoundSource` on success.
 fn pre_loop_bound_source(
     bytes: &[u8],
     header_pc: usize,
@@ -1461,52 +1625,165 @@ fn pre_loop_bound_source(
     sig: &KernelSignature,
 ) -> Result<Option<BoundSource>, LoweringError> {
     let mut pc = 0usize;
+    // The most recent `aload <K>` we observed — None unless the
+    // immediately previous opcode was an aload.
     let mut last_aload_local: Option<u16> = None;
-    let mut last_arraylength_local: Option<u16> = None;
+    // Whether the most recent stack-producing opcode is `aload_0`
+    // (the receiver). Tracked separately from `last_aload_local`
+    // because a `getfield` consuming the receiver transforms the
+    // stack-top into a `this.<field>` value with different bounds
+    // semantics.
+    let mut last_aload_was_zero = false;
+    // After `getfield <cp>` immediately following `aload_0`, the
+    // stack top is the named field — record its cp_index so a
+    // subsequent `arraylength` knows it came from a this-field.
+    let mut last_getfield_this_cp: Option<u16> = None;
+    // After `arraylength`, the s32 length value is on top of the
+    // stack; remember its origin so the matching `istore slot`
+    // can resolve to either `ParamLocal` or `ThisField`.
+    let mut last_arraylength_src: Option<ArraySrc> = None;
     while pc < header_pc {
         let op = bytes[pc];
         let size = instr_size(bytes, pc)?;
         match op {
-            0x2A..=0x2D => last_aload_local = Some((op - 0x2A) as u16),
-            0x19 => last_aload_local = Some(bytes[pc + 1] as u16),
+            // ── aload variants ───────────────────────────────────────
+            0x2A => {
+                // aload_0 — the receiver in non-static methods.
+                last_aload_local = Some(0);
+                last_aload_was_zero = true;
+                last_getfield_this_cp = None;
+                pc += size;
+                continue;
+            }
+            0x2B..=0x2D => {
+                last_aload_local = Some((op - 0x2A) as u16);
+                last_aload_was_zero = false;
+                last_getfield_this_cp = None;
+                pc += size;
+                continue;
+            }
+            0x19 => {
+                let k = bytes[pc + 1] as u16;
+                last_aload_local = Some(k);
+                last_aload_was_zero = k == 0;
+                last_getfield_this_cp = None;
+                pc += size;
+                continue;
+            }
             0xC4 if bytes[pc + 1] == 0x19 => {
-                last_aload_local =
-                    Some(u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]));
+                let k = u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]);
+                last_aload_local = Some(k);
+                last_aload_was_zero = k == 0;
+                last_getfield_this_cp = None;
+                pc += size;
+                continue;
             }
-            0xBE => {
-                last_arraylength_local = last_aload_local;
+            // ── getfield (Phase 9 #2) ────────────────────────────────
+            // Only the `aload_0; getfield` shape contributes to a
+            // bound-source. Any other getfield (post-non-zero aload,
+            // post-arithmetic) would have already failed the
+            // analyzer's `Reason::NonStaticReceiverMisuse` /
+            // `Reason::FieldAccess` checks.
+            0xB4 => {
+                if last_aload_was_zero {
+                    let cp = u16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]);
+                    last_getfield_this_cp = Some(cp);
+                } else {
+                    last_getfield_this_cp = None;
+                }
                 last_aload_local = None;
+                last_aload_was_zero = false;
+                pc += size;
+                continue;
             }
-            // istore *
+            // ── arraylength ──────────────────────────────────────────
+            0xBE => {
+                if let Some(cp) = last_getfield_this_cp {
+                    last_arraylength_src = Some(ArraySrc::ThisField(cp));
+                } else if let Some(local) = last_aload_local {
+                    last_arraylength_src = Some(ArraySrc::ParamLocal(local));
+                } else {
+                    last_arraylength_src = None;
+                }
+                last_aload_local = None;
+                last_aload_was_zero = false;
+                last_getfield_this_cp = None;
+                pc += size;
+                continue;
+            }
+            // ── istore <slot> variants ───────────────────────────────
             0x36 => {
                 let target_slot = bytes[pc + 1] as u16;
-                if target_slot == slot && last_arraylength_local.is_some() {
-                    let src_local = last_arraylength_local.unwrap();
-                    return Ok(Some(param_len_for_local(sig, src_local)?));
+                if target_slot == slot {
+                    if let Some(src) = last_arraylength_src {
+                        return Ok(Some(resolve_bound_src(sig, src)?));
+                    }
                 }
-                last_arraylength_local = None;
+                last_arraylength_src = None;
             }
             0x3B..=0x3E => {
                 let target_slot = (op - 0x3B) as u16;
-                if target_slot == slot && last_arraylength_local.is_some() {
-                    let src_local = last_arraylength_local.unwrap();
-                    return Ok(Some(param_len_for_local(sig, src_local)?));
+                if target_slot == slot {
+                    if let Some(src) = last_arraylength_src {
+                        return Ok(Some(resolve_bound_src(sig, src)?));
+                    }
                 }
-                last_arraylength_local = None;
+                last_arraylength_src = None;
             }
             0xC4 if bytes[pc + 1] == 0x36 => {
                 let target_slot = u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]);
-                if target_slot == slot && last_arraylength_local.is_some() {
-                    let src_local = last_arraylength_local.unwrap();
-                    return Ok(Some(param_len_for_local(sig, src_local)?));
+                if target_slot == slot {
+                    if let Some(src) = last_arraylength_src {
+                        return Ok(Some(resolve_bound_src(sig, src)?));
+                    }
                 }
-                last_arraylength_local = None;
+                last_arraylength_src = None;
             }
             _ => {}
         }
+        // Every other instruction clears the aload/getfield/arraylength
+        // tracking state — only contiguous sequences are recognised.
+        last_aload_local = None;
+        last_aload_was_zero = false;
+        last_getfield_this_cp = None;
         pc += size;
     }
     Ok(None)
+}
+
+/// Resolve an [`ArraySrc`] to its [`BoundSource`] flavour using the
+/// kernel signature: a parameter slot maps to `ParamLen(i)`; a
+/// this-field cp_index maps to `ThisFieldLen(i)` where `i` is the
+/// dedup'd position of the cp_index in
+/// [`KernelSignature::this_field_cps`].
+fn resolve_bound_src(sig: &KernelSignature, src: ArraySrc) -> Result<BoundSource, LoweringError> {
+    match src {
+        ArraySrc::ParamLocal(slot) => param_len_for_local(sig, slot),
+        ArraySrc::ThisField(cp) => {
+            // Dedup the analyzer's body-encounter list in the same
+            // order `Emitter::new` does (first-encounter order
+            // preserved). The marshaller mirrors this dedup so the
+            // index here is stable between emitter and runtime.
+            let mut idx: Option<usize> = None;
+            let mut seen: Vec<u16> = Vec::with_capacity(sig.this_field_cps.len());
+            for &c in &sig.this_field_cps {
+                if !seen.contains(&c) {
+                    if c == cp {
+                        idx = Some(seen.len());
+                        break;
+                    }
+                    seen.push(c);
+                }
+            }
+            let idx = idx.ok_or_else(|| {
+                LoweringError::Internal(format!(
+                    "this-field bound source cp_index #{cp} not in \
+                     KernelSignature::this_field_cps — analyzer/emitter mismatch"
+                ))
+            })?;
+            Ok(BoundSource::ThisFieldLen(idx))
+        }
+    }
 }
 
 fn param_len_for_local(sig: &KernelSignature, slot: u16) -> Result<BoundSource, LoweringError> {
@@ -1536,6 +1813,10 @@ fn param_len_for_local(sig: &KernelSignature, slot: u16) -> Result<BoundSource, 
 pub(crate) enum BoundSource {
     /// `pN_len` for parameter index N.
     ParamLen(usize),
+    /// Phase 9 #2 — `pthis_<i>_len` for a this-field array access.
+    /// The index is the dedup'd position of the field's cp_index in
+    /// [`KernelSignature::this_field_cps`].
+    ThisFieldLen(usize),
     /// A literal compile-time constant.
     Literal(i32),
 }

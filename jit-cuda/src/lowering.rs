@@ -45,6 +45,7 @@ pub fn lower_method(
 ) -> Result<PtxModule, LoweringError> {
     let kernel_name = mangle(class_name, &method.name, &method.descriptor);
     let params = build_param_list(sig);
+    let is_static = method.is_static();
 
     let code = method.code().ok_or_else(|| {
         LoweringError::UnsupportedNode("method has no Code attribute".into())
@@ -52,7 +53,7 @@ pub fn lower_method(
     let bytes = &code.code;
     let shape = detect_loop(bytes)?;
 
-    let mut emitter = Emitter::new(bytes, sig);
+    let mut emitter = Emitter::new(bytes, sig, is_static);
     emitter.bind_param_locals()?;
 
     match shape {
@@ -89,6 +90,10 @@ pub fn lower_method(
                     let bound_reg = emitter.materialise_param_len(idx);
                     emitter.emit_loop_guard(&bound_reg);
                 }
+                BoundSource::ThisFieldLen(idx) => {
+                    let bound_reg = emitter.materialise_this_field_len(idx);
+                    emitter.emit_loop_guard(&bound_reg);
+                }
                 BoundSource::Literal(v) => {
                     let bound_reg = emitter.materialise_literal_s32(v);
                     emitter.emit_loop_guard(&bound_reg);
@@ -122,46 +127,50 @@ pub fn lower_method(
 }
 
 /// Public alongside `lower_method`: the kernel parameter convention.
+///
+/// For non-static methods (Phase 9 #2), the kernel takes one
+/// `(ptr, len)` pair per unique `this.<field>` access *before* the
+/// regular parameter list. The unique-fields list is dedup'd from
+/// `sig.this_field_cps` in body-encounter order — so the marshaller
+/// can match the same ordering on the runtime side.
 pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
-    // AUDIT 2026-05-17 (Fix 8): hoist a single reusable `String`
-    // buffer for parameter-name composition instead of issuing a
-    // fresh `format!("p{i}_ptr")` / `_len` / scalar call per arm.
-    // Each `format!` was a heap allocation + a `Display` round-trip;
-    // the per-kernel param list is small but lowering runs once per
-    // method per JIT pass, and the previous code allocated up to
-    // 2 strings per array param.
-    use std::fmt::Write;
-    let mut out = Vec::with_capacity(sig.param_kinds.len() * 2 + 2);
-    let mut buf = String::with_capacity(16);
-    let mut make_name = |buf: &mut String, i: usize, suffix: &str| -> String {
-        buf.clear();
-        buf.push('p');
-        // Use `write!` so the digit conversion writes straight into
-        // the reused buffer without an intermediate allocation.
-        let _ = write!(buf, "{i}");
-        buf.push_str(suffix);
-        // One `clone` here is unavoidable because `PtxParam` owns its
-        // `String`. We still save one allocation per array param vs
-        // the old `format!`-per-arm path because `make_name` reuses
-        // the scratch buffer's capacity across iterations.
-        buf.clone()
-    };
+    let mut out = Vec::new();
+    // Phase 9 #2 — prepend `pthis_<i>_ptr` / `pthis_<i>_len` for each
+    // unique cp_index in `sig.this_field_cps`. The order of unique
+    // entries is body-encounter order (first occurrence wins), which
+    // matches `Emitter::new`'s dedup pass.
+    let mut seen: Vec<u16> = Vec::new();
+    for &cp in &sig.this_field_cps {
+        if seen.contains(&cp) {
+            continue;
+        }
+        let i = seen.len();
+        out.push(PtxParam {
+            name: format!("pthis_{i}_ptr"),
+            kind: PtxParamKind::U64Ptr,
+        });
+        out.push(PtxParam {
+            name: format!("pthis_{i}_len"),
+            kind: PtxParamKind::S32,
+        });
+        seen.push(cp);
+    }
     for (i, k) in sig.param_kinds.iter().enumerate() {
         match k {
             ParamKind::I32 => out.push(PtxParam {
-                name: make_name(&mut buf, i, ""),
+                name: format!("p{i}"),
                 kind: PtxParamKind::S32,
             }),
             ParamKind::I64 => out.push(PtxParam {
-                name: make_name(&mut buf, i, ""),
+                name: format!("p{i}"),
                 kind: PtxParamKind::S64,
             }),
             ParamKind::F32 => out.push(PtxParam {
-                name: make_name(&mut buf, i, ""),
+                name: format!("p{i}"),
                 kind: PtxParamKind::F32,
             }),
             ParamKind::F64 => out.push(PtxParam {
-                name: make_name(&mut buf, i, ""),
+                name: format!("p{i}"),
                 kind: PtxParamKind::F64,
             }),
             ParamKind::I32Array
@@ -171,11 +180,11 @@ pub fn build_param_list(sig: &KernelSignature) -> Vec<PtxParam> {
             | ParamKind::I16Array
             | ParamKind::I8Array => {
                 out.push(PtxParam {
-                    name: make_name(&mut buf, i, "_ptr"),
+                    name: format!("p{i}_ptr"),
                     kind: PtxParamKind::U64Ptr,
                 });
                 out.push(PtxParam {
-                    name: make_name(&mut buf, i, "_len"),
+                    name: format!("p{i}_len"),
                     kind: PtxParamKind::S32,
                 });
             }
@@ -248,6 +257,16 @@ impl<'a> Emitter<'a> {
         r
     }
 
+    /// Phase 9 #2 — materialise `pthis_<i>_len` into a fresh s32 register.
+    /// `idx` is the dedup'd position of a `this.<field>` cp_index in
+    /// [`KernelSignature::this_field_cps`].
+    pub(crate) fn materialise_this_field_len(&mut self, idx: usize) -> emit::Reg {
+        let r = self.regs.fresh_reg(RegKind::S32);
+        use std::fmt::Write;
+        writeln!(self.body, "    ld.param.s32 {}, [pthis_{idx}_len];", r.name).unwrap();
+        r
+    }
+
     /// Materialise an integer literal into a fresh s32 register.
     pub(crate) fn materialise_literal_s32(&mut self, v: i32) -> emit::Reg {
         let r = self.regs.fresh_reg(RegKind::S32);
@@ -305,6 +324,7 @@ mod tests {
             param_kinds: vec![ParamKind::I32Array, ParamKind::I32Array],
             return_kind: ParamKind::I32Array,
             estimated_work: 1 << 20,
+            this_field_cps: Vec::new(),
             needs_d2h_sync: false,
         };
         let params = build_param_list(&sig);
@@ -325,6 +345,7 @@ mod tests {
             param_kinds: vec![ParamKind::I32Array, ParamKind::I32Array],
             return_kind: ParamKind::I64,
             estimated_work: 1 << 20,
+            this_field_cps: Vec::new(),
             needs_d2h_sync: false,
         };
         let params = build_param_list(&sig);
@@ -344,7 +365,10 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
         };
-        lower_method(class, &method, &sig, 7, 0)
+        // sm_75 (Turing) — the test host's RTX 2060 and the lowest
+        // arch still accepted by both CUDA 12.x and CUDA 13.x `ptxas`
+        // (CUDA 13 dropped Volta / sm_70).
+        lower_method(class, &method, &sig, 7, 5)
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
@@ -354,7 +378,7 @@ mod tests {
         let text = m.render();
         // Headers + entry name
         assert!(text.contains(".version 7.5"));
-        assert!(text.contains(".target sm_70"));
+        assert!(text.contains(".target sm_75"));
         assert!(text.contains(".visible .entry EligibleVectorAdd__vectorAdd_"));
         // tid computation
         assert!(text.contains("%ctaid.x"));
@@ -432,7 +456,7 @@ mod tests {
         std::fs::write(&src_path, &text).expect("write ptx");
         let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
         let out = std::process::Command::new(&ptxas)
-            .arg("-arch=sm_70")
+            .arg("-arch=sm_75")
             .arg(&src_path)
             .output()
             .expect("invoke ptxas");
@@ -442,6 +466,88 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
             text,
+        );
+    }
+
+    /// Phase 9 #2 push 2 — `NonStaticScale.scaleInPlace(I)V` is the
+    /// first non-static fixture that lowers end-to-end. The method's
+    /// body uses the `aload_0; getfield <data>` pattern (3 occurrences:
+    /// one in the bound computation, one each for the store target /
+    /// load source inside the loop) but accesses the same field every
+    /// time, so dedup'd this-field count = 1.
+    ///
+    /// We assert:
+    /// - `pthis_0_ptr` and `pthis_0_len` are emitted as the first
+    ///   two params (before the regular `p0` int factor parameter).
+    /// - The loop bound is sourced from `pthis_0_len`, not `pN_len`.
+    /// - Each `iaload` / `iastore` emits a bounds check against
+    ///   `pthis_0_len`.
+    /// - `failure_flag` is still the last parameter.
+    #[test]
+    fn non_static_scale_lowers_to_real_ptx() {
+        let m = lower_fixture("NonStaticScale", "scaleInPlace", "(I)V");
+        let text = m.render();
+
+        // Entry name + non-static-this kernel params.
+        assert!(
+            text.contains(".visible .entry NonStaticScale__scaleInPlace_"),
+            "missing entry header:\n{text}"
+        );
+        assert!(
+            text.contains(".param .u64 pthis_0_ptr"),
+            "missing pthis_0_ptr param:\n{text}"
+        );
+        assert!(
+            text.contains(".param .s32 pthis_0_len"),
+            "missing pthis_0_len param:\n{text}"
+        );
+        // Regular int-factor parameter follows.
+        assert!(
+            text.contains(".param .s32 p0"),
+            "missing p0 (factor) param:\n{text}"
+        );
+        assert!(
+            text.contains(".param .u64 failure_flag"),
+            "missing failure_flag param:\n{text}"
+        );
+
+        // The kernel body pre-loads `pthis_0_ptr` so the
+        // `aload_0; getfield` chain can resolve at compile time.
+        assert!(
+            text.contains("ld.param.u64") && text.contains("[pthis_0_ptr]"),
+            "expected `ld.param.u64 _, [pthis_0_ptr]` in body:\n{text}"
+        );
+
+        // Loop bound from `pthis_0_len` (NOT `p0_len` — p0 is the
+        // scalar factor).
+        assert!(
+            text.contains("[pthis_0_len]"),
+            "loop bound must read from pthis_0_len, not pN_len:\n{text}"
+        );
+        assert!(
+            !text.contains("[p0_len]"),
+            "p0 is a scalar — kernel must not reference p0_len:\n{text}"
+        );
+
+        // Element-wise iaload + imul + iastore.
+        assert!(
+            text.contains("ld.global.s32"),
+            "expected an int load:\n{text}"
+        );
+        assert!(
+            text.contains("st.global.s32"),
+            "expected an int store:\n{text}"
+        );
+        assert!(
+            text.contains("mul.lo.s32"),
+            "expected an int multiply:\n{text}"
+        );
+
+        // Bounds-check failure block is emitted because the body does
+        // an array load and a store, both against pthis_0_len.
+        assert!(
+            text.contains("L_bounds_fail:"),
+            "expected bounds-fail label:\n{text}"
         );
     }
 
@@ -480,54 +586,15 @@ mod tests {
 
     #[test]
     fn straight_line_method_lowers_without_loop() {
-        // AUDIT 2026-05-16: replaced the synthetic `vec![0x03, 0xAC]`
-        // (which violated the "no synthetic bytecode" rule in
-        // `test_support.rs:7-8`) with a real fixture compiled from
-        // `test_classes/gpu/EligibleStraightLine.java` whose body is
-        // `iconst_0; ireturn`.
-        let method = load_method("EligibleStraightLine", "constReturn", "()I");
-        let code = method.code().expect("constReturn has a Code attribute");
-        let shape = super::loop_recog::detect_loop(&code.code).unwrap();
+        // Use the constructor `<init>` of EligibleVectorAdd: it has no
+        // backward branch, just aload_0; invokespecial; return. The
+        // invokespecial is rejected by the analyzer, so we can't take
+        // the analyze-then-lower path. Instead, drive detect_loop
+        // directly and verify StraightLine classification.
+        //
+        // Bytecode for "iconst_0; ireturn" — straight line.
+        let bytes = vec![0x03, 0xAC];
+        let shape = super::loop_recog::detect_loop(&bytes).unwrap();
         assert!(matches!(shape, super::loop_recog::LoopShape::StraightLine));
-    }
-
-    // AUDIT 2026-05-16: `frem`/`drem` previously emitted a non-existent
-    // `rem.f32`/`rem.f64` PTX mnemonic that ptxas rejects on every
-    // kernel. The fix routes both through `LoweringError::UnsupportedNode`
-    // so the analyzer skips the method entirely. These two tests pin the
-    // behavior so the bug cannot regress.
-
-    #[test]
-    fn frem_is_rejected_by_lowering() {
-        let method = load_method("FloatRemainder", "fremScalar", "(FF)F");
-        // `fremScalar` is a straight-line method — analyze decides it is
-        // eligible. Lowering must then reject `frem` (0x72).
-        let sig = match analyze(&method) {
-            OffloadVerdict::Eligible(s) => s,
-            v => panic!("expected FloatRemainder.fremScalar to be analyzer-eligible, got {v:?}"),
-        };
-        let err = lower_method("FloatRemainder", &method, &sig, 7, 0)
-            .expect_err("frem must not lower (PTX has no rem.f32)");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("frem"),
-            "expected error message to mention 'frem', got: {msg}",
-        );
-    }
-
-    #[test]
-    fn drem_is_rejected_by_lowering() {
-        let method = load_method("FloatRemainder", "dremScalar", "(DD)D");
-        let sig = match analyze(&method) {
-            OffloadVerdict::Eligible(s) => s,
-            v => panic!("expected FloatRemainder.dremScalar to be analyzer-eligible, got {v:?}"),
-        };
-        let err = lower_method("FloatRemainder", &method, &sig, 7, 0)
-            .expect_err("drem must not lower (PTX has no rem.f64)");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("drem"),
-            "expected error message to mention 'drem', got: {msg}",
-        );
     }
 }

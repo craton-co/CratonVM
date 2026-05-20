@@ -35,3 +35,86 @@ let mut host = vec![0i32; 4];
 out.to_host(&mut host)?;
 assert_eq!(host, vec![11, 22, 33, 44]);
 ```
+
+## Streams, events, and async memcpy
+
+Phase 2 adds the building blocks for overlapping host/device transfers with
+kernel execution. The synchronous API in the sketch above is unchanged: every
+call still completes before returning. The types in this section are opt-in
+and only matter when a caller wants to pipeline work explicitly.
+
+### `Stream`
+
+A `Stream` is a FIFO queue of GPU work bound to a `DeviceContext`. Operations
+enqueued on the same stream run in submission order; operations on different
+streams may overlap. Construct with `Stream::new(&ctx)`; drop releases the
+underlying CUstream. Call `synchronize()` to block the host until every
+enqueued op has retired.
+
+```ignore
+let ctx = DeviceContext::probe()?;
+let stream = Stream::new(&ctx)?;
+let buf = DeviceBuffer::<f32>::from_host_async(&ctx, &host[..], &stream)?;
+module.launch_on_stream(&ctx, "vector_add", &cfg, args, &stream)?;
+let mut out = vec![0.0f32; host.len()];
+buf.to_host_async(&mut out, &stream)?;
+stream.synchronize()?;          // block until all three steps done
+```
+
+`from_host_async`, `to_host_async`, and `launch_on_stream` mirror the
+synchronous variants but enqueue work onto the given stream instead of the
+context's default stream. The host-side slices passed to the async memcpy
+helpers must outlive the stream synchronization point.
+
+### `Event`
+
+An `Event` is a one-shot marker that can be recorded on one stream and waited
+on from another. Use it to express cross-stream dependencies without
+host-side synchronization.
+
+```ignore
+let s1 = Stream::new(&ctx)?;
+let s2 = Stream::new(&ctx)?;
+let ev = Event::new(&ctx)?;
+module.launch_on_stream(&ctx, "stage1", &cfg, args1, &s1)?;
+s1.record_event(&ev)?;
+s2.wait_event(&ev)?;
+module.launch_on_stream(&ctx, "stage2", &cfg, args2, &s2)?;
+```
+
+`stage2` will not start before `stage1` has finished, but neither stream
+blocks the host. Events are reusable: re-recording on a stream overwrites
+the prior marker.
+
+### Stub-mode op log
+
+When the crate is built without the `cuda` feature, every `Stream` records
+its enqueued operations into an internal `Vec<StreamOp>` instead of touching
+a driver. Tests inspect the log via `stream.ops()` to assert the expected
+order of submissions without an attached GPU. In real (`cuda`) mode
+`stream.ops()` returns an empty `Vec` — the log only exists in the stub
+backend.
+
+```ignore
+let ctx = DeviceContext::probe()?;        // stub mode
+let stream = Stream::new(&ctx)?;
+let buf = DeviceBuffer::<f32>::from_host_async(&ctx, &host, &stream)?;
+module.launch_on_stream(&ctx, "k", &cfg, args, &stream)?;
+buf.to_host_async(&mut out, &stream)?;
+stream.synchronize()?;
+assert_eq!(stream.ops().len(), 4);        // 3 enqueues + 1 sync
+```
+
+### `StreamOp` variants
+
+The op log captures one variant per enqueue or synchronization call:
+
+| Variant         | Captures                                                       |
+| --------------- | -------------------------------------------------------------- |
+| `UploadAsync`   | byte count of `from_host_async` (H→D) copies.                  |
+| `DownloadAsync` | byte count of `to_host_async` (D→H) copies.                    |
+| `Launch`        | kernel name, `grid` and `block` dims passed to `launch_on_stream`. |
+| `EventRecord`   | event id recorded into the stream.                             |
+| `EventWait`     | event id the stream is gated on.                               |
+| `Synchronize`   | a host-side `stream.synchronize()` call.                       |
+

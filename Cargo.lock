@@ -447,6 +447,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "craton-gpu"
+version = "0.2.0"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,6 +1016,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jit-cuda"
 version = "0.2.0"
 dependencies = [
+ "craton-gpu",
  "rustjvm-jit-api",
  "rustjvm-reader",
  "rustjvm-types",
@@ -1982,6 +1987,7 @@ name = "rustjvm-vm"
 version = "0.2.0"
 dependencies = [
  "bitfield-struct",
+ "bytemuck",
  "criterion",
  "cuda-bridge",
  "indexmap",
