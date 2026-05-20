@@ -1699,8 +1699,18 @@ impl NativeMethodRegistry {
         // unconditional registration is the documented behavior, and
         // the 128-bit keyspace makes false hits practically impossible.
         let prior = self.methods.insert(key, callback);
+        // Duplicate-registration / collision detection MUST use a stable
+        // key — the `(class, name, descriptor)` triple — not `fn` pointer
+        // equality. Rust `fn` pointer comparison is unreliable: the
+        // compiler may merge identical functions or duplicate them across
+        // codegen units, so `prior == Some(callback)` produces no
+        // meaningful result (and triggers the
+        // `unpredictable_function_pointer_comparisons` lint). If `prior`
+        // is `Some`, this key was already occupied: it is a legitimate
+        // re-registration iff the very same triple appears in
+        // `registrations`; otherwise it is a true 128-bit hash collision.
         debug_assert!(
-            prior.is_none() || prior == Some(callback) || self.registrations.iter().any(
+            prior.is_none() || self.registrations.iter().any(
                 |(c, m, d)| c.as_ref() == class_name
                     && m.as_ref() == method_name
                     && d.as_ref() == descriptor
