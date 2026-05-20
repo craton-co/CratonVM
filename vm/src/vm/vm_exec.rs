@@ -7152,24 +7152,15 @@ fn invoke_on_class_shared_inner(
                                 | "java/util/LinkedHashSet"
                             )
                             && method_name == "toArray")
-                        // CleanerFactory.<clinit> NPE fix — real-JDK
-                        // `java.lang.ref.Cleaner.create()` bytecode allocates
-                        // a `CleanerImpl`, then calls `CleanerImpl.start(cleaner,
-                        // tf)` which builds an `InnocuousThread` and calls
-                        // `t.setPriority(...)`. Our Thread `<init>` natives do
-                        // not populate the `holder:FieldHolder` field, so
-                        // `Thread.priority(int)` (called from `setPriority`)
-                        // dereferences `holder.group` and NPEs. The NPE bubbles
-                        // through `CleanerFactory.<clinit>` (silently
-                        // swallowed) leaving the static `cleaner` field null,
-                        // which blocks WildFly boot. Force our synthetic
-                        // `Cleaner.create` / `register` natives to win so the
-                        // bytecode never reaches the InnocuousThread path.
-                        || (class_name == "java/lang/ref/Cleaner"
-                            && matches!(
-                                method_name,
-                                "create" | "register"
-                            ))
+                        // P69-Cleaner-realfix: the forced `Cleaner.create` /
+                        // `register` overrides were removed.  They dodged an
+                        // `InnocuousThread.setPriority` NPE inside the real
+                        // `Cleaner.create()` bytecode caused by a null
+                        // `Thread.holder`.  `populate_real_thread_holder` (in
+                        // native-builtins `register_essential_natives`) now
+                        // builds a genuine `Thread$FieldHolder` for every
+                        // real-JDK Thread, so the real `Cleaner` /
+                        // `CleanerImpl` bytecode runs unmodified.
                         // RKC16N.6 RECON (Session 94): real-JDK java/lang/String
                         // bytecode resolution is failing for these basic methods
                         // during JDK class clinits like

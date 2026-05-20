@@ -3252,24 +3252,14 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // Releases the OS fd stashed on the descriptor's own `fd`/`handle`.
     registry.register("java/io/FileDescriptor", "close0", "()V", native_fd_close0);
 
-    // FileCleanable.register(FileDescriptor) — best-effort GC-time fd cleanup
-    // registration. The real-JDK `FileInputStream`/`FileOutputStream`
-    // constructors call this at the end so the OS fd is reclaimed if the
-    // stream is GC'd without an explicit `close()`. The real bytecode builds
-    // a `FileCleanable` (a `PhantomCleanable` subclass) and registers it with
-    // `CleanerFactory.cleaner()` — but CratonVM models `java.lang.ref.Cleaner`
-    // with a synthetic backing whose `impl` slot is not a real `CleanerImpl`,
-    // so the JDK `PhantomCleanable.<init>` -> `CleanerImpl.getCleanerImpl`
-    // `checkcast` fails (ClassCastException) and the constructor aborts.
-    // Deterministic `close()` already releases the fd via `close0` above, so
-    // skipping the phantom-cleanable registration only forgoes the
-    // GC-fallback path (unsupported by the synthetic Cleaner regardless).
-    registry.register(
-        "java/io/FileCleanable",
-        "register",
-        "(Ljava/io/FileDescriptor;)V",
-        native_noop,
-    );
+    // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
+    // It existed because the synthetic `java.lang.ref.Cleaner` left a
+    // bogus `impl` field, so the real `PhantomCleanable.<init>` ->
+    // `CleanerImpl.getCleanerImpl` `checkcast` threw ClassCastException.
+    // The real `Cleaner.create()` bytecode now runs (Thread `holder` is
+    // populated), producing a genuine `CleanerImpl`, so the real-JDK
+    // `FileCleanable.register` -> phantom-cleanable GC-time fd cleanup
+    // path works unmodified.
 
     // --- java.io.FileWriter ---
     // FileWriter wraps FileOutputStream; we use the same fd-in-field-0 layout.
