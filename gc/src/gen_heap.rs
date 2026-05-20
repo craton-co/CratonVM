@@ -638,9 +638,9 @@ impl GenerationalHeap {
     ///
     /// False positives (passing a non-object aligned heap-range address) are
     /// safe: the generational collector's `forward_object` already drops
-    /// "suspected false roots" whose computed total size exceeds
-    /// `MAX_SANE_OBJECT_SIZE`, so the worst case is over-retention rather
-    /// than a deref of garbage.
+    /// "suspected false roots" whose computed extent runs off the end of the
+    /// from-space arena, so the worst case is over-retention rather than a
+    /// deref of garbage.
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         if addr == 0 || addr & 0x7 != 0 {
             return None;
@@ -2609,11 +2609,22 @@ impl GenerationalHeap {
 
         let total_size = gen_object_total_size(header);
 
-        // Sanity: skip objects with implausibly large computed sizes. This
-        // guards against false conservative roots from JIT spill slots that
-        // bit-match a heap address but don't point at a real object.
-        const MAX_SANE_OBJECT_SIZE: usize = 64 * 1024 * 1024; // 64 MB
-        if total_size > MAX_SANE_OBJECT_SIZE || total_size < HEADER_SIZE {
+        // Sanity: skip objects whose computed extent does not fit entirely
+        // within the young from-space. This guards against false conservative
+        // roots from JIT spill slots that bit-match a heap address but don't
+        // point at a real object — a bogus header yields a size that runs off
+        // the end of the arena. A genuine object, however large, fits within
+        // the arena it was allocated from by construction, so this never
+        // rejects a real live array (a fixed byte cap did: a 64 MB int[] is
+        // perfectly valid at a multi-GB heap).
+        let from_base = young_from.base_ptr() as usize;
+        let from_end = from_base + young_from.capacity();
+        let obj_addr = old_ptr as usize;
+        let fits_in_arena = obj_addr >= from_base
+            && obj_addr
+                .checked_add(total_size)
+                .is_some_and(|obj_end| obj_end <= from_end);
+        if total_size < HEADER_SIZE || !fits_in_arena {
             tracing::warn!(
                 "GC: skipping suspected false root at {:p} (computed size {} bytes, \
                  kind={:?}, num_slots={}, array_len={})",
