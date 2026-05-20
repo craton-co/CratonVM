@@ -33,11 +33,20 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
                 path.display()
             )
         });
-    // `read_class` leaves method attributes (including `Code`) lazily
-    // undecoded; `ClassFileMethod::code()` returns `None` for a `Raw`
-    // attribute. Force-decode so the analyzer/lowerer see the bytecode.
-    force_decode_all(&mut method.attributes, &class.constant_pool)
-        .unwrap_or_else(|e| panic!("failed to decode attributes of {method_name}{descriptor}: {e:?}"));
+    // The class reader leaves attributes in their lazy `Raw` form;
+    // `ClassFileMethod::code()` only sees *decoded* attributes, so
+    // without this the Code attribute is invisible and every
+    // analyzer/lowering test panics with a spurious `NoCode`. Force
+    // every method attribute (and the nested Code attributes) to decode
+    // so fixtures behave like a class loaded by the real VM.
+    rustjvm_reader::attribute::force_decode_all(&mut method.attributes, &class.constant_pool)
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to decode attributes of {method_name}{descriptor} \
+                 in {}: {e:?}",
+                path.display()
+            )
+        });
     method
 }
 
