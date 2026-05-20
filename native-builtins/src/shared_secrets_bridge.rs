@@ -390,19 +390,37 @@ fn jla_new_stack_trace_element(
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cls_name = ctx.get_field_by_name(sfi, "className");
-    let method = ctx.get_field_by_name(sfi, "methodName");
-    let file = ctx.get_field_by_name(sfi, "fileName");
+    let class_dotted = match ctx.get_field_by_name(sfi, "className") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let method = match ctx.get_field_by_name(sfi, "methodName") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let file = match ctx.get_field_by_name(sfi, "fileName") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    };
     let line = match ctx.get_field_by_name(sfi, "lineNumber") {
         Value::Int(l) => l,
         _ => -1,
     };
+    let class_slashed = class_dotted.replace('.', "/");
     let ste = ctx.new_object("java/lang/StackTraceElement")?;
     if let Some(Value::Object(Some(o))) = ste.clone() {
-        ctx.set_field_by_name(o, "declaringClass", cls_name);
-        ctx.set_field_by_name(o, "methodName", method);
-        ctx.set_field_by_name(o, "fileName", file);
-        ctx.set_field_by_name(o, "lineNumber", Value::Int(line));
+        // Use the shared filler so `declaringClassObject` is also
+        // populated with the real Class mirror — `computeFormat()`
+        // needs it (otherwise `getClassLoader0()` NPEs / mis-resolves).
+        crate::lang_misc::fill_stack_trace_element(
+            ctx,
+            o,
+            &class_slashed,
+            &class_dotted,
+            &method,
+            file.as_deref(),
+            line,
+        );
     }
     Ok(ste)
 }
