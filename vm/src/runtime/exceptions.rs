@@ -370,6 +370,9 @@ pub fn throw_runtime_error(
         RuntimeError::FileNotFoundException { path } => {
             ("java/io/FileNotFoundException", Some(path.as_str()))
         }
+        RuntimeError::NoSuchFileException { path } => {
+            ("java/nio/file/NoSuchFileException", Some(path.as_str()))
+        }
         RuntimeError::UnsupportedOperationException { message } => (
             "java/lang/UnsupportedOperationException",
             Some(message.as_str()),

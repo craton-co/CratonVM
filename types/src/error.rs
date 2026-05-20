@@ -232,6 +232,9 @@ pub enum RuntimeError {
     #[error("FileNotFoundException: {path}")]
     FileNotFoundException { path: String },
 
+    #[error("NoSuchFileException: {path}")]
+    NoSuchFileException { path: String },
+
     #[error("UnsupportedOperationException: {message}")]
     UnsupportedOperationException { message: String },
 
