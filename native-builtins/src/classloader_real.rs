@@ -374,32 +374,78 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // ClassLoader.loadClass(String) — delegate to VM class loading
+    // ClassLoader.loadClass(String) — delegate to VM class loading.
+    //
+    // `findClass` is the documented `ClassLoader` extension point: application
+    // code subclasses `ClassLoader` and overrides `findClass` to load classes
+    // from custom sources (Eclipse Equinox OSGi, custom classloaders). The JVM
+    // `loadClass` contract is "after parent delegation fails, call findClass".
+    // Because this native stands in for `ClassLoader.loadClass` (CratonVM keeps
+    // no JDK bytecode for it), it MUST perform the virtual `findClass` dispatch
+    // itself when the receiver is a non-builtin subclass that overrides it —
+    // otherwise the override is silently shadowed and custom classloaders break.
     r.register(
         cl,
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
+        cl_real_load_class,
+    );
+    r.register(
+        cl,
+        "loadClass",
+        "(Ljava/lang/String;Z)Ljava/lang/Class;",
         |ctx, args| {
-            let class_name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
-            let internal = class_name.replace('.', "/");
-            match ctx.load_class(&internal) {
-                Ok(Some(mirror)) => {
-                    Ok(Some(mirror))
-                }
-                Ok(None) | Err(_) => {
-                    // JDK spec: ClassLoader.loadClass throws ClassNotFoundException
-                    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
-                    let msg = ctx.create_string(&class_name);
-                    ctx.set_field(exc, 0, Value::Object(Some(msg)));
-                    Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc))
-                }
-            }
+            // The boolean `resolve` arg (slot 2) is ignored — we always resolve.
+            // Drop it so `cl_real_load_class` sees the `(receiver, name)` shape.
+            let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
+            cl_real_load_class(ctx, &trimmed)
         },
     );
+}
+
+/// `ClassLoader.loadClass(String)` for real-JDK mode.
+///
+/// Delegation order (JVMS §5.3 / `ClassLoader.loadClass` contract):
+///   1. standard VM class loading (bootstrap → platform → app),
+///   2. if that fails and the receiver is a non-builtin `ClassLoader`
+///      subclass overriding `findClass`, dispatch the override virtually,
+///   3. otherwise throw `ClassNotFoundException`.
+fn cl_real_load_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> rustjvm_types::error::MethodCallResult {
+    let class_name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
+    let internal = class_name.replace('.', "/");
+
+    // 1. Standard VM class loading.
+    if let Ok(Some(mirror)) = ctx.load_class(&internal) {
+        return Ok(Some(mirror));
+    }
+
+    // 2. Custom-classloader extension point: if the receiver overrides
+    //    `findClass`, the JVM `loadClass` contract requires us to call it.
+    //    `invoke_virtual` resolves on the receiver's actual class, so this
+    //    dispatches to the subclass's overriding `findClass` bytecode.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if crate::classloader::receiver_overrides_find_class(ctx, *this) {
+            return ctx.invoke_virtual(
+                *this,
+                "findClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(class_name_obj))],
+            );
+        }
+    }
+
+    // 3. Genuinely not found and no user override — throw CNFE per spec.
+    let exc = alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+    let msg = ctx.create_string(&class_name);
+    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    Err(rustjvm_types::error::MethodCallFailed::ExceptionThrown(exc))
 }
 
 /// Get or create the system (app) class loader singleton.

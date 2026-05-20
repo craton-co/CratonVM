@@ -408,6 +408,59 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
+/// True if `class_name` is a base / built-in classloader class for which the
+/// Rust `cl_load_class` / `cl_find_class` natives are authoritative — there is
+/// no user-supplied Java `findClass` override to defer to.
+pub(crate) fn is_builtin_loader_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/lang/ClassLoader"
+            | "java/net/URLClassLoader"
+            | "java/security/SecureClassLoader"
+    ) || class_name.starts_with("jdk/internal/loader/")
+        || class_name.starts_with("sun/misc/Launcher$")
+}
+
+/// Virtual-dispatch correctness for custom `ClassLoader` subclasses.
+///
+/// `cl_load_class` is registered as the Rust native for
+/// `ClassLoader.loadClass`. When application code subclasses `ClassLoader`
+/// and overrides `findClass` (the documented extension point — Equinox OSGi,
+/// custom classloaders generally), the inherited `loadClass` MUST still
+/// dispatch to that override (JVMS §5.3 / `ClassLoader.loadClass` contract).
+/// Because CratonVM has no Java bytecode for `ClassLoader.loadClass` to run,
+/// the native must perform the `findClass` callback itself.
+///
+/// Returns the `ObjectRef` of the receiver's actual class **iff** the
+/// receiver is a non-builtin `ClassLoader` subclass whose hierarchy declares
+/// its own `findClass` bytecode (i.e. a genuine user override). Returns
+/// `None` for base / built-in loaders, where the native fallback is correct
+/// and a `findClass` callback would recurse.
+pub(crate) fn receiver_overrides_find_class(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    while let Some(id) = cid {
+        let name = match ctx.class_name_of_id(id) {
+            Some(n) => n,
+            None => return false,
+        };
+        if is_builtin_loader_class(&name) {
+            // Reached the builtin base without seeing a user override.
+            return false;
+        }
+        // A `findClass` declared on this (non-builtin) class is a real
+        // user override of the extension point.
+        if ctx
+            .declared_methods(id)
+            .iter()
+            .any(|m| m.name == "findClass")
+        {
+            return true;
+        }
+        cid = ctx.superclass_of(id);
+    }
+    false
+}
+
 fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name_obj = match args.get(1) {
@@ -475,13 +528,36 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
     // 3. Parent couldn't find it — fall back to standard loading
     //    (this covers bootstrap → extension → application delegation)
-    match ctx.ensure_class_initialized(&internal) {
-        Ok(cid) => {
-            let mirror = ctx.get_class_mirror(cid);
-            Ok(Some(Value::Object(Some(mirror))))
-        }
-        Err(_) => Ok(Some(Value::Object(None))),
+    if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
+        let mirror = ctx.get_class_mirror(cid);
+        return Ok(Some(Value::Object(Some(mirror))));
     }
+
+    // 4. Custom-classloader extension point. The JVM `ClassLoader.loadClass`
+    //    contract is: after parent delegation fails, call `findClass(name)`.
+    //    `findClass` is the documented override hook — application code
+    //    (Eclipse Equinox OSGi, custom loaders) subclasses `ClassLoader`
+    //    and overrides `findClass` to load from a custom source. Since this
+    //    Rust native stands in for `ClassLoader.loadClass` (CratonVM keeps
+    //    no JDK bytecode for it), the native must perform the virtual
+    //    `findClass` dispatch itself so the user override actually runs.
+    //
+    //    Guarded by `receiver_overrides_find_class` so this only fires for
+    //    genuine non-builtin subclasses — a built-in loader has no override
+    //    and the callback would recurse back into `cl_find_class`.
+    if receiver_overrides_find_class(ctx, this) {
+        // `invoke_virtual` resolves on the receiver's actual class, so this
+        // dispatches to the subclass's overriding `findClass` bytecode.
+        return ctx.invoke_virtual(
+            this,
+            "findClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name_obj))],
+        );
+    }
+
+    // 5. Not found and no user override — class genuinely missing.
+    Ok(Some(Value::Object(None)))
 }
 
 fn cl_load_class_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
