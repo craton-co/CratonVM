@@ -515,6 +515,97 @@ mod tests {
         );
     }
 
+    // ──────── array opcode ↔ element-kind mismatch rejection ────────
+    //
+    // AUDIT 2026-05-20: `array_param_of` returned the parameter's
+    // `ParamKind` element type but every array-access call site
+    // discarded it (`let (idx, _kind) = ...`). Nothing verified that an
+    // `iaload` was issued against an `int[]` rather than a `float[]`,
+    // so a type-confused access emitted a load/store of the wrong
+    // width/signedness against a buffer of a different element type —
+    // silent bit-reinterpreted data corruption with no rejection.
+    //
+    // We cannot express this with a javac-compiled fixture: the Java
+    // type-checker forbids `iaload` on a `float[]`. The mismatch is a
+    // *VM-internal* inconsistency between the descriptor-derived
+    // `param_kinds` and the array opcode the bytecode actually uses.
+    // These tests reproduce it directly by lowering a real fixture's
+    // bytecode under a deliberately-wrong `KernelSignature`.
+
+    /// `EligibleVectorAdd.vectorAdd` does `iaload`/`iastore`. Lowered
+    /// with a signature that (wrongly) declares the params as `float[]`,
+    /// the element-kind check must reject the method so it falls back to
+    /// the safe CPU interpreter.
+    #[test]
+    fn iaload_on_float_array_param_is_rejected() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        // Deliberately mistyped signature: the bytecode does integer
+        // array ops, but we tell the lowerer the params are float[].
+        let bad_sig = KernelSignature {
+            param_kinds: vec![
+                ParamKind::F32Array,
+                ParamKind::F32Array,
+                ParamKind::F32Array,
+            ],
+            return_kind: ParamKind::Void,
+            estimated_work: 1 << 20,
+            needs_d2h_sync: false,
+        };
+        let err = lower_method("EligibleVectorAdd", &method, &bad_sig, 7, 5)
+            .expect_err("iaload on a float[] param must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("iaload") || msg.contains("iastore"),
+            "expected an iaload/iastore element-kind mismatch error, got: {msg}",
+        );
+        assert!(
+            msg.contains("F32Array"),
+            "error should name the mismatched declared kind, got: {msg}",
+        );
+    }
+
+    /// Control: the *same* fixture lowered with the *correct* int-array
+    /// signature must still be Eligible — the kind check must not
+    /// reject matching accesses.
+    #[test]
+    fn iaload_on_matching_int_array_param_still_lowers() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let good_sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected EligibleVectorAdd.vectorAdd eligible, got {v:?}"),
+        };
+        // analyze() derives int[] params from the descriptor.
+        assert_eq!(good_sig.param_kinds[0], ParamKind::I32Array);
+        lower_method("EligibleVectorAdd", &method, &good_sig, 7, 5)
+            .expect("matching iaload on int[] must still lower");
+    }
+
+    /// `EligibleSaxpy.saxpy` does `faload`/`fastore` on `float[]`
+    /// params. Lowered under an int-array signature the float ops must
+    /// be rejected.
+    #[test]
+    fn faload_on_int_array_param_is_rejected() {
+        let method = load_method("EligibleSaxpy", "saxpy", "(F[F[F[F)V");
+        let bad_sig = KernelSignature {
+            param_kinds: vec![
+                ParamKind::F32, // the scalar `a` — correct
+                ParamKind::I32Array,
+                ParamKind::I32Array,
+                ParamKind::I32Array,
+            ],
+            return_kind: ParamKind::Void,
+            estimated_work: 1 << 20,
+            needs_d2h_sync: false,
+        };
+        let err = lower_method("EligibleSaxpy", &method, &bad_sig, 7, 5)
+            .expect_err("faload on an int[] param must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("faload") || msg.contains("fastore"),
+            "expected a faload/fastore element-kind mismatch error, got: {msg}",
+        );
+    }
+
     #[test]
     fn drem_is_rejected_by_lowering() {
         let method = load_method("FloatRemainder", "dremScalar", "(DD)D");
