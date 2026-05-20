@@ -156,8 +156,25 @@ pub struct DeviceModule(backend::DeviceModuleInner);
 impl DeviceModule {
     /// Load a PTX text module and resolve the named kernels.
     pub fn from_ptx(ctx: &DeviceContext, ptx: &str, kernel_names: &[&str]) -> Result<Self> {
-        // Use a default module name for cudarc 0.13 API
-        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", kernel_names).map(Self)
+        // cudarc 0.13's `CudaDevice::load_ptx` keeps the kernel-name
+        // slice alive for the lifetime of the loaded module, so the
+        // backend requires `&[&'static str]`. The public surface stays
+        // `&[&str]` for ergonomics; we bridge by interning each name
+        // into a `'static` leak. A PTX module is loaded once and lives
+        // for the rest of the process, so this leak is bounded by the
+        // total distinct kernel-name count — not a per-launch cost.
+        #[cfg(feature = "cuda")]
+        {
+            let static_names: Vec<&'static str> = kernel_names
+                .iter()
+                .map(|n| &*Box::leak(n.to_string().into_boxed_str()))
+                .collect();
+            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", &static_names).map(Self)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", kernel_names).map(Self)
+        }
     }
 
     /// Launch a kernel by name with raw argument bytes. The argument
