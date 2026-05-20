@@ -2673,18 +2673,13 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getInputStream",
         "()Ljava/io/InputStream;",
         |ctx, args| {
-            eprintln!("[UCN-ENTRY] URLConnection.getInputStream ENTERED");
             let this = obj_arg(args, 0)?;
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
                 _ => {
-                    eprintln!("[UCN-DBG] URLConnection.getInputStream: no HUC_URL in field 0 — trying openStream via args");
                     return Err(ioex("URLConnection.getInputStream: no URL"));
                 }
             };
-            let url_str = read_field_string_or(ctx, url_obj, 5, "");
-            let url_str2 = if url_str.is_empty() { read_field_string_or(ctx, url_obj, 0, "") } else { url_str };
-            eprintln!("[UCN-DBG] URLConnection.getInputStream: {}", url_str2);
             ctx.invoke_virtual(
                 url_obj,
                 "openStream",
