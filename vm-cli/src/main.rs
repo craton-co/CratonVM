@@ -351,11 +351,134 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Rewrite common HotSpot launcher spellings so clap can parse them.
+/// Launcher options that consume the *following* argv token as their value
+/// (the `--opt value` form). Needed by [`insert_program_args_separator`] so a
+/// value token (e.g. the classpath string after `-cp`) is not mistaken for the
+/// bare main-class name that selects the program. Both the HotSpot spellings
+/// (`-jar`, `-classpath`, `-cp`, `-p`, `-mp`) and the clap long spellings
+/// (`--jar`, `--classpath`, ...) are listed because this runs before
+/// `normalize_java_launcher_argv` rewrites them.
 ///
-/// Surefire / tooling often invokes `java -classpath Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦` and `java -jar Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦`.
-/// Our clap schema uses `--classpath` / `--jar`; bare `-classpath` used to be
-/// misparsed as `-c` with value `lasspath`, breaking Maven test runs.
+/// Options using the inline `--opt=value` form need no entry here -- the value
+/// travels in the same token. Boolean flags also need no entry.
+const VALUE_TAKING_OPTS: &[&str] = &[
+    "-jar",
+    "--jar",
+    "-classpath",
+    "-cp",
+    "--classpath",
+    "-c",
+    "-p",
+    "--module-path",
+    "-mp",
+    "--Xmx",
+    "--Xbootclasspath",
+    "--java-home",
+    "--Xverify",
+    "--XX:SharedArchiveFile",
+    "--Xshare",
+    "--XX:AOTMode",
+    "--XX:AOTCache",
+    "--XX:AOTCacheOutput",
+    "--dump-missing-natives",
+    "--dump-missing-natives-grouped",
+    "--jdwp-port",
+    "--add-reads",
+    "--add-exports",
+    "--add-opens",
+    "--add-modules",
+    "--Xlog",
+    "--stack-dump-on-timeout",
+    "--gpu-device",
+    "--gpu-min-work",
+];
+
+/// Enforce `java`-launcher positional semantics: every token *after* the
+/// program selector is a program argument and must be passed to the Java
+/// application verbatim -- even if it starts with `-`/`--` or equals
+/// `--help` / `--version` / `--list-modules`.
+///
+/// The program is selected by either `-jar <jarfile>` or the first bare
+/// (non-option) token used as a main-class name. This function scans the
+/// leading option section and, as soon as it identifies the selector,
+/// inserts a literal `--` separator immediately after it. The downstream
+/// stages (`normalize_java_launcher_argv`, `extract_system_properties`,
+/// `extract_hotspot_flags`) and clap itself all treat everything past `--`
+/// as opaque program args, so launcher options are recognised only in the
+/// leading section -- matching the stock `java` launcher.
+///
+/// If the caller already supplied an explicit `--`, or no program selector
+/// is present (e.g. `java --version` / `java --help` with no program), the
+/// argv is returned unchanged so the launcher still handles those itself.
+fn insert_program_args_separator(args: Vec<String>) -> Vec<String> {
+    if args.is_empty() {
+        return args;
+    }
+    let mut out = vec![args[0].clone()];
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        // An explicit separator already delimits the program args -- respect
+        // it and copy the remainder verbatim.
+        if a == "--" {
+            out.extend_from_slice(&args[i..]);
+            return out;
+        }
+        // `-jar <jar>`: the jar is the selector. Copy `-jar` and its operand,
+        // then insert `--` so the rest of argv is program args (unless the
+        // caller already placed an explicit `--` there).
+        if (a == "-jar" || a == "--jar") && i + 1 < args.len() {
+            out.push(args[i].clone());
+            out.push(args[i + 1].clone());
+            if args.get(i + 2).map(String::as_str) != Some("--") {
+                out.push("--".into());
+            }
+            out.extend_from_slice(&args[i + 2..]);
+            return out;
+        }
+        // Inline `--jar=<jar>` / `-jar=<jar>` form.
+        if a.starts_with("-jar=") || a.starts_with("--jar=") {
+            out.push(args[i].clone());
+            if args.get(i + 1).map(String::as_str) != Some("--") {
+                out.push("--".into());
+            }
+            out.extend_from_slice(&args[i + 1..]);
+            return out;
+        }
+        // An option that consumes the next token as its value -- copy both
+        // and keep scanning; the value token is not the main-class name.
+        if VALUE_TAKING_OPTS.contains(&a) {
+            out.push(args[i].clone());
+            if i + 1 < args.len() {
+                out.push(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Any other `-`/`--`-prefixed token in the leading section is a
+        // launcher option (boolean flag or inline `--opt=value`) -- copy and
+        // continue scanning.
+        if a.starts_with('-') {
+            out.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        // First bare token: the main-class name. It selects the program;
+        // insert `--` right after it so all following tokens are program
+        // args (unless an explicit `--` already follows).
+        out.push(args[i].clone());
+        if args.get(i + 1).map(String::as_str) != Some("--") {
+            out.push("--".into());
+        }
+        out.extend_from_slice(&args[i + 1..]);
+        return out;
+    }
+    out
+}
+
+/// Rewrite common HotSpot launcher spellings so clap can parse them.
 fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
     if args.is_empty() {
         return args;
@@ -525,8 +648,16 @@ fn run() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // `java`-launcher positional semantics: insert a `--` separator right
+    // after the program selector (`-jar <jar>` or the first bare main-class
+    // token) so every token past it is treated as a program argument and
+    // passed to the Java application verbatim — even `--help`, `--version`,
+    // `--list-modules`. Without this, clap would intercept those anywhere.
+    // Runs first so the explicit `--` it parks is honoured by every
+    // downstream stage.
+    let argv: Vec<String> = insert_program_args_separator(std::env::args().collect());
     // Extract -Dkey=value system properties before clap parsing
-    let raw_args: Vec<String> = normalize_java_launcher_argv(std::env::args().collect());
+    let raw_args: Vec<String> = normalize_java_launcher_argv(argv);
     let (filtered_args, system_properties) = extract_system_properties(raw_args);
     // T6 CLI compat: strip HotSpot-style flags before clap so their
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
@@ -2112,6 +2243,98 @@ fn parse_size(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // insert_program_args_separator tests — `java`-launcher positional
+    // semantics: tokens after the program selector are program args.
+    // -----------------------------------------------------------------------
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sep_jar_then_program_help_is_program_arg() {
+        // `-jar foo.jar --help`: `--help` must become a program arg.
+        let out = insert_program_args_separator(argv(&["java", "-jar", "foo.jar", "--help"]));
+        assert_eq!(out, argv(&["java", "-jar", "foo.jar", "--", "--help"]));
+    }
+
+    #[test]
+    fn sep_jar_with_leading_opts() {
+        // Launcher options before `-jar` stay in the leading section.
+        let out = insert_program_args_separator(argv(&[
+            "java",
+            "--java-home",
+            "C:/jdk",
+            "-jar",
+            "app.jar",
+            "--list-modules",
+            "--version",
+        ]));
+        assert_eq!(
+            out,
+            argv(&[
+                "java",
+                "--java-home",
+                "C:/jdk",
+                "-jar",
+                "app.jar",
+                "--",
+                "--list-modules",
+                "--version",
+            ])
+        );
+    }
+
+    #[test]
+    fn sep_bare_main_class_then_program_args() {
+        // `-cp bench Main --help 0`: `Main` selects the program; everything
+        // after it (including `--help`) is a program arg.
+        let out =
+            insert_program_args_separator(argv(&["java", "-cp", "bench", "Main", "--help", "0"]));
+        assert_eq!(
+            out,
+            argv(&["java", "-cp", "bench", "Main", "--", "--help", "0"])
+        );
+    }
+
+    #[test]
+    fn sep_no_program_left_unchanged() {
+        // `java --version` with no program: nothing to delimit; the
+        // launcher must still handle `--version` itself.
+        let inp = argv(&["java", "--version"]);
+        assert_eq!(insert_program_args_separator(inp.clone()), inp);
+        let inp = argv(&["java", "--help"]);
+        assert_eq!(insert_program_args_separator(inp.clone()), inp);
+    }
+
+    #[test]
+    fn sep_explicit_separator_respected() {
+        // An explicit `--` already delimits program args; copy verbatim.
+        let inp = argv(&["java", "-jar", "a.jar", "--", "--help"]);
+        assert_eq!(insert_program_args_separator(inp.clone()), inp);
+    }
+
+    #[test]
+    fn sep_value_token_not_mistaken_for_main_class() {
+        // The classpath string after `-cp` is a value, not the main class.
+        let out = insert_program_args_separator(argv(&[
+            "java", "-cp", "lib.jar", "Main", "arg1",
+        ]));
+        assert_eq!(
+            out,
+            argv(&["java", "-cp", "lib.jar", "Main", "--", "arg1"])
+        );
+    }
+
+    #[test]
+    fn sep_inline_jar_value() {
+        // `--jar=foo.jar` inline form: `--version` after it is a program arg.
+        let out =
+            insert_program_args_separator(argv(&["java", "--jar=foo.jar", "--version"]));
+        assert_eq!(out, argv(&["java", "--jar=foo.jar", "--", "--version"]));
+    }
 
     // -----------------------------------------------------------------------
     // parse_size tests
