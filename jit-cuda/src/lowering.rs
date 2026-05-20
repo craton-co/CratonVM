@@ -344,7 +344,7 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("fixture {class}.{method_name} not eligible: {v:?}"),
         };
-        lower_method(class, &method, &sig, 7, 0)
+        lower_method(class, &method, &sig, 7, 5)
             .unwrap_or_else(|e| panic!("lowering failed for {class}.{method_name}: {e}"))
     }
 
@@ -354,7 +354,7 @@ mod tests {
         let text = m.render();
         // Headers + entry name
         assert!(text.contains(".version 7.5"));
-        assert!(text.contains(".target sm_70"));
+        assert!(text.contains(".target sm_75"));
         assert!(text.contains(".visible .entry EligibleVectorAdd__vectorAdd_"));
         // tid computation
         assert!(text.contains("%ctaid.x"));
@@ -432,7 +432,7 @@ mod tests {
         std::fs::write(&src_path, &text).expect("write ptx");
         let ptxas = std::env::var("PTXAS").unwrap_or_else(|_| "ptxas".to_string());
         let out = std::process::Command::new(&ptxas)
-            .arg("-arch=sm_70")
+            .arg("-arch=sm_75")
             .arg(&src_path)
             .output()
             .expect("invoke ptxas");
@@ -469,7 +469,7 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("expected TwoLoops.clearTwice to be eligible, got {v:?}"),
         };
-        let err = lower_method("TwoLoops", &method, &sig, 7, 0)
+        let err = lower_method("TwoLoops", &method, &sig, 7, 5)
             .expect_err("two-loop method must not lower");
         let msg = format!("{err}");
         assert!(
@@ -506,7 +506,7 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("expected FloatRemainder.fremScalar to be analyzer-eligible, got {v:?}"),
         };
-        let err = lower_method("FloatRemainder", &method, &sig, 7, 0)
+        let err = lower_method("FloatRemainder", &method, &sig, 7, 5)
             .expect_err("frem must not lower (PTX has no rem.f32)");
         let msg = format!("{err}");
         assert!(
@@ -522,7 +522,7 @@ mod tests {
             OffloadVerdict::Eligible(s) => s,
             v => panic!("expected FloatRemainder.dremScalar to be analyzer-eligible, got {v:?}"),
         };
-        let err = lower_method("FloatRemainder", &method, &sig, 7, 0)
+        let err = lower_method("FloatRemainder", &method, &sig, 7, 5)
             .expect_err("drem must not lower (PTX has no rem.f64)");
         let msg = format!("{err}");
         assert!(

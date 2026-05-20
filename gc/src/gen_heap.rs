@@ -1236,44 +1236,44 @@ impl GenerationalHeap {
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         // SAFETY: If any thread is currently inside a JIT call, we MUST NOT
-        // run a moving collection. JIT frames hold raw object pointers in
-        // their spill slots which are NOT visible to the conservative root
-        // scanner — a Cheney copy would relocate those objects but leave the
-        // JIT frame holding the stale (pre-move) address. Subsequent reads
-        // through that spill slot would dereference freed memory, and writes
-        // would corrupt unrelated allocations.
+        // run a *moving* collection. JIT frames hold raw object pointers in
+        // their spill slots / registers which are NOT precisely described by
+        // an oop map — the GC sees them only through the *conservative*
+        // stack scan (`conservative_roots::scan_active_jit_frames`). A Cheney
+        // copy would relocate those objects but it cannot safely rewrite a
+        // conservatively-discovered slot: a stack word that merely *looks*
+        // like a heap pointer might actually be an `i64`, and rewriting it
+        // would corrupt the mutator's data.
         //
-        // Until precise JIT oop maps are wired into the GC (so spill slots
-        // can be rewritten with forwarded pointers — see
-        // `find_oop_map_for_pc` in `jit/src/lib.rs`), the only safe response
-        // is to skip this collection cycle entirely. We do NOT install
-        // forwarding pointers, do NOT swap spaces, and do NOT reset arenas.
+        // Previously the collector simply *skipped* the cycle entirely while
+        // any JIT frame was live. Because a busy program always has a JIT
+        // frame on the stack, the young gen would fill and the process would
+        // OOM (the user-visible "young gen exhausted" abort).
         //
-        // The mutator will continue allocating from the (possibly full)
-        // young gen. If the young gen is exhausted before quiescence ends
-        // the allocator will surface OOM to the caller — that is strictly
-        // safer than silently corrupting live JIT-managed pointers.
+        // The fix: when JIT frames are active, run a **non-moving**
+        // mark-sweep of the young generation instead of skipping. A
+        // non-moving collection never relocates an object, so every JIT
+        // spill slot stays valid no matter what it points at. Marking is
+        // precise enough — it starts from the full root set (interpreter
+        // frames, statics, JNI handles, *and* the conservative JIT-frame
+        // roots that the caller already folded into `roots`) plus the
+        // old→young dirty-card references — and dead young objects are
+        // reclaimed into the from-space free list. Conservative false
+        // positives only over-retain; they can never free a live object.
         //
-        // TODO: Skipped collection because JIT quiescence is active. Remove
-        // once precise JIT oop maps land.
+        // This reclaims memory while JIT frames are live and eliminates the
+        // OOM. A precise compacting collection still runs once every JIT
+        // call has returned (quiescence ends), so fragmentation introduced
+        // by the non-moving sweep is transient.
         if crate::gc_quiescence::is_active() {
-            tracing::warn!(
-                "GC skipped: JIT frames are active (depth={}) — moving \
-                 collection would invalidate raw pointers held in JIT spill \
-                 slots. Retrying once quiescence ends.",
+            tracing::debug!(
+                "JIT frames are active (depth={}) — running non-moving \
+                 young-gen mark-sweep (compaction deferred until quiescence \
+                 ends).",
                 crate::gc_quiescence::depth(),
             );
-            return (
-                GcResult {
-                    stats: crate::gc::GcStats {
-                        objects_copied: 0,
-                        bytes_copied: 0,
-                        bytes_freed: 0,
-                    },
-                    pointer_map: HashMap::new(),
-                },
-                Vec::new(),
-            );
+            let result = self.sweep_young_non_moving(roots, finalizer_addrs);
+            return result;
         }
 
         let mut young_from = self.young_from.lock();
@@ -1868,6 +1868,285 @@ impl GenerationalHeap {
                 pointer_map,
             },
             dead_finalizers,
+        )
+    }
+
+    /// Non-moving young-generation mark-sweep, used when JIT frames are
+    /// active and a moving (Cheney) collection would be unsafe.
+    ///
+    /// Unlike [`Self::collect_garbage_inner`]'s copying collector, this
+    /// **never relocates an object**. Survivors keep their exact
+    /// addresses, so every raw pointer held in a JIT spill slot or
+    /// register stays valid regardless of whether the GC could describe
+    /// it precisely. Dead young objects are reclaimed into the
+    /// from-space arena's free list (see [`Arena::add_free_block`]).
+    ///
+    /// ## Correctness
+    ///
+    /// Marking must be **complete** — a non-moving sweep frees every
+    /// young object that is not marked, so a missed root would free a
+    /// live object. The root set is:
+    ///
+    ///   * `roots` — every precise VM root the caller gathered
+    ///     (interpreter frame locals/stacks, statics, JNI handles, class
+    ///     locks, autobox caches, …) **plus** the conservative
+    ///     JIT-frame roots that `collect_roots` already appended via
+    ///     `conservative_roots::scan_active_jit_frames`.
+    ///   * old→young references discovered by scanning dirty cards.
+    ///   * `finalizer_addrs` — finalizable objects kept alive so their
+    ///     `finalize()` can run.
+    ///
+    /// A conservative false-positive root only over-retains an object;
+    /// it can never cause a live object to be freed. Because nothing
+    /// moves, a stack word that merely *looks* like a pointer is never
+    /// rewritten, so the mutator's non-pointer data is never corrupted.
+    ///
+    /// Returns an empty pointer map (no object moved) and the list of
+    /// resurrected dead-finalizer addresses (unchanged, since they too
+    /// stay in place).
+    fn sweep_young_non_moving(
+        &self,
+        roots: &[ObjectRef],
+        finalizer_addrs: &[usize],
+    ) -> (GcResult, Vec<usize>) {
+        let mut young_from = self.young_from.lock();
+        let old_gen = self.old_gen.lock();
+
+        // Fold every mutator's thread-local card buffer into the bitmap
+        // before scanning dirty cards (same protocol as the moving path).
+        self.card_table.flush_all();
+        self.card_table.drain_pending();
+
+        let bytes_before = young_from.used();
+        let from_base = young_from.base_ptr() as usize;
+        let from_end = from_base + young_from.used();
+
+        // Helper: is `addr` the start of a young from-space object?
+        let in_young = |addr: usize| -> bool {
+            addr >= from_base && addr < from_end && (addr & 0x7) == 0
+        };
+
+        // ----- Mark phase -------------------------------------------------
+        //
+        // BFS over young-gen objects. The worklist holds young object
+        // pointers that have been marked but not yet scanned. Marking an
+        // old-gen object is unnecessary for a young collection, but we
+        // still traverse *through* an old-gen object if a dirty card says
+        // it may reference young gen (handled below via the dirty-card
+        // seed). Marking uses `GC_FLAG_MARKED` in the object header.
+        let mut worklist: Vec<*mut u8> = Vec::new();
+
+        // mark_if_young: mark a candidate young pointer and enqueue it.
+        // SAFETY contract: `ptr` is only dereferenced after `in_young`
+        // confirms it lands inside the live from-space region.
+        let mut mark_young = |ptr: *mut u8, worklist: &mut Vec<*mut u8>| {
+            let addr = ptr as usize;
+            if !in_young(addr) {
+                return;
+            }
+            // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
+            // address inside the live from-space region, so reading an
+            // ObjectHeader there is valid.
+            let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+            // Reject implausible headers — a conservative root may point
+            // at a non-object word. `is_object_address`-style sanity.
+            if (header.kind as u8) > 1
+                || header.num_slots > (1 << 24)
+                || header.array_length > (1 << 27)
+            {
+                return;
+            }
+            if header.gc_flags & GC_FLAG_MARKED == 0 {
+                header.gc_flags |= GC_FLAG_MARKED;
+                worklist.push(ptr);
+            }
+        };
+
+        // Seed: precise + conservative roots gathered by the caller.
+        for root in roots.iter() {
+            mark_young(root.as_ptr(), &mut worklist);
+        }
+
+        // Seed: finalizable objects — keep them alive so finalize() runs.
+        for &addr in finalizer_addrs {
+            mark_young(addr as *mut u8, &mut worklist);
+        }
+
+        // Seed: old→young references from dirty cards. Reuse the existing
+        // dirty-card scanner, which yields (old_obj, slot_idx, _) tuples;
+        // we read the referenced young object out of each slot.
+        let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
+        Self::scan_dirty_cards(&self.card_table, &old_gen, &young_from, &mut extra_roots);
+        // `scan_dirty_cards` *consumes* the dirty-card tracking list. Since
+        // this collection does not move young objects, every old→young
+        // reference it found is still valid and the card covering it must
+        // stay dirty for the NEXT collection. Re-dirty each old object's
+        // card after we have read its slots below.
+        let mut redirty_cards: Vec<usize> = Vec::with_capacity(extra_roots.len());
+        for &(old_obj, slot_idx, _) in &extra_roots {
+            // Card covering this old object must remain dirty for the
+            // next GC (the old→young edge survives an in-place sweep).
+            redirty_cards.push(old_obj.as_ptr() as usize);
+            // SAFETY: `old_obj` is a live old-gen object from dirty-card
+            // scanning; its header is valid.
+            let header = unsafe { &*(old_obj.as_ptr() as *const ObjectHeader) };
+            if header.kind == ObjectKind::Array
+                && header.element_type == ArrayElementType::Reference
+            {
+                // SAFETY: `slot_idx` is within array bounds (from card scan).
+                let slot_ptr = unsafe {
+                    old_obj
+                        .as_ptr()
+                        .add(HEADER_SIZE + slot_idx * REF_ELEMENT_SIZE)
+                };
+                // SAFETY: `slot_ptr` is a valid 8-byte ref element.
+                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                if raw != 0 {
+                    mark_young(raw as usize as *mut u8, &mut worklist);
+                }
+            } else {
+                // SAFETY: `slot_idx` is within `num_slots` (from card scan).
+                let slot_ptr =
+                    unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                // SAFETY: `slot_ptr` is a valid Value-sized slot.
+                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                if let Value::Object(Some(ref_obj)) = value {
+                    mark_young(ref_obj.as_ptr(), &mut worklist);
+                }
+            }
+        }
+
+        // Restore the dirty cards consumed by `scan_dirty_cards` so the
+        // next collection still sees these old→young references.
+        self.card_table.mark_dirty_bulk(&redirty_cards);
+
+        // BFS: transitively mark every young object reachable from a root.
+        while let Some(obj_ptr) = worklist.pop() {
+            // SAFETY: `obj_ptr` was validated by `mark_young` before being
+            // pushed — it is a sane young-gen object header.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            if header.kind == ObjectKind::Array {
+                if header.element_type == ArrayElementType::Reference {
+                    for i in 0..header.array_length as usize {
+                        // SAFETY: `i` < `array_length`; offset within array data.
+                        let s_ptr =
+                            unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                        // SAFETY: `s_ptr` is a valid 8-byte ref element.
+                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                        if raw != 0 {
+                            mark_young(raw as usize as *mut u8, &mut worklist);
+                        }
+                    }
+                }
+            } else {
+                for slot_idx in 0..header.num_slots as usize {
+                    // SAFETY: `slot_idx` < `num_slots`; offset within field region.
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                    // SAFETY: `s_ptr` is a valid Value-sized slot.
+                    let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        mark_young(ref_obj.as_ptr(), &mut worklist);
+                    }
+                }
+            }
+        }
+
+        // ----- Sweep phase ------------------------------------------------
+        //
+        // Walk the from-space linearly, skipping holes already on the free
+        // list (exactly as `OldGen::walk_objects` does — a hole's stale
+        // bytes must never be parsed as an object). Every *unmarked*
+        // object is dead: zero it and return its span to the free list.
+        // Every marked object is a survivor: clear the mark and leave it
+        // exactly where it is.
+        let existing_free = young_from.free_blocks_sorted();
+        let mut dead_regions: Vec<(usize, usize)> = Vec::new();
+        let mut bytes_swept: usize = 0;
+        let mut objects_swept: usize = 0;
+        let mut objects_live: usize = 0;
+
+        let mut cursor: usize = 0;
+        let used = young_from.used();
+        let mut free_iter = existing_free.iter().peekable();
+        while cursor < used {
+            // If `cursor` is the start of a known free block, skip it.
+            if let Some(&&(off, sz)) = free_iter.peek() {
+                if cursor == off {
+                    cursor += sz;
+                    free_iter.next();
+                    continue;
+                }
+            }
+            // SAFETY: `cursor` is within `used`; the from-space region
+            // `[base, base+used)` is backed by mapped, allocated memory.
+            let obj_ptr = unsafe { (from_base + cursor) as *mut u8 };
+            let header = unsafe { &mut *(obj_ptr as *const ObjectHeader as *mut ObjectHeader) };
+            let total_size = gen_object_total_size(header);
+            // Defensive: a corrupt / zero-size header would desynchronise
+            // the linear walk. Stop rather than risk freeing live data.
+            if total_size < HEADER_SIZE || cursor + total_size > used {
+                tracing::warn!(
+                    "non-moving sweep: stopping walk at offset {} — implausible \
+                     object size {} (kind={:?}, num_slots={}, array_len={})",
+                    cursor,
+                    total_size,
+                    header.kind,
+                    header.num_slots,
+                    header.array_length,
+                );
+                break;
+            }
+
+            if header.gc_flags & GC_FLAG_MARKED != 0 {
+                // Survivor: clear the mark, keep in place.
+                header.gc_flags &= !GC_FLAG_MARKED;
+                objects_live += 1;
+            } else {
+                // Dead: zero the whole object span so a later conservative
+                // root scan cannot resurrect a stale header inside the
+                // reclaimed hole, then record it for the free list.
+                // SAFETY: `[obj_ptr, obj_ptr+total_size)` lies within the
+                // live from-space region (checked above).
+                unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
+                dead_regions.push((cursor, total_size));
+                bytes_swept += total_size;
+                objects_swept += 1;
+            }
+            cursor += total_size;
+        }
+
+        // Publish reclaimed regions to the arena's free list. Subsequent
+        // `try_alloc_young` calls will satisfy allocations from these
+        // holes before bumping the cursor — reclaiming memory without
+        // moving a single survivor.
+        for (off, sz) in dead_regions {
+            young_from.add_free_block(off, sz);
+        }
+
+        let live_bytes = bytes_before.saturating_sub(bytes_swept);
+        tracing::debug!(
+            "non-moving young sweep: {} live objects ({} bytes), {} dead \
+             objects reclaimed ({} bytes) into free list",
+            objects_live,
+            live_bytes,
+            objects_swept,
+            bytes_swept,
+        );
+
+        self.stats.minor_gc_count.fetch_add(1, Ordering::Relaxed);
+
+        (
+            GcResult {
+                stats: crate::gc::GcStats {
+                    objects_copied: 0,
+                    bytes_copied: live_bytes,
+                    bytes_freed: bytes_swept,
+                },
+                // Nothing moved — no roots need rewriting.
+                pointer_map: HashMap::new(),
+            },
+            // Resurrected finalizers keep their addresses (non-moving).
+            finalizer_addrs.to_vec(),
         )
     }
 

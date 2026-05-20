@@ -572,13 +572,89 @@ fn native_file_rename_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // ---------------------------------------------------------------------------
 // Native method implementations: java.io.FileInputStream
 // ---------------------------------------------------------------------------
+//
+// FD-STORAGE CONTRACT (FIS-FIX 2026-05-19):
+//
+// The real-JDK `java.io.FileInputStream` declares its first instance field
+// as `fd` of type `java.io.FileDescriptor` — a *reference* slot, NOT an int.
+// Writing a raw `Value::Int(fd)` into that reference slot is silently
+// dropped by the heap (the slot is reference-typed), so the descriptor
+// reads back as `null` and every subsequent `read`/`available` saw EOF.
+// This broke `Properties.load(new FileInputStream(...))` — the failure mode
+// that made Tomcat's `CatalinaProperties` return a null `common.loader`
+// and ultimately threw `ClassNotFoundException` for `o.a.c.startup.Catalina`.
+//
+// The correct location for the OS handle is the `FileDescriptor` object's
+// own `fd`(int)/`handle`(long) fields — exactly how `RandomAccessFile`
+// already does it. The JDK `FileInputStream` constructor allocates that
+// `FileDescriptor` and then calls the `open0` native, so we DO NOT register
+// a native `<init>` override any more: the JDK constructor runs, creates
+// the descriptor, and `open0` populates it.
+//
+// `fis_get_fd` additionally tolerates two legacy synthetic layouts:
+//   * a raw int FdId in instance slot 0 (older synthetic streams), and
+//   * the `fd+1` encoding in slot 1 used by the canonical `System.in`
+//     object allocated in `vm_util::ensure_system_stdin_object`.
 
-fn native_fis_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Resolve the `java.io.FileDescriptor` object referenced by a
+/// `FileInputStream`/`FileOutputStream`'s `fd` field, if present.
+fn fis_fd_object(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "fd") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// Store an open `FdId` so later `read`/`available`/`close` natives can
+/// recover it. Prefers the `FileDescriptor` object (real-JDK layout);
+/// also mirrors the id into instance slot 0 so synthetic objects without
+/// a `FileDescriptor` keep working.
+fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
+    if let Some(fd_obj) = fis_fd_object(ctx, this) {
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+    }
+    ctx.set_field(this, 0, Value::Int(fd as i32));
+}
+
+/// Recover the `FdId` previously stored on a `FileInputStream`.
+///
+/// Tries, in order: the `FileDescriptor` object's `fd`/`handle` fields,
+/// a raw int in instance slot 0, then the `fd+1` encoding in slot 1
+/// (canonical `System.in`).
+fn fis_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
+    if let Some(fd_obj) = fis_fd_object(ctx, this) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            // `fd == 0` is a legitimate descriptor (stdin); `-1` means closed.
+            Value::Int(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+    }
+    // Legacy synthetic layouts.
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v >= 0 => return Some(v as FdId),
+        _ => {}
+    }
+    // `System.in`: slot 1 holds `fd+1` (0 means "unset").
+    match ctx.get_field(this, 1) {
+        Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
+        _ => {}
+    }
+    None
+}
+
+fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args[0] = this (FileInputStream), args[1] = path (String).
+    // Invoked by the JDK constructor after it has allocated `this.fd`.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             return Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: "FileInputStream.<init>: missing this".to_string(),
+                message: "FileInputStream.open0: missing this".to_string(),
             }))
         }
     };
@@ -591,34 +667,7 @@ fn native_fis_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         .fd_table()
         .open_read(&path)
         .map_err(|_| file_not_found(&path))?;
-    ctx.set_field(this, 0, Value::Int(fd as i32));
-    Ok(None)
-}
-
-fn native_fis_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: "FileInputStream.<init>: missing this".to_string(),
-            }))
-        }
-    };
-    let file_obj = match args.get(1) {
-        Some(Value::Object(Some(f))) => *f,
-        _ => {
-            return Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: "FileInputStream.<init>(File): missing File arg".to_string(),
-            }))
-        }
-    };
-    let path = read_file_path(ctx, file_obj).unwrap_or_default();
-    let path = validated_path(&path)?;
-    let fd = ctx
-        .fd_table()
-        .open_read(&path)
-        .map_err(|_| file_not_found(&path))?;
-    ctx.set_field(this, 0, Value::Int(fd as i32));
+    fis_set_fd(ctx, this, fd);
     Ok(None)
 }
 
@@ -627,9 +676,9 @@ fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(Some(Value::Int(-1))),
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(Some(Value::Int(-1))),
     };
     let result = ctx.fd_table().read_byte(fd).map_err(io_err)?;
     Ok(Some(Value::Int(result)))
@@ -653,9 +702,9 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(l)) => *l as usize,
         _ => 0,
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(Some(Value::Int(-1))),
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
     let read_start = std::time::Instant::now();
@@ -671,6 +720,10 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(n as i32)))
 }
 
+// Retained for the `read([B)I` shape; the JDK 25 `read([B)I` is plain
+// bytecode that routes through `readBytes`, so this is not registered,
+// but kept available for synthetic callers.
+#[allow(dead_code)]
 fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0]=this, args[1]=byte[]
     let this = match args.first() {
@@ -682,9 +735,9 @@ fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(Some(Value::Int(-1))),
     };
     let len = ctx.array_length(arr);
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(Some(Value::Int(-1))),
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
     let n = ctx.fd_table().read_bytes(fd, &mut buf).map_err(io_err)?;
@@ -701,9 +754,9 @@ fn native_fis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(Some(Value::Int(0))),
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(Some(Value::Int(0))),
     };
     let n = ctx.fd_table().available(fd).unwrap_or(0);
     Ok(Some(Value::Int(n as i32)))
@@ -722,9 +775,9 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if n <= 0 {
         return Ok(Some(Value::Long(0)));
     }
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(Some(Value::Long(0))),
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(Some(Value::Long(0))),
     };
     // Read and discard `n` bytes
     let to_skip = n.min(8192) as usize;
@@ -738,11 +791,18 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fis_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     let _ = ctx.fd_table().close(fd);
+    // Mark the descriptor closed so a double-close / post-close read is a
+    // clean EOF rather than reusing a recycled fd id.
+    if let Some(fd_obj) = fis_fd_object(ctx, this) {
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    }
+    ctx.set_field(this, 0, Value::Int(-1));
     Ok(None)
 }
 
@@ -2985,38 +3045,14 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- java.io.FileInputStream ---
-    registry.register(
-        "java/io/FileInputStream",
-        "<init>",
-        "(Ljava/lang/String;)V",
-        native_fis_init_string,
-    );
-    registry.register(
-        "java/io/FileInputStream",
-        "<init>",
-        "(Ljava/io/File;)V",
-        native_fis_init_file,
-    );
-    registry.register("java/io/FileInputStream", "read", "()I", native_fis_read);
-    registry.register(
-        "java/io/FileInputStream",
-        "read",
-        "([BII)I",
-        native_fis_read_bytes,
-    );
-    registry.register(
-        "java/io/FileInputStream",
-        "read",
-        "([B)I",
-        native_fis_read_byte_array,
-    );
-    registry.register(
-        "java/io/FileInputStream",
-        "available",
-        "()I",
-        native_fis_available,
-    );
-    registry.register("java/io/FileInputStream", "close", "()V", native_fis_close);
+    // FIS-FIX 2026-05-19: we deliberately do NOT register a native `<init>`
+    // override. The real-JDK `FileInputStream` constructor allocates the
+    // `fd` `FileDescriptor` and then calls the `open0` native — overriding
+    // `<init>` skipped that allocation, so `open0`/`readBytes` had nowhere
+    // valid to store/recover the OS handle (instance slot 0 is a *reference*
+    // slot for the `FileDescriptor`, and a raw int written there is dropped).
+    // The `open0`/`read0`/`readBytes`/`skip0`/`available0` natives below
+    // store the handle on the `FileDescriptor` object instead.
 
     // --- java.io.FileOutputStream ---
     registry.register(
@@ -3067,14 +3103,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // --- JDK 25 real bytecode uses different method names for I/O natives ---
     // FileInputStream: open0, read0, readBytes, skip0, available0 etc.
     registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);
-    registry.register("java/io/FileInputStream", "open0", "(Ljava/lang/String;)V", native_fis_init_string);
+    registry.register("java/io/FileInputStream", "open0", "(Ljava/lang/String;)V", native_fis_open0);
     registry.register("java/io/FileInputStream", "read0", "()I", native_fis_read);
     registry.register("java/io/FileInputStream", "readBytes", "([BII)I", native_fis_read_bytes);
     registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
     registry.register("java/io/FileInputStream", "available0", "()I", native_fis_available);
     registry.register("java/io/FileInputStream", "length0", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
     registry.register("java/io/FileInputStream", "position0", "()J", |_ctx, _args| Ok(Some(Value::Long(0))));
-    registry.register("java/io/FileInputStream", "isRegularFile0", "(Ljava/io/FileDescriptor;)Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    // Report "not a regular file" so the JDK `readAllBytes()` takes the
+    // generic streaming `InputStream.readAllBytes` loop (which calls our
+    // `readBytes` native) instead of the `length0()`-sized fast path —
+    // `length0` is a stub returning 0, which would otherwise read nothing.
+    registry.register("java/io/FileInputStream", "isRegularFile0", "(Ljava/io/FileDescriptor;)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
 
     // FileOutputStream: open0, write(I,Z), writeBytes
     registry.register("java/io/FileOutputStream", "initIDs", "()V", native_noop);

@@ -692,7 +692,44 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;", native_printf);
     registry.register("java/io/PrintStream", "format",
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;", native_printf);
+    // PrintStream writer-path entries. JUnit's ConsoleLauncher wraps
+    // `System.out` (a PrintStream) in a `PrintWriter`; `PrintWriter.write`
+    // delegates `out.write(String,int,int)` straight onto the PrintStream
+    // receiver. The real JDK PrintStream only has a package-private
+    // `write(String)` and no 3-arg form, so without these natives the
+    // launcher aborts with `NoSuchMethodError: PrintStream.write(String,II)V`.
+    registry.register("java/io/PrintStream", "write", "([BII)V", native_printstream_write);
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;)V",
+        native_printstream_write_string,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;II)V",
+        native_printstream_write_string_range,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "append",
+        "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;",
+        native_printstream_append,
+    );
     // PrintWriter
+    registry.register(
+        "java/io/PrintWriter",
+        "write",
+        "(Ljava/lang/String;II)V",
+        native_printstream_write_string_range,
+    );
+    registry.register(
+        "java/io/PrintWriter",
+        "write",
+        "(Ljava/lang/String;)V",
+        native_printstream_write_string,
+    );
     registry.register("java/io/PrintWriter", "println", "(Ljava/lang/String;)V", native_println_string);
     registry.register("java/io/PrintWriter", "println", "()V", native_println_void);
     registry.register("java/io/PrintWriter", "println", "(I)V", native_println_int);
@@ -7992,6 +8029,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "([BII)V",
         native_printstream_write,
     );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;)V",
+        native_printstream_write_string,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(Ljava/lang/String;II)V",
+        native_printstream_write_string_range,
+    );
 
     // --- java.io.PrintWriter ---
     registry.register(
@@ -11106,6 +11155,77 @@ fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
+/// `PrintStream.write(String)` — the package-private writer-path entry used by
+/// `print(String)`. Writes the whole string to the underlying stream.
+fn native_printstream_write_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this (PrintStream), args[1]=String
+    let text = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => return Ok(None),
+    };
+    ctx.record_printed_line(text.clone());
+    stream_write(ctx, args, &text);
+    Ok(None)
+}
+
+/// `PrintStream.append(CharSequence)` — appends the text and returns `this`.
+fn native_printstream_append(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this (PrintStream), args[1]=CharSequence
+    let text = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => "null".to_string(),
+    };
+    ctx.record_printed_line(text.clone());
+    stream_write(ctx, args, &text);
+    Ok(args.first().copied())
+}
+
+/// `PrintStream.write(String, int, int)` — writes `str.substring(off, off+len)`
+/// to the underlying stream. This is the writer-path 3-arg entry that JUnit's
+/// console output reaches via `Writer.write(String,int,int)` when a system
+/// `PrintStream` is used through the character-writer chain.
+fn native_printstream_write_string_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this (PrintStream), args[1]=String, args[2]=off, args[3]=len
+    let full = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => return Ok(None),
+    };
+    let off = match args.get(2) {
+        Some(Value::Int(o)) => (*o).max(0) as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(l)) => (*l).max(0) as usize,
+        _ => 0,
+    };
+    // Slice on UTF-16 code units to match Java String.substring semantics.
+    let units: Vec<u16> = full.encode_utf16().collect();
+    let end = off.saturating_add(len).min(units.len());
+    let start = off.min(end);
+    let text = String::from_utf16_lossy(&units[start..end]);
+    ctx.record_printed_line(text.clone());
+    stream_write(ctx, args, &text);
+    Ok(None)
+}
+
 /// Format a double like Java does (no trailing zeros for integers, etc.)
 // ---------------------------------------------------------------------------
 // Step 2: StringBuilder / StringBuffer natives
@@ -11951,7 +12071,21 @@ pub(crate) fn unsafe_offset(args: &[Value], pos: usize) -> usize {
     // decode, but clamp clearly-invalid offsets to 0 (HotSpot-style callers
     // already fail CAS/get semantics safely on wrong offsets).
     const MAX_REASONABLE_OFFSET: usize = 1 << 30; // 1 Gi slot/byte cap
-    let clamp = |u: usize| if u <= MAX_REASONABLE_OFFSET { u } else { 0 };
+    // C32: the Buffer.address probe offset is an intentional high-range
+    // sentinel (`BUFFER_ADDRESS_SENTINEL`) minted by
+    // `native_unsafe_object_field_offset`. It is far above
+    // `MAX_REASONABLE_OFFSET`; the clamp below would otherwise rewrite it
+    // to 0, defeating the sentinel check in `native_unsafe_get_long` and
+    // making Netty's `PlatformDependent0$3.run()` read 0 → return null →
+    // NPE in `PlatformDependent0.<clinit>`. Pass the sentinel through
+    // verbatim so the sentinel-aware reader can answer non-zero.
+    let clamp = |u: usize| {
+        if u == BUFFER_ADDRESS_SENTINEL || u <= MAX_REASONABLE_OFFSET {
+            u
+        } else {
+            0
+        }
+    };
     match args.get(pos) {
         Some(Value::Long(off)) => {
             if *off < 0 {
