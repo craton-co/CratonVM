@@ -2251,6 +2251,30 @@ pub fn native_map_clear_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 pub fn native_map_key_set_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_map_key_set(ctx, args)
 }
+/// Collect a synthetic `HashMap`'s keys into a freshly-allocated `Object[]`.
+///
+/// Unlike `native_map_key_set_pub` (which builds a `HashSet` view), this
+/// returns a plain reference array — the shape consumed by the synthetic
+/// `java/util/Enumeration$Impl` helper (field 0 = `Object[]`, field 1 =
+/// `int` cursor). Used by `ResourceBundle.getKeys()` overrides so a
+/// caller iterating the bundle via `Enumeration` walks the real keys.
+///
+/// `map` must be the backing `HashMap` ref. Returns an empty array when
+/// `map` is null or unreadable.
+pub fn native_map_keys_as_array(
+    ctx: &mut dyn NativeContext,
+    map: Option<ObjectRef>,
+) -> ObjectRef {
+    let keys = match map {
+        Some(m) => map_collect_keys(ctx, m),
+        None => Vec::new(),
+    };
+    let arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    arr
+}
 pub fn native_map_values_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_map_values(ctx, args)
 }

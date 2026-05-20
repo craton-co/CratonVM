@@ -496,6 +496,57 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         rb_handle_get_object,
     );
     registry.register(rb, "containsKey", "(Ljava/lang/String;)Z", rb_contains_key);
+
+    // getKeys() / keySet() — REQUIRED for any caller that *iterates* the
+    // bundle rather than looking keys up individually. `getKeys()` is an
+    // ABSTRACT method on `java.util.ResourceBundle`: our synthetic bundle
+    // object carries the abstract class `java/util/ResourceBundle`, so
+    // without an explicit native override an `invokevirtual getKeys()`
+    // resolves the abstract declaration (no Code) and throws
+    // `AbstractMethodError`. Concrete tripwire: the JDK XML serializer's
+    // `com.sun.org.apache.xml.internal.serializer.CharInfo.<init>` loads
+    // `XMLEntities` via `ResourceBundle.getBundle(...)` then walks it with
+    // `getKeys()` — the AbstractMethodError aborted `ToXMLStream.<clinit>`,
+    // left `m_xmlcharInfo` null, and surfaced downstream as a
+    // `TransformerException` that broke Hazelcast 5.4.0's XSLT schema
+    // validation at boot.
+    //
+    // We return a synthetic `java/util/Enumeration$Impl` (field 0 =
+    // `Object[]` of keys, field 1 = `int` cursor) — its
+    // `hasMoreElements`/`nextElement` natives are registered
+    // unconditionally by `register_enumeration_impl_natives`, so this works
+    // in both real-JDK and synthetic-JDK modes.
+    registry.register(rb, "getKeys", "()Ljava/util/Enumeration;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let map = match ctx.get_field(this, 0) {
+            Value::Object(Some(m)) => Some(m),
+            _ => None,
+        };
+        let arr = cratonvm_native_collections::native_map_keys_as_array(ctx, map);
+        let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+        ctx.set_field(enm, 0, Value::Object(Some(arr)));
+        ctx.set_field(enm, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(enm))))
+    });
+    // keySet() — newer (Java 9+) accessor with the same role as getKeys().
+    // Delegate to the backing map's keySet so callers get a real Set view.
+    registry.register(rb, "keySet", "()Ljava/util/Set;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let map = match ctx.get_field(this, 0) {
+            Value::Object(Some(m)) => m,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        cratonvm_native_collections::native_map_key_set_pub(
+            ctx,
+            &[Value::Object(Some(map))],
+        )
+    });
     // Per JLS / java.util.ResourceBundle Javadoc: getLocale() must NEVER
     // return null on a successfully loaded bundle. Stock JDK returns the
     // bundle's locale (or Locale.ROOT for a base bundle). Returning null

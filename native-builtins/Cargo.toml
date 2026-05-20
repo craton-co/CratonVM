@@ -41,7 +41,15 @@ regex = "1"
 # `PREFIX_PATTERN` uses `(?=AsyncLogger(Config)?\.)`. We try `regex` first
 # (fast, DFA) and only fall back to `fancy-regex` (NFA + backtracking) when
 # the simpler engine rejects the pattern.
-fancy-regex = "0.13"
+#
+# Pinned to >=0.14: fancy-regex 0.13 only supports *constant-size* look-behind
+# and rejects variable-length look-behind ("Look-behind assertion without
+# constant size"). Java's `java.util.regex` allows variable-length look-behind,
+# and real workloads use it — Hazelcast's `AbstractXmlConfigHelper`
+# `.schemaValidation` splits on `(?<!\G\S+)\s` (a negative look-behind whose
+# `\G\S+` body is unbounded). 0.18 added variable-length look-behind support and
+# produces split results identical to the reference JDK for that pattern.
+fancy-regex = "0.18"
 parking_lot.workspace = true
 # WP4.2: VarHandle metadata side-table.
 rustc-hash.workspace = true
