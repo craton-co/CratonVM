@@ -67,6 +67,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_properties_natives(registry);
     register_collections_extras_natives(registry);
     register_unmodifiable_natives(registry);
+    register_set_from_map_natives(registry);
     // BlockingQueue family (LinkedBlockingQueue, ArrayBlockingQueue,
     // ConcurrentLinkedQueue, ConcurrentLinkedDeque) is overridden with a
     // synthetic 4-field layout (head/tail/size/capacity) that conflicts with
@@ -15534,6 +15535,17 @@ fn chm_collect_all_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Val
 }
 
 /// Collect all keys from all segments.
+///
+/// Uses the layout-aware `get_node_key` helper rather than a hardcoded
+/// `NODE_FIELD_KEY` slot: CHM segment bucket nodes can use either the legacy
+/// (key@0,val@1) or the JDK (hash@0,key@1,val@2) layout. Reading slot 0
+/// blindly returned the `hash` int for JDK-layout nodes, so `keySet()` /
+/// `values()` collected garbage that was then silently dropped — leaving the
+/// view iterators empty even though `size()` was correct. `entrySet()` already
+/// went through `get_node_key`/`get_node_value` and worked, which is why only
+/// `keySet()`/`values()` were broken (observed via Felix's
+/// `Felix.getServiceReferences`, whose `new ArrayList<>(set)` over a
+/// `Collections.newSetFromMap(new ConcurrentHashMap())` came back empty).
 fn chm_collect_all_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut keys = Vec::new();
     for seg in chm_all_segments(ctx, this) {
@@ -15542,7 +15554,7 @@ fn chm_collect_all_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> 
             for i in 0..(cap as usize) {
                 let mut node_val = ctx.get_array_element(b, i);
                 while let Value::Object(Some(node)) = node_val {
-                    keys.push(ctx.get_field(node, NODE_FIELD_KEY));
+                    keys.push(get_node_key(ctx, node));
                     node_val = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
@@ -15552,6 +15564,9 @@ fn chm_collect_all_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> 
 }
 
 /// Collect all values from all segments.
+///
+/// See `chm_collect_all_keys` — uses the layout-aware `get_node_value` helper
+/// so JDK-layout bucket nodes (hash@0,key@1,val@2) are read correctly.
 fn chm_collect_all_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let mut vals = Vec::new();
     for seg in chm_all_segments(ctx, this) {
@@ -15560,7 +15575,7 @@ fn chm_collect_all_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value
             for i in 0..(cap as usize) {
                 let mut node_val = ctx.get_array_element(b, i);
                 while let Value::Object(Some(node)) = node_val {
-                    vals.push(ctx.get_field(node, NODE_FIELD_VALUE));
+                    vals.push(get_node_value(ctx, node));
                     node_val = ctx.get_field(node, NODE_FIELD_NEXT);
                 }
             }
@@ -15635,6 +15650,22 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "keySet", "()Ljava/util/Set;", native_chm_key_set);
     r.register(c, "values", "()Ljava/util/Collection;", native_chm_values);
     r.register(c, "entrySet", "()Ljava/util/Set;", native_chm_entry_set);
+    // `ConcurrentHashMap.keySet()` has a covariant return type: the real
+    // method's descriptor is `()L...$KeySetView;`, and `()Ljava/util/Set;`
+    // is only the synthetic bridge. `javac` emits an invokevirtual against
+    // the *covariant* descriptor when the static receiver type is
+    // `ConcurrentHashMap`, so without this registration `keySet()` fell
+    // through to the real-JDK bytecode (`new KeySetView(this, null)`), whose
+    // iterator walks the unpopulated `table` field and yields nothing. This
+    // broke `new ArrayList<>(Collections.newSetFromMap(new ConcurrentHashMap()))`
+    // — observed as Felix `getServiceReference` returning null because
+    // `Felix.getServiceReferences` copies the CHM-backed result set.
+    r.register(
+        c,
+        "keySet",
+        "()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;",
+        native_chm_key_set,
+    );
     r.register(c, "toString", "()Ljava/lang/String;", native_chm_to_string);
     r.register(
         c,
@@ -16314,13 +16345,19 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let vals = chm_collect_all_values(ctx, this);
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = alloc_ref_array(ctx, vals.len().max(10));
-    ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(vals.len() as i32));
-    for (i, v) in vals.into_iter().enumerate() {
-        let _ = ctx.set_array_element(arr, i, v);
+    // Use the layout-aware ArrayList helpers: in real-JDK mode `elementData`
+    // and `size` are NOT at slots 0/1 (`AbstractList.modCount` occupies an
+    // earlier slot), so the previous hardcoded `set_field(list, 0/1, ...)`
+    // wrote the backing array into the wrong slots and `values()` iterated
+    // empty even though `size()` was correct.
+    let n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", n_fields);
+    let arr = alloc_ref_array(ctx, vals.len().max(AL_DEFAULT_CAPACITY));
+    for (i, v) in vals.iter().enumerate() {
+        let _ = ctx.set_array_element(arr, i, *v);
     }
+    al_set_data(ctx, list, arr);
+    al_set_size(ctx, list, vals.len() as i32);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -16569,6 +16606,122 @@ fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_chm_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_chm_key_set(ctx, args)
+}
+
+// ===========================================================================
+// Collections$SetFromMap — the view returned by `Collections.newSetFromMap`.
+//
+// `SetFromMap` captures `s = m.keySet()` *once* in its constructor and routes
+// `iterator()` / `toArray()` through that captured `s`. CratonVM's `keySet()`
+// natives return an eager snapshot, so when `newSetFromMap` runs over a fresh
+// (empty) map, `s` is permanently empty — every later `set.add(...)` mutates
+// the live map `m` but not the stale `s`. `iterator()`/`toArray()` then come
+// back empty even though `size()` (which delegates to `m.size()`) is correct.
+//
+// Felix's `CapabilitySet.match` returns `Collections.newSetFromMap(new
+// ConcurrentHashMap())`, fills it via `addAll`, and `Felix.getServiceReferences`
+// then does `new ArrayList<>(set)` — which calls `set.toArray()` and came back
+// empty, so `getServiceReference("...StartLevel")` returned null and Felix's
+// `AutoProcessor.processAutoProperties` NPE'd.
+//
+// Fix: intercept the affected `SetFromMap` view methods and route them through
+// the *live* backing map `m` instead of the captured `s`.
+// ===========================================================================
+
+const SET_FROM_MAP_CLASS: &str = "java/util/Collections$SetFromMap";
+
+/// Resolve the live backing `Map` field (`m`) of a `Collections$SetFromMap`.
+fn set_from_map_backing(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let slot = ctx.resolve_field_index(SET_FROM_MAP_CLASS, "m")?;
+    match ctx.get_field(this, slot) {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    }
+}
+
+fn native_set_from_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match set_from_map_backing(ctx, this) {
+        Some(m) => native_map_size(ctx, &[Value::Object(Some(m))]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_set_from_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let size = match native_set_from_map_size(ctx, args)? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+}
+
+fn native_set_from_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    match set_from_map_backing(ctx, this) {
+        Some(m) => native_map_contains_key(ctx, &[Value::Object(Some(m)), key]),
+        None => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_set_from_map_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let keys = match set_from_map_backing(ctx, this) {
+        Some(m) => map_collect_keys(ctx, m),
+        None => Vec::new(),
+    };
+    let arr = alloc_ref_array(ctx, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        let _ = ctx.set_array_element(arr, i, *k);
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_set_from_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // Build a fresh HashSet snapshot of the live map's keys and hand back its
+    // iterator — the snapshot is taken *now*, so it reflects every add() that
+    // happened after `newSetFromMap` constructed the (then-empty) view.
+    let backing = set_from_map_backing(ctx, this);
+    let set = match backing {
+        Some(m) => match native_map_key_set(ctx, &[Value::Object(Some(m))])? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return Ok(Some(Value::Object(None))),
+        },
+        None => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[])
+}
+
+fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
+    let c = SET_FROM_MAP_CLASS;
+    r.register(c, "size", "()I", native_set_from_map_size);
+    r.register(c, "isEmpty", "()Z", native_set_from_map_is_empty);
+    r.register(
+        c,
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_set_from_map_contains,
+    );
+    r.register(
+        c,
+        "toArray",
+        "()[Ljava/lang/Object;",
+        native_set_from_map_to_array,
+    );
+    r.register(c, "iterator", "()Ljava/util/Iterator;", native_set_from_map_iterator);
 }
 
 

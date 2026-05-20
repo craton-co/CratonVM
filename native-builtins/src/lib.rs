@@ -7011,10 +7011,22 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     );
 
     // `Collections.newSetFromMap` — Spring Boot 3+ `SpringApplicationShutdownHook`
-    // builds `closedContexts` from `Collections.newSetFromMap(new WeakHashMap<>())`.
-    // Real-JDK `newSetFromMap` walks the empty map then wraps it in a private
-    // `SetFromMap` implementation; mixed stub/real paths can NPE during `<clinit>`.
-    // Return an empty mutable `HashSet` (same 3-field shape as other natives).
+    // builds `closedContexts` from `Collections.newSetFromMap(new WeakHashMap<>())`,
+    // and Felix's `CapabilitySet.match` returns
+    // `Collections.newSetFromMap(new ConcurrentHashMap())`.
+    // Real-JDK `newSetFromMap` wraps the map in a private `SetFromMap`
+    // implementation; mixed stub/real paths can NPE during `<clinit>`, so we
+    // return a plain mutable `HashSet`.
+    //
+    // The HashSet MUST be built with the same shape the collection natives
+    // expect: a one-slot object whose slot 0 holds a *backing HashMap*
+    // (itself a buckets/size/capacity triple). The earlier version stored a
+    // raw `Object[]` directly in HashSet slot 0 — `add()` happened to work,
+    // but `new ArrayList<>(set)` (which calls `HashSet.toArray()`, which reads
+    // slot 0 as a HashMap) saw a malformed map and produced an empty list.
+    // That made `Felix.getServiceReferences` — which copies the
+    // `CapabilitySet.match` result via `new ArrayList<>(set)` — return null,
+    // so `getServiceReference("...StartLevel")` NPE'd.
     registry.register(
         "java/util/Collections",
         "newSetFromMap",
@@ -7022,14 +7034,18 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             let _map = args.get(1).copied().unwrap_or(Value::Object(None));
             let cap = 16usize;
-            let set = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+            // Backing HashMap: slot 0 = buckets, slot 1 = size, slot 2 = capacity.
+            let backing = crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
             let buckets = ctx.new_array(rustjvm_types::ArrayElementType::Reference, cap);
             for i in 0..cap {
                 ctx.set_array_element(buckets, i, Value::Object(None));
             }
-            ctx.set_field(set, 0, Value::Object(Some(buckets)));
-            ctx.set_field(set, 1, Value::Int(0));
-            ctx.set_field(set, 2, Value::Int(cap as i32));
+            ctx.set_field(backing, 0, Value::Object(Some(buckets)));
+            ctx.set_field(backing, 1, Value::Int(0));
+            ctx.set_field(backing, 2, Value::Int(cap as i32));
+            // HashSet: slot 0 = backing HashMap.
+            let set = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+            ctx.set_field(set, 0, Value::Object(Some(backing)));
             Ok(Some(Value::Object(Some(set))))
         },
     );
