@@ -357,34 +357,64 @@ fn native_sl_iterator(
     Ok(it)
 }
 
+/// `ServiceLoader.stream()` — return a `Stream<Provider<S>>`-equivalent.
+///
+/// Root-cause note (session 95): the prior implementation routed through
+/// `Spliterators.spliteratorUnknownSize(iterator(), 0)` followed by
+/// `StreamSupport.stream(spliterator, false)`. In the open-sourced
+/// non-synthetic-JDK build, `Spliterators.spliteratorUnknownSize` has NO
+/// native registration (`register_p69_spliterator` only runs under
+/// `register_synthetic_overrides`), so the call fell through to real-JDK
+/// bytecode and produced a real `Spliterators$IteratorSpliterator`. The
+/// `native_stream_support_stream_from_spliterator` override then read
+/// field 0 of that real spliterator, found it was not our synthetic
+/// backing `Object[]`, and fell into `drain_spliterator_to_stream` —
+/// which is a give-up stub that always yields an EMPTY stream. Net
+/// effect: `ServiceLoader.load(X).stream().count()` returned 0 even
+/// though `iterator()` produced the providers correctly.
+///
+/// Fix: drain the iterator directly into an `Object[]` and build a
+/// synthetic `java/util/stream/Stream` (field 0 = array) — the layout
+/// every `Stream.*` native (`count`, `map`, `filter`, `toList`,
+/// `forEach`, ...) already understands. No JDK Spliterator middleman.
 fn native_sl_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    eprintln!("[SL-STREAM-DBG] native_sl_stream entered");
-    // Defer to iterator() + StreamSupport.stream.
     let it = native_sl_iterator(ctx, args)?;
     let iter_obj = match it {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(None))),
+        // Null iterator → empty stream (not null) so downstream
+        // `.count()` / `.filter()` natives have a valid receiver.
+        _ => return alloc_synthetic_stream(ctx, &[]),
     };
-    let spliterator = ctx.invoke(
-        "java/util/Spliterators",
-        "spliteratorUnknownSize",
-        "(Ljava/util/Iterator;I)Ljava/util/Spliterator;",
-        &[Value::Object(Some(iter_obj)), Value::Int(0)],
-    )?;
-    let sp_obj = match spliterator {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let stream = ctx.invoke(
-        "java/util/stream/StreamSupport",
-        "stream",
-        "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;",
-        &[Value::Object(Some(sp_obj)), Value::Int(0)],
-    )?;
-    Ok(stream)
+    // Drain the iterator into a Vec<Value>.
+    let mut collected: Vec<Value> = Vec::new();
+    const SAFETY_CAP: usize = 1_000_000;
+    loop {
+        let has_next = ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]);
+        if !matches!(has_next, Ok(Some(Value::Int(1)))) {
+            break;
+        }
+        let next = ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]);
+        match next {
+            Ok(Some(v)) => collected.push(v),
+            _ => break,
+        }
+        if collected.len() >= SAFETY_CAP {
+            break;
+        }
+    }
+    if matches!(
+        std::env::var("RUSTJVM_DIAG_SERVICELOADER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) {
+        eprintln!(
+            "[SL-DBG] stream() drained {} providers into synthetic stream",
+            collected.len()
+        );
+    }
+    alloc_synthetic_stream(ctx, &collected)
 }
 
 fn native_sl_find_first(
