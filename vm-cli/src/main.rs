@@ -1,13 +1,3 @@
-// Round-7 cross-cutting Fix 2: install mimalloc as the global allocator. The
-// default Windows allocator (HeapAlloc) is slow on the small, high-frequency
-// allocations the VM produces (Value boxing, frame locals, parking_lot
-// internal nodes, String, Vec<u8> for class bytes). Gated behind the
-// `mimalloc` feature (on by default; disable with `--no-default-features` on
-// targets like musl that have no mimalloc support).
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rustjvm_vm::error::MethodCallFailed;
@@ -18,29 +8,7 @@ use rustjvm_vm::vm::{
 use rustjvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
-// AUDIT 2026-05-16: extracted magic numbers into named constants.
-/// Default watchdog timeout in seconds. Bumped from 45 → 120 to cover
-/// WildFly bootstrap (clinit cascade through SimpleAttributeDef) on
-/// cold-cache JDK 25.
-const DEFAULT_WATCHDOG_SEC: u64 = 120;
-/// Grace period in seconds after the watchdog fires before SIGKILL.
-const WATCHDOG_GRACE_SEC: u64 = 3;
-// Round-9 cross-cutting MED-6 fix (audit `round9-cross-cutting.md`): the
-// `DEFAULT_JAVA_STACK_SIZE` constant that used to live here was dead code
-// — the real default (and the only knob consulted by the spawn path) is
-// in `vm/src/vm/vm_exec.rs` at the `child_stack_size` calculation, which
-// honours `RUST_MIN_STACK` and defaults independently. Keeping a duplicate
-// const here was a maintenance hazard (two sources of truth) so it was
-// removed; document the real owner above instead.
-/// Maximum depth of `Throwable.getCause()` chain we render before
-/// stopping (defensive against malicious or pathological cycles).
-///
-/// AUDIT 2026-05-17 (Fix 5): also referenced by the rendering loop
-/// below — previously the const was defined but the loop hard-coded
-/// `0..8`, making the constant a stale documentation hazard.
-const MAX_CAUSE_CHAIN_DEPTH: usize = 8;
-
-/// RustJVM — A Java Virtual Machine implemented in Rust.
+/// RustJVM Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
 ///
@@ -193,15 +161,56 @@ struct Args {
     #[arg(long = "Xlog", value_name = "SPEC")]
     xlog: Option<String>,
 
-    /// T19.H1 — if set, spawn a watchdog thread that, after `SECONDS`,
+    /// T19.H1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ if set, spawn a watchdog thread that, after `SECONDS`,
     /// signals every interpreter thread to dump its frame chain to
     /// stderr and then calls `std::process::abort()`. Used to
     /// diagnose silent-hang bootstraps (Keycloak, WildFly, Quarkus).
-    /// The flag is honoured on a best-effort basis — threads stuck
+    /// The flag is honoured on a best-effort basis Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ threads stuck
     /// inside Rust native code will not dump (the watchdog still
     /// aborts with a reduced-information banner in that case).
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
+
+    // -----------------------------------------------------------------------
+    // GPU offload (see docs/gpu/cuda-oxide-evaluation.md)
+    //
+    // Every field below is gated behind the `gpu` Cargo feature. Without
+    // the feature the flags are not parsed, not documented in --help,
+    // and the CPU execution path is byte-identical to before the GPU
+    // work landed.
+    // -----------------------------------------------------------------------
+
+    /// Enable GPU offload of eligible static methods. Requires the
+    /// CLI to be built with `--features gpu` and a CUDA driver. With
+    /// no driver, the flag is honoured but no methods are offloaded.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu")]
+    gpu: bool,
+
+    /// Select CUDA device ordinal when --gpu is on. Defaults to 0.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu-device", value_name = "N", default_value_t = 0)]
+    gpu_device: u32,
+
+    /// Minimum estimated work (array length / loop trip count) before
+    /// a method is offloaded. Smaller inputs run on the CPU because
+    /// the host↔device round-trip dominates.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu-min-work", value_name = "N", default_value_t = 4096)]
+    gpu_min_work: u32,
+
+    /// Print one line per analyzer verdict (Eligible / Rejected) at
+    /// INFO level. Useful for understanding why a method did or did
+    /// not offload.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "print-gpu-decisions")]
+    print_gpu_decisions: bool,
+
+    /// Probe the GPU, print device name + compute capability + memory,
+    /// then exit. Useful for sanity-checking before a real run.
+    #[cfg(feature = "gpu")]
+    #[arg(long = "gpu-info")]
+    gpu_info: bool,
 
     /// Arguments passed to the Java program's main method.
     #[arg(trailing_var_arg = true)]
@@ -256,7 +265,7 @@ fn validate_class_name(name: &str) -> Result<()> {
 /// Some libraries ship as a single "all-in-one" fat JAR (e.g.
 /// `netty-all.jar`, `groovy-all.jar`) or, alternatively, as a set of split
 /// modules that live next to it (e.g. `netty-common.jar`, `netty-buffer.jar`,
-/// —...).  When a user passes a classpath entry that points at the aggregate JAR
+/// Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦).  When a user passes a classpath entry that points at the aggregate JAR
 /// but the repository only contains the split distribution, the classloader
 /// silently drops the entry and the program fails with a puzzling
 /// `NoClassDefFoundError`.
@@ -306,25 +315,21 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
             out.push(entry);
             continue;
         };
-        // AUDIT 2026-05-17 (Fix 4): lowercase each candidate file name
-        // exactly once per iteration. The previous loop allocated TWO
-        // lowercase Strings per JAR (one for `starts_with`, one for the
-        // `!= file_name` check) which was hot on classpath entries with
-        // hundreds of sibling jars.
         let mut substitutes: Vec<String> = Vec::new();
         for dirent in reader.flatten() {
             let p = dirent.path();
             if p.extension().map(|e| e == "jar").unwrap_or(false) {
                 if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                    let lower = name.to_ascii_lowercase();
-                    if lower.starts_with(split_prefix) && lower != file_name {
+                    if name.to_ascii_lowercase().starts_with(split_prefix)
+                        && name.to_ascii_lowercase() != file_name
+                    {
                         substitutes.push(p.to_string_lossy().into_owned());
                     }
                 }
             }
         }
         if substitutes.is_empty() {
-            // Nothing to substitute — preserve original entry so downstream
+            // Nothing to substitute Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ preserve original entry so downstream
             // logging surfaces the missing file.
             out.push(entry);
             continue;
@@ -343,32 +348,26 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
 
 /// Rewrite common HotSpot launcher spellings so clap can parse them.
 ///
-/// Surefire / tooling often invokes `java -classpath —...` and `java -jar —...`.
+/// Surefire / tooling often invokes `java -classpath Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦` and `java -jar Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦`.
 /// Our clap schema uses `--classpath` / `--jar`; bare `-classpath` used to be
 /// misparsed as `-c` with value `lasspath`, breaking Maven test runs.
-fn normalize_java_launcher_argv(mut args: Vec<String>) -> Vec<String> {
+fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
     if args.is_empty() {
         return args;
     }
-    // AUDIT 2026-05-17 (Fix 6): `args` is now consumed by value (it
-    // already was, but `args[i].clone()` defeated that). Move strings
-    // out of the input vec with `std::mem::take` — the trailing `[i]`
-    // slot is overwritten with an empty `String`, which we never look
-    // at again because `i` only ever advances.
-    let mut out: Vec<String> = Vec::with_capacity(args.len() + 2);
-    out.push(std::mem::take(&mut args[0]));
+    let mut out = vec![args[0].clone()];
     let mut i = 1usize;
     let mut past_separator = false;
     while i < args.len() {
         let a = args[i].as_str();
         if past_separator {
-            out.push(std::mem::take(&mut args[i]));
+            out.push(args[i].clone());
             i += 1;
             continue;
         }
         if a == "--" {
             past_separator = true;
-            out.push(std::mem::take(&mut args[i]));
+            out.push(args[i].clone());
             i += 1;
             continue;
         }
@@ -379,22 +378,20 @@ fn normalize_java_launcher_argv(mut args: Vec<String>) -> Vec<String> {
         if a == "-mp" {
             out.push("--".into());
             past_separator = true;
-            out.push(std::mem::take(&mut args[i]));
+            out.push(args[i].clone());
             i += 1;
             continue;
         }
         if a == "-jar" && i + 1 < args.len() {
             out.push("--jar".into());
-            out.push(std::mem::take(&mut args[i + 1]));
+            out.push(args[i + 1].clone());
             i += 2;
         } else if (a == "-classpath" || a == "-cp") && i + 1 < args.len() {
             out.push("--classpath".into());
-            out.push(std::mem::take(&mut args[i + 1]));
+            out.push(args[i + 1].clone());
             i += 2;
         } else if let Some(rest) = a.strip_prefix("-classpath=") {
             out.push("--classpath".into());
-            // Owned substring — there is no zero-copy path here without
-            // restructuring `args`.
             out.push(rest.to_string());
             i += 1;
         } else if let Some(rest) = a.strip_prefix("-cp=") {
@@ -402,7 +399,7 @@ fn normalize_java_launcher_argv(mut args: Vec<String>) -> Vec<String> {
             out.push(rest.to_string());
             i += 1;
         } else {
-            out.push(std::mem::take(&mut args[i]));
+            out.push(args[i].clone());
             i += 1;
         }
     }
@@ -463,7 +460,7 @@ struct HotspotFlags {
     heap_dump_on_oom: Option<bool>,
     /// `-XX:HeapDumpPath=<path>` companion.
     heap_dump_path: Option<String>,
-    /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` — the
+    /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the
     /// entire token (including prefix) is preserved so the existing
     /// `AgentRegistry::parse_agent_option` can consume it verbatim.
     agent_options: Vec<String>,
@@ -480,7 +477,7 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     let mut out = HotspotFlags::default();
     let mut past_separator = false;
     for arg in raw {
-        // Tokens after `--` are program arguments — pass through unchanged.
+        // Tokens after `--` are program arguments Р Р†Р вЂљРІР‚Сњ pass through unchanged.
         if past_separator {
             filtered.push(arg);
             continue;
@@ -523,26 +520,6 @@ fn run() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Pre-`std::process::exit` hook: dump the dispatch_trace ring before
-    // `native_system_exit` / `native_runtime_exit` tear the process down.
-    // This restores last-N-bytecodes visibility for "silent System.exit"
-    // bugs (the Cassandra NodeTool airline NPE was completely hidden behind
-    // `exit(0)` with an empty Java caller chain until this hook landed; with
-    // `RUSTJVM_DBG_LETSGO=1` set, the ring now reveals the last Java method
-    // that ran before exit).
-    //
-    // No-op when neither `RUSTJVM_DBG_EXIT` nor `RUSTJVM_DBG_LETSGO` is set,
-    // so clean runs stay quiet.
-    rustjvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
-        if std::env::var_os("RUSTJVM_DBG_EXIT").is_some()
-            || std::env::var_os("RUSTJVM_DBG_LETSGO").is_some()
-        {
-            rustjvm_vm::dispatch_trace::dump_to_stderr_unconditional(&format!(
-                "pre-System.exit({code})"
-            ));
-        }
-    });
-
     // Extract -Dkey=value system properties before clap parsing
     let raw_args: Vec<String> = normalize_java_launcher_argv(std::env::args().collect());
     let (filtered_args, system_properties) = extract_system_properties(raw_args);
@@ -550,6 +527,49 @@ fn run() -> Result<()> {
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
+
+    // GPU handlers — only compiled when the `gpu` Cargo feature is on.
+    // Without the feature, the CPU execution path below is reached
+    // unconditionally and unchanged.
+    #[cfg(feature = "gpu")]
+    {
+        if args.gpu_info {
+            match cuda_bridge::probe() {
+                Ok(caps) => {
+                    println!(
+                        "device {}: {} (sm_{}{}), {:.2} GiB",
+                        caps.ordinal,
+                        caps.name,
+                        caps.compute_major,
+                        caps.compute_minor,
+                        (caps.total_global_mem as f64) / (1024.0 * 1024.0 * 1024.0)
+                    );
+                }
+                Err(e) => {
+                    println!("no CUDA device available: {e}");
+                }
+            }
+            return Ok(());
+        }
+
+        if args.gpu {
+            match cuda_bridge::probe() {
+                Ok(caps) => {
+                    info!(
+                        "gpu offload enabled on device {}: {} (sm_{}{})",
+                        args.gpu_device, caps.name, caps.compute_major, caps.compute_minor
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rustjvm-cli] --gpu requested but no CUDA driver available ({e}); \
+                         running on CPU"
+                    );
+                    args.gpu = false;
+                }
+            }
+        }
+    }
 
     // Strip a literal `--` separator that clap parked in the trailing
     // positional list. We pass `--` through to clap so it knows where
@@ -589,101 +609,19 @@ fn run() -> Result<()> {
         let manifest = ClassPath::read_jar_manifest(jar_path)
             .ok_or_else(|| anyhow::anyhow!("Cannot read manifest from {}", jar_path.display()))?;
 
-        // JN3: ClassPath::new only accepts entries whose extension is `.jar`
-        // (or `.jmod`/`modules`). WARs, EARs, and other Java archive types
-        // are silently dropped — so `--jar jenkins.war` would never have
-        // its contents indexed and `executable.Main` (the launcher class
-        // declared in `Main-Class`) could not be resolved.
-        //
-        // Work around this in the CLI by materialising any non-`.jar`
-        // archive as a sibling temp file with a `.jar` extension and
-        // adding that path to the classpath instead. The original `jar_path`
-        // is still used for manifest parsing (which doesn't care about the
-        // extension), and the `Class-Path` manifest header is resolved
-        // relative to the original file's parent so sibling lookups still
-        // work.
-        let cp_entry_for_archive = match jar_path.extension().and_then(|e| e.to_str()) {
-            Some(ext) if ext.eq_ignore_ascii_case("jar") => jar_path.to_path_buf(),
-            _ => {
-                // Copy <name>.<ext> to <tmp>/<name>.jar so ClassPath::new
-                // recognises it. The temp file lives for the process
-                // lifetime (the OS reclaims it on exit; we don't bother
-                // with explicit cleanup because the orchestrator runs
-                // short-lived CLI invocations).
-                let stem = jar_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("app");
-                // Disambiguate with PID + a millisecond timestamp to
-                // avoid clobbering when multiple VMs run concurrently.
-                let pid = std::process::id();
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let tmp = std::env::temp_dir()
-                    .join(format!("rustjvm-{pid}-{now_ms}-{stem}.jar"));
-                std::fs::copy(jar_path, &tmp).with_context(|| {
-                    format!(
-                        "failed to stage {} as {} for classpath registration",
-                        jar_path.display(),
-                        tmp.display()
-                    )
-                })?;
-                tracing::debug!(
-                    "JN3: staged non-.jar archive {} → {} so ClassPath accepts it",
-                    jar_path.display(),
-                    tmp.display()
-                );
-                tmp
-            }
-        };
-
-        // Build classpath: JAR (or staged .jar copy) itself + manifest Class-Path entries.
-        // The manifest's Class-Path header is still resolved relative to the
-        // user-supplied path so sibling JARs are found at their real locations.
-        let mut cp = vec![cp_entry_for_archive.to_string_lossy().into_owned()];
+        // Build classpath: JAR itself + manifest Class-Path entries
+        let mut cp = vec![jar_path.to_string_lossy().into_owned()];
         cp.extend(manifest.resolve_class_path(jar_path));
 
         // KC26: For Quarkus applications, the RunnerClassLoader normally loads
         // classes from jars listed in quarkus-application.dat. Since we can't
         // fully emulate that complex bootstrap, add all application jars to
-        // the VM classpath so ClassLoader.loadClass can find them.
-        //
-        // Round-7/8 fix: gate the dir scan on a cheap Quarkus heuristic
-        // so non-Quarkus `--jar` invocations don't pay for the dir walk.
-        // Detection ladder (cheapest first):
-        //   1. Env override `RUSTJVM_QUARKUS=1` — force on (CI / test).
-        //   2. JAR filename contains `quarkus-` or ends `-runner.jar`.
-        //   3. Manifest has any `Quarkus-` prefixed main attribute.
-        // KC26 fix: when it fires, canonicalise jar_path (so a bare
-        // basename — user cd'd into lib/ — still resolves a parent) and
-        // probe BOTH the jar's own dir AND its parent: Keycloak packs
-        // quarkus-run.jar in lib/ (one level deep), whereas the
-        // canonical Quarkus packaging puts it at the project root.
-        let looks_quarkus = {
-            let env_forced = std::env::var_os("RUSTJVM_QUARKUS")
-                .map(|v| !v.is_empty() && v != "0")
-                .unwrap_or(false);
-            // Lowercase the filename once before matching so
-            // `Quarkus-App-1.0-Runner.jar`, `MyApp-RUNNER.jar`, etc. all
-            // trip the heuristic — macOS / Windows filesystems are
-            // case-insensitive and Maven JARs often capitalise the name.
-            let filename_hit = jar_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| {
-                    let n_lower = n.to_ascii_lowercase();
-                    n_lower.contains("quarkus-") || n_lower.ends_with("-runner.jar")
-                })
-                .unwrap_or(false);
-            let manifest_hit = manifest
-                .attributes
-                .keys()
-                .any(|k| k.starts_with("Quarkus-"));
-            env_forced || filename_hit || manifest_hit
-        };
-        if looks_quarkus {
+        // the VM classpath so ClassLoader.loadClass can find them. Canonicalise
+        // jar_path first so a bare basename (user cd'd into lib/) still resolves
+        // its parent. Probe BOTH the jar's own dir AND its parent, since
+        // Keycloak packaging puts quarkus-run.jar in lib/ (one level deep),
+        // whereas the canonical Quarkus packaging puts it at the project root.
+        {
             let canon_jar = std::fs::canonicalize(jar_path)
                 .unwrap_or_else(|_| jar_path.to_path_buf());
             let jar_dir = canon_jar.parent().map(|p| p.to_path_buf());
@@ -766,6 +704,17 @@ fn run() -> Result<()> {
 
     if let Some(mode) = xverify_mode {
         config = config.with_xverify_mode(mode);
+    }
+
+    // Forward the GPU-offload CLI flags into VmConfig. Only compiled
+    // when the `gpu` Cargo feature is on; without the feature these
+    // fields do not exist on VmConfig (see vm/src/config.rs).
+    #[cfg(feature = "gpu")]
+    {
+        config.gpu_offload_enabled = args.gpu;
+        config.gpu_device_ordinal = args.gpu_device;
+        config.gpu_min_work = args.gpu_min_work;
+        config.print_gpu_decisions = args.print_gpu_decisions;
     }
 
     if let Some(bcp) = &args.boot_classpath {
@@ -892,7 +841,7 @@ fn run() -> Result<()> {
         config = config.with_xlog_spec(xlog_spec.clone());
     }
 
-    // T6.1.2 — `-XX:+HeapDumpOnOutOfMemoryError` / `-XX:HeapDumpPath=...`.
+    // T6.1.2 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ `-XX:+HeapDumpOnOutOfMemoryError` / `-XX:HeapDumpPath=...`.
     // The interpreter's OOM path already honors these config fields (see
     // `maybe_dump_heap_on_oom` in `vm/src/runtime/interpreter.rs`); we
     // only need to thread the CLI values through.
@@ -903,7 +852,7 @@ fn run() -> Result<()> {
         config.heap_dump_path = Some(path);
     }
 
-    // T6.3.3 — `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
+    // T6.3.3 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
     // are stashed here and handed to the JVMTI `AgentRegistry` at VM
     // startup; registering them in a dedicated config field lets the
     // startup path load them in the canonical Agent_OnLoad order.
@@ -924,7 +873,7 @@ fn run() -> Result<()> {
                         // Per the `java.lang.instrument` package spec, a
                         // misconfigured agent should fail loudly enough
                         // that the operator notices, but the VM should
-                        // still try to run the application — match the
+                        // still try to run the application Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ match the
                         // HotSpot warn-and-continue behaviour.
                         eprintln!("Warning: ignoring {opt}: {e}");
                     }
@@ -946,18 +895,18 @@ fn run() -> Result<()> {
     // Create VM and execute main method
     let mut vm = Vm::new(config);
 
-    // T19.H1 — optional watchdog that dumps every interpreter thread's
+    // T19.H1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ optional watchdog that dumps every interpreter thread's
     // frame chain and aborts the process if the main method hasn't
     // completed within the configured deadline. Triggered by the
     // `--stack-dump-on-timeout=SECONDS` CLI flag.
     //
-    // I1 — make hangs visible by default.
+    // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ make hangs visible by default.
     //
     // When neither `--stack-dump-on-timeout` is supplied nor the
     // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG` env var is set, install a
     // conservative 45-second default. This guarantees a hung VM emits
     // **something** to stderr before the surrounding harness kills the
-    // process — the previous default of "no watchdog" produced empty
+    // process Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the previous default of "no watchdog" produced empty
     // stderr + Windows TerminateProcess rc=-1 from the bench runners,
     // which made hangs (e.g. CGLIB's `String.indexOf` looping inside
     // `TypeUtils.parseSignature`) visually indistinguishable from a
@@ -969,18 +918,8 @@ fn run() -> Result<()> {
     // every existing probe runner's 60s `TIMEOUT_SEC`. Long-running
     // services (Keycloak, Quarkus, WildFly) should pass an explicit
     // `--stack-dump-on-timeout=N` (with N suitably large) or set
-    // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` — the same way they pass
+    // `RUSTJVM_DISABLE_DEFAULT_WATCHDOG=1` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the same way they pass
     // explicit `-Xmx` instead of relying on heap defaults.
-    // `RUSTJVM_STACK_DUMP_TIMEOUT` is a high-priority override that lets
-    // an orchestrator force a short watchdog deadline (e.g. 20s) so the
-    // ring + thread stacks get dumped before an outer test timeout
-    // SIGKILLs the process. It wins over `RUSTJVM_DEFAULT_WATCHDOG_SEC`
-    // but is still trumped by an explicit `--stack-dump-on-timeout`
-    // CLI flag (the user's explicit intent always wins).
-    let env_override_timeout = std::env::var("RUSTJVM_STACK_DUMP_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|s| *s > 0);
     let effective_watchdog = match args.stack_dump_on_timeout {
         Some(s) if s > 0 => Some(s),
         Some(_) => None, // explicit `--stack-dump-on-timeout=0` disables
@@ -989,19 +928,11 @@ fn run() -> Result<()> {
                 == Some("1")
             {
                 None
-            } else if let Some(s) = env_override_timeout {
-                Some(s)
             } else {
                 Some(
                     std::env::var("RUSTJVM_DEFAULT_WATCHDOG_SEC")
                         .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        // AUDIT 2026-05-16: validate the env-supplied
-                        // watchdog into a sane range. Previously an
-                        // unvalidated parse meant `RUSTJVM_DEFAULT_WATCHDOG_SEC=0`
-                        // or huge integers could cripple the hang
-                        // detector. Bound to [1, 86400] (1 day).
-                        .filter(|&s| (1..=86_400).contains(&s))
+                        .and_then(|s| s.parse().ok())
                         // Bumped from 45 → 120: WildFly bootstrap was making
                         // forward progress through clinit cascade (64 distinct
                         // stack snapshots dumped in the 3s grace window) but
@@ -1009,14 +940,14 @@ fn run() -> Result<()> {
                         // chain on cold-cache JDK. 120s matches typical CI
                         // budget for boot tests while still catching real
                         // hangs.
-                        .unwrap_or(DEFAULT_WATCHDOG_SEC),
+                        .unwrap_or(120),
                 )
             }
         }
     };
     if let Some(secs) = effective_watchdog {
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
-        // RKC16N.5 — capture the audit-dump paths into the watchdog
+        // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
         // census. Without this, the only flush path is the
         // clean-shutdown branch at the end of `main()`, and every
@@ -1061,15 +992,6 @@ fn run() -> Result<()> {
                      aborting process ==="
                 );
 
-                // Always dump the dispatch_trace ring on watchdog fire,
-                // even when `RUSTJVM_DBG_LETSGO` wasn't set: the header
-                // alone confirms the dump path executed, and when the
-                // env var *was* set the last few entries usually point
-                // straight at the looping/hung method.
-                rustjvm_vm::dispatch_trace::dump_to_stderr_unconditional(
-                    "watchdog",
-                );
-
                 // KC-watchdog-native: when zero Java threads ack'd a dump,
                 // every interpreter thread is parked in native (Rust) code
                 // — the most common cause being a JNI / native-method loop
@@ -1110,7 +1032,7 @@ fn run() -> Result<()> {
                     rustjvm_native_api::native_ring::dump_to_stderr();
                 }
 
-                // RKC16N.5 — flush the missing-natives audit BEFORE
+                // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE
                 // `process::abort()` so a hung or watchdog-killed run
                 // still produces the diagnostic JSON. Errors are
                 // logged but never unwrap; abort still happens.
@@ -1169,7 +1091,7 @@ fn run() -> Result<()> {
         .collect();
 
     // Resolve the String[] class id for the args array.
-    // ClassId(0) is java/lang/Object — the base reference array element type.
+    // ClassId(0) is java/lang/Object Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the base reference array element type.
     let string_array_class_id = rustjvm_vm::ClassId::new(0);
     let args_array = vm.shared.heap.alloc_array(
         string_array_class_id,
@@ -1191,7 +1113,7 @@ fn run() -> Result<()> {
         match vm.invoke("java/lang/System", "initPhase1", "()V", &[]) {
             Ok(_) => {
                 tracing::info!("System.initPhase1() completed");
-                // WP1.3: initPhase1 just finished — advance to level 2.
+                // WP1.3: initPhase1 just finished Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ advance to level 2.
                 vm.shared.set_init_level(2);
             }
             Err(e) => {
@@ -1218,7 +1140,7 @@ fn run() -> Result<()> {
                 vm.shared.resolution_cache.write().clear();
                 // WP1.3: even though initPhase1 threw mid-flight, the
                 // early system-properties / stream installation ran
-                // before the failure — enough for callers gated on
+                // before the failure Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ enough for callers gated on
                 // level 2 (e.g. `java.class.path` availability) to
                 // proceed.  Bump anyway so downstream `initLevel()`
                 // observers don't stall at 1.
@@ -1233,13 +1155,13 @@ fn run() -> Result<()> {
         // subsystems we don't implement), but many callers key on
         // `initLevel() >= 3` to decide whether
         // `ClassLoader.getSystemClassLoader()` may read the `scl`
-        // field directly.  We leave the level at 2 here — bumping
+        // field directly.  We leave the level at 2 here Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ bumping
         // past it would send those callers down a null-deref path.
         // The CLI bumps to 4 below, just before `main()`, once the
         // initPhase2 gate no longer matters.
     }
 
-    // WP1.3: right before `main()` starts, advance to level 4 —
+    // WP1.3: right before `main()` starts, advance to level 4 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ
     // HotSpot's "VM fully initialized" state.  This is the signal
     // that `ClassLoader.getSystemClassLoader()` may return `scl` if
     // it is populated (in rustjvm it usually isn't, so callers fall
@@ -1251,7 +1173,7 @@ fn run() -> Result<()> {
     vm.shared.set_init_level(3);
     vm.shared.set_init_level(4);
 
-    // WP2.4-C — run every `-javaagent:` agent's `premain(String,
+    // WP2.4-C Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ run every `-javaagent:` agent's `premain(String,
     // Instrumentation)` hook BEFORE the application's `main`. Per the
     // `java.lang.instrument` package spec, agent failures are warnings
     // (logged inside the dispatcher) unless the agent throws a fatal
@@ -1289,44 +1211,11 @@ fn run() -> Result<()> {
         }
     };
 
-    // [MAIN-RETURN] diagnostic — gate on RUSTJVM_DBG_MAIN_RETURN=1 so it
-    // does not pollute clean runs. When set, prints whether main() returned
-    // Ok / Err::Internal(msg) / Err::Exception, plus how long it ran and
-    // how many non-daemon threads are still alive. Used to distinguish a
-    // silent main-return (Spring's `ApplicationFailedEvent` consumed the
-    // throwable) from an external kill (watchdog timeout, OS signal).
-    if std::env::var_os("RUSTJVM_DBG_MAIN_RETURN").is_some() {
-        let swallowed = vm
-            .shared
-            .swallow_counter
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let kind = match &result {
-            Ok(_) => "Ok".to_string(),
-            Err(MethodCallFailed::InternalError(e)) => {
-                format!("Err::Internal({e})")
-            }
-            Err(MethodCallFailed::ExceptionThrown(_)) => {
-                "Err::Exception".to_string()
-            }
-        };
-        let pending_nd = vm
-            .shared
-            .thread_registry
-            .alive_non_daemon_thread_ids()
-            .len();
-        eprintln!(
-            "[MAIN-RETURN] SpringApplication/main() returned in {:.2}s; \
-             result={kind}; swallowed_vm_errors={swallowed}; \
-             pending_non_daemon_threads={pending_nd}",
-            main_elapsed.as_secs_f64()
-        );
-    }
-
     // NEW-10: before reporting the invocation result, write the
     // missing-natives audit log to the user-specified JSON path. We
     // do this unconditionally (regardless of Ok/Err) so a crashing
     // program still produces a census file. Any I/O error surfaces
-    // as a warning — the primary invocation result takes precedence.
+    // as a warning Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the primary invocation result takes precedence.
     if let Some(path) = &args.dump_missing_natives {
         match vm.shared.dump_missing_natives_json(path) {
             Ok(()) => {
@@ -1385,7 +1274,7 @@ fn run() -> Result<()> {
         }
     }
 
-    // T19.K1 — wait for non-daemon threads before exiting.
+    // T19.K1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ wait for non-daemon threads before exiting.
     //
     // Per the JVM specification, the VM keeps running until every
     // non-daemon thread has terminated. Daemon threads (GC workers,
@@ -1402,7 +1291,7 @@ fn run() -> Result<()> {
     // We only wait when `main()` returned cleanly (`Ok`). On
     // exception we propagate to the existing error-printing path
     // which calls `bail!()` and lets the process exit with non-zero
-    // status — same as HotSpot's "Exception in thread \"main\"".
+    // status Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ same as HotSpot's "Exception in thread \"main\"".
     // Waiting for daemons or worker threads after a fatal error
     // would just delay the stack trace.
     //
@@ -1411,16 +1300,16 @@ fn run() -> Result<()> {
     // and bounding the wait would surprise users. CI runs that need
     // to bound execution can use the existing
     // `--stack-dump-on-timeout` watchdog which `abort()`s the
-    // process from a separate thread — this loop will be
+    // process from a separate thread Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this loop will be
     // interrupted by the watchdog's `process::abort()` call.
     if matches!(result, Ok(_)) {
-        // T19.K1 — diagnostic only when the wait is actually
+        // T19.K1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ diagnostic only when the wait is actually
         // observable (i.e. there ARE non-daemon threads). HelloWorld
         // and any program that doesn't `Thread.start()` a user
         // thread skips this message and exits silently. Long-running
         // apps (Quarkus, Keycloak, embedded Jetty) print one line so
         // the user can tell the wait is what's holding the process
-        // alive — useful when a CI run mysteriously sits at "main
+        // alive Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ useful when a CI run mysteriously sits at "main
         // returned" forever.
         let pending = vm
             .shared
@@ -1461,26 +1350,26 @@ fn run() -> Result<()> {
             // current rustjvm, `Throwable.fillInStackTrace` (see
             // `native-builtins/src/lang_misc.rs`) only stashes frames into the
             // per-thread `JvmThread::throwable_stacks` map keyed by identity
-            // hash — it does NOT populate the heap-side `stackTrace` /
+            // hash Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ it does NOT populate the heap-side `stackTrace` /
             // `backtrace` field. The Java code only writes that field lazily
             // when something calls `Throwable.getStackTrace()`. For unhandled
             // exceptions that escape `main()`, that has typically never
             // happened, so the renderer below will usually find a null array
             // and emit no `\tat ...` lines. Promoting the synthetic capture
             // to populate the heap field (or wiring this CLI to read from
-            // `throwable_stacks` directly) is roadmap item T2.2.18 — see
+            // `throwable_stacks` directly) is roadmap item T2.2.18 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see
             // `docs/roadmap-100.md` line 471.
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
             let mut prefix = "Exception in thread \"main\"";
-            for _depth in 0..MAX_CAUSE_CHAIN_DEPTH {
+            for depth in 0..8 {
                 let cid = vm.shared.heap.class_id_of(cur);
                 let cname = vm.shared.class_manager.read()
                     .get_class(cid).map(|c| c.name.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 // Find fields by name so we work regardless of layout.
                 // Also probe `target` (used by InvocationTargetException
-                // in lieu of Throwable.cause — see its `getCause()` override)
+                // in lieu of Throwable.cause Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see its `getCause()` override)
                 // so that `Caused by:` chains still walk through the wrapper.
                 let (msg_idx, cause_idx, stack_idx, target_idx) = {
                     let cm = vm.shared.class_manager.read();
@@ -1613,11 +1502,11 @@ fn run() -> Result<()> {
                 }
 
                 // Fallback: when `Throwable.stackTrace[]` was never populated
-                // (the array is null or empty — the typical case for an
+                // (the array is null or empty Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the typical case for an
                 // exception that escapes `main()` without anyone calling
                 // `getStackTrace()`), pull frames from the per-thread
                 // `JvmThread::throwable_stacks` map keyed by identity hash
-                // — that's where `Throwable.fillInStackTrace` actually
+                // Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ that's where `Throwable.fillInStackTrace` actually
                 // stashes the captured frames in this VM. See
                 // `vm/src/vm/vm_init.rs::Vm::throwable_stack_for`.
                 if !emitted_frames {
@@ -1639,7 +1528,7 @@ fn run() -> Result<()> {
                 // Follow cause. Throwable.cause is the canonical chain link,
                 // but InvocationTargetException stores the wrapped exception
                 // in its own `target` field and its `getCause()` override
-                // returns that — so the heap-level `cause` is null/self while
+                // returns that Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ so the heap-level `cause` is null/self while
                 // the real cause lives in `target`. Probe both.
                 let mut next_cause = {
                     let mut next = None;
@@ -1879,6 +1768,7 @@ fn run() -> Result<()> {
                     prefix = "Caused by:";
                     continue;
                 }
+                let _ = depth;
                 break;
             }
             let had_caused_by = lines.iter().any(|l| l.starts_with("Caused by:"));
@@ -1912,152 +1802,14 @@ fn run() -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// letsgo postmortem SEGV trap — Windows SEH unhandled-exception filter.
-//
-// When `RUSTJVM_DBG_LETSGO=1` is set, the VM's `dispatch_trace` ring
-// buffer records every bytecode-method entry and every native dispatch.
-// A SIGSEGV / STATUS_ACCESS_VIOLATION on Windows skips the Rust panic
-// path entirely, so we install a low-level SEH filter that dumps the
-// ring to stderr before the OS terminates the process with rc=139.
-//
-// Mirrors the pattern in `rustjvm-vm/src/lib.rs::harness_exit_shim` but
-// targets release-build crash diagnosis rather than test teardown.
-// ---------------------------------------------------------------------------
-#[cfg(windows)]
-mod letsgo_segv_trap {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[repr(C)]
-    struct ExceptionRecord {
-        exception_code: u32,
-        exception_flags: u32,
-        exception_record: *mut ExceptionRecord,
-        exception_address: *mut core::ffi::c_void,
-        number_parameters: u32,
-        exception_information: [usize; 15],
-    }
-
-    #[repr(C)]
-    struct ExceptionPointers {
-        exception_record: *mut ExceptionRecord,
-        context_record: *mut core::ffi::c_void,
-    }
-
-    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-    const STATUS_ACCESS_VIOLATION: u32 = 0xC0000005;
-    const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000001D;
-    const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC0000096;
-    const STATUS_STACK_OVERFLOW: u32 = 0xC00000FD;
-    const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xC0000094;
-
-    static DUMPED: AtomicBool = AtomicBool::new(false);
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn SetUnhandledExceptionFilter(
-            filter: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
-        ) -> Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>;
-    }
-
-    unsafe extern "system" fn handler(info: *mut ExceptionPointers) -> i32 {
-        if DUMPED.swap(true, Ordering::SeqCst) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        use std::io::Write;
-        let mut stderr = std::io::stderr().lock();
-        if !info.is_null() {
-            let rec = (*info).exception_record;
-            if !rec.is_null() {
-                let _ = writeln!(
-                    stderr,
-                    "===== letsgo SEH trap fired: code=0x{:08X} addr={:p} =====",
-                    (*rec).exception_code,
-                    (*rec).exception_address,
-                );
-                let code = (*rec).exception_code;
-                let name = match code {
-                    STATUS_ACCESS_VIOLATION => "STATUS_ACCESS_VIOLATION",
-                    STATUS_ILLEGAL_INSTRUCTION => "STATUS_ILLEGAL_INSTRUCTION",
-                    STATUS_PRIVILEGED_INSTRUCTION => "STATUS_PRIVILEGED_INSTRUCTION",
-                    STATUS_STACK_OVERFLOW => "STATUS_STACK_OVERFLOW",
-                    STATUS_INTEGER_DIVIDE_BY_ZERO => "STATUS_INTEGER_DIVIDE_BY_ZERO",
-                    _ => "<other>",
-                };
-                let _ = writeln!(stderr, "exception name: {name}");
-                if code == STATUS_ACCESS_VIOLATION && (*rec).number_parameters >= 2 {
-                    let op = (*rec).exception_information[0];
-                    let va = (*rec).exception_information[1];
-                    let op_str = match op {
-                        0 => "read",
-                        1 => "write",
-                        8 => "DEP/NX",
-                        _ => "?",
-                    };
-                    let _ = writeln!(
-                        stderr,
-                        "access-violation op={op} ({op_str}) faulting_va=0x{va:016X}",
-                    );
-                }
-            }
-        }
-        let _ = stderr.flush();
-        rustjvm_vm::dispatch_trace::dump_to_stderr("SEH");
-        EXCEPTION_CONTINUE_SEARCH
-    }
-
-    pub fn install() {
-        unsafe {
-            SetUnhandledExceptionFilter(Some(handler));
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod letsgo_segv_trap {
-    pub fn install() {}
-}
-
 fn main() {
-    // AUDIT 2026-05-16: --version / --help fast path. The previous flow
-    // installed a 64 MB-stack worker thread, initialized
-    // tracing-subscriber, ran the panic hook, and the three preparse
-    // rewrites before clap could detect `--version`. For HotSpot-style
-    // single-flag probes (which CI scripts hammer to detect the JVM),
-    // that's wasteful. Peek argv before any of that work — and before
-    // installing the dispatch ring / SEH trap below, since version probes
-    // by definition do not need crash forensics.
-    {
-        let mut args = std::env::args().skip(1);
-        if let Some(first) = args.next() {
-            match first.as_str() {
-                "--version" | "-V" | "-version" => {
-                    println!(
-                        "rustjvm {} (CratonVM)",
-                        env!("CARGO_PKG_VERSION"),
-                    );
-                    println!("openjdk version \"25\"");
-                    println!("OpenJDK Runtime Environment RustJVM (build 25+CratonVM)");
-                    println!("RustJVM VM (build 25+CratonVM, mixed mode)");
-                    return;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // letsgo postmortem — initialize the dispatch ring + SEH trap *before*
-    // any VM startup so even crashes during init are captured.
-    rustjvm_vm::dispatch_trace::init_from_env();
-    letsgo_segv_trap::install();
-
-    // I1 — Visibility-first panic hook.
+    // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ Visibility-first panic hook.
     //
     // The previous T14 hook silenced **every** Rust panic by routing it to
     // `tracing::debug!`. That worked for the well-known initPhase1
     // bootstrap-path panics (unaligned-pointer reads, transient null
     // dereferences) which the outer `safe_native_call` already logs once
-    // via a user-facing warning — but it also silenced *real* panics that
+    // via a user-facing warning Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ but it also silenced *real* panics that
     // escaped a `catch_unwind`. Because the tracing subscriber installed
     // by `run()` filters at WARN+, debug-level panic notices were never
     // written to stderr, and any genuine VM crash showed up in the logs
@@ -2069,13 +1821,13 @@ fn main() {
     // `--stack-dump-on-timeout`), and the failure was indistinguishable
     // from a successful run that produced no output.
     //
-    // The new hook routes everything to `stderr` directly — the only sink
+    // The new hook routes everything to `stderr` directly Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the only sink
     // that is guaranteed to survive every other failure mode (tracing
     // subscriber not initialized, WARN-level filter, panic firing from a
     // worker thread before `run()` builds the subscriber). For
     // bootstrap-path panics that are still expected to be quiet, the
     // outer `safe_native_call` continues to swallow them via its own
-    // `catch_unwind` — the hook fires *before* `catch_unwind` catches
+    // `catch_unwind` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the hook fires *before* `catch_unwind` catches
     // the unwind, but only the recovery path knows the panic was caught,
     // so we always emit at hook time. The cost is a couple of extra
     // stderr lines on the (rare) bootstrap-panic path; the gain is that
@@ -2145,7 +1897,7 @@ fn main() {
         } else {
             let _ = writeln!(stderr, "thread '{thread_name}' panicked:\n{msg}");
         }
-        // Backtrace only when explicitly requested — matches the stock
+        // Backtrace only when explicitly requested Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ matches the stock
         // Rust hook semantics so users opting out of backtrace still see
         // the panic message but no overhead.
         let bt = std::backtrace::Backtrace::capture();
@@ -2178,26 +1930,12 @@ fn main() {
         }
     }));
 
-    // Round-9 misc HIGH fix (audit `round9-misc.md`): this is the *Rust
-    // native stack* for the main carrier thread — it is NOT the Java
-    // `-Xss` budget. The CratonVM interpreter recurses in Rust at
-    // ~2-4 KiB per Java frame (recursive `execute_frame` + invoke
-    // dispatch + JIT entry trampoline). A 2 MiB native stack only fits
-    // ~500-1000 nested Java frames before overflow, which Quarkus /
-    // WildFly / JDK module-loader clinit chains routinely exceed during
-    // cold start (observed >1000 nested `<clinit>` frames). Use Rust's
-    // 8 MiB default to match the child-thread sizing in
-    // `vm/src/vm/vm_exec.rs`; override via `RUST_MIN_STACK` if a test
-    // or workload wants to dial it down. The eventual `-Xss` CLI flag
-    // will gate the *Java* stack-depth limit (`max_stack_depth` in
-    // `JvmConfig`) independently of this native budget.
-    let main_stack_size = std::env::var("RUST_MIN_STACK")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8 * 1024 * 1024);
+    // The interpreter uses recursive Rust calls for Java method invocations.
+    // Deep Java call stacks (e.g. Quarkus bootstrap) can exceed the default
+    // 8 MB Rust stack.  Spawn the real entry point on a thread with 64 MB.
     let builder = std::thread::Builder::new()
         .name("main-vm".into())
-        .stack_size(main_stack_size);
+        .stack_size(64 * 1024 * 1024);
     let handler = builder.spawn(|| {
         if let Err(e) = run() {
             eprintln!("{e:#}");
@@ -2206,17 +1944,8 @@ fn main() {
     }).expect("failed to spawn main-vm thread");
     handler.join().unwrap_or_else(|e| {
         eprintln!("main-vm thread panicked: {:?}", e);
-        // letsgo postmortem — surface the dispatch trail on a panic-join,
-        // mirroring the SEH path. No-op when RUSTJVM_DBG_LETSGO is unset.
-        rustjvm_vm::dispatch_trace::dump_to_stderr("panic-join");
         std::process::exit(1);
     });
-    // Successful exit path: also dump the trail if the flag was set so
-    // we can compare the last N dispatches against the expected normal
-    // shutdown sequence (only printed when the flag is active).
-    if rustjvm_vm::dispatch_trace::is_enabled() {
-        rustjvm_vm::dispatch_trace::dump_to_stderr("normal-exit");
-    }
 }
 
 /// Parse a JVM-style memory size string (e.g., "256m", "1g", "1024k").
@@ -2370,7 +2099,7 @@ mod tests {
 
     #[test]
     fn extract_d_value_with_equals() {
-        // -Dkey=val=ue  —  key = "val=ue"
+        // -Dkey=val=ue  Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ  key = "val=ue"
         let raw = vec!["rustjvm".to_string(), "-Dpath=a=b".to_string()];
         let (_, props) = extract_system_properties(raw);
         assert_eq!(props, vec![("path".to_string(), "a=b".to_string())]);

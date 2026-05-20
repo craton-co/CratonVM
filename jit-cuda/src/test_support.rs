@@ -19,8 +19,25 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
     let path = fixture_path(class_name);
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
-    let class = read_class(&bytes)
+    let mut class = read_class(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
+    // The reader keeps method attributes lazy (`LazyAttribute::Raw`);
+    // `ClassFileMethod::code()` only returns an already-decoded Code
+    // attribute. Force-decode the `Code` attribute (in place, while the
+    // constant pool is still borrowable) so the analyzer can see the
+    // method body — otherwise `analyze()` returns `Rejected(NoCode)`.
+    // Only `Code` is decoded: force-decoding every attribute can hit a
+    // ByteView range panic on certain malformed annotation attributes
+    // (`reader/src/byte_view.rs` — a separate reader-crate issue), and
+    // the analyzer only needs the method body anyway.
+    let cp = &class.constant_pool;
+    for method in class.methods.iter_mut() {
+        for attr in method.attributes.iter_mut() {
+            if attr.name() == "Code" {
+                let _ = attr.decode(cp);
+            }
+        }
+    }
     class
         .methods
         .into_iter()
