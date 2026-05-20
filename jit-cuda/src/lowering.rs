@@ -413,6 +413,34 @@ mod tests {
     }
 
     #[test]
+    fn i2c_lowers_to_zero_extend_not_sign_extend() {
+        // CRIT regression pin: `i2c` (0x92) converts int -> char, and
+        // `char` is UNSIGNED 16-bit (JVMS §6.5: "zero extend"). The
+        // lowered PTX must mask the low 16 bits (`and.b32 ..., 65535`)
+        // — it must NOT route through the sign-extending shift pair
+        // (`shl.b32` + `shr.s32`) used by `i2b`/`i2s`. A sign-extending
+        // i2c silently turns 0xFFFF into -1 on the GPU.
+        let m = lower_fixture("EligibleI2cConvert", "toChar", "([I[I)V");
+        let text = m.render();
+        assert!(
+            text.contains(".visible .entry EligibleI2cConvert__toChar_"),
+            "fixture did not lower to a kernel:\n{text}",
+        );
+        // The zero-extend mask must be present: `and.b32 dst, src, 65535`.
+        assert!(
+            text.contains("and.b32") && text.contains("65535"),
+            "expected `and.b32 ..., 65535` zero-extend for i2c, got:\n{text}",
+        );
+        // And the sign-extending shift must NOT appear — that is the
+        // bug. (`i2b`/`i2s` would emit `shr.s32`, but this fixture has
+        // no such conversion.)
+        assert!(
+            !text.contains("shr.s32"),
+            "i2c must not emit the sign-extending `shr.s32`:\n{text}",
+        );
+    }
+
+    #[test]
     #[ignore = "diagnostic — prints PTX to stdout; run with --nocapture"]
     fn dump_vector_add_ptx() {
         let m = lower_fixture("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
