@@ -7225,22 +7225,75 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // <init>(URI)V — treat URI as file:// path
+    // <init>(URI)V — `new File(file:/path)`.
+    //
+    // The previous implementation read the URI string from raw slot 5, but
+    // that slot is the `port` int in the real `java.net.URI` layout — the
+    // result was an empty path. ActiveMQ's launcher locates ACTIVEMQ_HOME
+    // via `new File(new URI(jarUrl).resolve(".."))`; an empty path there
+    // forced a wrong `../.` fallback and broke lib/*.jar discovery.
+    //
+    // Read the URI's `path` field *by name* (slot-order safe), falling back
+    // to parsing the cached `string` full-text field. Then apply the
+    // `WinNTFileSystem.fromURIPath` transform (strip the leading `/` before
+    // a drive letter, drop a trailing `/`) and normalise separators.
     r.register(file, "<init>", "(Ljava/net/URI;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let uri_str = match args.get(1) {
-            Some(Value::Object(Some(u))) => {
-                // URI field layout varies; try field 5 (raw full string)
-                match ctx.get_field(*u, 5) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                }
+        let uri = match args.get(1) {
+            Some(Value::Object(Some(u))) => *u,
+            _ => {
+                let s = ctx.create_string("");
+                ctx.set_field(this, 0, Value::Object(Some(s)));
+                return Ok(None);
             }
+        };
+        // Prefer the parsed `path` component.
+        let mut path = match ctx.get_field_by_name(uri, "path") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        let path = uri_str.strip_prefix("file://").unwrap_or(&uri_str)
-            .strip_prefix("file:").unwrap_or(&uri_str).to_string();
-        let s = ctx.create_string(&path);
+        if path.is_empty() {
+            // Parse from the full URI text:
+            //   scheme:[//authority]path[?query][#fragment]
+            let raw = match ctx.get_field_by_name(uri, "string") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if !raw.is_empty() {
+                let after_scheme = match raw.find(':') {
+                    Some(i) => &raw[i + 1..],
+                    None => &raw[..],
+                };
+                let body = if let Some(rest) = after_scheme.strip_prefix("//") {
+                    let slash = rest.find('/').unwrap_or(rest.len());
+                    &rest[slash..]
+                } else {
+                    after_scheme
+                };
+                path = body
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
+        let mut p = path;
+        let chars: Vec<char> = p.chars().collect();
+        if chars.len() > 2 && chars[0] == '/' && chars[2] == ':' {
+            p = p[1..].to_string();
+            if p.len() > 3 && p.ends_with('/') {
+                p.pop();
+            }
+        } else if p.len() > 1 && p.ends_with('/') {
+            p.pop();
+        }
+        // Normalise to platform separators / collapse `.` `..` segments.
+        let normalised = file_normalise_path(&p);
+        let s = ctx.create_string(&normalised);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
