@@ -40,11 +40,14 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_CLI_FRONTEND: &str = "org/apache/flink/client/cli/CliFrontend";
+#[allow(dead_code)]
 const CN_STANDALONE_ENTRYPOINT: &str =
     "org/apache/flink/runtime/entrypoint/StandaloneSessionClusterEntrypoint";
 
 /// Generic `main([Ljava/lang/String;)V` no-op for Flink entry points.
+#[allow(dead_code)]
 fn flink_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[flink-shim] main short-circuited (boot-test mode)");
     Ok(None)
@@ -53,45 +56,21 @@ fn flink_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 /// Generic `<clinit>()V` no-op for Flink entry-point classes. The real
 /// clinit triggers Akka / Kryo / Scala static initializers which depend
 /// on `sun.misc.Unsafe` offsets CratonVM cannot populate.
+#[allow(dead_code)]
 fn flink_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 /// Install every Flink boot-test short-circuit this module owns.
 ///
-/// **NOT WIRED YET.** The orchestrator owns `lib.rs` and is responsible
-/// for adding the call to this function from
-/// `register_essential_natives`.
+/// Disabled per "no synthetic stubs" policy (matches the round-8 batch shim
+/// disable in commit 8071d25). All registrations were pure fake-out returning
+/// `Ok(None)` without doing real work; they have been removed so Flink runs
+/// against real bytecode.
 pub fn register_flink_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when set to "1", skip installing the boot-test
-    // short-circuits so the real Flink main runs (used by the
-    // orchestrator's real-app diagnostics).
-    if std::env::var("RUSTJVM_FLINK_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    // CliFrontend.main — `bin/flink` CLI primary entry point.
-    registry.register(
-        CN_CLI_FRONTEND,
-        "main",
-        "([Ljava/lang/String;)V",
-        flink_main_noop,
-    );
-    registry.register(CN_CLI_FRONTEND, "<clinit>", "()V", flink_clinit_noop);
-
-    // StandaloneSessionClusterEntrypoint.main — defensive: standalone
-    // cluster bootstrap entry point invoked by `bin/start-cluster.sh`.
-    registry.register(
-        CN_STANDALONE_ENTRYPOINT,
-        "main",
-        "([Ljava/lang/String;)V",
-        flink_main_noop,
-    );
-    registry.register(
-        CN_STANDALONE_ENTRYPOINT,
-        "<clinit>",
-        "()V",
-        flink_clinit_noop,
-    );
+    let _ = registry;
+    let _ = CN_CLI_FRONTEND;
+    let _ = CN_STANDALONE_ENTRYPOINT;
 }
 
 #[cfg(test)]
