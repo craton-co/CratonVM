@@ -9,6 +9,7 @@
 
 #![cfg(test)]
 
+use rustjvm_reader::attribute::force_decode_all;
 use rustjvm_reader::class_reader::read_class;
 use rustjvm_reader::method::ClassFileMethod;
 
@@ -21,7 +22,7 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
     let class = read_class(&bytes)
         .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-    class
+    let mut method = class
         .methods
         .into_iter()
         .find(|m| &*m.name == method_name && &*m.descriptor == descriptor)
@@ -31,7 +32,13 @@ pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> Cla
                  (did the Java source change without recompiling?)",
                 path.display()
             )
-        })
+        });
+    // `read_class` leaves method attributes (including `Code`) lazily
+    // undecoded; `ClassFileMethod::code()` returns `None` for a `Raw`
+    // attribute. Force-decode so the analyzer/lowerer see the bytecode.
+    force_decode_all(&mut method.attributes, &class.constant_pool)
+        .unwrap_or_else(|e| panic!("failed to decode attributes of {method_name}{descriptor}: {e:?}"));
+    method
 }
 
 fn fixture_path(class_name: &str) -> std::path::PathBuf {

@@ -579,7 +579,7 @@ impl<'a> Emitter<'a> {
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
             0x91 => self.conv_truncate_i32(8)?,                                // i2b
-            0x92 => self.conv_truncate_i32(16)?,                               // i2c (unsigned 16)
+            0x92 => self.conv_zero_extend_i32(16)?,                            // i2c (unsigned 16)
             0x93 => self.conv_truncate_i32(16)?,                               // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
             // AUDIT 2026-05-19: `lcmp` (0x94) was dispatched to
@@ -1079,6 +1079,24 @@ impl<'a> Emitter<'a> {
         let tmp = self.regs.fresh_reg(RegKind::S32);
         writeln!(self.body, "    shl.b32 {}, {}, {};", tmp.name, a.name, amt).unwrap();
         writeln!(self.body, "    shr.s32 {}, {}, {};", r.name, tmp.name, amt).unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
+    /// Truncate an s32 to its low `bits` and **zero-extend** the result.
+    ///
+    /// Used by `i2c` (JVMS §6.5): `char` is an unsigned 16-bit type, so
+    /// the low bits must be zero-extended — NOT sign-extended like `i2b`
+    /// / `i2s`. We emit a single mask:
+    ///   and.b32  r, a, ((1 << bits) - 1)
+    /// For `bits == 16` the mask is `0xFFFF`, so e.g. an int `0xFFFF`
+    /// yields `65535`, matching the JVM (the sign-extending path would
+    /// wrongly yield `-1`).
+    fn conv_zero_extend_i32(&mut self, bits: u32) -> Result<(), LoweringError> {
+        let a = self.stack.pop()?;
+        let r = self.regs.fresh_reg(RegKind::S32);
+        let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+        writeln!(self.body, "    and.b32 {}, {}, {};", r.name, a.name, mask).unwrap();
         self.stack.push(r);
         Ok(())
     }
