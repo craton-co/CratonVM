@@ -14501,12 +14501,39 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/StackTraceElement;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Create a StackTraceElement with same info (4-field: class, method, file, line)
+            // Create a StackTraceElement from the synthetic StackFrame:
+            // slot 0 = dotted class, 1 = method, 2 = file, 3 = line,
+            // 5 = '/'-separated internal class name.
             let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
-            ctx.set_field(ste, 0, ctx.get_field(this, 0));
-            ctx.set_field(ste, 1, ctx.get_field(this, 1));
-            ctx.set_field(ste, 2, ctx.get_field(this, 2));
-            ctx.set_field(ste, 3, ctx.get_field(this, 3));
+            let class_dotted = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let class_slashed = match ctx.get_field(this, 5) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => class_dotted.replace('.', "/"),
+            };
+            let method_name = match ctx.get_field(this, 1) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let file_name = match ctx.get_field(this, 2) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            };
+            let line = match ctx.get_field(this, 3) {
+                Value::Int(n) => n,
+                _ => -1,
+            };
+            crate::lang_misc::fill_stack_trace_element(
+                ctx,
+                ste,
+                &class_slashed,
+                &class_dotted,
+                &method_name,
+                file_name.as_deref(),
+                line,
+            );
             Ok(Some(Value::Object(Some(ste))))
         },
     );

@@ -624,10 +624,38 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(ste))));
             }
             let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
-            ctx.set_field(ste, 0, ctx.get_field(this, SF_CLASSNAME));
-            ctx.set_field(ste, 1, ctx.get_field(this, SF_METHODNAME));
-            ctx.set_field(ste, 2, ctx.get_field(this, SF_FILENAME));
-            ctx.set_field(ste, 3, ctx.get_field(this, SF_LINENUMBER));
+            // Decode SFI slots into the values `fill_stack_trace_element`
+            // needs. `SF_CLASSNAME` holds the dotted class name; the
+            // `/`-separated internal name lives in `SF_DECL_INTERNAL`.
+            let class_dotted = match ctx.get_field(this, SF_CLASSNAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let class_slashed = match ctx.get_field(this, SF_DECL_INTERNAL) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => class_dotted.replace('.', "/"),
+            };
+            let method_name = match ctx.get_field(this, SF_METHODNAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let file_name = match ctx.get_field(this, SF_FILENAME) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            };
+            let line = match ctx.get_field(this, SF_LINENUMBER) {
+                Value::Int(n) => n,
+                _ => -1,
+            };
+            crate::lang_misc::fill_stack_trace_element(
+                ctx,
+                ste,
+                &class_slashed,
+                &class_dotted,
+                &method_name,
+                file_name.as_deref(),
+                line,
+            );
             Ok(Some(Value::Object(Some(ste))))
         },
     );
