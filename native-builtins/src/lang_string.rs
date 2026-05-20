@@ -2465,12 +2465,9 @@ pub(crate) fn native_string_matches(ctx: &mut dyn NativeContext, args: &[Value])
     let s = ctx.read_string(this).unwrap_or_default();
     let matched = if let Ok(re) = compile_java_regex(&pattern, 0) {
         let anchored = format!("^(?:{})$", re.as_str());
-        match regex::Regex::new(&anchored) {
-            Ok(full) => full.is_match(&s),
-            Err(_) => match fancy_regex::Regex::new(&anchored) {
-                Ok(full) => full.is_match(&s).unwrap_or(false),
-                Err(_) => re.is_match(&s),
-            },
+        match crate::compile_anchored_cached(&anchored) {
+            Some(full) => full.is_match(&s),
+            None => re.is_match(&s),
         }
     } else {
         s == pattern

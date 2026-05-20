@@ -120,7 +120,8 @@ pub struct DeviceModule(backend::DeviceModuleInner);
 impl DeviceModule {
     /// Load a PTX text module and resolve the named kernels.
     pub fn from_ptx(ctx: &DeviceContext, ptx: &str, kernel_names: &[&str]) -> Result<Self> {
-        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, kernel_names).map(Self)
+        // Use a default module name for cudarc 0.13 API
+        backend::DeviceModuleInner::from_ptx(&ctx.0, ptx, "module", kernel_names).map(Self)
     }
 
     /// Launch a kernel by name with raw argument bytes. The argument
@@ -154,7 +155,20 @@ impl KernelArgs {
     }
 
     pub fn push_device_ptr<T>(mut self, buf: &DeviceBuffer<T>) -> Self {
-        self.raw.push(KernelArg::DevicePtr(buf.0.device_ptr()));
+        // AUDIT 2026-05-16 (CRIT-1 fix): plumb the device pointer
+        // returned by `CudaSlice::device_ptr` into the `KernelArg`.
+        // In cudarc 0.13, SyncRecord was removed; stream ordering is
+        // now handled via CudaDevice::wait_for and fork_default_stream.
+        #[cfg(feature = "cuda")]
+        {
+            let addr = buf.0.device_ptr_arg();
+            self.raw.push(KernelArg::DevicePtr { addr });
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            self.raw
+                .push(KernelArg::DevicePtr { addr: buf.0.device_ptr_arg() });
+        }
         self
     }
 
@@ -179,9 +193,27 @@ impl KernelArgs {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+// AUDIT 2026-05-16 (CRIT-1 fix): under the `cuda` feature, the
+// `DevicePtr` variant carries the raw device address.
+// In cudarc 0.13, SyncRecord was removed; stream ordering is
+// now handled via CudaDevice::wait_for and fork_default_stream.
+//
+// In stub mode (no `cuda` feature) the variant degenerates to a bare
+// `u64` since there is no real allocation to guard.
 pub(crate) enum KernelArg {
-    DevicePtr(u64),
+    #[cfg(feature = "cuda")]
+    DevicePtr {
+        addr: u64,
+    },
+    #[cfg(not(feature = "cuda"))]
+    DevicePtr {
+        // Never read in stub mode — the stub `launch_raw` returns
+        // `NoDriver` without inspecting args. We still carry the field
+        // so the variant shape matches the real backend for any future
+        // code that pattern-matches across both cfgs.
+        #[allow(dead_code)]
+        addr: u64,
+    },
     I32(i32),
     I64(i64),
     F32(f32),
@@ -196,6 +228,46 @@ pub(crate) enum KernelArg {
 /// `len()`.
 pub struct DeviceBuffer<T>(pub(crate) backend::DeviceBufferInner<T>);
 
+#[cfg(feature = "cuda")]
+impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBuffer<T> {
+    const ASSERT_DEVICE_REPR: () = assert!(
+        std::mem::size_of::<T>() > 0,
+        "T must implement DeviceRepr when cuda feature is enabled"
+    );
+    /// Allocate `len` elements on the device, contents undefined.
+    pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        backend::DeviceBufferInner::uninit(&ctx.0, len).map(Self)
+    }
+
+    /// Allocate `len` elements, zero-initialised.
+    pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        backend::DeviceBufferInner::zeros(&ctx.0, len).map(Self)
+    }
+
+    /// Allocate and upload from `host` in one shot.
+    pub fn from_host(ctx: &DeviceContext, host: &[T]) -> Result<Self> {
+        let _ = Self::ASSERT_DEVICE_REPR;
+        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+    }
+
+    /// Copy `len()` elements back into `dst` (must be at least
+    /// `self.len()` long).
+    pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
+        self.0.to_host(dst)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {

@@ -599,6 +599,52 @@ pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
         "()Lorg/apache/logging/log4j/core/Logger;",
         native_core_logger_get_parent,
     );
+    // EJBCA / log4j-1.2-api bridge — `org.apache.log4j.LogManager.<clinit>`
+    // builds a `Hierarchy(new RootLogger(Level.DEBUG))` whose ctor calls
+    // `RootLogger.setLevel(DEBUG)`, which routes to
+    // `org.apache.log4j.Category.setLevel(Level)` → private
+    // `setLevel(log4j2.Level)` → `CategoryUtil.setLevel(this.logger, level)`
+    // → `core.Logger.setLevel(level)`. The real bytecode of
+    // `core.Logger.setLevel` allocates a new `Logger$PrivateConfig` and
+    // copies `this.privateConfig.config` — but our synthetic core.Logger
+    // (built via `alloc_concurrent_synthetic`) has `privateConfig == null`,
+    // so the `PrivateConfig(Logger, PrivateConfig, Level)` ctor NPEs
+    // reading `pc.config` at Logger.java:423.
+    //
+    // No-op the call: the synthetic logger silently swallows level changes,
+    // matching the rest of the no-op pipeline (`isXxxEnabled` returns
+    // false, `info/warn/...` are all no-ops). See the existing
+    // `getAppenders` / `getContext` / `getParent` overrides for the same
+    // pattern on this class.
+    registry.register(
+        CN_CORE_LOGGER,
+        "setLevel",
+        "(Lorg/apache/logging/log4j/Level;)V",
+        native_log_void,
+    );
+    // Companion accessors used by `org.apache.log4j.Category` and
+    // `CategoryUtil` after `setLevel` returns. `addAppender` and
+    // `removeAppender` go down the same `privateConfig` path; the rest
+    // are simple field reads that would return null/garbage on the
+    // synthetic. Match the existing no-op contract.
+    registry.register(
+        CN_CORE_LOGGER,
+        "addAppender",
+        "(Lorg/apache/logging/log4j/core/Appender;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_CORE_LOGGER,
+        "removeAppender",
+        "(Lorg/apache/logging/log4j/core/Appender;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_CORE_LOGGER,
+        "setAdditive",
+        "(Z)V",
+        native_log_void,
+    );
 }
 
 /// Register no-op natives on `SimpleLogger` for every Logger interface

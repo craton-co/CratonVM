@@ -828,7 +828,15 @@ pub fn find_field_recursive<'a>(
     //   3. Otherwise, recursively search the superclass of C.
     //
     // Phase 1+3: walk the superclass chain, checking own fields at each level.
+    //
+    // Perf: the per-level interface BFS reuses two scratch buffers
+    // (`queue`, `visited`) across superclass levels instead of
+    // allocating a fresh `Vec` + default-hasher `HashSet` per level.
+    // `visited` is an `FxHashSet` — the fx hasher is faster than the
+    // SipHash default and the `ClassId` keys are not attacker-keyed.
     let mut current_id = class_id;
+    let mut queue: Vec<ClassId> = Vec::new();
+    let mut visited: FxHashSet<ClassId> = FxHashSet::default();
     loop {
         let class = store.get(current_id)?;
         if let Some((idx, field)) = class.find_own_field(field_name) {
@@ -838,8 +846,9 @@ pub fn find_field_recursive<'a>(
         // Per the spec, only static fields can be inherited from interfaces;
         // we still return whatever matches by name and let the caller
         // distinguish static vs. instance via the field flags.
-        let mut queue: Vec<ClassId> = class.interfaces.clone();
-        let mut visited = std::collections::HashSet::new();
+        queue.clear();
+        visited.clear();
+        queue.extend_from_slice(&class.interfaces);
         let mut i = 0;
         while i < queue.len() {
             let iface_id = queue[i];

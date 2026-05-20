@@ -58,13 +58,16 @@ pub fn lower_method(
 
     match shape {
         LoopShape::StraightLine => {
-            // Single-thread kernel: every CUDA thread runs the body
-            // identically. Marshalling pre-allocates a 1-element output
-            // buffer; collision on `ret_ptr` is benign because every
-            // thread writes the same value.
+            // Single-thread kernel: the body is identical on every CUDA
+            // thread because there is no induction variable. If the
+            // launch geometry has more than one thread, every thread
+            // would run the body — and any array store would have all
+            // threads racing to write the same element. Emit a
+            // `tid != 0` guard so only thread 0 executes the body; this
+            // makes the kernel correct regardless of the launch
+            // geometry chosen by the marshalling layer.
             emitter.emit_tid();
-            // Optional: skip extra threads. We could check `tid != 0`
-            // and ret, to avoid redundant work; harmless either way.
+            emitter.emit_straight_line_guard();
             // Walk the whole method.
             emitter.walk(0, bytes.len(), None)?;
         }

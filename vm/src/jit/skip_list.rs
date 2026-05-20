@@ -951,6 +951,28 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/LinkedHashMap", "afterNodeInsertion")
         | ("java/util/LinkedHashMap", "afterNodeAccess")
         | ("java/util/LinkedHashMap", "afterNodeRemoval")
+        // NETTY.1 (current session) — JIT'd `java/util/Arrays.fill(byte[], byte)`
+        // never returns. Reproducer: `apps/netty/NettyEchoTest` (rc=124 after
+        // 30s) hangs during the netty bootstrap cascade. `RUSTJVM_FRAME_TRACE=1`
+        // capture shows the very last frame pushed before the freeze is
+        // `java/util/Arrays.fill([BB)V`, called from
+        // `io/netty/util/internal/StringUtil.<clinit>` at bci 121 to zero-fill
+        // the 65536-element `HEX2B` byte array with -1. With
+        // `RUSTJVM_DISABLE_JIT=1` the hang vanishes and surfaces a clean
+        // `PlatformDependent0.<clinit>` NPE (a separate downstream gap, not a
+        // JIT issue) — classic JIT-miscompile signature.
+        //
+        // The 65536-iteration counted loop (bci 5..17: `iload i; iload n;
+        // if_icmpge 20; aload arr; iload i; iload b; bastore; iinc i,1;
+        // goto 5`) crosses the 1000-backedge OSR threshold on its first call
+        // and triggers OSR re-compilation of `Arrays.fill`. The JIT'd version
+        // has an infinite loop — either the bounds check is miscompiled (so
+        // `if_icmpge` never fires) or the `iinc` mishandles the IV (so `i`
+        // never reaches `n`). The companion `Arrays.fill(int[], int)` etc.
+        // share the same bytecode shape and are skip-listed pre-emptively.
+        // Other `java/util/Arrays` methods (sort, copyOf, hashCode) don't
+        // exhibit this counted-loop shape and stay JIT-eligible.
+        | ("java/util/Arrays", "fill")
         // NEW-1.4 — regalloc parameter-mapping bug, surfaces as
         // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
         // Tracked by the committed reproducer in

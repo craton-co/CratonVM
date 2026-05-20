@@ -1467,6 +1467,22 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     const BDRPP: &str = "org/springframework/beans/factory/support/BeanDefinitionRegistryPostProcessor";
     const BFPP: &str = "org/springframework/beans/factory/config/BeanFactoryPostProcessor";
 
+    // GAUNTLET ROUND-5: CCPP/BDRPP/BFPP post-processor shims DISABLED.
+    // These registrations short-circuited the real
+    // `@Configuration`/`@Bean`/post-processor processing path on FIVE
+    // (class, method) pairs — including the INTERFACE-LEVEL ones
+    // (BeanDefinitionRegistryPostProcessor.postProcessBeanDefinitionRegistry
+    // and BeanFactoryPostProcessor.postProcessBeanFactory) which silently
+    // replaced bytecode for ANY Spring bean implementing those interfaces.
+    // With insurance-backend the consequence is that
+    // `AbstractApplicationContext.invokeBeanFactoryPostProcessors` returns
+    // without doing any real work, so refresh() completes Ok in ~1.7s
+    // without actually scanning @Configuration classes or registering
+    // tomcat/JPA beans. Disabling lets real bytecode run; if it surfaces
+    // a real exception, that's progress.
+    let _ = (CCPP, BDRPP, BFPP);
+    let _ = ccpp_process_config_bean_definitions;
+    /*
     registry.register(
         CCPP,
         "processConfigBeanDefinitions",
@@ -1500,6 +1516,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
         ccpp_process_config_bean_definitions,
     );
+    */
 
     // ───────────────────────────────────────────────────────────────────────
     // sportme defence-in-depth, layer 2:
@@ -1719,38 +1736,16 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // `(ConfigurationClassPostProcessor, processConfigBeanDefinitions,
     //   (Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V)`
     // in vm/src/vm/vm_exec.rs.
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "processConfigBeanDefinitions",
-        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
-        ccpp_process_config_bean_definitions_noop,
-    );
-
-    // Companion no-op: `postProcessBeanDefinitionRegistry` is the
-    // `BeanDefinitionRegistryPostProcessor` entry that Spring calls before
-    // `processConfigBeanDefinitions`. Its default impl simply delegates to
-    // `processConfigBeanDefinitions` after a registryId guard. No-op'ing it
-    // too prevents the guard's IllegalStateException ("already called for
-    // this post-processor") if Spring's lifecycle re-enters via a different
-    // path, and ensures the property-injection failure cannot be reached
-    // from the BFPP fan-out either.
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "postProcessBeanDefinitionRegistry",
-        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
-        ccpp_process_config_bean_definitions_noop,
-    );
-
-    // And the BFPP entry (`postProcessBeanFactory`) — same rationale. Skips
-    // the `enhanceConfigurationClasses` CGLIB pass which is irrelevant on
-    // CratonVM (no CGLIB) and could crash on the same property-injection
-    // surface if Spring decides to re-wrap any config class.
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "postProcessBeanFactory",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-        ccpp_process_config_bean_definitions_noop,
-    );
+    // CCPP no-op shims DISABLED per gauntlet "no synthetic stubs" policy.
+    // Previously these three registrations short-circuited the real
+    // `@Configuration`/`@Bean` processing path (CCPP.processConfigBeanDefinitions
+    // + postProcessBeanDefinitionRegistry + postProcessBeanFactory) so the
+    // JVM could exit Spring Boot rc=0 without ever running ApplicationContext
+    // refresh on real beans. With the shim off, the underlying
+    // PropertyBatchUpdateException at internalConfigurationAnnotationProcessor's
+    // setter injection (environment / resourceLoader / beanClassLoader)
+    // surfaces — the orchestrator dispatches a follow-up fix agent for that.
+    let _ = ccpp_process_config_bean_definitions_noop;
 }
 
 /// `AbstractBeanDefinition.getBeanClassName()` — return the canonical bean

@@ -217,6 +217,43 @@ fn emit_default_ctor(
     method
 }
 
+/// Build the bytes for a `setBeanFactory(BeanFactory)V` body that is a no-op
+/// (`return`). The marker interface `EnhancedConfiguration` extends
+/// `BeanFactoryAware`, which declares `setBeanFactory(BeanFactory) throws
+/// BeansException`. Real CGLIB enhancement stores the factory into a
+/// `$$beanFactory` field; the no-op variant is enough for context refresh
+/// to advance past the `BeanFactoryAware` callback. Subsequent code that
+/// reflectively reads `$$beanFactory` will see no such field and fall back
+/// to other lookup paths — same trade-off as our prior identity-bypass
+/// enhancer, which never had the field either.
+fn emit_set_bean_factory(
+    name_idx: u16,
+    descriptor_idx: u16,
+    code_attr_name_idx: u16,
+) -> Vec<u8> {
+    let mut method = Vec::new();
+    method.extend_from_slice(&0x0001u16.to_be_bytes()); // ACC_PUBLIC
+    method.extend_from_slice(&name_idx.to_be_bytes()); // "setBeanFactory"
+    method.extend_from_slice(&descriptor_idx.to_be_bytes()); // "(Lorg/springframework/beans/factory/BeanFactory;)V"
+    method.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1 (Code)
+
+    // Body bytecode: just `return` (0xB1). max_stack=0, max_locals=2 (this + arg).
+    let code: [u8; 1] = [0xB1];
+
+    let mut code_attr = Vec::new();
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // max_stack
+    code_attr.extend_from_slice(&2u16.to_be_bytes()); // max_locals (this + factory arg)
+    code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes()); // code_length
+    code_attr.extend_from_slice(&code);
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count (no StackMapTable; v52 lets us skip)
+
+    method.extend_from_slice(&code_attr_name_idx.to_be_bytes());
+    method.extend_from_slice(&(code_attr.len() as u32).to_be_bytes());
+    method.extend_from_slice(&code_attr);
+    method
+}
+
 /// Generate a fresh `<OriginalName>$$EnhancerByCGLIB$$<counter>` class
 /// file as a `Vec<u8>` plus the chosen internal-name. The new class
 /// extends `super_internal_name` and implements
@@ -238,12 +275,23 @@ fn build_enhancer_class(super_internal_name: &str) -> (String, Vec<u8>) {
     let code_attr_name_idx = cw.add_utf8("Code");
     let super_init_methodref = cw.add_methodref(super_class_idx, "<init>", "()V");
 
+    // -- setBeanFactory(BeanFactory)V — required because the marker interface
+    // `EnhancedConfiguration` extends `BeanFactoryAware`, whose abstract
+    // `setBeanFactory(BeanFactory)V` must be implemented or invocation throws
+    // NoSuchMethodError when Spring's `BeanFactoryAware` post-processor casts
+    // and invokes it.
+    let set_bf_name_idx = cw.add_utf8("setBeanFactory");
+    let set_bf_desc_idx =
+        cw.add_utf8("(Lorg/springframework/beans/factory/BeanFactory;)V");
+
     let ctor = emit_default_ctor(
         init_name_idx,
         void_no_arg_desc_idx,
         code_attr_name_idx,
         super_init_methodref,
     );
+    let set_bean_factory =
+        emit_set_bean_factory(set_bf_name_idx, set_bf_desc_idx, code_attr_name_idx);
 
     // access_flags = ACC_PUBLIC (0x0001) | ACC_SUPER (0x0020) — JLS-required
     // for any new class file. ACC_SYNTHETIC (0x1000) flags the generated
@@ -255,7 +303,7 @@ fn build_enhancer_class(super_internal_name: &str) -> (String, Vec<u8>) {
         this_class_idx,
         super_class_idx,
         &[iface_idx],
-        &[ctor],
+        &[ctor, set_bean_factory],
     );
 
     (new_name, bytes)

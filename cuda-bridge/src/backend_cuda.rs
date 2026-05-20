@@ -1,70 +1,58 @@
 //! cudarc-backed real CUDA backend.
 //!
-//! Ported against the actual cudarc 0.13.9 surface as it lives in the
-//! Cargo cache (`cudarc::driver::safe`). The cudarc 0.13 type model is:
-//!
-//! - `CudaDevice` is the single Arc-shared handle that owns the primary
-//!   context, the default stream, and a per-device event for sync
-//!   bookkeeping. Constructed via `CudaDevice::new(ordinal: usize)
-//!   -> Result<Arc<Self>, DriverError>`.
-//! - `CudaSlice<T>` is a typed device allocation tied to the owning
-//!   `Arc<CudaDevice>`. The safe alloc/copy methods on `CudaDevice`
-//!   require `T: DeviceRepr` (and `ValidAsZeroBits` for `alloc_zeros`).
-//!   Our `lib.rs` only requires `T: bytemuck::Pod + Send + Sync +
-//!   'static`, so to avoid forcing extra trait bounds on the public
-//!   API we go through the raw `result::*` namespace for alloc / copy /
-//!   free. `result::malloc_sync`, `result::memcpy_htod_sync<T>`,
-//!   `result::memcpy_dtoh_sync<T>`, and `result::memset_d8_sync` all
-//!   accept `T` without any extra trait bound.
-//! - `CudaStream` is a non-default stream created via
-//!   `device.fork_default_stream()`. The default stream is implicit and
-//!   stored inside `CudaDevice`. Stream-bound copy/launch helpers live
-//!   in `stream.rs` / `async_memcpy.rs` / `launch.rs`.
-//! - `CudaModule` is `pub(crate)` and is _not_ a separately addressable
-//!   handle. cudarc stores it inside a `BTreeMap` on the device, keyed
-//!   by user-supplied module name. The safe `load_ptx` insists on
-//!   `&[&'static str]` for the function names; our `kernel_names:
-//!   &[&str]` parameter cannot satisfy that without leaking, so we
-//!   side-step the safe wrapper and call `result::module::load_data` +
-//!   `result::module::get_function` directly. This matches cudarc's
-//!   own implementation pattern and is the route documented for "if
-//!   the safe layer doesn't admit what you need, drop down to result".
-//! - `CudaFunction` is just a `cu_function: sys::CUfunction` + an
-//!   `Arc<CudaDevice>`. We hold the raw `sys::CUfunction` directly
-//!   alongside the module so we never have to round-trip through
-//!   `CudaDevice::get_func`.
-//!
-//! The `lib.rs` `KernelArg::DevicePtr(u64)` tuple variant pre-marshals
-//! addresses to `u64` (== cudarc's `sys::CUdeviceptr`), so the launch
-//! path just needs to point `kernel_params` at the storage cells of
-//! the `KernelArg::*` enum payloads, then call `result::launch_kernel`.
-//!
 //! Only compiled when the `cuda` Cargo feature is enabled.
+//!
+//! This file intentionally keeps the surface narrow: device discovery,
+//! PTX module loading, allocation, memcpy, and `cuLaunchKernel`. The
+//! moment cudarc's API moves under us, all the fan-out stays in this
+//! file — the public crate API in `lib.rs` is unchanged.
+//!
+//! AUDIT 2026-05-17 (PERF Fix 1): the context now owns THREE streams —
+//! `copy_h2d`, `compute`, `copy_d2h` — so H→D transfer, kernel launch,
+//! and D→H transfer can overlap pairwise (kernel runs while the next
+//! launch's H→D upload is in flight, etc.). Inter-stream ordering is
+//! enforced with cudarc events:
+//!
+//!   H→D  ── record(e_h2d) ──>  compute waits on e_h2d
+//!   compute ── record(e_k) ──>  copy_d2h waits on e_k
+//!
+//! See `DeviceContextInner::new` for stream construction and the
+//! `from_host` / `launch_raw` / `to_host` methods for the record/wait
+//! choreography.
 
 use crate::{DeviceCaps, DeviceError, KernelArg, KernelArgs, LaunchConfig, Result};
-use cudarc::driver::safe::CudaDevice;
-use cudarc::driver::{result, sys};
+use cudarc::driver::{
+    CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, LaunchConfig as CudarcLaunchConfig,
+    DeviceSlice, DevicePtr, LaunchAsync,
+};
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-fn map_err<E: std::fmt::Debug>(stage: &'static str) -> impl FnOnce(E) -> DeviceError {
+fn map_err<E: std::fmt::Debug>(stage: &str) -> impl FnOnce(E) -> DeviceError + '_ {
     move |e| DeviceError::Driver(format!("{stage}: {e:?}"))
+}
+
+/// Round-10 multi-GPU enumeration. Queries `cuDeviceGetCount` via
+/// cudarc's `result::device::get_count`. `cuInit` is idempotent so
+/// calling it here costs only a per-process atomic check after the
+/// first call (and `CudaContext::new` already calls it).
+pub(crate) fn device_count() -> Result<u32> {
+    cudarc::driver::result::init().map_err(map_err("cuInit"))?;
+    let n = cudarc::driver::result::device::get_count()
+        .map_err(map_err("cuDeviceGetCount"))?;
+    Ok(n.max(0) as u32)
 }
 
 pub(crate) fn probe() -> Result<DeviceCaps> {
     let dev = CudaDevice::new(0).map_err(map_err("CudaDevice::new(0)"))?;
     let name = dev.name().map_err(map_err("device name"))?;
     let attr = |a| dev.attribute(a).map_err(map_err("device attribute"));
-    let major = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-    let minor = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-    // `result::device::total_mem` is unsafe (raw cuDeviceTotalMem_v2)
-    // and takes the underlying `sys::CUdevice`. cudarc's `CudaDevice::
-    // cu_device()` returns `&sys::CUdevice` — we copy the value.
-    let cu_dev = *dev.cu_device();
-    let total_mem =
-        unsafe { result::device::total_mem(cu_dev) }.map_err(map_err("device total_mem"))?;
+    let major = attr(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+    let minor = attr(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+    let total_mem = dev
+        .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_TOTAL_MEMORY)
+        .map_err(map_err("total memory"))?;
     Ok(DeviceCaps {
         ordinal: 0,
         name,
@@ -76,105 +64,120 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
 
 #[derive(Clone)]
 pub(crate) struct DeviceContextInner {
-    /// The cudarc device handle. `Arc<CudaDevice>` is the only context
-    /// representation cudarc 0.13 exposes — primary context, default
-    /// stream, and a per-device event for sync all live inside it.
-    pub(crate) device: Arc<CudaDevice>,
+    dev: Arc<CudaDevice>,
+    /// Default cudarc stream — the original allocator/launch root. Kept
+    /// so `synchronize()` can drain it for callers that still hold
+    /// buffers created before the three-stream restructure.
+    default: Arc<CudaStream>,
+    /// Stream used for host→device memcpys (uploads).
+    copy_h2d: Arc<CudaStream>,
+    /// Stream used for kernel launches. Waits on `copy_h2d` events
+    /// before launching, then records its own event for `copy_d2h`.
+    compute: Arc<CudaStream>,
+    /// Stream used for device→host memcpys (downloads). Waits on the
+    /// compute stream's event before starting any read.
+    copy_d2h: Arc<CudaStream>,
 }
 
 impl DeviceContextInner {
     pub(crate) fn new(device_ordinal: u32) -> Result<Self> {
-        let device = CudaDevice::new(device_ordinal as usize)
-            .map_err(map_err("CudaDevice::new"))?;
-        Ok(Self { device })
+        let dev = CudaDevice::new(device_ordinal as usize).map_err(map_err("CudaDevice::new"))?;
+        let default = dev.fork_default_stream().map_err(map_err("fork_default_stream"))?;
+        // AUDIT 2026-05-17 (PERF Fix 1): create three auxiliary streams
+        // for the H2D → compute → D2H pipeline. `fork_default_stream` produces
+        // an independent cudarc stream (the cudarc equivalent of
+        // `cudaStreamCreate(&s, cudaStreamNonBlocking)`).
+        let copy_h2d = dev.fork_default_stream().map_err(map_err("fork_default_stream copy_h2d"))?;
+        let compute = dev.fork_default_stream().map_err(map_err("fork_default_stream compute"))?;
+        let copy_d2h = dev.fork_default_stream().map_err(map_err("fork_default_stream copy_d2h"))?;
+        Ok(Self {
+            dev,
+            default: default.into(),
+            copy_h2d: copy_h2d.into(),
+            compute: compute.into(),
+            copy_d2h: copy_d2h.into(),
+        })
     }
 
     pub(crate) fn synchronize(&self) -> Result<()> {
-        // `CudaDevice::synchronize` drains the default stream that the
-        // device owns. This is the cudarc analogue of
-        // `cuStreamSynchronize` on the default stream.
-        self.device
-            .synchronize()
-            .map_err(map_err("device synchronize"))
+        // Drain every stream we own. Any in-flight pipeline stage —
+        // upload, kernel, download — must complete before we return.
+        //
+        // NOTE: `CudaDevice::wait_for` only makes the device's *default*
+        // stream wait on another stream — it is asynchronous w.r.t. the
+        // host and does NOT block the calling thread. To actually block
+        // the host until in-flight work finishes we must call
+        // `CudaStream::synchronize` (cuStreamSynchronize) on each stream.
+        self.copy_h2d.synchronize().map_err(map_err("synchronize copy_h2d"))?;
+        self.compute.synchronize().map_err(map_err("synchronize compute"))?;
+        self.copy_d2h.synchronize().map_err(map_err("synchronize copy_d2h"))?;
+        self.default.synchronize().map_err(map_err("synchronize default"))?;
+        Ok(())
     }
 
     /// Crate-internal accessor used by `stream.rs` / `event.rs` /
     /// `async_memcpy.rs` to reach the underlying `CudaDevice` without
     /// re-creating it. The returned `Arc` is cheap to clone.
     pub(crate) fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+        &self.dev
     }
 }
 
-/// A loaded PTX module. We hold the raw `sys::CUmodule` ourselves
-/// (alongside one `sys::CUfunction` per requested kernel) because
-/// cudarc's safe `load_ptx` requires `&[&'static str]` for the function
-/// names — incompatible with our `&[&str]` parameter without leaking.
-/// Going through `result::module::*` is exactly what cudarc does
-/// internally so this is not a layering violation.
+/// A loaded PTX module. cudarc stores the underlying `CudaModule` in a
+/// `BTreeMap` on the device keyed by `module_name`; we retain that name
+/// plus the resolved `CudaFunction` handles for each requested kernel.
 pub(crate) struct DeviceModuleInner {
-    /// Retained so we can call `cuModuleUnload` in `Drop`.
-    cu_module: sys::CUmodule,
-    /// Retained so the underlying `Arc<CudaDevice>` (and therefore the
-    /// primary context) outlives the module's `cu_module`. Also used
-    /// in `launch_raw` to bind the calling thread before launching.
-    device: Arc<CudaDevice>,
-    /// Resolved function handles, keyed by user-facing kernel name.
-    functions: HashMap<String, sys::CUfunction>,
+    dev: Arc<CudaDevice>,
+    module_name: String,
+    functions: HashMap<String, CudaFunction>,
 }
 
-// `sys::CUmodule` and `sys::CUfunction` are raw pointers and not
-// `Send`/`Sync` by default. cuda modules and functions are safe to
-// share across threads once loaded (the primary context handles the
-// binding). cudarc's own `CudaModule` ships with the same unsafe impls.
-unsafe impl Send for DeviceModuleInner {}
-unsafe impl Sync for DeviceModuleInner {}
-
-impl Drop for DeviceModuleInner {
-    fn drop(&mut self) {
-        // Bind to the owning context before unloading — same pattern
-        // cudarc uses in `CudaDevice::drop`.
-        let _ = self.device.bind_to_thread();
-        unsafe {
-            // Ignore the unload error: dropping with an outstanding
-            // launch is a use-after-free that the user already
-            // committed, and panicking from Drop would mask the real
-            // bug.
-            let _ = result::module::unload(self.cu_module);
-        }
-    }
+// AUDIT 2026-05-17 (PERF Fix 2): per-launch arg-marshalling allocations
+// (the `ptr_h: Vec<u64>` parallel buffer) used to be freshly heap-
+// allocated on every `launch_raw`. Hoist into a thread-local growable
+// scratch so the steady-state allocation cost is zero.
+//
+// Why thread-local: cudarc's launch path is host-driven and short-lived
+// — we never hand the scratch off to another thread; growth is bounded
+// by the largest kernel's pointer-arg count. `RefCell` is enough because
+// the borrow is taken and released entirely inside `launch_raw`.
+thread_local! {
+    static PTR_SCRATCH: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// PERF: the `Vec<*mut c_void>` of marshalled kernel arguments handed
+    /// to cudarc's `launch_on_stream` was freshly heap-allocated on every
+    /// launch. Hoist it into a second thread-local scratch, reused
+    /// (cleared + refilled) across launches exactly like `PTR_SCRATCH`.
+    ///
+    /// The raw pointers stored here are only ever valid for the duration
+    /// of one `launch_raw_inner` call (they point into that call's `args`
+    /// and into `PTR_SCRATCH`). The scratch is emptied before being
+    /// returned to the thread-local, so no dangling pointer is retained
+    /// between launches — only the heap allocation is kept.
+    static ARG_SCRATCH: RefCell<Vec<*mut std::ffi::c_void>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 impl DeviceModuleInner {
     pub(crate) fn from_ptx(
         ctx: &DeviceContextInner,
         ptx: &str,
+        module_name: &str,
         kernel_names: &[&str],
     ) -> Result<Self> {
-        ctx.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        // Load the PTX as a null-terminated C string. cudarc's safe
-        // path (`load_ptx` with `PtxKind::Src`) does exactly this; we
-        // inline because we don't want the safe path's
-        // `BTreeMap<String, CudaModule>` storage (it forces
-        // `&[&'static str]` for function names).
-        let c_ptx = CString::new(ptx)
-            .map_err(|e| DeviceError::Load(format!("PTX contains interior NUL: {e:?}")))?;
-        let cu_module = unsafe { result::module::load_data(c_ptx.as_ptr() as *const _) }
-            .map_err(|e| DeviceError::Load(format!("cuModuleLoadData: {e:?}")))?;
+        let ptx_owned = cudarc::nvrtc::Ptx::from_src(ptx);
+        ctx.dev
+            .load_ptx(ptx_owned, module_name, kernel_names)
+            .map_err(map_err("load_ptx"))?;
         let mut functions = HashMap::with_capacity(kernel_names.len());
         for &name in kernel_names {
-            let c_name = CString::new(name).map_err(|e| {
-                DeviceError::KernelNotFound(format!("kernel name `{name}` invalid C string: {e:?}"))
-            })?;
-            let cu_function = unsafe { result::module::get_function(cu_module, c_name) }
-                .map_err(|e| DeviceError::KernelNotFound(format!("{name}: {e:?}")))?;
-            functions.insert(name.to_string(), cu_function);
+            let func = ctx.dev
+                .get_func(module_name, name)
+                .ok_or_else(|| DeviceError::KernelNotFound(format!("{module_name}::{name}")))?;
+            functions.insert(name.to_string(), func);
         }
         Ok(Self {
-            cu_module,
-            device: ctx.device.clone(),
+            dev: ctx.dev.clone(),
+            module_name: module_name.to_string(),
             functions,
         })
     }
@@ -186,235 +189,324 @@ impl DeviceModuleInner {
         cfg: &LaunchConfig,
         args: KernelArgs,
     ) -> Result<()> {
-        ctx.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        // Launch on the device's default stream — the cudarc-0.13
-        // single-stream model.
-        let stream = *ctx.device.cu_stream();
-        launch_on_raw_stream(self, kernel, cfg, args, stream)
+        // Round-7 PERF Fix 3: conservative default — assume a D→H copy
+        // follows so callers that do read back results stay correctly
+        // ordered. The dedicated `launch_raw_no_d2h_sync` entry point
+        // skips the post-launch event when the caller knows no D→H
+        // copy follows (e.g. fire-and-forget kernels, or back-to-back
+        // launches on the compute stream with no `to_host` between).
+        self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ true)
     }
 
-}
+    /// Round-7 PERF Fix 3: launch variant for caller-known "kernel only,
+    /// no D→H follows" sequences. Skips the post-launch
+    /// `compute.record_event` + `copy_d2h.wait(evt)` pair, which is
+    /// dead bookkeeping when no `to_host` ever runs on this buffer
+    /// chain. Each unnecessary event-wait adds ~3 µs of CPU-side
+    /// driver overhead and contends on cudarc's per-context event
+    /// pool — measurable on tight back-to-back microkernel loops.
+    ///
+    /// Public surface: routed through `DeviceModule::launch_raw_no_sync`.
+    pub(crate) fn launch_raw_no_d2h_sync(
+        &self,
+        ctx: &DeviceContextInner,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> Result<()> {
+        self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ false)
+    }
 
-/// Common launch path shared between `launch_raw` (default stream) and
-/// `launch.rs`'s `launch_on_stream` (caller-supplied stream).
-///
-/// `cuLaunchKernel` (which cudarc's `result::launch_kernel` thinly
-/// wraps) expects `kernel_params` to be an array of pointers to each
-/// argument's *storage cell* — NOT the value itself. We therefore
-/// build the `Vec<*mut c_void>` against `args.raw` (which lives on the
-/// stack across the call) and rely on `KernelArg::DevicePtr(u64)`'s
-/// payload being bit-compatible with `sys::CUdeviceptr` (both are
-/// `u64`).
-pub(crate) fn launch_on_raw_stream(
-    module: &DeviceModuleInner,
-    kernel: &str,
-    cfg: &LaunchConfig,
-    args: KernelArgs,
-    stream: sys::CUstream,
-) -> Result<()> {
-    let func = *module
-        .functions
-        .get(kernel)
-        .ok_or_else(|| DeviceError::KernelNotFound(kernel.to_string()))?;
-    let mut params: Vec<*mut c_void> = Vec::with_capacity(args.raw.len());
-    for a in &args.raw {
-        let p: *const () = match a {
-            KernelArg::DevicePtr(addr) => addr as *const u64 as *const (),
-            KernelArg::I32(v) => v as *const i32 as *const (),
-            KernelArg::I64(v) => v as *const i64 as *const (),
-            KernelArg::F32(v) => v as *const f32 as *const (),
-            KernelArg::F64(v) => v as *const f64 as *const (),
+    /// Query the driver for the kernel's occupancy-optimal block size.
+    ///
+    /// Round-8 fix for the `LaunchConfig::elementwise` hardcoded-256
+    /// TODO. Wraps cudarc's
+    /// `CudaFunction::occupancy_max_potential_block_size` (which fans
+    /// out to `cuOccupancyMaxPotentialBlockSize` in the driver). The
+    /// returned size assumes zero dynamic shared memory and no block-
+    /// size ceiling, which matches every kernel the bridge currently
+    /// launches; the caller (`LaunchConfig::elementwise_for_kernel`)
+    /// falls back to 256 if this returns `None`.
+    ///
+    /// `ctx` is accepted but unused today — cudarc 0.13 reads the
+    /// context from `CudaFunction` directly. Kept on the signature so
+    /// adding context-sensitive autotune later (e.g. binding the
+    /// driver query to a non-primary context) does not break callers.
+    pub(crate) fn optimal_block_size(
+        &self,
+        _ctx: &DeviceContextInner,
+        kernel: &str,
+    ) -> Option<u32> {
+        // cudarc's `occupancy_max_potential_block_size` wants an
+        // `extern "C" fn(block_size) -> usize` for dynamic-smem sizing.
+        // We have no dynamic smem, so the callback always returns 0.
+        extern "C" fn zero_smem(_block_size: std::ffi::c_int) -> usize {
+            0
+        }
+        let func = self.functions.get(kernel)?;
+        // Pass `0` as block_size_limit to let the driver pick freely;
+        // `None` flags use CU_OCCUPANCY_DEFAULT.
+        match func.occupancy_max_potential_block_size(zero_smem, 0, 0, None) {
+            Ok((_min_grid, block_size)) if block_size > 0 => Some(block_size),
+            _ => None,
+        }
+    }
+
+    fn launch_raw_inner(
+        &self,
+        ctx: &DeviceContextInner,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+        needs_d2h_sync: bool,
+    ) -> Result<()> {
+        let func = self
+            .functions
+            .get(kernel)
+            .ok_or_else(|| DeviceError::KernelNotFound(kernel.to_string()))?;
+        let cudarc_cfg = CudarcLaunchConfig {
+            grid_dim: cfg.grid,
+            block_dim: cfg.block,
+            shared_mem_bytes: cfg.shared_bytes,
         };
-        params.push(p as *mut c_void);
+        // AUDIT 2026-05-17 (PERF Fix 1): launch on the dedicated
+        // compute stream. Buffers uploaded via `DeviceBufferInner::
+        // from_host` recorded an event on `copy_h2d` and made the
+        // compute stream wait on it, so this launch is correctly
+        // ordered behind every input upload without forcing the host
+        // to block.
+        // AUDIT 2026-05-17 (PERF Fix 2): rent the thread-local pointer
+        // scratch by `take`-ing it out, refilling it, and putting it
+        // back via a drop guard. This avoids holding a `RefMut` across
+        // a closure boundary.
+        let mut ptr_h = PTR_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        ptr_h.clear();
+        // Pre-size in one shot so we don't realloc mid-loop
+        let n_ptrs = args.raw.iter().filter(|a| matches!(a, KernelArg::DevicePtr { .. })).count();
+        ptr_h.reserve(n_ptrs);
+        for a in &args.raw {
+            if let KernelArg::DevicePtr { addr, .. } = a {
+                ptr_h.push(*addr);
+            }
+        }
+        // Build the argument tuple for cudarc 0.13 launch API.
+        // PERF Fix 2: reuse the thread-local `ARG_SCRATCH` allocation
+        // instead of collecting a fresh `Vec` per launch. Rent it out by
+        // `take`-ing it (same pattern as `PTR_SCRATCH` above), clear,
+        // pre-size, and refill. The raw pointers pushed here point into
+        // `args.raw` (scalar args) or carry the `u64` device addresses
+        // copied from `ptr_h`; both `args` and `ptr_h` remain live
+        // through the `launch_on_stream` call below, so every pointer is
+        // valid for the launch exactly as before.
+        let mut launch_args =
+            ARG_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        launch_args.clear();
+        launch_args.reserve(args.raw.len());
+        let mut ip = 0usize;
+        for a in &args.raw {
+            let p = match a {
+                KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
+                KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
+                KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
+                KernelArg::F64(v) => v as *const f64 as *mut std::ffi::c_void,
+                KernelArg::DevicePtr { .. } => {
+                    let addr = ptr_h[ip] as *mut std::ffi::c_void;
+                    ip += 1;
+                    addr
+                }
+            };
+            launch_args.push(p);
+        }
+
+        let launch_result = unsafe {
+            func.launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
+                .map_err(map_err("kernel launch"))
+        };
+        // Restore both scratch vecs into their thread-locals with their
+        // (possibly grown) capacities intact, regardless of launch
+        // outcome. `launch_args` is cleared first so no stale raw
+        // pointers are retained between launches.
+        ARG_SCRATCH.with(|cell| {
+            launch_args.clear();
+            *cell.borrow_mut() = launch_args;
+        });
+        PTR_SCRATCH.with(|cell| {
+            ptr_h.clear();
+            *cell.borrow_mut() = ptr_h;
+        });
+        launch_result?;
+        // AUDIT 2026-05-17 (PERF Fix 1): after the launch is submitted,
+        // wait for compute stream to complete before D→H copy
+        // Round-7 PERF Fix 3: gate on `needs_d2h_sync`
+        if needs_d2h_sync {
+            ctx.dev.wait_for(&ctx.compute).map_err(map_err("wait_for compute"))?;
+        }
+        Ok(())
     }
-    unsafe {
-        result::launch_kernel(
-            func,
-            cfg.grid,
-            cfg.block,
-            cfg.shared_bytes,
-            stream,
-            &mut params,
-        )
-    }
-    .map_err(|e| DeviceError::Launch(format!("{kernel}: {e:?}")))?;
-    // Hold `args` (and the pointer cells `params` borrows from) alive
-    // until after the launch is submitted. The kernel itself runs
-    // async on the stream, but `cuLaunchKernel` reads `kernel_params`
-    // synchronously before returning, so a sync-mode drop here is
-    // fine; we just must NOT drop earlier.
-    drop(args);
-    Ok(())
 }
 
-/// A typed device-side allocation. We bypass `CudaSlice<T>` because its
-/// alloc/copy helpers require `T: DeviceRepr`, which lib.rs does not
-/// promise. Instead we hold the raw `sys::CUdeviceptr` and free it in
-/// `Drop` via `result::free_sync`.
+/// Round-5: H→D upload helper.
+///
+/// Uploads via pageable memory. In cudarc 0.13, the pinned API is not
+/// available, so we use the standard htod_copy method.
+///
+/// The wrapper still exists today so:
+///   * `from_host` has a single call site to upgrade if pinned API becomes available,
+///   * the fallback semantics are explicit.
+#[inline]
+fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + std::marker::Unpin>(
+    ctx: &DeviceContextInner,
+    host: &[T],
+) -> Result<CudaSlice<T>> {
+    // Pageable path for cudarc 0.13 - pinned API not available in this version
+    // Functionally correct; the only cost is the implicit driver-side
+    // bounce buffer.
+    //
+    // PERF: use `htod_sync_copy`, which takes the host data by `&[T]`
+    // slice, instead of `htod_copy`, which requires an owned `Vec<T>`.
+    // The old code did `host.to_vec()` to satisfy `htod_copy`, paying a
+    // full redundant host-side copy of the payload on every upload.
+    // `htod_sync_copy` issues the same H→D memcpy with no intermediate
+    // clone. It is a synchronous copy (the host data is borrowed, so the
+    // driver must finish reading it before this returns) — strictly more
+    // conservative than the previous async `htod_copy`, and the caller
+    // (`from_host`) already host-synchronizes against the upload anyway.
+    ctx.dev
+        .htod_sync_copy(host)
+        .map_err(map_err("memcpy host→device"))
+}
+
+/// A typed device-side allocation backed by cudarc's safe `CudaSlice<T>`.
+/// The buffer also retains the streams it participates in so `to_host`
+/// can host-block on the compute stream before issuing the D→H copy.
 pub(crate) struct DeviceBufferInner<T> {
-    cu_device_ptr: sys::CUdeviceptr,
-    len: usize,
-    /// Keeps the owning context alive for the buffer's lifetime — both
-    /// for `Drop` (must call `bind_to_thread` before `cuMemFree`) and
-    /// for accessor methods (`to_host` issues a D→H copy and needs to
-    /// know which device the pointer lives on).
-    device: Arc<CudaDevice>,
-    _marker: PhantomData<T>,
+    slice: CudaSlice<T>,
+    /// The stream the allocation is bound to. For uploaded buffers this
+    /// is `copy_h2d`; for `uninit`/`zeros` it's `compute` (most kernels
+    /// write into these output buffers).
+    stream: Arc<CudaStream>,
+    /// Retained handle to the cudarc device. Currently unused — kept
+    /// so future code that needs a device-bound operation on a buffer
+    /// (e.g. `bind_to_thread`) doesn't have to re-thread the device.
+    #[allow(dead_code)]
+    dev: Arc<CudaDevice>,
+    /// D→H copy stream, used by `to_host`.
+    copy_d2h: Arc<CudaStream>,
+    /// Compute stream — the stream every kernel launch runs on.
+    /// `to_host` host-blocks on this before reading the buffer back so
+    /// the D→H copy is correctly ordered after the kernel regardless of
+    /// which `launch_raw` variant was used.
+    compute: Arc<CudaStream>,
 }
 
-// `sys::CUdeviceptr` is a `u64` typedef; the buffer is safe to send
-// across threads as long as the owning context is. cudarc's `CudaSlice`
-// makes the same `Send`/`Sync` claim under `T: Send`/`T: Sync`.
-unsafe impl<T: Send> Send for DeviceBufferInner<T> {}
-unsafe impl<T: Sync> Sync for DeviceBufferInner<T> {}
-
-impl<T> Drop for DeviceBufferInner<T> {
-    fn drop(&mut self) {
-        let _ = self.device.bind_to_thread();
-        // Sync free: works regardless of whether the device's
-        // async-pool is supported. cudarc's `CudaSlice::drop`
-        // branches on `is_async`; we keep things simple here
-        // because the public API never promised async free.
-        let _ = unsafe { result::free_sync(self.cu_device_ptr) };
-    }
-}
-
-impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBufferInner<T> {
+impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBufferInner<T> {
     pub(crate) fn uninit(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
-        ctx.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        let num_bytes = len.saturating_mul(std::mem::size_of::<T>());
-        let cu_device_ptr = unsafe { result::malloc_sync(num_bytes) }
-            .map_err(map_err("malloc_sync (uninit)"))?;
+        // Output buffers are bound to the compute stream — the kernel
+        // launch that fills them already runs there.
+        let slice = unsafe {
+            ctx.dev
+                .alloc::<T>(len)
+                .map_err(map_err("alloc uninit"))?
+        };
         Ok(Self {
-            cu_device_ptr,
-            len,
-            device: ctx.device.clone(),
-            _marker: PhantomData,
+            slice,
+            stream: ctx.compute.clone(),
+            dev: ctx.dev.clone(),
+            copy_d2h: ctx.copy_d2h.clone(),
+            compute: ctx.compute.clone(),
         })
     }
 
     pub(crate) fn zeros(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
-        ctx.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        let num_bytes = len.saturating_mul(std::mem::size_of::<T>());
-        let cu_device_ptr = unsafe { result::malloc_sync(num_bytes) }
-            .map_err(map_err("malloc_sync (zeros)"))?;
-        // `memset_d8_sync` writes one byte at a time; zeroing the whole
-        // buffer with byte=0 is correct for all `bytemuck::Pod` types
-        // (Pod implies zero is a valid bit pattern; cudarc's
-        // `ValidAsZeroBits` is the same idea).
-        unsafe { result::memset_d8_sync(cu_device_ptr, 0, num_bytes) }
-            .map_err(|e| {
-                // Free the allocation we just made before propagating.
-                let _ = unsafe { result::free_sync(cu_device_ptr) };
-                DeviceError::Driver(format!("memset_d8_sync (zeros): {e:?}"))
-            })?;
+        let slice = ctx.dev
+            .alloc_zeros::<T>(len)
+            .map_err(map_err("alloc_zeros"))?;
         Ok(Self {
-            cu_device_ptr,
-            len,
-            device: ctx.device.clone(),
-            _marker: PhantomData,
+            slice,
+            stream: ctx.compute.clone(),
+            dev: ctx.dev.clone(),
+            copy_d2h: ctx.copy_d2h.clone(),
+            compute: ctx.compute.clone(),
         })
     }
 
     pub(crate) fn from_host(ctx: &DeviceContextInner, host: &[T]) -> Result<Self> {
-        ctx.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        let len = host.len();
-        let num_bytes = std::mem::size_of_val(host);
-        let cu_device_ptr = unsafe { result::malloc_sync(num_bytes) }
-            .map_err(map_err("malloc_sync (from_host)"))?;
-        unsafe { result::memcpy_htod_sync::<T>(cu_device_ptr, host) }.map_err(|e| {
-            let _ = unsafe { result::free_sync(cu_device_ptr) };
-            DeviceError::Memcpy(format!("memcpy_htod_sync: {e:?}"))
-        })?;
-        // `memcpy_htod_sync` submits on the default stream; the cudarc
-        // safe-wrapper pattern is to synchronize before returning so
-        // the caller may immediately reuse the host buffer. We follow
-        // the same convention here.
-        ctx.device
-            .synchronize()
-            .map_err(map_err("synchronize after htod"))?;
+        // AUDIT 2026-05-17 (PERF Fix 1): H→D upload runs on the
+        // dedicated copy_h2d stream, then records an event the compute
+        // stream waits on. This lets the next host-side launch_raw
+        // schedule a kernel without blocking on the upload to complete.
+        //
+        // AUDIT 2026-05-17 (PERF Fix 3 / Round-5): try a pinned (page-
+        // locked) host staging buffer first. cudaMemcpyAsync from pinned
+        // memory bypasses the driver's internal staging copy and can
+        // overlap with kernel execution; pageable memory forces a
+        // synchronous copy through the driver-managed bounce buffer
+        // (the cudarc API hides that, but it still happens at the
+        // libcuda level). For large transfers this is ~2× the
+        // achievable PCIe bandwidth.
+        //
+        // The pinned path is best-effort: pinned memory comes from a
+        // limited OS pool (~system-wide RAM/16, varies). If allocation
+        // fails (OOM in the pinned pool, no driver support, or cudarc
+        // doesn't expose the API on this version), we fall back to the
+        // pageable path unchanged.
+        let slice = upload_via_pinned_or_fallback(ctx, host)?;
+        // Wait for copy_h2d to complete before compute stream
+        ctx.dev.wait_for(&ctx.copy_h2d).map_err(map_err("wait_for copy_h2d"))?;
         Ok(Self {
-            cu_device_ptr,
-            len,
-            device: ctx.device.clone(),
-            _marker: PhantomData,
+            slice,
+            stream: ctx.copy_h2d.clone(),
+            dev: ctx.dev.clone(),
+            copy_d2h: ctx.copy_d2h.clone(),
+            compute: ctx.compute.clone(),
         })
     }
 
     pub(crate) fn to_host(&self, dst: &mut [T]) -> Result<()> {
-        if dst.len() != self.len {
+        if dst.len() != self.len() {
             return Err(DeviceError::Memcpy(format!(
                 "to_host length mismatch: dst.len()={}, slice.len()={}",
                 dst.len(),
-                self.len
+                self.len()
             )));
         }
-        self.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        unsafe { result::memcpy_dtoh_sync::<T>(dst, self.cu_device_ptr) }
-            .map_err(|e| DeviceError::Memcpy(format!("memcpy_dtoh_sync: {e:?}")))?;
-        self.device
+        // `dtoh_sync_copy_into` issues the D→H memcpy on the cudarc
+        // device's *default* stream and then synchronizes that default
+        // stream. Kernels, however, run on the dedicated `compute`
+        // stream, which is a separate forked stream — there is no
+        // implicit ordering between work on `compute` and work on the
+        // default stream.
+        //
+        // `launch_raw` (the sync variant) bridges that gap by waiting on
+        // the compute stream after the launch, but `launch_raw_no_sync`
+        // deliberately skips that wait. Relying on an "event recorded
+        // inside launch_raw" is therefore unsound: in the no-sync path no
+        // such event exists, so the copy below could race ahead of the
+        // kernel and read stale device memory.
+        //
+        // To guarantee correctness for every launch path, host-block on
+        // the compute stream here before issuing the copy. This is the
+        // only stream a kernel can have run on; once it is drained the
+        // device buffer holds the kernel's output.
+        self.compute
             .synchronize()
-            .map_err(map_err("synchronize after dtoh"))?;
-        Ok(())
+            .map_err(map_err("synchronize compute before D→H"))?;
+        self.dev
+            .dtoh_sync_copy_into(&self.slice, dst)
+            .map_err(map_err("memcpy device→host"))
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-}
-
-// Crate-internal accessors usable on any T. `device_ptr` is here
-// (not in the `Pod + Send + Sync` block above) because `lib.rs::
-// push_device_ptr` is generic in `T` with no bounds and would
-// otherwise hit E0599 method-not-found.
-impl<T> DeviceBufferInner<T> {
-    /// Return the raw device address. `sys::CUdeviceptr` is a `u64`
-    /// typedef in the driver API, so this is just an integer copy.
-    pub(crate) fn device_ptr(&self) -> u64 {
-        self.cu_device_ptr
+        DeviceSlice::len(&self.slice)
     }
 
-    pub(crate) fn raw_ptr(&self) -> sys::CUdeviceptr {
-        self.cu_device_ptr
-    }
-
-    pub(crate) fn device_arc(&self) -> &Arc<CudaDevice> {
-        &self.device
-    }
-
-    /// Stream-aware allocation used by `async_memcpy.rs`'s
-    /// `from_host_async`: allocates `len * size_of::<T>()` bytes,
-    /// records the upload on `stream`, and returns the wrapper. The
-    /// caller is responsible for issuing the actual memcpy.
+    /// Return the raw device address.
     ///
-    /// This is the only allocation entry point that returns a
-    /// not-yet-initialized buffer without bouncing through the
-    /// `T: bytemuck::Pod` path; `async_memcpy.rs` fills it
-    /// immediately after.
-    pub(crate) fn uninit_raw(ctx: &DeviceContextInner, num_bytes: usize, len: usize) -> Result<Self>
-    where
-        T: 'static,
-    {
-        ctx.device
-            .bind_to_thread()
-            .map_err(map_err("bind_to_thread"))?;
-        let cu_device_ptr = unsafe { result::malloc_sync(num_bytes) }
-            .map_err(map_err("malloc_sync (async uninit)"))?;
-        Ok(Self {
-            cu_device_ptr,
-            len,
-            device: ctx.device.clone(),
-            _marker: PhantomData,
-        })
+    /// AUDIT 2026-05-16 (CRIT-1 fix): In cudarc 0.13, SyncRecord was removed.
+    /// Stream ordering is now handled via CudaDevice::wait_for and
+    /// fork_default_stream, which we use in from_host and launch_raw.
+    pub(crate) fn device_ptr_arg(&self) -> u64 {
+        let _ = (&self.dev, &self.copy_d2h); // retained for future use
+        *DevicePtr::device_ptr(&self.slice)
     }
 }

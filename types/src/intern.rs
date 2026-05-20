@@ -87,6 +87,32 @@ impl StringPool {
     /// Callers who would otherwise be tempted to construct a non-`'static`
     /// `StringPool` and outlive it should prefer [`Self::intern_arc`].
     pub fn intern(&self, s: &str) -> &'static str {
+        // Fast path: shared read lock, cache hit. We only need the *bytes* of
+        // the pool-owned `Arc<str>`, not ownership of a clone, so we read the
+        // string slice directly and skip the atomic refcount bump that
+        // `intern_arc` -> `Arc::clone` would perform. The bytes are pinned for
+        // as long as the pool's own `Arc<str>` clone lives (forever — we never
+        // call `remove`), so the `&str` borrowed from `existing` is valid for
+        // the pool's lifetime; see the lifetime-extension argument below.
+        {
+            let read = self.map.read();
+            if let Some((existing, _)) = read.get_key_value(s) {
+                // SAFETY: `existing` is the pool-owned `Arc<str>`; its bytes
+                // are pinned while the pool retains that clone — which is
+                // forever, since the pool never removes entries. The pool is
+                // intended for use as a `'static` singleton (see
+                // `global_pool`). The transmute is sound iff the pool
+                // outlives every `&'static` it yields, which holds for the
+                // singleton and for stack-local test pools (the returned
+                // reference is bounded by the pool's frame).
+                let bytes: &str = existing;
+                return unsafe { std::mem::transmute::<&str, &'static str>(bytes) };
+            }
+        }
+
+        // Slow path (cache miss): fall through to `intern_arc`, which takes
+        // the write lock and allocates the backing `Arc<str>`. We hold the
+        // resulting clone only long enough to derive the static reference.
         let arc = self.intern_arc(s);
         // SAFETY: `arc` is a clone of the pool-owned `Arc<str>`; the pool
         // keeps its own clone forever (we never call `remove`). The bytes of
@@ -117,15 +143,26 @@ impl StringPool {
         // Slow path: take the write lock. Allocate the `Arc<str>` exactly
         // ONCE — `Arc::<str>::from(&str)` copies the bytes into the Arc's
         // single backing allocation directly, no intermediate `String` or
-        // `Box<str>`. Re-check under the write lock in case a concurrent
-        // writer beat us to it.
-        let mut write = self.map.write();
-        if let Some((existing, _)) = write.get_key_value(s) {
-            return Arc::clone(existing);
-        }
+        // `Box<str>`.
+        //
+        // Hashing: the previous structure hashed `s` a *third* time on the
+        // miss path (`get_key_value` to re-check, then `insert`). Using the
+        // `entry` API instead hashes the (now owned) key exactly once for the
+        // combined re-check + insert: `entry` performs a single lookup, and
+        // `or_insert_with` does not re-hash. The `entry` key must be owned, so
+        // we allocate the `Arc<str>` up front; on the rare re-check hit (a
+        // concurrent writer beat us between dropping the read lock and taking
+        // the write lock) that allocation is dropped when the closure is not
+        // run, exactly as the old `get_key_value` early-return discarded work.
         let arc: Arc<str> = Arc::from(s);
-        write.insert(Arc::clone(&arc), ());
-        arc
+        let mut write = self.map.write();
+        match write.entry(Arc::clone(&arc)) {
+            std::collections::hash_map::Entry::Occupied(e) => Arc::clone(e.key()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(());
+                arc
+            }
+        }
     }
 
     /// Returns the number of unique strings currently interned.

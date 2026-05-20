@@ -162,9 +162,16 @@ impl VType {
             Some(b'F') => VType::Float,
             Some(b'D') => VType::Double,
             Some(b'L') => {
-                // Strip 'L' prefix and ';' suffix to get the class name
-                let class_name = &descriptor[1..descriptor.len() - 1];
-                VType::ObjectRef(Arc::from(class_name))
+                // Strip 'L' prefix and ';' suffix to get the class name.
+                // A malformed L-type with no terminating ';' (e.g. the
+                // bare string "L", or "Ljava/lang/String" with no ';')
+                // must NOT panic on the slice — fall back to Top so
+                // verification fails cleanly later, matching the
+                // `_ => VType::Top` arm below.
+                match descriptor.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                    Some(class_name) => VType::ObjectRef(Arc::from(class_name)),
+                    None => VType::Top, // malformed object descriptor
+                }
             }
             Some(b'[') => VType::ArrayRef(Arc::from(descriptor)),
             _ => VType::Top, // invalid descriptor → Top (verification will fail later)
@@ -315,9 +322,19 @@ fn array_is_assignable(
         return true;
     }
 
-    // Both must start with '['
-    let child_elem = &child_desc[1..];
-    let parent_elem = &parent_desc[1..];
+    // Both must start with '['. A malformed descriptor that does not
+    // (e.g. the bare string "[" with nothing after it, or an empty
+    // string) yields `None` element descriptors — treat as not
+    // assignable so verification rejects the class instead of panicking
+    // on the slice.
+    let child_elem = match child_desc.strip_prefix('[') {
+        Some(e) => e,
+        None => return false,
+    };
+    let parent_elem = match parent_desc.strip_prefix('[') {
+        Some(e) => e,
+        None => return false,
+    };
 
     // If both are reference arrays, check element type assignability
     match (
@@ -326,8 +343,14 @@ fn array_is_assignable(
     ) {
         // Both reference arrays (L or [)
         (Some(b'L'), Some(b'L')) => {
-            let child_class = &child_elem[1..child_elem.len() - 1];
-            let parent_class = &parent_elem[1..parent_elem.len() - 1];
+            // Strip 'L'..';' with bounds checks; a missing ';'
+            // terminator is malformed → not assignable, no panic.
+            let (Some(child_class), Some(parent_class)) = (
+                strip_object_descriptor(child_elem),
+                strip_object_descriptor(parent_elem),
+            ) else {
+                return false;
+            };
             // RVERIF.2: same JDK-interface relaxation as the scalar
             // ObjectRef arm (covers e.g. `[List` -> `[Collection` when
             // both element types are loaded as flag-less stubs).
@@ -339,7 +362,9 @@ fn array_is_assignable(
         (Some(b'['), Some(b'[')) => array_is_assignable(child_elem, parent_elem, hierarchy),
         // Nested array assignable to Object array
         (Some(b'['), Some(b'L')) => {
-            let parent_class = &parent_elem[1..parent_elem.len() - 1];
+            let Some(parent_class) = strip_object_descriptor(parent_elem) else {
+                return false; // malformed L-type → not assignable
+            };
             parent_class == "java/lang/Object"
                 || parent_class == "java/io/Serializable"
                 || parent_class == "java/lang/Cloneable"
@@ -349,20 +374,38 @@ fn array_is_assignable(
     }
 }
 
+/// Strip the `L` prefix and `;` suffix of an object field descriptor,
+/// returning the internal class name. Returns `None` for a malformed
+/// descriptor (no `L` prefix or no `;` terminator) so callers can reject
+/// it instead of panicking on an out-of-bounds slice.
+fn strip_object_descriptor(desc: &str) -> Option<&str> {
+    desc.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+}
+
 /// Merge two array types.
 fn merge_arrays(a: &str, b: &str, hierarchy: &dyn ClassHierarchy) -> VType {
     if a == b {
         return VType::ArrayRef(Arc::from(a));
     }
 
-    let a_elem = &a[1..];
-    let b_elem = &b[1..];
+    // Both must start with '['. A malformed descriptor that does not
+    // (e.g. the bare string "[" or an empty string) cannot be merged as
+    // an array — fall back to Object instead of panicking on the slice.
+    let (Some(a_elem), Some(b_elem)) = (a.strip_prefix('['), b.strip_prefix('[')) else {
+        return VType::ObjectRef(Arc::from("java/lang/Object"));
+    };
 
     match (a_elem.as_bytes().first(), b_elem.as_bytes().first()) {
         // Both reference arrays
         (Some(b'L'), Some(b'L')) => {
-            let a_class = &a_elem[1..a_elem.len() - 1];
-            let b_class = &b_elem[1..b_elem.len() - 1];
+            // Strip 'L'..';' with bounds checks; a missing ';'
+            // terminator is malformed → fall back to Object, no panic.
+            let (Some(a_class), Some(b_class)) = (
+                strip_object_descriptor(a_elem),
+                strip_object_descriptor(b_elem),
+            ) else {
+                return VType::ObjectRef(Arc::from("java/lang/Object"));
+            };
             let common = hierarchy.common_superclass(a_class, b_class);
             VType::ArrayRef(Arc::from(format!("[L{common};").as_str()))
         }

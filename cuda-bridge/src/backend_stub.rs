@@ -31,6 +31,7 @@ impl DeviceModuleInner {
     pub(crate) fn from_ptx(
         _ctx: &DeviceContextInner,
         _ptx: &str,
+        _module_name: &str,
         _kernel_names: &[&str],
     ) -> Result<Self> {
         Err(DeviceError::NoDriver)
@@ -72,7 +73,7 @@ impl<T> DeviceBufferInner<T> {
         0
     }
 
-    pub(crate) fn device_ptr(&self) -> u64 {
+    pub(crate) fn device_ptr_arg(&self) -> u64 {
         0
     }
 }

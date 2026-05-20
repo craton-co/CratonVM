@@ -132,14 +132,32 @@ impl Arena {
     /// Grow the arena to at least `new_capacity` bytes, preserving existing data.
     ///
     /// If `new_capacity` <= current capacity, this is a no-op.
-    /// All existing pointers into the arena are **invalidated** — the caller
-    /// must update all references after calling this (e.g., during a GC pause).
+    ///
+    /// # Panics
+    ///
+    /// `Vec::resize` may reallocate the backing buffer, which **invalidates
+    /// every raw pointer** previously handed out by [`Self::alloc`]. Nothing
+    /// in the type system enforces that callers fix up those pointers, so
+    /// growing a non-empty arena is almost always a silent heap-corruption
+    /// bug. To make the "safe by accident" usage explicit, this method
+    /// **panics** if the arena has any live allocations (`cursor != 0`).
+    ///
+    /// Only an empty arena (cursor at 0, e.g. a freshly-reset to-space) may
+    /// be grown. If a future caller genuinely needs to grow a populated
+    /// arena it must first relocate every object and reset the cursor.
     ///
     /// Returns the old base pointer so callers can compute relocation offsets.
     pub fn grow(&mut self, new_capacity: usize) -> *const u8 {
         if new_capacity <= self.data.len() {
             return self.data.as_ptr();
         }
+        assert_eq!(
+            self.cursor, 0,
+            "Arena::grow called on a non-empty arena ({} bytes live): \
+             Vec::resize may reallocate and invalidate every pointer into \
+             the arena. Only an empty (reset) arena may be grown.",
+            self.cursor,
+        );
         let old_base = self.data.as_ptr();
         self.data.resize(new_capacity, 0);
         old_base

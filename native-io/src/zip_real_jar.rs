@@ -561,12 +561,31 @@ fn native_jarfile_get_manifest(
             Some(s) => s,
             None => return Ok(Some(Value::Object(None))),
         };
+        // Perf fix: reuse the lazily-built `name_index` instead of an O(n)
+        // `file_names()` scan on every call. Build the index once (same as
+        // `getEntry`/`getInputStream`), then do a hashed lookup.
+        if state.name_index.is_none() {
+            let mut idx: HashMap<String, usize> =
+                HashMap::with_capacity(state.archive.len());
+            for (i, n) in state.archive.file_names().enumerate() {
+                idx.insert(n.to_string(), i);
+            }
+            state.name_index = Some(idx);
+        }
+        // `name_index` is keyed by exact entry name; the manifest is stored
+        // under the canonical "META-INF/MANIFEST.MF". Some archives use a
+        // lower/mixed-case path, so retain the case-insensitive fallback
+        // (still hashed for the common case) to match prior behavior.
         let idx_opt = state
-            .archive
-            .file_names()
-            .enumerate()
-            .find(|(_, n)| n.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
-            .map(|(i, _)| i);
+            .name_index
+            .as_ref()
+            .and_then(|m| {
+                m.get("META-INF/MANIFEST.MF").copied().or_else(|| {
+                    m.iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
+                        .map(|(_, i)| *i)
+                })
+            });
         let Some(idx) = idx_opt else {
             return Ok(Some(Value::Object(None)));
         };

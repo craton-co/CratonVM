@@ -4,10 +4,10 @@
 //! `java.awt.image.BufferedImage`. All pixel data is stored internally
 //! as ARGB u32 arrays regardless of the declared `ImageType`.
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 
 // ── Graphics2D reference ─────────────────────────────────────────────────
 
@@ -67,20 +67,38 @@ pub struct BufferedImageData {
 impl BufferedImageData {
     /// Create a new image filled with transparent black (or opaque black for
     /// non-alpha types).
+    ///
+    /// # Panics
+    /// Panics if `width * height` overflows `usize`. Java-controlled callers
+    /// must use [`BufferedImageData::try_new`] instead, which surfaces the
+    /// overflow as a recoverable error.
     pub fn new(width: u32, height: u32, image_type: ImageType) -> Self {
-        let len = (width as usize) * (height as usize);
+        Self::try_new(width, height, image_type)
+            .expect("pixel-buffer size overflow in BufferedImageData::new")
+    }
+
+    /// Fallible constructor: returns `None` if `width * height` overflows
+    /// (the pixel count cannot be represented as a `u32`).
+    ///
+    /// `BufferedImage.<init>` floors dimensions at 1 but never caps them, so
+    /// Java-controlled sizes can reach ~2^31 per axis. The pixel count is the
+    /// natural `u32` linear index (a Java array is `int`-indexed); requiring
+    /// it to fit in `u32` rejects any image larger than ~65535x65535 before
+    /// the backing `Vec` is allocated, instead of overflowing the multiply.
+    pub fn try_new(width: u32, height: u32, image_type: ImageType) -> Option<Self> {
+        let len = width.checked_mul(height)? as usize;
         let fill = if image_type.has_alpha() {
             0x0000_0000 // transparent
         } else {
             0xFF00_0000 // opaque black
         };
-        BufferedImageData {
+        Some(BufferedImageData {
             image_type,
             width,
             height,
             pixels: vec![fill; len],
             next_graphics_id: 1,
-        }
+        })
     }
 
     // ── Accessors ────────────────────────────────────────────────────
@@ -257,12 +275,9 @@ impl Clone for BufferedImageData {
 ///
 /// Used by native methods to look up image objects by handle.
 ///
-/// TODO(perf): swap `HashMap<u64, _>` for `rustc_hash::FxHashMap<u64, _>`.
-/// IDs are monotonically-increasing sequential `u64`s — SipHash provides no
-/// security benefit here, and FxHash is roughly 2-3x faster for integer keys.
-/// Requires adding `rustc-hash` to `native-awt/Cargo.toml` (the workspace
-/// already pulls it in transitively via wgpu/winit; sibling crates use a
-/// hand-rolled equivalent in `classloading/src/fx_hash.rs`).
+/// Storage uses [`FxHashMap`]: IDs are monotonically-increasing sequential
+/// `u64`s, so SipHash provides no security benefit here and FxHash is
+/// roughly 2-3x faster for integer keys on this lookup hot path.
 ///
 /// TODO(leak): no eviction is wired. `destroy()` exists but is never called
 /// from `natives.rs` — every `java.awt.image.BufferedImage` allocated by the
@@ -271,25 +286,34 @@ impl Clone for BufferedImageData {
 ///   (b) bounded LRU, or
 ///   (c) weak-ref tied to Java BufferedImage GC (cleanest).
 pub struct ImageRegistry {
-    images: HashMap<u64, BufferedImageData>,
+    images: FxHashMap<u64, BufferedImageData>,
     next_id: u64,
 }
 
 impl ImageRegistry {
     fn new() -> Self {
         ImageRegistry {
-            images: HashMap::new(),
+            images: FxHashMap::default(),
             next_id: 1,
         }
     }
 
     /// Create a new image and return its registry ID.
-    pub fn create(&mut self, width: u32, height: u32, image_type: ImageType) -> ImageId {
+    ///
+    /// Returns `None` if `width * height` overflows `usize` — the caller
+    /// (a native method) should surface this as a Java `OutOfMemoryError`
+    /// rather than panicking.
+    pub fn create(
+        &mut self,
+        width: u32,
+        height: u32,
+        image_type: ImageType,
+    ) -> Option<ImageId> {
+        let data = BufferedImageData::try_new(width, height, image_type)?;
         let id = self.next_id;
         self.next_id += 1;
-        let data = BufferedImageData::new(width, height, image_type);
         self.images.insert(id, data);
-        ImageId(id)
+        Some(ImageId(id))
     }
 
     /// Look up an image by ID (immutable).
@@ -343,6 +367,23 @@ mod tests {
         assert_eq!(img.height(), 240);
         assert_eq!(img.image_type(), ImageType::IntArgb);
         assert_eq!(img.get_data_buffer().len(), 320 * 240);
+    }
+
+    #[test]
+    fn try_new_rejects_pixel_count_overflow() {
+        // 70000 x 70000 ~= 4.9e9 pixels: overflows u32. Must return None,
+        // not panic in the multiply.
+        assert!(BufferedImageData::try_new(70_000, 70_000, ImageType::IntArgb).is_none());
+        assert!(BufferedImageData::try_new(0xFFFF_FFFF, 0xFFFF_FFFF, ImageType::IntArgb).is_none());
+        // A normal size still succeeds.
+        assert!(BufferedImageData::try_new(16, 16, ImageType::IntArgb).is_some());
+    }
+
+    #[test]
+    fn registry_create_rejects_overflow() {
+        let mut reg = ImageRegistry::new();
+        assert!(reg.create(70_000, 70_000, ImageType::IntArgb).is_none());
+        assert!(reg.create(8, 8, ImageType::IntArgb).is_some());
     }
 
     #[test]
@@ -466,7 +507,7 @@ mod tests {
     #[test]
     fn registry_create_get_destroy() {
         let mut reg = ImageRegistry::new();
-        let id = reg.create(64, 64, ImageType::IntArgb);
+        let id = reg.create(64, 64, ImageType::IntArgb).unwrap();
         assert!(reg.get(id).is_some());
         assert_eq!(reg.get(id).unwrap().width(), 64);
 

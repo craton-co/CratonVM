@@ -3224,7 +3224,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
             // If the receiver IS a lambda proxy but calling a non-SAM method
             // (e.g. andThen), dispatch on the functional interface class.
-            let class_name = {
+            //
+            // KC26 array.clone() bug: array objects store their COMPONENT class
+            // id (e.g. `OptionCategory`) in the header — NOT the array class
+            // id. Calling `get_class(receiver_class_id).name` for an array
+            // receiver therefore returns the component class name. Routing
+            // dispatch through the component then resolves `clone()` to the
+            // *component's* override (`Enum.clone()` for enum arrays — which
+            // is the JDK's deliberate CNSE-thrower) instead of `Object.clone`
+            // (the array-cloning native). Per JVMS §4.4.1, every array class's
+            // method table is `Object`'s — short-circuit array receivers to
+            // `java/lang/Object` here, matching the parallel logic in
+            // `invoke_or_native` and `try_stackless_invoke`.
+            let class_name = if self.shared.heap.kind_of(receiver)
+                == rustjvm_types::ObjectKind::Array
+            {
+                "java/lang/Object".to_string()
+            } else {
                 let lambda_iface = {
                     let proxies = self.shared.lambda_proxies.read();
                     proxies.get(&receiver_class_id).map(|lcs| lcs.functional_interface.to_string())
@@ -7629,6 +7645,21 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "log" | "info" | "warning" | "severe"
                                     | "fine" | "finer" | "finest"
+                                    // JULI's `DirectJDKLog` (Tomcat) routes
+                                    // every log call through `Logger.logp`,
+                                    // not `warning`/`log`. Without `logp`
+                                    // here the bytecode runs against our
+                                    // synthetic Logger (no Handler chain) and
+                                    // the message is silently dropped — that
+                                    // was the "Tomcat Bootstrap rc=0, no
+                                    // output" symptom. Force the native
+                                    // (registered in logmanager.rs) to win.
+                                    | "logp"
+                                    // `isLoggable` gates JULI's emit path;
+                                    // the real bytecode returns false for our
+                                    // parent-less synthetic Logger, so every
+                                    // log call short-circuits to a no-op.
+                                    | "isLoggable"
                             ))
                         || (class_name == "org/jboss/logmanager/Logger"
                             && matches!(
@@ -7733,6 +7764,24 @@ fn invoke_on_class_shared_inner(
                                 | "getName"
                                 | "getLevel"
                                 | "getMessageFactory"
+                                // EJBCA / log4j-1.2-api bridge —
+                                // `org.apache.log4j.LogManager.<clinit>`
+                                // → `new Hierarchy(new RootLogger(DEBUG))`
+                                // → `RootLogger.setLevel(DEBUG)` → eventually
+                                // `core.Logger.setLevel(level)` on our
+                                // synthetic Logger. The real bytecode
+                                // builds a new `Logger$PrivateConfig` from
+                                // `this.privateConfig.config` and NPEs
+                                // because the synthetic was allocated
+                                // without a privateConfig. Force the no-op
+                                // native (registered in log4j_extras) to
+                                // win for the level/appender mutators that
+                                // touch privateConfig. See the existing
+                                // `getAppenders` rationale above.
+                                | "setLevel"
+                                | "addAppender"
+                                | "removeAppender"
+                                | "setAdditive"
                             ))
                         // log4j 2.x LogManager surface: getContext /
                         // getLogger / getFormatterLogger / getRootLogger /

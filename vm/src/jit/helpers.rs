@@ -45,6 +45,29 @@ thread_local! {
     /// the interpreter detects the sentinel, takes this flag, and throws a
     /// real `NullPointerException` through the method's exception table.
     static JIT_PENDING_NPE: Cell<bool> = const { Cell::new(false) };
+
+    /// Debug-only reentrancy guard for [`jit_thread_mut`]. Set while a
+    /// `&mut JvmThread` handed out by `jit_thread_mut` is considered live, and
+    /// cleared when the [`JitThreadGuard`] returned alongside it is dropped.
+    /// A nested/aliasing `jit_thread_mut` call observes the set flag and trips
+    /// the `debug_assert!`. Compiled out entirely in release builds, so release
+    /// behaviour is unchanged.
+    #[cfg(debug_assertions)]
+    static JIT_THREAD_BORROWED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Debug-only RAII guard that marks the `jit_thread_mut` borrow as released
+/// when dropped. In release builds this is a zero-sized no-op.
+pub(crate) struct JitThreadGuard {
+    #[cfg(debug_assertions)]
+    _private: (),
+}
+
+impl Drop for JitThreadGuard {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        JIT_THREAD_BORROWED.with(|b| b.set(false));
+    }
 }
 
 /// Set the current thread's JvmThread pointer for JIT helper access.
@@ -144,7 +167,13 @@ fn set_jit_pending_npe() {
     JIT_PENDING_NPE.with(|e| e.set(true));
 }
 
-/// Obtain an exclusive reference to the JIT thread. Returns None if not set.
+/// Obtain an exclusive reference to the JIT thread. Returns `None` if not set,
+/// otherwise the `&mut JvmThread` paired with a [`JitThreadGuard`] RAII token.
+///
+/// The caller MUST keep the guard alive for as long as it uses the returned
+/// reference (binding it to `_guard` is sufficient). When the guard drops it
+/// clears the debug reentrancy flag; a nested/aliasing `jit_thread_mut` call
+/// made while a prior guard is still live trips a `debug_assert!`.
 ///
 /// # Safety
 /// Caller must ensure this is only called from JIT helper functions on the same
@@ -153,13 +182,30 @@ fn set_jit_pending_npe() {
 // SAFETY: Caller must ensure this is only called from JIT helper functions on the
 // same thread that called `set_jit_thread`, and that no other `&mut JvmThread`
 // reference is live. The pointer was set by `set_jit_thread` from a valid `&mut JvmThread`.
+// The `JIT_THREAD_BORROWED` flag + `JitThreadGuard` enforce the "no aliasing
+// borrow" half of this invariant in debug builds; release builds are unaffected.
 #[inline]
-unsafe fn jit_thread_mut() -> Option<&'static mut JvmThread> {
+unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
     let ptr = JIT_THREAD.with(|t| t.get());
     if ptr.is_null() {
         None
     } else {
-        Some(&mut *ptr)
+        #[cfg(debug_assertions)]
+        JIT_THREAD_BORROWED.with(|b| {
+            debug_assert!(
+                !b.get(),
+                "jit_thread_mut: aliasing &mut JvmThread borrow detected \
+                 (a prior JitThreadGuard is still live)"
+            );
+            b.set(true);
+        });
+        Some((
+            &mut *ptr,
+            JitThreadGuard {
+                #[cfg(debug_assertions)]
+                _private: (),
+            },
+        ))
     }
 }
 
@@ -543,7 +589,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     let total_size = rustjvm_types::HEADER_SIZE + data_size;
     if heap.try_alloc_young_probe(total_size).is_none() {
         // Young gen full — trigger GC from JIT context
-        if let Some(thread) = jit_thread_mut() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
             let mut roots = crate::memory::roots::collect_roots(vm, thread);
             let result = heap.collect_garbage(&mut roots, &vm.monitors);
             crate::memory::gc::update_all_roots(vm, thread, &result.pointer_map);
@@ -1232,6 +1278,33 @@ unsafe fn jit_typecheck_resolve(
     obj_ref: ObjectRef,
     class_name: &str,
 ) -> bool {
+    // KC26 array.clone() bug — descriptor-based array assignability.
+    //
+    // When the receiver is an array, falling through to the class-hierarchy
+    // `is_subclass_of` path misses every legitimate case: primitive arrays
+    // carry `class_id == 0` (no class entry), and reference arrays store
+    // their *component* class id in the header (which is never a subclass
+    // of the array class). The interpreter's `Checkcast` handler
+    // (`runtime/interpreter.rs::6876`) computes the array's descriptor
+    // and runs `array_is_assignable_to` — mirror that here so JIT-compiled
+    // checkcast/instanceof on arrays returns the same result.
+    //
+    // Reproducer: `() -> SRC.clone()` on an `int[]` field returns null in
+    // the JIT'd lambda body because `checkcast [I` after the clone() return
+    // hit the false branch below and zeroed the result. With this branch
+    // in place, the cast succeeds and the array round-trips correctly.
+    if vm.heap.kind_of(obj_ref) == rustjvm_types::ObjectKind::Array {
+        if let Some(src_desc) =
+            crate::runtime::interpreter::array_descriptor_of(vm, obj_ref)
+        {
+            if crate::runtime::interpreter::array_is_assignable_to(
+                vm, &src_desc, class_name,
+            ) {
+                return true;
+            }
+        }
+    }
+
     // Fast path: target already loaded. Most call sites hit this.
     //
     // IMPORTANT: bind the result to a local so the `RwLockReadGuard` temporary
@@ -1561,7 +1634,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             return rc;
         }
         // Overflow: decode args once and hand off to the interpreter.
-        if let Some(thread) = jit_thread_mut() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
             let bail_args = decode_dispatch_values(vm, info, args_slice);
             return bail_to_interpreter(vm, thread, info, &bail_args);
         }
@@ -1592,7 +1665,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
                 return rc;
             }
-            if let Some(thread) = jit_thread_mut() {
+            if let Some((thread, _guard)) = jit_thread_mut() {
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
                 return bail_to_interpreter(vm, thread, info, &bail_args);
             }
@@ -1619,7 +1692,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
                 return rc;
             }
-            if let Some(thread) = jit_thread_mut() {
+            if let Some((thread, _guard)) = jit_thread_mut() {
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
                 return bail_to_interpreter(vm, thread, info, &bail_args);
             }
@@ -1628,7 +1701,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     }
 
     // Slow path: interpreter fallback
-    let thread = match jit_thread_mut() {
+    let (thread, _jit_thread_guard) = match jit_thread_mut() {
         Some(t) => t,
         None => {
             return 0;
@@ -1798,7 +1871,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
     };
 
-    let thread = match jit_thread_mut() {
+    let (thread, _jit_thread_guard) = match jit_thread_mut() {
         Some(t) => t,
         None => return 0,
     };
@@ -1914,7 +1987,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
 
         // Entry not cached yet — use cached class name for fast dispatch.
-        let class_name: String = {
+        //
+        // KC26 array.clone() bug: array receivers store the COMPONENT class
+        // id in their header (per the documented invariant in
+        // `runtime/interpreter.rs`). Falling through to
+        // `get_class(receiver_class_id).name` would resolve dispatch on the
+        // component (e.g. `OptionCategory`/`Enum`) and surface
+        // `Enum.clone() → CloneNotSupportedException` for every array clone
+        // of an enum type. Per JVMS §4.4.1, array classes inherit their
+        // method table from `Object`; short-circuit accordingly.
+        let class_name: String = if vm.heap.kind_of(receiver_ref)
+            == rustjvm_types::ObjectKind::Array
+        {
+            "java/lang/Object".to_string()
+        } else {
             let guard = mic.cached_class_name.lock();
             match &*guard {
                 Some(name) => name.clone(),
@@ -2005,7 +2091,15 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // --- Cache miss: full resolution + update cache ---
     mic.record_miss();
 
-    let class_name = {
+    // See the matching block in the cache-hit branch above for the rationale
+    // — array receivers must dispatch through `java/lang/Object` rather than
+    // their component class id, otherwise enum-array `clone()` resolves to
+    // `Enum.clone()` (a JDK-deliberate CNSE thrower).
+    let class_name: std::sync::Arc<str> = if vm.heap.kind_of(receiver_ref)
+        == rustjvm_types::ObjectKind::Array
+    {
+        std::sync::Arc::from("java/lang/Object")
+    } else {
         let cm = vm.class_manager.read();
         cm.get_class(receiver_class_id)
             .map(|c| c.name.clone())
@@ -2294,7 +2388,7 @@ pub unsafe extern "C" fn jit_uncommon_trap(
     let (class_name, method_name, descriptor) = {
         // The thread's current frame has the method info
         let default = ("unknown".to_string(), "unknown".to_string(), "()V".to_string());
-        if let Some(thread) = jit_thread_mut() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
             if let Some(frame) = thread.frames.last() {
                 (
                     frame.class_name().to_string(),

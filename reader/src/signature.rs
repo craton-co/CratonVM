@@ -101,9 +101,18 @@ pub struct MethodSig {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Maximum recursion depth for signature parsing. A generic signature can
+/// nest type arguments / array dimensions arbitrarily deeply; without a cap
+/// an attacker-controlled `Signature` attribute string drives recursive
+/// descent into a native stack overflow. 255 matches the JVMS
+/// array-dimension limit and is far beyond any legitimate signature.
+const MAX_SIG_DEPTH: u32 = 255;
+
 struct SigParser<'a> {
     input: &'a [u8],
     pos: usize,
+    /// Current recursive-descent nesting depth; see [`MAX_SIG_DEPTH`].
+    depth: u32,
 }
 
 impl<'a> SigParser<'a> {
@@ -111,6 +120,7 @@ impl<'a> SigParser<'a> {
         SigParser {
             input: s.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -214,6 +224,20 @@ impl<'a> SigParser<'a> {
     }
 
     fn parse_type_sig(&mut self) -> Option<TypeSig> {
+        // Bound recursion: every recursive descent (array components,
+        // class type signatures, type arguments) routes through here, so
+        // a single depth guard at this chokepoint defends the whole
+        // grammar against a hostile, deeply-nested signature string.
+        if self.depth >= MAX_SIG_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let result = self.parse_type_sig_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_type_sig_inner(&mut self) -> Option<TypeSig> {
         match self.peek()? {
             b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => {
                 let ch = self.advance()? as char;
@@ -475,9 +499,9 @@ pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
     }
     let parsed = SigParser::new(sig).parse_class_sig();
     let mut cache = signature_cache().lock();
-    match &parsed {
+    match parsed {
         Some(c) => {
-            let arc = Arc::new(c.clone());
+            let arc = Arc::new(c);
             cache.insert(Arc::clone(sig), ParsedSignature::Class(Arc::clone(&arc)));
             Some(arc)
         }
@@ -498,9 +522,9 @@ pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
     }
     let parsed = SigParser::new(sig).parse_method_sig();
     let mut cache = signature_cache().lock();
-    match &parsed {
+    match parsed {
         Some(m) => {
-            let arc = Arc::new(m.clone());
+            let arc = Arc::new(m);
             cache.insert(Arc::clone(sig), ParsedSignature::Method(Arc::clone(&arc)));
             Some(arc)
         }
@@ -521,9 +545,9 @@ pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
     }
     let parsed = SigParser::new(sig).parse_type_sig();
     let mut cache = signature_cache().lock();
-    match &parsed {
+    match parsed {
         Some(t) => {
-            let arc = Arc::new(t.clone());
+            let arc = Arc::new(t);
             cache.insert(Arc::clone(sig), ParsedSignature::Field(Arc::clone(&arc)));
             Some(arc)
         }
@@ -568,6 +592,26 @@ mod tests {
         let sig = parse_method_signature("()V").unwrap();
         assert!(sig.param_types.is_empty());
         assert!(matches!(sig.return_type, TypeSig::Base('V')));
+    }
+
+    #[test]
+    fn deeply_nested_signature_is_rejected_not_overflow() {
+        // A pathological array signature `[[[...I` nested far past the
+        // depth cap must fail to parse rather than overflow the stack.
+        let bomb = format!("{}I", "[".repeat(100_000));
+        assert!(parse_field_signature(&bomb).is_none());
+
+        // Deeply-nested generic type arguments are also bounded: build
+        // `Lp<Lp<Lp<...>;>;>;` to a hostile depth and confirm no overflow.
+        let mut nested = String::new();
+        for _ in 0..100_000 {
+            nested.push_str("Lp<");
+        }
+        nested.push_str("Lp;");
+        for _ in 0..100_000 {
+            nested.push_str(">;");
+        }
+        assert!(parse_field_signature(&nested).is_none());
     }
 
     #[test]

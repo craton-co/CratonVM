@@ -48,21 +48,27 @@ fn validate_count(label: &str, count: u16, limit: u16) -> Result<(), ClassReader
 }
 
 /// Parse a `.class` file from a byte slice.
+///
+/// This copies `data` once into a fresh `Arc<[u8]>` and delegates to
+/// [`read_class_arc`]. Callers that already hold the class bytes as an
+/// `Arc<[u8]>` should call [`read_class_arc`] directly to skip that copy.
 pub fn read_class(data: &[u8]) -> Result<ClassFile, ClassReaderError> {
-    // Wrap the input bytes in a single shared `Arc<[u8]>` that will be
-    // threaded through every `LazyAttribute::Raw` produced for this class
-    // file. Each lazy attribute is then a `(name: Arc<str>, source:
-    // Arc<[u8]>, range: Range<usize>)` — a refcount bump on the source plus
-    // a range, no body memcpy. The Arc is kept alive by whichever lazy
-    // attribute(s) survive parsing; once they decode or drop, the backing
-    // buffer is freed.
-    //
-    // The single `Arc::from(data)` here copies `data` once into a fresh
-    // heap allocation. That's one O(class_file_size) copy at parse entry,
-    // replacing potentially hundreds of per-attribute `to_vec()` copies
-    // inside `read_attributes`.
-    let source: Arc<[u8]> = Arc::from(data);
+    read_class_arc(Arc::from(data))
+}
 
+/// Parse a `.class` file from an already-`Arc`-wrapped byte buffer.
+///
+/// The `source` `Arc<[u8]>` is threaded through every `LazyAttribute::Raw`
+/// produced for this class file. Each lazy attribute is then a `(name:
+/// Arc<str>, source: Arc<[u8]>, range: Range<usize>)` — a refcount bump on
+/// the source plus a range, no body memcpy. The Arc is kept alive by
+/// whichever lazy attribute(s) survive parsing; once they decode or drop,
+/// the backing buffer is freed.
+///
+/// Accepting an `Arc<[u8]>` directly avoids the O(class_file_size) copy
+/// that [`read_class`] performs at parse entry when the caller already
+/// owns a shared buffer.
+pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> {
     let mut buf = ClassFileBuffer::new(&source);
 
     // Magic number

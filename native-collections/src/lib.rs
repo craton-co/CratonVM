@@ -15,6 +15,35 @@ use rustjvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::{ObjectKind, ObjectRef, Value};
 
+// ---------------------------------------------------------------------------
+// Cached debug-flag probes.
+//
+// These flags are read from the OS environment on every native call in the
+// original code (`std::env::var`/`var_os`), which is a syscall-backed lookup
+// on the hot path. The values never change for the lifetime of the process,
+// so we resolve each exactly once into a `OnceLock<bool>` and reference the
+// cached boolean thereafter. Behaviour is identical — the flag is still
+// "enabled iff the env var is set" — but the per-call OS probe is gone.
+// ---------------------------------------------------------------------------
+
+/// `true` iff `RUSTJVM_HM_TRACE` is set (HashMap equals/contract tracing).
+fn dbg_hm_trace() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_HM_TRACE").is_some())
+}
+
+/// `true` iff `RUSTJVM_HS_ITR_DBG` is set (HashSet iterator tracing).
+fn dbg_hs_itr() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_HS_ITR_DBG").is_some())
+}
+
+/// `true` iff `RUSTJVM_DBG_SBLOAD` is set (synthetic-build-load tracing).
+fn dbg_sbload() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some())
+}
+
 /// Create an iterator backed by a snapshot array of the given size.
 /// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
 pub fn make_iterator_from_array(
@@ -659,7 +688,10 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        return Ok(Some(Value::Object(None))); // IndexOutOfBoundsException (simplified)
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -681,7 +713,10 @@ pub fn native_al_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        return Ok(Some(Value::Object(None)));
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -711,16 +746,20 @@ pub fn native_al_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let index = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let index_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => return Ok(None),
     };
     let elem = args.get(2).copied().unwrap_or(Value::Object(None));
     let (_, size) = al_state(ctx, this);
     let size = size as usize;
-    if index > size {
-        return Ok(None); // IndexOutOfBoundsException (simplified)
+    if index_i32 < 0 || index_i32 as usize > size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index: index_i32,
+        }
+        .into());
     }
+    let index = index_i32 as usize;
     let buf = al_ensure_capacity(ctx, this, size + 1);
     // Shift elements right
     for i in (index..size).rev() {
@@ -743,7 +782,10 @@ pub fn native_al_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
-        return Ok(Some(Value::Object(None)));
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
     }
     let data = match data {
         Some(d) => d,
@@ -777,10 +819,16 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     for i in 0..size {
         let elem = ctx.get_array_element(data, i);
         if values_equal(ctx, &elem, &target) {
-            // Shift left
-            for j in (i + 1)..size {
-                let val = ctx.get_array_element(data, j);
-                ctx.set_array_element(data, j - 1, val);
+            // Close the gap: shift the tail [i+1..size) left by one into
+            // [i..size-1). Use the bulk intrinsic (memmove-style overlap is
+            // handled by the VM) with a per-element fallback, mirroring
+            // `native_al_add_all`.
+            let tail_len = size - i - 1;
+            if !ctx.bulk_array_copy(data, i + 1, data, i, tail_len) {
+                for j in (i + 1)..size {
+                    let val = ctx.get_array_element(data, j);
+                    ctx.set_array_element(data, j - 1, val);
+                }
             }
             ctx.set_array_element(data, size - 1, Value::Object(None));
             al_set_size(ctx, this, (size - 1) as i32);
@@ -898,7 +946,7 @@ pub fn native_al_to_array_typed(
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, this);
     let size = size as usize;
-    if std::env::var_os("RUSTJVM_DBG_SBLOAD").is_some() {
+    if dbg_sbload() {
         eprintln!(
             "[DBG_SBLOAD] AL.toArray(T[]) size={} data_some={} template_some={}",
             size,
@@ -1104,15 +1152,35 @@ fn native_al_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let from = match args.get(1) {
-        Some(Value::Int(i)) => *i as usize,
+    let from_i32 = match args.get(1) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let to = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+    let to_i32 = match args.get(2) {
+        Some(Value::Int(i)) => *i,
         _ => 0,
     };
-    let (data, _size) = al_state(ctx, this);
+    let (data, size) = al_state(ctx, this);
+    if from_i32 < 0 || from_i32 > size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index: from_i32,
+        }
+        .into());
+    }
+    if to_i32 < 0 || to_i32 > size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index: to_i32,
+        }
+        .into());
+    }
+    if from_i32 > to_i32 {
+        return Err(rustjvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("fromIndex({from_i32}) > toIndex({to_i32})"),
+        }
+        .into());
+    }
+    let from = from_i32 as usize;
+    let to = to_i32 as usize;
     let sub_size = to.saturating_sub(from);
     let __al_n_fields = al_slots(ctx).2;
     let new_list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
@@ -1211,10 +1279,16 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
                 Some(arr)
             } else {
-                eprintln!(
-                    "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
-                    this, arr
-                );
+                // Diagnostic only — slot 0 is not the `table` field for
+                // JDK-constructed maps, and the fallback below resolves it
+                // properly. Gate the probe behind the cached HM-trace flag
+                // so the common path does no stderr I/O.
+                if dbg_hm_trace() {
+                    eprintln!(
+                        "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
+                        this, arr
+                    );
+                }
                 None
             }
         }
@@ -1380,7 +1454,7 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
     // arbitrary key types. See `map_hash_key` for the matching contract
     // commentary and the Spring `AnnotationTypeMapping.aliasedBy` symptom.
     let res = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))]);
-    if std::env::var("RUSTJVM_HM_TRACE").is_ok() {
+    if dbg_hm_trace() {
         eprintln!("[HM-EQ] invoke_virtual(equals) -> {:?}", res);
     }
     match res {
@@ -2480,10 +2554,38 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let values = map_collect_values(ctx, this);
-    for val in &values {
-        if values_equal(ctx, val, &target) {
-            return Ok(Some(Value::Int(1)));
+    // Properties-backed ConcurrentHashMap path: keep the existing
+    // segment-aware collection (rare; correctness over speed).
+    if properties_backing_chm(ctx, this).is_some() {
+        let values = map_collect_values(ctx, this);
+        for val in &values {
+            if values_equal(ctx, val, &target) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        return Ok(Some(Value::Int(0)));
+    }
+    // Plain HashMap: walk the buckets directly and short-circuit on the
+    // first matching value instead of materializing every value into a Vec.
+    let (buckets, _size, cap) = map_state(ctx, this);
+    if let Some(b) = buckets {
+        // Chain-walk cycle guard: bound each chain by the table-wide node
+        // count to avoid a hang on a corrupt (cyclic) chain.
+        const CHAIN_WALK_LIMIT: usize = 4096;
+        for i in 0..(cap as usize) {
+            let mut node_val = ctx.get_array_element(b, i);
+            let mut walk_count: usize = 0;
+            while let Value::Object(Some(node)) = node_val {
+                walk_count += 1;
+                if walk_count > CHAIN_WALK_LIMIT {
+                    break;
+                }
+                let value = get_node_value(ctx, node);
+                if values_equal(ctx, &value, &target) {
+                    return Ok(Some(Value::Int(1)));
+                }
+                node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+            }
         }
     }
     Ok(Some(Value::Int(0)))
@@ -3317,7 +3419,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => {
             // (Quieted: previously eprintln. Enable via RUSTJVM_HS_ITR_DBG.)
-            if std::env::var("RUSTJVM_HS_ITR_DBG").is_ok() {
+            if dbg_hs_itr() {
                 eprintln!("[HS-ITR-DBG] native_hs_iterator: backing map is None for {:?}", this);
             }
             return Ok(Some(Value::Object(None)));
@@ -3325,7 +3427,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     // Collect keys into a snapshot array
     let keys = map_collect_keys(ctx, backing);
-    if std::env::var("RUSTJVM_HS_ITR_DBG").is_ok() {
+    if dbg_hs_itr() {
         eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
     }
     let keys_arr = alloc_ref_array(ctx, keys.len());
@@ -10068,6 +10170,20 @@ fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback:
         .insert(name.to_string(), v);
 }
 
+/// Copy the per-object LHM overlay from `src` to `dst`. Used by
+/// `Object.clone()` so that a cloned `LinkedHashMap` retains its bucket
+/// table, head/tail pointers, and other state stored outside the heap
+/// fields. Without this, `lhm.clone()` returns an LHM with all state
+/// missing and downstream `HashMap.clone()` bytecode walks an empty
+/// receiver.
+pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
+    let mut m = lhm_overlay().lock().unwrap();
+    let src_state = m.get(&lhm_overlay_key(src)).cloned();
+    if let Some(s) = src_state {
+        m.insert(lhm_overlay_key(dst), s);
+    }
+}
+
 const LHM_NODE_KEY: usize = 0;
 const LHM_NODE_VALUE: usize = 1;
 const LHM_NODE_HASH: usize = 2;
@@ -10323,6 +10439,18 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(cap as i32));
     lhm_set(ctx, this, "head", LHM_FIELD_HEAD, Value::Object(None));
     lhm_set(ctx, this, "tail", LHM_FIELD_TAIL, Value::Object(None));
+
+    // KC26 clone path: LinkedHashMap.<init>()V is intercepted natively (we
+    // never run the bytecode chain LHM → HashMap.<init> → putfield loadFactor).
+    // That leaves the JDK-resolved `loadFactor`, `threshold`, and `table` heap
+    // slots zero-initialised. Once any bytecode path reads them — notably
+    // `HashMap.clone()` → `reinitialize()` → `putMapEntries()` → `resize()` —
+    // a loadFactor of 0.0f makes the resize compute `newCap = 1073741824`,
+    // which then OOMs on the `anewarray Node[1073741824]`. Mirror the JDK
+    // defaults into the real heap fields so cloned LHM instances see sane
+    // values when the HashMap.clone bytecode walks them.
+    try_set_jdk_map_field(ctx, this, "loadFactor", Value::Float(0.75_f32));
+    try_set_jdk_map_field(ctx, this, "threshold", Value::Int((cap as i32 * 3) / 4));
 }
 
 fn native_lhm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17602,7 +17730,13 @@ fn native_empty_enumeration(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 }
 
 fn native_itr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // UnsupportedOperationException in real Java, but no-op for simplicity
+    // Iterator.remove() is an optional operation; this snapshot-based iterator
+    // does not support it. Throw UnsupportedOperationException per the contract
+    // instead of silently doing nothing (which would mask caller bugs).
+    Err(rustjvm_types::error::RuntimeError::UnsupportedOperationException {
+        message: "remove".to_string(),
+    }
+    .into())
 }
 
 // ListIterator extras (snapshot-based: field 0 = array, field 1 = cursor)

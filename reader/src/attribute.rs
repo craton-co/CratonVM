@@ -731,13 +731,31 @@ pub fn decode_attribute_with_source_arc(
 /// in exactly one place. `length` is the total body length, needed by
 /// attributes that store raw bytes (`StackMapTable`, `Unknown`).
 ///
-/// `source` + `body_offset` describe the location of *this attribute's
-/// body* inside the shared class file buffer. Sub-attributes that store
-/// raw bytes use `body_offset + buf.position()` to compute the absolute
-/// offset of their payload start inside `source` and wrap it as
-/// `ByteView::new(Arc::clone(source), start..end)` — a refcount-only
-/// view on the shared buffer instead of a fresh `Vec<u8>` (or, post-
-/// round-4-wave-2, a fresh `Arc<[u8]>`) per payload.
+/// `source` + `body_offset` together pin payload locations inside the
+/// shared class file buffer. **Invariant**: `body_offset` is the absolute
+/// offset in `source` of *buf-position 0* — that is, the start of the
+/// **outermost** attribute body whose bytes the top-level
+/// [`decode_attribute_with_source_arc`] sliced into `buf`. Because `buf`
+/// is *not* re-sliced when descending into nested attributes (`Code`'s
+/// inner table, `Record`'s component tables, …), `buf.position()` is
+/// always measured from the outermost body's start, and the absolute
+/// source offset of the current buf position is always
+/// `body_offset + buf.position()` — at any nesting depth.
+///
+/// Sub-attributes that store raw bytes use exactly that formula to
+/// compute the absolute offset of their payload start inside `source`
+/// and wrap it as `ByteView::new(Arc::clone(source), start..end)` — a
+/// refcount-only view on the shared buffer instead of a fresh
+/// `Vec<u8>` (or, post-round-4-wave-2, a fresh `Arc<[u8]>`) per
+/// payload.
+///
+/// Round-11 fix: prior to this version, the `Code` and `Record` cases
+/// each recomputed `body_offset = body_offset + buf.position()` before
+/// recursing into [`decode_attributes_vec`], and that function then
+/// added `buf.position()` again — double-counting the offset. Any
+/// nested `StackMapTable` inside a `Code` body produced a `ByteView`
+/// range that ran ~108 bytes past the source length and tripped
+/// `ByteView::new`'s bounds assertion at boot.
 fn decode_attribute_body(
     name: &Arc<str>,
     length: usize,
@@ -975,9 +993,14 @@ fn decode_attribute_body(
             for _ in 0..num_components {
                 let comp_name_index = buf.read_u16()?;
                 let comp_descriptor_index = buf.read_u16()?;
-                let nested_offset = body_offset + buf.position();
+                // `body_offset` is the absolute offset in `source` of
+                // buf-position 0 (the outermost attribute body's start).
+                // It stays constant across nesting levels because `buf`
+                // is the same buffer; absolute offsets are always
+                // `body_offset + buf.position()`. See the comment on
+                // [`decode_attribute_body`] for the invariant.
                 let comp_attributes =
-                    decode_attributes_vec(buf, cp, source, nested_offset)?;
+                    decode_attributes_vec(buf, cp, source, body_offset)?;
                 components.push(RecordComponent {
                     name_index: comp_name_index,
                     descriptor_index: comp_descriptor_index,
@@ -1245,8 +1268,23 @@ fn decode_attributes_vec(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
     source: &Arc<[u8]>,
-    outer_body_offset: usize,
+    outermost_body_offset: usize,
 ) -> Result<Vec<Attribute>, ClassReaderError> {
+    // INVARIANT (round-11 fix): `outermost_body_offset` is the absolute
+    // offset in `source` that corresponds to *buf-position 0* — i.e. the
+    // start of the **outermost** attribute body that the top-level
+    // `decode_attribute_with_source_arc` call sliced the buffer from.
+    //
+    // The buffer is *not* re-sliced per nesting level, so its position is
+    // always measured from the outermost body's start. Therefore the
+    // absolute source offset of *any* current buf position is
+    // `outermost_body_offset + buf.position()`, regardless of nesting
+    // depth. Callers must thread the same outermost offset through unchanged
+    // — they must NOT re-add `buf.position()` at each nesting level
+    // (doing so double-counts the position and produces a `start..end`
+    // range that overshoots the source, panicking
+    // `ByteView::new`'s bounds check on attributes like a nested
+    // `StackMapTable` inside a `Code` body).
     let count = buf.read_u16()?;
     let mut out = Vec::with_capacity((count as usize).min(PREALLOC_CAP));
     for _ in 0..count {
@@ -1270,12 +1308,18 @@ fn decode_attributes_vec(
         }
         // Snapshot to enforce per-attribute length, mirroring class_reader.rs.
         let start_pos = buf.position();
-        let nested_body_offset = outer_body_offset + start_pos;
         // Round 7 audit fix (MED #7): pass the `Arc<str>` directly so
         // the body can dispatch via `Arc::ptr_eq` against canonical
         // names (`LineNumberTable`, `LocalVariableTable`, etc. are the
         // ubiquitous nested attribute inside `Code`).
-        let attr = decode_attribute_body(&name, length, buf, cp, source, nested_body_offset)?;
+        //
+        // Per the invariant above we pass the *outermost* body offset
+        // through unchanged; the nested decoder will compute its own
+        // payload's absolute offset as
+        // `outermost_body_offset + buf.position()` exactly the same way
+        // the top-level decoder does.
+        let attr =
+            decode_attribute_body(&name, length, buf, cp, source, outermost_body_offset)?;
         let consumed = buf.position() - start_pos;
         if consumed != length {
             return Err(ClassReaderError::InvalidClassData {
@@ -1353,8 +1397,12 @@ fn decode_code_body(
         });
     }
 
-    let nested_body_offset = body_offset + buf.position();
-    let attributes = decode_attributes_vec(buf, cp, source, nested_body_offset)?;
+    // `body_offset` is the absolute source offset of buf-position 0
+    // (the outermost attribute body's start). Thread it through unchanged
+    // — see the invariant comment on [`decode_attributes_vec`]. The nested
+    // decoder will compute absolute offsets as `body_offset + buf.position()`
+    // exactly the same way this function does.
+    let attributes = decode_attributes_vec(buf, cp, source, body_offset)?;
 
     Ok(Attribute::Code(CodeAttribute {
         max_stack,
@@ -1365,15 +1413,32 @@ fn decode_code_body(
     }))
 }
 
+/// Maximum nesting depth for annotation `element_value` structures.
+/// Annotation arrays (`[`) and nested annotations (`@`) recurse on
+/// attacker-controlled class data; this cap (matching the JVMS
+/// array-dimension limit) stops a malicious .class file from blowing
+/// the native stack via unbounded recursion.
+const MAX_ELEMENT_VALUE_DEPTH: u32 = 255;
+
 /// Decode a single annotation structure (JVM spec 4.7.16).
 fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassReaderError> {
+    decode_annotation_depth(buf, 0)
+}
+
+/// Depth-tracking implementation of [`decode_annotation`]. `depth` counts
+/// the annotation/array nesting so far; it is checked against
+/// [`MAX_ELEMENT_VALUE_DEPTH`] inside [`decode_element_value_depth`].
+fn decode_annotation_depth(
+    buf: &mut ClassFileBuffer<'_>,
+    depth: u32,
+) -> Result<Annotation, ClassReaderError> {
     let type_index = buf.read_u16()?;
     let num_element_value_pairs = buf.read_u16()?;
     let mut element_value_pairs =
         Vec::with_capacity((num_element_value_pairs as usize).min(PREALLOC_CAP));
     for _ in 0..num_element_value_pairs {
         let element_name_index = buf.read_u16()?;
-        let value = decode_element_value(buf)?;
+        let value = decode_element_value_depth(buf, depth)?;
         element_value_pairs.push(ElementValuePair {
             element_name_index,
             value,
@@ -1389,6 +1454,24 @@ fn decode_annotation(buf: &mut ClassFileBuffer<'_>) -> Result<Annotation, ClassR
 fn decode_element_value(
     buf: &mut ClassFileBuffer<'_>,
 ) -> Result<ElementValue, ClassReaderError> {
+    decode_element_value_depth(buf, 0)
+}
+
+/// Depth-tracking implementation of [`decode_element_value`]. The `[`
+/// (array) and `@` (nested annotation) tags recurse; each recursion
+/// increments `depth`, and exceeding [`MAX_ELEMENT_VALUE_DEPTH`] returns
+/// an error instead of descending further.
+fn decode_element_value_depth(
+    buf: &mut ClassFileBuffer<'_>,
+    depth: u32,
+) -> Result<ElementValue, ClassReaderError> {
+    if depth >= MAX_ELEMENT_VALUE_DEPTH {
+        return Err(ClassReaderError::InvalidClassData {
+            message: format!(
+                "annotation element_value nesting exceeds {MAX_ELEMENT_VALUE_DEPTH}"
+            ),
+        });
+    }
     let tag = buf.read_u8()?;
     match tag {
         b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
@@ -1411,14 +1494,14 @@ fn decode_element_value(
             Ok(ElementValue::Class { class_info_index })
         }
         b'@' => {
-            let annotation = decode_annotation(buf)?;
+            let annotation = decode_annotation_depth(buf, depth + 1)?;
             Ok(ElementValue::AnnotationValue(annotation))
         }
         b'[' => {
             let num_values = buf.read_u16()?;
             let mut values = Vec::with_capacity((num_values as usize).min(PREALLOC_CAP));
             for _ in 0..num_values {
-                values.push(decode_element_value(buf)?);
+                values.push(decode_element_value_depth(buf, depth + 1)?);
             }
             Ok(ElementValue::Array(values))
         }
@@ -1666,6 +1749,25 @@ mod tests {
             }
             other => panic!("Expected LineNumberTable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deeply_nested_element_value_array_is_rejected() {
+        // Build an element_value that is a 300-deep stack of `[` arrays
+        // (each array tag followed by a u16 count of 1). This exceeds the
+        // MAX_ELEMENT_VALUE_DEPTH cap and must return an error rather than
+        // recursing into a native stack overflow.
+        let mut data = Vec::new();
+        for _ in 0..300 {
+            data.push(b'[');
+            data.extend_from_slice(&1u16.to_be_bytes());
+        }
+        // Innermost value: a constant int (`I`) + u16 const index.
+        data.push(b'I');
+        data.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut buf = ClassFileBuffer::new(&data);
+        assert!(decode_element_value(&mut buf).is_err());
     }
 
     #[test]
@@ -2765,6 +2867,142 @@ mod tests {
                 assert_eq!(&*data, &[0xDEu8, 0xAD, 0xBE, 0xEF][..]);
             }
             other => panic!("Expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the round-11 off-by-`buf.position()` bug in
+    /// `decode_attributes_vec`. The previous code recomputed
+    /// `body_offset += buf.position()` at every nesting level and then
+    /// re-added `buf.position()` inside the nested decoder, double-
+    /// counting the offset. When a `Code` attribute contained a nested
+    /// `StackMapTable` (which produces a `ByteView` over the shared
+    /// class buffer), the computed `start..end` range ran ~`code_length`
+    /// bytes past the source and tripped `ByteView::new`'s bounds
+    /// assertion — panicking *every* boot class load and therefore
+    /// every Java program.
+    ///
+    /// Build a synthetic `Code` body containing a nested `StackMapTable`
+    /// and verify it decodes without panicking and that the
+    /// StackMapTable's bytes match exactly what we wrote.
+    #[test]
+    fn decode_code_with_nested_stack_map_table_does_not_overshoot() {
+        // CP: [0]=Tombstone, [1]=Utf8("StackMapTable")
+        let cp = ConstantPool::new(vec![
+                ConstantPoolEntry::Tombstone,
+                ConstantPoolEntry::Utf8(rustjvm_types::intern_arc("StackMapTable")),
+        ]);
+
+        // Build the Code body bytes:
+        //   max_stack(u2)=1, max_locals(u2)=1,
+        //   code_length(u4)=4, code = [0x2A, 0xB7, 0x00, 0xB1],
+        //   exception_table_length(u2)=0,
+        //   attributes_count(u2)=1,
+        //     name_index(u2)=1, length(u4)=3, body=[0xFF,0x00,0x42]
+        let mut body = Vec::<u8>::new();
+        body.extend_from_slice(&1u16.to_be_bytes()); // max_stack
+        body.extend_from_slice(&1u16.to_be_bytes()); // max_locals
+        body.extend_from_slice(&4u32.to_be_bytes()); // code_length
+        body.extend_from_slice(&[0x2A, 0xB7, 0x00, 0xB1]); // code
+        body.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        body.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
+        // Nested StackMapTable
+        body.extend_from_slice(&1u16.to_be_bytes()); // name_index -> "StackMapTable"
+        body.extend_from_slice(&3u32.to_be_bytes()); // length
+        body.extend_from_slice(&[0xFF, 0x00, 0x42]); // stack map entries
+
+        // The top-level decode_attribute path slices source[range] and
+        // hands `body_offset = range.start` to decode_attribute_body.
+        // We exercise it through `decode_attribute_with_source` which is
+        // the canonical entry used by the class reader.
+        let source: Arc<[u8]> = Arc::from(body.as_slice());
+        let attr = decode_attribute_with_source(
+            "Code",
+            &source,
+            0..source.len(),
+            &cp,
+        )
+        .expect("Code with nested StackMapTable must decode");
+
+        match attr {
+            Attribute::Code(code) => {
+                assert_eq!(code.max_stack, 1);
+                assert_eq!(code.max_locals, 1);
+                assert_eq!(&*code.code, &[0x2A, 0xB7, 0x00, 0xB1][..]);
+                assert_eq!(code.attributes.len(), 1);
+                match &code.attributes[0] {
+                    Attribute::StackMapTable { entries } => {
+                        // The nested StackMapTable's ByteView must
+                        // contain *exactly* the 3 body bytes we wrote.
+                        // Pre-fix this assertion never ran — the panic
+                        // hit on ByteView::new before the attribute was
+                        // returned.
+                        assert_eq!(&**entries, &[0xFF, 0x00, 0x42][..]);
+                    }
+                    other => panic!(
+                        "Expected nested StackMapTable, got {other:?}"
+                    ),
+                }
+            }
+            other => panic!("Expected Code, got {other:?}"),
+        }
+    }
+
+    /// Same regression coverage as above but parameterised so the buggy
+    /// `outer_body_offset + buf.position()` arithmetic would overshoot
+    /// `source.len()` (and panic) rather than merely producing wrong
+    /// bytes. We pad `source` so the un-offset range is in bounds, then
+    /// double-check the resolved bytes are correct — confirming the
+    /// invariant fix routes the ByteView at the right location.
+    #[test]
+    fn nested_stack_map_table_lands_at_correct_absolute_offset() {
+        let cp = ConstantPool::new(vec![
+                ConstantPoolEntry::Tombstone,
+                ConstantPoolEntry::Utf8(rustjvm_types::intern_arc("StackMapTable")),
+        ]);
+
+        // Build the Code body bytes (same shape as above), but place it
+        // at an offset inside `source` to mimic real class-file layout.
+        let mut code_body = Vec::<u8>::new();
+        code_body.extend_from_slice(&2u16.to_be_bytes()); // max_stack
+        code_body.extend_from_slice(&3u16.to_be_bytes()); // max_locals
+        code_body.extend_from_slice(&5u32.to_be_bytes()); // code_length
+        code_body.extend_from_slice(&[0x2A, 0xB7, 0x00, 0x01, 0xB1]); // code
+        code_body.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        code_body.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
+        code_body.extend_from_slice(&1u16.to_be_bytes()); // name_index
+        code_body.extend_from_slice(&4u32.to_be_bytes()); // length
+        let smt_bytes = [0xAB, 0xCD, 0xEF, 0x01];
+        code_body.extend_from_slice(&smt_bytes);
+
+        // Prepend 100 bytes of preamble + append 100 trailing bytes so
+        // a buggy double-counted offset would land somewhere bogus and
+        // either return wrong bytes or panic.
+        let preamble = vec![0xAAu8; 100];
+        let trailing = vec![0xBBu8; 100];
+        let mut source_bytes = preamble.clone();
+        source_bytes.extend_from_slice(&code_body);
+        source_bytes.extend_from_slice(&trailing);
+
+        let source: Arc<[u8]> = Arc::from(source_bytes.as_slice());
+        let range = preamble.len()..preamble.len() + code_body.len();
+        let attr = decode_attribute_with_source("Code", &source, range, &cp)
+            .expect("Code with nested StackMapTable must decode");
+        match attr {
+            Attribute::Code(code) => {
+                let nested = code
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        Attribute::StackMapTable { entries } => Some(entries),
+                        _ => None,
+                    })
+                    .expect("nested StackMapTable present");
+                // Bytes must match the 4 we wrote — proves the
+                // ByteView points at the correct absolute offset in
+                // `source`, not at `range.start + something_double_counted`.
+                assert_eq!(&**nested, &smt_bytes[..]);
+            }
+            other => panic!("Expected Code, got {other:?}"),
         }
     }
 }

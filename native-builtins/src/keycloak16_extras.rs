@@ -1,63 +1,31 @@
 //! Keycloak 16.1.1 (WildFly-based) boot-test shims.
 //!
-//! Keycloak 16 ships its own jboss-modules + WildFly subset. The `main`
-//! entry resolves to `org.jboss.as.server.Main.main` via the module spec.
-//! Our brute-force layered-jar walk SHOULD find the jar but doesn't —
-//! short-circuit `Main.main` directly.
+//! **HISTORY**: Previously this module short-circuited
+//! `org.jboss.as.server.Main.main`, `org.keycloak.Keycloak.main`, and
+//! several other Keycloak / WildFly bootstrap entry points to fake a
+//! clean rc=0 exit.
+//!
+//! **CURRENT STATE (real-bytecode audit)**: every short-circuit
+//! registration has been REMOVED. Real Keycloak 16 / WildFly bytecode
+//! now runs. This file is kept so the call site in
+//! `lib.rs::register_essential_natives` continues to compile.
 
-use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::error::MethodCallResult;
-use rustjvm_types::Value;
+use rustjvm_native_api::NativeMethodRegistry;
 
-fn kc16_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[keycloak16-shim] Main.main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-pub fn register_keycloak16_stubs(registry: &mut NativeMethodRegistry) {
-    // Env-var gate: only install Keycloak-16-specific shims when the
-    // operator explicitly opts in via `RUSTJVM_KC16_REAL=1`. These shims
-    // short-circuit the WildFly entry classes used by KC16 and would
-    // otherwise affect unrelated runs.
-    if std::env::var("RUSTJVM_KC16_REAL").as_deref() != Ok("1") {
-        return;
+/// Audit cleanup: no longer registers any natives. Previously short-
+/// circuited the Keycloak / WildFly bootstrap entry classes.
+///
+/// Re-enable via `RUSTJVM_USE_KC16_MAIN_SHIM=1` only for boot-test
+/// (exit-rc-only) work; the shim is OFF by default so real bytecode runs.
+pub fn register_keycloak16_stubs(_registry: &mut NativeMethodRegistry) {
+    if std::env::var("RUSTJVM_USE_KC16_MAIN_SHIM").as_deref() == Ok("1") {
+        tracing::warn!(
+            "[keycloak16-shim] RUSTJVM_USE_KC16_MAIN_SHIM=1 set — legacy shim opt-in noted but \
+             registration code has been removed in the real-bytecode audit."
+        );
     }
-    // The actual entry class declared in org.jboss.as.standalone/main/module.xml.
-    registry.register(
-        "org/jboss/as/server/Main",
-        "main",
-        "([Ljava/lang/String;)V",
-        kc16_main_noop,
-    );
-    registry.register(
-        "org/jboss/as/server/Main",
-        "<clinit>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
-    // Defensive: Keycloak 16 entry classes. The standalone.sh launcher
-    // points at `org/keycloak/Keycloak` (the documented entry per the
-    // KC16 task brief), but practical boot still goes through
-    // `org/jboss/modules/Main` -> `org/jboss/as/server/Main`. We also
-    // cover the legacy/internal entry-class candidates seen on KC16
-    // distributions.
-    for class in [
-        "org/keycloak/Keycloak",
-        "org/keycloak/Main",
-        "org/keycloak/keycloak/Main",
-        "org/keycloak/server/Main",
-        "org/keycloak/server/KeycloakServer",
-    ] {
-        registry.register(class, "main", "([Ljava/lang/String;)V", kc16_main_noop);
-        registry.register(class, "<clinit>", "()V", |_ctx, _args| Ok(None));
-    }
+    // Intentionally empty. Real Keycloak 16 bytecode runs.
 }
-
-// Wiring: `register_keycloak16_stubs` is invoked from
-// `register_essential_natives` in `native-builtins/src/lib.rs`. The shared
-// `org/jboss/modules/Main` jboss-modules launcher shim (the WF9 entry
-// point used by both WildFly and Keycloak-16) is registered by
-// `wildfly_method_synth::register_wildfly_method_synth_stubs`.
 
 #[cfg(test)]
 mod tests {

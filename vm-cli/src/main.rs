@@ -287,11 +287,10 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
         let path = std::path::Path::new(&entry);
-        // If the entry already exists on disk (or is a directory), keep it.
-        if path.exists() {
-            out.push(entry);
-            continue;
-        }
+        // PERF: the aggregate-jar case is rare, so do a cheap filename match
+        // before touching the filesystem. Entries whose file name is not a
+        // known aggregate name can never be substituted, so they skip the
+        // `exists()` stat syscall (and the `read_dir` below) entirely.
         let file_name = match path.file_name().and_then(|s| s.to_str()) {
             Some(n) => n.to_ascii_lowercase(),
             None => {
@@ -306,6 +305,12 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
             out.push(entry);
             continue;
         };
+        // Only now (for a candidate aggregate name) pay for the stat syscall.
+        // If the entry already exists on disk (or is a directory), keep it.
+        if path.exists() {
+            out.push(entry);
+            continue;
+        }
         // Look for split jars next to where the aggregate was expected to be.
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -946,6 +951,15 @@ fn run() -> Result<()> {
         }
     };
     if let Some(secs) = effective_watchdog {
+        // Enable the native-call ring buffer so the watchdog's "0 Java
+        // threads dumped" fallback can show the last ~64 native methods
+        // every thread entered. Without this, the ring's
+        // `dump_to_stderr` reports "recording disabled" and a hang in
+        // pure Rust runtime code has no actionable diagnostic.
+        // Recording cost (single relaxed AtomicBool load on entry, plus
+        // a parking_lot::Mutex when set) is negligible compared to the
+        // value of identifying the hang site on intermittent hangs.
+        rustjvm_native_api::native_ring::enable(true);
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
@@ -1364,15 +1378,22 @@ fn run() -> Result<()> {
             let mut prefix = "Exception in thread \"main\"";
             for depth in 0..8 {
                 let cid = vm.shared.heap.class_id_of(cur);
-                let cname = vm.shared.class_manager.read()
-                    .get_class(cid).map(|c| c.name.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+                // PERF: resolve the class name AND the Throwable field indices
+                // under a single read guard. These were two back-to-back
+                // `class_manager.read()` calls; both are pure reads with no
+                // intervening work, so one guard is behavior-identical and
+                // avoids a redundant lock/unlock per cause-chain iteration.
+                //
                 // Find fields by name so we work regardless of layout.
                 // Also probe `target` (used by InvocationTargetException
                 // in lieu of Throwable.cause Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see its `getCause()` override)
                 // so that `Caused by:` chains still walk through the wrapper.
-                let (msg_idx, cause_idx, stack_idx, target_idx) = {
+                let (cname, msg_idx, cause_idx, stack_idx, target_idx) = {
                     let cm = vm.shared.class_manager.read();
+                    let cname = cm
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
                     let mut msg_i: Option<usize> = None;
                     let mut cause_i: Option<usize> = None;
                     let mut stack_i: Option<usize> = None;
@@ -1403,7 +1424,7 @@ fn run() -> Result<()> {
                             walk = cls.superclass;
                         } else { break; }
                     }
-                    (msg_i, cause_i, stack_i, target_i)
+                    (cname, msg_i, cause_i, stack_i, target_i)
                 };
                 let message = if let Some(i) = msg_idx {
                     let v = vm.shared.heap.get_field(cur, i);
@@ -1636,12 +1657,15 @@ fn run() -> Result<()> {
                                     let elem = vm.shared.heap.get_array_element(arr, i).ok();
                                     if let Some(Value::Object(Some(eref))) = elem {
                                         let ecid = vm.shared.heap.class_id_of(eref);
-                                        let ename = vm.shared.class_manager.read()
-                                            .get_class(ecid).map(|c| c.name.to_string())
-                                            .unwrap_or_else(|| "?".to_string());
+                                        // PERF: one read guard for the sub-exception class
+                                        // name and its field indices (back-to-back reads).
                                         // Read detailMessage and cause from this sub-exception
-                                        let (smsg, scause, spname) = {
+                                        let (ename, smsg, scause, spname) = {
                                             let cm = vm.shared.class_manager.read();
+                                            let ename = cm
+                                                .get_class(ecid)
+                                                .map(|c| c.name.to_string())
+                                                .unwrap_or_else(|| "?".to_string());
                                             let mut mi: Option<usize> = None;
                                             let mut ci: Option<usize> = None;
                                             let mut pn: Option<usize> = None;
@@ -1670,7 +1694,7 @@ fn run() -> Result<()> {
                                                     _ => None,
                                                 }).unwrap_or_default()
                                             };
-                                            (read_s(mi), ci, read_s(pn))
+                                            (ename, read_s(mi), ci, read_s(pn))
                                         };
                                         lines.push(format!(
                                             "[rustjvm-cli]   [{i}] {ename} property='{spname}' message={smsg:?}"
@@ -1698,11 +1722,14 @@ fn run() -> Result<()> {
                                         for _d in 0..6 {
                                             let Some(sc) = sub_cur else { break };
                                             let sc_cid = vm.shared.heap.class_id_of(sc);
-                                            let sc_name = vm.shared.class_manager.read()
-                                                .get_class(sc_cid).map(|c| c.name.to_string())
-                                                .unwrap_or_else(|| "?".to_string());
-                                            let (sc_msg, sc_cause_idx) = {
+                                            // PERF: one read guard for the sub-cause class
+                                            // name and its field indices (back-to-back reads).
+                                            let (sc_name, sc_msg, sc_cause_idx) = {
                                                 let cm = vm.shared.class_manager.read();
+                                                let sc_name = cm
+                                                    .get_class(sc_cid)
+                                                    .map(|c| c.name.to_string())
+                                                    .unwrap_or_else(|| "?".to_string());
                                                 let mut mi: Option<usize> = None;
                                                 let mut ci: Option<usize> = None;
                                                 let mut walk = Some(sc_cid);
@@ -1727,7 +1754,7 @@ fn run() -> Result<()> {
                                                     Value::Object(Some(s)) => rustjvm_vm::vm::read_java_string(&vm.shared.heap, s),
                                                     _ => None,
                                                 }).unwrap_or_default();
-                                                (m, ci)
+                                                (sc_name, m, ci)
                                             };
                                             lines.push(format!("[rustjvm-cli]       Caused by: {sc_name}: {sc_msg}"));
                                             if let Some(frames) = vm.throwable_stack_for(sc) {
@@ -1962,7 +1989,13 @@ fn parse_size(s: &str) -> Option<usize> {
         _ => (s, 1),
     };
 
-    num_str.parse::<usize>().ok().map(|n| n * multiplier)
+    // Use checked_mul so an oversized input (e.g. "999999999999g") yields
+    // None — surfaced to the user as an invalid-size error — rather than
+    // panicking in debug or silently wrapping to a nonsensical cap in release.
+    num_str
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
 }
 
 #[cfg(test)]
@@ -1993,6 +2026,14 @@ mod tests {
         assert_eq!(parse_size("abc"), None);
         assert_eq!(parse_size("m"), None);
         assert_eq!(parse_size("-1m"), None);
+    }
+
+    #[test]
+    fn parse_size_overflow() {
+        // Multiplying by the suffix factor must not overflow `usize`:
+        // an oversized input returns None instead of panicking/wrapping.
+        assert_eq!(parse_size("999999999999g"), None);
+        assert_eq!(parse_size(&format!("{}g", usize::MAX)), None);
     }
 
     // -----------------------------------------------------------------------

@@ -299,34 +299,48 @@ pub enum ReturnKind {
 
 /// Parse the parameter list of a method descriptor (the part between `(`
 /// and `)`).
+///
+/// On a malformed descriptor (missing `(` / `)`, or an unparseable
+/// parameter type) this returns the parameters parsed so far instead of
+/// panicking, so a corrupt descriptor cannot abort the VM. A well-formed
+/// descriptor still yields the exact parameter list.
 pub fn descriptor_param_slots(desc: &str) -> Vec<DescKind> {
     let bytes = desc.as_bytes();
     let mut out = Vec::new();
-    let start = bytes
-        .iter()
-        .position(|&b| b == b'(')
-        .expect("descriptor must start with '('")
-        + 1;
-    let end = bytes
-        .iter()
-        .position(|&b| b == b')')
-        .expect("descriptor must contain ')'");
-    let mut i = start;
+    let (Some(open), Some(end)) = (
+        bytes.iter().position(|&b| b == b'('),
+        bytes.iter().position(|&b| b == b')'),
+    ) else {
+        // Malformed: no '(' or no ')' — return whatever we have (empty).
+        return out;
+    };
+    let mut i = open + 1;
     while i < end {
-        let (kind, advanced) = parse_one_field(desc, i);
+        let Some((kind, advanced)) = parse_one_field(desc, i) else {
+            // Malformed parameter type — stop rather than panic/loop.
+            break;
+        };
         out.push(kind);
+        if advanced <= i {
+            // Defensive: a non-advancing parse would loop forever.
+            break;
+        }
         i = advanced;
     }
     out
 }
 
 /// Parse the return type of a method descriptor.
+///
+/// On a malformed descriptor (missing `)`, or an unparseable return
+/// type) this falls back to `ReturnKind::Void` instead of panicking, so
+/// a corrupt descriptor cannot abort the VM.
 pub fn descriptor_return(desc: &str) -> ReturnKind {
     let bytes = desc.as_bytes();
-    let close = bytes
-        .iter()
-        .position(|&b| b == b')')
-        .expect("descriptor must contain ')'");
+    let Some(close) = bytes.iter().position(|&b| b == b')') else {
+        // Malformed: no ')' — treat as void.
+        return ReturnKind::Void;
+    };
     let after = close + 1;
     if after >= bytes.len() {
         return ReturnKind::Void;
@@ -334,37 +348,43 @@ pub fn descriptor_return(desc: &str) -> ReturnKind {
     if bytes[after] == b'V' {
         return ReturnKind::Void;
     }
-    let (kind, _) = parse_one_field(desc, after);
-    match kind {
-        DescKind::Reference(s) => ReturnKind::Reference(s),
-        other => ReturnKind::Prim(other),
+    match parse_one_field(desc, after) {
+        Some((DescKind::Reference(s), _)) => ReturnKind::Reference(s),
+        Some((other, _)) => ReturnKind::Prim(other),
+        // Malformed return type — fall back to void.
+        None => ReturnKind::Void,
     }
 }
 
 /// Parse a single field-type (JVMS §4.3.2) at `desc[i..]`. Returns
-/// `(kind, next_index)`.
-fn parse_one_field(desc: &str, i: usize) -> (DescKind, usize) {
+/// `Some((kind, next_index))`, or `None` if the descriptor is malformed
+/// (out-of-range index, missing `;` terminator, or an unsupported
+/// descriptor byte). Returning `None` instead of panicking ensures a
+/// corrupt method descriptor cannot abort the VM during proxy emission.
+fn parse_one_field(desc: &str, i: usize) -> Option<(DescKind, usize)> {
     let bytes = desc.as_bytes();
-    match bytes[i] {
-        b'B' | b'C' | b'I' | b'S' | b'Z' => (DescKind::Int, i + 1),
-        b'J' => (DescKind::Long, i + 1),
-        b'F' => (DescKind::Float, i + 1),
-        b'D' => (DescKind::Double, i + 1),
+    let &head = bytes.get(i)?;
+    match head {
+        b'B' | b'C' | b'I' | b'S' | b'Z' => Some((DescKind::Int, i + 1)),
+        b'J' => Some((DescKind::Long, i + 1)),
+        b'F' => Some((DescKind::Float, i + 1)),
+        b'D' => Some((DescKind::Double, i + 1)),
         b'L' => {
-            let semi = i + 1
-                + desc[i + 1..]
-                    .find(';')
-                    .expect("L-type missing terminator ';'");
-            let raw = &desc[i..=semi];
-            (DescKind::Reference(raw.to_string()), semi + 1)
+            // Require a terminating ';' after the 'L'. A bare "L" (or any
+            // L-type with no ';') is malformed → None instead of panic.
+            let rel = desc.get(i + 1..)?.find(';')?;
+            let semi = i + 1 + rel;
+            let raw = desc.get(i..=semi)?;
+            Some((DescKind::Reference(raw.to_string()), semi + 1))
         }
         b'[' => {
-            let (inner, next) = parse_one_field(desc, i + 1);
-            let _ = inner;
-            let raw = &desc[i..next];
-            (DescKind::Reference(raw.to_string()), next)
+            // An array prefix must be followed by an element type.
+            let (_inner, next) = parse_one_field(desc, i + 1)?;
+            let raw = desc.get(i..next)?;
+            Some((DescKind::Reference(raw.to_string()), next))
         }
-        other => panic!("unsupported descriptor byte: 0x{other:02X} in '{desc}'"),
+        // Unsupported descriptor byte → None instead of `panic!`.
+        _ => None,
     }
 }
 
@@ -1104,12 +1124,18 @@ fn descriptor_param_byte_at(desc: &str, j: usize) -> u8 {
     let mut k = 0usize;
     while i < end {
         let head = bytes[i];
-        let (_, next) = parse_one_field(desc, i);
+        // Malformed descriptor → stop and fall back to the default below.
+        let Some((_, next)) = parse_one_field(desc, i) else {
+            break;
+        };
         if k == j {
             // Walk past array dimensions for the reporting byte. For
             // primitives `head` already is the canonical letter; for
             // reference types we return `L`.
             return head;
+        }
+        if next <= i {
+            break;
         }
         i = next;
         k += 1;
@@ -1160,7 +1186,10 @@ fn wrapper_for_int_letter(desc: &str, j: usize) -> &'static str {
     let mut i = start;
     let mut k = 0usize;
     while i < end {
-        let (kind, next) = parse_one_field(desc, i);
+        // Malformed descriptor → stop and fall back to the default below.
+        let Some((kind, next)) = parse_one_field(desc, i) else {
+            break;
+        };
         if k == j {
             return match bytes[i] {
                 b'B' => "java/lang/Byte",
@@ -1172,6 +1201,9 @@ fn wrapper_for_int_letter(desc: &str, j: usize) -> &'static str {
             };
         }
         let _ = kind;
+        if next <= i {
+            break;
+        }
         i = next;
         k += 1;
     }

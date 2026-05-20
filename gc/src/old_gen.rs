@@ -102,7 +102,9 @@ fn min_satisfying_bucket(size: usize) -> usize {
 /// the other O(N) cost in the original implementation) and lets the next
 /// major GC absorb the fragmentation in one sweep.
 pub struct OldGen {
-    /// Backing storage (pre-allocated, zero-initialized).
+    /// Backing storage. `len() == capacity` so pointers can be computed
+    /// into it, but the bytes are *not* eagerly zeroed (round-11 perf) —
+    /// `alloc` zeroes every region before handing it out.
     data: Vec<u8>,
     /// Size-segregated free list: `buckets[k]` holds blocks whose size
     /// falls in bucket `k`. Each bucket is treated as a LIFO stack —
@@ -115,17 +117,33 @@ pub struct OldGen {
 impl OldGen {
     /// Create a new old generation with the given capacity.
     pub fn new(capacity: usize) -> Self {
-        // Round-5 #14: skip the eager `vec![0u8; capacity]` zero-init —
-        // `alloc` zeros every byte it hands out, and the freed-block
-        // zero pass was redundant work. The Rust `Vec` allocator still
-        // requests committed pages; we just don't double-touch them.
+        // Round-11 perf: skip the eager `vec![0u8; capacity]` zero pass.
+        // A 128 MiB old gen previously touched every page on construction
+        // (zero-fill + page commit) before a single object was allocated.
         //
-        // Note: kept as `vec![0u8; capacity]` for now because removing
-        // the eager zero changes observable behavior for tests that
-        // peek into the backing buffer. The performance critical
-        // double-zero in the alloc/free hot loop is gone — see `alloc`
-        // and `free` below.
-        let data = vec![0u8; capacity];
+        // `alloc` is the *sole* point that hands a byte to a caller, and
+        // it always `write_bytes(ptr, 0, size)` before returning — so no
+        // legitimate caller can observe an uninitialised byte as data.
+        // `walk_objects`/`scan_region`/`compact` only ever read headers
+        // inside *allocated* regions (the gaps between free blocks); a
+        // freshly-constructed `OldGen` has the whole capacity as a single
+        // free block, so the walk scans nothing. `compact` zeroes any
+        // freed tail it creates.
+        //
+        // We still need `data.len() == capacity` because pointers are
+        // computed as `data.as_mut_ptr().add(offset)` and `capacity()` /
+        // `contains` rely on `data.len()`. Reserve the full capacity, then
+        // set the length without initialising — the OS hands back pages
+        // lazily on first write instead of all up front.
+        let mut data: Vec<u8> = Vec::with_capacity(capacity);
+        // SAFETY: `with_capacity(capacity)` allocated exactly `capacity`
+        // bytes of backing storage. `u8` has no validity invariant and no
+        // `Drop`, so extending the logical length over that already-owned
+        // allocation is sound. Every byte is zero-initialised by `alloc`
+        // before it is handed out; no read observes it uninitialised.
+        unsafe {
+            data.set_len(capacity);
+        }
         let mut buckets: Vec<Vec<FreeBlock>> = (0..NUM_BUCKETS).map(|_| Vec::new()).collect();
         // Seed the initial block in the bucket that fits the full capacity.
         let initial = FreeBlock { offset: 0, size: capacity };
@@ -318,6 +336,104 @@ impl OldGen {
         }
 
         objects
+    }
+
+    /// Walk old-gen objects, retaining only those whose start offset falls
+    /// inside one of the supplied dirty-card offset ranges.
+    ///
+    /// Round-11 perf: the minor-GC dirty-card scan previously called
+    /// [`Self::walk_objects`], which allocates a `Vec` holding *every*
+    /// live old-gen object and sorts the entire free list, even when only
+    /// a handful of cards are dirty. This variant bounds two of those
+    /// costs to the dirty set:
+    ///
+    /// * the result `Vec` only ever holds objects in dirty cards, so its
+    ///   size is O(dirty objects) rather than O(all old-gen objects);
+    /// * an allocated region that overlaps no dirty card is walked for
+    ///   *cursor advancement only* — no `(ptr, size)` pairs are pushed.
+    ///
+    /// `dirty_ranges` must be a list of `[start, end)` byte offsets
+    /// (relative to the data buffer) sorted ascending by `start` and
+    /// non-overlapping; the card table produces exactly that. Object
+    /// boundaries are still derived header-by-header from the sorted free
+    /// list — that derivation is what makes the scan *correct*, so it is
+    /// preserved unchanged; only the work *per object* is bounded.
+    pub fn walk_objects_in_card_ranges(
+        &self,
+        dirty_ranges: &[(usize, usize)],
+    ) -> Vec<(*mut u8, usize)> {
+        let mut objects = Vec::new();
+        if dirty_ranges.is_empty() {
+            return objects;
+        }
+        let base = self.data.as_ptr() as usize;
+
+        // Same offset-sorted free-list view as `walk_objects`; needed to
+        // locate true object boundaries (old-gen layout is header-following
+        // with no external object index).
+        let mut sorted_free: Vec<FreeBlock> = self.buckets.iter().flatten().copied().collect();
+        sorted_free.sort_by_key(|b| b.offset);
+
+        let last_dirty_end = dirty_ranges[dirty_ranges.len() - 1].1;
+        let mut cursor: usize = 0;
+        for block in &sorted_free {
+            if block.offset > cursor {
+                self.scan_region_filtered(base, cursor, block.offset, dirty_ranges, &mut objects);
+            }
+            cursor = block.offset + block.size;
+            // Allocated regions are address-ordered; once the cursor passes
+            // the last dirty card there is nothing left to collect.
+            if cursor >= last_dirty_end {
+                return objects;
+            }
+        }
+        if cursor < self.data.len() {
+            self.scan_region_filtered(base, cursor, self.data.len(), dirty_ranges, &mut objects);
+        }
+
+        objects
+    }
+
+    /// Like [`Self::scan_region`], but only pushes objects whose start
+    /// offset lies within one of `dirty_ranges`. Every object boundary is
+    /// still visited so the cursor advances correctly; the filter only
+    /// gates whether the `(ptr, size)` pair is collected.
+    fn scan_region_filtered(
+        &self,
+        base: usize,
+        start_offset: usize,
+        end_offset: usize,
+        dirty_ranges: &[(usize, usize)],
+        objects: &mut Vec<(*mut u8, usize)>,
+    ) {
+        let mut offset = start_offset;
+        while offset < end_offset {
+            let ptr = (base + offset) as *mut u8;
+            // SAFETY: `offset` is a valid object boundary within an
+            // allocated region of the data buffer (see `scan_region`).
+            let header = unsafe { &*(ptr as *const ObjectHeader) };
+            if header.kind == ObjectKind::HumongousFiller {
+                break;
+            }
+            let total_size = if header.kind == ObjectKind::Array {
+                HEADER_SIZE
+                    + array_data_size(header.array_length as usize, header.element_type)
+                        .expect("array_data_size overflow in old_gen scan")
+            } else {
+                HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+            };
+            if total_size < HEADER_SIZE || offset + total_size > end_offset {
+                break;
+            }
+            // Collect only if the object's start lands in a dirty card.
+            if dirty_ranges
+                .iter()
+                .any(|&(s, e)| offset >= s && offset < e)
+            {
+                objects.push((ptr, total_size));
+            }
+            offset += total_size;
+        }
     }
 
     /// Scan a contiguous allocated region for objects.

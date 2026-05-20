@@ -108,6 +108,23 @@ pub struct GcResult {
 ///
 /// Returns GC statistics and a pointer remapping table.
 ///
+/// # Root remapping contract
+///
+/// This function updates **only** the `ObjectRef`s in the `roots` slice it is
+/// handed: every root that points into `from_space` is rewritten in place to
+/// its new to-space address (Phase 1). A `debug_assert` at the end of Phase 1
+/// verifies this happened for every such root.
+///
+/// VM-external references — JVMTI/JNI handles, class statics, the interned
+/// string pool, and the monitor table — are **not** part of the `roots` slice
+/// and are therefore **not** remapped here. Remapping those is the caller's
+/// responsibility: the caller must apply the returned [`GcResult::pointer_map`]
+/// to every external reference table (see `Heap::collect_garbage`, which calls
+/// `MonitorCleanup::remap_after_gc`, and the VM crate which remaps statics /
+/// JNI / the string pool). If an external root is reachable from the heap it
+/// must also be included in `roots` so the object survives the copy; passing
+/// it only via an external table is a use-after-free.
+///
 /// # Safety
 /// The arenas must contain valid heap objects. All roots must point into from_space.
 pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [ObjectRef]) -> GcResult {
@@ -133,6 +150,17 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
         // points to a valid, fully-copied object with a proper ObjectHeader.
         *root = unsafe { ObjectRef::from_raw(new_ptr) };
     }
+
+    // Contract check: after Phase 1 no root may still point into from-space.
+    // Every from-space root was forwarded and rewritten above; a root that
+    // remains in from-space here means a root was missed (would dangle once
+    // from-space is reset). External references (statics/JNI/string pool/
+    // monitors) are intentionally NOT in `roots` — see the function doc.
+    debug_assert!(
+        roots.iter().all(|r| !from_space.contains(r.as_ptr())),
+        "gc::collect: a root still points into from-space after Phase 1 — \
+         every passed root must be remapped before from-space is reset",
+    );
 
     // Phase 2: Cheney scan — scan to-space linearly, forwarding any references found in copied objects
     let mut scan_cursor: usize = 0;
@@ -220,6 +248,23 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
     result
 }
 
+/// Sanity bound on a single heap object's total size.
+///
+/// Mirrors the `MAX_SANE_OBJECT_SIZE` guard in `gen_heap.rs::forward_object`.
+/// A corrupt header (e.g. a stale `num_slots`/`array_length`) can inflate the
+/// computed `total_size` arbitrarily; without this check the subsequent
+/// `to_space.alloc` fails and `forward_object` aborts the whole process. With
+/// the check, the corruption is detected and surfaced as a recoverable GC
+/// error instead.
+const MAX_SANE_OBJECT_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+
+/// Error returned by [`try_forward_object`] when an object cannot be safely copied.
+#[derive(Debug)]
+pub struct GcError {
+    /// Human-readable description of the failure.
+    pub message: String,
+}
+
 /// Forward a single object from from-space to to-space.
 ///
 /// If the object has already been forwarded (forwarding_ptr is set),
@@ -232,27 +277,75 @@ fn forward_object(
     objects_copied: &mut usize,
     pointer_map: &mut HashMap<usize, usize>,
 ) -> *mut u8 {
+    match try_forward_object(from_space, to_space, old_ptr, objects_copied, pointer_map) {
+        Ok(new_ptr) => new_ptr,
+        Err(e) => {
+            // A genuine to-space OOM (or a corrupt header that slipped past the
+            // sanity check) is unrecoverable for the semi-space collector: there
+            // is no partial-copy state to unwind. Abort with a clear message.
+            eprintln!("FATAL: gc: forward_object: {}", e.message);
+            std::process::abort();
+        }
+    }
+}
+
+/// Fallible core of [`forward_object`].
+///
+/// Returns `Err(GcError)` if the object header looks corrupt (implausibly
+/// large `total_size`) or if to-space is genuinely out of memory. Detecting a
+/// corrupt header here turns a hard `process::abort()` into a surfaced GC
+/// error.
+fn try_forward_object(
+    from_space: &Arena,
+    to_space: &mut Arena,
+    old_ptr: *mut u8,
+    objects_copied: &mut usize,
+    pointer_map: &mut HashMap<usize, usize>,
+) -> Result<*mut u8, GcError> {
     // SAFETY: old_ptr is a valid heap object in from_space (verified by caller's
     // from_space.contains() check). The header is readable for the duration of GC.
     let header = unsafe { &*(old_ptr as *const ObjectHeader) };
 
     // Already forwarded?
     if header.is_forwarded() {
-        return header.forwarding_address();
+        return Ok(header.forwarding_address());
     }
 
     let total_size = object_total_size(header);
 
+    // Sanity: a corrupt header (stale num_slots / array_length) can inflate
+    // `total_size` arbitrarily. Detect that here — matching the
+    // `MAX_SANE_OBJECT_SIZE` guard in `gen_heap.rs::forward_object` — so a
+    // bad header is surfaced as a recoverable GC error instead of being
+    // converted into a hard process abort by the to-space OOM path below.
+    if total_size > MAX_SANE_OBJECT_SIZE || total_size < HEADER_SIZE {
+        return Err(GcError {
+            message: format!(
+                "implausible object size {} bytes at {:p} (kind={:?}, \
+                 num_slots={}, array_len={}) — corrupt header, refusing to copy",
+                total_size,
+                old_ptr,
+                header.kind,
+                header.num_slots,
+                header.array_length,
+            ),
+        });
+    }
+
     // Allocate in to-space
-    let new_ptr = to_space.alloc(total_size, 8).unwrap_or_else(|| {
-        eprintln!(
-            "FATAL: gc: forward_object: to-space OOM allocating {} bytes (to-space {}/{} used)",
-            total_size,
-            to_space.used(),
-            to_space.capacity(),
-        );
-        std::process::abort();
-    });
+    let new_ptr = match to_space.alloc(total_size, 8) {
+        Some(p) => p,
+        None => {
+            return Err(GcError {
+                message: format!(
+                    "to-space OOM allocating {} bytes (to-space {}/{} used)",
+                    total_size,
+                    to_space.used(),
+                    to_space.capacity(),
+                ),
+            });
+        }
+    };
 
     // SAFETY: old_ptr and new_ptr are non-overlapping (from-space vs to-space),
     // both regions are at least total_size bytes. copy_nonoverlapping is valid.
@@ -306,7 +399,7 @@ fn forward_object(
     // from_space.contains() check uses the arena's data bounds, so this is fine.
     debug_assert!(from_space.contains(old_ptr));
 
-    new_ptr
+    Ok(new_ptr)
 }
 
 /// Compute the total size of a heap object (header + data).
@@ -329,6 +422,10 @@ pub fn object_total_size(header: &ObjectHeader) -> usize {
 /// so that `finalize()` can still access the object. The returned
 /// `dead_finalizers` vector contains the NEW addresses of these resurrected
 /// objects.
+///
+/// The same root-remapping contract as [`collect`] applies: only the `roots`
+/// slice is remapped in place; VM-external references must be remapped by the
+/// caller using the returned [`GcResult::pointer_map`].
 pub fn collect_with_finalizers(
     from_space: &mut Arena,
     to_space: &mut Arena,
@@ -351,6 +448,14 @@ pub fn collect_with_finalizers(
         );
         *root = unsafe { ObjectRef::from_raw(new_ptr) };
     }
+
+    // Contract check: see `collect`. After Phase 1 no root may still point
+    // into from-space; external references are remapped by the caller.
+    debug_assert!(
+        roots.iter().all(|r| !from_space.contains(r.as_ptr())),
+        "gc::collect_with_finalizers: a root still points into from-space \
+         after Phase 1 — every passed root must be remapped before reset",
+    );
 
     // Phase 2: Cheney scan (same as collect)
     let mut scan_cursor: usize = 0;

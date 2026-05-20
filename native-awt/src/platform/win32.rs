@@ -797,8 +797,13 @@ impl PlatformBackend for Win32Backend {
                 if ptr.is_null() {
                     return None;
                 }
+                // GetClipboardData returns a borrowed handle whose buffer may
+                // be corrupt or missing the wide-char NUL terminator. Cap the
+                // scan so an un-terminated buffer is treated as truncated
+                // rather than reading unbounded out-of-bounds memory.
+                const MAX_CLIP_WCHARS: usize = 16 * 1024 * 1024;
                 let mut len = 0;
-                while *ptr.add(len) != 0 {
+                while len < MAX_CLIP_WCHARS && *ptr.add(len) != 0 {
                     len += 1;
                 }
                 let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));

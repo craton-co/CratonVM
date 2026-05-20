@@ -21,37 +21,23 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 fn activemq_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[activemq-shim] console/Main.main short-circuited (System.exit(1) bypass)");
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn activemq_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 pub fn register_activemq_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("RUSTJVM_ACTIVEMQ_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[activemq-shim] RUSTJVM_ACTIVEMQ_REAL=1 — skipping shim registration, running real ActiveMQ");
-        return;
-    }
-    // org.apache.activemq.console.Main.main([Ljava/lang/String;)V — no-op,
-    // skipping the System.exit(1) help-text path.
-    registry.register(
-        "org/apache/activemq/console/Main",
-        "main",
-        "([Ljava/lang/String;)V",
-        activemq_main_noop,
-    );
-
-    // Defensive: also no-op the <clinit> in case static init reaches
-    // platform-specific code that exits early.
-    registry.register(
-        "org/apache/activemq/console/Main",
-        "<clinit>",
-        "()V",
-        activemq_void_noop,
-    );
+    // DISABLED per "no synthetic stubs" policy. The two registrations here
+    // were a fake `Main.main` no-op and a fake `<clinit>` no-op, masking the
+    // real failure path. The orchestrator wants the first real-bytecode
+    // failure surfaced, then dispatches follow-up fix agents.
+    let _ = registry;
 }
 
 // TODO(orchestrator): wire register_activemq_stubs() in native-builtins/src/lib.rs

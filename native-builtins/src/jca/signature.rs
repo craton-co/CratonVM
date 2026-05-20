@@ -38,17 +38,32 @@
 #![allow(clippy::collapsible_if)]
 
 use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
-use rustjvm_types::{ArrayElementType, ObjectRef, Value};
+use rustjvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 use rustjvm_types::error::{MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
 use crate::crypto_impl;
 
-const SIG_FIELD_ALGO: usize = 0;
-const SIG_FIELD_STATE: usize = 1;
-const SIG_FIELD_PROVIDER: usize = 2;
-const SIG_FIELD_PENDING: usize = 3;
-const SIG_FIELD_KEYID: usize = 4;
+// `java.security.Signature` (JDK 25) extends `SignatureSpi` and declares
+// instance fields that overlap our intended synthetic state. To avoid the
+// VM's descriptor-aware `set_field` coercing our `Value::Int(...)` writes
+// into `Object(None)` on slots the real class declares as references, our
+// synthetic state is appended *after* the real-layout field count.
+//
+// Offsets are relative to `synthetic_base_offset(...)`.
+fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize {
+    let cid = ctx
+        .ensure_class_initialized(class_name)
+        .unwrap_or(ClassId::new(0));
+    ctx.class_num_total_fields(cid)
+}
+
+const SIG_OFF_ALGO: usize = 0;
+const SIG_OFF_STATE: usize = 1;
+const SIG_OFF_PROVIDER: usize = 2;
+const SIG_OFF_PENDING: usize = 3;
+const SIG_OFF_KEYID: usize = 4;
+const SIG_PRIVATE_SLOTS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // SigProbe fix: process-wide side tables for Signature algorithm / state /
@@ -197,7 +212,8 @@ fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
             return kid;
         }
     }
-    match ctx.get_field(this, SIG_FIELD_KEYID) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    match ctx.get_field(this, base + SIG_OFF_KEYID) {
         Value::Long(id) => id as u64,
         Value::Int(id) => id as u64,
         _ => 0,
@@ -213,16 +229,18 @@ fn extract_key_id_from_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> u64 {
 }
 
 fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
-    let cur = match ctx.get_field(this, SIG_FIELD_PENDING) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let cur = match ctx.get_field(this, base + SIG_OFF_PENDING) {
         Value::Int(n) => n,
         _ => 0,
     };
-    ctx.set_field(this, SIG_FIELD_PENDING, Value::Int(cur + data.len() as i32));
+    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(cur + data.len() as i32));
     crypto_impl::sig_data_append(sig_id(this), data);
 }
 
 fn take_data(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
-    ctx.set_field(this, SIG_FIELD_PENDING, Value::Int(0));
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     crypto_impl::sig_data_take(sig_id(this))
 }
 
@@ -262,31 +280,38 @@ fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<boo
 fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
-    let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 5);
-    // SigProbe fix: side-table is the authoritative store; slot writes
-    // remain for any synthetic-mode caller that goes through slot indexing.
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let obj = alloc_concurrent_synthetic(
+        ctx,
+        "java/security/Signature",
+        base + SIG_PRIVATE_SLOTS,
+    );
+    // SigProbe fix: side-table is the authoritative store; the base-offset
+    // slot writes remain for any synthetic-mode caller that goes through
+    // slot indexing.
     set_sig_algo(obj, idx);
     set_sig_state(obj, STATE_UNINIT);
     set_sig_keyid(obj, 0);
     let algo_str = ctx.create_string(&alg);
     ctx.set_field_by_name(obj, "algorithm", Value::Object(Some(algo_str)));
-    ctx.set_field(obj, SIG_FIELD_ALGO, Value::Int(idx));
-    ctx.set_field(obj, SIG_FIELD_STATE, Value::Int(STATE_UNINIT));
-    ctx.set_field(obj, SIG_FIELD_PROVIDER, Value::Int(0));
-    ctx.set_field(obj, SIG_FIELD_PENDING, Value::Int(0));
-    ctx.set_field(obj, SIG_FIELD_KEYID, Value::Long(0));
+    ctx.set_field(obj, base + SIG_OFF_ALGO, Value::Int(idx));
+    ctx.set_field(obj, base + SIG_OFF_STATE, Value::Int(STATE_UNINIT));
+    ctx.set_field(obj, base + SIG_OFF_PROVIDER, Value::Int(0));
+    ctx.set_field(obj, base + SIG_OFF_PENDING, Value::Int(0));
+    ctx.set_field(obj, base + SIG_OFF_KEYID, Value::Long(0));
     Ok(Some(Value::Object(Some(obj))))
 }
 
 fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(this, STATE_SIGN);
-    ctx.set_field(this, SIG_FIELD_STATE, Value::Int(STATE_SIGN));
-    ctx.set_field(this, SIG_FIELD_PENDING, Value::Int(0));
+    ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_SIGN));
+    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let kid = extract_key_id_from_key(ctx, *k);
         set_sig_keyid(this, kid);
-        ctx.set_field(this, SIG_FIELD_KEYID, Value::Long(kid as i64));
+        ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
     }
     crypto_impl::sig_data_clear(sig_id(this));
     Ok(None)
@@ -294,13 +319,14 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
     set_sig_state(this, STATE_VERIFY);
-    ctx.set_field(this, SIG_FIELD_STATE, Value::Int(STATE_VERIFY));
-    ctx.set_field(this, SIG_FIELD_PENDING, Value::Int(0));
+    ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_VERIFY));
+    ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let kid = extract_key_id_from_key(ctx, *k);
         set_sig_keyid(this, kid);
-        ctx.set_field(this, SIG_FIELD_KEYID, Value::Long(kid as i64));
+        ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
     }
     crypto_impl::sig_data_clear(sig_id(this));
     Ok(None)
@@ -351,7 +377,8 @@ fn sig_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
         Value::Int(n) => n,
         _ => 0,
     });
@@ -361,7 +388,7 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
         Value::Int(n) => n,
         _ => -1,
     });
@@ -375,7 +402,8 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
         Value::Int(n) => n,
         _ => 0,
     });
@@ -385,7 +413,7 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
         Value::Int(n) => n,
         _ => -1,
     });
@@ -412,7 +440,8 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
         Value::Int(n) => n,
         _ => 0,
     });
@@ -422,7 +451,7 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
         Value::Int(n) => n,
         _ => -1,
     });
@@ -439,7 +468,8 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_STATE) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
         Value::Int(n) => n,
         _ => 0,
     });
@@ -449,7 +479,7 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
         Value::Int(n) => n,
         _ => -1,
     });
@@ -474,7 +504,8 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let idx = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, SIG_FIELD_ALGO) {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let idx = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     });

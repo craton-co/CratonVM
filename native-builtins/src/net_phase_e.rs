@@ -2219,6 +2219,20 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let name = name.trim_start_matches('/');
             ctx.find_resource(name)
                 .ok_or_else(|| ioex(format!("URL.openStream: classpath resource not found: {name}")))?
+        } else if let Some(name) = url_str.strip_prefix("resource:") {
+            // Synthetic `resource:/<name>` URLs are produced by
+            // `Class.getResource(String)` in `lang_class.rs` for resources
+            // that the classloader knows about but for which we don't have
+            // a real `file:` or `jar:` URL. Felix's
+            // `Util.loadDefaultProperties` does `Util.class.getResource(...).
+            // openConnection().getInputStream()`, which arrives here via
+            // `URLConnection.getInputStream` → `URL.openStream` and used to
+            // hit the unsupported-scheme arm, leaving Felix's static
+            // `DEFAULTS` field null and tripping a downstream NPE on
+            // `DEFAULTS.isEmpty()`.
+            let name = name.trim_start_matches('/');
+            ctx.find_resource(name)
+                .ok_or_else(|| ioex(format!("URL.openStream: resource not found: {name}")))?
         } else if url_str.starts_with("http://") || url_str.starts_with("https://") {
             let resp = http_perform_request("GET", &url_str, &[], &[], 10)
                 .map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;

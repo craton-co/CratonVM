@@ -226,7 +226,7 @@ fn detect_int_array_sum(
     iv_local: usize,
 ) -> Option<SimdIntArraySum> {
     // back_edge should be a goto instruction
-    if code[back_edge] != 0xa7 {
+    if code.get(back_edge).copied() != Some(0xa7) {
         return None;
     }
     let back_edge_end = back_edge + 3;
@@ -334,48 +334,48 @@ fn detect_int_array_sum(
 
 /// Extract local index from an lload instruction at pc.
 fn extract_lload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x1e => Some(0),                     // lload_0
-        0x1f => Some(1),                     // lload_1
-        0x20 => Some(2),                     // lload_2
-        0x21 => Some(3),                     // lload_3
-        0x16 => Some(code[pc + 1] as usize), // lload // Widening: always safe
+    match *code.get(pc)? {
+        0x1e => Some(0),                                  // lload_0
+        0x1f => Some(1),                                  // lload_1
+        0x20 => Some(2),                                  // lload_2
+        0x21 => Some(3),                                  // lload_3
+        0x16 => code.get(pc + 1).map(|&b| b as usize),    // lload
         _ => None,
     }
 }
 
 /// Extract local index from an lstore instruction at pc.
 fn extract_lstore_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x3f => Some(0),                     // lstore_0
-        0x40 => Some(1),                     // lstore_1
-        0x41 => Some(2),                     // lstore_2
-        0x42 => Some(3),                     // lstore_3
-        0x37 => Some(code[pc + 1] as usize), // lstore // Widening: always safe
+    match *code.get(pc)? {
+        0x3f => Some(0),                                  // lstore_0
+        0x40 => Some(1),                                  // lstore_1
+        0x41 => Some(2),                                  // lstore_2
+        0x42 => Some(3),                                  // lstore_3
+        0x37 => code.get(pc + 1).map(|&b| b as usize),    // lstore
         _ => None,
     }
 }
 
 /// Extract local index from a dload instruction at pc.
 fn extract_dload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x26 => Some(0),                     // dload_0
-        0x27 => Some(1),                     // dload_1
-        0x28 => Some(2),                     // dload_2
-        0x29 => Some(3),                     // dload_3
-        0x18 => Some(code[pc + 1] as usize), // dload // Widening: always safe
+    match *code.get(pc)? {
+        0x26 => Some(0),                                  // dload_0
+        0x27 => Some(1),                                  // dload_1
+        0x28 => Some(2),                                  // dload_2
+        0x29 => Some(3),                                  // dload_3
+        0x18 => code.get(pc + 1).map(|&b| b as usize),    // dload
         _ => None,
     }
 }
 
 /// Extract local index from a dstore instruction at pc.
 fn extract_dstore_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
-        0x47 => Some(0),                     // dstore_0
-        0x48 => Some(1),                     // dstore_1
-        0x49 => Some(2),                     // dstore_2
-        0x4a => Some(3),                     // dstore_3
-        0x39 => Some(code[pc + 1] as usize), // dstore // Widening: always safe
+    match *code.get(pc)? {
+        0x47 => Some(0),                                  // dstore_0
+        0x48 => Some(1),                                  // dstore_1
+        0x49 => Some(2),                                  // dstore_2
+        0x4a => Some(3),                                  // dstore_3
+        0x39 => code.get(pc + 1).map(|&b| b as usize),    // dstore
         _ => None,
     }
 }
@@ -390,7 +390,7 @@ fn detect_fp_array_sum(
     iv_local: usize,
 ) -> Option<SimdFpArraySum> {
     // back_edge should be a goto instruction
-    if code[back_edge] != 0xa7 {
+    if code.get(back_edge).copied() != Some(0xa7) {
         return None;
     }
     let back_edge_end = back_edge + 3;
@@ -2711,24 +2711,24 @@ fn find_store_index_pc(code: &[u8], start: usize, store_pc: usize) -> Option<usi
 
 /// Extract the local variable index from an iload instruction at `pc`.
 fn extract_iload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
+    match *code.get(pc)? {
         0x1a => Some(0),
         0x1b => Some(1),
         0x1c => Some(2),
         0x1d => Some(3),
-        0x15 => Some(code[pc + 1] as usize), // Widening: always safe
+        0x15 => code.get(pc + 1).map(|&b| b as usize), // iload
         _ => None,
     }
 }
 
 /// Extract the local variable index from an aload instruction at `pc`.
 fn extract_aload_local(code: &[u8], pc: usize) -> Option<usize> {
-    match code[pc] {
+    match *code.get(pc)? {
         0x2a => Some(0),
         0x2b => Some(1),
         0x2c => Some(2),
         0x2d => Some(3),
-        0x19 => Some(code[pc + 1] as usize), // Widening: always safe
+        0x19 => code.get(pc + 1).map(|&b| b as usize), // aload
         _ => None,
     }
 }
@@ -3147,6 +3147,14 @@ struct Compiler {
     typecheck_info_idx: FxHashMap<usize, usize>,
     ldc_info_idx: FxHashMap<usize, usize>,
     ldc2w_info_idx: FxHashMap<usize, usize>,
+
+    /// Memo for `magic_signed_div32`: constant divisor → computed
+    /// `(magic, shift)` pair. The magic-number derivation runs a Newton-style
+    /// iteration; a loop body with a repeated `/ k` or `% k` on the same
+    /// constant `k` would otherwise recompute it at every occurrence. The
+    /// result is a pure function of the divisor, so caching is behavior-
+    /// preserving.
+    magic_div_memo: FxHashMap<i32, (i64, u32)>,
 }
 
 impl Compiler {
@@ -3294,6 +3302,7 @@ impl Compiler {
             typecheck_info_idx: FxHashMap::default(),
             ldc_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
+            magic_div_memo: FxHashMap::default(),
         }
     }
 
@@ -3974,6 +3983,32 @@ impl Compiler {
         self.modrm_rbp_disp(reg, offset);
     }
 
+    /// MOV reg, [rbp + positive_disp] — load a stack-passed argument from
+    /// the caller's stack frame. Used in the prologue when a Java param's
+    /// index exceeds the platform's ARG_REGS register file (e.g. the 5th
+    /// arg on Windows x64 when needs_heap consumes ARG_REGS[0] for the VM
+    /// pointer). The 4th-arg-and-beyond live above rbp in the caller's
+    /// reserved stack slots:
+    ///   * Windows: shadow space at [rbp+0x10..0x28] (caller's home for
+    ///     RCX/RDX/R8/R9) + stack args at [rbp+0x30], [rbp+0x38], ...
+    ///   * SysV:   stack args at [rbp+0x10], [rbp+0x18], ...
+    /// `positive_disp` is the byte offset above rbp.
+    fn emit_load_caller_arg(&mut self, reg: u8, positive_disp: i32) {
+        debug_assert!(positive_disp > 0, "caller arg disp must be positive");
+        self.rex_w_r(reg);
+        self.buf.emit_byte(0x8B); // MOV r64, r/m64
+        // ModRM r/m=101 (RBP) with positive displacement.
+        if (-128..=127).contains(&positive_disp) {
+            // mod=01, disp8
+            self.buf.emit_byte(0x45 | ((reg & 7) << 3));
+            self.buf.emit_byte(positive_disp as u8); // Cast: x86-64 immediate encoding
+        } else {
+            // mod=10, disp32
+            self.buf.emit_byte(0x85 | ((reg & 7) << 3));
+            self.buf.emit(&positive_disp.to_le_bytes());
+        }
+    }
+
     /// MOV [rbp - offset], reg
     fn emit_store_local(&mut self, offset: i32, reg: u8) {
         self.rex_w_r(reg);
@@ -4334,7 +4369,7 @@ impl Compiler {
             }
             // idiv: left / const_val — non-power-of-2 (magic number method)
             0x6c if const_val >= 2 => {
-                let (magic, shift) = Self::magic_signed_div32(const_val);
+                let (magic, shift) = self.magic_div_cached(const_val);
                 self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                 self.pop_to_rax();
                 self.emit_idiv_magic(magic, shift);
@@ -4343,7 +4378,7 @@ impl Compiler {
             }
             // irem: left % const_val — non-power-of-2 (magic number method)
             0x70 if const_val >= 2 => {
-                let (magic, shift) = Self::magic_signed_div32(const_val);
+                let (magic, shift) = self.magic_div_cached(const_val);
                 self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
                 self.pop_to_rax();
                 self.emit_irem_magic(magic, shift, const_val);
@@ -4822,6 +4857,20 @@ impl Compiler {
         self.buf.emit(&[0x89, 0xC8]); // MOV EAX, ECX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]); // MOVSXD RAX, EAX
+    }
+
+    /// Memoized wrapper around [`Self::magic_signed_div32`]. The magic-number
+    /// derivation is a pure function of the divisor; caching it per constant
+    /// avoids recomputing the Newton iteration for repeated `/ k` / `% k` in
+    /// a loop body. The cached `(magic, shift)` is bit-identical to a fresh
+    /// computation, so generated machine code is unchanged.
+    fn magic_div_cached(&mut self, d: i32) -> (i64, u32) {
+        if let Some(&pair) = self.magic_div_memo.get(&d) {
+            return pair;
+        }
+        let pair = Self::magic_signed_div32(d);
+        self.magic_div_memo.insert(d, pair);
+        pair
     }
 
     /// Compute magic number for signed 32-bit division by constant d (d >= 2).
@@ -5793,34 +5842,83 @@ impl Compiler {
             self.emit_movq_mem_rbp_from_xmm(offset, xmm);
         }
 
+        // Layout of caller-passed args:
+        //   * Register-passed: ARG_REGS[ctx_offset..ctx_offset+reg_arg_count]
+        //     (when needs_heap, ARG_REGS[0] carries the hidden VM/heap ptr).
+        //   * Stack-passed: at positive offsets above rbp. After
+        //     `push rbp; mov rbp, rsp`, the saved rbp lives at [rbp+0] and
+        //     the return address at [rbp+8]. On Windows the next 32 bytes
+        //     ([rbp+0x10..0x28]) are the caller's shadow space (home slots
+        //     for the 4 register args); stack args start at [rbp+0x30].
+        //     On SysV there is no shadow space and stack args start at
+        //     [rbp+0x10]. The caller's `emit_stack_arg_setup` pushes
+        //     args in ascending ABI-index order, so arg `k` (where
+        //     `k >= reg_arg_count + ctx_offset`) lives at
+        //     `[rbp + stack_arg_base + (k - ctx_offset - reg_arg_count) * 8]`.
+        //
+        // ROUND-12 fix: previously the prologue only loaded
+        // `ARG_REGS.iter().skip(ctx_offset).take(num_params)`, silently
+        // dropping any param beyond the register file. The result was
+        // garbage in the corresponding local slot (whatever the frame
+        // location happened to hold from the prior call), surfacing as a
+        // `ClassCastException` when the JIT'd lambda's `aload` consumed
+        // the missing reference. The fix below loads register-passed
+        // params (clamped to the available register count) and then
+        // loads the remaining stack-passed params via `emit_load_caller_arg`.
+        let ctx_offset = if self.needs_heap { 1 } else { 0 };
         if self.needs_heap {
             // First ABI arg is the heap pointer — save to frame
             self.emit_store_local(self.heap_local_offset, ARG_REGS[0]);
-            // Java params: XMM/GPR-mapped locals go to assigned reg, others to frame
-            for (i, &reg) in ARG_REGS.iter().skip(1).enumerate().take(self.num_params) {
-                if let Some(xmm) = self.xmm_for_local(i) {
-                    // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
-                    self.emit_mov_reg_reg(RAX, reg);
-                    self.emit_movq_xmm_from_rax(xmm);
-                } else if let Some(local_reg) = self.reg_for_local(i) {
-                    self.emit_mov_reg_reg(local_reg, reg);
-                } else {
-                    let offset = self.local_offset(i);
-                    self.emit_store_local(offset, reg);
-                }
+        }
+        let reg_capacity = ARG_REGS.len() - ctx_offset;
+        let reg_arg_count = self.num_params.min(reg_capacity);
+
+        // Load register-passed Java params (java idx 0..reg_arg_count) from
+        // ARG_REGS[ctx_offset + i] into the destination local slot.
+        for i in 0..reg_arg_count {
+            let reg = ARG_REGS[ctx_offset + i];
+            if let Some(xmm) = self.xmm_for_local(i) {
+                // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
+                self.emit_mov_reg_reg(RAX, reg);
+                self.emit_movq_xmm_from_rax(xmm);
+            } else if let Some(local_reg) = self.reg_for_local(i) {
+                self.emit_mov_reg_reg(local_reg, reg);
+            } else {
+                let offset = self.local_offset(i);
+                self.emit_store_local(offset, reg);
             }
-        } else {
-            // Normal: Java params start at ARG_REGS[0..]
-            for (i, &reg) in ARG_REGS.iter().enumerate().take(self.num_params) {
+        }
+
+        // Load stack-passed Java params (java idx reg_arg_count..num_params)
+        // from the caller's stack frame at [rbp + positive_disp]. This path
+        // is exercised on Windows x64 when needs_heap is true and
+        // num_params == 4 (heap consumes ARG_REGS[0], leaving 3 register
+        // slots for the 4 Java args), and on either platform if num_params
+        // ever exceeds the register file's Java-arg capacity.
+        if self.num_params > reg_arg_count {
+            // The caller's `emit_stack_arg_setup` materializes stack
+            // args at `[rsp + shadow]` (shadow=32 on Windows, 0 on SysV)
+            // immediately before the CALL. After the call sequence
+            // (CALL pushes 8B return addr; prologue pushes 8B rbp), the
+            // first stack arg lives at `[rbp + 16 + shadow]`.
+            #[cfg(target_os = "windows")]
+            let stack_arg_base: i32 = 16 + 32; // 0x30 — past saved rbp + retaddr + 32B shadow space
+            #[cfg(not(target_os = "windows"))]
+            let stack_arg_base: i32 = 16; // 0x10 — past saved rbp + retaddr
+
+            for i in reg_arg_count..self.num_params {
+                let stack_idx = i - reg_arg_count; // 0-based index among stack args
+                let positive_disp = stack_arg_base + (stack_idx as i32) * 8; // Cast: x86-64 immediate encoding
+                // Load via RAX scratch so XMM-mapped float/double params
+                // can still be moved through the existing GPR→XMM helper.
+                self.emit_load_caller_arg(RAX, positive_disp);
                 if let Some(xmm) = self.xmm_for_local(i) {
-                    // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
-                    self.emit_mov_reg_reg(RAX, reg);
                     self.emit_movq_xmm_from_rax(xmm);
                 } else if let Some(local_reg) = self.reg_for_local(i) {
-                    self.emit_mov_reg_reg(local_reg, reg);
+                    self.emit_mov_reg_reg(local_reg, RAX);
                 } else {
                     let offset = self.local_offset(i);
-                    self.emit_store_local(offset, reg);
+                    self.emit_store_local(offset, RAX);
                 }
             }
         }
@@ -7908,8 +8006,19 @@ impl Compiler {
         let do_div_off = self.buf.pos();
         let rel1 = (do_div_off as i64) - (jne1_patch as i64 + 1);
         let rel2 = (do_div_off as i64) - (jne2_patch as i64 + 1);
-        debug_assert!((-128..=127).contains(&rel1));
-        debug_assert!((-128..=127).contains(&rel2));
+        // Hard runtime checks: a rel8 displacement that does not fit in an i8
+        // would silently miscompile in release builds. `emit_safe_idiv` cannot
+        // signal a failure (it returns `()`), so assert rather than emit a
+        // broken branch. The intervening block is fixed-size and small, so
+        // this can only fire on a genuine codegen bug.
+        assert!(
+            (-128..=127).contains(&rel1),
+            "emit_safe_idiv: JNE1 rel8 displacement {rel1} out of i8 range",
+        );
+        assert!(
+            (-128..=127).contains(&rel2),
+            "emit_safe_idiv: JNE2 rel8 displacement {rel2} out of i8 range",
+        );
         self.buf.patch_byte(jne1_patch, rel1 as u8);
         self.buf.patch_byte(jne2_patch, rel2 as u8);
 
@@ -7944,7 +8053,12 @@ impl Compiler {
         // :after_div — patch the JMP from the overflow path.
         let after_off = self.buf.pos();
         let rel_jmp = (after_off as i64) - (jmp_after_patch as i64 + 1);
-        debug_assert!((-128..=127).contains(&rel_jmp));
+        // Hard runtime check (see JNE patch checks above): a rel8 that does not
+        // fit in an i8 would silently miscompile in release builds.
+        assert!(
+            (-128..=127).contains(&rel_jmp),
+            "emit_safe_idiv: JMP rel8 displacement {rel_jmp} out of i8 range",
+        );
         self.buf.patch_byte(jmp_after_patch, rel_jmp as u8);
     }
 

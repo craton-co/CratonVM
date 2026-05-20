@@ -964,37 +964,30 @@ pub(crate) fn native_loader_load_module(
             }
         }
 
-        // RKC19/WF39 Task C — Synthetic class definition fallback.
+        // Real-bytecode audit: the RKC19/WF39 Task C "synthetic class
+        // definition fallback" has been GATED OFF by default.
         //
-        // Even after the brute-force layered-jar walk and the
-        // `ensure_class_initialized` pre-warm, some WildFly bootstrap entry
-        // classes (e.g. `org/jboss/as/server/Main`) may still be unreachable
-        // — the jar that ships them may have been excluded from the module
-        // path, repackaged under a different name, or shipped only in an
-        // add-on we don't scan.  When this happens, `Class.forName("org/
-        // jboss/as/server/Main")` from jboss-modules' `Module.run` falls
-        // through to a `ClassNotFoundException`, or worse, materialises a
-        // synthetic stub class that does NOT have a `main` method on its
-        // method list — causing `getDeclaredMethod("main",
-        // String[].class)` to throw `NoSuchMethodException`.
+        // This loop previously synthesized a 191-byte class file with a
+        // no-op `main([Ljava/lang/String;)V` body and (when redefine=true
+        // on `define_class_full`) REPLACED real WildFly / Keycloak entry
+        // classes whose bytecode hadn't been pre-loaded. That is a pure
+        // fake-out: any classes injected this way would silently return
+        // without booting WildFly.
         //
-        // The native intercept registered in `register_jboss_module_loader`
-        // (binding `org/jboss/as/server/Main.main` to
-        // `native_wildfly_main_noop`) is only consulted at method-dispatch
-        // time, NOT during reflective `getDeclaredMethod` lookup which
-        // walks the class's actual method list.  Without a synthesised
-        // class that physically has `main([Ljava/lang/String;)V` in its
-        // method table, the registry entry is never reached.
-        //
-        // The fix: for each WildFly/Keycloak bootstrap fallback class
-        // that is STILL unknown to the class manager after the
-        // brute-force walk, synthesise a minimal valid class file
-        // containing a no-op `main([Ljava/lang/String;)V` method and
-        // `define_class_from_bytes` it.  This guarantees that reflective
-        // method lookup finds the `main` symbol; the actual no-op
-        // semantics come from the native intercept binding (or from the
-        // synthetic bytecode body, which is also a single `return`).
-        for synth_name in &entry_candidates {
+        // The loop body is left intact so future debugging can re-enable
+        // it via `RUSTJVM_USE_WILDFLY_SYNTH_BYTECODE=1`, but the default
+        // behavior is to run the real bytecode for every entry candidate
+        // that loaded via `ensure_class_initialized` above, and to fail
+        // loudly (rather than fake-out) for any that didn't.
+        let allow_synth_bytecode =
+            std::env::var("RUSTJVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() == Ok("1");
+        if !allow_synth_bytecode {
+            // Skip the entire synthesis pass. Suppress dead-code warning
+            // on the synthesis helper since it is now only called from
+            // inside the opt-in branch below.
+            let _ = build_synthetic_class_with_main;
+        }
+        if allow_synth_bytecode { for synth_name in &entry_candidates {
             // KC17 Task A — surface BOTH facts (class loaded? main present?)
             // so the keycloak-16 boot trace shows whether the synth path
             // even runs.
@@ -1096,7 +1089,7 @@ pub(crate) fn native_loader_load_module(
                 "[kc17-bf] post-synth state {}: class_id={:?} main_exists={}",
                 synth_name, cid_post, main_exists_post
             );
-        }
+        } } // close `for synth_name` and `if allow_synth_bytecode`
     }
 
     // Insert into cache, but check for race-loser.
@@ -2552,59 +2545,28 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         native_jdk_module_logger_clinit,
     );
 
-    // RKC19/WF39 — Task E: synthetic last-resort `main(String[])` for the
-    // well-known WildFly bootstrap entry-points.
-    //
-    // The brute-force layered-jar walk in `native_loader_load_module` plus
-    // the `ensure_class_initialized` pre-warm should make the REAL
-    // `org.jboss.as.server.Main.main` resolvable via `Class.forName` +
-    // `Class.getDeclaredMethod("main", String[].class)` in the vast majority
-    // of WildFly distributions.  But some shipped builds carry a
-    // `wildfly-server-<X>.jar` whose `Main.class` isn't statically locatable
-    // (renamed, repackaged, or version-mismatched against the
-    // `org.jboss.as.standalone` module.xml's `<main-class>` declaration).
-    //
-    // To prevent CratonVM from crashing with `NoSuchMethodException` (and
-    // exiting with non-zero rc) in that pathological scenario, we register a
-    // synthetic no-op `main(String[])` on every known WildFly bootstrap class
-    // name.  If the REAL class loads first, the registry entry is shadowed
-    // (the real bytecode takes precedence in method resolution).  If the
-    // real class is missing — `ensure_class_initialized` will materialise a
-    // synthetic stub and the JVM's method-resolution will fall through to
-    // these native entries, yielding a clean rc=0 exit.
-    //
-    // None of these methods do any work — they intentionally return without
-    // booting WildFly.  The intent is "exit cleanly so the test framework
-    // observes a process that ran to completion" rather than "actually boot
-    // WildFly with a synthetic main".  Real WildFly boot requires the real
-    // bytecode.
-    for entry_class in &[
-        "org/jboss/as/server/Main",
-        "org/jboss/as/Main",
-        "org/jboss/as/standalone/Main",
-        "org/jboss/as/embedded/EmbeddedStandaloneServerFactory$Main",
-        "org/jboss/as/host/controller/Main",
-        "org/jboss/as/process/Main",
-        // RKC19/WF39 Task C — Keycloak 16 ships its own bootstrap entry-points
-        // alongside the WildFly-based jboss-modules launcher.  Register
-        // synthetic no-op `main(String[])` for them too so `keycloak-16 rc=1`
-        // (mirror of `wildfly rc=1`) is converted into a clean rc=0 boot-test.
-        "org/keycloak/Main",
-        "org/keycloak/keycloak/Main",
-    ] {
-        registry.register(
-            entry_class,
-            "main",
-            "([Ljava/lang/String;)V",
-            native_wildfly_main_noop,
-        );
-    }
+    // Real-bytecode audit: the RKC19/WF39 Task E "synthetic last-resort
+    // `main(String[])` for WildFly bootstrap entry-points" registration
+    // has been REMOVED. It registered `native_wildfly_main_noop` on
+    // `org/jboss/as/server/Main` et al unconditionally, which (because
+    // native intercepts win over Java bytecode in method dispatch) caused
+    // CratonVM to skip the real WildFly boot. The function is left below
+    // as `#[allow(dead_code)]` only so a future audit can confirm what
+    // the shim looked like; it is no longer wired into the registry.
+    let _ = native_wildfly_main_noop;
 }
 
 /// RKC19/WF39 — synthetic no-op `main(String[])` for WildFly bootstrap
 /// entry-points.  See the comment in `register_jboss_module_loader` for
 /// rationale.  Returns `void` (i.e. `None` plus an `Ok(...)` result) without
 /// performing any work.
+///
+/// Real-bytecode audit: this function is NO LONGER REGISTERED. It is
+/// retained `#[allow(dead_code)]` purely so the registration deletion
+/// site can reference it via `let _ = ...` without provoking a
+/// dead-symbol warning.  Real `org/jboss/as/server/Main.main` bytecode
+/// now runs.
+#[allow(dead_code)]
 fn native_wildfly_main_noop(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],

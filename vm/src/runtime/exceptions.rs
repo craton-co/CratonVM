@@ -459,6 +459,14 @@ pub fn convert_class_not_found(
     class_name: &str,
     err: MethodCallFailed,
 ) -> MethodCallFailed {
+    if std::env::var_os("RUSTJVM_DBG_NCDFE").is_some() {
+        eprintln!("[NCDFE] class={} err={:?}", class_name, err);
+        let cm = shared.class_manager.read();
+        for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+            let cn = cm.get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
+            eprintln!("[NCDFE-STK {}] {}.{} pc={}", i, cn, f.method_name(), f.pc);
+        }
+    }
     match err {
         MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
             ..

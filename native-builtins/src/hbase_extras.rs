@@ -42,12 +42,17 @@ use rustjvm_native_api::{NativeContext, NativeMethodRegistry};
 use rustjvm_types::error::MethodCallResult;
 use rustjvm_types::Value;
 
+#[allow(dead_code)]
 const CN_VERSION_INFO: &str = "org/apache/hadoop/hbase/util/VersionInfo";
+#[allow(dead_code)]
 const CN_HMASTER: &str = "org/apache/hadoop/hbase/HMaster";
+#[allow(dead_code)]
 const CN_HBCK2: &str = "org/apache/hadoop/hbase/HBCK2";
+#[allow(dead_code)]
 const CN_HBASE_FSCK: &str = "org/apache/hadoop/hbase/util/HBaseFsck";
 
 /// Generic `main([Ljava/lang/String;)V` no-op for HBase entry points.
+#[allow(dead_code)]
 fn hbase_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     tracing::warn!("[hbase-shim] main short-circuited (boot-test mode)");
     Ok(None)
@@ -56,6 +61,7 @@ fn hbase_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 /// Generic `<clinit>()V` no-op for HBase entry-point classes. The real
 /// clinit pulls in Hadoop `Configuration` static fields which NPE under
 /// CratonVM's partial bootstrap.
+#[allow(dead_code)]
 fn hbase_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -66,37 +72,12 @@ fn hbase_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// for adding the call to this function from
 /// `register_essential_natives`.
 pub fn register_hbase_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when set to "1", skip installing the boot-test
-    // short-circuits so the real HBase main runs (used by the
-    // orchestrator's real-app diagnostics).
-    if std::env::var("RUSTJVM_HBASE_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    // VersionInfo.main — `bin/hbase version` entry point.
-    registry.register(
-        CN_VERSION_INFO,
-        "main",
-        "([Ljava/lang/String;)V",
-        hbase_main_noop,
-    );
-    registry.register(CN_VERSION_INFO, "<clinit>", "()V", hbase_clinit_noop);
-
-    // HMaster.main — region-server master entry point.
-    registry.register(CN_HMASTER, "main", "([Ljava/lang/String;)V", hbase_main_noop);
-    registry.register(CN_HMASTER, "<clinit>", "()V", hbase_clinit_noop);
-
-    // HBCK2.main — HBase consistency checker entry point.
-    registry.register(CN_HBCK2, "main", "([Ljava/lang/String;)V", hbase_main_noop);
-    registry.register(CN_HBCK2, "<clinit>", "()V", hbase_clinit_noop);
-
-    // HBaseFsck.main — legacy fsck entry point.
-    registry.register(
-        CN_HBASE_FSCK,
-        "main",
-        "([Ljava/lang/String;)V",
-        hbase_main_noop,
-    );
-    registry.register(CN_HBASE_FSCK, "<clinit>", "()V", hbase_clinit_noop);
+    // DISABLED per "no synthetic stubs" policy. All eight registrations here
+    // were fake-main / fake-<clinit> no-ops covering VersionInfo, HMaster,
+    // HBCK2, and HBaseFsck — masking the real failure path. The orchestrator
+    // wants the first real-bytecode failure surfaced, then dispatches
+    // follow-up fix agents.
+    let _ = registry;
 }
 
 #[cfg(test)]

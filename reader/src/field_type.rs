@@ -38,8 +38,24 @@ impl FieldType {
         Ok(field_type)
     }
 
+    /// Maximum array nesting depth. The JVMS caps array descriptors at 255
+    /// dimensions; we use the same bound to stop attacker-controlled
+    /// descriptors from blowing the native stack via unbounded recursion.
+    const MAX_ARRAY_DEPTH: u32 = 255;
+
     /// Parse a field type descriptor, returning the parsed type and the remaining unparsed string.
     pub fn parse_partial(descriptor: &str) -> Result<(Self, &str), ClassReaderError> {
+        Self::parse_partial_depth(descriptor, 0)
+    }
+
+    /// Depth-tracking implementation of [`FieldType::parse_partial`]. Each
+    /// `[` (array dimension) increments `depth`; exceeding
+    /// [`FieldType::MAX_ARRAY_DEPTH`] returns an error instead of recursing
+    /// deeper, preventing a stack overflow on hostile descriptors.
+    fn parse_partial_depth(
+        descriptor: &str,
+        depth: u32,
+    ) -> Result<(Self, &str), ClassReaderError> {
         let bytes = descriptor.as_bytes();
         if bytes.is_empty() {
             return Err(ClassReaderError::InvalidTypeDescriptor {
@@ -69,7 +85,13 @@ impl FieldType {
                 ))
             }
             b'[' => {
-                let (component_type, remaining) = Self::parse_partial(&descriptor[1..])?;
+                if depth >= Self::MAX_ARRAY_DEPTH {
+                    return Err(ClassReaderError::InvalidTypeDescriptor {
+                        descriptor: descriptor.to_string(),
+                    });
+                }
+                let (component_type, remaining) =
+                    Self::parse_partial_depth(&descriptor[1..], depth + 1)?;
                 Ok((FieldType::Array(Box::new(component_type)), remaining))
             }
             _ => Err(ClassReaderError::InvalidTypeDescriptor {
@@ -167,6 +189,22 @@ mod tests {
         assert_eq!(FieldType::Long.stack_slots(), 2);
         assert_eq!(FieldType::Double.stack_slots(), 2);
         assert_eq!(FieldType::Object("Foo".to_string()).stack_slots(), 1);
+    }
+
+    #[test]
+    fn deeply_nested_array_is_rejected_not_overflow() {
+        // 256 leading '[' exceeds the 255-dimension cap: must return an
+        // error rather than recursing into a stack overflow.
+        let descriptor = format!("{}I", "[".repeat(256));
+        assert!(FieldType::parse(&descriptor).is_err());
+
+        // Far past the cap stays an error (and does not panic/overflow).
+        let huge = format!("{}I", "[".repeat(100_000));
+        assert!(FieldType::parse(&huge).is_err());
+
+        // Exactly 255 dimensions remains valid.
+        let at_cap = format!("{}I", "[".repeat(255));
+        assert!(FieldType::parse(&at_cap).is_ok());
     }
 
     #[test]

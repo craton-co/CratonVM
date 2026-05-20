@@ -137,9 +137,19 @@ impl EventStream {
         };
 
         let relative_start = (effective_start - base_index) as usize;
-        let mut results = Vec::new();
+        // Perf: previously `repo.iter().skip(relative_start)` walked the
+        // VecDeque from the front on every poll — O(n) even when the cursor
+        // was already near the end. `EventRepository::get` indexes the
+        // backing VecDeque in O(1) (same fix already applied to
+        // `next_event`). We iterate `[relative_start, repo_len)` directly.
+        let repo_len_usize = repo.len();
+        let mut results = Vec::with_capacity(repo_len_usize.saturating_sub(relative_start));
 
-        for event in repo.iter().skip(relative_start) {
+        for rel in relative_start..repo_len_usize {
+            let event = match repo.get(rel) {
+                Some(e) => e,
+                None => break,
+            };
             if !self.type_filters.is_empty() && !self.type_filters.contains(&event.type_id) {
                 continue;
             }

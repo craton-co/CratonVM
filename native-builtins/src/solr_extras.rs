@@ -38,9 +38,21 @@ pub fn register_solr_stubs(registry: &mut NativeMethodRegistry) {
 
     // Solr 9.4.1 CLI uses Picocli for arg parsing. If picocli's clinit
     // triggers System.exit(2) on our partial bootstrap, short-circuit it.
+    //
+    // BUGFIX (KC26): the previous list included `picocli/CommandLine` and
+    // `picocli/CommandLine$DefaultExceptionHandler`. Registering a no-op
+    // `<clinit>` globally on these picocli classes breaks any non-Solr
+    // application that uses picocli: the real `<clinit>` populates the
+    // static `TRACER` field (and other singletons), so a no-op stub leaves
+    // them null and every subsequent call to `CommandLine.tracer()` NPEs
+    // on `tracer.modified`. Keycloak 26 (Quarkus) bundles picocli 4.7.6
+    // for its CLI and hit exactly that on `parseAndRun`. The Solr-specific
+    // `System.exit(2)` concern only manifested with Solr-specific
+    // surrounding classes; removing the picocli entries from this global
+    // list lets the real bytecode `<clinit>` run for every other consumer.
+    // If Solr later regresses on this path, the fix is a Solr-app-only
+    // stub (gated by a Solr classpath check), not a global override.
     for cls in [
-        "picocli/CommandLine",
-        "picocli/CommandLine$DefaultExceptionHandler",
         "org/apache/solr/cli/SolrCLI",
         "org/apache/solr/cli/StartCommand",
         "org/apache/solr/cli/StopCommand",

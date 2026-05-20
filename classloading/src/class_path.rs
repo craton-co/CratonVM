@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing::debug;
 use zip::ZipArchive;
 
@@ -118,6 +119,26 @@ fn read_file_for_classpath(path: &Path) -> std::io::Result<Vec<u8>> {
 /// file entries are usually well under this cap, so eviction only kicks
 /// in for pathological probe sets.
 const CANONICALIZE_CACHE_CAP: usize = 1024;
+
+/// Cached verdict for the `RUSTJVM_DBG_GETRESOURCES` env var.
+///
+/// `find_all_resource_urls` is called once per `ClassPath` instance
+/// (bootstrap / extension / application) for every `getResources`
+/// probe — a hot path on Spring-style classpath scans. The env var
+/// can't change after process start, so `std::env::var` (which locks
+/// the libc environ and allocates a `String`) is read exactly once
+/// here and the boolean verdict reused on every subsequent call.
+static DBG_GETRESOURCES: OnceLock<bool> = OnceLock::new();
+
+/// `true` when `RUSTJVM_DBG_GETRESOURCES` is set to a non-empty,
+/// non-`"0"` value. Computed once and cached for the process lifetime.
+fn dbg_getresources() -> bool {
+    *DBG_GETRESOURCES.get_or_init(|| {
+        std::env::var("RUSTJVM_DBG_GETRESOURCES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
 
 /// Bounded FIFO cache for [`fs::canonicalize`] results.
 ///
@@ -1439,7 +1460,19 @@ impl ClassPath {
         &self,
         class_name: &str,
     ) -> Option<(String, Vec<Vec<u8>>)> {
-        if class_name.contains("..") || class_name.starts_with('/') || class_name.contains('\0') {
+        // Audit-fix #6: match `find_class` / `find_class_source_path`'s full
+        // validation set (NUL bytes, leading slash, backslash, drive letter,
+        // dot-dot, relative-dir prefixes). The previous truncated check let
+        // `..\\Object` or `C:\Foo` reach the JAR-name lookups below.
+        if class_name.contains("..")
+            || class_name.starts_with('/')
+            || class_name.starts_with('\\')
+            || class_name.contains("\\\\")
+            || class_name.contains('\0')
+            || class_name.contains(':')
+            || class_name.contains("./")
+            || class_name.contains(".\\")
+        {
             return None;
         }
         let relative_path = format!("{}.class", class_name);
@@ -1449,7 +1482,9 @@ impl ClassPath {
                     let full_path = dir.join(Path::new(&relative_path));
                     if full_path.exists() {
                         // Directories are never signed.
-                        let abs = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+                        let abs = self
+                            .canonicalize_cached(dir)
+                            .unwrap_or_else(|_| dir.to_path_buf());
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
                         let p = p.trim_start_matches('/').trim_end_matches('/').to_string();
@@ -1463,7 +1498,9 @@ impl ClassPath {
                         Self::find_in_archive(archive, &relative_path).is_some()
                     };
                     if found {
-                        let abs = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                        let abs = self
+                            .canonicalize_cached(path)
+                            .unwrap_or_else(|_| path.clone());
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
                         let p = p.trim_start_matches('/').to_string();
@@ -1553,9 +1590,10 @@ impl ClassPath {
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
                         // Canonicalize and verify the resolved path is under the classpath root.
-                        if let (Ok(canon_dir), Ok(canon_path)) =
-                            (fs::canonicalize(dir), fs::canonicalize(&full_path))
-                        {
+                        if let (Ok(canon_dir), Ok(canon_path)) = (
+                            self.canonicalize_cached(dir),
+                            self.canonicalize_cached(&full_path),
+                        ) {
                             if !canon_path.starts_with(&canon_dir) {
                                 debug!(
                                     "Resource path traversal blocked: {} escapes {}",
@@ -1693,9 +1731,10 @@ impl ClassPath {
             match entry {
                 ClassPathEntry::Directory(dir) => {
                     let full_path = dir.join(Path::new(name));
-                    if let (Ok(canon_dir), Ok(canon_path)) =
-                        (fs::canonicalize(dir), fs::canonicalize(&full_path))
-                    {
+                    if let (Ok(canon_dir), Ok(canon_path)) = (
+                        self.canonicalize_cached(dir),
+                        self.canonicalize_cached(&full_path),
+                    ) {
                         if !canon_path.starts_with(&canon_dir) {
                             continue;
                         }
@@ -1779,9 +1818,7 @@ impl ClassPath {
         // one block per loader — useful for spotting whether a specific
         // jar is missing from the application classpath entirely vs
         // simply lacking the resource.
-        let dbg = std::env::var("RUSTJVM_DBG_GETRESOURCES")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+        let dbg = dbg_getresources();
         if dbg {
             eprintln!(
                 "[GRES-DBG] find_all_resource_urls({}) — scanning {} entries",
@@ -1795,14 +1832,17 @@ impl ClassPath {
                 ClassPathEntry::Directory(dir) => {
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
-                        if let (Ok(canon_dir), Ok(canon_path)) =
-                            (fs::canonicalize(dir), fs::canonicalize(&full_path))
-                        {
+                        if let (Ok(canon_dir), Ok(canon_path)) = (
+                            self.canonicalize_cached(dir),
+                            self.canonicalize_cached(&full_path),
+                        ) {
                             if !canon_path.starts_with(&canon_dir) {
                                 continue;
                             }
                         }
-                        let abs = fs::canonicalize(&full_path).unwrap_or(full_path);
+                        let abs = self
+                            .canonicalize_cached(&full_path)
+                            .unwrap_or(full_path);
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
@@ -1824,7 +1864,9 @@ impl ClassPath {
                         );
                     }
                     if found {
-                        let abs = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                        let abs = self
+                            .canonicalize_cached(path)
+                            .unwrap_or_else(|_| path.clone());
                         let p = abs.to_string_lossy().replace('\\', "/");
                         // Strip UNC prefix \\?\ that canonicalize produces on Windows.
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
@@ -2213,7 +2255,11 @@ impl ClassPath {
     ) -> Option<Vec<u8>> {
         let mut guard = archive.lock();
         let result = guard.by_name(name).and_then(|mut zip_entry| {
-            let mut data = Vec::with_capacity(zip_entry.size() as usize);
+            // Audit-fix #2: the declared `size()` comes from the JAR central
+            // directory and is attacker-controlled (up to `u64::MAX`). Clamp
+            // it via `safe_with_capacity` to avoid a multi-GiB pre-allocation
+            // from a crafted JAR, matching the sibling entry-read paths.
+            let mut data = Vec::with_capacity(safe_with_capacity(zip_entry.size()));
             zip_entry.read_to_end(&mut data)?;
             Ok(data)
         });
