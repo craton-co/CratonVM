@@ -15,6 +15,15 @@ use rustjvm_reader::method::ClassFileMethod;
 /// Load `class_name.class` from the fixtures directory and return the
 /// named method. Panics if the class or method cannot be found — tests
 /// that depend on a fixture should fail loudly when it goes missing.
+///
+/// The reader builds every attribute as a `LazyAttribute::Raw` and
+/// never structurally parses it; `ClassFileMethod::code()` only returns
+/// `Some` once the `Code` attribute has been *force-decoded* (see its
+/// doc comment). The analyzer and lowering pipeline both call `code()`,
+/// so this helper force-decodes every method's attributes against the
+/// class's constant pool before handing the method back — otherwise
+/// every fixture method would look like it had no `Code` attribute and
+/// the analyzer would (wrongly) reject it with `Reason::NoCode`.
 pub fn load_method(class_name: &str, method_name: &str, descriptor: &str) -> ClassFileMethod {
     let path = fixture_path(class_name);
     let bytes = std::fs::read(&path)

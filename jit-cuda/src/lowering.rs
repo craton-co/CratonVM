@@ -91,15 +91,15 @@ pub fn lower_method(
             match bound {
                 BoundSource::ParamLen(idx) => {
                     let bound_reg = emitter.materialise_param_len(idx);
-                    emitter.emit_loop_guard(&bound_reg);
+                    emitter.emit_loop_guard(&bound_reg, &li);
                 }
                 BoundSource::ThisFieldLen(idx) => {
                     let bound_reg = emitter.materialise_this_field_len(idx);
-                    emitter.emit_loop_guard(&bound_reg);
+                    emitter.emit_loop_guard(&bound_reg, &li);
                 }
                 BoundSource::Literal(v) => {
                     let bound_reg = emitter.materialise_literal_s32(v);
-                    emitter.emit_loop_guard(&bound_reg);
+                    emitter.emit_loop_guard(&bound_reg, &li);
                 }
             }
             // Body — walks until it hits the back-branch goto.
@@ -422,21 +422,62 @@ mod tests {
         assert!(text.contains("L_bounds_fail:"));
     }
 
+    // AUDIT 2026-05-20: `EligibleDotProduct.dot([I[I)J` is a genuine
+    // scalar-accumulator reduction. Its bytecode accumulates every
+    // `(long)a[i] * (long)b[i]` term into a single `long` local
+    // (slot 2) and `lreturn`s it. Lowering it with the current
+    // `scalar_return` emitter is a CORRECTNESS bug: each CUDA thread
+    // would write its own per-element term through the single
+    // `ret_ptr`, racing to overwrite the one scalar slot — silently
+    // wrong results. So the analyzer (rightly) rejects it with
+    // `ReductionNotImplemented`, and lowering must never run on it.
+    //
+    // The old `dot_product_lowers_with_long_math` test asserted the
+    // method LOWERS; that assertion is unsafe and was only ever
+    // reachable when fixtures failed earlier at `Rejected(NoCode)`.
+    // It is re-specified here to assert the (correct) rejection, and
+    // `#[ignore]`d as a forward pointer: once a guarded single-writer
+    // or block-reduction lowering exists, restore the lowering
+    // assertions below and drop the `#[ignore]`.
     #[test]
+    #[ignore = "EligibleDotProduct.dot is a scalar-accumulator reduction; \
+                racy under the current per-thread scalar_return lowering. \
+                Re-enable as a lowering test once block-reduction lowering lands."]
     fn dot_product_lowers_with_long_math() {
-        let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
+        let method = load_method("EligibleDotProduct", "dot", "([I[I)J");
+        // Reduction shape — analyzer must reject, lowering must not run.
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(crate::analyzer::Reason::ReductionNotImplemented),
+        );
+    }
+
+    #[test]
+    fn i2c_lowers_to_zero_extend_not_sign_extend() {
+        // CRIT regression pin: `i2c` (0x92) converts int -> char, and
+        // `char` is UNSIGNED 16-bit (JVMS §6.5: "zero extend"). The
+        // lowered PTX must mask the low 16 bits (`and.b32 ..., 65535`)
+        // — it must NOT route through the sign-extending shift pair
+        // (`shl.b32` + `shr.s32`) used by `i2b`/`i2s`. A sign-extending
+        // i2c silently turns 0xFFFF into -1 on the GPU.
+        let m = lower_fixture("EligibleI2cConvert", "toChar", "([I[I)V");
         let text = m.render();
-        assert!(text.contains(".visible .entry EligibleDotProduct__dot_"));
-        // i2l conversions appear (a[i] is int, multiplied as long).
-        assert!(text.contains("cvt.s64.s32"));
-        // 64-bit multiply + add somewhere.
-        assert!(text.contains("mul.lo.s64"));
-        assert!(text.contains("add.s64"));
-        // Scalar return → ret_ptr store of an s64.
-        assert!(text.contains("[ret_ptr]"));
-        assert!(text.contains("st.global.s64"));
-        // Bounds-fail block present.
-        assert!(text.contains("L_bounds_fail:"));
+        assert!(
+            text.contains(".visible .entry EligibleI2cConvert__toChar_"),
+            "fixture did not lower to a kernel:\n{text}",
+        );
+        // The zero-extend mask must be present: `and.b32 dst, src, 65535`.
+        assert!(
+            text.contains("and.b32") && text.contains("65535"),
+            "expected `and.b32 ..., 65535` zero-extend for i2c, got:\n{text}",
+        );
+        // And the sign-extending shift must NOT appear — that is the
+        // bug. (`i2b`/`i2s` would emit `shr.s32`, but this fixture has
+        // no such conversion.)
+        assert!(
+            !text.contains("shr.s32"),
+            "i2c must not emit the sign-extending `shr.s32`:\n{text}",
+        );
     }
 
     #[test]
@@ -623,6 +664,200 @@ mod tests {
             msg.contains("frem"),
             "expected error message to mention 'frem', got: {msg}",
         );
+    }
+
+    // ──────── array opcode ↔ element-kind mismatch rejection ────────
+    //
+    // AUDIT 2026-05-20: `array_param_of` returned the parameter's
+    // `ParamKind` element type but every array-access call site
+    // discarded it (`let (idx, _kind) = ...`). Nothing verified that an
+    // `iaload` was issued against an `int[]` rather than a `float[]`,
+    // so a type-confused access emitted a load/store of the wrong
+    // width/signedness against a buffer of a different element type —
+    // silent bit-reinterpreted data corruption with no rejection.
+    //
+    // We cannot express this with a javac-compiled fixture: the Java
+    // type-checker forbids `iaload` on a `float[]`. The mismatch is a
+    // *VM-internal* inconsistency between the descriptor-derived
+    // `param_kinds` and the array opcode the bytecode actually uses.
+    // These tests reproduce it directly by lowering a real fixture's
+    // bytecode under a deliberately-wrong `KernelSignature`.
+
+    /// `EligibleVectorAdd.vectorAdd` does `iaload`/`iastore`. Lowered
+    /// with a signature that (wrongly) declares the params as `float[]`,
+    /// the element-kind check must reject the method so it falls back to
+    /// the safe CPU interpreter.
+    #[test]
+    fn iaload_on_float_array_param_is_rejected() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        // Deliberately mistyped signature: the bytecode does integer
+        // array ops, but we tell the lowerer the params are float[].
+        let bad_sig = KernelSignature {
+            param_kinds: vec![
+                ParamKind::F32Array,
+                ParamKind::F32Array,
+                ParamKind::F32Array,
+            ],
+            return_kind: ParamKind::Void,
+            estimated_work: 1 << 20,
+            needs_d2h_sync: false,
+        };
+        let err = lower_method("EligibleVectorAdd", &method, &bad_sig, 7, 5)
+            .expect_err("iaload on a float[] param must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("iaload") || msg.contains("iastore"),
+            "expected an iaload/iastore element-kind mismatch error, got: {msg}",
+        );
+        assert!(
+            msg.contains("F32Array"),
+            "error should name the mismatched declared kind, got: {msg}",
+        );
+    }
+
+    /// Control: the *same* fixture lowered with the *correct* int-array
+    /// signature must still be Eligible — the kind check must not
+    /// reject matching accesses.
+    #[test]
+    fn iaload_on_matching_int_array_param_still_lowers() {
+        let method = load_method("EligibleVectorAdd", "vectorAdd", "([I[I[I)V");
+        let good_sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!("expected EligibleVectorAdd.vectorAdd eligible, got {v:?}"),
+        };
+        // analyze() derives int[] params from the descriptor.
+        assert_eq!(good_sig.param_kinds[0], ParamKind::I32Array);
+        lower_method("EligibleVectorAdd", &method, &good_sig, 7, 5)
+            .expect("matching iaload on int[] must still lower");
+    }
+
+    /// `EligibleSaxpy.saxpy` does `faload`/`fastore` on `float[]`
+    /// params. Lowered under an int-array signature the float ops must
+    /// be rejected.
+    #[test]
+    fn faload_on_int_array_param_is_rejected() {
+        let method = load_method("EligibleSaxpy", "saxpy", "(F[F[F[F)V");
+        let bad_sig = KernelSignature {
+            param_kinds: vec![
+                ParamKind::F32, // the scalar `a` — correct
+                ParamKind::I32Array,
+                ParamKind::I32Array,
+                ParamKind::I32Array,
+            ],
+            return_kind: ParamKind::Void,
+            estimated_work: 1 << 20,
+            needs_d2h_sync: false,
+        };
+        let err = lower_method("EligibleSaxpy", &method, &bad_sig, 7, 5)
+            .expect_err("faload on an int[] param must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("faload") || msg.contains("fastore"),
+            "expected a faload/fastore element-kind mismatch error, got: {msg}",
+        );
+    }
+
+    // ─────────── counted-loop canonical-shape validation ────────────
+    //
+    // AUDIT 2026-05-20: the element-wise GPU lowering ("one thread per
+    // iteration, `tid` IS the loop variable") is only correct for the
+    // canonical `for (int i = 0; i < n; i++)` loop. The recognizer in
+    // `loop_recog.rs` previously recorded but never validated the exit
+    // comparison and the `iinc` stride, and never checked the start
+    // value — so `i <= n`, `i != n`, `i += 2`, and `i = 5` loops were
+    // silently mis-lowered (wrong / missing elements). These tests pin
+    // the conservative rejection: every non-canonical shape must fail
+    // `lower_method` (→ CPU fallback), and the canonical baseline must
+    // still lower.
+
+    /// Helper: a `NonCanonicalLoops` method is analyzer-eligible but
+    /// must be rejected by `lower_method`. Returns the error message.
+    fn expect_loop_lowering_rejected(method_name: &str, descriptor: &str) -> String {
+        let method = load_method("NonCanonicalLoops", method_name, descriptor);
+        let sig = match analyze(&method) {
+            OffloadVerdict::Eligible(s) => s,
+            v => panic!(
+                "expected NonCanonicalLoops.{method_name} to be analyzer-eligible, got {v:?}"
+            ),
+        };
+        let err = lower_method("NonCanonicalLoops", &method, &sig, 7, 5)
+            .expect_err("non-canonical loop must not lower");
+        format!("{err}")
+    }
+
+    #[test]
+    fn le_loop_is_rejected_by_lowering() {
+        // `for (i = 0; i <= n; i++)` — javac emits `if_icmpgt` for the
+        // exit. The `tid < n` dispatch would drop the last element.
+        let msg = expect_loop_lowering_rejected("leLoop", "([II)V");
+        assert!(
+            msg.contains("non-canonical loop-exit comparison"),
+            "expected exit-comparison rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn ne_loop_is_rejected_by_lowering() {
+        // `for (i = 0; i != n; i++)` — javac emits `if_icmpeq` exit.
+        let msg = expect_loop_lowering_rejected("neLoop", "([II)V");
+        assert!(
+            msg.contains("non-canonical loop-exit comparison"),
+            "expected exit-comparison rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn stride2_loop_is_rejected_by_lowering() {
+        // `for (i = 0; i < n; i += 2)` — `iinc iv, 2`. The lowering
+        // would read element `tid` where the loop wants `2*tid`.
+        let msg = expect_loop_lowering_rejected("stride2Loop", "([I)V");
+        assert!(
+            msg.contains("non-unit loop stride"),
+            "expected stride rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn nonzero_start_loop_is_rejected_by_lowering() {
+        // `for (i = 5; i < n; i++)` — `iconst_5; istore iv`. Every
+        // access would be offset by 5.
+        let msg = expect_loop_lowering_rejected("start5Loop", "([I)V");
+        assert!(
+            msg.contains("non-zero loop start value"),
+            "expected start-value rejection, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn canonical_loop_still_lowers_correctly() {
+        // The canonical `for (i = 0; i < n; i++)` baseline must still
+        // be recognized and lowered to a real element-wise kernel.
+        let m = lower_fixture("NonCanonicalLoops", "canonical", "([I[I[I)V");
+        let text = m.render();
+        assert!(text.contains(".visible .entry NonCanonicalLoops__canonical_"));
+        // Canonical guard: `tid >= bound` early-out.
+        assert!(text.contains("setp.ge.s32"));
+        // Two int loads + one int store + one add — the body lowered.
+        assert!(text.matches("ld.global.s32").count() >= 2);
+        assert!(text.contains("st.global.s32"));
+        assert!(text.contains("add.s32"));
+    }
+
+    #[test]
+    fn canonical_loop_recognizer_records_unit_stride() {
+        // White-box: the recognizer accepts the canonical loop and
+        // records exit op `if_icmpge` (0xA2) and stride +1.
+        let method = load_method("NonCanonicalLoops", "canonical", "([I[I[I)V");
+        let code = method.code().expect("canonical has a Code attribute");
+        let shape = super::loop_recog::detect_loop(&code.code)
+            .expect("canonical loop must be recognized");
+        match shape {
+            super::loop_recog::LoopShape::Counted(li) => {
+                assert_eq!(li.exit_op, 0xA2, "canonical exit op must be if_icmpge");
+                assert_eq!(li.iv_stride, 1, "canonical stride must be +1");
+            }
+            other => panic!("expected Counted loop, got {other:?}"),
+        }
     }
 
     #[test]

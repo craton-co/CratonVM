@@ -331,7 +331,30 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit `if (tid >= bound) ret;` using a fresh predicate register.
-    pub fn emit_loop_guard(&mut self, bound: &Reg) {
+    ///
+    /// This `tid >= bound` dispatch (one thread runs iff `0 <= tid <
+    /// bound`) is the GPU analogue of the canonical Java loop
+    /// `for (int i = 0; i < bound; i++)`. It is *only* correct for that
+    /// exact shape: start value 0, stride +1, strict-`<` exit. The loop
+    /// recognizer ([`crate::lowering::loop_recog::detect_loop`]) has
+    /// already rejected every other shape — `<=`/`!=`/`>`/`>=` exits,
+    /// non-unit strides, non-zero starts — before emission reaches
+    /// here. The `debug_assert!`s below pin that contract: if a future
+    /// change to the recognizer ever lets a non-canonical loop through,
+    /// a debug build trips here instead of silently corrupting data.
+    pub fn emit_loop_guard(&mut self, bound: &Reg, loop_info: &CountedLoop) {
+        debug_assert_eq!(
+            loop_info.exit_op, 0xA2,
+            "emit_loop_guard: counted loop reached emission with a \
+             non-`if_icmpge` exit (0x{:02x}) — loop_recog must reject it",
+            loop_info.exit_op
+        );
+        debug_assert_eq!(
+            loop_info.iv_stride, 1,
+            "emit_loop_guard: counted loop reached emission with stride {} \
+             — loop_recog must reject any non-unit stride",
+            loop_info.iv_stride
+        );
         let tid = self.tid_reg.clone().expect("emit_tid was called");
         let p = self.regs.fresh_reg(RegKind::Pred);
         writeln!(
@@ -546,21 +569,31 @@ impl<'a> Emitter<'a> {
             0x3A => self.astore(self.bytes[pc + 1] as u16)?,
             0x4B..=0x4E => self.astore((op - 0x4B) as u16)?,
             // ── array load ──────────────────────────────────────────
-            0x2E => self.array_load(RegKind::S32, ".s32", 4)?, // iaload
-            0x2F => self.array_load(RegKind::S64, ".s64", 8)?, // laload
-            0x30 => self.array_load(RegKind::F32, ".f32", 4)?, // faload
-            0x31 => self.array_load(RegKind::F64, ".f64", 8)?, // daload
+            0x2E => self.array_load(RegKind::S32, ".s32", 4, ParamKind::I32Array, "iaload")?, // iaload
+            0x2F => self.array_load(RegKind::S64, ".s64", 8, ParamKind::I64Array, "laload")?, // laload
+            0x30 => self.array_load(RegKind::F32, ".f32", 4, ParamKind::F32Array, "faload")?, // faload
+            0x31 => self.array_load(RegKind::F64, ".f64", 8, ParamKind::F64Array, "daload")?, // daload
             0x33 => self.array_load_byte()?,                    // baload
             0x34 => self.array_load_char()?,                    // caload
             0x35 => self.array_load_short()?,                   // saload
             // ── array store ─────────────────────────────────────────
-            0x4F => self.array_store(RegKind::S32, ".s32", 4)?, // iastore
-            0x50 => self.array_store(RegKind::S64, ".s64", 8)?, // lastore
-            0x51 => self.array_store(RegKind::F32, ".f32", 4)?, // fastore
-            0x52 => self.array_store(RegKind::F64, ".f64", 8)?, // dastore
+            0x4F => self.array_store(RegKind::S32, ".s32", 4, ParamKind::I32Array, "iastore")?, // iastore
+            0x50 => self.array_store(RegKind::S64, ".s64", 8, ParamKind::I64Array, "lastore")?, // lastore
+            0x51 => self.array_store(RegKind::F32, ".f32", 4, ParamKind::F32Array, "fastore")?, // fastore
+            0x52 => self.array_store(RegKind::F64, ".f64", 8, ParamKind::F64Array, "dastore")?, // dastore
             0x54 => self.array_store_byte()?,                    // bastore
-            0x55 => self.array_store_char_or_short(2)?,          // castore
-            0x56 => self.array_store_char_or_short(2)?,          // sastore
+            0x55 => {
+                // castore — char[] element store. No `char[]` ParamKind
+                // exists (char arrays are not an offloadable parameter
+                // type), so reject rather than reinterpret a buffer of a
+                // different element type.
+                return Err(LoweringError::UnsupportedNode(
+                    "castore (char[] element access; char arrays are not \
+                     a supported kernel parameter type)"
+                        .into(),
+                ));
+            }
+            0x56 => self.array_store_short(2)?,                  // sastore
             // ── stack ops ───────────────────────────────────────────
             0x57 => {
                 self.stack.pop()?;
@@ -1287,6 +1320,10 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    // AUDIT 2026-05-19: `cmp_long_or_float` was removed — it always
+    // returned `Err`, so every `*cmp*` opcode now rejects explicitly at
+    // the `emit_op` dispatch site instead of routing through dead code.
+
     // ─────────────────── array ops ──────────────────────────────────
 
     /// Find the array param backing the top-of-stack array reference.
@@ -1309,6 +1346,17 @@ impl<'a> Emitter<'a> {
         // unchanged (we just clone the local's Reg), so the runtime
         // register name on the simulated stack equals that initial
         // binding.
+        //
+        // AUDIT 2026-05-20: this association is *name-based* and is
+        // therefore fragile under aliasing — an `astore`/`aload` of the
+        // reference into another local, or a `dup`/`swap`, can leave a
+        // simulated-stack `Reg` whose `name` no longer equals the
+        // binding even though it refers to the same array, or (worse)
+        // equals a *different* binding. We keep name-matching here
+        // because carrying a tagged `ParamKind` on every `Reg` is more
+        // invasive than this audit's budget allows; the element-kind
+        // check in `array_param_checked` below mitigates the most
+        // dangerous failure mode (type-confused loads/stores).
         for (i, k) in self.sig.param_kinds.iter().enumerate() {
             if !k.is_array() {
                 continue;
@@ -1334,15 +1382,43 @@ impl<'a> Emitter<'a> {
         ))
     }
 
+    /// Like [`array_param_of`], but also verifies that the array-access
+    /// opcode's element type matches the parameter's declared
+    /// `ParamKind`. A mismatch (e.g. `iaload` on a `float[]` param)
+    /// would emit a load/store of the wrong width or signedness against
+    /// a buffer of a different element type — silent bit-reinterpreted
+    /// data corruption. Reject such methods so they fall back to the
+    /// safe CPU interpreter.
+    fn array_param_checked(
+        &self,
+        array_reg: &Reg,
+        expected: ParamKind,
+        opcode_name: &str,
+    ) -> Result<ArrayKey, LoweringError> {
+        let (array_key, actual) = self.array_param_of(array_reg)?;
+        if actual != expected {
+            return Err(LoweringError::UnsupportedNode(format!(
+                "{opcode_name} on array {} whose declared \
+                 element type is {actual:?} (expected {expected:?}); \
+                 array-access opcode does not match the array's element \
+                 type — rejecting to avoid type-confused memory access",
+                array_key.len_param_name()
+            )));
+        }
+        Ok(array_key)
+    }
+
     fn array_load(
         &mut self,
         elem_kind: RegKind,
         suffix: &str,
         elem_size: usize,
+        expected: ParamKind,
+        opcode_name: &str,
     ) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let array_key = self.array_param_checked(&array_ref, expected, opcode_name)?;
         let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1380,7 +1456,8 @@ impl<'a> Emitter<'a> {
     fn array_load_byte(&mut self) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let array_key =
+            self.array_param_checked(&array_ref, ParamKind::I8Array, "baload")?;
         let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1417,17 +1494,31 @@ impl<'a> Emitter<'a> {
     }
 
     fn array_load_char(&mut self) -> Result<(), LoweringError> {
-        self.array_load_16(true)
+        // `caload` operates on `char[]`. There is no `char[]` variant of
+        // `ParamKind` (char arrays are not an offloadable parameter
+        // type), so a `caload` can never match a supported array
+        // parameter — reject unconditionally rather than silently
+        // reinterpreting some other 16-bit-or-wider buffer.
+        Err(LoweringError::UnsupportedNode(
+            "caload (char[] element access; char arrays are not a \
+             supported kernel parameter type)"
+                .into(),
+        ))
     }
 
     fn array_load_short(&mut self) -> Result<(), LoweringError> {
-        self.array_load_16(false)
+        self.array_load_16(false, ParamKind::I16Array, "saload")
     }
 
-    fn array_load_16(&mut self, is_char: bool) -> Result<(), LoweringError> {
+    fn array_load_16(
+        &mut self,
+        is_char: bool,
+        expected: ParamKind,
+        opcode_name: &str,
+    ) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let array_key = self.array_param_checked(&array_ref, expected, opcode_name)?;
         let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1471,11 +1562,13 @@ impl<'a> Emitter<'a> {
         _elem_kind: RegKind,
         suffix: &str,
         elem_size: usize,
+        expected: ParamKind,
+        opcode_name: &str,
     ) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let array_key = self.array_param_checked(&array_ref, expected, opcode_name)?;
         let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1512,7 +1605,8 @@ impl<'a> Emitter<'a> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let array_key =
+            self.array_param_checked(&array_ref, ParamKind::I8Array, "bastore")?;
         let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1539,11 +1633,12 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn array_store_char_or_short(&mut self, elem_size: usize) -> Result<(), LoweringError> {
+    fn array_store_short(&mut self, elem_size: usize) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
+        let array_key =
+            self.array_param_checked(&array_ref, ParamKind::I16Array, "sastore")?;
         let len_param = array_key.len_param_name();
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);

@@ -24,6 +24,32 @@
 //!
 //! Anything that doesn't match is rejected with a precise
 //! [`crate::emitter::LoweringError::UnsupportedNode`] reason.
+//!
+//! # Canonical-shape validation (correctness)
+//!
+//! The element-wise GPU lowering model is "one CUDA thread per loop
+//! iteration, the thread index `tid` *is* the loop variable". That
+//! identity only holds for the strictly canonical loop:
+//!
+//! ```text
+//!   for (int i = 0; i < bound; i++) { body; }
+//! ```
+//!
+//! — start value `0`, stride `+1`, strict-less-than (`<`) exit. For
+//! any other shape the emitter would silently mis-lower:
+//!
+//! * `i <= bound` (`if_icmpgt` exit) runs `bound + 1` iterations; the
+//!   `tid < bound` dispatch drops the last element.
+//! * `i != bound` (`if_icmpeq` exit) is not equivalent to `tid < bound`.
+//! * a non-`+1` `iinc` stride means element `stride*tid` is read as
+//!   element `tid`.
+//! * a non-zero start (`for (i = 5; ...)`) offsets every array access.
+//!
+//! [`classify_counted_loop`] therefore validates all three properties
+//! and rejects (via [`crate::emitter::LoweringError::UnsupportedNode`],
+//! which makes the VM fall back to the CPU interpreter — always safe)
+//! anything that is not exactly the canonical shape. Correctness over
+//! coverage: when in doubt we reject rather than mis-lower.
 
 use crate::emitter::LoweringError;
 
@@ -53,9 +79,24 @@ pub(crate) struct CountedLoop {
     pub exit_pc: usize,
     /// Local-variable slot that holds the induction variable.
     pub iv_slot: u16,
-    /// Loop-exit comparison opcode (`if_icmpge` / `if_icmplt` / ...).
+    /// Loop-exit comparison opcode. Always `if_icmpge` (0xA2) for an
+    /// accepted loop — `classify_counted_loop` rejects anything else,
+    /// because only `if_icmpge` is the negation of the canonical
+    /// `i < bound` continuation test. Kept so the emitter can assert
+    /// the invariant and so future non-canonical lowering has the
+    /// information it needs.
     pub exit_op: u8,
+    /// Induction-variable `iinc` stride. Always `+1` for an accepted
+    /// loop — `classify_counted_loop` rejects any other value. Kept
+    /// for the same reason as `exit_op`.
+    pub iv_stride: i32,
 }
+
+/// `if_icmpge` — the only loop-exit comparison the canonical
+/// element-wise lowering accepts. It is the negation of the
+/// canonical `i < bound` loop-continuation test that `javac`
+/// emits for `for (int i = 0; i < bound; i++)`.
+const IF_ICMPGE: u8 = 0xA2;
 
 /// Scan a method's bytecode and classify its loop shape.
 pub(crate) fn detect_loop(bytes: &[u8]) -> Result<LoopShape, LoweringError> {
@@ -141,13 +182,19 @@ fn classify_counted_loop(
         )));
     }
 
-    // Walk from header_pc forward. The exit comparison is the first
-    // `if_icmp*` between header_pc and back_branch_pc whose target is
-    // the post-loop region (i.e., > back_branch_pc).
+    // Walk from header_pc forward. We need three things:
+    //  * the loop-exit `if_icmp*` (first compare branching past the
+    //    back-branch),
+    //  * the local slot of the `iload` that produced the comparison's
+    //    LHS operand (that local is the induction variable), and
+    //  * the induction variable's `iinc` (to read its stride).
     let mut exit_if_pc = None;
     let mut exit_pc = None;
-    let mut iv_slot = None;
-    let mut found_iinc = false;
+    // Local slots of the `iload`s seen during the header walk, in
+    // order. When we reach the exit-if, javac has emitted exactly
+    // `iload iv; iload bound; if_icmp*`, so the second-to-last `iload`
+    // is the induction variable and the last is the bound.
+    let mut iload_history: Vec<u16> = Vec::new();
     let mut pc = header_pc;
     while pc <= back_branch_pc {
         if pc >= bytes.len() {
@@ -156,8 +203,17 @@ fn classify_counted_loop(
         let op = bytes[pc];
         let size = instr_size(bytes, pc)?;
 
-        // Loop-exit comparisons we accept: if_icmplt/ge/gt/le (0x9F-0xA4)
-        // and the unary if* (0x99-0x9E).
+        // Track `iload` instructions (narrow + wide) until the exit-if,
+        // so we can recover the induction-variable slot from the
+        // exit-if's LHS operand.
+        if exit_if_pc.is_none() {
+            if let Some(slot) = iload_slot(bytes, pc, op) {
+                iload_history.push(slot);
+            }
+        }
+
+        // Loop-exit comparisons: if_icmp* (0x9F-0xA4) and unary if*
+        // (0x99-0x9E) whose target is the post-loop region.
         if (0x99..=0xA4).contains(&op) {
             let off = i16::from_be_bytes([
                 *bytes.get(pc + 1).ok_or_else(truncated)?,
@@ -170,17 +226,6 @@ fn classify_counted_loop(
             }
         }
 
-        // Find the iinc to identify the induction variable slot.
-        if op == 0x84 && !found_iinc {
-            // iinc index, const  (3 bytes)
-            iv_slot = Some(bytes[pc + 1] as u16);
-            found_iinc = true;
-        } else if op == 0xC4 && bytes.get(pc + 1) == Some(&0x84) && !found_iinc {
-            // wide iinc index, const  (6 bytes)
-            iv_slot = Some(u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]));
-            found_iinc = true;
-        }
-
         pc += size;
     }
 
@@ -190,13 +235,62 @@ fn classify_counted_loop(
         )
     })?;
     let exit_pc = exit_pc.unwrap();
-    let iv_slot = iv_slot.ok_or_else(|| {
-        LoweringError::UnsupportedNode(
-            "no iinc found in loop body — induction variable unidentified".into(),
-        )
-    })?;
-
     let exit_op = bytes[exit_if_pc];
+
+    // ── Bug A: validate the exit comparison is the canonical `i < bound`
+    // shape. javac compiles `for (i = 0; i < bound; i++)` with the
+    // *negated* test `if_icmpge bound -> exit`. `<=` becomes `if_icmpgt`,
+    // `!=` becomes `if_icmpeq`, `>` becomes `if_icmple`, etc. The
+    // emitter's `tid < bound` dispatch is only correct for `if_icmpge`;
+    // reject every other comparison so the loop runs on the CPU
+    // interpreter instead of being silently mis-lowered.
+    if exit_op != IF_ICMPGE {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "non-canonical loop-exit comparison 0x{exit_op:02x} at pc={exit_if_pc} \
+             — only `if_icmpge` (the negation of the canonical `i < bound` test) \
+             is lowered; `<=`/`!=`/`>`/`>=` loops run on the CPU"
+        )));
+    }
+
+    // The induction variable is the LHS of the exit comparison. javac
+    // emits exactly two operand-producing `iload`s in the header
+    // (`iload iv; iload bound`), so the second-to-last `iload` is `iv`.
+    if iload_history.len() < 2 {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "loop header at pc={header_pc} does not have the canonical \
+             `iload iv; iload bound; if_icmp*` operand shape"
+        )));
+    }
+    let iv_slot = iload_history[iload_history.len() - 2];
+
+    // Find the induction variable's `iinc` in the loop body and read
+    // its stride.
+    let iv_stride = find_iv_stride(bytes, header_pc, back_branch_pc, iv_slot)?
+        .ok_or_else(|| {
+            LoweringError::UnsupportedNode(format!(
+                "no `iinc` for induction-variable slot {iv_slot} found in the \
+                 loop body — induction variable is not a simple counter"
+            ))
+        })?;
+
+    // ── Bug B (stride): the element-wise lowering rewrites `iload iv`
+    // to the raw thread index `tid` and *skips* the iv `iinc`. That is
+    // only correct when the stride is exactly +1; a stride of `k` would
+    // make the kernel read element `tid` where the loop wanted element
+    // `k*tid`. Reject any non-unit (including negative) stride.
+    if iv_stride != 1 {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "non-unit loop stride {iv_stride} (iinc on slot {iv_slot}) — only \
+             `i++` (stride +1) is lowered; strided loops run on the CPU"
+        )));
+    }
+
+    // ── Bug B (start value): the lowering treats `tid` as the loop
+    // variable, which assumes the loop starts at 0. Verify the pre-loop
+    // sets the iv slot to 0 via `iconst_0; istore iv`. Reject otherwise
+    // (`for (i = 5; ...)` would offset every array access by 5).
+    verify_zero_start(bytes, header_pc, iv_slot)?;
+
     let body_start_pc = exit_if_pc + instr_size(bytes, exit_if_pc)?;
 
     Ok(LoopShape::Counted(CountedLoop {
@@ -207,7 +301,158 @@ fn classify_counted_loop(
         exit_pc,
         iv_slot,
         exit_op,
+        iv_stride,
     }))
+}
+
+/// If the instruction at `pc` is an `iload` (narrow `iload`, the
+/// `iload_0..3` short forms, or a `wide iload`), return the local slot
+/// it reads. Otherwise return `None`.
+fn iload_slot(bytes: &[u8], pc: usize, op: u8) -> Option<u16> {
+    match op {
+        0x15 => bytes.get(pc + 1).map(|&b| b as u16), // iload
+        0x1A..=0x1D => Some((op - 0x1A) as u16),      // iload_0..iload_3
+        0xC4 if bytes.get(pc + 1) == Some(&0x15) => {
+            // wide iload
+            Some(u16::from_be_bytes([
+                *bytes.get(pc + 2)?,
+                *bytes.get(pc + 3)?,
+            ]))
+        }
+        _ => None,
+    }
+}
+
+/// Scan the loop body for an `iinc` (narrow or wide) targeting
+/// `iv_slot` and return its constant delta. `None` means no such
+/// `iinc` exists. Errors only on malformed bytecode.
+fn find_iv_stride(
+    bytes: &[u8],
+    header_pc: usize,
+    back_branch_pc: usize,
+    iv_slot: u16,
+) -> Result<Option<i32>, LoweringError> {
+    let mut pc = header_pc;
+    while pc <= back_branch_pc {
+        if pc >= bytes.len() {
+            break;
+        }
+        let op = bytes[pc];
+        let size = instr_size(bytes, pc)?;
+        if op == 0x84 {
+            // iinc index, const  (3 bytes)
+            let slot = *bytes.get(pc + 1).ok_or_else(truncated)? as u16;
+            if slot == iv_slot {
+                let delta = *bytes.get(pc + 2).ok_or_else(truncated)? as i8 as i32;
+                return Ok(Some(delta));
+            }
+        } else if op == 0xC4 && bytes.get(pc + 1) == Some(&0x84) {
+            // wide iinc index, const  (6 bytes)
+            let slot = u16::from_be_bytes([
+                *bytes.get(pc + 2).ok_or_else(truncated)?,
+                *bytes.get(pc + 3).ok_or_else(truncated)?,
+            ]);
+            if slot == iv_slot {
+                let delta = i16::from_be_bytes([
+                    *bytes.get(pc + 4).ok_or_else(truncated)?,
+                    *bytes.get(pc + 5).ok_or_else(truncated)?,
+                ]) as i32;
+                return Ok(Some(delta));
+            }
+        }
+        pc += size;
+    }
+    Ok(None)
+}
+
+/// Verify the pre-loop region (`0..header_pc`) initialises `iv_slot`
+/// to the constant 0 via `iconst_0; istore iv` (the only loop start
+/// the element-wise lowering can model). The store to `iv` immediately
+/// preceding the header must be fed by `iconst_0`.
+///
+/// Errors (rejects the loop) if the start value is missing, is not a
+/// literal `0`, or comes from anything other than a constant push.
+fn verify_zero_start(
+    bytes: &[u8],
+    header_pc: usize,
+    iv_slot: u16,
+) -> Result<(), LoweringError> {
+    // Walk the pre-loop, remembering the most recent constant pushed
+    // and the most recent `istore` to `iv_slot`. The canonical prelude
+    // ends `... iconst_0; istore iv` right before the header.
+    let mut pc = 0usize;
+    // Integer constant pushed by the immediately-preceding instruction
+    // (`Some(value)`), or `None` if the previous instruction was not a
+    // recognised constant push.
+    let mut last_const: Option<i32> = None;
+    // The constant feeding the most recent `istore iv`, if any.
+    let mut iv_start: Option<i32> = None;
+    let mut saw_iv_store = false;
+    while pc < header_pc {
+        if pc >= bytes.len() {
+            break;
+        }
+        let op = bytes[pc];
+        let size = instr_size(bytes, pc)?;
+        if pc + size > bytes.len() {
+            return Err(truncated());
+        }
+        // Constant pushes the canonical prelude can use for the start.
+        let pushed = match op {
+            0x02..=0x08 => Some(op as i32 - 0x03), // iconst_m1..iconst_5
+            0x10 => Some(*bytes.get(pc + 1).ok_or_else(truncated)? as i8 as i32), // bipush
+            0x11 => Some(i16::from_be_bytes([
+                *bytes.get(pc + 1).ok_or_else(truncated)?,
+                *bytes.get(pc + 2).ok_or_else(truncated)?,
+            ]) as i32), // sipush
+            _ => None,
+        };
+        // Identify an `istore` and the slot it writes.
+        let store_slot: Option<u16> = match op {
+            0x36 => bytes.get(pc + 1).map(|&b| b as u16), // istore
+            0x3B..=0x3E => Some((op - 0x3B) as u16),      // istore_0..3
+            0xC4 if bytes.get(pc + 1) == Some(&0x36) => Some(u16::from_be_bytes([
+                *bytes.get(pc + 2).ok_or_else(truncated)?,
+                *bytes.get(pc + 3).ok_or_else(truncated)?,
+            ])), // wide istore
+            _ => None,
+        };
+        if let Some(slot) = store_slot {
+            if slot == iv_slot {
+                // The value stored into `iv` is whatever constant was
+                // pushed immediately before. If the previous op was not
+                // a constant push, `last_const` is `None` → not provably
+                // zero → rejected below.
+                iv_start = last_const;
+                saw_iv_store = true;
+            }
+            last_const = None;
+        } else {
+            // After any non-store instruction, only a constant-push
+            // leaves a known value as the new stack top.
+            last_const = pushed;
+        }
+        pc += size;
+    }
+
+    if !saw_iv_store {
+        return Err(LoweringError::UnsupportedNode(format!(
+            "induction-variable slot {iv_slot} is never initialised by a \
+             constant `istore` in the loop prelude — start value unknown"
+        )));
+    }
+    match iv_start {
+        Some(0) => Ok(()),
+        Some(v) => Err(LoweringError::UnsupportedNode(format!(
+            "non-zero loop start value {v} for induction-variable slot \
+             {iv_slot} — only `for (i = 0; ...)` is lowered; non-zero-start \
+             loops run on the CPU"
+        ))),
+        None => Err(LoweringError::UnsupportedNode(format!(
+            "loop start value for induction-variable slot {iv_slot} is not a \
+             compile-time constant — cannot prove it is 0; loop runs on the CPU"
+        ))),
+    }
 }
 
 /// JVM instruction size, used here for the loop scanner. Mirrors the

@@ -1528,10 +1528,60 @@ fn handle_jit_dispatch_error(
     err: crate::error::MethodCallFailed,
     info: &JitInvokeInfo,
 ) {
-    use crate::error::MethodCallFailed;
+    use crate::error::{MethodCallFailed, RuntimeError, VmError};
     match err {
         MethodCallFailed::ExceptionThrown(exc) => {
             set_jit_pending_exception(exc);
+        }
+        // A native callee that returns `Err(RuntimeError::X)` is, by the
+        // exception model, asking the VM to throw the Java exception that
+        // `X` maps to (e.g. `NoSuchMethodException`, `NullPointerException`,
+        // `ClassCastException`). The `From<RuntimeError>` conversion wraps
+        // these as `InternalError(VmError::Runtime(..))`, which is *not*
+        // an internal VM bug — it is a catchable Java throwable.
+        //
+        // The interpreter's per-instruction post-processing already does
+        // this conversion (`interpreter.rs`: "Convert RuntimeErrors from
+        // native methods into catchable Java exceptions"), but the JIT
+        // dispatch path previously skipped it and wrapped the runtime
+        // error in a *fatal* `java/lang/InternalError`. That turned an
+        // ordinary catchable exception into an uncatchable abort — e.g.
+        // Netty's `Class.getDeclaredConstructor(...)` probe for the
+        // legacy `DirectByteBuffer(long,int)` constructor (absent on
+        // JDK 25) threw `NoSuchMethodException`, which Netty catches and
+        // falls back from; under the JIT it surfaced as a fatal
+        // `InternalError: ... NoSuchMethodException: <init>`.
+        //
+        // Mirror the interpreter: route `VmError::Runtime` through
+        // `throw_runtime_error` so the proper Java exception object is
+        // built and caught by the caller's exception table. Exclude
+        // `NotImplemented` / `StackOverflowError` for parity with the
+        // interpreter's exclusion list (those stay as hard errors).
+        MethodCallFailed::InternalError(VmError::Runtime(rt_err))
+            if !matches!(
+                rt_err,
+                RuntimeError::NotImplemented { .. } | RuntimeError::StackOverflowError
+            ) =>
+        {
+            match crate::runtime::exceptions::throw_runtime_error(vm, thread, rt_err) {
+                MethodCallFailed::ExceptionThrown(exc) => {
+                    set_jit_pending_exception(exc);
+                }
+                MethodCallFailed::InternalError(vm_err2) => {
+                    // Exception-object construction failed — fall back to
+                    // the legacy `InternalError` wrap so the failure is
+                    // still visible rather than silently dropped.
+                    let msg = format!(
+                        "JIT dispatch into {}.{}{} failed: {}",
+                        info.class_name, info.method_name, info.descriptor, vm_err2,
+                    );
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        vm, thread, "java/lang/InternalError", Some(&msg),
+                    ) {
+                        set_jit_pending_exception(exc);
+                    }
+                }
+            }
         }
         MethodCallFailed::InternalError(vm_err) => {
             // Format a message that points at the failing dispatch site so

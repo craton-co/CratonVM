@@ -1279,6 +1279,19 @@ const NODE_NUM_FIELDS: usize = 4;
 
 /// Extract HashMap state: (buckets, size, capacity).
 fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32, i32) {
+    // See through CratonVM's unmodifiable wrapper views. When a generic
+    // `java/util/Map` interface native (registered to `native_map_*`) is
+    // dispatched on a `rustjvm/internal/UnmodifiableMap` receiver — which
+    // happens when the wrapper class does not itself register the invoked
+    // method — slot 0 of the wrapper is the *backing map* ObjectRef, not a
+    // bucket array. Without this unwrap, `map_state` reads a non-array
+    // Object at slot 0, fires `[MAP-STATE-GUARD]`, and (in `native_map_put`)
+    // `map_resize` would clobber the wrapper's backing pointer; the warning
+    // floods because Keycloak 26's config code repeatedly calls `get` /
+    // `containsKey` / `size` on `Map.of(...)` / `Collections.unmodifiableMap`
+    // results. Reading map state from the backing is always correct because
+    // every wrapper mutator throws — these are read-only callers.
+    let this = unwrap_unmod(ctx, this);
     let buckets_slot0 = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => {
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
@@ -1289,9 +1302,16 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
                 // properly. Gate the probe behind the cached HM-trace flag
                 // so the common path does no stderr I/O.
                 if dbg_hm_trace() {
+                    let map_cls = ctx
+                        .class_name_of_id(ctx.class_id_of_object(this))
+                        .unwrap_or_default();
+                    let slot0_cls = ctx
+                        .class_name_of_id(ctx.class_id_of_object(arr))
+                        .unwrap_or_default();
                     eprintln!(
-                        "[MAP-STATE-GUARD] non-array buckets slot0: map={:?} slot0={:?}",
-                        this, arr
+                        "[MAP-STATE-GUARD] non-array buckets slot0: map={:?}({}) slot0={:?}({}) \
+                         — receiver was not a bucket-backed HashMap; treating buckets as absent",
+                        this, map_cls, arr, slot0_cls
                     );
                 }
                 None
@@ -2288,11 +2308,29 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
+/// True when `obj` is one of CratonVM's unmodifiable wrapper views.
+fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(obj);
+    matches!(
+        ctx.class_name_of_id(cid).as_deref(),
+        Some(UNMOD_MAP_CLASS)
+            | Some(UNMOD_LIST_CLASS)
+            | Some(UNMOD_SET_CLASS)
+            | Some(UNMOD_COLLECTION_CLASS)
+    )
+}
+
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // If a generic `java/util/Map.put` interface native is dispatched on an
+    // unmodifiable wrapper receiver, honour the JDK contract and throw rather
+    // than mutating (or, worse, `map_resize`-clobbering) the private backing.
+    if is_unmod_wrapper(ctx, this) {
+        return Err(unsupported_op());
+    }
     // S111r34: when the receiver is a LinkedHashMap (or subclass like
     // `org/springframework/core/annotation/AnnotationAttributes`),
     // delegate to `native_lhm_put` so that subsequent `LinkedHashMap.get`
@@ -2504,6 +2542,9 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_unmod_wrapper(ctx, this) {
+        return Err(unsupported_op());
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -2666,6 +2707,9 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if is_unmod_wrapper(ctx, this) {
+        return Err(unsupported_op());
+    }
     let (buckets, _, cap) = map_state(ctx, this);
     if let Some(b) = buckets {
         for i in 0..(cap as usize) {
@@ -5690,6 +5734,66 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
 
     // toList (Java 16+ convenience)
     r.register(c, "toList", "()Ljava/util/List;", native_stream_to_list);
+
+    // spliterator() — declared abstract on `java.util.stream.BaseStream` and
+    // inherited by Stream/IntStream/LongStream/DoubleStream. Real-JDK bytecode
+    // (e.g. Netty's iterator-from-stream paths) calls `stream.spliterator()`;
+    // with no Java-side pipeline our synthetic Stream has nothing to dispatch
+    // to, surfacing as `NoSuchMethodError Stream.spliterator()`. Register a
+    // native on every Stream sub-interface (plus BaseStream) that materialises
+    // the stream's backing Object[] into a synthetic 3-field Spliterator
+    // (field 0 = array, field 1 = pos, field 2 = fence) — the exact layout the
+    // existing Spliterator natives (estimateSize/tryAdvance/forEachRemaining/
+    // characteristics) already understand.
+    for sc in &[
+        "java/util/stream/Stream",
+        "java/util/stream/BaseStream",
+        "java/util/stream/IntStream",
+        "java/util/stream/LongStream",
+        "java/util/stream/DoubleStream",
+        "java/util/stream/ReferencePipeline",
+    ] {
+        r.register(
+            sc,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_stream_spliterator,
+        );
+    }
+}
+
+/// `Stream.spliterator()` / `BaseStream.spliterator()` — build a synthetic
+/// Spliterator over the stream's backing elements.
+///
+/// The returned object is our standard 3-field synthetic Spliterator
+/// (field 0 = backing Object[], field 1 = cursor/pos, field 2 = fence),
+/// which `native_spliterator_{estimate_size,characteristics,try_advance,
+/// for_each_remaining}` all consume directly. Works for both synthetic
+/// Streams (field-0 array read) and real-JDK ReferencePipeline instances
+/// (materialised via `toArray()` inside `stream_elements_mut`).
+fn native_stream_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            // Null receiver — return an empty spliterator.
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let elements = stream_elements_mut(ctx, this);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, v) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
+    Ok(Some(Value::Object(Some(spl))))
 }
 
 // -- Source methods --
@@ -9585,6 +9689,14 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     let c = "java/util/LinkedList";
     registry.register(c, "<init>", "()V", native_ll_init);
     registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ll_add);
+    // Positional insert/removal — required so the overlay LinkedList stays the
+    // single source of truth. Without these, real-JDK `add(int,E)` /
+    // `remove(int)` bytecode runs against the JDK field layout (`first`/`last`)
+    // that our synthetic `<init>` never populates, silently desyncing the list
+    // (e.g. Felix's resolver permutation queue: add(0,perm) writes one
+    // structure, isEmpty()/remove(0) read the overlay → permutation lost).
+    registry.register(c, "add", "(ILjava/lang/Object;)V", native_ll_add_at);
+    registry.register(c, "remove", "(I)Ljava/lang/Object;", native_ll_remove_at);
     registry.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ll_add_first);
     registry.register(c, "addLast", "(Ljava/lang/Object;)V", native_ll_add_last);
     registry.register(c, "get", "(I)Ljava/lang/Object;", native_ll_get);
@@ -9610,6 +9722,15 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
     registry.register(c, "offer", "(Ljava/lang/Object;)Z", native_ll_add);
     registry.register(c, "toArray", "()[Ljava/lang/Object;", native_ll_to_array);
+    // LinkedList.toArray(T[]) — typed overload. Without this the JDK's
+    // node-iterating bytecode runs against our overlay structure (where the
+    // JDK `first` field is always null) and returns an array full of nulls.
+    registry.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        native_ll_to_array_typed,
+    );
     registry.register(c, "toString", "()Ljava/lang/String;", native_ll_to_string);
     registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ll_iterator);
     // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
@@ -9933,6 +10054,109 @@ fn native_ll_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(None)
 }
 
+/// Insert `element` into a fresh node positioned immediately before `succ`.
+/// Mirrors real-JDK `LinkedList.linkBefore`. `succ` must be a live node of
+/// `this`. Updates `head`/`size` as needed; `tail` is unaffected because the
+/// new node is never the last.
+fn ll_link_before(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value, succ: ObjectRef) {
+    let node = ll_alloc_node(ctx, element);
+    let pred = ctx.get_field(succ, LL_NODE_PREV);
+    ctx.set_field(node, LL_NODE_PREV, pred);
+    ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(succ)));
+    ctx.set_field(succ, LL_NODE_PREV, Value::Object(Some(node)));
+    match pred {
+        Value::Object(Some(pred_node)) => {
+            ctx.set_field(pred_node, LL_NODE_NEXT, Value::Object(Some(node)));
+        }
+        _ => {
+            // succ was the head — node becomes the new head.
+            ll_set(this, "head", Value::Object(Some(node)));
+        }
+    }
+    let size = ll_size(ctx, this);
+    ll_set(this, "size", Value::Int(size + 1));
+}
+
+/// Unlink a live node, returning its element. Mirrors `LinkedList.unlink`.
+fn ll_unlink_node(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef) -> Value {
+    let element = ctx.get_field(node, LL_NODE_ELEM);
+    let prev = ctx.get_field(node, LL_NODE_PREV);
+    let next = ctx.get_field(node, LL_NODE_NEXT);
+    match prev {
+        Value::Object(Some(prev_node)) => {
+            ctx.set_field(prev_node, LL_NODE_NEXT, next);
+        }
+        _ => {
+            // node was the head.
+            ll_set(this, "head", next);
+        }
+    }
+    match next {
+        Value::Object(Some(next_node)) => {
+            ctx.set_field(next_node, LL_NODE_PREV, prev);
+        }
+        _ => {
+            // node was the tail.
+            ll_set(this, "tail", prev);
+        }
+    }
+    let size = ll_size(ctx, this);
+    ll_set(this, "size", Value::Int((size - 1).max(0)));
+    element
+}
+
+/// `LinkedList.add(int index, E element)` — positional insert.
+fn native_ll_add_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let element = args.get(2).copied().unwrap_or(Value::Object(None));
+    let size = ll_size(ctx, this);
+    if index < 0 || index > size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
+    }
+    if index == size {
+        ll_link_last(ctx, this, element);
+    } else {
+        match ll_node_at(ctx, this, index) {
+            Some(succ) => ll_link_before(ctx, this, element, succ),
+            None => ll_link_last(ctx, this, element),
+        }
+    }
+    Ok(None)
+}
+
+/// `LinkedList.remove(int index)` — positional removal, returns the element.
+fn native_ll_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let size = ll_size(ctx, this);
+    if index < 0 || index >= size {
+        return Err(rustjvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+            index,
+        }
+        .into());
+    }
+    match ll_node_at(ctx, this, index) {
+        Some(node) => Ok(Some(ll_unlink_node(ctx, this, node))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 /// Traverse to the node at the given index
 fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<ObjectRef> {
     let size = ll_size(ctx, this);
@@ -10204,6 +10428,58 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         };
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `LinkedList.toArray(T[])` — typed-array overload.
+///
+/// CratonVM's `LinkedList` is an overlay-backed structure (head/next nodes
+/// live in our own fields, NOT the JDK's `first`/`last`/`size`). The real
+/// JDK's `LinkedList.toArray(T[])` bytecode iterates the JDK `first` node,
+/// which is always null in our representation — so without this override the
+/// call returns a correctly-sized array full of `null`s. That bug surfaced as
+/// ActiveMQ's `--version` NPE: `console.Main.runTaskClass` does
+/// `list.toArray(new String[list.size()])` on a `LinkedList`, then
+/// `AbstractCommand.parseOptions` calls `.startsWith("-")` on the (null)
+/// first element.
+fn native_ll_to_array_typed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let template = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = ll_size(ctx, this) as usize;
+    // Reuse the supplied array when it is large enough; otherwise allocate.
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        _ => alloc_ref_array(ctx, size),
+    };
+    let mut cur_opt = match ll_get(this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let mut i = 0;
+    while let Some(cur) = cur_opt {
+        if i >= size {
+            break;
+        }
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        ctx.set_array_element(target, i, elem);
+        i += 1;
+        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+    }
+    // JDK contract: if the supplied array is longer than the list, the
+    // element immediately after the copied range is set to null.
+    let target_len = ctx.array_length(target);
+    if target_len > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    Ok(Some(Value::Object(Some(target))))
 }
 
 fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

@@ -47,29 +47,22 @@ impl DeviceModule {
 
         #[cfg(feature = "cuda")]
         {
-            // Bind the calling thread to the buffer's owning context
-            // before submission. `launch_on_raw_stream` itself doesn't
-            // bind — for the default-stream path the caller is
-            // `backend_cuda::launch_raw` which does the bind; here we
-            // do the same.
-            ctx.inner()
-                .device()
-                .bind_to_thread()
-                .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
-            // Reach into the private inner module handle via this
-            // crate-local module's privilege over the lib.rs items
-            // it descends from. `DeviceModule(backend::
-            // DeviceModuleInner)` exposes its sole field with default
-            // (module-private) visibility, but `launch.rs` is a child
+            // CUDA-MERGE-NOTE (2026-05-20): the bridge's `backend_cuda`
+            // backend was ported to cudarc 0.13, which does not expose a
+            // raw-`CUstream` launch helper (`launch_on_raw_stream`). The
+            // explicit-stream submission path was never completed against
+            // that API. Until a raw-stream launch helper lands, delegate
+            // to the context's standard compute-stream launch
+            // (`DeviceModuleInner::launch_raw`); the kernel still runs and
+            // is correctly ordered, it just shares the context's compute
+            // stream rather than `stream`'s. The `StreamOp::Launch` record
+            // below keeps the op log faithful for callers that inspect it.
+            //
+            // `DeviceModule(backend::DeviceModuleInner)` exposes its sole
+            // field with module-private visibility; `launch.rs` is a child
             // of the crate root and so sees it.
             let module: &crate::backend_cuda::DeviceModuleInner = &self.0;
-            crate::backend_cuda::launch_on_raw_stream(
-                module,
-                kernel,
-                cfg,
-                args,
-                stream.raw(),
-            )?;
+            module.launch_raw(ctx.inner(), kernel, cfg, args)?;
             stream.record_op(StreamOp::Launch {
                 kernel: kernel.to_string(),
                 grid: cfg.grid,

@@ -1749,6 +1749,25 @@ impl SharedVm {
         // our ReentrantLock native when nested inside deep I/O call chains.
         sys_props.insert("jdk.io.useMonitors".to_string(), "true".to_string());
 
+        // JEP 498 — `sun.misc.Unsafe` memory-access methods (getObject,
+        // putOrderedLong, …) call `Unsafe.beforeMemoryAccess()` on entry.
+        // Under the JDK 25 default (`warn`) the *first* call drops into
+        // `beforeMemoryAccessSlow()`, which runs a `StackWalker.walk()` and
+        // unconditionally dereferences `frames.get(1)` to name the caller.
+        // CratonVM's StackWalker can return fewer than two frames for some
+        // native/JIT-spliced call chains, so `List.get(1)` throws
+        // ArrayIndexOutOfBoundsException — surfacing in jctools'
+        // MpscUnboundedArrayQueue (Netty's per-NioEventLoop task queue) as
+        // "failed to create a child event loop". Setting the documented
+        // escape-hatch property to `allow` makes `beforeMemoryAccess()`
+        // return at its first check (`MEMORY_ACCESS_OPTION == ALLOW`),
+        // bypassing the warning machinery entirely — exactly what a real
+        // JVM does when run with `-Dsun.misc.unsafe.memory.access=allow`.
+        sys_props.insert(
+            "sun.misc.unsafe.memory.access".to_string(),
+            "allow".to_string(),
+        );
+
         // ---- Tier 2: platform-derived keys ----
         sys_props.insert("os.name".to_string(), canonical_os_name());
         sys_props.insert("os.arch".to_string(), canonical_os_arch());

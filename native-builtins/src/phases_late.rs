@@ -3569,6 +3569,9 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
 // Path = 1-field synthetic (field 0 = String path)
 // ---------------------------------------------------------------------------
 const P57_PATH_FIELD: usize = 0;
+/// Field index on a synthetic `java/nio/file/FileSystem` that, when set, holds
+/// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
+const P57_FS_JAR_FIELD: usize = 1;
 
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let path = "java/nio/file/Path";
@@ -3989,7 +3992,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/Path;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let p = p57_read_path(ctx, this);
+            let p_raw = p57_read_path(ctx, this);
+            let p = jarfs_decode(&p_raw)
+                .map(|(_, e)| e)
+                .unwrap_or_else(|| p_raw.clone());
             let name = std::path::Path::new(&p)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -4030,7 +4036,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, this);
-            let s = ctx.create_string(&p);
+            // jar-FS Path.toString() shows the in-jar entry (matches zipfs).
+            let display = jarfs_decode(&p)
+                .map(|(_, e)| if e.starts_with('/') { e } else { format!("/{e}") })
+                .unwrap_or(p);
+            let s = ctx.create_string(&display);
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -4091,9 +4101,36 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getPath",
         "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
         |ctx, args| {
-            let first_ref = obj_arg(args, 0)?;
-            let first = ctx.read_string(first_ref).unwrap_or_default();
-            let result = p57_alloc_path(ctx, &first);
+            // arg 0 = this FileSystem; arg 1 = first path element;
+            // arg 2 = remaining elements (String[]).
+            let this = obj_arg(args, 0)?;
+            let first_ref = obj_arg(args, 1)?;
+            let mut first = ctx.read_string(first_ref).unwrap_or_default();
+            // Append the varargs elements with the jar separator.
+            if let Ok(rest) = obj_arg(args, 2) {
+                let len = ctx.array_length(rest);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(rest, i) {
+                        let part = ctx.read_string(s).unwrap_or_default();
+                        if !part.is_empty() {
+                            if !first.is_empty() && !first.ends_with('/') {
+                                first.push('/');
+                            }
+                            first.push_str(&part);
+                        }
+                    }
+                }
+            }
+            // If this FileSystem was mounted from a JAR, produce a jar-FS path.
+            let jar = match ctx.get_field(this, P57_FS_JAR_FIELD) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let result = if jar.is_empty() {
+                p57_alloc_path(ctx, &first)
+            } else {
+                p57_alloc_path(ctx, &jarfs_encode(&jar, &first))
+            };
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -4208,8 +4245,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         fsp,
         "newFileSystem",
         "(Ljava/nio/file/Path;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
-        |ctx, _args| {
+        |ctx, args| {
+            // arg 0 = provider (this); arg 1 = Path to the JAR to mount.
+            // Mount the JAR's interior as a real jar-backed FileSystem so
+            // `getPath`/`resolve`/`Files.*` resolve to archive entries rather
+            // than non-existent host paths (smallrye ClassPathUtils relies on
+            // walking the mounted jar to find config sources).
+            let jar_path = obj_arg(args, 1)
+                .ok()
+                .map(|p| p57_read_path(ctx, p))
+                .unwrap_or_default();
             let fs = p57_alloc_default_filesystem(ctx);
+            if !jar_path.is_empty() {
+                let jp = ctx.create_string(&jar_path);
+                ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+            }
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -4492,7 +4542,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let is_dir = std::path::Path::new(&p).is_dir();
+            let is_dir = match jarfs_decode(&p) {
+                Some((jar, entry)) => matches!(jarfs_classify(&jar, &entry), JarFsKind::Dir),
+                None => std::path::Path::new(&p).is_dir(),
+            };
             Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
         },
     );
@@ -4504,7 +4557,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let is_file = std::path::Path::new(&p).is_file();
+            let is_file = match jarfs_decode(&p) {
+                Some((jar, entry)) => matches!(jarfs_classify(&jar, &entry), JarFsKind::File),
+                None => std::path::Path::new(&p).is_file(),
+            };
             Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
         },
     );
@@ -4528,7 +4584,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let readable = std::path::Path::new(&p).exists();
+            let readable = match jarfs_decode(&p) {
+                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+                None => std::path::Path::new(&p).exists(),
+            };
             Ok(Some(Value::Int(if readable { 1 } else { 0 })))
         },
     );
@@ -4548,7 +4607,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(files, "size", "(Ljava/nio/file/Path;)J", |ctx, args| {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        let size = match jarfs_decode(&p) {
+            Some((jar, entry)) => jarfs_read_entry(&jar, &entry).map(|b| b.len() as u64).unwrap_or(0),
+            None => std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+        };
         Ok(Some(Value::Long(size as i64)))
     });
 
@@ -4559,15 +4621,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read_to_string(&p) {
+            match p57_read_to_string(&p) {
                 Ok(content) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -4580,15 +4639,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
             // Ignore charset, always UTF-8
-            match std::fs::read_to_string(&p) {
+            match p57_read_to_string(&p) {
                 Ok(content) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -4610,7 +4666,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> rustjvm_types::error::MethodCallResult {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        match std::fs::read_to_string(&p) {
+        match p57_read_to_string(&p) {
             Ok(content) => {
                 let lines: Vec<&str> = content.lines().collect();
                 // Resolve real-JDK ArrayList layout: elementData / size slots
@@ -4635,10 +4691,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx.set_field(list, size_slot, Value::Int(lines.len() as i32));
                 Ok(Some(Value::Object(Some(list))))
             }
-            Err(e) => Err(RuntimeError::IllegalStateException {
-                message: format!("IOException: {}", e),
-            }
-            .into()),
+            Err(e) => Err(p57_io_error(&e)),
         }
     }
     r.register(
@@ -4661,7 +4714,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read_to_string(&p) {
+            match p57_read_to_string(&p) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     use rustjvm_types::ArrayElementType;
@@ -4674,10 +4727,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field(stream, 0, Value::Object(Some(arr)));
                     Ok(Some(Value::Object(Some(stream))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }
-                .into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -4901,7 +4951,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
             // Read the file into a byte array and wrap in a SeekableByteChannel stub
-            match std::fs::read(&p) {
+            let read = match jarfs_decode(&p) {
+                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+                None => std::fs::read(&p),
+            };
+            match read {
                 Ok(data) => {
                     let channel = alloc_concurrent_synthetic(ctx, "java/nio/channels/SeekableByteChannel", 3);
                     use rustjvm_types::ArrayElementType;
@@ -4914,9 +4968,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field(channel, 2, Value::Int(data.len() as i32)); // size
                     Ok(Some(Value::Object(Some(channel))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }.into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -4928,7 +4980,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read(&p) {
+            let read = match jarfs_decode(&p) {
+                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+                None => std::fs::read(&p),
+            };
+            match read {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
                     use rustjvm_types::ArrayElementType;
@@ -4942,9 +4998,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
                     Ok(Some(Value::Object(Some(stream))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }.into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -4956,8 +5010,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            if !std::path::Path::new(&p).exists() {
-                return Err(RuntimeError::IllegalStateException {
+            let exists = match jarfs_decode(&p) {
+                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+                None => std::path::Path::new(&p).exists(),
+            };
+            if !exists {
+                return Err(RuntimeError::IOException {
                     message: format!("NoSuchFileException: {}", p),
                 }.into());
             }
@@ -4973,10 +5031,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
             let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 4);
-            let md = std::fs::metadata(&p);
-            let (size, is_dir, is_file) = match &md {
-                Ok(m) => (m.len() as i64, m.is_dir(), m.is_file()),
-                Err(_) => (0i64, false, false),
+            let (size, is_dir, is_file) = match jarfs_decode(&p) {
+                Some((jar, entry)) => match jarfs_classify(&jar, &entry) {
+                    JarFsKind::File => {
+                        let sz = jarfs_read_entry(&jar, &entry)
+                            .map(|b| b.len() as i64)
+                            .unwrap_or(0);
+                        (sz, false, true)
+                    }
+                    JarFsKind::Dir => (0i64, true, false),
+                    JarFsKind::Absent => (0i64, false, false),
+                },
+                None => match std::fs::metadata(&p) {
+                    Ok(m) => (m.len() as i64, m.is_dir(), m.is_file()),
+                    Err(_) => (0i64, false, false),
+                },
             };
             ctx.set_field(attrs, 0, Value::Long(size));
             ctx.set_field(attrs, 1, Value::Int(if is_dir { 1 } else { 0 }));
@@ -4995,12 +5064,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let p = p57_read_path(ctx, path_obj);
             let stream = alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 1);
             // Build array of Path entries
-            let entries: Vec<String> = match std::fs::read_dir(&p) {
-                Ok(rd) => rd
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.path().to_string_lossy().replace('\\', "/"))
+            let entries: Vec<String> = match jarfs_decode(&p) {
+                Some((jar, dir)) => jarfs_list_dir(&jar, &dir)
+                    .into_iter()
+                    .map(|child| jarfs_encode(&jar, &child))
                     .collect(),
-                Err(_) => vec![],
+                None => match std::fs::read_dir(&p) {
+                    Ok(rd) => rd
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path().to_string_lossy().replace('\\', "/"))
+                        .collect(),
+                    Err(_) => vec![],
+                },
             };
             use rustjvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
@@ -5131,7 +5206,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            Ok(Some(Value::Int(if std::path::Path::new(&p).exists() { 1 } else { 0 })))
+            let exists = match jarfs_decode(&p) {
+                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+                None => std::path::Path::new(&p).exists(),
+            };
+            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
         },
     );
 
@@ -5142,7 +5221,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            Ok(Some(Value::Int(if !std::path::Path::new(&p).exists() { 1 } else { 0 })))
+            let exists = match jarfs_decode(&p) {
+                Some((jar, entry)) => !matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent),
+                None => std::path::Path::new(&p).exists(),
+            };
+            Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
         },
     );
 
@@ -5153,7 +5236,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read(&p) {
+            let read = match jarfs_decode(&p) {
+                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+                None => std::fs::read(&p),
+            };
+            match read {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
                     use rustjvm_types::ArrayElementType;
@@ -5167,9 +5254,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     ctx.set_field_by_name(stream, "count", Value::Int(data.len() as i32));
                     Ok(Some(Value::Object(Some(stream))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }.into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -5181,7 +5266,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read_to_string(&p) {
+            match p57_read_to_string(&p) {
                 Ok(content) => {
                     let reader = alloc_concurrent_synthetic(ctx, "java/io/BufferedReader", 2);
                     let s = ctx.create_string(&content);
@@ -5190,9 +5275,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     br_sidetable_register(reader, content);
                     Ok(Some(Value::Object(Some(reader))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }.into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -5204,7 +5287,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read_to_string(&p) {
+            match p57_read_to_string(&p) {
                 Ok(content) => {
                     let reader = alloc_concurrent_synthetic(ctx, "java/io/BufferedReader", 2);
                     let s = ctx.create_string(&content);
@@ -5213,9 +5296,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     br_sidetable_register(reader, content);
                     Ok(Some(Value::Object(Some(reader))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }.into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -5467,7 +5548,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            match std::fs::read(&p) {
+            let read = match jarfs_decode(&p) {
+                Some((jar, entry)) => jarfs_read_entry(&jar, &entry),
+                None => std::fs::read(&p),
+            };
+            match read {
                 Ok(data) => {
                     use rustjvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
@@ -5476,9 +5561,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                     Ok(Some(Value::Object(Some(arr))))
                 }
-                Err(e) => Err(RuntimeError::IllegalStateException {
-                    message: format!("IOException: {}", e),
-                }.into()),
+                Err(e) => Err(p57_io_error(&e)),
             }
         },
     );
@@ -5535,6 +5618,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toUri", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
+        // jar-FS Path → `jar:file:/<jar>!/<entry>` URI (matches JDK zipfs), so
+        // callers that round-trip back through URL/openStream can re-open it.
+        if let Some((jar, entry)) = jarfs_decode(&p) {
+            let jar_slash = jar.replace('\\', "/");
+            let jar_abs = if jar_slash.starts_with('/') {
+                jar_slash
+            } else {
+                format!("/{jar_slash}")
+            };
+            let entry = entry.trim_start_matches('/');
+            let uri_str = format!("jar:file:{jar_abs}!/{entry}");
+            let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+            let s = ctx.create_string(&uri_str);
+            ctx.set_field(uri, 0, Value::Object(Some(s)));
+            ctx.set_field(uri, 4, Value::Object(Some(s)));
+            return Ok(Some(Value::Object(Some(uri))));
+        }
         let prefixed;
         let slash_p: &str = if p.starts_with('/') { &p } else { prefixed = format!("/{}", p); &prefixed };
         let uri_str = format!("file://{}", slash_p);
@@ -5692,21 +5792,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             |ctx, args| {
                 let path_ref = obj_arg(args, 1)?;
                 let p = ctx.read_string(path_ref).unwrap_or_default();
-                let canonical = std::fs::canonicalize(&p)
-                    .map(|c| {
-                        // Strip the Windows `\\?\` extended-length prefix —
-                        // the real JDK's canonicalize0 never returns it, and
-                        // it corrupts any subsequent `File.toURI()`.
-                        let s = c.to_string_lossy().into_owned();
-                        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-                            format!(r"\\{rest}")
-                        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-                            rest.to_string()
-                        } else {
-                            s
-                        }
-                    })
-                    .unwrap_or(p);
+                // Normalize even for non-existent paths: make absolute and
+                // collapse `.`/`..` so containment checks behave like the
+                // real JDK. Strips the `\\?\` extended-length prefix too.
+                let canonical = file_canonicalize_path(&p);
                 let s = ctx.create_string(&canonical);
                 Ok(Some(Value::Object(Some(s))))
             },
@@ -6041,7 +6130,146 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     obj
 }
 
+// --- jar-filesystem path encoding ---------------------------------------
+//
+// `FileSystemProvider.newFileSystem(Path jar, Map)` mounts the interior of a
+// JAR as a `FileSystem`.  We model that filesystem's `Path`s as strings of the
+// form  `\x01JARFS\x01<jar-os-path>\x01<entry-within-jar>`.  The leading
+// `\x01` sentinel cannot occur in a real path, so the file-IO natives can
+// detect jar-FS paths and read the entry straight out of the archive instead
+// of going to the host filesystem (which would `ENOENT`).
+const JARFS_SENTINEL: char = '\u{1}';
+
+fn jarfs_encode(jar: &str, entry: &str) -> String {
+    let entry = entry.trim_start_matches('/');
+    format!("{JARFS_SENTINEL}JARFS{JARFS_SENTINEL}{jar}{JARFS_SENTINEL}{entry}")
+}
+
+/// If `p` is a jar-FS encoded path, return `(jar_os_path, entry)`.
+fn jarfs_decode(p: &str) -> Option<(String, String)> {
+    let body = p.strip_prefix(JARFS_SENTINEL)?.strip_prefix("JARFS")?;
+    let body = body.strip_prefix(JARFS_SENTINEL)?;
+    let sep = body.find(JARFS_SENTINEL)?;
+    let jar = body[..sep].to_string();
+    let entry = body[sep + JARFS_SENTINEL.len_utf8()..].to_string();
+    Some((jar, entry))
+}
+
+/// Read a jar-internal entry's bytes. `entry` "" or "/" means the jar root
+/// (a directory) — callers should treat that as a directory, not a file.
+fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let entry = entry.trim_start_matches('/');
+    let jar_bytes = std::fs::read(jar)?;
+    let cursor = std::io::Cursor::new(jar_bytes);
+    let mut zip = zip::ZipArchive::new(cursor)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut f = zip
+        .by_name(entry)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let mut buf = Vec::with_capacity(f.size().min(1 << 27) as usize);
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Kind of a jar-FS path: regular file, directory, or absent.
+enum JarFsKind {
+    File,
+    Dir,
+    Absent,
+}
+
+fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
+    let entry = entry.trim_start_matches('/');
+    let jar_bytes = match std::fs::read(jar) {
+        Ok(b) => b,
+        Err(_) => return JarFsKind::Absent,
+    };
+    let cursor = std::io::Cursor::new(jar_bytes);
+    let mut zip = match zip::ZipArchive::new(cursor) {
+        Ok(z) => z,
+        Err(_) => return JarFsKind::Absent,
+    };
+    if entry.is_empty() {
+        return JarFsKind::Dir;
+    }
+    if zip.by_name(entry).is_ok() {
+        return JarFsKind::File;
+    }
+    // An explicit directory entry, or any entry living under `entry/`.
+    let dir_prefix = format!("{entry}/");
+    if zip.by_name(&dir_prefix).is_ok() {
+        return JarFsKind::Dir;
+    }
+    for i in 0..zip.len() {
+        if let Ok(f) = zip.by_index(i) {
+            if f.name().starts_with(&dir_prefix) {
+                return JarFsKind::Dir;
+            }
+        }
+    }
+    JarFsKind::Absent
+}
+
+/// List the immediate children of a directory `dir` inside a JAR. Returns
+/// full entry paths (relative to the jar root).
+fn jarfs_list_dir(jar: &str, dir: &str) -> Vec<String> {
+    let dir = dir.trim_start_matches('/').trim_end_matches('/');
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    let jar_bytes = match std::fs::read(jar) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let cursor = std::io::Cursor::new(jar_bytes);
+    let mut zip = match zip::ZipArchive::new(cursor) {
+        Ok(z) => z,
+        Err(_) => return Vec::new(),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..zip.len() {
+        if let Ok(f) = zip.by_index(i) {
+            let name = f.name();
+            if let Some(rest) = name.strip_prefix(&prefix) {
+                let rest = rest.trim_end_matches('/');
+                if rest.is_empty() {
+                    continue;
+                }
+                // Immediate child only: keep the first path segment.
+                let child = match rest.find('/') {
+                    Some(j) => &rest[..j],
+                    None => rest,
+                };
+                seen.insert(format!("{prefix}{child}"));
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Build a `java.io.IOException` runtime error from a Rust IO error — used so
+/// callers like SmallRye that `catch (IOException)` can recover, instead of an
+/// uncatchable `IllegalStateException`.
+fn p57_io_error(e: &std::io::Error) -> rustjvm_types::error::MethodCallFailed {
+    RuntimeError::IOException { message: e.to_string() }.into()
+}
+
+/// Read a path (host file or jar-FS entry) into a UTF-8 string.
+fn p57_read_to_string(p: &str) -> std::io::Result<String> {
+    let bytes = match jarfs_decode(p) {
+        Some((jar, entry)) => jarfs_read_entry(&jar, &entry)?,
+        None => std::fs::read(p)?,
+    };
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn p57_normalize_path(path: &str) -> String {
+    if let Some((jar, entry)) = jarfs_decode(path) {
+        return jarfs_encode(&jar, &p57_normalize_path(&entry));
+    }
     let sep = '/';
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split(sep) {
@@ -6066,6 +6294,25 @@ fn p57_normalize_path(path: &str) -> String {
 /// - If `other` is empty, return `base`.
 /// - Otherwise, join `base` + separator + `other`.
 fn p57_resolve_paths(base: &str, other: &str) -> String {
+    // jar-FS aware: resolve happens within the mounted JAR's entry namespace.
+    if let Some((jar, base_entry)) = jarfs_decode(base) {
+        let other_entry = jarfs_decode(other)
+            .map(|(_, e)| e)
+            .unwrap_or_else(|| other.to_string());
+        if other_entry.is_empty() {
+            return base.to_string();
+        }
+        if other_entry.starts_with('/') {
+            return jarfs_encode(&jar, &other_entry);
+        }
+        let be = base_entry.trim_end_matches('/');
+        let joined = if be.is_empty() {
+            other_entry
+        } else {
+            format!("{be}/{other_entry}")
+        };
+        return jarfs_encode(&jar, &joined);
+    }
     if other.is_empty() {
         return base.to_string();
     }
@@ -6086,6 +6333,13 @@ fn p57_resolve_paths(base: &str, other: &str) -> String {
 
 /// Extract parent directory from a path string. Returns empty string for root-only paths.
 fn p57_parent_of(path: &str) -> String {
+    if let Some((jar, entry)) = jarfs_decode(path) {
+        let trimmed = entry.trim_end_matches('/');
+        return match trimmed.rfind('/') {
+            Some(i) => jarfs_encode(&jar, &entry[..i]),
+            None => jarfs_encode(&jar, ""),
+        };
+    }
     if path.is_empty() {
         return String::new();
     }
@@ -6106,7 +6360,8 @@ fn p57_parent_of(path: &str) -> String {
 /// Allocate a synthetic default FileSystem object.
 /// FileSystem = 1-field synthetic (field 0 = separator String).
 fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 1);
+    // Field 0 = separator; field 1 (P57_FS_JAR_FIELD) = mounted-JAR path (or null).
+    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 2);
     let sep = if cfg!(windows) { "\\" } else { "/" };
     let s = ctx.create_string(sep);
     ctx.set_field(fs, 0, Value::Object(Some(s)));
@@ -7148,6 +7403,68 @@ fn file_normalise_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Strip the Windows `\\?\` / `\\?\UNC\` extended-length prefix that
+/// `std::fs::canonicalize` prepends. The real JDK's `getCanonicalPath`
+/// never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
+/// makes a later `File.toURI()` produce `file://?/C:/...`, an invalid URL.
+fn strip_unc(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        p.to_string()
+    }
+}
+
+/// Canonicalize a `java.io.File` path the way `File.getCanonicalPath()` does.
+///
+/// `std::fs::canonicalize` only works for paths that *exist* on disk; the real
+/// JDK's `getCanonicalPath` also normalizes non-existent paths — it makes them
+/// absolute, collapses `.`/`..` segments, and normalizes separators. The old
+/// fallback returned a raw absolute path with `..` segments intact, so a
+/// containment check (`child.startsWith(parentDir)`) — as Felix's
+/// `getDataFile` does — would spuriously fail.
+fn file_canonicalize_path(path: &str) -> String {
+    // First try the real filesystem call (resolves symlinks for existing paths).
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return strip_unc(&c.to_string_lossy());
+    }
+    // Path doesn't exist — normalize lexically. Make absolute against CWD.
+    let norm = file_normalise_path(path);
+    let p = std::path::Path::new(&norm);
+    let abs: std::path::PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    // Collapse `.` and `..` segments lexically (the prefix/root are preserved).
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop the last normal segment, but never past the root/prefix.
+                match out.last() {
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    _ => out.push(comp),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut result = std::path::PathBuf::new();
+    for comp in out {
+        result.push(comp.as_os_str());
+    }
+    strip_unc(&result.to_string_lossy())
+}
+
 /// Allocate a new File synthetic with the given path.
 fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
@@ -7225,22 +7542,75 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // <init>(URI)V — treat URI as file:// path
+    // <init>(URI)V — `new File(file:/path)`.
+    //
+    // The previous implementation read the URI string from raw slot 5, but
+    // that slot is the `port` int in the real `java.net.URI` layout — the
+    // result was an empty path. ActiveMQ's launcher locates ACTIVEMQ_HOME
+    // via `new File(new URI(jarUrl).resolve(".."))`; an empty path there
+    // forced a wrong `../.` fallback and broke lib/*.jar discovery.
+    //
+    // Read the URI's `path` field *by name* (slot-order safe), falling back
+    // to parsing the cached `string` full-text field. Then apply the
+    // `WinNTFileSystem.fromURIPath` transform (strip the leading `/` before
+    // a drive letter, drop a trailing `/`) and normalise separators.
     r.register(file, "<init>", "(Ljava/net/URI;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let uri_str = match args.get(1) {
-            Some(Value::Object(Some(u))) => {
-                // URI field layout varies; try field 5 (raw full string)
-                match ctx.get_field(*u, 5) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                }
+        let uri = match args.get(1) {
+            Some(Value::Object(Some(u))) => *u,
+            _ => {
+                let s = ctx.create_string("");
+                ctx.set_field(this, 0, Value::Object(Some(s)));
+                return Ok(None);
             }
+        };
+        // Prefer the parsed `path` component.
+        let mut path = match ctx.get_field_by_name(uri, "path") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        let path = uri_str.strip_prefix("file://").unwrap_or(&uri_str)
-            .strip_prefix("file:").unwrap_or(&uri_str).to_string();
-        let s = ctx.create_string(&path);
+        if path.is_empty() {
+            // Parse from the full URI text:
+            //   scheme:[//authority]path[?query][#fragment]
+            let raw = match ctx.get_field_by_name(uri, "string") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if !raw.is_empty() {
+                let after_scheme = match raw.find(':') {
+                    Some(i) => &raw[i + 1..],
+                    None => &raw[..],
+                };
+                let body = if let Some(rest) = after_scheme.strip_prefix("//") {
+                    let slash = rest.find('/').unwrap_or(rest.len());
+                    &rest[slash..]
+                } else {
+                    after_scheme
+                };
+                path = body
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
+        let mut p = path;
+        let chars: Vec<char> = p.chars().collect();
+        if chars.len() > 2 && chars[0] == '/' && chars[2] == ':' {
+            p = p[1..].to_string();
+            if p.len() > 3 && p.ends_with('/') {
+                p.pop();
+            }
+        } else if p.len() > 1 && p.ends_with('/') {
+            p.pop();
+        }
+        // Normalise to platform separators / collapse `.` `..` segments.
+        let normalised = file_normalise_path(&p);
+        let s = ctx.create_string(&normalised);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -7327,44 +7697,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
     // makes a later `File.toURI()` produce `file://?/C:/...`, an invalid
     // URL that breaks Tomcat's `ClassLoaderFactory.buildClassLoaderUrl`.
-    fn strip_unc(p: &str) -> String {
-        if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = p.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            p.to_string()
-        }
-    }
     r.register(file, "getCanonicalPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        match std::fs::canonicalize(&path) {
-            Ok(canonical) => {
-                let s = ctx.create_string(&strip_unc(&canonical.to_string_lossy()));
-                Ok(Some(Value::Object(Some(s))))
-            }
-            Err(_) => {
-                // Fall back to absolute path if canonicalize fails (file may not exist)
-                let p = std::path::Path::new(&path);
-                let abs = if p.is_absolute() {
-                    path
-                } else {
-                    std::env::current_dir()
-                        .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                        .unwrap_or(path)
-                };
-                let s = ctx.create_string(&abs);
-                Ok(Some(Value::Object(Some(s))))
-            }
-        }
+        let canonical = file_canonicalize_path(&path);
+        let s = ctx.create_string(&canonical);
+        Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "getCanonicalFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let canonical = std::fs::canonicalize(&path)
-            .map(|p| strip_unc(&p.to_string_lossy()))
-            .unwrap_or(path);
+        let canonical = file_canonicalize_path(&path);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &canonical)))))
     });
     r.register(file, "isAbsolute", "()Z", |ctx, args| {
@@ -16574,7 +16917,10 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let exists = std::path::Path::new(&path_str).exists();
+                let exists = match jarfs_decode(&path_str) {
+                    Some((jar, e)) => !matches!(jarfs_classify(&jar, &e), JarFsKind::Absent),
+                    None => std::path::Path::new(&path_str).exists(),
+                };
                 Ok(Some(Value::Int(if exists { 1 } else { 0 })))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -16591,8 +16937,11 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(1))),
                 };
-                let not_exists = !std::path::Path::new(&path_str).exists();
-                Ok(Some(Value::Int(if not_exists { 1 } else { 0 })))
+                let exists = match jarfs_decode(&path_str) {
+                    Some((jar, e)) => !matches!(jarfs_classify(&jar, &e), JarFsKind::Absent),
+                    None => std::path::Path::new(&path_str).exists(),
+                };
+                Ok(Some(Value::Int(if !exists { 1 } else { 0 })))
             } else {
                 Ok(Some(Value::Int(1)))
             }
@@ -16608,7 +16957,10 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let is_dir = std::path::Path::new(&path_str).is_dir();
+                let is_dir = match jarfs_decode(&path_str) {
+                    Some((jar, e)) => matches!(jarfs_classify(&jar, &e), JarFsKind::Dir),
+                    None => std::path::Path::new(&path_str).is_dir(),
+                };
                 Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -16625,7 +16977,10 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let is_file = std::path::Path::new(&path_str).is_file();
+                let is_file = match jarfs_decode(&path_str) {
+                    Some((jar, e)) => matches!(jarfs_classify(&jar, &e), JarFsKind::File),
+                    None => std::path::Path::new(&path_str).is_file(),
+                };
                 Ok(Some(Value::Int(if is_file { 1 } else { 0 })))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -16638,9 +16993,10 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Long(0))),
             };
-            let size = std::fs::metadata(&path_str)
-                .map(|m| m.len() as i64)
-                .unwrap_or(0);
+            let size = match jarfs_decode(&path_str) {
+                Some((jar, e)) => jarfs_read_entry(&jar, &e).map(|b| b.len() as i64).unwrap_or(0),
+                None => std::fs::metadata(&path_str).map(|m| m.len() as i64).unwrap_or(0),
+            };
             Ok(Some(Value::Long(size)))
         } else {
             Ok(Some(Value::Long(0)))
@@ -16656,7 +17012,10 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => return Ok(Some(Value::Int(0))),
                 };
-                let readable = std::path::Path::new(&path_str).exists();
+                let readable = match jarfs_decode(&path_str) {
+                    Some((jar, e)) => !matches!(jarfs_classify(&jar, &e), JarFsKind::Absent),
+                    None => std::path::Path::new(&path_str).exists(),
+                };
                 Ok(Some(Value::Int(if readable { 1 } else { 0 })))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -16695,7 +17054,11 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let fname = std::path::Path::new(&path_str)
+            // jar-FS aware: operate on the in-jar entry portion.
+            let entry = jarfs_decode(&path_str)
+                .map(|(_, e)| e)
+                .unwrap_or_else(|| path_str.clone());
+            let fname = std::path::Path::new(&entry)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
@@ -16711,6 +17074,20 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => return Ok(Some(Value::Object(None))),
         };
+        if let Some((jar, entry)) = jarfs_decode(&path_str) {
+            let trimmed = entry.trim_end_matches('/');
+            if trimmed.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let parent_entry = match trimmed.rfind('/') {
+                Some(i) => &trimmed[..i],
+                None => "",
+            };
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let s = ctx.create_string(&jarfs_encode(&jar, parent_entry));
+            ctx.set_field(p, 0, Value::Object(Some(s)));
+            return Ok(Some(Value::Object(Some(p))));
+        }
         if let Some(parent) = std::path::Path::new(&path_str)
             .parent()
             .and_then(|p| p.to_str())
@@ -16736,9 +17113,14 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let abs = std::fs::canonicalize(&path_str)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(path_str);
+            // jar-FS paths are already absolute within the mounted filesystem.
+            let abs = if jarfs_decode(&path_str).is_some() {
+                path_str
+            } else {
+                std::fs::canonicalize(&path_str)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(path_str)
+            };
             let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
             let s = ctx.create_string(&abs);
             ctx.set_field(p, 0, Value::Object(Some(s)));
@@ -16759,10 +17141,14 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let resolved = std::path::Path::new(&base)
-                .join(&other)
-                .to_string_lossy()
-                .into_owned();
+            let resolved = if jarfs_decode(&base).is_some() {
+                p57_resolve_paths(&base, &other)
+            } else {
+                std::path::Path::new(&base)
+                    .join(&other)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
             let s = ctx.create_string(&resolved);
             ctx.set_field(p, 0, Value::Object(Some(s)));
@@ -16787,10 +17173,14 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             } else {
                 String::new()
             };
-            let resolved = std::path::Path::new(&base)
-                .join(&other)
-                .to_string_lossy()
-                .into_owned();
+            let resolved = if jarfs_decode(&base).is_some() || jarfs_decode(&other).is_some() {
+                p57_resolve_paths(&base, &other)
+            } else {
+                std::path::Path::new(&base)
+                    .join(&other)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
             let s = ctx.create_string(&resolved);
             ctx.set_field(p, 0, Value::Object(Some(s)));
@@ -16803,7 +17193,10 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => return Ok(Some(Value::Int(0))),
         };
-        let count = std::path::Path::new(&path_str).components().count() as i32;
+        let entry = jarfs_decode(&path_str)
+            .map(|(_, e)| e)
+            .unwrap_or(path_str);
+        let count = std::path::Path::new(&entry).components().count() as i32;
         Ok(Some(Value::Int(count.max(0))))
     });
 }
@@ -30736,151 +31129,25 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
 // 1-field synthetic (daemon=0 Int)
 // =============================================================================
 
-// Cleaner synthetic layout (see docs/plans/new17-cleaner.md):
-//   field 0 : Object[]  — backing list pinning Cleanable entries alive
-//   field 1 : Int       — number of live cleanables
-//
-// Cleaner$Cleanable synthetic layout:
-//   field 0 : Object (Runnable) — the action to run on referent death
-//   field 1 : Int               — cleaned flag (0 = pending, 1 = done)
-//   field 2 : Int               — index of this cleanable in its owner's array
-const CLEANER_ARR: usize = 0;
-const CLEANER_LEN: usize = 1;
-const CLEANABLE_ACTION: usize = 0;
-const CLEANABLE_FLAG: usize = 1;
-const CLEANABLE_IDX: usize = 2;
-const CLEANER_INITIAL_CAP: i32 = 16;
-/// Cleaner ref-type discriminator expected by
-/// `NativeContext::discover_reference` / `vm_exec::discover_reference`.
-const REF_TYPE_CLEANER: u8 = 3;
+// P69-Cleaner-realfix: the synthetic `java.lang.ref.Cleaner` model
+// (backing-array layout + `alloc_cleaner`) has been removed.  Real-JDK
+// `Cleaner.create()` now runs unmodified once Thread `holder` is
+// populated — see `register_p69_cleaner` for the full rationale.
 
-fn alloc_cleaner(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", 2);
-    let arr = ctx.new_array(
-        rustjvm_types::ArrayElementType::Reference,
-        CLEANER_INITIAL_CAP as usize,
-    );
-    ctx.set_field(obj, CLEANER_ARR, Value::Object(Some(arr)));
-    ctx.set_field(obj, CLEANER_LEN, Value::Int(0));
-    obj
-}
-
-pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
-    let c = "java/lang/ref/Cleaner";
-    r.register(c, "create", "()Ljava/lang/ref/Cleaner;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(alloc_cleaner(ctx)))))
-    });
-    r.register(
-        c,
-        "create",
-        "(Ljava/util/concurrent/ThreadFactory;)Ljava/lang/ref/Cleaner;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_cleaner(ctx))))),
-    );
-    r.register(
-        c,
-        "register",
-        "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let referent = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => {
-                    // Null referent: return a dead cleanable so the caller's
-                    // control flow still works (JDK throws NPE here, but we
-                    // soft-fail to stay consistent with other synthetic paths).
-                    let cleanable = alloc_concurrent_synthetic(
-                        ctx, "java/lang/ref/Cleaner$Cleanable", 3,
-                    );
-                    ctx.set_field(cleanable, CLEANABLE_ACTION, Value::Object(None));
-                    ctx.set_field(cleanable, CLEANABLE_FLAG, Value::Int(1));
-                    ctx.set_field(cleanable, CLEANABLE_IDX, Value::Int(-1));
-                    return Ok(Some(Value::Object(Some(cleanable))));
-                }
-            };
-            let action = match args.get(2) {
-                Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
-                _ => Value::Object(None),
-            };
-
-            // Allocate the cleanable synthetic.
-            let cleanable = alloc_concurrent_synthetic(
-                ctx, "java/lang/ref/Cleaner$Cleanable", 3,
-            );
-            ctx.set_field(cleanable, CLEANABLE_ACTION, action);
-            ctx.set_field(cleanable, CLEANABLE_FLAG, Value::Int(0));
-
-            // Append into the Cleaner's backing array, growing by doubling if full.
-            let mut arr = match ctx.get_field(this, CLEANER_ARR) {
-                Value::Object(Some(a)) => a,
-                _ => {
-                    let a = ctx.new_array(
-                        rustjvm_types::ArrayElementType::Reference,
-                        CLEANER_INITIAL_CAP as usize,
-                    );
-                    ctx.set_field(this, CLEANER_ARR, Value::Object(Some(a)));
-                    a
-                }
-            };
-            let mut len = ctx.get_field(this, CLEANER_LEN).as_int().unwrap_or(0);
-            let cap = ctx.array_length(arr) as i32;
-            if len >= cap {
-                let new_cap = (cap.max(1) * 2) as usize;
-                let new_arr = ctx.new_array(
-                    rustjvm_types::ArrayElementType::Reference,
-                    new_cap,
-                );
-                for i in 0..cap as usize {
-                    let v = ctx.get_array_element(arr, i);
-                    ctx.set_array_element(new_arr, i, v);
-                }
-                ctx.set_field(this, CLEANER_ARR, Value::Object(Some(new_arr)));
-                arr = new_arr;
-            }
-            ctx.set_array_element(arr, len as usize, Value::Object(Some(cleanable)));
-            ctx.set_field(cleanable, CLEANABLE_IDX, Value::Int(len));
-            len += 1;
-            ctx.set_field(this, CLEANER_LEN, Value::Int(len));
-
-            // Register with the ref processor as a Cleaner phantom.
-            // The *cleanable* is the "reference object" — when the
-            // referent dies, the GC pushes the cleanable's address into
-            // `cleaner_actions`, which `run_cleaner_actions` drains.
-            ctx.discover_reference(REF_TYPE_CLEANER, cleanable, referent, None);
-
-            Ok(Some(Value::Object(Some(cleanable))))
-        },
-    );
-
-    // Cleanable.clean() — synchronous user-triggered cleanup.
-    // Guarded by the cleaned flag so GC-triggered + user-triggered are idempotent.
-    let cl = "java/lang/ref/Cleaner$Cleanable";
-    r.register(cl, "clean", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let already = matches!(ctx.get_field(this, CLEANABLE_FLAG), Value::Int(1));
-        if already {
-            return Ok(None);
-        }
-        ctx.set_field(this, CLEANABLE_FLAG, Value::Int(1));
-        let action = match ctx.get_field(this, CLEANABLE_ACTION) {
-            Value::Object(Some(o)) => o,
-            _ => return Ok(None),
-        };
-        // Clear the slot so the action can drop naturally on the next GC.
-        ctx.set_field(this, CLEANABLE_ACTION, Value::Object(None));
-        // Per Cleaner contract, exceptions thrown by run() are caught.
-        // NOTE: `invoke_virtual` prepends the receiver (and for lambda
-        // proxies prepends captured values), so `args` must be the SAM
-        // method's explicit arguments only — `Runnable.run()V` is
-        // zero-arg, so pass `&[]`. Previously this passed
-        // `&[Value::Object(Some(action))]`, which caused the lambda
-        // dispatch path in `vm_exec::invoke_virtual` to build
-        // `full_args = [captured..., action]` — one too many args for
-        // the static impl method, leading to a SEGV inside the
-        // interpreter when reading past the end of locals during
-        // CleanerProbe's `cleanable.clean()` call.
-        let _ = ctx.invoke_virtual(action, "run", "()V", &[]);
-        Ok(None)
-    });
+pub(crate) fn register_p69_cleaner(_r: &mut NativeMethodRegistry) {
+    // P69-Cleaner-realfix: the synthetic `Cleaner.create`/`register`/
+    // `Cleaner$Cleanable.clean` overrides have been removed.  They existed
+    // only to dodge an `InnocuousThread.setPriority` NPE inside the real
+    // `Cleaner.create()` bytecode — that NPE was caused by VM-constructed
+    // Thread objects whose `holder:Thread$FieldHolder` field was left null
+    // (the `Thread.<init>` natives in `register_essential_natives` skipped
+    // it).  `populate_real_thread_holder` now builds a genuine
+    // `FieldHolder` for every real-JDK Thread, so the real
+    // `java.lang.ref.Cleaner` / `jdk.internal.ref.CleanerImpl` bytecode
+    // runs unmodified and yields a real `CleanerImpl` in `Cleaner.impl`.
+    // That in turn fixes `jdk.internal.ref.CleanerImpl.getCleanerImpl`
+    // (the `checkcast jdk/internal/ref/CleanerImpl` no longer throws),
+    // so `FileCleanable.register` and `PhantomCleanable.<init>` work.
 }
 
 // =============================================================================

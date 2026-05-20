@@ -212,6 +212,16 @@ pub fn analyze_with_annotations(
         .map(|k| k.admit)
         .unwrap_or(AdmissionHint::Strict);
 
+    // AUDIT 2026-05-20: walk the bytecode BEFORE the signature-shape
+    // checks (`ReductionNotImplemented` / `CountedLoopScalarReturn`).
+    // A method that uses a forbidden opcode — `invokestatic`,
+    // `instanceof`, `athrow`, … — must be rejected for THAT specific
+    // reason, not the coarse `ReductionNotImplemented` shape reason
+    // that also happens to match its `[I…)scalar` descriptor. Running
+    // the opcode scan first means `reject_invoke`, `reject_type_check`
+    // and friends get their precise reject reason; the shape checks
+    // below only ever fire on a method that is otherwise GPU-clean.
+    //
     // Single bytecode pass: `scan_bytecode` collects the reject reason,
     // the `this_field_cps` receiver-access CP indices (Phase 9 #2), the
     // loop-trip work estimate, and the backward-branch flag — no second
@@ -221,6 +231,21 @@ pub fn analyze_with_annotations(
             Ok(t) => t,
             Err(reason) => return OffloadVerdict::Rejected(reason),
         };
+
+    // AUDIT 2026-05-16: an array-in / scalar-out signature is a
+    // reduction shape (sum, dot, max, count, …). The emitter's
+    // `scalar_return` lowering writes the value through `ret_ptr`
+    // from every CUDA thread, so each thread races to overwrite the
+    // single scalar with its per-element term — silently wrong
+    // results. Until a proper block-reduction lowering exists, refuse
+    // the shape and let the VM run the method on the CPU.
+    //
+    // This shape check runs AFTER the opcode scan above so a method
+    // that is rejected for a more specific opcode reason keeps that
+    // reason.
+    if return_kind.is_scalar() && param_kinds.iter().any(|k| k.is_array()) {
+        return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
+    }
 
     // AUDIT 2026-05-19: a method with a backward branch is a counted
     // loop; the counted-loop lowering runs one CUDA thread per
@@ -472,44 +497,6 @@ fn instruction_size(bytes: &[u8], pc: usize) -> Result<usize, Reason> {
         _ => return Err(Reason::UnknownOpcode(op)),
     };
     Ok(size)
-}
-
-/// Cheap loop-trip heuristic: if the bytecode contains at least one
-/// backward branch, default to "lots of work"; otherwise use bytecode
-/// length. The interpreter (Part E) only uses this to skip offload
-/// for tiny inputs, so precision is not critical.
-fn estimate_work(code: &CodeAttribute) -> usize {
-    let bytes = &code.code;
-    let mut has_backward = false;
-    let mut pc = 0usize;
-    while pc < bytes.len() {
-        let op = bytes[pc];
-        let size = instruction_size(bytes, pc).unwrap_or(1);
-        if (0x99..=0xA7).contains(&op) || op == 0xC6 || op == 0xC7 {
-            if pc + 3 <= bytes.len() {
-                let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
-                if off < 0 {
-                    has_backward = true;
-                }
-            }
-        } else if op == 0xC8 && pc + 5 <= bytes.len() {
-            let off = i32::from_be_bytes([
-                bytes[pc + 1],
-                bytes[pc + 2],
-                bytes[pc + 3],
-                bytes[pc + 4],
-            ]);
-            if off < 0 {
-                has_backward = true;
-            }
-        }
-        pc += size;
-    }
-    if has_backward {
-        1 << 20
-    } else {
-        bytes.len().max(1)
-    }
 }
 
 #[cfg(test)]

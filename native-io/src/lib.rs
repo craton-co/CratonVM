@@ -780,14 +780,24 @@ fn fis_fd_object(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> 
 }
 
 /// Store an open `FdId` so later `read`/`available`/`close` natives can
-/// recover it. Prefers the `FileDescriptor` object (real-JDK layout);
-/// also mirrors the id into instance slot 0 so synthetic objects without
-/// a `FileDescriptor` keep working.
+/// recover it. Prefers the `FileDescriptor` object (real-JDK layout).
+///
+/// FIS-FIX 2026-05-20: only mirror the raw `FdId` into instance slot 0 when
+/// the real-JDK `fd` `FileDescriptor` reference is *absent* (legacy synthetic
+/// streams). In the real-JDK layout slot 0 *is* the `fd` reference field —
+/// writing a raw `Value::Int` there overwrites the `FileDescriptor` object
+/// with `null`, so the JDK `close()`/`getFD()` bytecode (`getfield fd`)
+/// reads `null` and NPEs in `FileDescriptor.closeAll`. The descriptor's own
+/// `fd`/`handle` fields already carry the id, so the mirror is redundant
+/// whenever a `FileDescriptor` object exists.
 fn fis_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
     if let Some(fd_obj) = fis_fd_object(ctx, this) {
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+        return;
     }
+    // Legacy synthetic layout: no `FileDescriptor` object — slot 0 is a
+    // plain scratch slot, so stash the raw id there.
     ctx.set_field(this, 0, Value::Int(fd as i32));
 }
 
@@ -992,6 +1002,39 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Long(total_skipped as i64)))
 }
 
+/// `java.io.FileDescriptor.close0()V` — the real-JDK `close()` bytecode path.
+///
+/// The JDK `FileInputStream.close()` / `FileOutputStream.close()` bytecode
+/// routes through `FileDescriptor.closeAll(closer)`, whose `closer.close()`
+/// calls `FileDescriptor.close()` -> `close0()`. `this` is the
+/// `FileDescriptor`; its own `fd`/`handle` fields carry the `FdId` we
+/// stashed in `fis_set_fd` / `fos` open. Release the OS fd and mark the
+/// descriptor `-1` so a double-close is a clean no-op.
+fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let fd = match ctx.get_field_by_name(fd_obj, "fd") {
+        Value::Int(v) if v >= 0 => Some(v as FdId),
+        _ => match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => Some(v as FdId),
+            _ => None,
+        },
+    };
+    if let Some(fd) = fd {
+        // stdin/stdout/stderr (0..=2) are process-lifetime streams — never
+        // release them or a later console write/read would hit a dead fd.
+        if fd > 2 {
+            let _ = ctx.fd_table().flush(fd);
+            let _ = ctx.fd_table().close(fd);
+        }
+    }
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    Ok(None)
+}
+
 fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -1015,6 +1058,62 @@ fn native_fis_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 // ---------------------------------------------------------------------------
 // Native method implementations: java.io.FileOutputStream
 // ---------------------------------------------------------------------------
+//
+// FOS-FIX 2026-05-20: same root cause as the FIS-FIX above. The real-JDK
+// `java.io.FileOutputStream` declares its first instance field as
+// `fd:Ljava/io/FileDescriptor;` — a *reference* slot. The old native
+// `<init>` overrides wrote `Value::Int(fd)` into instance slot 0; the heap
+// silently coerced that primitive write on a reference slot to
+// `Object(None)`, so every later `write`/`flush`/`close` read slot 0, saw
+// `Object(None)`, and no-op'd — files came out empty. We now let the real
+// JDK `FileOutputStream` constructor run (it allocates the `fd`
+// `FileDescriptor` and calls the `open0` native), and store/recover the OS
+// handle on the `FileDescriptor` object's own `fd`/`handle` fields.
+
+/// Resolve the `FileDescriptor` object referenced by a `FileOutputStream`.
+fn fos_fd_object(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "fd") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// Store an open write `FdId` on the `FileOutputStream`'s `FileDescriptor`.
+/// Falls back to instance slot 0 only when no `FileDescriptor` exists
+/// (legacy synthetic streams).
+fn fos_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: FdId) {
+    if let Some(fd_obj) = fos_fd_object(ctx, this) {
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+        return;
+    }
+    ctx.set_field(this, 0, Value::Int(fd as i32));
+}
+
+/// Recover the write `FdId` previously stored on a `FileOutputStream`.
+fn fos_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
+    if let Some(fd_obj) = fos_fd_object(ctx, this) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            Value::Int(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+    }
+    // Legacy synthetic layout.
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v >= 0 => return Some(v as FdId),
+        _ => {}
+    }
+    // `System.out`/`System.err`: slot 1 holds `fd+1`.
+    match ctx.get_field(this, 1) {
+        Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
+        _ => {}
+    }
+    None
+}
 
 fn native_fos_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -1031,7 +1130,7 @@ fn native_fos_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let path = validated_path(&path)?;
     let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
-    ctx.set_field(this, 0, Value::Int(fd as i32));
+    fos_set_fd(ctx, this, fd);
     Ok(None)
 }
 
@@ -1051,7 +1150,7 @@ fn native_fos_init_string_append(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let path = validated_path(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
     let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
-    ctx.set_field(this, 0, Value::Int(fd as i32));
+    fos_set_fd(ctx, this, fd);
     Ok(None)
 }
 
@@ -1075,7 +1174,7 @@ fn native_fos_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let path = read_file_path(ctx, file_obj).unwrap_or_default();
     let path = validated_path(&path)?;
     let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
-    ctx.set_field(this, 0, Value::Int(fd as i32));
+    fos_set_fd(ctx, this, fd);
     Ok(None)
 }
 
@@ -1100,7 +1199,7 @@ fn native_fos_init_file_append(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let path = validated_path(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
     let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
-    ctx.set_field(this, 0, Value::Int(fd as i32));
+    fos_set_fd(ctx, this, fd);
     Ok(None)
 }
 
@@ -1113,9 +1212,9 @@ fn native_fos_write_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     ctx.fd_table().write_byte(fd, b).map_err(io_err)?;
     Ok(None)
@@ -1153,9 +1252,9 @@ fn native_fos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let off = off as usize;
     let len = len as usize;
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
@@ -1178,9 +1277,9 @@ fn native_fos_write_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr);
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
@@ -1200,9 +1299,9 @@ fn native_fos_write_byte_ignore_append(ctx: &mut dyn NativeContext, args: &[Valu
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     ctx.fd_table().write_byte(fd, b).map_err(io_err)?;
     Ok(None)
@@ -1232,9 +1331,9 @@ fn native_fos_write_bytes_ignore_append(ctx: &mut dyn NativeContext, args: &[Val
     check_array_bounds(off_i, len_i, ctx.array_length(arr))?;
     let off = off_i as usize;
     let len = len_i as usize;
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     let mut buf = vec![0u8; len];
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
@@ -1248,9 +1347,9 @@ fn native_fos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     ctx.fd_table().flush(fd).map_err(io_err)?;
     Ok(None)
@@ -1261,12 +1360,17 @@ fn native_fos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let fd = match ctx.get_field(this, 0) {
-        Value::Int(fd) => fd as FdId,
-        _ => return Ok(None),
+    let fd = match fos_get_fd(ctx, this) {
+        Some(fd) => fd,
+        None => return Ok(None),
     };
     let _ = ctx.fd_table().flush(fd);
     let _ = ctx.fd_table().close(fd);
+    // Mark the descriptor closed so a double-close is a clean no-op.
+    if let Some(fd_obj) = fos_fd_object(ctx, this) {
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    }
     Ok(None)
 }
 
@@ -2109,6 +2213,43 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let new_pos = pos.checked_add(to_read).unwrap_or(usize::MAX);
     ctx.set_field(this, BAIS_FIELD_POS, Value::Int(new_pos as i32));
     Ok(Some(Value::Int(to_read as i32)))
+}
+
+/// `ByteArrayInputStream.read(byte[])` / `InputStream.read(byte[])`.
+///
+/// The JDK contract is `read(b, 0, b.length)`. In real-JDK mode the
+/// boot `java.io.InputStream` bytecode would normally provide this
+/// (it is `read(b,0,b.length)`), and `ByteArrayInputStream` does not
+/// override the single-arg form. But SmallRye's copy of the JDK
+/// `Properties$LineReader` calls `inStream.read(inByteBuf)` against a
+/// `ByteArrayInputStream` we synthesised for `URL.openStream()`; if the
+/// single-arg `read([B)I` is not served here it falls through to a
+/// path that never reports EOF, so `LineReader.readLine()` spins
+/// forever (KC26 `show-config` hang). Serving it directly — with the
+/// correct `-1`-at-EOF contract — keeps the loop terminating.
+fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let buf = match args.get(1) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let buf_len = ctx.array_length(buf) as i32;
+    // Delegate to the (off=0, len=b.length) three-arg form. This
+    // dispatches to the BAIS-specific `read([BII)I` native and so
+    // honours the `-1`-at-EOF contract for the synthetic streams
+    // produced by `URL.openStream` / `Class.getResourceAsStream`.
+    native_bais_read_bytes(
+        ctx,
+        &[
+            Value::Object(Some(this)),
+            Value::Object(Some(buf)),
+            Value::Int(0),
+            Value::Int(buf_len),
+        ],
+    )
 }
 
 fn native_bais_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3280,30 +3421,14 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // store the handle on the `FileDescriptor` object instead.
 
     // --- java.io.FileOutputStream ---
-    registry.register(
-        "java/io/FileOutputStream",
-        "<init>",
-        "(Ljava/lang/String;)V",
-        native_fos_init_string,
-    );
-    registry.register(
-        "java/io/FileOutputStream",
-        "<init>",
-        "(Ljava/lang/String;Z)V",
-        native_fos_init_string_append,
-    );
-    registry.register(
-        "java/io/FileOutputStream",
-        "<init>",
-        "(Ljava/io/File;)V",
-        native_fos_init_file,
-    );
-    registry.register(
-        "java/io/FileOutputStream",
-        "<init>",
-        "(Ljava/io/File;Z)V",
-        native_fos_init_file_append,
-    );
+    // FOS-FIX 2026-05-20: do NOT register native `<init>` overrides. As with
+    // `FileInputStream` (see FIS-FIX), the real-JDK `FileOutputStream`
+    // constructor allocates the `fd` `FileDescriptor` and calls the `open0`
+    // native. Overriding `<init>` skipped that allocation, so the fd had to
+    // be stored in instance slot 0 — but slot 0 is the *reference*-typed `fd`
+    // field, and a raw `Value::Int` write there is silently dropped, leaving
+    // every `write`/`flush`/`close` a no-op (empty files). The `open0`
+    // native below stores the handle on the `FileDescriptor` object instead.
     registry.register(
         "java/io/FileOutputStream",
         "write",
@@ -3346,6 +3471,21 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/FileOutputStream", "open0", "(Ljava/lang/String;Z)V", native_fos_init_string_append);
     registry.register("java/io/FileOutputStream", "write", "(IZ)V", native_fos_write_byte_ignore_append);
     registry.register("java/io/FileOutputStream", "writeBytes", "([BIIZ)V", native_fos_write_bytes_ignore_append);
+
+    // FileDescriptor.close0() — the real-JDK `FileInputStream.close()` /
+    // `FileOutputStream.close()` bytecode routes through
+    // `FileDescriptor.closeAll` -> `FileDescriptor.close()` -> `close0()`.
+    // Releases the OS fd stashed on the descriptor's own `fd`/`handle`.
+    registry.register("java/io/FileDescriptor", "close0", "()V", native_fd_close0);
+
+    // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
+    // It existed because the synthetic `java.lang.ref.Cleaner` left a
+    // bogus `impl` field, so the real `PhantomCleanable.<init>` ->
+    // `CleanerImpl.getCleanerImpl` `checkcast` threw ClassCastException.
+    // The real `Cleaner.create()` bytecode now runs (Thread `holder` is
+    // populated), producing a genuine `CleanerImpl`, so the real-JDK
+    // `FileCleanable.register` -> phantom-cleanable GC-time fd cleanup
+    // path works unmodified.
 
     // --- java.io.FileWriter ---
     // FileWriter wraps FileOutputStream; we use the same fd-in-field-0 layout.
@@ -3608,6 +3748,7 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register(bais, "<init>", "([B)V", native_bais_init);
     registry.register(bais, "<init>", "([BII)V", native_bais_init_offset);
     registry.register(bais, "read", "()I", native_bais_read);
+    registry.register(bais, "read", "([B)I", native_bais_read_byte_array);
     registry.register(bais, "read", "([BII)I", native_bais_read_bytes);
     registry.register(bais, "available", "()I", native_bais_available);
     registry.register(bais, "skip", "(J)J", native_bais_skip);
@@ -3641,6 +3782,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java.io.InputStream (base class fallback) ---
     registry.register("java/io/InputStream", "read", "()I", native_bais_read);
+    registry.register(
+        "java/io/InputStream",
+        "read",
+        "([B)I",
+        native_bais_read_byte_array,
+    );
     registry.register(
         "java/io/InputStream",
         "read",

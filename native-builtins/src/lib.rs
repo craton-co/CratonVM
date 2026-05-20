@@ -3284,13 +3284,40 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Thread", "interrupt0", "()V", native_thread_interrupt);
     // Also register public interrupt() so it works on synthetic Thread stubs
     registry.register("java/lang/Thread", "interrupt", "()V", native_thread_interrupt);
-    registry.register("java/lang/Thread", "getPriority", "()I", |_ctx, _args| {
+    // getPriority / isDaemon / setDaemon: in real-JDK mode these live on
+    // `Thread.holder` (a `Thread$FieldHolder`).  These natives shadow the
+    // real Java methods, so they must read/write through `holder` when it
+    // is present.  When `holder` is null (synthetic-JDK Thread, or a
+    // not-fully-constructed Thread) they fall back to spec defaults.
+    registry.register("java/lang/Thread", "getPriority", "()I", |ctx, args| {
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if let Value::Object(Some(holder)) = ctx.get_field_by_name(*this, "holder") {
+                if let Value::Int(p) = ctx.get_field_by_name(holder, "priority") {
+                    return Ok(Some(Value::Int(p)));
+                }
+            }
+        }
         Ok(Some(Value::Int(5)))
     });
-    registry.register("java/lang/Thread", "isDaemon", "()Z", |_ctx, _args| {
+    registry.register("java/lang/Thread", "isDaemon", "()Z", |ctx, args| {
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if let Value::Object(Some(holder)) = ctx.get_field_by_name(*this, "holder") {
+                if let Value::Int(d) = ctx.get_field_by_name(holder, "daemon") {
+                    return Ok(Some(Value::Int(if d != 0 { 1 } else { 0 })));
+                }
+            }
+        }
         Ok(Some(Value::Int(0)))
     });
-    registry.register("java/lang/Thread", "setDaemon", "(Z)V", native_noop_with_this);
+    registry.register("java/lang/Thread", "setDaemon", "(Z)V", |ctx, args| {
+        if let Some(Value::Object(Some(this))) = args.first() {
+            let on = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+            if let Value::Object(Some(holder)) = ctx.get_field_by_name(*this, "holder") {
+                ctx.set_field_by_name(holder, "daemon", Value::Int(if on { 1 } else { 0 }));
+            }
+        }
+        Ok(None)
+    });
     // NOTE: do NOT register a `getThreadGroup` shim that returns null.
     // In real-JDK mode the Thread class has a Java implementation
     // (`return holder.group`) and shadowing it with a null-returning
@@ -3307,6 +3334,78 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // raw slots 0..3 there corrupts the object. We detect by num_fields:
     // synthetic Thread has at most ~6 slots; real-JDK Thread has 20+.
     fn is_synthetic_thread_layout(num_fields: usize) -> bool { num_fields <= 8 }
+
+    // Real-JDK Thread layout: `priority`, `daemon`, `threadStatus`,
+    // `stackSize` live inside a nested `java.lang.Thread$FieldHolder`
+    // referenced by `Thread.holder`; only `name`/`holder`/`tid`/etc. are
+    // direct fields.  When these `<init>` natives intercept a real-JDK
+    // Thread they must populate a genuine `FieldHolder` — otherwise
+    // `Thread.setPriority` (`holder.priority = ...`), `getState`
+    // (`holder.threadStatus`) and `isDaemon` (`holder.daemon`) all NPE,
+    // and `jdk.internal.ref.CleanerImpl.getCleanerImpl` (used by the real
+    // `Cleaner.create()` bytecode) fails downstream.  Allocate + run the
+    // real `FieldHolder(ThreadGroup, Runnable, long, int, boolean)` ctor.
+    fn populate_real_thread_holder(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        group: Value,
+        target: Value,
+        name: Value,
+    ) {
+        ctx.set_field_by_name(this, "name", name);
+        // Don't clobber an already-populated holder (e.g. if the real
+        // Java constructor somehow ran first, or a re-entrant call).
+        if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
+            return;
+        }
+        let holder_class = match ctx.ensure_class_initialized("java/lang/Thread$FieldHolder") {
+            Ok(cid) => cid,
+            Err(_) => return,
+        };
+        let nfields = ctx.class_num_total_fields(holder_class).max(1);
+        let holder = ctx.alloc_object(holder_class, nfields);
+        // A real ThreadGroup is required: the FieldHolder ctor stores it,
+        // and `Thread.getThreadGroup()` returns `holder.group`.  Fall back
+        // to the current thread's group when the caller passed null.
+        let group = match group {
+            Value::Object(Some(_)) => group,
+            _ => {
+                let cur = ctx.current_thread_object();
+                let g = ctx.get_field_by_name(cur, "holder");
+                match g {
+                    Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
+                    _ => Value::Object(None),
+                }
+            }
+        };
+        let args = [
+            Value::Object(Some(holder)),
+            group,
+            target,
+            Value::Long(0),  // stackSize
+            Value::Int(5),   // priority = NORM_PRIORITY
+            Value::Int(0),   // daemon = false
+        ];
+        let ctor_ok = ctx
+            .invoke(
+                "java/lang/Thread$FieldHolder",
+                "<init>",
+                "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V",
+                &args,
+            )
+            .is_ok();
+        if !ctor_ok {
+            // Constructor unavailable — populate the known fields directly
+            // so the holder is still usable by getPriority/isDaemon/getState.
+            ctx.set_field_by_name(holder, "group", args[1]);
+            ctx.set_field_by_name(holder, "task", target);
+            ctx.set_field_by_name(holder, "stackSize", Value::Long(0));
+            ctx.set_field_by_name(holder, "priority", Value::Int(5));
+            ctx.set_field_by_name(holder, "daemon", Value::Int(0));
+            ctx.set_field_by_name(holder, "threadStatus", Value::Int(0));
+        }
+        ctx.set_field_by_name(this, "holder", Value::Object(Some(holder)));
+    }
     registry.register(
         "java/lang/Thread",
         "<init>",
@@ -3317,22 +3416,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
-                // Real-JDK Thread: let the Java constructor run (this native
-                // shouldn't intercept). Return MethodCallFailed::NotImplemented
-                // would be ideal, but we don't have that wired; instead we
-                // do nothing — the JDK constructor body still executed
-                // before this native was dispatched only if the native
-                // wasn't bound. Since we ARE bound, we have to manually
-                // delegate. Fall back to calling the field-resolution path.
+                // Real-JDK Thread: this native intercepts the real Java
+                // constructor, so we must populate the `holder:FieldHolder`
+                // it would otherwise build (see populate_real_thread_holder).
                 let group = args.get(1).cloned().unwrap_or(Value::Object(None));
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
                 let name_val = args.get(3).cloned().unwrap_or_else(|| {
                     Value::Object(Some(ctx.create_string("Thread")))
                 });
-                ctx.set_field_by_name(this, "name", name_val);
-                ctx.set_field_by_name(this, "priority", Value::Int(5));
-                ctx.set_field_by_name(this, "group", group);
-                ctx.set_field_by_name(this, "target", target);
+                populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
             }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -3363,10 +3455,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => Value::Object(Some(s)),
                     _ => Value::Object(Some(ctx.create_string("Thread"))),
                 };
-                ctx.set_field_by_name(this, "name", name_val);
-                ctx.set_field_by_name(this, "priority", Value::Int(5));
-                ctx.set_field_by_name(this, "group", group);
-                ctx.set_field_by_name(this, "target", target);
+                populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
             }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -3398,10 +3487,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     Value::Object(Some(s)) => Value::Object(Some(s)),
                     _ => Value::Object(Some(ctx.create_string("Thread"))),
                 };
-                ctx.set_field_by_name(this, "name", name_val);
-                ctx.set_field_by_name(this, "priority", Value::Int(5));
-                ctx.set_field_by_name(this, "group", group);
-                ctx.set_field_by_name(this, "target", target);
+                populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
             }
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
@@ -4145,9 +4231,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // --- Throwable additional signatures ---
     // JDK 9+: Throwable.getStackTraceDepth / getStackTraceElement are used
-    // by Throwable.getOurStackTrace() when a backtrace object exists.
-    registry.register("java/lang/Throwable", "getStackTraceDepth", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    registry.register("java/lang/Throwable", "getStackTraceElement", "(I)Ljava/lang/StackTraceElement;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // by Throwable.getOurStackTrace() on older JDKs when a backtrace object
+    // exists. Use the real implementations (which read the identity-hash-keyed
+    // trace store) rather than null-stubs — the stubs forced depth 0 / null
+    // frames in real-JDK mode, where `register_synthetic_overrides` (the only
+    // other place these were wired correctly) is never called.
+    registry.register("java/lang/Throwable", "getStackTraceDepth", "()I", native_throwable_get_stack_trace_depth);
+    registry.register("java/lang/Throwable", "getStackTraceElement", "(I)Ljava/lang/StackTraceElement;", native_throwable_get_stack_trace_element);
 
     // =======================================================================
     // Session 10: Native Method Bridging — register all remaining ACC_NATIVE
@@ -4557,7 +4647,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java/lang/StackTraceElement ---
     registry.register("java/lang/StackTraceElement", "initStackTraceElement", "(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V", native_noop_with_this);
-    registry.register("java/lang/StackTraceElement", "initStackTraceElements", "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V", native_noop);
+    // `initStackTraceElements` MUST populate the array — real-JDK
+    // `Throwable.getOurStackTrace()` calls `StackTraceElement.of(backtrace,
+    // depth)` which allocates the STE[] and delegates here. A no-op left
+    // every real-JDK `printStackTrace()` / `getStackTrace()` empty.
+    registry.register("java/lang/StackTraceElement", "initStackTraceElements", "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V", native_init_stack_trace_elements);
 
     // --- java/lang/reflect/Executable + Field ---
     registry.register("java/lang/reflect/Executable", "getParameters0", "()[Ljava/lang/reflect/Parameter;", |_ctx, _args| Ok(Some(Value::Object(None))));
@@ -16013,13 +16107,51 @@ fn native_matcher_find(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         let abs_end = offset + m.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
-        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
+        // Java `Matcher.find()` semantics: the next search starts at the end
+        // of this match. But for a **zero-width** match (`abs_end == abs_start`)
+        // the next search MUST advance by one position — otherwise `find()`
+        // re-matches the same empty string forever (Tomcat's `Bootstrap.getPaths`
+        // loops `Matcher.find()` over `(\"[^\"]*\")|(([^,])*)`, whose second
+        // branch matches empty, and hangs the whole VM). HotSpot's `Matcher`
+        // does this via `if (nextSearchIndex == first) nextSearchIndex++`.
+        let next_offset = if abs_end == abs_start {
+            advance_one_char(&input, abs_end)
+        } else {
+            abs_end
+        };
+        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(next_offset as i32));
         Ok(Some(Value::Int(1)))
     } else {
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(-1));
         Ok(Some(Value::Int(0)))
     }
+}
+
+/// Advance a byte offset into `text` past exactly one UTF-8 scalar value.
+///
+/// Used by `Matcher.find()` to step past a zero-width match. A bare
+/// `offset + 1` could land in the middle of a multi-byte character and panic
+/// on the next `&text[offset..]` slice, so when `offset` is inside the string
+/// we round up to the next char boundary.
+///
+/// When `offset` is already at the end of the string (a valid zero-width
+/// match position — e.g. `$` or `x*` matching `[len,len]`), we return
+/// `text.len() + 1`. That is deliberately one past the end so the *next*
+/// `find()` trips its `offset > input.len()` guard and cleanly reports "no
+/// match" — mirroring HotSpot's `Matcher.find()`, which advances
+/// `nextSearchIndex` past `to` and then returns `false`. Returning `text.len()`
+/// here instead would let `find()` re-match the empty string at the end
+/// forever.
+fn advance_one_char(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len() + 1;
+    }
+    let mut next = offset + 1;
+    while next < text.len() && !text.is_char_boundary(next) {
+        next += 1;
+    }
+    next
 }
 
 /// `Matcher.find(int start)` — reset the search position to `start` and look
@@ -16053,7 +16185,15 @@ fn native_matcher_find_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         let abs_end = offset + m.end;
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(abs_start as i32));
         ctx.set_field(this, MAT_FIELD_MATCH_END, Value::Int(abs_end as i32));
-        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(abs_end as i32));
+        // Zero-width match: advance the stored offset so a following no-arg
+        // `find()` does not re-match the empty string in place. See
+        // `native_matcher_find` for the full rationale.
+        let next_offset = if abs_end == abs_start {
+            advance_one_char(&input, abs_end)
+        } else {
+            abs_end
+        };
+        ctx.set_field(this, MAT_FIELD_OFFSET, Value::Int(next_offset as i32));
         Ok(Some(Value::Int(1)))
     } else {
         ctx.set_field(this, MAT_FIELD_MATCH_START, Value::Int(-1));

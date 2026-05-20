@@ -109,15 +109,13 @@ impl DeviceContextInner {
         // Drain every stream we own. Any in-flight pipeline stage —
         // upload, kernel, download — must complete before we return.
         //
-        // NOTE: `CudaDevice::wait_for` only makes the device's *default*
-        // stream wait on another stream — it is asynchronous w.r.t. the
-        // host and does NOT block the calling thread. To actually block
-        // the host until in-flight work finishes we must call
-        // `CudaStream::synchronize` (cuStreamSynchronize) on each stream.
-        self.copy_h2d.synchronize().map_err(map_err("synchronize copy_h2d"))?;
-        self.compute.synchronize().map_err(map_err("synchronize compute"))?;
-        self.copy_d2h.synchronize().map_err(map_err("synchronize copy_d2h"))?;
-        self.default.synchronize().map_err(map_err("synchronize default"))?;
+        // `CudaDevice::synchronize` (`cuCtxSynchronize`) host-blocks the
+        // calling thread until ALL streams on the context — `copy_h2d`,
+        // `compute`, `copy_d2h`, and the default stream — have drained.
+        // (`CudaDevice::wait_for` only makes the default stream wait on
+        // another stream and does NOT block the host, so it cannot be
+        // used here.)
+        self.dev.synchronize().map_err(map_err("synchronize device"))?;
         Ok(())
     }
 
@@ -149,16 +147,18 @@ pub(crate) struct DeviceModuleInner {
 // the borrow is taken and released entirely inside `launch_raw`.
 thread_local! {
     static PTR_SCRATCH: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-    /// PERF: the `Vec<*mut c_void>` of marshalled kernel arguments handed
-    /// to cudarc's `launch_on_stream` was freshly heap-allocated on every
-    /// launch. Hoist it into a second thread-local scratch, reused
-    /// (cleared + refilled) across launches exactly like `PTR_SCRATCH`.
+    /// AUDIT 2026-05-20 (PERF Fix #3): pool for the per-launch
+    /// `Vec<*mut c_void>` of marshalled kernel arguments handed to
+    /// cudarc's `launch_on_stream`. Previously a fresh heap allocation
+    /// per `launch_raw`; pooled here the same way as `PTR_SCRATCH` so
+    /// steady-state launches are allocation-free.
     ///
     /// The raw pointers stored here are only ever valid for the duration
     /// of one `launch_raw_inner` call (they point into that call's `args`
     /// and into `PTR_SCRATCH`). The scratch is emptied before being
     /// returned to the thread-local, so no dangling pointer is retained
-    /// between launches — only the heap allocation is kept.
+    /// between launches — only the heap allocation is kept. `*mut c_void`
+    /// is not `Send`, but the vec never crosses threads.
     static ARG_SCRATCH: RefCell<Vec<*mut std::ffi::c_void>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -309,19 +309,26 @@ impl DeviceModuleInner {
         // device address: `ptr_h` provides that storage and is kept live
         // (not moved or dropped) until after `launch_on_stream` returns.
         //
-        // PERF Fix 2: reuse the thread-local `ARG_SCRATCH` allocation
-        // instead of collecting a fresh `Vec` per launch. Rent it out by
-        // `take`-ing it (same pattern as `PTR_SCRATCH` above), clear,
-        // pre-size, and refill. Both `args` and `ptr_h` remain live
-        // through the `launch_on_stream` call below, so every pointer is
-        // valid for the launch exactly as before.
-        let mut launch_args =
+        // LIFETIME INVARIANT (enforced below): every pointer in
+        // `launch_args` borrows INTO either `args.raw`'s backing store or
+        // `ptr_h`'s backing store. Both `args` and `ptr_h` MUST stay live
+        // and un-reallocated until `launch_on_stream` has returned. We
+        // bind `arg_store` as an explicit `&Vec<KernelArg>` reference so
+        // the borrow checker pins `args` for at least the span of that
+        // reference, and we add a `_keep_alive` anchor after the launch
+        // so any future refactor that drops `args`/`ptr_h` early fails to
+        // compile.
+        let arg_store: &Vec<KernelArg> = &args.raw;
+        let mut ip = 0usize;
+        // AUDIT 2026-05-20 (PERF Fix #3): rent the thread-local pointer-vec
+        // scratch instead of allocating a fresh `Vec` per launch. Same
+        // rent/clear/refill/return-via-drop pattern as `PTR_SCRATCH`.
+        let mut launch_args: Vec<*mut std::ffi::c_void> =
             ARG_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         launch_args.clear();
-        launch_args.reserve(args.raw.len());
-        let mut ip = 0usize;
-        for a in &args.raw {
-            let p = match a {
+        launch_args.reserve(arg_store.len());
+        launch_args.extend(arg_store.iter().map(|a| {
+            match a {
                 KernelArg::I32(v) => v as *const i32 as *mut std::ffi::c_void,
                 KernelArg::I64(v) => v as *const i64 as *mut std::ffi::c_void,
                 KernelArg::F32(v) => v as *const f32 as *mut std::ffi::c_void,
@@ -333,28 +340,59 @@ impl DeviceModuleInner {
                     ip += 1;
                     slot
                 }
-            };
-            launch_args.push(p);
-        }
+            }
+        }));
 
         // cudarc 0.13's `LaunchAsync::launch_on_stream` consumes the
         // `CudaFunction` by value (`self`). `CudaFunction` is not
         // `Copy`, and `self.functions` only lends a `&CudaFunction`, so
         // we clone it for the launch — the clone is cheap (it wraps an
         // `Arc<CudaModule>` plus a raw `CUfunction` handle).
+        //
+        // SAFETY: `launch_on_stream` reads, for every entry of
+        // `launch_args`, the bytes the entry points at. Those bytes live
+        // in two backing stores that MUST remain allocated, un-moved, and
+        // un-reallocated for the full duration of this call:
+        //   * `args.raw` (aliased here as `arg_store`) — holds every
+        //     scalar `KernelArg` value; the scalar pointers in
+        //     `launch_args` point directly at those `Vec` elements.
+        //   * `ptr_h` — the thread-local-rented `Vec<u64>` of device-
+        //     address slots; the `DevicePtr` pointers in `launch_args`
+        //     point at its elements.
+        // `launch_on_stream` is synchronous on the host side w.r.t.
+        // argument marshalling: it copies the pointed-at parameter bytes
+        // into the driver before returning, so the pointers only need to
+        // be valid until this call returns (not until the kernel runs).
+        // `func.clone()` does not touch either store. Neither `args` nor
+        // `ptr_h` is mutated, moved, or reallocated between building
+        // `launch_args` and this call. The `_keep_alive` binding after
+        // the launch ties both objects' lifetimes past this point so the
+        // contract is compiler-enforced against future refactors.
         let launch_result = unsafe {
             func.clone()
                 .launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
                 .map_err(map_err("kernel launch"))
         };
-        // Restore both scratch vecs into their thread-locals with their
-        // (possibly grown) capacities intact, regardless of launch
-        // outcome. `launch_args` is cleared first so no stale raw
-        // pointers are retained between launches.
+        // Liveness anchor: `launch_on_stream` has returned, so the raw
+        // pointers in `launch_args` are no longer dereferenced by the
+        // driver. Borrowing `args` and `ptr_h` here forces the borrow
+        // checker to keep both alive across the `unsafe` launch above —
+        // a future refactor that drops/moves either before this point
+        // will fail to compile rather than silently introduce UB.
+        let _keep_alive: (&KernelArgs, &Vec<u64>) = (&args, &ptr_h);
+        // AUDIT 2026-05-20 (PERF Fix #3): return the pointer-vec scratch
+        // to its thread-local with capacity intact. The launch has
+        // returned, so the driver no longer dereferences these pointers;
+        // `_keep_alive` already pinned the backing stores across the
+        // launch. Cleared before storing so no dangling pointers linger.
         ARG_SCRATCH.with(|cell| {
             launch_args.clear();
             *cell.borrow_mut() = launch_args;
         });
+        // Restore the scratch vec into the thread-local with its
+        // (possibly grown) capacity intact, regardless of launch
+        // outcome. Safe to consume `ptr_h` now: the launch has returned
+        // and `_keep_alive` has already pinned it across the launch.
         PTR_SCRATCH.with(|cell| {
             ptr_h.clear();
             *cell.borrow_mut() = ptr_h;
@@ -373,17 +411,27 @@ impl DeviceModuleInner {
 /// Round-5: H→D upload helper.
 ///
 /// Uploads via pageable memory. In cudarc 0.13, the pinned API is not
-/// available, so we use the standard htod_copy method.
+/// available, so we use the standard slice-based htod copy.
 ///
 /// The wrapper still exists today so:
 ///   * `from_host` has a single call site to upgrade if pinned API becomes available,
 ///   * the fallback semantics are explicit.
+///
+/// AUDIT 2026-05-20 (PERF Fix): previously this did
+/// `ctx.dev.htod_copy(host.to_vec())`. `htod_copy` takes an *owned*
+/// `Vec`, so `host.to_vec()` cloned the entire input slice into a fresh
+/// heap allocation before the H→D transfer — doubling host memory
+/// traffic per upload. cudarc 0.13's `htod_sync_copy` takes `&[T]`
+/// directly and memcpys it straight to the device, so the redundant
+/// allocation+copy is gone. `htod_sync_copy` is synchronous (it does
+/// not retain the host buffer), which is why the `Unpin` bound is no
+/// longer required.
 #[inline]
-fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + std::marker::Unpin>(
+fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static>(
     ctx: &DeviceContextInner,
     host: &[T],
 ) -> Result<CudaSlice<T>> {
-    // Pageable path for cudarc 0.13 - pinned API not available in this version
+    // Pageable path for cudarc 0.13 - pinned API not available in this version.
     // Functionally correct; the only cost is the implicit driver-side
     // bounce buffer.
     //
@@ -424,16 +472,26 @@ pub(crate) struct DeviceBufferInner<T> {
     compute: Arc<CudaStream>,
 }
 
+/// Reject element counts whose byte size overflows `usize` before
+/// handing `len` to the driver, which would otherwise allocate a
+/// wrapped (too-small) buffer (or wrap inside cudarc).
+///
+/// AUDIT 2026-05-20 (PERF Fix #4): shared guard for `uninit` and
+/// `zeros` — `zeros` previously called `alloc_zeros::<T>(len)` with no
+/// overflow check at all.
+#[inline]
+fn check_alloc_size<T>(stage: &str, len: usize) -> Result<()> {
+    len.checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| DeviceError::Driver(format!(
+            "{stage}: size overflow ({len} elements of {} bytes)",
+            std::mem::size_of::<T>()
+        )))?;
+    Ok(())
+}
+
 impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBufferInner<T> {
     pub(crate) fn uninit(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
-        // Reject element counts whose byte size overflows `usize` before
-        // handing `len` to the driver, which would otherwise allocate a
-        // wrapped (too-small) buffer.
-        len.checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| DeviceError::Driver(
-                format!("alloc uninit: size overflow ({len} elements of {} bytes)",
-                    std::mem::size_of::<T>())
-            ))?;
+        check_alloc_size::<T>("alloc uninit", len)?;
         // Output buffers are bound to the compute stream — the kernel
         // launch that fills them already runs there.
         let slice = unsafe {
@@ -451,6 +509,9 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
     }
 
     pub(crate) fn zeros(ctx: &DeviceContextInner, len: usize) -> Result<Self> {
+        // AUDIT 2026-05-20 (PERF Fix #4): same overflow guard as `uninit`
+        // — `alloc_zeros` would otherwise wrap inside cudarc on a huge `len`.
+        check_alloc_size::<T>("alloc_zeros", len)?;
         let slice = ctx.dev
             .alloc_zeros::<T>(len)
             .map_err(map_err("alloc_zeros"))?;
@@ -517,13 +578,14 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         // such event exists, so the copy below could race ahead of the
         // kernel and read stale device memory.
         //
-        // To guarantee correctness for every launch path, host-block on
-        // the compute stream here before issuing the copy. This is the
-        // only stream a kernel can have run on; once it is drained the
-        // device buffer holds the kernel's output.
-        self.compute
+        // To guarantee correctness for every launch path, host-block the
+        // device here before issuing the copy. `CudaDevice::synchronize`
+        // (`cuCtxSynchronize`) drains every stream — including the
+        // dedicated `compute` stream a kernel can have run on — so once
+        // it returns the device buffer holds the kernel's output.
+        self.dev
             .synchronize()
-            .map_err(map_err("synchronize compute before D→H"))?;
+            .map_err(map_err("synchronize device before D→H"))?;
         self.dev
             .dtoh_sync_copy_into(&self.slice, dst)
             .map_err(map_err("memcpy device→host"))

@@ -905,16 +905,37 @@ unsafe fn emit_osr_trampoline(
     tramp.emit_byte(0x89);
     tramp.emit_byte(0xC0 | ((arg0_reg & 7) << 3) | 2);
 
+    // CRITICAL: the callee-saved registers MUST be spilled to the exact
+    // frame slots the compiled method's epilogue restores them from.
+    //
+    // The epilogue (`x64::Compiler::emit_epilogue`) iterates
+    // `alloc_used_regs` — which is `RegAllocResult::used_callee_saved` —
+    // and restores register `i` from `[rbp - (callee_saved_base + i*8)]`.
+    // `used_callee_saved` is produced by filtering the fixed `LOCAL_REGS`
+    // priority list, so it is always in `LOCAL_REGS` order.
+    //
+    // If the trampoline spills the registers in any other order (e.g.
+    // local-slot first-appearance order, which can differ when the
+    // allocator assigns a higher-priority register to a higher-numbered
+    // local), then register X's value lands in the slot the epilogue
+    // reads register Y from. After OSR return, the method's epilogue
+    // restores the callee-saved registers SWAPPED — and since these hold
+    // the caller's live (often pointer-typed) values, the caller resumes
+    // with corrupted registers and segfaults on the next dereference.
+    //
+    // Therefore: always emit the spill set in `LOCAL_REGS` order.
     let used_regs: Vec<u8> = if let Some(assignments) = local_assignments {
-        let mut regs = Vec::new();
+        let mut used = [false; 16];
         for &a in assignments {
             if let Some(reg) = a {
-                if !regs.contains(&reg) {
-                    regs.push(reg);
-                }
+                used[(reg & 0x0F) as usize] = true;
             }
         }
-        regs
+        LOCAL_REGS
+            .iter()
+            .copied()
+            .filter(|&r| used[(r & 0x0F) as usize])
+            .collect()
     } else {
         LOCAL_REGS.iter().copied().take(num_reg_locals).collect()
     };
