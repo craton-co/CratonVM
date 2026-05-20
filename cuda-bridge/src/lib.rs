@@ -79,6 +79,27 @@ pub fn probe() -> Result<DeviceCaps> {
 #[derive(Clone)]
 pub struct DeviceContext(backend::DeviceContextInner);
 
+// cudarc 0.13's `CudaStream` does not impl `Send`/`Sync` because it
+// holds a raw `sys::CUstream` (a `*mut CUstream_st`). The CUDA driver
+// docs explicitly permit using a stream from any thread that has
+// initialized the context, so the raw pointer is logically thread-safe;
+// cudarc itself impls `Send`/`Sync` for `CudaDevice`, `CudaModule`, and
+// `CudaFunction` on exactly the same grounds, and the missing impls on
+// `CudaStream` are an upstream oversight (filed: `coreylowman/cudarc#318`).
+//
+// The `cuda`-backed `DeviceContextInner` owns four `Arc<CudaStream>`s,
+// so it inherits the missing impls. `stream.rs`'s `Stream` wrapper and
+// `event.rs`'s `EventCuda` already carry the identical `unsafe impl`
+// pair for the same reason; this asserts the same safety condition for
+// `DeviceContext` so downstream consumers (notably the VM's
+// `OffloadCache`, which is reachable from the `Send + Sync` `SharedVm`)
+// can store it across threads.
+//
+// In stub mode `DeviceContextInner` is a unit struct and is trivially
+// `Send + Sync`; these impls are harmless there.
+unsafe impl Send for DeviceContext {}
+unsafe impl Sync for DeviceContext {}
+
 impl DeviceContext {
     /// Create or attach to the primary context on `device_ordinal`.
     pub fn new(device_ordinal: u32) -> Result<Self> {
@@ -281,8 +302,108 @@ pub(crate) enum KernelArg {
 /// `len()`.
 pub struct DeviceBuffer<T>(pub(crate) backend::DeviceBufferInner<T>);
 
+// ── Device-element bound ─────────────────────────────────────────────
+//
+// `DeviceBuffer<T>`'s allocation/transfer methods (`uninit`, `zeros`,
+// `from_host`, `to_host`) need different `T` bounds depending on the
+// build mode:
+//
+//   * `cuda`     — cudarc requires `T: DeviceRepr + ValidAsZeroBits +
+//                  Unpin` (plus `bytemuck::Pod + Send + Sync + 'static`).
+//   * stub       — no driver, so only `bytemuck::Pod + Send + Sync +
+//                  'static` is meaningful.
+//
+// Downstream crates (the VM's `gpu_marshal` wrappers) are generic over
+// `T` but cannot name cudarc's traits — `cudarc` is not, and must not
+// become, a direct dependency of `cratonvm-vm`. `DeviceElem` is the
+// single public bound that bundles whatever the active backend needs,
+// so callers write `T: DeviceElem` and stay backend-agnostic.
+//
+// It is a sealed trait with a blanket impl: any `T` that satisfies the
+// underlying per-mode bounds automatically implements `DeviceElem`, and
+// no downstream crate can add its own impls.
+mod device_elem_seal {
+    pub trait Sealed {}
+}
+
+/// Marker bound for types that can back a [`DeviceBuffer`].
+///
+/// Bundles every per-backend trait requirement (`bytemuck::Pod`,
+/// `Send`/`Sync`, `'static`, and — under the `cuda` feature — cudarc's
+/// `DeviceRepr`/`ValidAsZeroBits`/`Unpin`) behind one name so generic
+/// callers do not have to depend on `cudarc` directly. Implemented
+/// automatically for every qualifying primitive (`i8`, `i32`, `i64`,
+/// `f32`, `f64`, …); sealed so the set cannot be widened downstream.
 #[cfg(feature = "cuda")]
-impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + std::marker::Unpin> DeviceBuffer<T> {
+pub trait DeviceElem:
+    bytemuck::Pod
+    + Send
+    + Sync
+    + 'static
+    + cudarc::driver::DeviceRepr
+    + cudarc::driver::ValidAsZeroBits
+    + std::marker::Unpin
+    + device_elem_seal::Sealed
+{
+}
+
+/// Marker bound for types that can back a [`DeviceBuffer`].
+///
+/// See the `cuda`-feature variant for the full rationale. In stub mode
+/// there is no driver, so the bound collapses to `bytemuck::Pod + Send +
+/// Sync + 'static`.
+#[cfg(not(feature = "cuda"))]
+pub trait DeviceElem:
+    bytemuck::Pod + Send + Sync + 'static + device_elem_seal::Sealed
+{
+}
+
+#[cfg(feature = "cuda")]
+impl<T> device_elem_seal::Sealed for T where
+    T: bytemuck::Pod
+        + Send
+        + Sync
+        + 'static
+        + cudarc::driver::DeviceRepr
+        + cudarc::driver::ValidAsZeroBits
+        + std::marker::Unpin
+{
+}
+
+#[cfg(feature = "cuda")]
+impl<T> DeviceElem for T where
+    T: bytemuck::Pod
+        + Send
+        + Sync
+        + 'static
+        + cudarc::driver::DeviceRepr
+        + cudarc::driver::ValidAsZeroBits
+        + std::marker::Unpin
+{
+}
+
+#[cfg(not(feature = "cuda"))]
+impl<T> device_elem_seal::Sealed for T where T: bytemuck::Pod + Send + Sync + 'static {}
+
+#[cfg(not(feature = "cuda"))]
+impl<T> DeviceElem for T where T: bytemuck::Pod + Send + Sync + 'static {}
+
+// `DeviceBufferInner<T>` (cuda backend) holds a `CudaSlice<T>` — which
+// cudarc *does* mark `Send`/`Sync` for `T: Send`/`T: Sync` — plus a set
+// of `Arc<CudaStream>` retained for stream-ordered `to_host`. The
+// `CudaStream` fields are the only thing keeping the buffer off the
+// `Send`/`Sync` auto-traits; the same `coreylowman/cudarc#318` reasoning
+// used for `DeviceContext` (above) and `Stream` applies. We mirror
+// `CudaSlice`'s own conditional bounds (`T: Send` / `T: Sync`) so the
+// buffer is exactly as thread-safe as its payload type.
+//
+// In stub mode `DeviceBufferInner<T>` is just a `PhantomData<T>`, so the
+// conditional impls reduce to the auto-trait behaviour anyway.
+unsafe impl<T: Send> Send for DeviceBuffer<T> {}
+unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
+
+#[cfg(feature = "cuda")]
+impl<T: DeviceElem> DeviceBuffer<T> {
     const ASSERT_DEVICE_REPR: () = assert!(
         std::mem::size_of::<T>() > 0,
         "T must implement DeviceRepr when cuda feature is enabled"
@@ -349,7 +470,7 @@ impl<T: bytemuck::Pod + Send + Sync + 'static + cudarc::driver::DeviceRepr + cud
 }
 
 #[cfg(not(feature = "cuda"))]
-impl<T: bytemuck::Pod + Send + Sync + 'static> DeviceBuffer<T> {
+impl<T: DeviceElem> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
         backend::DeviceBufferInner::uninit(&ctx.0, len).map(Self)
