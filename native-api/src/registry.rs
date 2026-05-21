@@ -789,6 +789,25 @@ pub trait NativeContext {
     /// Used by `System.gc()` / `Runtime.gc()`.
     fn force_gc(&mut self);
 
+    /// T19.H1 — mark the start of a *blocking region* inside a native
+    /// method (a spin/poll loop or an OS wait that may run for a long
+    /// time, e.g. `ReferenceQueue.remove`, a selector `select`, a socket
+    /// `accept`).
+    ///
+    /// While inside a blocking region the calling thread is treated as
+    /// GC-safe: its frame roots are published to the registry snapshot
+    /// and a concurrent stop-the-world collector will NOT wait for it to
+    /// reach an interpreter safepoint. Every `begin_blocking_region` MUST
+    /// be paired with exactly one `end_blocking_region`.
+    ///
+    /// The default impl is a no-op so out-of-tree `NativeContext`
+    /// implementors (tests) need not change.
+    fn begin_blocking_region(&mut self) {}
+
+    /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
+    /// Re-syncs the thread with any GC that ran while it was blocked.
+    fn end_blocking_region(&mut self) {}
+
     // -- Reflection metadata methods --
 
     /// Get metadata for all fields declared in this class (not inherited).

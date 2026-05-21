@@ -1200,6 +1200,12 @@ fn run() -> Result<()> {
         // a parking_lot::Mutex when set) is negligible compared to the
         // value of identifying the hang site on intermittent hangs.
         cratonvm_native_api::native_ring::enable(true);
+        // T19.H1 — also enable the dispatch-trace ring. The native-call
+        // ring records only opaque fn-pointers from two dispatch sites;
+        // the dispatch trace records *named* class.method.desc for every
+        // bytecode-method entry and every `safe_native_call`, which is
+        // the actionable diagnostic for "main thread is in native code".
+        cratonvm_vm::dispatch_trace::enable();
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
@@ -1284,6 +1290,14 @@ fn run() -> Result<()> {
                     // buffer. The last entry with `STILL-IN-NATIVE`
                     // marks the hang site.
                     cratonvm_native_api::native_ring::dump_to_stderr();
+                    // T19.H1: dump the dispatch-trace ring too — it
+                    // records *named* class.method.desc for the last
+                    // 256 bytecode-method entries and native dispatches
+                    // (across all threads), so the last few NAT/BC
+                    // entries pinpoint the hung native and its caller.
+                    cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional(
+                        "watchdog-native-hang",
+                    );
                 }
 
                 // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE

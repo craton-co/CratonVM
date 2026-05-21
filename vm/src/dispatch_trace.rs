@@ -58,6 +58,16 @@ pub fn init_from_env() {
     }
 }
 
+/// Programmatically enable dispatch tracing (independent of the
+/// `CRATONVM_DBG_LETSGO` env var). Used by the stack-dump watchdog so a
+/// hang in native code leaves a breadcrumb of the last bytecode/native
+/// dispatch even when the user did not pre-arm tracing.
+pub fn enable() {
+    ENABLED.store(true, Ordering::Relaxed);
+    // Force-init the ring so `record_*` can fill it.
+    let _ = ring();
+}
+
 fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed) as u64
 }

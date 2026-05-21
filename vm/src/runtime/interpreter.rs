@@ -943,7 +943,7 @@ pub fn check_pending_async_exception(
 }
 
 /// Apply a GC pointer map to a thread's frame locals and operand stacks.
-fn apply_pointer_map_to_thread(
+pub(crate) fn apply_pointer_map_to_thread(
     thread: &mut JvmThread,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) {

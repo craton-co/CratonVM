@@ -24,6 +24,28 @@ pub struct GcBarrier {
     /// GC generation counter — incremented after each collection.
     /// Threads compare their local generation to detect missed GCs.
     pub gc_generation: AtomicU64,
+    /// T19.H1 — count of threads currently parked in a *blocking* native
+    /// operation (`Object.wait`, `Thread.sleep`, `LockSupport.park`,
+    /// `Thread.join`, `ReferenceQueue.remove`, selector `select`, …).
+    ///
+    /// Such a thread is GC-safe: before blocking it deposits its frame
+    /// roots into the thread-registry snapshot (`deposit_root_snapshot`),
+    /// and on wake it applies the GC pointer map (`check_post_block_gc`).
+    /// While parked it executes no code and cannot reach an interpreter
+    /// safepoint to call `arrive_and_wait`.
+    ///
+    /// The stop-the-world barrier must therefore NOT include parked
+    /// threads in `expected` — otherwise `wait_for_all` deadlocks waiting
+    /// for a thread that is (correctly) blocked indefinitely, e.g. the
+    /// Reference Handler parked in `ReferenceQueue.remove`. This is the
+    /// JVM `_thread_blocked` state, scoped precisely to genuine blocking
+    /// operations (NOT every native call — a *running* native still
+    /// holds raw `ObjectRef`s in Rust locals and must be waited for so
+    /// the copying collector does not relocate objects under it).
+    ///
+    /// Maintained by `enter_blocked` / `leave_blocked`, called from
+    /// `deposit_root_snapshot` / `check_post_block_gc`.
+    threads_blocked: AtomicU64,
     /// Protected coordination state.
     inner: Mutex<GcBarrierInner>,
     /// Signaled when all expected threads have arrived at the barrier.
@@ -49,6 +71,7 @@ impl GcBarrier {
         Self {
             stw_requested: AtomicBool::new(false),
             gc_generation: AtomicU64::new(0),
+            threads_blocked: AtomicU64::new(0),
             inner: Mutex::new(GcBarrierInner {
                 initiator: None,
                 expected: 0,
@@ -70,11 +93,79 @@ impl GcBarrier {
             return false;
         }
         inner.initiator = Some(initiator);
-        inner.expected = alive_count.saturating_sub(1);
+        // T19.H1 — exclude threads currently parked in a blocking native
+        // from the set we wait for. They are GC-safe (roots already
+        // deposited via `deposit_root_snapshot`) and execute no code, so
+        // they will not reach an interpreter safepoint. Without this, a
+        // STW initiated while e.g. the Reference Handler thread is parked
+        // in `ReferenceQueue.remove` deadlocks `wait_for_all` forever.
+        //
+        // Race analysis (the count may change after this read):
+        //  * blocked→running after the read: the waking thread runs
+        //    `check_post_block_gc`, sees `stw_requested`, and calls
+        //    `arrive_and_wait` — which only ever *over*-counts `arrived`
+        //    (harmless: `wait_for_all` uses a `<` test, and the extra
+        //    `notify_all` is a no-op once already signalled).
+        //  * running→blocked after the read: handled by `enter_blocked`,
+        //    which — if a STW is already active — makes the thread
+        //    arrive at the barrier *before* it parks, so the initiator
+        //    is not left waiting for a thread that counted in `expected`
+        //    and then vanished into a block.
+        let blocked = self.threads_blocked.load(Ordering::Acquire);
+        let blocked_u32 = u32::try_from(blocked).unwrap_or(u32::MAX);
+        inner.expected = alive_count
+            .saturating_sub(1)
+            .saturating_sub(blocked_u32);
         inner.arrived = 0;
         inner.pointer_map.clear();
         self.stw_requested.store(true, Ordering::Release);
         true
+    }
+
+    /// T19.H1 — mark the calling thread as entering a blocking native
+    /// operation (about to park in `wait`/`park`/`sleep`/`select`/…) and
+    /// return a [`BlockedGuard`] that clears the mark on drop.
+    ///
+    /// The guard makes the in-blocked accounting **leak-proof**: even if
+    /// the blocking call returns `Err` via `?` or unwinds, `Drop` still
+    /// decrements the counter, so `request_stw`'s `expected` can never
+    /// drift permanently low (which would make GC stop waiting for live
+    /// mutators).
+    ///
+    /// `pre_stw` on the returned guard is `true` if a stop-the-world
+    /// pause was already in progress at the transition: the caller
+    /// should then `arrive_and_wait` *before* parking, because
+    /// `request_stw` may have counted this thread in `expected` before
+    /// it became blocked.
+    pub fn enter_blocked(&self) -> BlockedGuard<'_> {
+        self.threads_blocked.fetch_add(1, Ordering::AcqRel);
+        BlockedGuard {
+            barrier: self,
+            pre_stw: self.stw_requested.load(Ordering::Acquire),
+        }
+    }
+
+    /// T19.H1 — non-guard variant of `enter_blocked` for native methods
+    /// that open a blocking region via `NativeContext::begin_blocking_region`
+    /// (e.g. `ReferenceQueue.remove`'s poll loop). Must be balanced by
+    /// exactly one `mark_blocked_region_leave`.
+    ///
+    /// Returns `true` if a stop-the-world pause is already in progress
+    /// (caller should `arrive_and_wait`).
+    pub fn mark_blocked_region_enter(&self) -> bool {
+        self.threads_blocked.fetch_add(1, Ordering::AcqRel);
+        self.stw_requested.load(Ordering::Acquire)
+    }
+
+    /// T19.H1 — end a region opened by `mark_blocked_region_enter`.
+    pub fn mark_blocked_region_leave(&self) {
+        self.threads_blocked.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Number of threads currently parked in a blocking native. Used by
+    /// diagnostics and by the watchdog's hang report.
+    pub fn blocked_count(&self) -> u64 {
+        self.threads_blocked.load(Ordering::Acquire)
     }
 
     /// Wait for all expected threads to arrive at the barrier.
@@ -152,6 +243,29 @@ impl GcBarrier {
 impl Default for GcBarrier {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// T19.H1 — RAII guard returned by [`GcBarrier::enter_blocked`].
+///
+/// Holding the guard means "this thread is parked in a blocking native
+/// and is GC-safe". Dropping it (normal return, `?` early-return, or
+/// unwind) decrements the barrier's blocked-thread count, so the
+/// accounting can never leak.
+#[must_use = "dropping the guard immediately ends the blocked state"]
+pub struct BlockedGuard<'a> {
+    barrier: &'a GcBarrier,
+    /// `true` if a stop-the-world pause was already active when the
+    /// thread entered the blocked state. The caller should arrive at the
+    /// barrier before parking — see `GcBarrier::enter_blocked`.
+    pub pre_stw: bool,
+}
+
+impl Drop for BlockedGuard<'_> {
+    fn drop(&mut self) {
+        self.barrier
+            .threads_blocked
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
