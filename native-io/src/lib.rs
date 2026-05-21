@@ -6921,6 +6921,19 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/Path;",
         native_path_to_absolute,
     );
+    // `Path.toRealPath` has no native — without one, the abstract
+    // interface-method dispatch falls back to returning a null Path,
+    // which broke Jetty's `start.jar` launcher: `DirConfigSource.<init>`
+    // does `dir.resolve("start.ini").normalize().toAbsolutePath()
+    // .toRealPath()` inside a `catch (NoSuchFileException)` and expects
+    // the throw when `start.ini` is absent. A null return slipped past
+    // the catch and surfaced downstream as `FS.canReadFile(null)` NPE.
+    registry.register(
+        path,
+        "toRealPath",
+        "([Ljava/nio/file/LinkOption;)Ljava/nio/file/Path;",
+        native_path_to_real_path,
+    );
     registry.register(
         path,
         "normalize",
@@ -7254,6 +7267,90 @@ fn native_path_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     });
     let result = alloc_path(ctx, &abs.to_string_lossy());
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// `java.nio.file.Path.toRealPath([Ljava/nio/file/LinkOption;)` —
+/// returns the *real* path of an existing file, resolving symbolic links.
+///
+/// Unlike `toAbsolutePath`, the JDK contract requires the file to exist:
+/// if it does not, `toRealPath` throws `java.nio.file.NoSuchFileException`
+/// (a subclass of `IOException`). Callers such as Jetty's
+/// `DirConfigSource.<init>` rely on that throw — they wrap the call in
+/// `catch (NoSuchFileException)` to detect a missing `start.ini`. Returning
+/// a null Path here (the pre-fix behaviour of the missing-native fallback)
+/// slipped past the catch and produced a downstream NPE.
+fn native_path_to_real_path(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("Path.toRealPath: null receiver".to_string()),
+                },
+            )));
+        }
+    };
+    let raw = read_path_str(ctx, this);
+    // The stored path string may carry forward slashes and a stray
+    // `/?/` fragment (an artifact of the synthetic Path representation).
+    // Normalize to native separators and drop a leading `?/` / `\?\`
+    // verbatim-prefix remnant before touching the filesystem, so
+    // `canonicalize` sees a well-formed path rather than failing with
+    // a Windows "invalid name" error (os error 123) for a path that is
+    // simply absent.
+    let s = normalize_real_path_input(&raw);
+    // JDK `toRealPath` requires the file to exist; resolve existence
+    // explicitly so a missing file yields `NoSuchFileException` (the
+    // exception Jetty's `DirConfigSource.<init>` catches) regardless of
+    // platform-specific `canonicalize` error mapping.
+    if !std::path::Path::new(&s).exists() {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::NoSuchFileException { path: s },
+        )));
+    }
+    // `std::fs::canonicalize` resolves symlinks for an existing path.
+    match std::fs::canonicalize(&s) {
+        Ok(real) => {
+            // Strip the Windows `\\?\` verbatim prefix that `canonicalize`
+            // adds, so the returned path string matches what the rest of
+            // the launcher (and `toString`) expects.
+            let real_str = real.to_string_lossy();
+            let cleaned = real_str
+                .strip_prefix(r"\\?\")
+                .unwrap_or(&real_str)
+                .to_string();
+            let result = alloc_path(ctx, &cleaned);
+            Ok(Some(Value::Object(Some(result))))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NoSuchFileException { path: s },
+            )))
+        }
+        Err(e) => Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IOException {
+                message: format!("{s}: {e}"),
+            },
+        ))),
+    }
+}
+
+/// Normalize a synthetic-Path string into a well-formed native path:
+/// drop a leading verbatim-prefix remnant (`/?/`, `\?\`, `\\?\`) and
+/// translate separators to the platform's native separator.
+fn normalize_real_path_input(raw: &str) -> String {
+    let mut s = raw;
+    for prefix in [r"\\?\", "/?/", r"\?\"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    if cfg!(windows) {
+        s.replace('/', "\\")
+    } else {
+        s.replace('\\', "/")
+    }
 }
 
 fn native_path_normalize(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
