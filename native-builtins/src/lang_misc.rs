@@ -118,69 +118,75 @@ fn cached_ste_class_id(ctx: &mut dyn NativeContext) -> ClassId {
     ClassId::new(0)
 }
 
-/// Populate a freshly-allocated `java/lang/StackTraceElement` instance.
+/// Populate a freshly-allocated `java/lang/StackTraceElement`'s fields.
 ///
-/// Real-JDK 25 `StackTraceElement` instance layout is NOT
-/// `[declaringClass, methodName, fileName, lineNumber]`. The actual field
-/// order is:
-///   0 declaringClassObject (Class)  1 classLoaderName (String)
-///   2 moduleName (String)           3 moduleVersion (String)
-///   4 declaringClass (String)       5 methodName (String)
-///   6 fileName (String)             7 lineNumber (int)
-///   8 format (byte)
+/// The real JDK 25 `StackTraceElement` instance-field layout is:
+///   slot 0 `declaringClassObject` (Class), 1 `classLoaderName` (String),
+///   2 `moduleName` (String), 3 `moduleVersion` (String),
+///   4 `declaringClass` (String), 5 `methodName` (String),
+///   6 `fileName` (String), 7 `lineNumber` (int), 8 `format` (byte).
 ///
-/// The previous native helpers wrote class/method/file/line into slots
-/// 0..=3, which clobbered `declaringClassObject` with a `String` and left
-/// the real `declaringClass`/`methodName`/`fileName`/`lineNumber` unset.
-/// `StackTraceElement.computeFormat()` then loaded `declaringClassObject`
-/// (a `String`) and dispatched `Class.getClassLoader0()` on it, surfacing
-/// as `NoSuchMethodError: java/lang/String.getClassLoader0` during
-/// Keycloak 26 boot.
+/// Earlier CratonVM code wrote the class/method/file/line into raw slots
+/// 0..=3 — which in the real layout are `declaringClassObject`,
+/// `classLoaderName`, `moduleName`, `moduleVersion`. That meant
+/// `getfield declaringClassObject` returned the *String* class name and
+/// `StackTraceElement.computeFormat()` then did `String.getClassLoader0()`
+/// → `NoSuchMethodError` (Keycloak 26 boot). It also left
+/// `declaringClassObject` null so `computeFormat` would NPE.
 ///
-/// We resolve the slots by field name (correct for the real loaded class)
-/// and fall back to the legacy 0..=3 layout only when the class isn't
-/// loaded yet (early-boot synthetic-stub path).
+/// This helper writes by field name when the real-JDK layout is present
+/// (detected by resolving `declaringClass`), and additionally populates
+/// `declaringClassObject` with the real `Class` mirror so the JDK's
+/// `computeFormat()` runs cleanly. It falls back to the legacy raw-slot
+/// `[class, method, file, line]` placement only for the synthetic-stub
+/// layout (class not carrying the named fields).
 ///
-/// `decl_class_internal` is the `/`-separated internal name of the frame's
-/// declaring class. When the real STE class is loaded we resolve its
-/// `Class` mirror and store it into `declaringClassObject` — real-JDK 25
-/// `StackTraceElement.of(backtrace, depth)` calls `computeFormat()` right
-/// after the native populates the element, and `computeFormat` does
-/// `declaringClassObject.getClassLoader0()`. If the field is left null
-/// (the previous behaviour) `computeFormat` NPEs with
-/// "Cannot invoke getClassLoader0 on null".
-pub(crate) fn write_ste_fields(
+/// `class_slashed` is the internal `/`-separated name (e.g.
+/// `java/lang/Class`); `class_dotted` is the user-facing `.`-separated
+/// form already resolved by the caller.
+pub(crate) fn fill_stack_trace_element(
     ctx: &mut dyn NativeContext,
     ste: ObjectRef,
-    class_name: Value,
-    method_name: Value,
-    file_name: Value,
-    line: Value,
-    decl_class_internal: Option<&str>,
+    class_slashed: &str,
+    class_dotted: &str,
+    method_name: &str,
+    file_name: Option<&str>,
+    line: i32,
 ) {
-    let by_name = ctx
+    let cls_str = ctx.create_string(class_dotted);
+    let meth_str = ctx.create_string(method_name);
+    let file_val = match file_name {
+        Some(f) => Value::Object(Some(ctx.create_string(f))),
+        None => Value::Object(None),
+    };
+
+    // Real-JDK layout iff the loaded class carries a named `declaringClass`
+    // String field. Synthetic-stub StackTraceElement has no named fields.
+    let real_layout = ctx
         .resolve_field_index("java/lang/StackTraceElement", "declaringClass")
         .is_some();
-    if by_name {
-        ctx.set_field_by_name(ste, "declaringClass", class_name);
-        ctx.set_field_by_name(ste, "methodName", method_name);
-        ctx.set_field_by_name(ste, "fileName", file_name);
-        ctx.set_field_by_name(ste, "lineNumber", line);
-        // `declaringClassObject` must be a real `Class` so `computeFormat()`
-        // can call `getClassLoader0()`/`getModule()` on it. Resolve the
-        // mirror from the frame's class name when it is loaded.
-        let mirror = decl_class_internal
-            .and_then(|n| ctx.class_id_by_name(n))
-            .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))));
-        if let Some(m) = mirror {
-            ctx.set_field_by_name(ste, "declaringClassObject", m);
+
+    if real_layout {
+        ctx.set_field_by_name(ste, "declaringClass", Value::Object(Some(cls_str)));
+        ctx.set_field_by_name(ste, "methodName", Value::Object(Some(meth_str)));
+        ctx.set_field_by_name(ste, "fileName", file_val);
+        ctx.set_field_by_name(ste, "lineNumber", Value::Int(line));
+        // Populate the transient `declaringClassObject` with the real Class
+        // mirror so `computeFormat()` (which does
+        // `getfield declaringClassObject; invokevirtual getClassLoader0`)
+        // operates on a genuine Class — not null (NPE) and not a String
+        // (NoSuchMethodError). Leave null if the class isn't loaded yet;
+        // `computeFormat` tolerates a null here via its catch-all handler.
+        if let Some(cid) = ctx.class_id_by_name(class_slashed) {
+            let mirror = ctx.get_class_mirror(cid);
+            ctx.set_field_by_name(ste, "declaringClassObject", Value::Object(Some(mirror)));
         }
     } else {
-        // Synthetic-stub layout (class not loaded): legacy 4-slot order.
-        ctx.set_field(ste, 0, class_name);
-        ctx.set_field(ste, 1, method_name);
-        ctx.set_field(ste, 2, file_name);
-        ctx.set_field(ste, 3, line);
+        // Legacy synthetic-stub layout: [class, method, file, line].
+        ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
+        ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
+        ctx.set_field(ste, 2, file_val);
+        ctx.set_field(ste, 3, Value::Int(line));
     }
 }
 
@@ -364,25 +370,19 @@ pub(crate) fn native_init_stack_trace_elements(
 
     let cap = ctx.array_length(elements);
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().take(cap).enumerate() {
-        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 9);
+        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
             Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
             None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
         };
-        let cls_str = ctx.create_string(&cls_dotted);
-        let meth_str = ctx.create_string(meth);
-        let file_val = match file {
-            Some(f) => Value::Object(Some(ctx.create_string(f))),
-            None => Value::Object(None),
-        };
-        write_ste_fields(
+        fill_stack_trace_element(
             ctx,
             ste,
-            Value::Object(Some(cls_str)),
-            Value::Object(Some(meth_str)),
-            file_val,
-            Value::Int(*line),
-            Some(cls_slashed),
+            cls_slashed,
+            &cls_dotted,
+            meth,
+            file.as_deref(),
+            *line,
         );
         ctx.set_array_element(elements, i, Value::Object(Some(ste)));
     }
@@ -449,28 +449,21 @@ pub(crate) fn native_throwable_get_stack_trace_element(
                      class_dotted: &str,
                      method_name: &str,
                      file_name: Option<&str>,
-                     line: i32,
-                     decl_internal: Option<&str>|
+                     line: i32|
      -> ObjectRef {
         let ste_cid = cached_ste_class_id(ctx);
-        // Size for the real-JDK 9-slot layout; alloc with the larger of
-        // the real field count and 9 so name-based field writes land.
-        let real = ctx.class_num_total_fields(ste_cid);
-        let ste_obj = ctx.alloc_object(ste_cid, real.max(9));
-        let cs = ctx.create_string(class_name);
-        let ms = ctx.create_string(method_name);
-        let file_val = match file_name {
-            Some(f) => Value::Object(Some(ctx.create_string(f))),
-            None => Value::Object(None),
-        };
-        write_ste_fields(
+        // Allocate with the real instance-field count so the named-field
+        // writes in `fill_stack_trace_element` land in valid slots.
+        let n = ctx.class_num_total_fields(ste_cid).max(4);
+        let ste_obj = ctx.alloc_object(ste_cid, n);
+        fill_stack_trace_element(
             ctx,
             ste_obj,
-            Value::Object(Some(cs)),
-            Value::Object(Some(ms)),
-            file_val,
-            Value::Int(line),
-            decl_internal,
+            class_slashed,
+            class_dotted,
+            method_name,
+            file_name,
+            line,
         );
         ste_obj
     };
@@ -491,12 +484,11 @@ pub(crate) fn native_throwable_get_stack_trace_element(
                 &ste.method_name,
                 ste.source_file.as_deref(),
                 ste.line_number,
-                Some(&ste.class_name),
             );
             Ok(Some(Value::Object(Some(obj))))
         }
         None => {
-            let obj = build_ste(ctx, "<unknown>", "<unknown>", None, -1, None);
+            let obj = build_ste(ctx, "<unknown>", "<unknown>", "<unknown>", None, -1);
             Ok(Some(Value::Object(Some(obj))))
         }
     }
@@ -870,7 +862,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     let len = trace_data.len();
     let arr = ctx.new_ref_array(ClassId::new(0), len);
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().enumerate() {
-        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 9);
+        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         // Reuse the dotted-name cache shared with `Class.getName()` so
         // repeat frames in the same trace (recursion) hit the cached
         // Arc<str> instead of re-allocating.
@@ -878,20 +870,14 @@ pub(crate) fn native_throwable_get_stack_trace_array(
             Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
             None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
         };
-        let cls_str = ctx.create_string(&cls_dotted);
-        let meth_str = ctx.create_string(meth);
-        let file_val = match file {
-            Some(f) => Value::Object(Some(ctx.create_string(f))),
-            None => Value::Object(None),
-        };
-        write_ste_fields(
+        fill_stack_trace_element(
             ctx,
             ste,
-            Value::Object(Some(cls_str)),
-            Value::Object(Some(meth_str)),
-            file_val,
-            Value::Int(*line),
-            Some(cls_slashed),
+            cls_slashed,
+            &cls_dotted,
+            meth,
+            file.as_deref(),
+            *line,
         );
         ctx.set_array_element(arr, i, Value::Object(Some(ste)));
     }
@@ -1021,51 +1007,26 @@ pub(crate) fn native_enum_get_declaring_class(
 }
 
 // --- StackTraceElement ---
-// Legacy 4-slot synthetic layout (used only when the real
-// `java/lang/StackTraceElement` class isn't loaded yet). When the real
-// class is loaded, fields are resolved by name — see `ste_read_field` /
-// `ste_write_field` — because the real-JDK 25 instance layout puts
-// `declaringClass`/`methodName`/`fileName`/`lineNumber` at slots 4..=7,
-// not 0..=3.
 const STE_FIELD_CLASS: usize = 0;
 const STE_FIELD_METHOD: usize = 1;
 const STE_FIELD_FILE: usize = 2;
 const STE_FIELD_LINE: usize = 3;
 
-/// Read an STE field by JDK name, falling back to the legacy slot index
-/// when the real class isn't loaded (synthetic-stub layout).
-fn ste_read_field(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    name: &str,
-    legacy_slot: usize,
-) -> Value {
+/// Read a logical StackTraceElement field, layout-aware.
+///
+/// Real-JDK `StackTraceElement` keeps the class-name String in the named
+/// field `declaringClass` (slot 4, after `declaringClassObject` and the
+/// module/loader strings), not slot 0. The legacy synthetic-stub layout
+/// uses raw slots `[class, method, file, line]`. Prefer the named field
+/// when the class carries it; fall back to the raw slot otherwise.
+fn ste_read_field(ctx: &dyn NativeContext, ste: ObjectRef, named: &str, raw_slot: usize) -> Value {
     if ctx
-        .resolve_field_index("java/lang/StackTraceElement", name)
+        .resolve_field_index("java/lang/StackTraceElement", "declaringClass")
         .is_some()
     {
-        ctx.get_field_by_name(this, name)
+        ctx.get_field_by_name(ste, named)
     } else {
-        ctx.get_field(this, legacy_slot)
-    }
-}
-
-/// Write an STE field by JDK name, falling back to the legacy slot index
-/// when the real class isn't loaded (synthetic-stub layout).
-fn ste_write_field(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    name: &str,
-    legacy_slot: usize,
-    value: Value,
-) {
-    if ctx
-        .resolve_field_index("java/lang/StackTraceElement", name)
-        .is_some()
-    {
-        ctx.set_field_by_name(this, name, value);
-    } else {
-        ctx.set_field(this, legacy_slot, value);
+        ctx.get_field(ste, raw_slot)
     }
 }
 
@@ -1074,50 +1035,36 @@ pub(crate) fn native_ste_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let class_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    ste_write_field(ctx, this, "declaringClass", STE_FIELD_CLASS, class_val);
-    ste_write_field(
+    // The 4-arg ctor is `(declaringClass, methodName, fileName, lineNumber)`.
+    // Decode the String args and route through the shared layout-aware
+    // filler so real-JDK STEs get `declaringClass`/`methodName`/... in the
+    // correct named slots (and `declaringClassObject` populated).
+    let class_dotted = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let method = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let file = match args.get(3) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let line = match args.get(4) {
+        Some(Value::Int(n)) => *n,
+        _ => -1,
+    };
+    let class_slashed = class_dotted.replace('.', "/");
+    fill_stack_trace_element(
         ctx,
         this,
-        "methodName",
-        STE_FIELD_METHOD,
-        args.get(2).copied().unwrap_or(Value::Object(None)),
+        &class_slashed,
+        &class_dotted,
+        &method,
+        file.as_deref(),
+        line,
     );
-    ste_write_field(
-        ctx,
-        this,
-        "fileName",
-        STE_FIELD_FILE,
-        args.get(3).copied().unwrap_or(Value::Object(None)),
-    );
-    ste_write_field(
-        ctx,
-        this,
-        "lineNumber",
-        STE_FIELD_LINE,
-        args.get(4).copied().unwrap_or(Value::Int(-1)),
-    );
-    // Populate `declaringClassObject` so `computeFormat()` (called lazily
-    // by `toString()` on the real class) does not NPE on a null Class.
-    // Derive the internal name from the dotted class-name string arg.
-    if ctx
-        .resolve_field_index("java/lang/StackTraceElement", "declaringClassObject")
-        .is_some()
-    {
-        if let Value::Object(Some(s)) = class_val {
-            if let Some(dotted) = ctx.read_string(s) {
-                let internal = dotted.replace('.', "/");
-                if let Some(cid) = ctx.class_id_by_name(&internal) {
-                    let mirror = ctx.get_class_mirror(cid);
-                    ctx.set_field_by_name(
-                        this,
-                        "declaringClassObject",
-                        Value::Object(Some(mirror)),
-                    );
-                }
-            }
-        }
-    }
     Ok(None)
 }
 
