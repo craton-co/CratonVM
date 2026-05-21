@@ -61,6 +61,12 @@ fn get_or_create_default(ctx: &mut dyn NativeContext) -> MethodCallResult {
         .lock()
         .insert(locale_obj, ("en", "US", "en-US"));
 
+    // Populate the real-JDK `baseLocale` instance field. Without this, any
+    // un-overridden `Locale` method that runs as bytecode (e.g.
+    // `Locale.equals` -> `baseLocale.equals(...)`) NPEs on the null field.
+    // `locale_populate` also records the data in the lib.rs side table.
+    crate::locale_populate(ctx, locale_obj, "en", "US", "");
+
     *cached_default_locale().lock() = Some(locale_obj);
     Ok(Some(Value::Object(Some(locale_obj))))
 }

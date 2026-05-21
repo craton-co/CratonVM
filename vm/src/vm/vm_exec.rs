@@ -1660,7 +1660,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        self.shared.heap.alloc_object(class_id, num_fields)
+        // Layout-mismatch guard: many native allocators hard-code a
+        // synthetic field count (e.g. `HashSet` => 1) that is SMALLER
+        // than the real JDK class layout. When real-JDK bytecode later
+        // executes `getfield`/`putfield` at the declared (inherited)
+        // field indices, the access runs past the undersized object —
+        // `gen_heap::get_field` then drops the read and the object's
+        // state silently corrupts (observed as Kafka 3.7 boot failures:
+        // `java/util/HashSet` allocated with num_slots=1 but
+        // real_field_count=3).
+        //
+        // Clamp the requested slot count UP to the resolved class's real
+        // declared instance-field count. This is the single, general fix
+        // point: every native allocator routes through this trait method,
+        // so individual call sites no longer need to remember to
+        // `.max(class_num_total_fields(cid))` themselves. Synthetic
+        // ClassIds not in the class manager report 0 here, so the
+        // requested count is used unchanged for those.
+        let real_fields = self
+            .shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0);
+        let slots = num_fields.max(real_fields);
+        self.shared.heap.alloc_object(class_id, slots)
     }
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {

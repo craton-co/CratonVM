@@ -154,6 +154,74 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     ctx.set_field_by_name(this, "assertionLock", Value::Object(Some(lock)));
 }
 
+/// Populate the `URLClassLoader`-specific instance fields that the real
+/// JDK `URLClassLoader` constructors set via inline field initialisers.
+///
+/// `URLClassLoader` declares two `final` fields beyond what `ClassLoader`
+/// provides:
+///   - `ucp`        — a `jdk.internal.loader.URLClassPath`
+///   - `closeables` — a `java.util.WeakHashMap<Closeable,Void>`
+///
+/// Every real `URLClassLoader(...)` constructor assigns both inline
+/// (`closeables = new WeakHashMap<>()`, `ucp = new URLClassPath(...)`).
+/// CratonVM's simplified `URLClassLoader.<init>` natives bypass the real
+/// constructor, so these fields stay `null`.
+///
+/// The concrete failure this fixes: the real-JDK bytecode for
+/// `URLClassLoader.getResourceAsStream(String)` does
+/// `synchronized (closeables) { ... }` (a `monitorenter` on the
+/// `closeables` field, pc≈55). A `null` `closeables` makes that
+/// `monitorenter` throw `NullPointerException` — exactly the Spring Boot 4
+/// boot failure (`Could not initialize Java logging` → NPE at
+/// `URLClassLoader.getResourceAsStream pc=56`).
+///
+/// `closeables` is built via `new_object` + the `()V` `<init>` so it routes
+/// through CratonVM's native `WeakHashMap.<init>` (which installs the
+/// `buckets`/`size`/`capacity` slots the `WeakHashMap.containsKey`/`put`
+/// natives expect). A plain `alloc_concurrent_synthetic` would leave the
+/// buckets array null and the subsequent `containsKey` would NPE instead.
+fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let diag = std::env::var_os("CRATONVM_DBG_URLCL").is_some();
+    // `closeables` — WeakHashMap. `getResourceAsStream` synchronizes on it.
+    // Only populate when currently null so a real `<init>` that already ran
+    // (e.g. the name-carrying constructor whose bytecode we don't override)
+    // is not clobbered.
+    let existing = ctx.get_field_by_name(this, "closeables");
+    if diag {
+        eprintln!(
+            "[DBG_URLCL] init_urlclassloader_fields: closeables(before)={:?} ucp={:?}",
+            existing,
+            ctx.get_field_by_name(this, "ucp"),
+        );
+    }
+    if !matches!(existing, Value::Object(Some(_))) {
+        if let Ok(Some(Value::Object(Some(whm)))) =
+            ctx.new_object("java/util/WeakHashMap")
+        {
+            // Route through the native `WeakHashMap.<init>()V` so the
+            // backing buckets array is installed; ignore failure (the
+            // object is still a valid non-null monitor either way).
+            let _ = ctx.invoke(
+                "java/util/WeakHashMap",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(whm))],
+            );
+            ctx.set_field_by_name(this, "closeables", Value::Object(Some(whm)));
+            if diag {
+                eprintln!(
+                    "[DBG_URLCL] init_urlclassloader_fields: closeables(after)={:?}",
+                    ctx.get_field_by_name(this, "closeables"),
+                );
+            }
+        } else if diag {
+            eprintln!(
+                "[DBG_URLCL] init_urlclassloader_fields: failed to allocate WeakHashMap for closeables",
+            );
+        }
+    }
+}
+
 /// Register ClassLoader natives needed in real-JDK mode.
 ///
 /// These override the complex real-JDK constructors with minimal versions
@@ -296,7 +364,20 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     );
 
     // URLClassLoader ctors — Spring Boot launcher allocates
-    // `LaunchedURLClassLoader` via these signatures early in boot.
+    // `LaunchedURLClassLoader` / `LaunchedClassLoader` via these signatures
+    // early in boot. Spring Boot 3.2+/4's `LaunchedClassLoader` calls
+    // `super(urls, parent)` (the 2-arg form below).
+    //
+    // NOTE: the `ucp` field of `URLClassLoader` is declared as a
+    // `jdk.internal.loader.URLClassPath`, NOT a `URL[]`. Storing the raw
+    // `URL[]` there is wrong-typed; later real-JDK bytecode that does
+    // `ucp.findResource(...)` would fail. We therefore do NOT write `ucp`
+    // here — `register_url_array` already wires the URLs into CratonVM's
+    // dynamic classpath, and `getResource`/`findClass` are served by
+    // natives that consult that classpath, not the `ucp` field. The
+    // `closeables` field IS initialised (via `init_urlclassloader_fields`)
+    // because the real-JDK `getResourceAsStream` bytecode synchronizes on
+    // it and a null value throws NPE on `monitorenter`.
     r.register(ucl, "<init>", "([Ljava/net/URL;)V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -304,13 +385,13 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         };
         let parent = get_or_create_system_cl(ctx);
         ctx.set_field_by_name(this, "parent", Value::Object(parent));
-        // Best-effort: stash URL array into known field name when present.
         let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-        ctx.set_field_by_name(this, "ucp", urls);
         // URLClassLoader extends SecureClassLoader extends ClassLoader;
         // the inherited `defaultDomain` / `classes` / `packages` fields
         // still need initialising (see `init_classloader_common_fields`).
         init_classloader_common_fields(ctx, this);
+        // `closeables` (WeakHashMap) — see `init_urlclassloader_fields`.
+        init_urlclassloader_fields(ctx, this);
         // Register the URLs with the application classpath so classes inside
         // the jars/dirs are actually loadable — without this a custom
         // URLClassLoader (Tomcat's CommonClassLoader, ActiveMQ's launcher)
@@ -330,8 +411,72 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "parent", parent);
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field_by_name(this, "ucp", urls);
             init_classloader_common_fields(ctx, this);
+            init_urlclassloader_fields(ctx, this);
+            register_url_array(ctx, urls);
+            Ok(None)
+        },
+    );
+    // Name-carrying URLClassLoader constructors (JDK 9+). Spring Boot's
+    // launcher and several frameworks use these. Registering natives for
+    // every signature guarantees `closeables` is non-null no matter which
+    // `super(...)` form a `URLClassLoader` subclass invokes — otherwise the
+    // unhandled signature falls through to real-JDK bytecode whose own
+    // inline field initialisers may not run cleanly in CratonVM.
+    r.register(
+        ucl,
+        "<init>",
+        "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let urls = args.get(2).copied().unwrap_or(Value::Object(None));
+            let parent = args.get(3).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "name", name);
+            ctx.set_field_by_name(this, "parent", parent);
+            init_classloader_common_fields(ctx, this);
+            init_urlclassloader_fields(ctx, this);
+            register_url_array(ctx, urls);
+            Ok(None)
+        },
+    );
+    r.register(
+        ucl,
+        "<init>",
+        "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let urls = args.get(1).copied().unwrap_or(Value::Object(None));
+            let parent = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "parent", parent);
+            init_classloader_common_fields(ctx, this);
+            init_urlclassloader_fields(ctx, this);
+            register_url_array(ctx, urls);
+            Ok(None)
+        },
+    );
+    r.register(
+        ucl,
+        "<init>",
+        "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let urls = args.get(2).copied().unwrap_or(Value::Object(None));
+            let parent = args.get(3).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "name", name);
+            ctx.set_field_by_name(this, "parent", parent);
+            init_classloader_common_fields(ctx, this);
+            init_urlclassloader_fields(ctx, this);
             register_url_array(ctx, urls);
             Ok(None)
         },
