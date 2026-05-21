@@ -12943,14 +12943,15 @@ fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => String::new(),
     };
     let elems = p59_jar_collect_entries(ctx, &path);
-    // Pack into a 2-field Enumeration synthetic: array=0, cursor=1. The
-    // existing Enumeration.hasMoreElements/nextElement natives walk this
-    // shape (see register_p59_spliterator / Iterator collateral).
+    // Pack into the concrete synthetic `Enumeration$Impl` (array=0,
+    // cursor=1). Allocating the bare `java/util/Enumeration` interface
+    // produced an object with no instantiable concrete class — it degraded
+    // to `java/lang/Object` and `invokeinterface hasMoreElements` failed.
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
     for (i, v) in elems.into_iter().enumerate() {
         ctx.set_array_element(arr, i, v);
     }
-    let enumeration = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+    let enumeration = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     ctx.set_field(enumeration, 0, Value::Object(Some(arr)));
     ctx.set_field(enumeration, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(enumeration))))
@@ -17356,7 +17357,8 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
     r.register(ni, "getInetAddresses", "()Ljava/util/Enumeration;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let addrs = ctx.get_field(this, 2);
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+        // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
         match addrs {
             Value::Object(Some(a)) => {
                 ctx.set_field(enum_obj, 0, Value::Object(Some(a)));
@@ -17405,7 +17407,8 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1500))) // standard ethernet MTU
     });
     r.register(ni, "getSubInterfaces", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+        // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+        let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
         ctx.set_field(enum_obj, 1, Value::Int(0));
@@ -29708,7 +29711,8 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             let s = ctx.create_string(name);
             ctx.set_array_element(arr, i, Value::Object(Some(s)));
         }
-        let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+        // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+        let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
         ctx.set_field(en, 0, Value::Object(Some(arr)));
         ctx.set_field(en, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(en))))

@@ -759,7 +759,12 @@ fn register_hashtable_enumerations(r: &mut NativeMethodRegistry) {
         for (i, v) in items.into_iter().enumerate() {
             ctx.set_array_element(arr, i, v);
         }
-        let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+        // Allocate the concrete synthetic `Enumeration$Impl` (pre-registered
+        // with `Object` superclass + `Enumeration`/`Iterator` interfaces and
+        // working `hasMoreElements`/`nextElement` natives) — NOT the bare
+        // `java/util/Enumeration` interface, which has no instantiable
+        // concrete class and degrades the object to `java/lang/Object`.
+        let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
         ctx.set_field(en, 0, Value::Object(Some(arr)));
         ctx.set_field(en, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(en))))

@@ -22006,6 +22006,57 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_array_element(arr, (real + off) as usize)))
         });
     }
+
+    // -----------------------------------------------------------------------
+    // PrintStream.charset() — guarantee a non-null Charset.
+    //
+    // Tomcat 10.1 `Catalina.initStreams()` does `new SystemLogHandler(System.out)`.
+    // `SystemLogHandler extends PrintStream`, so the super-ctor chain runs the
+    // real-JDK `PrintStream(boolean, OutputStream)` bytecode. At pc 22 that
+    // bytecode tests `out instanceof PrintStream`; because `out` IS `System.out`
+    // (a PrintStream), it takes the pc-33 branch and calls `out.charset()`,
+    // stores the result in its own `charset` field, then at pc 53/56 builds
+    // `new OutputStreamWriter(out, charset)`. The real `OutputStreamWriter`
+    // (OutputStream, Charset) ctor null-checks the charset at pc 6 and throws
+    // `NullPointerException("charset")` when it is null.
+    //
+    // `PrintStream.charset()` is just `getfield charset`. The VM-pinned
+    // `System.out` / `System.err` objects are allocated by
+    // `SharedVm::ensure_system_streams` with only slot 0 (the fd id) populated;
+    // their `charset` field is left null unless `System.initPhase1`'s
+    // `install_charset` happens to stamp it. Rather than depend on that
+    // stamping (which can silently fail if the `final charset` field cannot be
+    // resolved by name at bootstrap time), override `charset()` so it can
+    // never return null: read the declared `charset` field, and if it is
+    // absent / null fall back to a fresh UTF-8 Charset (also writing it back so
+    // later reads stay consistent). This makes every freshly-constructed
+    // PrintStream — and any OutputStreamWriter built from one — receive a
+    // valid non-null charset, matching real-JDK `Charset.defaultCharset()`.
+    registry.register(
+        "java/io/PrintStream",
+        "charset",
+        "()Ljava/nio/charset/Charset;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    // No receiver — still hand back a usable UTF-8 Charset
+                    // rather than null so callers never NPE.
+                    let cs = charset_alloc(ctx, "UTF-8");
+                    return Ok(Some(Value::Object(Some(cs))));
+                }
+            };
+            // Honour an already-set charset (e.g. a PrintStream constructed
+            // with an explicit charset, or one stamped by install_charset).
+            if let Value::Object(Some(cs)) = ctx.get_field_by_name(this, "charset") {
+                return Ok(Some(Value::Object(Some(cs))));
+            }
+            // Field missing or null: synthesize UTF-8 and write it back.
+            let cs = charset_alloc(ctx, "UTF-8");
+            ctx.set_field_by_name(this, "charset", Value::Object(Some(cs)));
+            Ok(Some(Value::Object(Some(cs))))
+        },
+    );
 }
 
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`

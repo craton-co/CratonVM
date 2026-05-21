@@ -687,13 +687,24 @@ fn make_hashtable_enumeration(
     ctx: &mut dyn NativeContext,
     snapshot: Vec<Value>,
 ) -> MethodCallResult {
-    // phases_late `java/util/Enumeration` registration expects
-    // field 0 = Object[] array, field 1 = Int cursor.
+    // Allocate the concrete synthetic `java/util/Enumeration$Impl` helper
+    // class (field 0 = Object[] array, field 1 = Int cursor). It is
+    // pre-registered in `vm_init` with `Object` as superclass and the
+    // `Enumeration`/`Iterator` interfaces, and its `hasMoreElements` /
+    // `nextElement` natives are bound by `register_enumeration_impl_natives`.
+    //
+    // The previous code allocated the bare `java/util/Enumeration`
+    // *interface*: an interface has no instantiable concrete class, so
+    // `ensure_class_initialized` could not produce a usable ClassId and the
+    // object degraded to `java/lang/Object` (ClassId 0). A subsequent
+    // `invokeinterface Enumeration.hasMoreElements` then failed to retarget
+    // to any class with that method (Hazelcast `NoSuchMethodError
+    // hasMoreElements()Z`).
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, snapshot.len());
     for (i, v) in snapshot.into_iter().enumerate() {
         ctx.set_array_element(arr, i, v);
     }
-    let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration", 2);
+    let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     ctx.set_field(en, 0, Value::Object(Some(arr)));
     ctx.set_field(en, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(en))))

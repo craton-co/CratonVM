@@ -4589,11 +4589,11 @@ impl ClassManager {
         });
 
         // Preserve the larger num_total_fields so existing objects don't break
-        let old_num_total = self
+        let (old_first_field_index, old_num_total) = self
             .class_store
             .get(id)
-            .map(|c| c.num_total_fields)
-            .unwrap_or(0);
+            .map(|c| (c.first_field_index, c.num_total_fields))
+            .unwrap_or((0, 0));
         let final_num_total = num_total_fields.max(old_num_total);
 
         // Update the class in-place
@@ -4628,10 +4628,111 @@ impl ClassManager {
             }
         }
 
+        // Propagate the layout change to already-loaded subclasses.
+        //
+        // A synthetic stub for an Abstract* JDK class (e.g.
+        // `java/util/AbstractList`) is created with the minimal field
+        // layout from `synthetic_stub_fields` — usually ZERO instance
+        // fields. A subclass loaded from real bytecode *while the parent
+        // is still a stub* (e.g. Scala's
+        // `JavaCollectionWrappers$SeqWrapper extends java.util.AbstractList`)
+        // computes its own `first_field_index` / `num_total_fields` from
+        // that too-small parent count.
+        //
+        // When the real `AbstractList` bytecode is later loaded, this
+        // upgrade path grows the parent's `num_total_fields` (real
+        // `AbstractList` has the `modCount` field). Without propagation
+        // the already-loaded subclass keeps its stale layout: its
+        // `num_total_fields` undercounts the true field total and its
+        // own fields overlap the parent's. `getfield`/`putfield` then
+        // resolve a field index that exceeds the object's allocated slot
+        // count (the GC guard reports
+        // "out-of-bounds field read ... undersized object layout").
+        //
+        // Fix: if the upgrade changed this class's layout, recompute the
+        // field layout of every transitive subclass. `ClassId`s are
+        // assigned in load order and a subclass is always loaded *after*
+        // its superclass, so a single forward pass by ascending id
+        // visits every class after its (already-recomputed) parent —
+        // a valid topological order for the superclass relation.
+        if old_first_field_index != first_field_index || old_num_total != final_num_total {
+            self.recompute_subclass_layouts(id);
+        }
+
+        // The upgrade replaced the constant pool and may have shifted
+        // field indices for this class and its subclasses; drop any
+        // cached `(referring-class, cp-index) -> ResolvedField` entries
+        // resolved against the stale layout. Mirrors the invalidation
+        // `redefine_class` does for in-place bytecode replacement.
+        fire_resolution_invalidate_hook(id.as_u32());
+
         // Cache the class bytes (FIFO-bounded helper).
         self.insert_class_bytes(name.to_string(), bytes.to_vec());
 
         Ok(())
+    }
+
+    /// Recompute `first_field_index` / `num_total_fields` for every class
+    /// whose superclass chain passes through `changed_id`, after that
+    /// class's instance-field layout changed (see `upgrade_synthetic_class`).
+    ///
+    /// Iterates the `ClassStore` in ascending `ClassId` order. Because a
+    /// subclass is always loaded — and therefore assigned a `ClassId` —
+    /// *after* its superclass, this ordering guarantees each class is
+    /// visited only after its parent has already been recomputed, so a
+    /// single pass propagates the change down arbitrarily deep
+    /// inheritance chains.
+    ///
+    /// As in the load/upgrade paths, `num_total_fields` is only ever
+    /// grown (`max(old, new)`): objects already allocated against the
+    /// previous layout must not be left with too few slots.
+    fn recompute_subclass_layouts(&mut self, changed_id: ClassId) {
+        let class_count = self.class_store.len();
+        for idx in 0..class_count {
+            let cid = ClassId::new(idx as u32);
+            // The changed class itself is already up to date.
+            if cid == changed_id {
+                continue;
+            }
+            let superclass_id = match self.class_store.get(cid) {
+                Some(c) => c.superclass,
+                None => continue,
+            };
+            // Only recompute classes that actually inherit (transitively)
+            // from the changed class. `is_subclass_of` includes the
+            // `superclass == changed_id` case via its own `id == other`
+            // check, so this single probe covers any chain depth.
+            let is_descendant = superclass_id
+                .and_then(|sid| self.class_store.get(sid))
+                .map(|sc| sc.is_subclass_of(changed_id, &self.class_store))
+                .unwrap_or(false);
+            if !is_descendant {
+                continue;
+            }
+            let Some(super_id) = superclass_id else {
+                continue;
+            };
+            let parent_total = self
+                .class_store
+                .get(super_id)
+                .map_or(0, |sc| sc.num_total_fields);
+            let own_instance_fields = match self.class_store.get(cid) {
+                Some(c) => c
+                    .fields
+                    .iter()
+                    .filter(|f| !f.access_flags.contains(FieldAccessFlags::STATIC))
+                    .count(),
+                None => continue,
+            };
+            let new_first = parent_total;
+            let new_total = parent_total + own_instance_fields;
+            if let Some(class) = self.class_store.get_mut(cid) {
+                class.first_field_index = new_first;
+                // Grow-only: never shrink below the count an existing
+                // object was allocated with.
+                class.num_total_fields = class.num_total_fields.max(new_total);
+            }
+        }
     }
 }
 

@@ -8219,7 +8219,28 @@ fn invoke_on_class_shared_inner(
                                 | "toString"
                                 | "hashCode"
                                 | "equals"
-                            ));
+                            ))
+                        // TOMCAT-CHARSET: `java.io.PrintStream.charset()` is a
+                        // concrete bytecode method (`getfield charset; areturn`).
+                        // Tomcat 10.1 `Catalina.initStreams()` builds
+                        // `new SystemLogHandler(System.out)`; the super-ctor
+                        // chain runs the real-JDK `PrintStream(boolean,
+                        // OutputStream)` bytecode, which — because `System.out`
+                        // IS a PrintStream — calls `System.out.charset()` and
+                        // then `new OutputStreamWriter(out, charset)`. The VM's
+                        // pinned `System.out` object (allocated by
+                        // `ensure_system_streams`) has a null `charset` field,
+                        // so the bytecode `getfield` returns null and
+                        // `OutputStreamWriter.<init>(OutputStream, Charset)`
+                        // throws `NullPointerException("charset")`. Without an
+                        // allow-list entry, `check_override` stays false for
+                        // this concrete method and our null-tolerant native
+                        // (registered in `register_charset_natives`) would be
+                        // ignored. Force the override so `charset()` always
+                        // yields a non-null UTF-8 Charset.
+                        || (class_name == "java/io/PrintStream"
+                            && method_name == "charset"
+                            && descriptor == "()Ljava/nio/charset/Charset;");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
