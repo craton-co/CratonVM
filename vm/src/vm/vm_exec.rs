@@ -1566,6 +1566,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::create_java_string(self.shared, text)
     }
 
+    fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
+        super::create_java_string_uninterned(self.shared, text)
+    }
+
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
         if let Some(s) = super::read_java_string(&self.shared.heap, obj) {
             return Some(s);
