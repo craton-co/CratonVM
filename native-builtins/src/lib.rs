@@ -17426,7 +17426,18 @@ pub(crate) fn alloc_concurrent_synthetic(
             let n = num_fields.max(real);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), num_fields),
+        Err(_) => {
+            // The real `.class` file could not be loaded. Allocating with
+            // `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
+            // but a non-zero slot count produces an "undersized object
+            // layout" object — the GC's `get_field` bounds guard rejects
+            // every field access on it (class declares 0 fields, object has
+            // `num_fields` slots). Register a synthetic class declaring
+            // `num_fields` instance fields so the header's `class_id`
+            // matches the allocated slot count.
+            let cid = ctx.ensure_synthetic_class(class_name, num_fields);
+            ctx.alloc_object(cid, num_fields)
+        }
     }
 }
 

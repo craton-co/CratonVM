@@ -230,7 +230,14 @@ fn alloc_impl(ctx: &mut dyn NativeContext, impl_class: &str) -> ObjectRef {
             let n = FU_NUM_SLOTS.max(real);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(ClassId::new(0), FU_NUM_SLOTS),
+        // Fall back to a synthetic class declaring `FU_NUM_SLOTS` fields
+        // rather than `ClassId::new(0)` (`java/lang/Object`, zero declared
+        // fields): an object with Object's id but a non-zero slot count is
+        // an undersized layout the GC's `get_field` bounds guard rejects.
+        Err(_) => {
+            let cid = ctx.ensure_synthetic_class(impl_class, FU_NUM_SLOTS);
+            ctx.alloc_object(cid, FU_NUM_SLOTS)
+        }
     }
 }
 
