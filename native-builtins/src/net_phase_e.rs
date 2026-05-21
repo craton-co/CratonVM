@@ -243,6 +243,24 @@ const HS_PORT: usize = 4;
 fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IOException { message: message.into() }.into()
 }
+/// A missing jar/zip entry must surface as `java.io.FileNotFoundException`
+/// (a subclass of `IOException`), matching the real JDK's
+/// `JarURLConnection.getInputStream()` contract. Callers such as SmallRye
+/// Config rely on `catch (FileNotFoundException)` to *skip* an absent
+/// profile-specific resource; a plain `IOException` is rethrown and aborts boot.
+fn fnfex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::FileNotFoundException { path: message.into() }.into()
+}
+/// Map a `zip::ZipArchive::by_name` failure to the right Java exception:
+/// `ZipError::FileNotFound` → `FileNotFoundException`, anything else → `IOException`.
+fn zip_entry_err(entry: &str, container: &str, e: zip::result::ZipError) -> cratonvm_types::error::MethodCallFailed {
+    match e {
+        zip::result::ZipError::FileNotFound => {
+            fnfex(format!("entry {entry} in {container}: specified file not found in archive"))
+        }
+        other => ioex(format!("URL.openStream: entry {entry} in {container}: {other}")),
+    }
+}
 fn npe<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::NullPointerException {
         message: Some(message.into()),
@@ -2456,7 +2474,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     .map_err(|e| ioex(format!("URL.openStream: open inner jar {nested_jar_entry}: {e}")))?;
                 let mut entry_file = inner_zip
                     .by_name(resource_entry)
-                    .map_err(|e| ioex(format!("URL.openStream: entry {resource_entry} in {nested_jar_entry}: {e}")))?;
+                    .map_err(|e| zip_entry_err(resource_entry, nested_jar_entry, e))?;
                 let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
                 entry_file
                     .read_to_end(&mut buf)
@@ -2472,7 +2490,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     .map_err(|e| ioex(format!("URL.openStream: open jar {outer_jar}: {e}")))?;
                 let mut entry_file = zip
                     .by_name(inner_path)
-                    .map_err(|e| ioex(format!("URL.openStream: entry {inner_path} in {outer_jar}: {e}")))?;
+                    .map_err(|e| zip_entry_err(inner_path, outer_jar, e))?;
                 let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
                 entry_file
                     .read_to_end(&mut buf)
