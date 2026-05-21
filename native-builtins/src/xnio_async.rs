@@ -389,17 +389,22 @@ pub(crate) fn lookup_future(handle: i64) -> Option<Arc<IoFutureInner>> {
 // ---------------------------------------------------------------------------
 
 fn read_option_coords(ctx: &dyn NativeContext, opt: ObjectRef) -> Option<(String, String)> {
-    // The declaringClass field can be either a Class mirror (preferred)
-    // or a String (fallback when the caller passed the class name
-    // directly). We accept both to keep the native resilient.
+    // The declaringClass field can be either a Class mirror (the real
+    // `org.xnio.Option.declClass` field, and the common case) or a String
+    // (a legacy fallback when a caller passed the class name directly).
+    // We accept both. For a Class mirror, resolve it to the represented
+    // class's internal name via `mirror_class_name` — NOT
+    // `class_id_of_object`, which would return "java/lang/Class" (the
+    // class *of the mirror object itself*).
     let declaring = match ctx.get_field(opt, OPT_DECLARING_CLASS) {
         Value::Object(Some(s)) => {
-            // Try reading as String first.
-            ctx.read_string(s).unwrap_or_else(|| {
-                // Fall back to the class_id_of_object lookup.
-                let cid = ctx.class_id_of_object(s);
-                ctx.class_name_of_id(cid).unwrap_or_default()
-            })
+            // A real Class mirror resolves through the mirror→class map.
+            if let Some(n) = crate::lang_class::mirror_class_name(ctx, s) {
+                n
+            } else {
+                // Legacy: the field held a plain String class name.
+                ctx.read_string(s).unwrap_or_default()
+            }
         }
         _ => String::new(),
     };
@@ -417,11 +422,13 @@ fn read_option_coords(ctx: &dyn NativeContext, opt: ObjectRef) -> Option<(String
 fn read_option_type(ctx: &dyn NativeContext, opt: ObjectRef) -> Option<String> {
     match ctx.get_field(opt, OPT_TYPE_CLASS) {
         Value::Object(Some(s)) => {
-            if let Some(s2) = ctx.read_string(s) {
-                Some(s2)
+            // Real `SingleOption.type` / `SequenceOption.elementType` is a
+            // Class mirror; resolve it to the represented class name.
+            // (Legacy synthetic path stored a plain String.)
+            if let Some(n) = crate::lang_class::mirror_class_name(ctx, s) {
+                Some(n)
             } else {
-                let cid = ctx.class_id_of_object(s);
-                ctx.class_name_of_id(cid)
+                ctx.read_string(s)
             }
         }
         _ => None,
@@ -1141,66 +1148,37 @@ fn nfe<S: Into<String>>(m: S) -> MethodCallFailed {
 
 /// Register all XNIO OptionMap / IoFuture / XnioExecutor natives.
 pub fn register_xnio_async_natives(registry: &mut NativeMethodRegistry) {
-    // R84 (WildFly): `org.wildfly.io.OptionAttributeDefinition$Builder.determineOptionType`
-    // reflects on `option.getClass().getDeclaredField("type")` to read the
-    // option's value-type Class. We synthesize `org.xnio.Option` instances
-    // (rather than the real `SingleOption`/`TypeOption` subclasses) and our
-    // stub field is named `typeClass`, so the reflection lookup throws
-    // `NoSuchFieldException` → wrapped as `IllegalArgumentException`. That
-    // takes down `RemotingSubsystemRootResource.<clinit>` and silently
-    // disables the entire subsystem. Shim `determineOptionType` to read
-    // OPT_TYPE_CLASS (slot 2) directly, bypassing reflection.
-    registry.register(
-        "org/wildfly/io/OptionAttributeDefinition$Builder",
-        "determineOptionType",
-        "(Lorg/xnio/Option;)Ljava/lang/Class;",
-        |ctx, args| {
-            let opt = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Slot 2 == OPT_TYPE_CLASS — populated by Option.simple.
-            // For options we did not create (real bytecode Option
-            // subclasses), the slot may be uninitialised; fall back to
-            // java.lang.String so the caller's isAssignableFrom chain
-            // categorises it as STRING (a safe default for XNIO options).
-            let v = ctx.get_field(opt, OPT_TYPE_CLASS);
-            match v {
-                Value::Object(Some(_)) => Ok(Some(v)),
-                _ => {
-                    let _ = ctx.load_class("java/lang/String")?;
-                    let cid = ctx.class_id_by_name("java/lang/String");
-                    Ok(Some(Value::Object(cid.map(|c| ctx.get_class_mirror(c)))))
-                }
-            }
-        },
-    );
-
-    // Option
-    registry.register(
-        "org/xnio/Option",
-        "simple",
-        "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Lorg/xnio/Option;",
-        native_option_simple,
-    );
-    registry.register(
-        "org/xnio/Option",
-        "getName",
-        "()Ljava/lang/String;",
-        native_option_get_name,
-    );
-    registry.register(
-        "org/xnio/Option",
-        "cast",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        native_option_cast,
-    );
-    registry.register(
-        "org/xnio/Option",
-        "parseValue",
-        "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Object;",
-        native_option_parse_value,
-    );
+    // ------------------------------------------------------------------
+    // `org.xnio.Option` is NOT synthesized.
+    //
+    // History: a previous round registered a native `Option.simple` that
+    // allocated a *synthetic* `org/xnio/Option` object (rather than the
+    // real `org.xnio.SingleOption` / `SequenceOption` subclass that XNIO's
+    // `Option.simple` constructs). WildFly's
+    // `org.wildfly.extension.io.OptionAttributeDefinition$Builder.determineOptionType`
+    // reflects on `option.getClass().getDeclaredField("type")` to recover
+    // the option's value-type `Class`. A synthetic `Option` has no `type`
+    // field, so `getDeclaredField` threw `NoSuchFieldException`, which
+    // WildFly wraps into `IllegalArgumentException`, killing
+    // `RemotingSubsystemRootResource.<clinit>` and failing the whole boot
+    // (`WFLYSRV0055/0056`).
+    //
+    // `org.xnio.Option`, `SingleOption`, and `SequenceOption` are pure
+    // Java with no native I/O — CratonVM runs their real bytecode fine.
+    // Letting the real `Option.simple` (→ `new SingleOption`) run produces
+    // an object with a genuine `type` field, so WildFly's reflection
+    // works. The real `SingleOption` instance field layout
+    // (slot0=`declClass`, slot1=`name`, slot2=`type`) intentionally
+    // matches `OPT_DECLARING_CLASS`/`OPT_NAME`/`OPT_TYPE_CLASS`, so the
+    // `OptionMap`/`Builder` slot reads below stay valid; `read_option_*`
+    // resolves the `Class` mirrors stored in slots 0/2.
+    //
+    // Therefore: no `Option.simple` / `getName` / `cast` / `parseValue`
+    // intercepts, and no `determineOptionType` shim.
+    let _ = native_option_simple;
+    let _ = native_option_get_name;
+    let _ = native_option_cast;
+    let _ = native_option_parse_value;
 
     // OptionMap
     registry.register(
