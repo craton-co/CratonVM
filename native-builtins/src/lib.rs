@@ -28501,7 +28501,7 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
             }
         };
         let (lang, country, variant) = (read(1), read(2), read(3));
-        locale_data_set(this, &lang, &country, &variant);
+        locale_populate(ctx, this, &lang, &country, &variant);
         Ok(None)
     });
     registry.register(loc, "getVariant", "()Ljava/lang/String;", |ctx, args| {
@@ -28576,8 +28576,58 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
 
 pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
     let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-    locale_data_set(loc, lang, country, "");
+    locale_populate(ctx, loc, lang, country, "");
     loc
+}
+
+/// Record a synthetic Locale's `(language, country, variant)` in the side
+/// table **and** populate its real-JDK `baseLocale` instance field with a
+/// non-null `sun/util/locale/BaseLocale` object.
+///
+/// CRITICAL FIX: the side table alone is not enough. Real-JDK `Locale`
+/// methods we do *not* natively override (e.g. `Locale.equals`,
+/// `Locale.hashCode`) run as bytecode and dereference the private
+/// `baseLocale` field — e.g. `Locale.equals` does
+/// `baseLocale.equals(otherBase)`. If `baseLocale` is left null (the
+/// previous side-table-only behaviour) that bytecode throws a
+/// `NullPointerException` (Tomcat's `StringManager.<init>` ->
+/// `bundle.getLocale().equals(Locale.ROOT)` tripped exactly this).
+///
+/// Populating `baseLocale` with a correctly-shaped `BaseLocale` makes
+/// real-JDK `Locale.equals`/`hashCode`/`getLanguage`/`toString` and every
+/// other un-overridden Locale method work directly. `localeExtensions` is
+/// deliberately left null — that is the spec-correct "no extensions" shape
+/// and `Locale.equals` handles a null `localeExtensions` on both sides.
+pub(crate) fn locale_populate(
+    ctx: &mut dyn NativeContext,
+    loc: ObjectRef,
+    lang: &str,
+    country: &str,
+    variant: &str,
+) {
+    locale_data_set(loc, lang, country, variant);
+    // Build the real-JDK `sun.util.locale.BaseLocale` backing object.
+    // BaseLocale's instance fields are `language`, `script`, `region`,
+    // `variant` (all `String`) plus a lazily-computed `int hash`. We set
+    // the four String fields by name; `hash` stays 0 (BaseLocale computes
+    // it lazily). `BaseLocale.equals` compares the four Strings, so using
+    // interned Strings (the default for `create_string`) keeps its
+    // identity (`==`) comparisons correct across separately-built Locales.
+    if let Ok(base_cid) = ctx.ensure_class_initialized("sun/util/locale/BaseLocale") {
+        let nfields = ctx.class_num_total_fields(base_cid).max(5);
+        let base = ctx.alloc_object(base_cid, nfields);
+        let lang_s = ctx.create_string(lang);
+        let script_s = ctx.create_string("");
+        let region_s = ctx.create_string(country);
+        let variant_s = ctx.create_string(variant);
+        ctx.set_field_by_name(base, "language", Value::Object(Some(lang_s)));
+        ctx.set_field_by_name(base, "script", Value::Object(Some(script_s)));
+        ctx.set_field_by_name(base, "region", Value::Object(Some(region_s)));
+        ctx.set_field_by_name(base, "variant", Value::Object(Some(variant_s)));
+        ctx.set_field_by_name(loc, "baseLocale", Value::Object(Some(base)));
+    }
+    // `localeExtensions` is intentionally left null (the "no extensions"
+    // shape that real-JDK `Locale.equals`/`hashCode` expect).
 }
 
 /// Read a Locale arg's `(language, country, variant)` — side table first,
@@ -28595,7 +28645,7 @@ fn native_locale_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    locale_data_set(this, &lang, "", "");
+    locale_populate(ctx, this, &lang, "", "");
     Ok(None)
 }
 
@@ -28612,7 +28662,7 @@ fn native_locale_init2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    locale_data_set(this, &lang, &country, "");
+    locale_populate(ctx, this, &lang, &country, "");
     Ok(None)
 }
 
