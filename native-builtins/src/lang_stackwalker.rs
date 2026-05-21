@@ -35,6 +35,7 @@ use cratonvm_types::Value;
 use cratonvm_types::error::MethodCallResult;
 
 use crate::alloc_concurrent_synthetic;
+use crate::lang_misc::write_ste_fields;
 
 /// Decode a `long` JVM argument that may reach natives as `Value::Long` or,
 /// due to interpreter tagging quirks, as `Value::Double` holding the same
@@ -128,11 +129,16 @@ fn populate_sfi(
     // Pre-cache `ste` so real JDK `toStackTraceElement()` / `getFileName()` /
     // `getLineNumber()` paths see a populated element without running
     // `StackTraceElement.of`.
-    let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
-    ctx.set_field(ste, 0, Value::Object(Some(cls_str)));
-    ctx.set_field(ste, 1, Value::Object(Some(meth_str)));
-    ctx.set_field(ste, 2, file_str);
-    ctx.set_field(ste, 3, Value::Int(entry.line_number));
+    let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 9);
+    write_ste_fields(
+        ctx,
+        ste,
+        Value::Object(Some(cls_str)),
+        Value::Object(Some(meth_str)),
+        file_str,
+        Value::Int(entry.line_number),
+        Some(&entry.class_name),
+    );
     ctx.set_field_by_name(sf, "ste", Value::Object(Some(ste)));
 
     // `declaring_class_native` fast-path reads `SF_DECL_INTERNAL` — on the
@@ -623,38 +629,24 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
                 return Ok(Some(Value::Object(Some(ste))));
             }
-            let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
-            // Decode SFI slots into the values `fill_stack_trace_element`
-            // needs. `SF_CLASSNAME` holds the dotted class name; the
-            // `/`-separated internal name lives in `SF_DECL_INTERNAL`.
-            let class_dotted = match ctx.get_field(this, SF_CLASSNAME) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let class_slashed = match ctx.get_field(this, SF_DECL_INTERNAL) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => class_dotted.replace('.', "/"),
-            };
-            let method_name = match ctx.get_field(this, SF_METHODNAME) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let file_name = match ctx.get_field(this, SF_FILENAME) {
+            let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 9);
+            let cls_v = ctx.get_field(this, SF_CLASSNAME);
+            let meth_v = ctx.get_field(this, SF_METHODNAME);
+            let file_v = ctx.get_field(this, SF_FILENAME);
+            let line_v = ctx.get_field(this, SF_LINENUMBER);
+            // `SF_DECL_INTERNAL` stashes the '/'-form internal class name.
+            let decl_internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s),
                 _ => None,
             };
-            let line = match ctx.get_field(this, SF_LINENUMBER) {
-                Value::Int(n) => n,
-                _ => -1,
-            };
-            crate::lang_misc::fill_stack_trace_element(
+            write_ste_fields(
                 ctx,
                 ste,
-                &class_slashed,
-                &class_dotted,
-                &method_name,
-                file_name.as_deref(),
-                line,
+                cls_v,
+                meth_v,
+                file_v,
+                line_v,
+                decl_internal.as_deref(),
             );
             Ok(Some(Value::Object(Some(ste))))
         },
