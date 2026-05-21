@@ -4266,10 +4266,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register(u2, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int);
     registry.register(u2, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_int);
     registry.register(u2, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_int);
-    registry.register(u2, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_int);
-    registry.register(u2, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_int);
-    registry.register(u2, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_int);
-    registry.register(u2, "putChar", "(Ljava/lang/Object;JC)V", native_unsafe_put_int);
+    registry.register(u2, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
+    registry.register(u2, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
+    registry.register(u2, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
+    registry.register(u2, "putChar", "(Ljava/lang/Object;JC)V", native_unsafe_put_char_mb);
     registry.register(u2, "getFloat", "(Ljava/lang/Object;J)F", native_unsafe_get_float);
     registry.register(u2, "putFloat", "(Ljava/lang/Object;JF)V", native_unsafe_put_float);
     registry.register(u2, "getDouble", "(Ljava/lang/Object;J)D", native_unsafe_get_double);
@@ -4286,27 +4286,27 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register(u2, "putFloatVolatile", "(Ljava/lang/Object;JF)V", native_unsafe_put_int_volatile);
     registry.register(u2, "getDoubleVolatile", "(Ljava/lang/Object;J)D", native_unsafe_get_long_volatile);
     registry.register(u2, "putDoubleVolatile", "(Ljava/lang/Object;JD)V", native_unsafe_put_long_volatile);
-    // Unaligned get/put variants (C16). On x86_64 unaligned access is native and
-    // little-endian. These delegate to the regular aligned natives, which are
-    // null-safe via static_{int,long}_store fallbacks from C11. The variants
-    // with a trailing bigEndian boolean are handled by the same funcs (base
-    // impls only read through value; trailing args are ignored).
-    registry.register(u2, "getIntUnaligned", "(Ljava/lang/Object;J)I", native_unsafe_get_int);
-    registry.register(u2, "getIntUnaligned", "(Ljava/lang/Object;JZ)I", native_unsafe_get_int);
-    registry.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JI)V", native_unsafe_put_int);
-    registry.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JIZ)V", native_unsafe_put_int);
-    registry.register(u2, "getLongUnaligned", "(Ljava/lang/Object;J)J", native_unsafe_get_long);
-    registry.register(u2, "getLongUnaligned", "(Ljava/lang/Object;JZ)J", native_unsafe_get_long);
-    registry.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJ)V", native_unsafe_put_long);
-    registry.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJZ)V", native_unsafe_put_long);
-    registry.register(u2, "getShortUnaligned", "(Ljava/lang/Object;J)S", native_unsafe_get_int);
-    registry.register(u2, "getShortUnaligned", "(Ljava/lang/Object;JZ)S", native_unsafe_get_int);
-    registry.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JS)V", native_unsafe_put_int);
-    registry.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JSZ)V", native_unsafe_put_int);
-    registry.register(u2, "getCharUnaligned", "(Ljava/lang/Object;J)C", native_unsafe_get_int);
-    registry.register(u2, "getCharUnaligned", "(Ljava/lang/Object;JZ)C", native_unsafe_get_int);
-    registry.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JC)V", native_unsafe_put_int);
-    registry.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JCZ)V", native_unsafe_put_int);
+    // Unaligned get/put variants (C16). For a `byte[]`-backed target a typed
+    // access must assemble/scatter N consecutive bytes honoring endianness;
+    // the multi-byte `*_mb` handlers do that and fall back to the generic
+    // element/field natives otherwise. The trailing `bigEndian` boolean is
+    // honored by the `*_mb` handlers (2-arg form = native little-endian).
+    registry.register(u2, "getIntUnaligned", "(Ljava/lang/Object;J)I", native_unsafe_get_int_mb);
+    registry.register(u2, "getIntUnaligned", "(Ljava/lang/Object;JZ)I", native_unsafe_get_int_mb);
+    registry.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JI)V", native_unsafe_put_int_mb);
+    registry.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JIZ)V", native_unsafe_put_int_mb);
+    registry.register(u2, "getLongUnaligned", "(Ljava/lang/Object;J)J", native_unsafe_get_long_mb);
+    registry.register(u2, "getLongUnaligned", "(Ljava/lang/Object;JZ)J", native_unsafe_get_long_mb);
+    registry.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJ)V", native_unsafe_put_long_mb);
+    registry.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJZ)V", native_unsafe_put_long_mb);
+    registry.register(u2, "getShortUnaligned", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
+    registry.register(u2, "getShortUnaligned", "(Ljava/lang/Object;JZ)S", native_unsafe_get_short_mb);
+    registry.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
+    registry.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JSZ)V", native_unsafe_put_short_mb);
+    registry.register(u2, "getCharUnaligned", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
+    registry.register(u2, "getCharUnaligned", "(Ljava/lang/Object;JZ)C", native_unsafe_get_char_mb);
+    registry.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JC)V", native_unsafe_put_char_mb);
+    registry.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JCZ)V", native_unsafe_put_char_mb);
     // Cache line writeback (no-ops — our VM doesn't have a hardware cache model)
     registry.register(u2, "writeback0", "(J)V", native_noop_with_this);
     registry.register(u2, "writebackPreSync0", "()V", native_unsafe_fence);
@@ -11938,24 +11938,24 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JLjava/lang/Object;)V",
         native_unsafe_put_object,
     );
-    r.register(u, "getInt", "(Ljava/lang/Object;J)I", native_unsafe_get_int);
+    r.register(u, "getInt", "(Ljava/lang/Object;J)I", native_unsafe_get_int_mb);
     r.register(
         u,
         "putInt",
         "(Ljava/lang/Object;JI)V",
-        native_unsafe_put_int,
+        native_unsafe_put_int_mb,
     );
     r.register(
         u,
         "getLong",
         "(Ljava/lang/Object;J)J",
-        native_unsafe_get_long,
+        native_unsafe_get_long_mb,
     );
     r.register(
         u,
         "putLong",
         "(Ljava/lang/Object;JJ)V",
-        native_unsafe_put_long,
+        native_unsafe_put_long_mb,
     );
     // Allocation
     r.register(
@@ -12008,14 +12008,14 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int);
     r.register(u, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_int);
     r.register(u, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_int);
-    r.register(u, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_int);
-    r.register(u, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_int);
+    r.register(u, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
+    r.register(u, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
     r.register(u, "getFloat", "(Ljava/lang/Object;J)F", native_unsafe_get_float);
     r.register(u, "putFloat", "(Ljava/lang/Object;JF)V", native_unsafe_put_float);
     r.register(u, "getDouble", "(Ljava/lang/Object;J)D", native_unsafe_get_double);
     r.register(u, "putDouble", "(Ljava/lang/Object;JD)V", native_unsafe_put_double);
-    r.register(u, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_int);
-    r.register(u, "putChar", "(Ljava/lang/Object;JC)V", native_unsafe_put_int);
+    r.register(u, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
+    r.register(u, "putChar", "(Ljava/lang/Object;JC)V", native_unsafe_put_char_mb);
     // Volatile variants for primitive types
     r.register(u, "getBooleanVolatile", "(Ljava/lang/Object;J)Z", native_unsafe_get_int_volatile);
     r.register(u, "putBooleanVolatile", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int_volatile);
@@ -12067,32 +12067,37 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u2, "putIntOpaque", "(Ljava/lang/Object;JI)V", native_unsafe_put_int_volatile);
     r.register(u2, "getReference", "(Ljava/lang/Object;J)Ljava/lang/Object;", native_unsafe_get_object);
     r.register(u2, "putReference", "(Ljava/lang/Object;JLjava/lang/Object;)V", native_unsafe_put_object);
-    r.register(u2, "getInt", "(Ljava/lang/Object;J)I", native_unsafe_get_int);
-    r.register(u2, "putInt", "(Ljava/lang/Object;JI)V", native_unsafe_put_int);
-    r.register(u2, "getLong", "(Ljava/lang/Object;J)J", native_unsafe_get_long);
-    r.register(u2, "putLong", "(Ljava/lang/Object;JJ)V", native_unsafe_put_long);
-    // Unaligned access variants (C16). On x86_64 we are little-endian and natively
-    // tolerate unaligned loads/stores, so these delegate to the regular aligned
-    // natives, which are null-safe via the static_{int,long}_store fallbacks added
-    // in C11. The variants with a trailing boolean (bigEndian flag) are handled by
-    // the same functions: the base impls only read args up to offset/value and
-    // ignore any trailing arg.
-    r.register(u2, "getIntUnaligned", "(Ljava/lang/Object;J)I", native_unsafe_get_int);
-    r.register(u2, "getIntUnaligned", "(Ljava/lang/Object;JZ)I", native_unsafe_get_int);
-    r.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JI)V", native_unsafe_put_int);
-    r.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JIZ)V", native_unsafe_put_int);
-    r.register(u2, "getLongUnaligned", "(Ljava/lang/Object;J)J", native_unsafe_get_long);
-    r.register(u2, "getLongUnaligned", "(Ljava/lang/Object;JZ)J", native_unsafe_get_long);
-    r.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJ)V", native_unsafe_put_long);
-    r.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJZ)V", native_unsafe_put_long);
-    r.register(u2, "getShortUnaligned", "(Ljava/lang/Object;J)S", native_unsafe_get_int);
-    r.register(u2, "getShortUnaligned", "(Ljava/lang/Object;JZ)S", native_unsafe_get_int);
-    r.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JS)V", native_unsafe_put_int);
-    r.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JSZ)V", native_unsafe_put_int);
-    r.register(u2, "getCharUnaligned", "(Ljava/lang/Object;J)C", native_unsafe_get_int);
-    r.register(u2, "getCharUnaligned", "(Ljava/lang/Object;JZ)C", native_unsafe_get_int);
-    r.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JC)V", native_unsafe_put_int);
-    r.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JCZ)V", native_unsafe_put_int);
+    r.register(u2, "getInt", "(Ljava/lang/Object;J)I", native_unsafe_get_int_mb);
+    r.register(u2, "putInt", "(Ljava/lang/Object;JI)V", native_unsafe_put_int_mb);
+    r.register(u2, "getLong", "(Ljava/lang/Object;J)J", native_unsafe_get_long_mb);
+    r.register(u2, "putLong", "(Ljava/lang/Object;JJ)V", native_unsafe_put_long_mb);
+    r.register(u2, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
+    r.register(u2, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
+    r.register(u2, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
+    r.register(u2, "putChar", "(Ljava/lang/Object;JC)V", native_unsafe_put_char_mb);
+    // Unaligned access variants (C16). When the target is a `byte[]` (every
+    // HeapByteBuffer's backing store) a typed read/write must assemble or
+    // scatter N consecutive elements honoring endianness — the multi-byte
+    // `*_mb` handlers do exactly that and fall back to the generic
+    // element/field natives for non-byte-array targets. The trailing
+    // `bigEndian` boolean is decoded by the `*_mb` handlers; the 2-arg form
+    // uses native (little-endian) order.
+    r.register(u2, "getIntUnaligned", "(Ljava/lang/Object;J)I", native_unsafe_get_int_mb);
+    r.register(u2, "getIntUnaligned", "(Ljava/lang/Object;JZ)I", native_unsafe_get_int_mb);
+    r.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JI)V", native_unsafe_put_int_mb);
+    r.register(u2, "putIntUnaligned", "(Ljava/lang/Object;JIZ)V", native_unsafe_put_int_mb);
+    r.register(u2, "getLongUnaligned", "(Ljava/lang/Object;J)J", native_unsafe_get_long_mb);
+    r.register(u2, "getLongUnaligned", "(Ljava/lang/Object;JZ)J", native_unsafe_get_long_mb);
+    r.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJ)V", native_unsafe_put_long_mb);
+    r.register(u2, "putLongUnaligned", "(Ljava/lang/Object;JJZ)V", native_unsafe_put_long_mb);
+    r.register(u2, "getShortUnaligned", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
+    r.register(u2, "getShortUnaligned", "(Ljava/lang/Object;JZ)S", native_unsafe_get_short_mb);
+    r.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
+    r.register(u2, "putShortUnaligned", "(Ljava/lang/Object;JSZ)V", native_unsafe_put_short_mb);
+    r.register(u2, "getCharUnaligned", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
+    r.register(u2, "getCharUnaligned", "(Ljava/lang/Object;JZ)C", native_unsafe_get_char_mb);
+    r.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JC)V", native_unsafe_put_char_mb);
+    r.register(u2, "putCharUnaligned", "(Ljava/lang/Object;JCZ)V", native_unsafe_put_char_mb);
     r.register(u2, "storeFence", "()V", native_unsafe_fence);
     r.register(u2, "loadFence", "()V", native_unsafe_fence);
     r.register(u2, "fullFence", "()V", native_unsafe_fence);
@@ -13294,6 +13299,250 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
     Ok(None)
 }
 
+/// Multi-byte `Unsafe` accessors for `byte[]`-backed memory.
+///
+/// `Unsafe.get{Short,Char,Int,Long}` and the `*Unaligned` variants take a
+/// *byte* offset into the target object.  When the target is a `byte[]`
+/// (the backing store of every `HeapByteBuffer`), a single typed read must
+/// assemble 2/4/8 consecutive array elements — it is NOT a single-element
+/// access.  The generic `native_unsafe_get_int` returns just one element,
+/// which truncates every `ByteBuffer.get{Char,Short,Int,Long}` to its first
+/// byte (e.g. ICU's `ICUBinary.readHeader` reading the `nfc.nrm` header).
+///
+/// The 3-arg `*Unaligned` form carries an explicit `bigEndian` boolean at
+/// args[3]; the 2-arg form (and the plain aligned `getChar`/`getInt`/…)
+/// uses the platform's native byte order, which on every CratonVM host
+/// (x86-64 / aarch64) is little-endian.
+///
+/// Returns `Some(bytes)` only when `obj` is a `byte[]` (or boolean[]) and
+/// the offset has byte-offset shape; otherwise `None`, so the caller falls
+/// back to the generic element/field path.
+fn unsafe_read_bytes_from_byte_array(
+    ctx: &dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    offset: usize,
+    width: usize,
+) -> Option<Vec<u8>> {
+    if ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
+        return None;
+    }
+    match ctx.heap_element_type_of(obj) {
+        cratonvm_types::ArrayElementType::Byte
+        | cratonvm_types::ArrayElementType::Boolean => {}
+        _ => return None,
+    }
+    // Array byte offsets always start at ABASE (16); see
+    // `unsafe_array_index_from_offset` / `native_unsafe_array_base_offset`.
+    const ABASE: usize = 16;
+    if offset < ABASE {
+        return None;
+    }
+    let start = offset - ABASE;
+    let len = ctx.array_length(obj);
+    if start + width > len {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(width);
+    for i in 0..width {
+        let b = ctx.get_array_element(obj, start + i).as_int().unwrap_or(0) as u8;
+        bytes.push(b);
+    }
+    Some(bytes)
+}
+
+/// Decode the trailing `bigEndian` boolean of an `*Unaligned` call.
+/// `Some(true)` = big-endian, `Some(false)` = little-endian, `None` = the
+/// 2-arg form (no explicit order) → native order = little-endian.
+fn unsafe_big_endian_arg(args: &[Value]) -> bool {
+    match args.get(3) {
+        Some(Value::Int(z)) => *z != 0,
+        // 2-arg form or non-int trailing slot: native (little-endian).
+        _ => false,
+    }
+}
+
+macro_rules! unsafe_multibyte_get {
+    ($name:ident, $width:expr, $assemble:expr) => {
+        pub(crate) fn $name(
+            ctx: &mut dyn NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let offset = unsafe_offset(args, 2);
+            if let Some(obj) = unsafe_obj(args, 1) {
+                if let Some(bytes) =
+                    unsafe_read_bytes_from_byte_array(ctx, obj, offset, $width)
+                {
+                    let big_endian = unsafe_big_endian_arg(args);
+                    let v: i64 = $assemble(&bytes, big_endian);
+                    return Ok(Some(Value::Int(v as i32)));
+                }
+            }
+            // Not a byte-array target — generic element/field access.
+            native_unsafe_get_int(ctx, args)
+        }
+    };
+}
+
+fn asm_u16(b: &[u8], big_endian: bool) -> i64 {
+    let v = if big_endian {
+        u16::from_be_bytes([b[0], b[1]])
+    } else {
+        u16::from_le_bytes([b[0], b[1]])
+    };
+    v as i64
+}
+fn asm_i16(b: &[u8], big_endian: bool) -> i64 {
+    let v = if big_endian {
+        i16::from_be_bytes([b[0], b[1]])
+    } else {
+        i16::from_le_bytes([b[0], b[1]])
+    };
+    v as i64
+}
+fn asm_i32(b: &[u8], big_endian: bool) -> i64 {
+    let v = if big_endian {
+        i32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    };
+    v as i64
+}
+
+// `getShort` → signed 16-bit; `getChar` → unsigned 16-bit; `getInt` → 32-bit.
+unsafe_multibyte_get!(native_unsafe_get_short_mb, 2, asm_i16);
+unsafe_multibyte_get!(native_unsafe_get_char_mb, 2, asm_u16);
+unsafe_multibyte_get!(native_unsafe_get_int_mb, 4, asm_i32);
+
+/// 64-bit `Unsafe` get for `byte[]`-backed memory (`getLong`/`getLongUnaligned`).
+pub(crate) fn native_unsafe_get_long_mb(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let offset = unsafe_offset(args, 2);
+    if let Some(obj) = unsafe_obj(args, 1) {
+        if let Some(b) = unsafe_read_bytes_from_byte_array(ctx, obj, offset, 8) {
+            let big_endian = unsafe_big_endian_arg(args);
+            let v = if big_endian {
+                i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+            } else {
+                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+            };
+            return Ok(Some(Value::Long(v)));
+        }
+    }
+    native_unsafe_get_long(ctx, args)
+}
+
+/// Multi-byte `Unsafe` put for `byte[]`-backed memory. Scatters a typed
+/// value into `width` consecutive array elements honoring endianness.
+/// Returns `true` if the write was handled here (byte-array target).
+fn unsafe_write_bytes_to_byte_array(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    offset: usize,
+    bytes: &[u8],
+) -> bool {
+    if ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
+        return false;
+    }
+    match ctx.heap_element_type_of(obj) {
+        cratonvm_types::ArrayElementType::Byte
+        | cratonvm_types::ArrayElementType::Boolean => {}
+        _ => return false,
+    }
+    const ABASE: usize = 16;
+    if offset < ABASE {
+        return false;
+    }
+    let start = offset - ABASE;
+    let len = ctx.array_length(obj);
+    if start + bytes.len() > len {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        // Byte-array elements round-trip as sign-extended Int.
+        ctx.set_array_element(obj, start + i, Value::Int(b as i8 as i32));
+    }
+    true
+}
+
+macro_rules! unsafe_multibyte_put {
+    ($name:ident, $width:expr, $generic:ident) => {
+        pub(crate) fn $name(
+            ctx: &mut dyn NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            let offset = unsafe_offset(args, 2);
+            if let Some(obj) = unsafe_obj(args, 1) {
+                if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
+                    && matches!(
+                        ctx.heap_element_type_of(obj),
+                        cratonvm_types::ArrayElementType::Byte
+                            | cratonvm_types::ArrayElementType::Boolean
+                    )
+                {
+                    let val = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+                    // The bigEndian flag, when present, is args[4].
+                    let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
+                    let raw = (val as u32) & ((1u64 << ($width * 8)) - 1) as u32;
+                    let mut bytes = [0u8; $width];
+                    if big_endian {
+                        for i in 0..$width {
+                            bytes[$width - 1 - i] = (raw >> (i * 8)) as u8;
+                        }
+                    } else {
+                        for i in 0..$width {
+                            bytes[i] = (raw >> (i * 8)) as u8;
+                        }
+                    }
+                    if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes) {
+                        return Ok(None);
+                    }
+                }
+            }
+            $generic(ctx, args)
+        }
+    };
+}
+
+unsafe_multibyte_put!(native_unsafe_put_short_mb, 2, native_unsafe_put_int);
+unsafe_multibyte_put!(native_unsafe_put_char_mb, 2, native_unsafe_put_int);
+unsafe_multibyte_put!(native_unsafe_put_int_mb, 4, native_unsafe_put_int);
+
+/// 64-bit `Unsafe` put for `byte[]`-backed memory.
+pub(crate) fn native_unsafe_put_long_mb(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let offset = unsafe_offset(args, 2);
+    if let Some(obj) = unsafe_obj(args, 1) {
+        if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
+            && matches!(
+                ctx.heap_element_type_of(obj),
+                cratonvm_types::ArrayElementType::Byte
+                    | cratonvm_types::ArrayElementType::Boolean
+            )
+        {
+            let val = match args.get(3) {
+                Some(Value::Long(l)) => *l,
+                Some(Value::Int(i)) => *i as i64,
+                _ => 0,
+            };
+            // For putLong the bigEndian flag is args[4].
+            let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
+            let bytes = if big_endian {
+                (val as u64).to_be_bytes()
+            } else {
+                (val as u64).to_le_bytes()
+            };
+            if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes) {
+                return Ok(None);
+            }
+        }
+    }
+    native_unsafe_put_long(ctx, args)
+}
+
 pub(crate) fn native_unsafe_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let offset = unsafe_offset(args, 2);
     let obj = match unsafe_obj(args, 1) {
@@ -13690,9 +13939,159 @@ fn native_unsafe_get_and_set_object(ctx: &mut dyn NativeContext, args: &[Value])
     unreachable!()
 }
 
+/// Byte width of one element of a primitive array.
+fn array_elem_byte_width(t: cratonvm_types::ArrayElementType) -> usize {
+    match t {
+        cratonvm_types::ArrayElementType::Boolean
+        | cratonvm_types::ArrayElementType::Byte => 1,
+        cratonvm_types::ArrayElementType::Char
+        | cratonvm_types::ArrayElementType::Short => 2,
+        cratonvm_types::ArrayElementType::Int
+        | cratonvm_types::ArrayElementType::Float => 4,
+        cratonvm_types::ArrayElementType::Long
+        | cratonvm_types::ArrayElementType::Double
+        | cratonvm_types::ArrayElementType::Reference => 8,
+    }
+}
+
+/// Read `n` bytes from a primitive array starting at the raw byte offset
+/// `byte_off` (an `Unsafe` offset including `ABASE` = 16). Each element is
+/// decomposed into native (little-endian) byte order. Returns `None` if the
+/// object is not a primitive array or the range is out of bounds.
+pub(crate) fn unsafe_array_read_bytes(
+    ctx: &dyn NativeContext,
+    arr: cratonvm_types::ObjectRef,
+    byte_off: usize,
+    n: usize,
+) -> Option<Vec<u8>> {
+    if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
+        return None;
+    }
+    let et = ctx.heap_element_type_of(arr);
+    if et == cratonvm_types::ArrayElementType::Reference {
+        return None;
+    }
+    const ABASE: usize = 16;
+    let start = byte_off.checked_sub(ABASE)?;
+    let width = array_elem_byte_width(et);
+    let len = ctx.array_length(arr);
+    let total = len.checked_mul(width)?;
+    if start + n > total {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut produced = 0usize;
+    let mut elem_idx = start / width;
+    let mut byte_in_elem = start % width;
+    while produced < n {
+        let v = ctx.get_array_element(arr, elem_idx);
+        let raw: u64 = match et {
+            cratonvm_types::ArrayElementType::Float => {
+                (v.as_int().unwrap_or(0) as u32) as u64
+            }
+            cratonvm_types::ArrayElementType::Double => match v {
+                Value::Long(l) => l as u64,
+                Value::Double(d) => d.to_bits(),
+                _ => v.as_long().unwrap_or(0) as u64,
+            },
+            cratonvm_types::ArrayElementType::Long => match v {
+                Value::Long(l) => l as u64,
+                _ => v.as_long().unwrap_or(0) as u64,
+            },
+            _ => (v.as_int().unwrap_or(0) as i64) as u64,
+        };
+        let elem_bytes = raw.to_le_bytes();
+        while byte_in_elem < width && produced < n {
+            out.push(elem_bytes[byte_in_elem]);
+            byte_in_elem += 1;
+            produced += 1;
+        }
+        byte_in_elem = 0;
+        elem_idx += 1;
+    }
+    Some(out)
+}
+
+/// Write a byte stream into a primitive array starting at the raw byte
+/// offset `byte_off`. Each destination element is reassembled from native
+/// (little-endian) bytes. Partial-element writes preserve the surrounding
+/// bytes of the touched element. Returns `false` if `arr` is not a
+/// primitive array or the range is out of bounds.
+pub(crate) fn unsafe_array_write_bytes(
+    ctx: &mut dyn NativeContext,
+    arr: cratonvm_types::ObjectRef,
+    byte_off: usize,
+    bytes: &[u8],
+) -> bool {
+    if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
+        return false;
+    }
+    let et = ctx.heap_element_type_of(arr);
+    if et == cratonvm_types::ArrayElementType::Reference {
+        return false;
+    }
+    const ABASE: usize = 16;
+    let start = match byte_off.checked_sub(ABASE) {
+        Some(s) => s,
+        None => return false,
+    };
+    let width = array_elem_byte_width(et);
+    let len = ctx.array_length(arr);
+    let total = match len.checked_mul(width) {
+        Some(t) => t,
+        None => return false,
+    };
+    if start + bytes.len() > total {
+        return false;
+    }
+    let mut consumed = 0usize;
+    let mut elem_idx = start / width;
+    let mut byte_in_elem = start % width;
+    while consumed < bytes.len() {
+        // Read-modify-write the touched element so partial writes are safe.
+        let cur = ctx.get_array_element(arr, elem_idx);
+        let mut elem_bytes = match et {
+            cratonvm_types::ArrayElementType::Double => match cur {
+                Value::Long(l) => (l as u64).to_le_bytes(),
+                Value::Double(d) => d.to_bits().to_le_bytes(),
+                _ => 0u64.to_le_bytes(),
+            },
+            cratonvm_types::ArrayElementType::Long => match cur {
+                Value::Long(l) => (l as u64).to_le_bytes(),
+                _ => 0u64.to_le_bytes(),
+            },
+            _ => ((cur.as_int().unwrap_or(0) as i64) as u64).to_le_bytes(),
+        };
+        while byte_in_elem < width && consumed < bytes.len() {
+            elem_bytes[byte_in_elem] = bytes[consumed];
+            byte_in_elem += 1;
+            consumed += 1;
+        }
+        let raw = u64::from_le_bytes(elem_bytes);
+        let new_val = match et {
+            cratonvm_types::ArrayElementType::Boolean
+            | cratonvm_types::ArrayElementType::Byte => {
+                Value::Int(raw as u8 as i8 as i32)
+            }
+            cratonvm_types::ArrayElementType::Char => Value::Int(raw as u16 as i32),
+            cratonvm_types::ArrayElementType::Short => {
+                Value::Int(raw as u16 as i16 as i32)
+            }
+            cratonvm_types::ArrayElementType::Int
+            | cratonvm_types::ArrayElementType::Float => Value::Int(raw as u32 as i32),
+            cratonvm_types::ArrayElementType::Long
+            | cratonvm_types::ArrayElementType::Double => Value::Long(raw as i64),
+            cratonvm_types::ArrayElementType::Reference => unreachable!(),
+        };
+        ctx.set_array_element(arr, elem_idx, new_val);
+        byte_in_elem = 0;
+        elem_idx += 1;
+    }
+    true
+}
+
 pub(crate) fn native_unsafe_copy_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe, srcObj, srcOffset, destObj, destOffset, bytes]
-    // In our VM, offset = slot index. Copy field-by-field.
     let src_obj = unsafe_obj(args, 1);
     let src_offset = unsafe_offset(args, 2);
     let dest_obj = unsafe_obj(args, 3);
@@ -13702,8 +14101,30 @@ pub(crate) fn native_unsafe_copy_memory(ctx: &mut dyn NativeContext, args: &[Val
         Some(Value::Int(b)) => *b as usize,
         _ => 0,
     };
+    if bytes == 0 {
+        return Ok(None);
+    }
     if let (Some(src), Some(dst)) = (src_obj, dest_obj) {
-        // Treat bytes as element count (since each slot = 1 in our model)
+        // Primitive-array → primitive-array: `copyMemory` is a raw byte copy
+        // (the JDK's NIO buffer-view classes — ByteBufferAsCharBuffer,
+        // ICUBinary.getChars/getInts — rely on this to move trie data from a
+        // `byte[]`-backed buffer into a `char[]`/`int[]`). Decompose each
+        // source element to bytes and reassemble into the destination
+        // element type, honoring per-element byte width and offsets.
+        let src_is_array = ctx.heap_kind_of(src) == cratonvm_types::ObjectKind::Array
+            && ctx.heap_element_type_of(src) != cratonvm_types::ArrayElementType::Reference;
+        let dst_is_array = ctx.heap_kind_of(dst) == cratonvm_types::ObjectKind::Array
+            && ctx.heap_element_type_of(dst) != cratonvm_types::ArrayElementType::Reference;
+        if src_is_array && dst_is_array {
+            if let Some(buf) = unsafe_array_read_bytes(ctx, src, src_offset, bytes) {
+                if unsafe_array_write_bytes(ctx, dst, dest_offset, &buf) {
+                    return Ok(None);
+                }
+            }
+            // Fall through to the legacy element-copy if the byte-exact
+            // path could not run (shouldn't happen for in-bounds calls).
+        }
+        // Legacy slot-by-slot copy for object-field / non-array targets.
         for i in 0..bytes {
             let val = ctx.get_field(src, src_offset + i);
             ctx.set_field(dst, dest_offset + i, val);
@@ -13733,6 +14154,15 @@ fn native_unsafe_set_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => 0,
     };
     if let Some(obj_ref) = obj {
+        // Primitive-array target: fill `bytes` raw bytes with `value`.
+        if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array
+            && ctx.heap_element_type_of(obj_ref) != cratonvm_types::ArrayElementType::Reference
+        {
+            let fill = vec![value; bytes];
+            if unsafe_array_write_bytes(ctx, obj_ref, offset, &fill) {
+                return Ok(None);
+            }
+        }
         let fill_value = Value::Int(value as i32);
         for i in 0..bytes {
             ctx.set_field(obj_ref, offset + i, fill_value);
