@@ -511,7 +511,14 @@ fn obj_arg_or_null(args: &[Value], idx: usize) -> Option<ObjectRef> {
 }
 
 fn alloc_object_for(ctx: &mut dyn NativeContext, class_name: &str, min_slots: usize) -> ObjectRef {
-    let cid = ctx.ensure_class_initialized(class_name).unwrap_or(ClassId::new(0));
+    // Fall back to a synthetic class (declaring `min_slots` fields) rather
+    // than `ClassId::new(0)` when the real class can't be loaded: an object
+    // allocated with `java/lang/Object`'s id but a non-zero slot count is an
+    // undersized layout the GC's `get_field` bounds guard rejects.
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => cid,
+        Err(_) => ctx.ensure_synthetic_class(class_name, min_slots),
+    };
     let real = ctx.class_num_total_fields(cid).max(min_slots);
     ctx.alloc_object(cid, real)
 }

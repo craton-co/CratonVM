@@ -494,6 +494,25 @@ pub trait NativeContext {
         name: &str,
     ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
 
+    /// Register (or look up) a minimal synthetic class with the given name
+    /// and instance-field count, returning its `ClassId`.
+    ///
+    /// Unlike [`ensure_class_initialized`], this never fails: when the real
+    /// `.class` file cannot be loaded it still produces a usable `ClassId`
+    /// whose class declares `num_fields` instance fields. Native allocators
+    /// MUST use this (rather than `ClassId::new(0)`) as the fallback class
+    /// when allocating an object with a non-zero field count — allocating
+    /// with `ClassId::new(0)` (`java/lang/Object`, which declares zero
+    /// fields) produces an "undersized object layout" object that the GC's
+    /// `get_field` bounds guard rejects on every field access.
+    ///
+    /// The default implementation falls back to `ClassId::new(0)` so mocks
+    /// and non-VM contexts still compile; real VM contexts override it.
+    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let _ = (name, num_fields);
+        ClassId::new(0)
+    }
+
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 

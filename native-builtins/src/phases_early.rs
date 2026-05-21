@@ -7414,7 +7414,19 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this = obj_arg(args, 0)?;
         let addr = obj_arg(args, 1)?;
         let port = args[2].as_int().unwrap_or(0);
-        let host_val = ctx.get_field(addr, 0);
+        // The InetAddress' host/IP lives in the `net_phase_e` side table —
+        // slot 0 is the typed `holder`, not a host String. Resolve through
+        // the layout-aware reader, preferring the host name and falling back
+        // to the IP literal.
+        let host_str = {
+            let h = crate::net_phase_e::inet_addr_host_string_or(ctx, addr, "");
+            if h.is_empty() {
+                crate::net_phase_e::inet_addr_ip_string_or(ctx, addr, "")
+            } else {
+                h
+            }
+        };
+        let host_val = Value::Object(Some(ctx.create_string(&host_str)));
         ctx.set_field(this, 0, host_val);
         ctx.set_field(this, 1, Value::Int(port));
         ctx.set_field(this, 2, Value::Object(Some(addr)));
@@ -10786,9 +10798,22 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(h)) = ctx.get_field(this, SOCK_HOST) {
             let host_str = ctx.read_string(h).unwrap_or_default();
-            let addr = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-            let hn = ctx.create_string(&host_str);
-            ctx.set_field(addr, 0, Value::Object(Some(hn)));
+            // Build through the shared allocator: populates the typed `holder`
+            // and the side table. Writing a bare String into slot 0 (the
+            // typed `holder` reference) poisons real-JDK InetAddress dispatch.
+            // If the stored host is a literal IP, use it as the address too;
+            // otherwise leave the address empty.
+            let ip = if host_str.parse::<std::net::IpAddr>().is_ok() {
+                host_str.as_str()
+            } else {
+                ""
+            };
+            let addr = crate::net_phase_e::alloc_inet_address_class(
+                ctx,
+                "java/net/InetAddress",
+                &host_str,
+                ip,
+            );
             Ok(Some(Value::Object(Some(addr))))
         } else {
             Ok(Some(Value::Object(None)))

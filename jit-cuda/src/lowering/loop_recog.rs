@@ -185,15 +185,15 @@ fn classify_counted_loop(
     // Walk from header_pc forward. We need three things:
     //  * the loop-exit `if_icmp*` (first compare branching past the
     //    back-branch),
-    //  * the local slot of the `iload` that produced the comparison's
-    //    LHS operand (that local is the induction variable), and
+    //  * the `pc` of the `iload` that produced the comparison's LHS
+    //    operand (that local is the induction variable), and
     //  * the induction variable's `iinc` (to read its stride).
     let mut exit_if_pc = None;
     let mut exit_pc = None;
-    // Local slots of the `iload`s seen during the header walk, in
-    // order. When we reach the exit-if, javac has emitted exactly
-    // `iload iv; iload bound; if_icmp*`, so the second-to-last `iload`
-    // is the induction variable and the last is the bound.
+    // (pc, local-slot) of the most-recent `iload` seen during the walk.
+    // When we reach the exit-if, the second-to-last `iload` is the LHS
+    // (`iv`) and the last is the RHS (the bound). javac always emits
+    // `iload iv; iload bound; if_icmp*` for the canonical loop header.
     let mut iload_history: Vec<u16> = Vec::new();
     let mut pc = header_pc;
     while pc <= back_branch_pc {
@@ -203,9 +203,8 @@ fn classify_counted_loop(
         let op = bytes[pc];
         let size = instr_size(bytes, pc)?;
 
-        // Track `iload` instructions (narrow + wide) until the exit-if,
-        // so we can recover the induction-variable slot from the
-        // exit-if's LHS operand.
+        // Track `iload` instructions (narrow + wide) so we can recover
+        // the induction-variable slot from the exit-if's LHS operand.
         if exit_if_pc.is_none() {
             if let Some(slot) = iload_slot(bytes, pc, op) {
                 iload_history.push(slot);
@@ -215,10 +214,7 @@ fn classify_counted_loop(
         // Loop-exit comparisons: if_icmp* (0x9F-0xA4) and unary if*
         // (0x99-0x9E) whose target is the post-loop region.
         if (0x99..=0xA4).contains(&op) {
-            let off = i16::from_be_bytes([
-                *bytes.get(pc + 1).ok_or_else(truncated)?,
-                *bytes.get(pc + 2).ok_or_else(truncated)?,
-            ]) as i32;
+            let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
             let target = (pc as i32 + off) as usize;
             if target > back_branch_pc && exit_if_pc.is_none() {
                 exit_if_pc = Some(pc);
@@ -240,10 +236,9 @@ fn classify_counted_loop(
     // ── Bug A: validate the exit comparison is the canonical `i < bound`
     // shape. javac compiles `for (i = 0; i < bound; i++)` with the
     // *negated* test `if_icmpge bound -> exit`. `<=` becomes `if_icmpgt`,
-    // `!=` becomes `if_icmpeq`, `>` becomes `if_icmple`, etc. The
-    // emitter's `tid < bound` dispatch is only correct for `if_icmpge`;
-    // reject every other comparison so the loop runs on the CPU
-    // interpreter instead of being silently mis-lowered.
+    // `!=` becomes `if_icmpeq`, etc. The emitter's `tid < bound` dispatch
+    // is only correct for `if_icmpge`; reject every other comparison so
+    // the loop runs on the CPU interpreter instead of being mis-lowered.
     if exit_op != IF_ICMPGE {
         return Err(LoweringError::UnsupportedNode(format!(
             "non-canonical loop-exit comparison 0x{exit_op:02x} at pc={exit_if_pc} \
@@ -371,7 +366,7 @@ fn find_iv_stride(
 /// preceding the header must be fed by `iconst_0`.
 ///
 /// Errors (rejects the loop) if the start value is missing, is not a
-/// literal `0`, or comes from anything other than a constant push.
+/// literal `0`, or comes from anything other than `iconst_0`.
 fn verify_zero_start(
     bytes: &[u8],
     header_pc: usize,
@@ -381,9 +376,8 @@ fn verify_zero_start(
     // and the most recent `istore` to `iv_slot`. The canonical prelude
     // ends `... iconst_0; istore iv` right before the header.
     let mut pc = 0usize;
-    // Integer constant pushed by the immediately-preceding instruction
-    // (`Some(value)`), or `None` if the previous instruction was not a
-    // recognised constant push.
+    // Most recent integer constant pushed onto the stack (if the last
+    // instruction was a constant push) — `Some(value)` or `None`.
     let mut last_const: Option<i32> = None;
     // The constant feeding the most recent `istore iv`, if any.
     let mut iv_start: Option<i32> = None;
@@ -428,8 +422,6 @@ fn verify_zero_start(
             }
             last_const = None;
         } else {
-            // After any non-store instruction, only a constant-push
-            // leaves a known value as the new stack top.
             last_const = pushed;
         }
         pc += size;

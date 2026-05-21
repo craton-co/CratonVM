@@ -1582,11 +1582,24 @@ pub fn execute(
                                 if method_name == "iterator"
                                     && method_descriptor == "()Ljava/util/Iterator;"
                                 {
-                                    let cm = shared.class_manager.read();
-                                    let itr_cid = cm
-                                        .get_loaded_class_id("java/util/Iterator")
-                                        .unwrap_or(ClassId::new(0));
-                                    drop(cm);
+                                    // The synthetic empty iterator needs a
+                                    // *concrete 2-field* class (array, cursor).
+                                    // The `java/util/Iterator` interface
+                                    // declares zero instance fields, and
+                                    // `ClassId::new(0)` (`java/lang/Object`)
+                                    // likewise declares zero — either would
+                                    // make this a 2-slot object whose class
+                                    // claims 0 fields, which the GC's
+                                    // `get_field` bounds guard rejects.
+                                    // Register a dedicated synthetic class
+                                    // declaring the 2 fields instead.
+                                    let itr_cid = shared
+                                        .class_manager
+                                        .write()
+                                        .ensure_synthetic_class(
+                                            "cratonvm/synthetic/EmptyIterator",
+                                            2,
+                                        );
                                     let itr = shared.heap.alloc_object(itr_cid, 2);
                                     // empty array placeholder + cursor=0
                                     let empty = shared.heap.alloc_array(
@@ -2378,16 +2391,16 @@ pub fn execute(
     if let Some(exc) = jit_early_exception {
         // The frame has been pushed. Search its exception table for a handler.
         let frame_idx = thread.frames.len() - 1;
-        // The JIT executed the entire method body, so we do not have the
-        // exact throw-site PC. Pass the frame's `last_instr_pc` (which on a
-        // freshly-pushed frame is 0) as a best-effort PC; the handler
-        // search still honors each entry's `[start_pc, end_pc)` range so
-        // we do not incorrectly route exceptions into a `finally` whose
-        // try region did not cover the throw site. This may cause us to
-        // miss a legitimate handler in the JIT-deopt case, but never to
-        // catch in the wrong one — propagation to the caller is correct.
-        let throw_pc = thread.frames[frame_idx].last_instr_pc;
-        match find_exception_handler_any_pc(shared, &thread.frames[frame_idx], throw_pc, exc) {
+        // The JIT executed the entire method body as native code, so there is
+        // no live throw-site PC. Previously this passed the freshly-pushed
+        // frame's `last_instr_pc` (always 0) to the PC-ranged search, which
+        // silently missed every handler whose `try` region does not start at
+        // offset 0 — e.g. a JIT-compiled `Main.main` whose `catch (Throwable)`
+        // protects `[2,26)` would never catch a callee exception, leaking it
+        // past the method (Jetty `start.jar` launcher). Use the PC-unknown
+        // search instead: it skips catch-all `finally` entries (unsafe to
+        // match without a PC) but matches typed handlers by exception class.
+        match find_exception_handler_pc_unknown(shared, &thread.frames[frame_idx], exc) {
             Some((handler_pc, exc_ref)) => {
                 thread.frames[frame_idx].stack.clear();
                 let _ = thread.frames[frame_idx].stack.push(Value::Object(Some(exc_ref)));
@@ -5021,6 +5034,63 @@ fn find_exception_handler_any_pc(
     // bytecode-throw routing, the other is JIT-throw routing) but share the
     // implementation below.
     find_exception_handler_impl(shared, frame, pc, exc)
+}
+
+/// Find a handler in `frame`'s exception table when the throw-site PC is
+/// **unknown** — the case after a JIT-compiled method runs to completion as
+/// native code and a callee it dispatched throws.
+///
+/// The JIT executes the whole bytecode body, so there is no live interpreter
+/// PC for the throw site. Passing `0` (a freshly-pushed frame's
+/// `last_instr_pc`) to the PC-range check in `find_exception_handler_impl`
+/// silently misses every handler whose protected region does not start at 0
+/// — e.g. a `try` block that begins a few bytes into the method. That bug
+/// made a JIT-compiled `Main.main` propagate a callee exception straight past
+/// its own `catch (Throwable)` (Jetty `start.jar` launcher: the launcher's
+/// usage-error handling never ran, surfacing a misleading inner NPE instead).
+///
+/// Mirroring `route_jit_exception_through_method`: skip catch-all
+/// (`catch_type == 0`, i.e. `finally`) entries — without a known PC they
+/// could swallow an exception thrown outside their region — but match typed
+/// handlers by exception class, which is sound regardless of throw site.
+fn find_exception_handler_pc_unknown(
+    shared: &SharedVm,
+    frame: &Frame,
+    exc: ObjectRef,
+) -> Option<(usize, ObjectRef)> {
+    let exc_class_id = shared.heap.class_id_of(exc);
+    let mut cm_guard = shared.class_manager.read();
+    cm_guard.get_class(frame.class_id)?;
+    for entry in frame.exception_table().iter() {
+        // PC unknown → cannot verify range membership; conservatively skip
+        // catch-all entries (they would catch anything) but still allow
+        // typed handlers to match on exception class.
+        if entry.catch_type == 0 {
+            continue;
+        }
+        let owning_class = cm_guard.get_class(frame.class_id)?;
+        let Some(catch_class_name) = owning_class.constant_pool.get_class_name(entry.catch_type)
+        else {
+            continue;
+        };
+        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
+            Some(id) => id,
+            None => {
+                let owned = catch_class_name.to_string();
+                drop(cm_guard);
+                let loaded = shared.load_class_concurrent(&owned);
+                cm_guard = shared.class_manager.read();
+                match loaded {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                }
+            }
+        };
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+            return Some((entry.handler_pc as usize, exc));
+        }
+    }
+    None
 }
 
 /// Shared core of [`find_exception_handler`] and
@@ -9986,11 +10056,17 @@ pub(crate) fn try_lambda_dispatch(
                 .write()
                 .load_class(&call_site.impl_handle.class_name)?;
             ensure_class_initialized_shared(shared, thread, class_id)?;
+            // Use `num_total_fields` (inherited + declared instance fields),
+            // matching the `New` opcode. `c.fields.len()` is wrong here: it
+            // counts this class's declared fields *including statics* while
+            // omitting inherited instance fields, so a subclass constructor
+            // reference would under-allocate and trip the GC `get_field`
+            // bounds guard on any inherited-field access.
             let num_fields = shared
                 .class_manager
                 .read()
                 .get_class(class_id)
-                .map(|c| c.fields.len())
+                .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let new_obj = gc_alloc_object(shared, thread, class_id, num_fields)?;
             // Build <init> args: [new_obj, ...full_args]

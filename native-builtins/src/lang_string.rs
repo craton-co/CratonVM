@@ -3439,21 +3439,35 @@ pub(crate) fn native_string_formatted(ctx: &mut dyn NativeContext, args: &[Value
 // ---------------------------------------------------------------------------
 //
 // `isBigEndian()Z` is called from `StringUTF16.<clinit>` on JDK 25 to decide
-// which byte order the compact-string byte[] uses for its `char` pairs. The
-// JDK implementation is an intrinsic bound to the host's native byte order;
-// we mirror that behaviour with a compile-time check against `target_endian`.
-// All tier-1 Rust targets (x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu,
-// aarch64-apple-darwin) are little-endian; only legacy big-endian targets
-// (SPARC, s390x, PowerPC BE) would return `true`.
+// which byte order the compact-string `byte[]` uses for its `char` pairs —
+// it seeds the `HI_BYTE_SHIFT` / `LO_BYTE_SHIFT` constants that `putChar` /
+// `getChar` / `compress` / `toBytes` use throughout `StringUTF16`.
+//
+// This MUST agree with the byte order CratonVM's own Rust string code uses.
+// CratonVM stores every compact UTF-16 string `byte[]` **big-endian** (high
+// byte first) regardless of host architecture — see `create_string` in
+// `vm/src/vm/vm_object.rs` (`hi = unit >> 8` written at `i*2`), and every
+// native String accessor in this file decodes the same `(hi << 8) | lo`
+// way. Constant-pool strings, `String.substring`, `String.concat`, interning,
+// etc. all go through that big-endian Rust path.
+//
+// If `isBigEndian()` returned `false` here, the *real-JDK* `StringUTF16`
+// bytecode (e.g. the `String(char[])` constructor, which has no native
+// override) would build a **little-endian** `byte[]`, while CratonVM's
+// native `charAt` / `toCharArray` / `hashCode` / `equals` would still read
+// it big-endian. The two halves of the VM would then disagree on every
+// non-Latin-1 string: observed as byte-swapped `char` values that broke
+// `java.lang.CharacterData00`'s packed lookup tables (`Character.getType`
+// AIOOBE for ch >= 0x100) and, downstream, Xerces XSD pattern compilation
+// (`Token.getRange` AIOOBE → Hazelcast schema-validation failure).
+//
+// Returning `true` makes the JDK bytecode use the same big-endian layout as
+// CratonVM's Rust code, keeping every code path consistent.
 pub(crate) fn native_string_utf16_is_big_endian(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    #[cfg(target_endian = "big")]
-    let result = 1;
-    #[cfg(target_endian = "little")]
-    let result = 0;
-    Ok(Some(Value::Int(result)))
+    Ok(Some(Value::Int(1)))
 }
 
 // ---------------------------------------------------------------------------
@@ -4461,16 +4475,18 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // StringUTF16.isBigEndian — used during <clinit> to pick a byte order
-    // for the compact-string byte[] layout. Mirrors the host endianness.
+    // for the compact-string byte[] layout. CratonVM always stores compact
+    // UTF-16 strings big-endian (see `create_string`), so this must return
+    // `true` regardless of host endianness to keep the real-JDK StringUTF16
+    // bytecode consistent with CratonVM's native string code.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn t18_k6_string_utf16_is_big_endian_returns_platform_endian() {
+    fn t18_k6_string_utf16_is_big_endian_returns_true() {
         let mut ctx = mock_ctx();
         let result = native_string_utf16_is_big_endian(&mut ctx, &[]).unwrap().unwrap();
-        // On x86_64 hosts we expect false; on big-endian we'd expect true.
-        let expected_int = if cfg!(target_endian = "big") { 1 } else { 0 };
-        assert_eq!(result, Value::Int(expected_int));
+        // Always true: CratonVM stores compact strings big-endian.
+        assert_eq!(result, Value::Int(1));
     }
 
     #[test]

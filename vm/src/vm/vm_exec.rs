@@ -1660,6 +1660,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        // Defense-in-depth: a native caller must never allocate an object
+        // with `ClassId::new(0)` (`java/lang/Object`, which declares zero
+        // instance fields) yet a non-zero slot count. Such an object has an
+        // "undersized layout" — its class says it has 0 fields but the
+        // header reserves `num_fields` slots — and the GC's `get_field`
+        // bounds guard then rejects (drops) every `getfield` on it, which is
+        // exactly the `class_name=java/lang/Object class_id=ClassId(0)
+        // real_field_count=Some(0)` failure WildFly's controller boot hit.
+        //
+        // Several native allocators still pass `ClassId::new(0)` on their
+        // class-resolution-failed fallback path. Rather than let a broken
+        // object reach the heap, substitute a synthetic class that declares
+        // `num_fields` instance fields so the header's `class_id` agrees
+        // with its slot count. Field-less Object allocations (`new Object()`
+        // and array-element class hints) are unaffected.
+        let class_id = if class_id == ClassId::new(0) && num_fields > 0 {
+            // One synthetic class per distinct field count, shared across
+            // all callers — keeps the class store from growing unbounded.
+            let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
+            self.shared
+                .class_manager
+                .write()
+                .ensure_synthetic_class(&name, num_fields)
+        } else {
+            class_id
+        };
         // Layout-mismatch guard: many native allocators hard-code a
         // synthetic field count (e.g. `HashSet` => 1) that is SMALLER
         // than the real JDK class layout. When real-JDK bytecode later
@@ -1692,6 +1718,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let class_id = self.shared.load_class_concurrent(name)?;
         super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
         Ok(class_id)
+    }
+
+    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        // Prefer the real class if it can be loaded — `ensure_synthetic_class`
+        // returns the existing id when the name is already registered, so a
+        // successful load here keeps native allocations on the real layout.
+        if let Ok(cid) = self.shared.load_class_concurrent(name) {
+            return cid;
+        }
+        // Real class unavailable: register a minimal synthetic class that
+        // declares `num_fields` instance fields. This guarantees the object
+        // header's `class_id` points at a class whose `num_total_fields`
+        // matches the allocated slot count, instead of `ClassId::new(0)`
+        // (`java/lang/Object`, zero declared fields) which the GC's
+        // `get_field` bounds guard rejects as an undersized layout.
+        self.shared
+            .class_manager
+            .write()
+            .ensure_synthetic_class(name, num_fields)
     }
 
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {

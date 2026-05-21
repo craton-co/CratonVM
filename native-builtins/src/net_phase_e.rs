@@ -299,6 +299,85 @@ fn inet_addr_field_string_or(
     read_field_string_or(ctx, this, which, default)
 }
 
+/// `pub(crate)` accessor for the InetAddress IP string, for sibling modules
+/// (`phases_late.rs` datagram / multicast natives) that previously read the
+/// raw slot. Consults the side table; returns `default` when no usable
+/// address is recorded.
+pub(crate) fn inet_addr_ip_string_or(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    default: &str,
+) -> String {
+    inet_addr_field_string_or(ctx, this, IA_ADDR, default)
+}
+
+/// `pub(crate)` accessor for the InetAddress host string. See
+/// [`inet_addr_ip_string_or`].
+pub(crate) fn inet_addr_host_string_or(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    default: &str,
+) -> String {
+    inet_addr_field_string_or(ctx, this, IA_HOST, default)
+}
+
+/// Populate the real-JDK `InetAddress$InetAddressHolder` referenced by the
+/// `holder` field of `ia`.
+///
+/// `InetAddressHolder` (JDK 17/21/25 layout) declares, in order:
+/// `originalHostName:String`, `hostName:String`, `address:int`, `family:int`.
+/// We populate it by field name so the write is robust to layout shifts.
+/// `address` is the packed big-endian IPv4 integer (0 for IPv6); `family`
+/// is 1 for IPv4 / 2 for IPv6 (`InetAddress.IPv4` / `IPv6` constants).
+///
+/// Linking a correctly-shaped holder into slot 0 is what keeps real-JDK
+/// `InetAddress` bytecode we do NOT natively override (e.g. Hazelcast's
+/// `DefaultAddressPicker` calling `getHostName().toLowerCase(loc)`) from
+/// retargeting the inner `invokevirtual` onto `java/lang/String`.
+fn inet_addr_populate_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, ip: &str) {
+    let holder = alloc_concurrent_synthetic(ctx, "java/net/InetAddress$InetAddressHolder", 4);
+    let host_s = ctx.create_string(host);
+    let orig_s = ctx.create_string(host);
+    let (address, family) = match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => (i32::from_be_bytes(v4.octets()), 1),
+        Ok(IpAddr::V6(_)) => (0, 2),
+        Err(_) => (0, 1),
+    };
+    ctx.set_field_by_name(holder, "originalHostName", Value::Object(Some(orig_s)));
+    ctx.set_field_by_name(holder, "hostName", Value::Object(Some(host_s)));
+    ctx.set_field_by_name(holder, "address", Value::Int(address));
+    ctx.set_field_by_name(holder, "family", Value::Int(family));
+    // Link the holder into the InetAddress' real `holder` field. Resolve by
+    // name so a String never lands in the typed reference slot.
+    if ctx.resolve_field_index("java/net/InetAddress", "holder").is_some() {
+        ctx.set_field_by_name(ia, "holder", Value::Object(Some(holder)));
+    } else {
+        // Class layout unavailable (synthetic ClassId 0) — fall back to
+        // slot 0, the holder's canonical position.
+        ctx.set_field(ia, 0, Value::Object(Some(holder)));
+    }
+}
+
+/// Shared InetAddress allocator. Allocates a `java/net/InetAddress` (or the
+/// IPv4 / IPv6 subclass when `class_name` is given), records `(host, ip)` in
+/// the side table, and populates the real-JDK `holder` field so both our
+/// natives and any un-overridden real-JDK bytecode see consistent state.
+///
+/// Instance slot 0 receives the typed `InetAddressHolder` — NOT a String —
+/// which is what keeps real-JDK `getHostName()` / `getAddress()` dispatch
+/// from retargeting onto `java/lang/String`.
+pub(crate) fn alloc_inet_address_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    host: &str,
+    ip: &str,
+) -> ObjectRef {
+    let ia = alloc_concurrent_synthetic(ctx, class_name, 2);
+    inet_addr_set(ia, host, ip);
+    inet_addr_populate_holder(ctx, ia, host, ip);
+    ia
+}
+
 const SEL_OPEN: usize = 0;
 
 const HS_ADDRESS: usize = 0;
@@ -525,14 +604,18 @@ fn new_java_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
 }
 
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> ObjectRef {
-    let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-    // Record host/IP in the ObjectRef-keyed side table. Do NOT write Strings
-    // into instance slots 0/1: those are the real-JDK `holder` reference
-    // fields, and a String there poisons real-JDK InetAddress bytecode
-    // dispatch (bogus `NoSuchMethodError java/lang/String.getHostName()`).
-    // See `inet_addr_side_table()` for the full rationale.
-    inet_addr_set(ia, host, ip);
-    ia
+    // Route through the shared allocator, picking the concrete subclass that
+    // matches the address family (real-JDK never hands back a bare
+    // `InetAddress`). The allocator records host/IP in the ObjectRef-keyed
+    // side table AND populates the real-JDK `holder` field — do NOT write
+    // bare Strings into instance slots 0/1, since slot 0 is the typed
+    // `holder` reference and a String there poisons real-JDK InetAddress
+    // bytecode dispatch. See `inet_addr_side_table()` for the full rationale.
+    let class_name = match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => "java/net/Inet6Address",
+        _ => "java/net/Inet4Address",
+    };
+    alloc_inet_address_class(ctx, class_name, host, ip)
 }
 
 fn alloc_inet_socket_address(

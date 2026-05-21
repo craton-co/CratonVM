@@ -114,33 +114,6 @@ impl Locals {
     }
 }
 
-/// Identifies an array-reference's backing kernel parameter — either a
-/// regular method parameter (`pN_ptr` / `pN_len`) or a `this.<field>`
-/// access (`pthis_<i>_ptr` / `pthis_<i>_len`).
-///
-/// Phase 9 #2 — non-static methods access primitive-array fields via
-/// the `aload_0; getfield <cp_index>` pattern. Each unique cp_index in
-/// the method body becomes one extra kernel parameter pair; the index
-/// here is the zero-based position of that cp_index in the dedup'd
-/// `this_field_cps` list (see [`Emitter::this_field_cps_unique`]).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum ArrayKey {
-    /// `pN_ptr` / `pN_len` — a declared method parameter.
-    Param(usize),
-    /// `pthis_N_ptr` / `pthis_N_len` — a unique `this.<field>` access.
-    ThisField(usize),
-}
-
-impl ArrayKey {
-    /// PTX-side name of the matching `_len` parameter.
-    pub fn len_param_name(self) -> String {
-        match self {
-            ArrayKey::Param(i) => format!("p{i}_len"),
-            ArrayKey::ThisField(i) => format!("pthis_{i}_len"),
-        }
-    }
-}
-
 /// All state the emitter needs while walking a method.
 pub(crate) struct Emitter<'a> {
     pub bytes: &'a [u8],
@@ -154,26 +127,6 @@ pub(crate) struct Emitter<'a> {
     /// by `bind_param_locals`; used by `array_param_of` to map an
     /// `aload`'d array reference back to its parameter index.
     pub param_ptr_reg: Vec<String>,
-    /// Phase 9 #2 — whether the lowered method is non-static. When
-    /// true, slot 0 holds `this` (the [`Self::this_sentinel_name`]
-    /// register), and `aload_0; getfield <cp>` chains resolve through
-    /// [`Self::this_field_ptr_reg`].
-    pub is_static: bool,
-    /// Phase 9 #2 — name of the sentinel U64 register bound to slot 0
-    /// for non-static methods. Never written by the kernel — only
-    /// inspected to detect the `aload_0; getfield` shape. Empty
-    /// string for static methods.
-    pub this_sentinel_name: String,
-    /// Phase 9 #2 — dedup'd `this_field_cps`, in the body-encounter
-    /// order recorded by the analyzer. `this_field_cps_unique[i]` is
-    /// the cp_index whose ptr lives in `pthis_<i>_ptr`.
-    pub this_field_cps_unique: Vec<u16>,
-    /// Phase 9 #2 — for each unique cp_index, the U64 register we
-    /// pre-loaded `pthis_<i>_ptr` into. Key: cp_index; value: (the
-    /// dedup'd index, the register). `getfield <cp>` pushes the
-    /// matching register's clone onto the operand stack; from then on
-    /// it behaves identically to an array-parameter reference.
-    pub this_field_ptr_reg: std::collections::HashMap<u16, (usize, Reg)>,
     /// Local slot of the loop induction variable (if we are in a loop).
     pub iv_slot: Option<u16>,
     /// Loop-bound register; populated once we emit the prologue. Used
@@ -196,17 +149,7 @@ pub(crate) struct Emitter<'a> {
 }
 
 impl<'a> Emitter<'a> {
-    pub fn new(bytes: &'a [u8], sig: &'a KernelSignature, is_static: bool) -> Self {
-        // Phase 9 #2 — dedup the analyzer's body-encounter order list.
-        // Each unique cp_index becomes one kernel parameter pair; we
-        // preserve first-encounter order so the kernel arg ordering
-        // is stable and matches the marshaller's iteration.
-        let mut this_field_cps_unique: Vec<u16> = Vec::new();
-        for &cp in &sig.this_field_cps {
-            if !this_field_cps_unique.contains(&cp) {
-                this_field_cps_unique.push(cp);
-            }
-        }
+    pub fn new(bytes: &'a [u8], sig: &'a KernelSignature) -> Self {
         Self {
             bytes,
             body: String::new(),
@@ -215,10 +158,6 @@ impl<'a> Emitter<'a> {
             locals: Locals::default(),
             sig,
             param_ptr_reg: vec![String::new(); sig.param_kinds.len()],
-            is_static,
-            this_sentinel_name: String::new(),
-            this_field_cps_unique,
-            this_field_ptr_reg: std::collections::HashMap::new(),
             iv_slot: None,
             bound_reg: None,
             tid_reg: None,
@@ -233,37 +172,8 @@ impl<'a> Emitter<'a> {
     /// param 0, slot 1 is param 1 (or slot 2 for a long/double param 0),
     /// etc. Each array parameter binds the slot to its `pN_ptr` U64 reg;
     /// each scalar parameter binds to a freshly-loaded value reg.
-    ///
-    /// Phase 9 #2 — for non-static methods, slot 0 is bound to a
-    /// sentinel U64 register that stands in for `this`. The sentinel
-    /// is never written by the kernel; subsequent `aload_0; getfield`
-    /// sequences resolve the sentinel back to the corresponding
-    /// `pthis_<i>_ptr` register pre-loaded here.
     pub fn bind_param_locals(&mut self) -> Result<(), LoweringError> {
         let mut slot = 0usize;
-        // Phase 9 #2 — slot 0 = `this` for non-static methods. Bind a
-        // sentinel U64 reg; `aload_0; getfield` recognises this name
-        // and rewrites the stack top to the matching this-field ptr.
-        if !self.is_static {
-            let sentinel = self.regs.fresh_reg(RegKind::U64);
-            // No `ld.param` is emitted — the sentinel is purely a
-            // type-system marker on the simulated operand stack.
-            // The marshaller does not pass `this` as a kernel arg;
-            // only the named fields are marshalled.
-            self.this_sentinel_name = sentinel.name.clone();
-            self.locals.set(slot, sentinel);
-            slot += 1;
-            // Pre-load each unique this-field array pointer into a
-            // fresh U64 register. `getfield <cp>` replaces the
-            // sentinel on the stack with a clone of this register;
-            // from that point on the array reference behaves
-            // identically to a method-parameter array reference.
-            for (i, &cp) in self.this_field_cps_unique.clone().iter().enumerate() {
-                let r = self.regs.fresh_reg(RegKind::U64);
-                writeln!(self.body, "    ld.param.u64 {}, [pthis_{i}_ptr];", r.name).unwrap();
-                self.this_field_ptr_reg.insert(cp, (i, r));
-            }
-        }
         for (i, k) in self.sig.param_kinds.iter().enumerate() {
             match k {
                 ParamKind::Void => {}
@@ -361,27 +271,6 @@ impl<'a> Emitter<'a> {
             self.body,
             "    setp.ge.s32 {}, {}, {};",
             p.name, tid.name, bound.name
-        )
-        .unwrap();
-        writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
-    }
-
-    /// Emit `if (tid != 0) ret;` for straight-line (scalar) kernels.
-    ///
-    /// A straight-line kernel has no induction variable, so the body is
-    /// identical on every CUDA thread. Without this guard every thread
-    /// in the grid executes the body — and any array store has every
-    /// thread writing the same element, which is a data race even if
-    /// the value written is identical. Restricting execution to thread
-    /// 0 makes the kernel deterministic regardless of the launch
-    /// geometry chosen by the marshalling layer.
-    pub fn emit_straight_line_guard(&mut self) {
-        let tid = self.tid_reg.clone().expect("emit_tid was called");
-        let p = self.regs.fresh_reg(RegKind::Pred);
-        writeln!(
-            self.body,
-            "    setp.ne.s32 {}, {}, 0;",
-            p.name, tid.name
         )
         .unwrap();
         writeln!(self.body, "    @{} bra L_done;", p.name).unwrap();
@@ -569,31 +458,21 @@ impl<'a> Emitter<'a> {
             0x3A => self.astore(self.bytes[pc + 1] as u16)?,
             0x4B..=0x4E => self.astore((op - 0x4B) as u16)?,
             // ── array load ──────────────────────────────────────────
-            0x2E => self.array_load(RegKind::S32, ".s32", 4, ParamKind::I32Array, "iaload")?, // iaload
-            0x2F => self.array_load(RegKind::S64, ".s64", 8, ParamKind::I64Array, "laload")?, // laload
-            0x30 => self.array_load(RegKind::F32, ".f32", 4, ParamKind::F32Array, "faload")?, // faload
-            0x31 => self.array_load(RegKind::F64, ".f64", 8, ParamKind::F64Array, "daload")?, // daload
+            0x2E => self.array_load(RegKind::S32, ".s32", 4)?, // iaload
+            0x2F => self.array_load(RegKind::S64, ".s64", 8)?, // laload
+            0x30 => self.array_load(RegKind::F32, ".f32", 4)?, // faload
+            0x31 => self.array_load(RegKind::F64, ".f64", 8)?, // daload
             0x33 => self.array_load_byte()?,                    // baload
             0x34 => self.array_load_char()?,                    // caload
             0x35 => self.array_load_short()?,                   // saload
             // ── array store ─────────────────────────────────────────
-            0x4F => self.array_store(RegKind::S32, ".s32", 4, ParamKind::I32Array, "iastore")?, // iastore
-            0x50 => self.array_store(RegKind::S64, ".s64", 8, ParamKind::I64Array, "lastore")?, // lastore
-            0x51 => self.array_store(RegKind::F32, ".f32", 4, ParamKind::F32Array, "fastore")?, // fastore
-            0x52 => self.array_store(RegKind::F64, ".f64", 8, ParamKind::F64Array, "dastore")?, // dastore
+            0x4F => self.array_store(RegKind::S32, ".s32", 4)?, // iastore
+            0x50 => self.array_store(RegKind::S64, ".s64", 8)?, // lastore
+            0x51 => self.array_store(RegKind::F32, ".f32", 4)?, // fastore
+            0x52 => self.array_store(RegKind::F64, ".f64", 8)?, // dastore
             0x54 => self.array_store_byte()?,                    // bastore
-            0x55 => {
-                // castore — char[] element store. No `char[]` ParamKind
-                // exists (char arrays are not an offloadable parameter
-                // type), so reject rather than reinterpret a buffer of a
-                // different element type.
-                return Err(LoweringError::UnsupportedNode(
-                    "castore (char[] element access; char arrays are not \
-                     a supported kernel parameter type)"
-                        .into(),
-                ));
-            }
-            0x56 => self.array_store_short(2)?,                  // sastore
+            0x55 => self.array_store_char_or_short(2)?,          // castore
+            0x56 => self.array_store_char_or_short(2)?,          // sastore
             // ── stack ops ───────────────────────────────────────────
             0x57 => {
                 self.stack.pop()?;
@@ -722,15 +601,23 @@ impl<'a> Emitter<'a> {
             0x8E => self.conv("cvt.rzi.s32.f64", RegKind::F64, RegKind::S32)?, // d2i
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
-            0x91 => self.conv_truncate_i32(8, true)?,                          // i2b (signed)
-            0x92 => self.conv_truncate_i32(16, false)?,                        // i2c (unsigned 16)
-            0x93 => self.conv_truncate_i32(16, true)?,                         // i2s (signed)
+            0x91 => self.conv_truncate_i32(8)?,                                // i2b
+            0x92 => self.conv_truncate_i32(16)?,                               // i2c (unsigned 16)
+            0x93 => self.conv_truncate_i32(16)?,                               // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
-            // AUDIT 2026-05-19: `lcmp` is implemented in PTX via
-            // `cmp_long` (setp + selp). The four float/double compares
-            // (`fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`) remain unimplemented and
-            // fall through to the default `UnsupportedNode` arm.
-            0x94 => self.cmp_long()?,                                          // lcmp
+            // AUDIT 2026-05-19: `lcmp` (0x94) was dispatched to
+            // `cmp_long_or_float`, which unconditionally returned `Err`.
+            // That made `lcmp` *look* supported at the dispatch site
+            // while never succeeding. Reject it explicitly here — same
+            // as `fcmpl`/`fcmpg`/`dcmpl`/`dcmpg`, which fall through to
+            // the default `UnsupportedNode` arm. `*cmp*` opcodes only
+            // appear paired with a following `if*`, which the canonical
+            // counted-loop subset never emits inside the body.
+            0x94 => {
+                return Err(LoweringError::UnsupportedNode(
+                    "lcmp is not supported in the element-wise lowering".into(),
+                ));
+            }
             // ── branches ────────────────────────────────────────────
             0x99..=0xA4 => {
                 // if* / if_icmp* — we accept these only at the loop
@@ -749,28 +636,19 @@ impl<'a> Emitter<'a> {
                 // goto / goto_w — if it targets the loop header, it's
                 // the back branch; mark and stop. Anything else is
                 // non-canonical.
-                let off = if op == 0xA7 {
-                    i16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]) as i64
+                let target = if op == 0xA7 {
+                    let off =
+                        i16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]) as i32;
+                    (pc as i32 + off) as usize
                 } else {
-                    i32::from_be_bytes([
+                    let off = i32::from_be_bytes([
                         self.bytes[pc + 1],
                         self.bytes[pc + 2],
                         self.bytes[pc + 3],
                         self.bytes[pc + 4],
-                    ]) as i64
+                    ]);
+                    (pc as i32 + off) as usize
                 };
-                // Compute the branch target with signed arithmetic so a
-                // negative offset cannot wrap into a huge `usize`, then
-                // bounds-check it before it flows into comparisons.
-                let signed_target = pc as i64 + off;
-                if signed_target < 0 || signed_target >= self.bytes.len() as i64 {
-                    return Err(LoweringError::UnsupportedNode(format!(
-                        "unconditional branch at pc={pc} has out-of-range target \
-                         {signed_target} (offset {off}, code length {})",
-                        self.bytes.len()
-                    )));
-                }
-                let target = signed_target as usize;
                 if let Some(li) = loop_info {
                     if target == li.header_pc {
                         self.hit_back_branch = true;
@@ -794,37 +672,6 @@ impl<'a> Emitter<'a> {
             0xAF => self.scalar_return(RegKind::F64, ".f64")?, // dreturn
             0xB1 => {
                 writeln!(self.body, "    bra L_done;").unwrap();
-            }
-            // ── getfield (Phase 9 #2 — receiver-access pattern) ─────
-            // Only the `aload_0; getfield <cp>` shape reaches this
-            // arm: the analyzer rejects other `getfield` shapes via
-            // `Reason::FieldAccess`, and the pre-`getfield` opcode is
-            // always `aload_0`. We pop the sentinel pushed by
-            // `aload_0` and replace it with the pre-loaded
-            // `pthis_<i>_ptr` register matching this cp_index.
-            0xB4 => {
-                let cp_index =
-                    u16::from_be_bytes([self.bytes[pc + 1], self.bytes[pc + 2]]);
-                let top = self.stack.pop()?;
-                if top.name != self.this_sentinel_name {
-                    return Err(LoweringError::UnsupportedNode(format!(
-                        "getfield #{cp_index} at pc={pc} on an operand stack \
-                         value that is not the `this` sentinel — only \
-                         `aload_0; getfield <primitive-array>` is supported"
-                    )));
-                }
-                let (_, reg) = self
-                    .this_field_ptr_reg
-                    .get(&cp_index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        LoweringError::Internal(format!(
-                            "getfield #{cp_index} at pc={pc}: cp_index was not \
-                             pre-bound by `bind_param_locals` — analyzer/\
-                             emitter signature mismatch"
-                        ))
-                    })?;
-                self.stack.push(reg);
             }
             // ── arraylength ─────────────────────────────────────────
             0xBE => self.arraylength()?,
@@ -1245,77 +1092,16 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// Narrowing int conversion (`i2b`/`i2s`/`i2c`).
-    ///
-    /// `signed` selects the extension applied back to s32:
-    ///  * `i2b` (int→byte) and `i2s` (int→short) keep the JVM's signed
-    ///    semantics — the low N bits are SIGN-extended.
-    ///  * `i2c` (int→char) is UNSIGNED: `char` is a 16-bit unsigned
-    ///    type, so the low 16 bits are ZERO-extended.
-    fn conv_truncate_i32(&mut self, bits: u32, signed: bool) -> Result<(), LoweringError> {
+    fn conv_truncate_i32(&mut self, bits: u32) -> Result<(), LoweringError> {
         let a = self.stack.pop()?;
         let r = self.regs.fresh_reg(RegKind::S32);
-        if signed {
-            // Sign-extend an N-bit value back to s32 by emitting:
-            //   shl  tmp, a, (32 - N)
-            //   shr  r,   tmp, (32 - N)
-            let amt = 32 - bits;
-            let tmp = self.regs.fresh_reg(RegKind::S32);
-            writeln!(self.body, "    shl.b32 {}, {}, {};", tmp.name, a.name, amt).unwrap();
-            writeln!(self.body, "    shr.s32 {}, {}, {};", r.name, tmp.name, amt).unwrap();
-        } else {
-            // Zero-extend: mask off everything above the low N bits.
-            let mask: u32 = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
-            writeln!(
-                self.body,
-                "    and.b32 {}, {}, 0x{mask:X};",
-                r.name, a.name
-            )
-            .unwrap();
-        }
-        self.stack.push(r);
-        Ok(())
-    }
-
-    /// `lcmp` (opcode 0x94): compare two 64-bit signed longs, pushing
-    /// `-1` if `a < b`, `0` if `a == b`, `+1` if `a > b` onto the int
-    /// stack. Implemented with two `setp` predicates and two `selp`s:
-    ///   gt = (a > b) ? 1 : 0
-    ///   r  = (a < b) ? -1 : gt
-    fn cmp_long(&mut self) -> Result<(), LoweringError> {
-        // JVM stack order: ..., a, b → b is on top.
-        let b = self.stack.pop()?;
-        let a = self.stack.pop()?;
-        let p_gt = self.regs.fresh_reg(RegKind::Pred);
-        let p_lt = self.regs.fresh_reg(RegKind::Pred);
-        let gt = self.regs.fresh_reg(RegKind::S32);
-        let r = self.regs.fresh_reg(RegKind::S32);
-        writeln!(
-            self.body,
-            "    setp.gt.s64 {}, {}, {};",
-            p_gt.name, a.name, b.name
-        )
-        .unwrap();
-        writeln!(
-            self.body,
-            "    setp.lt.s64 {}, {}, {};",
-            p_lt.name, a.name, b.name
-        )
-        .unwrap();
-        // gt = a > b ? 1 : 0
-        writeln!(
-            self.body,
-            "    selp.s32 {}, 1, 0, {};",
-            gt.name, p_gt.name
-        )
-        .unwrap();
-        // r = a < b ? -1 : gt
-        writeln!(
-            self.body,
-            "    selp.s32 {}, -1, {}, {};",
-            r.name, gt.name, p_lt.name
-        )
-        .unwrap();
+        // Sign-extend an N-bit value back to s32 by emitting:
+        //   shl  tmp, a, (32 - N)
+        //   shr  r,   tmp, (32 - N)
+        let amt = 32 - bits;
+        let tmp = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    shl.b32 {}, {}, {};", tmp.name, a.name, amt).unwrap();
+        writeln!(self.body, "    shr.s32 {}, {}, {};", r.name, tmp.name, amt).unwrap();
         self.stack.push(r);
         Ok(())
     }
@@ -1327,52 +1113,20 @@ impl<'a> Emitter<'a> {
     // ─────────────────── array ops ──────────────────────────────────
 
     /// Find the array param backing the top-of-stack array reference.
-    /// Returns (key, kind). The reference itself must have been
-    /// produced by either:
-    ///
-    /// - `aload` of an array-parameter local — returns
-    ///   `ArrayKey::Param(idx)`; the kind is the analyzer's
-    ///   `ParamKind` for that slot.
-    /// - Phase 9 #2: `aload_0; getfield <cp>` — returns
-    ///   `ArrayKey::ThisField(idx)` where `idx` is the dedup'd
-    ///   position of `cp` in `this_field_cps_unique`. The kind is
-    ///   `ParamKind::I32Array` today (the analyzer's
-    ///   `NonStaticReceiverMisuse` path only admits int[] fields in
-    ///   the first cut; widening to other primitive arrays is a
-    ///   follow-up that needs analyzer + marshaller coordination).
-    fn array_param_of(&self, array_reg: &Reg) -> Result<(ArrayKey, ParamKind), LoweringError> {
+    /// Returns (param_index, kind). The reference itself must have
+    /// been produced by an `aload` of a parameter local.
+    fn array_param_of(&self, array_reg: &Reg) -> Result<(usize, ParamKind), LoweringError> {
         // Each array-parameter binding recorded its U64 register name
         // in `param_ptr_reg[i]`. The reference flows through `aload`
         // unchanged (we just clone the local's Reg), so the runtime
         // register name on the simulated stack equals that initial
         // binding.
-        //
-        // AUDIT 2026-05-20: this association is *name-based* and is
-        // therefore fragile under aliasing — an `astore`/`aload` of the
-        // reference into another local, or a `dup`/`swap`, can leave a
-        // simulated-stack `Reg` whose `name` no longer equals the
-        // binding even though it refers to the same array, or (worse)
-        // equals a *different* binding. We keep name-matching here
-        // because carrying a tagged `ParamKind` on every `Reg` is more
-        // invasive than this audit's budget allows; the element-kind
-        // check in `array_param_checked` below mitigates the most
-        // dangerous failure mode (type-confused loads/stores).
         for (i, k) in self.sig.param_kinds.iter().enumerate() {
             if !k.is_array() {
                 continue;
             }
             if !self.param_ptr_reg[i].is_empty() && self.param_ptr_reg[i] == array_reg.name {
-                return Ok((ArrayKey::Param(i), *k));
-            }
-        }
-        // Phase 9 #2 — `getfield` of a `this.<field>` primitive array.
-        // The `this_field_ptr_reg` map indexes by cp_index; iterate
-        // the entries and match by register name. The entry's
-        // `(this_field_index, _)` tuple gives us the `pthis_<i>_*`
-        // parameter index directly.
-        for (_cp, (idx, reg)) in &self.this_field_ptr_reg {
-            if reg.name == array_reg.name {
-                return Ok((ArrayKey::ThisField(*idx), ParamKind::I32Array));
+                return Ok((i, *k));
             }
         }
         Err(LoweringError::UnsupportedNode(
@@ -1382,47 +1136,19 @@ impl<'a> Emitter<'a> {
         ))
     }
 
-    /// Like [`array_param_of`], but also verifies that the array-access
-    /// opcode's element type matches the parameter's declared
-    /// `ParamKind`. A mismatch (e.g. `iaload` on a `float[]` param)
-    /// would emit a load/store of the wrong width or signedness against
-    /// a buffer of a different element type — silent bit-reinterpreted
-    /// data corruption. Reject such methods so they fall back to the
-    /// safe CPU interpreter.
-    fn array_param_checked(
-        &self,
-        array_reg: &Reg,
-        expected: ParamKind,
-        opcode_name: &str,
-    ) -> Result<ArrayKey, LoweringError> {
-        let (array_key, actual) = self.array_param_of(array_reg)?;
-        if actual != expected {
-            return Err(LoweringError::UnsupportedNode(format!(
-                "{opcode_name} on array {} whose declared \
-                 element type is {actual:?} (expected {expected:?}); \
-                 array-access opcode does not match the array's element \
-                 type — rejecting to avoid type-confused memory access",
-                array_key.len_param_name()
-            )));
-        }
-        Ok(array_key)
-    }
-
     fn array_load(
         &mut self,
         elem_kind: RegKind,
         suffix: &str,
         elem_size: usize,
-        expected: ParamKind,
-        opcode_name: &str,
     ) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let array_key = self.array_param_checked(&array_ref, expected, opcode_name)?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
+        let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
         let result = self.regs.fresh_reg(elem_kind);
         writeln!(
@@ -1456,9 +1182,8 @@ impl<'a> Emitter<'a> {
     fn array_load_byte(&mut self) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let array_key =
-            self.array_param_checked(&array_ref, ParamKind::I8Array, "baload")?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1494,32 +1219,18 @@ impl<'a> Emitter<'a> {
     }
 
     fn array_load_char(&mut self) -> Result<(), LoweringError> {
-        // `caload` operates on `char[]`. There is no `char[]` variant of
-        // `ParamKind` (char arrays are not an offloadable parameter
-        // type), so a `caload` can never match a supported array
-        // parameter — reject unconditionally rather than silently
-        // reinterpreting some other 16-bit-or-wider buffer.
-        Err(LoweringError::UnsupportedNode(
-            "caload (char[] element access; char arrays are not a \
-             supported kernel parameter type)"
-                .into(),
-        ))
+        self.array_load_16(true)
     }
 
     fn array_load_short(&mut self) -> Result<(), LoweringError> {
-        self.array_load_16(false, ParamKind::I16Array, "saload")
+        self.array_load_16(false)
     }
 
-    fn array_load_16(
-        &mut self,
-        is_char: bool,
-        expected: ParamKind,
-        opcode_name: &str,
-    ) -> Result<(), LoweringError> {
+    fn array_load_16(&mut self, is_char: bool) -> Result<(), LoweringError> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let array_key = self.array_param_checked(&array_ref, expected, opcode_name)?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
@@ -1562,17 +1273,15 @@ impl<'a> Emitter<'a> {
         _elem_kind: RegKind,
         suffix: &str,
         elem_size: usize,
-        expected: ParamKind,
-        opcode_name: &str,
     ) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let array_key = self.array_param_checked(&array_ref, expected, opcode_name)?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
-        let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
+        let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
         writeln!(
             self.body,
@@ -1605,9 +1314,8 @@ impl<'a> Emitter<'a> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let array_key =
-            self.array_param_checked(&array_ref, ParamKind::I8Array, "bastore")?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1633,13 +1341,12 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn array_store_short(&mut self, elem_size: usize) -> Result<(), LoweringError> {
+    fn array_store_char_or_short(&mut self, elem_size: usize) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
-        let array_key =
-            self.array_param_checked(&array_ref, ParamKind::I16Array, "sastore")?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
@@ -1673,12 +1380,11 @@ impl<'a> Emitter<'a> {
 
     fn arraylength(&mut self) -> Result<(), LoweringError> {
         let array_ref = self.stack.pop()?;
-        let (array_key, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = array_key.len_param_name();
+        let (param_idx, _kind) = self.array_param_of(&array_ref)?;
         let r = self.regs.fresh_reg(RegKind::S32);
         writeln!(
             self.body,
-            "    ld.param.s32 {}, [{len_param}];",
+            "    ld.param.s32 {}, [p{param_idx}_len];",
             r.name
         )
         .unwrap();
@@ -1789,30 +1495,9 @@ pub(crate) fn locate_bound(
     )))
 }
 
-/// Source of a value sitting on the operand stack: either an `aload`
-/// of a parameter local, or (Phase 9 #2) the result of an
-/// `aload_0; getfield <cp>` chain accessing a `this.<field>`
-/// primitive array.
-#[derive(Clone, Copy, Debug)]
-enum ArraySrc {
-    /// `aload <slot>` of a parameter local. The marshaller-side
-    /// length lives at `pN_len` where N is computed from the slot.
-    ParamLocal(u16),
-    /// `aload_0; getfield <cp_index>`. The marshaller-side length
-    /// lives at `pthis_<i>_len` where `i` is the dedup'd position of
-    /// `cp_index` in `KernelSignature::this_field_cps`.
-    ThisField(u16),
-}
-
 /// Try to identify the source of a bound-local: scan the pre-loop
-/// bytecode for either:
-///
-///   - `aload K; arraylength; istore slot`  (static or non-static
-///     methods accessing an array parameter), or
-///   - `aload_0; getfield <cp>; arraylength; istore slot`  (Phase 9
-///     #2: non-static method's bound source is `this.<field>.length`).
-///
-/// Returns the matching `BoundSource` on success.
+/// bytecode for `aload K; arraylength; istore slot` where K is a
+/// parameter local. Returns the param's length name on success.
 fn pre_loop_bound_source(
     bytes: &[u8],
     header_pc: usize,
@@ -1820,23 +1505,8 @@ fn pre_loop_bound_source(
     sig: &KernelSignature,
 ) -> Result<Option<BoundSource>, LoweringError> {
     let mut pc = 0usize;
-    // The most recent `aload <K>` we observed — None unless the
-    // immediately previous opcode was an aload.
     let mut last_aload_local: Option<u16> = None;
-    // Whether the most recent stack-producing opcode is `aload_0`
-    // (the receiver). Tracked separately from `last_aload_local`
-    // because a `getfield` consuming the receiver transforms the
-    // stack-top into a `this.<field>` value with different bounds
-    // semantics.
-    let mut last_aload_was_zero = false;
-    // After `getfield <cp>` immediately following `aload_0`, the
-    // stack top is the named field — record its cp_index so a
-    // subsequent `arraylength` knows it came from a this-field.
-    let mut last_getfield_this_cp: Option<u16> = None;
-    // After `arraylength`, the s32 length value is on top of the
-    // stack; remember its origin so the matching `istore slot`
-    // can resolve to either `ParamLocal` or `ThisField`.
-    let mut last_arraylength_src: Option<ArraySrc> = None;
+    let mut last_arraylength_local: Option<u16> = None;
     while pc < header_pc {
         let op = bytes[pc];
         let size = instr_size(bytes, pc)?;
@@ -1850,144 +1520,46 @@ fn pre_loop_bound_source(
             )));
         }
         match op {
-            // ── aload variants ───────────────────────────────────────
-            0x2A => {
-                // aload_0 — the receiver in non-static methods.
-                last_aload_local = Some(0);
-                last_aload_was_zero = true;
-                last_getfield_this_cp = None;
-                pc += size;
-                continue;
-            }
-            0x2B..=0x2D => {
-                last_aload_local = Some((op - 0x2A) as u16);
-                last_aload_was_zero = false;
-                last_getfield_this_cp = None;
-                pc += size;
-                continue;
-            }
-            0x19 => {
-                let k = bytes[pc + 1] as u16;
-                last_aload_local = Some(k);
-                last_aload_was_zero = k == 0;
-                last_getfield_this_cp = None;
-                pc += size;
-                continue;
-            }
+            0x2A..=0x2D => last_aload_local = Some((op - 0x2A) as u16),
+            0x19 => last_aload_local = Some(bytes[pc + 1] as u16),
             0xC4 if bytes[pc + 1] == 0x19 => {
-                let k = u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]);
-                last_aload_local = Some(k);
-                last_aload_was_zero = k == 0;
-                last_getfield_this_cp = None;
-                pc += size;
-                continue;
+                last_aload_local =
+                    Some(u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]));
             }
-            // ── getfield (Phase 9 #2) ────────────────────────────────
-            // Only the `aload_0; getfield` shape contributes to a
-            // bound-source. Any other getfield (post-non-zero aload,
-            // post-arithmetic) would have already failed the
-            // analyzer's `Reason::NonStaticReceiverMisuse` /
-            // `Reason::FieldAccess` checks.
-            0xB4 => {
-                if last_aload_was_zero {
-                    let cp = u16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]);
-                    last_getfield_this_cp = Some(cp);
-                } else {
-                    last_getfield_this_cp = None;
-                }
-                last_aload_local = None;
-                last_aload_was_zero = false;
-                pc += size;
-                continue;
-            }
-            // ── arraylength ──────────────────────────────────────────
             0xBE => {
-                if let Some(cp) = last_getfield_this_cp {
-                    last_arraylength_src = Some(ArraySrc::ThisField(cp));
-                } else if let Some(local) = last_aload_local {
-                    last_arraylength_src = Some(ArraySrc::ParamLocal(local));
-                } else {
-                    last_arraylength_src = None;
-                }
+                last_arraylength_local = last_aload_local;
                 last_aload_local = None;
-                last_aload_was_zero = false;
-                last_getfield_this_cp = None;
-                pc += size;
-                continue;
             }
-            // ── istore <slot> variants ───────────────────────────────
+            // istore *
             0x36 => {
                 let target_slot = bytes[pc + 1] as u16;
-                if target_slot == slot {
-                    if let Some(src) = last_arraylength_src {
-                        return Ok(Some(resolve_bound_src(sig, src)?));
-                    }
+                if target_slot == slot && last_arraylength_local.is_some() {
+                    let src_local = last_arraylength_local.unwrap();
+                    return Ok(Some(param_len_for_local(sig, src_local)?));
                 }
-                last_arraylength_src = None;
+                last_arraylength_local = None;
             }
             0x3B..=0x3E => {
                 let target_slot = (op - 0x3B) as u16;
-                if target_slot == slot {
-                    if let Some(src) = last_arraylength_src {
-                        return Ok(Some(resolve_bound_src(sig, src)?));
-                    }
+                if target_slot == slot && last_arraylength_local.is_some() {
+                    let src_local = last_arraylength_local.unwrap();
+                    return Ok(Some(param_len_for_local(sig, src_local)?));
                 }
-                last_arraylength_src = None;
+                last_arraylength_local = None;
             }
             0xC4 if bytes[pc + 1] == 0x36 => {
                 let target_slot = u16::from_be_bytes([bytes[pc + 2], bytes[pc + 3]]);
-                if target_slot == slot {
-                    if let Some(src) = last_arraylength_src {
-                        return Ok(Some(resolve_bound_src(sig, src)?));
-                    }
+                if target_slot == slot && last_arraylength_local.is_some() {
+                    let src_local = last_arraylength_local.unwrap();
+                    return Ok(Some(param_len_for_local(sig, src_local)?));
                 }
-                last_arraylength_src = None;
+                last_arraylength_local = None;
             }
             _ => {}
         }
-        // Every other instruction clears the aload/getfield/arraylength
-        // tracking state — only contiguous sequences are recognised.
-        last_aload_local = None;
-        last_aload_was_zero = false;
-        last_getfield_this_cp = None;
         pc += size;
     }
     Ok(None)
-}
-
-/// Resolve an [`ArraySrc`] to its [`BoundSource`] flavour using the
-/// kernel signature: a parameter slot maps to `ParamLen(i)`; a
-/// this-field cp_index maps to `ThisFieldLen(i)` where `i` is the
-/// dedup'd position of the cp_index in
-/// [`KernelSignature::this_field_cps`].
-fn resolve_bound_src(sig: &KernelSignature, src: ArraySrc) -> Result<BoundSource, LoweringError> {
-    match src {
-        ArraySrc::ParamLocal(slot) => param_len_for_local(sig, slot),
-        ArraySrc::ThisField(cp) => {
-            // Dedup the analyzer's body-encounter list in the same
-            // order `Emitter::new` does (first-encounter order
-            // preserved). The marshaller mirrors this dedup so the
-            // index here is stable between emitter and runtime.
-            let mut idx: Option<usize> = None;
-            let mut seen: Vec<u16> = Vec::with_capacity(sig.this_field_cps.len());
-            for &c in &sig.this_field_cps {
-                if !seen.contains(&c) {
-                    if c == cp {
-                        idx = Some(seen.len());
-                        break;
-                    }
-                    seen.push(c);
-                }
-            }
-            let idx = idx.ok_or_else(|| {
-                LoweringError::Internal(format!(
-                    "this-field bound source cp_index #{cp} not in \
-                     KernelSignature::this_field_cps — analyzer/emitter mismatch"
-                ))
-            })?;
-            Ok(BoundSource::ThisFieldLen(idx))
-        }
-    }
 }
 
 fn param_len_for_local(sig: &KernelSignature, slot: u16) -> Result<BoundSource, LoweringError> {
@@ -2017,10 +1589,6 @@ fn param_len_for_local(sig: &KernelSignature, slot: u16) -> Result<BoundSource, 
 pub(crate) enum BoundSource {
     /// `pN_len` for parameter index N.
     ParamLen(usize),
-    /// Phase 9 #2 — `pthis_<i>_len` for a this-field array access.
-    /// The index is the dedup'd position of the field's cp_index in
-    /// [`KernelSignature::this_field_cps`].
-    ThisFieldLen(usize),
     /// A literal compile-time constant.
     Literal(i32),
 }

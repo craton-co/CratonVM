@@ -39,8 +39,6 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -110,19 +108,20 @@ fn alloc_inet_address_mirror(
 ) -> ObjectRef {
     // `java.net.Inet4Address` / `Inet6Address` are real bootstrap classes:
     // their instance slots 0/1 are the inherited `holder` reference fields,
-    // NOT `hostName` / `address` Strings. Record host/IP in the shared
-    // `net_phase_e` ObjectRef-keyed side table and leave the instance slots
-    // at their zero-initialised (null) defaults — writing a String into the
-    // `holder` slot is what caused bogus
-    // `NoSuchMethodError java/lang/String.getHostName()` when real-JDK
-    // InetAddress bytecode ran against these mirrors.
+    // NOT `hostName` / `address` Strings. Route through the shared
+    // `net_phase_e` allocator: it records host/IP in the ObjectRef-keyed
+    // side table AND populates a real-JDK `InetAddress$InetAddressHolder`
+    // in the `holder` field — so both the natives we override and any
+    // un-overridden real-JDK InetAddress bytecode see a consistent shape.
+    // Writing a bare String into the `holder` slot is what caused bogus
+    // `NoSuchMethodError java/lang/String.getHostName()` /
+    // `java/lang/Object.toLowerCase(...)` when real-JDK InetAddress bytecode
+    // ran against these mirrors (observed as Hazelcast boot failures).
     let class_name = match ip {
         IpAddr::V4(_) => "java/net/Inet4Address",
         IpAddr::V6(_) => "java/net/Inet6Address",
     };
-    let mirror = alloc_concurrent_synthetic(ctx, class_name, 2);
-    crate::net_phase_e::inet_addr_set_external(mirror, host, &ip.to_string());
-    mirror
+    crate::net_phase_e::alloc_inet_address_class(ctx, class_name, host, &ip.to_string())
 }
 
 fn read_string_arg(

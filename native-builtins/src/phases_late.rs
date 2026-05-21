@@ -17464,10 +17464,15 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
     let lo_display = ctx.create_string("Loopback Interface");
     ctx.set_field(lo, 0, Value::Object(Some(lo_name)));
     ctx.set_field(lo, 1, Value::Object(Some(lo_display)));
-    // InetAddress for 127.0.0.1 — host/IP go in the `net_phase_e` side
-    // table, NOT instance slots (real-JDK `InetAddress` slot 0 is `holder`).
-    let lo_addr = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-    crate::net_phase_e::inet_addr_set_external(lo_addr, "localhost", "127.0.0.1");
+    // InetAddress for 127.0.0.1 — route through the shared allocator so the
+    // typed `holder` field is populated and host/IP land in the side table
+    // (instance slots 0/1 are the real-JDK `holder` references, NOT Strings).
+    let lo_addr = crate::net_phase_e::alloc_inet_address_class(
+        ctx,
+        "java/net/Inet4Address",
+        "localhost",
+        "127.0.0.1",
+    );
     let lo_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(lo_addrs, 0, Value::Object(Some(lo_addr)));
     ctx.set_field(lo, 2, Value::Object(Some(lo_addrs)));
@@ -17488,8 +17493,12 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
         let eth_display = ctx.create_string("Primary Network Interface");
         ctx.set_field(eth, 0, Value::Object(Some(eth_name)));
         ctx.set_field(eth, 1, Value::Object(Some(eth_display)));
-        let eth_addr = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-        crate::net_phase_e::inet_addr_set_external(eth_addr, &hostname, &primary_ip);
+        let eth_addr = crate::net_phase_e::alloc_inet_address_class(
+            ctx,
+            "java/net/Inet4Address",
+            &hostname,
+            &primary_ip,
+        );
         let eth_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(eth_addrs, 0, Value::Object(Some(eth_addr)));
         ctx.set_field(eth, 2, Value::Object(Some(eth_addrs)));
@@ -37540,8 +37549,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 } else {
                     (src_addr_str.as_str(), 0)
                 };
-                let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-                crate::net_phase_e::inet_addr_set_external(ia, src_ip, src_ip);
+                let ia = crate::net_phase_e::alloc_inet_address_class(
+                    ctx,
+                    "java/net/InetAddress",
+                    src_ip,
+                    src_ip,
+                );
                 ctx.set_field(packet, 2, Value::Object(Some(ia)));
                 ctx.set_field(packet, 3, Value::Int(src_port));
             }
@@ -37584,8 +37597,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 } else {
                     (addr_str.as_str(), "0")
                 };
-                let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-                crate::net_phase_e::inet_addr_set_external(ia, ip, ip);
+                let ia = crate::net_phase_e::alloc_inet_address_class(
+                    ctx,
+                    "java/net/InetAddress",
+                    ip,
+                    ip,
+                );
                 return Ok(Some(Value::Object(Some(ia))));
             }
         }
@@ -37803,8 +37820,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         } else {
             (src_str.as_str(), 0)
         };
-        let src_addr = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-        crate::net_phase_e::inet_addr_set_external(src_addr, src_ip_str, src_ip_str);
+        let src_addr = crate::net_phase_e::alloc_inet_address_class(
+            ctx,
+            "java/net/InetAddress",
+            src_ip_str,
+            src_ip_str,
+        );
         ctx.set_field(pkt, 3, Value::Object(Some(src_addr)));
         ctx.set_field(pkt, 4, Value::Int(src_port));
         Ok(None)

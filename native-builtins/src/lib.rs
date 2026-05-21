@@ -17426,7 +17426,18 @@ pub(crate) fn alloc_concurrent_synthetic(
             let n = num_fields.max(real);
             ctx.alloc_object(cid, n)
         }
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), num_fields),
+        Err(_) => {
+            // The real `.class` file could not be loaded. Allocating with
+            // `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
+            // but a non-zero slot count produces an "undersized object
+            // layout" object — the GC's `get_field` bounds guard rejects
+            // every field access on it (class declares 0 fields, object has
+            // `num_fields` slots). Register a synthetic class declaring
+            // `num_fields` instance fields so the header's `class_id`
+            // matches the allocated slot count.
+            let cid = ctx.ensure_synthetic_class(class_name, num_fields);
+            ctx.alloc_object(cid, num_fields)
+        }
     }
 }
 
@@ -25805,11 +25816,12 @@ fn register_net_natives(registry: &mut NativeMethodRegistry) {
         "getLoopbackAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-            let host = ctx.create_string("localhost");
-            let addr = ctx.create_string("127.0.0.1");
-            ctx.set_field(ia, 0, Value::Object(Some(host)));
-            ctx.set_field(ia, 1, Value::Object(Some(addr)));
+            let ia = net_phase_e::alloc_inet_address_class(
+                ctx,
+                "java/net/Inet4Address",
+                "localhost",
+                "127.0.0.1",
+            );
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -26548,11 +26560,16 @@ pub(crate) fn resolve_primary_ipv4(hostname: &str) -> String {
 fn native_inet_localhost(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let hostname = resolve_real_hostname();
     let ip = resolve_primary_ipv4(&hostname);
-    let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-    let host_ref = ctx.create_string(&hostname);
-    let addr_ref = ctx.create_string(&ip);
-    ctx.set_field(ia, 0, Value::Object(Some(host_ref)));
-    ctx.set_field(ia, 1, Value::Object(Some(addr_ref)));
+    // Route through the shared allocator: populates the typed `holder` field
+    // and the InetAddress side table. Writing bare Strings into slots 0/1
+    // (the real-JDK `holder` references) is the slot-type confusion that
+    // broke Hazelcast's `getHostName().toLowerCase(Locale)`.
+    let class_name = if ip.parse::<std::net::Ipv6Addr>().is_ok() {
+        "java/net/Inet6Address"
+    } else {
+        "java/net/Inet4Address"
+    };
+    let ia = net_phase_e::alloc_inet_address_class(ctx, class_name, &hostname, &ip);
     Ok(Some(Value::Object(Some(ia))))
 }
 fn native_inet_get_host_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -26560,28 +26577,24 @@ fn native_inet_get_host_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    let host = net_phase_e::inet_addr_host_string_or(ctx, this, "");
+    Ok(Some(Value::Object(Some(ctx.create_string(&host)))))
 }
 fn native_inet_get_host_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, 1)))
+    let ip = net_phase_e::inet_addr_ip_string_or(ctx, this, "");
+    Ok(Some(Value::Object(Some(ctx.create_string(&ip)))))
 }
 fn native_inet_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let host = match ctx.get_field(this, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let addr = match ctx.get_field(this, 1) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let host = net_phase_e::inet_addr_host_string_or(ctx, this, "");
+    let addr = net_phase_e::inet_addr_ip_string_or(ctx, this, "");
     let s = format!("{}/{}", host, addr);
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
@@ -26597,11 +26610,12 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     // Handle null/localhost/loopback
     if hostname.is_empty() || hostname == "localhost" {
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-        let host = ctx.create_string("localhost");
-        let addr = ctx.create_string("127.0.0.1");
-        ctx.set_field(ia, 0, Value::Object(Some(host)));
-        ctx.set_field(ia, 1, Value::Object(Some(addr)));
+        let ia = net_phase_e::alloc_inet_address_class(
+            ctx,
+            "java/net/Inet4Address",
+            "localhost",
+            "127.0.0.1",
+        );
         return Ok(Some(Value::Object(Some(ia))));
     }
 
@@ -26609,11 +26623,12 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if hostname.parse::<std::net::Ipv4Addr>().is_ok()
         || hostname.parse::<std::net::Ipv6Addr>().is_ok()
     {
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-        let host = ctx.create_string(&hostname);
-        let addr = ctx.create_string(&hostname);
-        ctx.set_field(ia, 0, Value::Object(Some(host)));
-        ctx.set_field(ia, 1, Value::Object(Some(addr)));
+        let class_name = if hostname.parse::<std::net::Ipv6Addr>().is_ok() {
+            "java/net/Inet6Address"
+        } else {
+            "java/net/Inet4Address"
+        };
+        let ia = net_phase_e::alloc_inet_address_class(ctx, class_name, &hostname, &hostname);
         return Ok(Some(Value::Object(Some(ia))));
     }
 
@@ -26621,11 +26636,18 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let lookup = format!("{}:0", hostname);
     if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
         if let Some(socket_addr) = addrs.next() {
-            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-            let host = ctx.create_string(&hostname);
-            let addr = ctx.create_string(&socket_addr.ip().to_string());
-            ctx.set_field(ia, 0, Value::Object(Some(host)));
-            ctx.set_field(ia, 1, Value::Object(Some(addr)));
+            let ip = socket_addr.ip();
+            let class_name = if ip.is_ipv6() {
+                "java/net/Inet6Address"
+            } else {
+                "java/net/Inet4Address"
+            };
+            let ia = net_phase_e::alloc_inet_address_class(
+                ctx,
+                class_name,
+                &hostname,
+                &ip.to_string(),
+            );
             return Ok(Some(Value::Object(Some(ia))));
         }
     }
@@ -26653,21 +26675,29 @@ fn native_inet_get_all_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let mut results = Vec::new();
     if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
         for sa in addrs {
-            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-            let host = ctx.create_string(&hostname);
-            let addr = ctx.create_string(&sa.ip().to_string());
-            ctx.set_field(ia, 0, Value::Object(Some(host)));
-            ctx.set_field(ia, 1, Value::Object(Some(addr)));
+            let ip = sa.ip();
+            let class_name = if ip.is_ipv6() {
+                "java/net/Inet6Address"
+            } else {
+                "java/net/Inet4Address"
+            };
+            let ia = net_phase_e::alloc_inet_address_class(
+                ctx,
+                class_name,
+                &hostname,
+                &ip.to_string(),
+            );
             results.push(ia);
         }
     }
     if results.is_empty() {
         // At least return localhost
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-        let host = ctx.create_string(&hostname);
-        let addr = ctx.create_string("127.0.0.1");
-        ctx.set_field(ia, 0, Value::Object(Some(host)));
-        ctx.set_field(ia, 1, Value::Object(Some(addr)));
+        let ia = net_phase_e::alloc_inet_address_class(
+            ctx,
+            "java/net/Inet4Address",
+            &hostname,
+            "127.0.0.1",
+        );
         results.push(ia);
     }
     let arr = ctx.new_ref_array(ClassId::new(0), results.len());
@@ -26718,21 +26748,22 @@ fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         .into());
     };
-    let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-    let host = ctx.create_string(&addr_str);
-    let addr = ctx.create_string(&addr_str);
-    ctx.set_field(ia, 0, Value::Object(Some(host)));
-    ctx.set_field(ia, 1, Value::Object(Some(addr)));
+    let class_name = if len == 16 {
+        "java/net/Inet6Address"
+    } else {
+        "java/net/Inet4Address"
+    };
+    let ia = net_phase_e::alloc_inet_address_class(ctx, class_name, &addr_str, &addr_str);
     Ok(Some(Value::Object(Some(ia))))
 }
 
-/// Parse the address string stored on field 1 into an `IpAddr`. Returns
-/// `None` if the field is absent or not parseable.
+/// Parse an InetAddress' address string into an `IpAddr`, via the layout-aware
+/// side-table reader. Returns `None` if no parseable address is recorded.
 fn inet_addr_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<std::net::IpAddr> {
-    let s = match ctx.get_field(this, 1) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return None,
-    };
+    let s = net_phase_e::inet_addr_ip_string_or(ctx, this, "");
+    if s.is_empty() {
+        return None;
+    }
     s.parse::<std::net::IpAddr>().ok()
 }
 
@@ -35971,14 +36002,11 @@ mod new2_net_tests {
     use crate::test_utils::MockNativeContext;
 
     /// Helper: allocate a minimal `InetAddress` synthetic carrying a
-    /// hostname / address pair. Mirrors what the real natives produce.
+    /// hostname / address pair. Mirrors what the real natives produce —
+    /// routes through the shared allocator so host/IP land in the side
+    /// table and the typed `holder` field is populated.
     fn alloc_inet(ctx: &mut MockNativeContext, host: &str, addr: &str) -> ObjectRef {
-        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-        let h = ctx.create_string(host);
-        let a = ctx.create_string(addr);
-        ctx.set_field(ia, 0, Value::Object(Some(h)));
-        ctx.set_field(ia, 1, Value::Object(Some(a)));
-        ia
+        net_phase_e::alloc_inet_address_class(ctx, "java/net/InetAddress", host, addr)
     }
 
     // ---------------- C1: getLocalHost ----------------
@@ -36010,17 +36038,12 @@ mod new2_net_tests {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected an InetAddress object, got {other:?}"),
         };
-        // field 0: hostname — non-empty
-        let host = match ctx.get_field(ia, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
+        // hostname — non-empty (read via the layout-aware getter native;
+        // the host/IP live in the InetAddress side table, NOT raw slots).
+        let host = net_phase_e::inet_addr_host_string_or(&mut ctx, ia, "");
         assert!(!host.is_empty(), "hostname must be set");
-        // field 1: ip — parseable as IPv4
-        let ip_s = match ctx.get_field(ia, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
+        // ip — parseable as IPv4
+        let ip_s = net_phase_e::inet_addr_ip_string_or(&mut ctx, ia, "");
         assert!(
             ip_s.parse::<std::net::Ipv4Addr>().is_ok(),
             "ip must parse as IPv4 (got {ip_s})"
@@ -36044,10 +36067,7 @@ mod new2_net_tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected InetAddress"),
         };
-        let ip = match ctx.get_field(ia, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
+        let ip = net_phase_e::inet_addr_ip_string_or(&mut ctx, ia, "");
         assert_eq!(ip, "192.168.1.42");
     }
 
@@ -36068,10 +36088,7 @@ mod new2_net_tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected InetAddress"),
         };
-        let ip = match ctx.get_field(ia, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
+        let ip = net_phase_e::inet_addr_ip_string_or(&mut ctx, ia, "");
         // Std-lib formats this as the canonical compressed form.
         assert_eq!(
             ip, "fe80::1",

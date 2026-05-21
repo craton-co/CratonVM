@@ -2491,10 +2491,25 @@ extern "C" fn jni_to_reflected_method(
             decl_class_id
         };
         // Allocate a synthetic Method object with class_id and method_index in fields.
-        let cm = shared.class_manager.read();
-        let method_class_id = cm.find_class_by_name("java/lang/reflect/Method").unwrap_or(ClassId::new(0));
-        drop(cm);
-        let obj = shared.heap.alloc_object(method_class_id, 4);
+        // Resolve the real `java.lang.reflect.Method` class — `find_class_by_name`
+        // only sees already-loaded classes, so `load_class_concurrent` is used to
+        // force the load. Allocating with `ClassId::new(0)` (`java/lang/Object`,
+        // zero declared fields) but 4 slots produces an undersized object the
+        // GC's `get_field` bounds guard rejects.
+        let method_class_id = shared
+            .load_class_concurrent("java/lang/reflect/Method")
+            .unwrap_or_else(|_| {
+                shared
+                    .class_manager
+                    .write()
+                    .ensure_synthetic_class("java/lang/reflect/Method", 4)
+            });
+        let num_fields = shared
+            .class_manager
+            .read()
+            .get_class(method_class_id)
+            .map_or(4, |c| c.num_total_fields.max(4));
+        let obj = shared.heap.alloc_object(method_class_id, num_fields);
         shared.heap.set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
         shared.heap.set_field(obj, 1, Value::Int(method_index as i32));
         obj_to_jobject(obj)
@@ -2520,10 +2535,24 @@ extern "C" fn jni_to_reflected_field(
         } else {
             decl_class_id
         };
-        let cm = shared.class_manager.read();
-        let field_class_id = cm.find_class_by_name("java/lang/reflect/Field").unwrap_or(ClassId::new(0));
-        drop(cm);
-        let obj = shared.heap.alloc_object(field_class_id, 4);
+        // Resolve the real `java.lang.reflect.Field` class (see the matching
+        // comment in `jni_to_reflected_method`): allocating with
+        // `ClassId::new(0)` + 4 slots produces an undersized object the GC's
+        // `get_field` bounds guard rejects.
+        let field_class_id = shared
+            .load_class_concurrent("java/lang/reflect/Field")
+            .unwrap_or_else(|_| {
+                shared
+                    .class_manager
+                    .write()
+                    .ensure_synthetic_class("java/lang/reflect/Field", 4)
+            });
+        let num_fields = shared
+            .class_manager
+            .read()
+            .get_class(field_class_id)
+            .map_or(4, |c| c.num_total_fields.max(4));
+        let obj = shared.heap.alloc_object(field_class_id, num_fields);
         shared.heap.set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
         shared.heap.set_field(obj, 1, Value::Int(field_index as i32));
         obj_to_jobject(obj)
@@ -3193,12 +3222,26 @@ extern "C" fn jni_alloc_object(_env: JNIEnv, clazz: JClass) -> JObject {
     }
     with_shared_vm(|shared| {
         let class_id = ClassId::new(clazz as u32);
-        let num_fields = shared
+        // `clazz` must resolve to a real class. If it does not (stale or
+        // bogus handle), return null rather than allocating an object against
+        // an unresolved/`ClassId(0)` class: a wrongly-classed object whose
+        // declared field count is unknown corrupts every later field access.
+        let num_fields = match shared
             .class_manager
             .read()
             .get_class(class_id)
             .map(|c| c.num_total_fields)
-            .unwrap_or(0);
+        {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    target: "cratonvm::jni",
+                    clazz,
+                    "AllocObject: JClass does not resolve to a loaded class"
+                );
+                return 0;
+            }
+        };
         let obj = shared.heap.alloc_object(class_id, num_fields);
         obj_to_jobject(obj)
     })
@@ -3774,9 +3817,25 @@ extern "C" fn jni_new_direct_byte_buffer(
         return 0;
     }
     with_shared_vm(|shared| {
-        // Allocate a java/nio/DirectByteBuffer-like object.
-        // We use a generic object with 2 fields: address and capacity.
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        // Allocate a java/nio/DirectByteBuffer-like object with 2 fields
+        // (address, capacity). The object's class must declare those 2
+        // fields — allocating with `ClassId::new(0)` (`java/lang/Object`,
+        // zero declared fields) yields an undersized object that the GC's
+        // `get_field` bounds guard rejects on every access.
+        let dbb_class_id = shared
+            .load_class_concurrent("java/nio/DirectByteBuffer")
+            .unwrap_or_else(|_| {
+                shared
+                    .class_manager
+                    .write()
+                    .ensure_synthetic_class("java/nio/DirectByteBuffer", 2)
+            });
+        let num_fields = shared
+            .class_manager
+            .read()
+            .get_class(dbb_class_id)
+            .map_or(2, |c| c.num_total_fields.max(2));
+        let obj = shared.heap.alloc_object(dbb_class_id, num_fields);
         let handle = obj_to_jobject(obj);
         // Store the address as a long in field 0.
         shared.heap.set_field(obj, 0, Value::Long(address as i64));
