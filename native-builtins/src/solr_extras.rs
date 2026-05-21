@@ -1,68 +1,22 @@
 //! Apache Solr 9.4.1 boot-test shims.
 //!
-//! Solr's CLI entry is `org.apache.solr.cli.SolrCLI`, which uses Picocli for
-//! argument parsing. Picocli's `<clinit>` chain reflects over annotation
-//! processors that don't survive CratonVM's partial bootstrap, and the
-//! ServiceLoader-based command discovery (StartCommand, StopCommand, etc.)
-//! likewise fails. We short-circuit `main` and `<clinit>` on the Solr CLI
-//! classes and on `picocli/CommandLine` so the JVM exits rc=0 for the boot
-//! smoke test. The actual server is started by Jetty's `start.Main`, which
-//! is already shimmed in `jetty_extras.rs`.
+//! **HISTORY**: Previously this module short-circuited `main` and
+//! `<clinit>` on the Solr CLI classes (`SolrCLI`, `CoreContainer`,
+//! `SolrDispatchFilter`, `StartCommand`, `StopCommand`, `SolrLogPostTool`)
+//! so the JVM exited rc=0 without running Solr's real bytecode.
+//!
+//! **CURRENT STATE (real-bytecode audit)**: every short-circuit
+//! registration has been REMOVED per the "no synthetic stubs" policy.
+//! Real Solr bytecode now runs. This file is kept so the call site in
+//! `lib.rs::register_essential_natives` continues to compile.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
 
-fn solr_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[solr-shim] entry short-circuited (boot-test mode)");
-    Ok(None)
+/// Audit cleanup: no longer registers any natives. Previously short-
+/// circuited `main`/`<clinit>` on Solr's CLI entry classes.
+pub fn register_solr_stubs(_registry: &mut NativeMethodRegistry) {
+    // Intentionally empty. Real Solr SolrCLI bytecode runs.
 }
-
-pub fn register_solr_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("CRATONVM_SOLR_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    // Solr 9.x entry classes — the actual server invokes the Jetty start.Main
-    // with module=http and additional config. Short-circuit the embedded
-    // entry classes that Solr defines.
-    for class in [
-        "org/apache/solr/cli/SolrCLI",
-        "org/apache/solr/core/CoreContainer",
-        "org/apache/solr/servlet/SolrDispatchFilter",
-    ] {
-        registry.register(class, "main", "([Ljava/lang/String;)V", solr_noop);
-        registry.register(class, "<clinit>", "()V", |_ctx, _args| Ok(None));
-    }
-    // Already-shimmed jetty start.Main is in jetty_extras.rs; rely on that
-    // for the boot path.
-
-    // Solr 9.4.1 CLI uses Picocli for arg parsing. If picocli's clinit
-    // triggers System.exit(2) on our partial bootstrap, short-circuit it.
-    //
-    // BUGFIX (KC26): the previous list included `picocli/CommandLine` and
-    // `picocli/CommandLine$DefaultExceptionHandler`. Registering a no-op
-    // `<clinit>` globally on these picocli classes breaks any non-Solr
-    // application that uses picocli: the real `<clinit>` populates the
-    // static `TRACER` field (and other singletons), so a no-op stub leaves
-    // them null and every subsequent call to `CommandLine.tracer()` NPEs
-    // on `tracer.modified`. Keycloak 26 (Quarkus) bundles picocli 4.7.6
-    // for its CLI and hit exactly that on `parseAndRun`. The Solr-specific
-    // `System.exit(2)` concern only manifested with Solr-specific
-    // surrounding classes; removing the picocli entries from this global
-    // list lets the real bytecode `<clinit>` run for every other consumer.
-    // If Solr later regresses on this path, the fix is a Solr-app-only
-    // stub (gated by a Solr classpath check), not a global override.
-    for cls in [
-        "org/apache/solr/cli/SolrCLI",
-        "org/apache/solr/cli/StartCommand",
-        "org/apache/solr/cli/StopCommand",
-        "org/apache/solr/SolrLogPostTool",
-    ] {
-        registry.register(cls, "<clinit>", "()V", |_ctx, _args| Ok(None));
-    }
-}
-// TODO orchestrator: wire `solr_extras::register_solr_stubs(registry);` into
-// `register_essential_natives` in lib.rs.
 
 #[cfg(test)]
 mod tests {
