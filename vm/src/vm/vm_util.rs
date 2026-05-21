@@ -603,21 +603,33 @@ fn initialize_class_shared(
                 // arm in `post_clinit_fixup` for `"org/jboss/modules/Module"`
                 // is also gone.
                 //
-                // KC26: Keycloak `Profile` / `FeatureOptions` may finish
-                // <clinit> nominally, yet their lazy cache static stays
-                // null because the populating Stream pipeline drained to
-                // nothing (no-op LambdaMetafactory CallSite). Fire the
-                // fixup so the cache is pre-populated with an empty
-                // container of the matching collection type; this short-
-                // circuits the infinite-loop getter call from
-                // `Profile.getOrderedFeatures` / `FeatureOptions.getFeatureValues`.
-                // (Kept — distinct from the removed Module band-aid above.)
-                if matches!(
-                    &*class_name_for_jfr,
-                    "org/keycloak/common/Profile" | "org/keycloak/config/FeatureOptions"
-                ) {
-                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
-                }
+                // (Removed) KC26 `org/keycloak/common/Profile` /
+                // `org/keycloak/config/FeatureOptions` post-clinit fixup.
+                //
+                // Earlier this arm called `keycloak_prepopulate_cache_statics`
+                // which stamped `Profile.FEATURES` (and similarly-named cache
+                // statics) with an *empty* `HashMap`. `Profile.FEATURES` is
+                // not a `<clinit>`-populated field at all — it is lazily
+                // built by `getOrderedFeatures()` on first access (`if
+                // FEATURES == null { FEATURES = <built map> }`). Pre-stamping
+                // it with an empty map made `getOrderedFeatures()` observe a
+                // non-null `FEATURES` and return the empty map forever, so
+                // `Profile.configure()` iterated zero feature entries, built
+                // an empty per-instance `features` map, and published a
+                // `CURRENT` profile that knows about no features. The first
+                // `Profile.isFeatureEnabled(feature)` then did
+                // `emptyMap.get(feature)` -> `null` ->
+                // `((Boolean) null).booleanValue()` -> NPE at Profile.java:407.
+                //
+                // The fixup's stated rationale ("no-op LambdaMetafactory
+                // CallSite makes the populating Stream pipeline loop forever")
+                // is stale: `vm/src/runtime/invokedynamic.rs` implements
+                // LambdaMetafactory.metafactory/altMetafactory for real, so
+                // the `Stream.of(Feature.values()).forEach(...)` pipeline in
+                // `getOrderedFeatures` runs normally. The synthetic empty-map
+                // stamp violated the no-synthetic-stubs policy and *caused*
+                // the NPE rather than preventing any hang. Removed so the real
+                // `Profile` bytecode populates `FEATURES`.
                 // Record JFR class load event
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2110,26 +2122,14 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             }
         }
-        // KC26: Keycloak 26 (Quarkus) — `org/keycloak/common/Profile`
-        // and `org/keycloak/config/FeatureOptions`. Both classes cache
-        // the result of a Stream pipeline in a static field. When our
-        // LambdaMetafactory produces a no-op CallSite, the lambdas
-        // (`lambda$getOrderedFeatures$2/$3`, `lambda$getFeatureValues$1`)
-        // collect into a perpetually-non-terminating source and the CLI
-        // blows past the 60s watchdog with rc=124.
-        //
-        // We pre-populate any plausibly-named static cache field with
-        // an empty container of the matching collection type (HashSet
-        // for Set descriptors, HashMap for Map descriptors, ArrayList
-        // for List descriptors). The accessor returns the cached value
-        // immediately and never enters the broken Stream pipeline. If
-        // no candidate field name matches, we log all static fields on
-        // the class so the next iteration can refine the candidate set
-        // without rebuilding. Each arm only writes a fresh value when
-        // the existing slot is null — never clobber a successful clinit.
-        "org/keycloak/common/Profile" | "org/keycloak/config/FeatureOptions" => {
-            keycloak_prepopulate_cache_statics(shared, class_id, class_name);
-        }
+        // (Removed) KC26 `org/keycloak/common/Profile` /
+        // `org/keycloak/config/FeatureOptions` arm — see the matching
+        // call-site removal in this file's `<clinit>`-success hook.
+        // It stamped `Profile.FEATURES` with an empty `HashMap`, which
+        // made `Profile.getOrderedFeatures()` skip its real lazy-init
+        // and `Profile.isFeatureEnabled` NPE on `null.booleanValue()`.
+        // Removed per the no-synthetic-stubs policy; the real `Profile`
+        // bytecode now populates `FEATURES`.
         "org/jboss/msc/service/ServiceLogger" => {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {
@@ -2174,238 +2174,6 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             }
         }
         _ => {}
-    }
-}
-
-/// Pre-populate any plausibly-named static cache field on Keycloak classes
-/// (`org/keycloak/common/Profile`, `org/keycloak/config/FeatureOptions`)
-/// with an empty container of the matching collection type.
-///
-/// Both classes have `getOrderedFeatures` / `getFeatureValues` Stream
-/// pipelines that, in the presence of a no-op LambdaMetafactory CallSite,
-/// loop forever. Their accessors read from a lazily-initialised static
-/// cache; populating that cache with an empty Set/Map/List instance short-
-/// circuits the broken Stream path.
-///
-/// The candidate set is intentionally broad because the Keycloak field
-/// names have drifted across releases (`orderedFeatures`,
-/// `ORDERED_FEATURES`, `featureSet`, `featuresByName`, etc.). For each
-/// candidate that exists AND is currently null, we inspect the field's
-/// declared descriptor and allocate the container that matches:
-///
-///   * `Set` descriptor   -> empty `java/util/HashSet`
-///   * `Map` descriptor   -> empty `java/util/HashMap` with non-null `table`
-///   * `List` descriptor  -> empty `java/util/ArrayList` with non-null
-///                           `elementData`
-///
-/// The synthesised containers are only required to be type-compatible
-/// for the accessor's read path: HashMap needs a non-null `table` so
-/// `containsKey`/`size` don't NPE on the internal `table.length` read;
-/// ArrayList needs `elementData` so `get(i)` doesn't trip arraylength
-/// on null; HashSet's backing `HashMap` field can stay null because
-/// Keycloak's accessor only returns the cached Set reference.
-fn keycloak_prepopulate_cache_statics(
-    shared: &SharedVm,
-    class_id: ClassId,
-    class_name: &str,
-) {
-    // Candidate field names across Keycloak releases. The lazy cache
-    // for `getOrderedFeatures` / `getFeatureValues` has shifted name
-    // several times; the list below covers what `git log`-style
-    // archaeology + IDE structure dumps surface across KC15-KC26.
-    const CANDIDATES: &[&str] = &[
-        // Set<Feature> caches.
-        "orderedFeatures",
-        "ORDERED_FEATURES",
-        "ordered_features",
-        "featuresOrdered",
-        "FEATURES_ORDERED",
-        "featureSet",
-        "FEATURE_SET",
-        "features",
-        "FEATURES",
-        "allFeatures",
-        "ALL_FEATURES",
-        "versionedFeatures",
-        "VERSIONED_FEATURES",
-        "unversionedFeatures",
-        "UNVERSIONED_FEATURES",
-        "defaultProfile",
-        "DEFAULT_PROFILE",
-        "cachedFeatures",
-        "cachedOrderedFeatures",
-        "CACHED_FEATURES",
-        // Map<String, ...> caches.
-        "featuresByName",
-        "FEATURES_BY_NAME",
-        "orderedFeaturesByName",
-        "ORDERED_FEATURES_BY_NAME",
-        "featureMap",
-        "FEATURE_MAP",
-        // FeatureOptions-specific candidates.
-        "featureValues",
-        "FEATURE_VALUES",
-        "featureNames",
-        "FEATURE_NAMES",
-    ];
-
-    // Snapshot (field-name, descriptor, static_idx) for every static so
-    // we can look up declared types without re-walking under multiple
-    // lock acquisitions. The static_idx counter mirrors the one used by
-    // `resolve_field_ref` (statics-only, NOT cls.fields position).
-    let static_descriptors: Vec<(String, String, usize)> = {
-        let cm = shared.class_manager.read();
-        match cm.get_class(class_id) {
-            Some(cls) => {
-                let mut out = Vec::new();
-                let mut static_idx = 0usize;
-                for f in &cls.fields {
-                    if f.is_static() {
-                        out.push((f.name.to_string(), f.descriptor.to_string(), static_idx));
-                        static_idx += 1;
-                    }
-                }
-                out
-            }
-            None => Vec::new(),
-        }
-    };
-
-    // Resolve container class IDs up-front. Any of these may be absent
-    // (e.g. if `java/util/HashMap` somehow hasn't loaded yet); we skip
-    // candidates whose container couldn't be resolved.
-    let (hashset_id, hashmap_id, arraylist_id) = {
-        let cm = shared.class_manager.read();
-        (
-            cm.find_class_by_name("java/util/HashSet")
-                .or_else(|| cm.find_class_by_name("java/util/LinkedHashSet"))
-                .or_else(|| cm.find_class_by_name("java/util/TreeSet")),
-            cm.find_class_by_name("java/util/HashMap")
-                .or_else(|| cm.find_class_by_name("java/util/LinkedHashMap"))
-                .or_else(|| cm.find_class_by_name("java/util/TreeMap")),
-            cm.find_class_by_name("java/util/ArrayList")
-                .or_else(|| cm.find_class_by_name("java/util/LinkedList")),
-        )
-    };
-
-    let mut populated: Vec<(String, &'static str)> = Vec::new();
-    let mut attempted: Vec<String> = Vec::new();
-
-    for &candidate in CANDIDATES {
-        let Some((_, descriptor, static_idx)) =
-            static_descriptors.iter().find(|(name, _, _)| name == candidate)
-        else {
-            continue; // Field doesn't exist on this class — skip silently.
-        };
-        let cur = super::vm_object::get_static_shared(shared, class_id, *static_idx);
-        attempted.push(candidate.to_string());
-        // Only patch null slots.
-        if !matches!(cur, Value::Object(None)) {
-            continue;
-        }
-
-        // Pick the container based on the field's declared type. The
-        // descriptor is `Ljava/util/<Interface>;` for collection fields.
-        let (container_kind, container_obj): (&'static str, Option<ObjectRef>) =
-            if descriptor.contains("Map") {
-                let Some(map_id) = hashmap_id else { continue };
-                // HashMap layout (simplified, sufficient for accessor
-                // fast paths):
-                //   0: table     -> Object[]  (must be non-null)
-                //   1: size      -> int       (0)
-                //   2: modCount  -> int       (0)
-                //   3: threshold -> int       (0)
-                //   4: loadFactor-> float     (0.75 ideally; 0 is fine
-                //                              since size==0 short-circuits
-                //                              before resize logic runs)
-                // Over-allocate to 8 slots in case the JDK we link
-                // against has additional fields (older HashMap had
-                // `entrySet`/`keySet`/`values` cached views).
-                if let Some(obj) = shared.heap.try_alloc_object(map_id, 8) {
-                    // Populate `table` (slot 0) with a small empty array
-                    // so `table.length` reads don't NPE in `containsKey`
-                    // / `getOrDefault`.
-                    if let Some(arr) = shared.heap.try_alloc_array(
-                        class_id,
-                        ArrayElementType::Reference,
-                        16,
-                    ) {
-                        shared.heap.set_field(obj, 0, Value::Object(Some(arr)));
-                    }
-                    ("HashMap", Some(obj))
-                } else {
-                    ("HashMap", None)
-                }
-            } else if descriptor.contains("List") {
-                let Some(list_id) = arraylist_id else { continue };
-                // ArrayList layout:
-                //   0: elementData -> Object[] (non-null, may be empty)
-                //   1: size        -> int     (0)
-                // Allocate with 4 slots to absorb any minor layout drift
-                // (e.g. `modCount` inherited from AbstractList).
-                if let Some(obj) = shared.heap.try_alloc_object(list_id, 4) {
-                    if let Some(arr) = shared.heap.try_alloc_array(
-                        class_id,
-                        ArrayElementType::Reference,
-                        0,
-                    ) {
-                        shared.heap.set_field(obj, 0, Value::Object(Some(arr)));
-                    }
-                    ("ArrayList", Some(obj))
-                } else {
-                    ("ArrayList", None)
-                }
-            } else {
-                // Default to Set semantics — also covers `Collection`,
-                // `Iterable`, raw `Object` typed cache fields.
-                let Some(set_id) = hashset_id else { continue };
-                // HashSet has a single instance field (`map`:HashMap).
-                // Two slots is a safe over-allocation if the layout
-                // changes; surplus slots are harmless.
-                if let Some(obj) = shared.heap.try_alloc_object(set_id, 2) {
-                    ("HashSet", Some(obj))
-                } else {
-                    ("HashSet", None)
-                }
-            };
-
-        if let Some(obj) = container_obj {
-            super::vm_object::set_static_shared(
-                shared,
-                class_id,
-                *static_idx,
-                Value::Object(Some(obj)),
-            );
-            populated.push((candidate.to_string(), container_kind));
-        }
-    }
-
-    if !populated.is_empty() {
-        tracing::warn!(
-            "Post-clinit fixup: {} pre-populated {} cache static(s): {:?} (candidates seen: {:?})",
-            class_name,
-            populated.len(),
-            populated,
-            attempted
-        );
-        crate::dispatch_trace::record_note(
-            "Post-clinit fixup: Keycloak cache pre-populated",
-        );
-    } else {
-        // Nothing matched — surface what statics actually exist so the
-        // next round can refine CANDIDATES without rebuilding.
-        let static_names: Vec<String> = static_descriptors
-            .iter()
-            .map(|(n, d, _)| format!("{}:{}", n, d))
-            .collect();
-        tracing::warn!(
-            "Post-clinit fixup: {} — no candidate cache field matched; statics on class: {:?}",
-            class_name,
-            static_names
-        );
-        crate::dispatch_trace::record_note(
-            "Post-clinit fixup: Keycloak candidate scan empty (see warn log for statics list)",
-        );
     }
 }
 
