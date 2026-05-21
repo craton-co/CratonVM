@@ -1264,12 +1264,18 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         return None;
     }
 
-    // Run escape analysis to identify non-escaping `new` instructions.
-    // These are tracked for potential future scalar replacement optimization.
+    // Run a *conservative* escape pre-pass here: `jit_scan` has no
+    // constant-pool resolver, so it cannot tell a trivial `<init>()V`
+    // apart from an arg-bearing constructor. We therefore pass an empty
+    // shape map (every `invokespecial` escapes its operands). The
+    // precise pass — which re-enables scalar replacement for the
+    // `new; dup; invokespecial <init>()V` pattern — runs later in
+    // `compile_bytecode`, where the resolved invoke descriptors are
+    // available, and overwrites this set.
     let non_escaping_new = if new_ops.is_empty() {
         std::collections::HashSet::new()
     } else {
-        analyze_escapes(code, code_len)
+        analyze_escapes(code, code_len, &FxHashMap::default())
     };
 
     Some(JitScanResult {
@@ -1505,13 +1511,32 @@ fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
 // Escape analysis
 // ---------------------------------------------------------------------------
 
+/// Per-`invokespecial` shape needed for precise escape analysis.
+///
+/// `analyze_escapes` walks raw bytecode and cannot resolve constant-pool
+/// `MethodRef` entries on its own, so the caller (which *does* have the
+/// CP resolver) supplies this map keyed by the `invokespecial` PC.
+#[derive(Clone, Copy)]
+struct InvokeSpecialShape {
+    /// Total operand-stack slots the call consumes (receiver + params).
+    arg_slots: usize,
+    /// `true` only for a `<init>` whose descriptor is exactly `()V`.
+    /// Such a constructor performs no field initialization beyond the
+    /// implicit `Object.<init>` chain, so scalar replacement of the
+    /// receiver is sound. Any other invokespecial (an arg-bearing
+    /// `<init>`, a `super`/`private` call) writes the receiver's fields
+    /// from a *separate, un-inlined* method body — the JIT cannot
+    /// reproduce those writes in the frame, so the receiver must escape.
+    is_trivial_void_init: bool,
+}
+
 /// Identify `new` instructions (0xbb) whose produced objects are non-escaping.
 ///
 /// A `new` at PC `p` is non-escaping when none of the following happen:
 /// - The object is returned via `areturn`
 /// - The object is stored as the VALUE of a `putfield` or `aastore`
-/// - The object is passed as an argument to any invoke other than `invokespecial <init>`
-///   on the object itself (the `this` slot of a direct `<init>` call is allowed)
+/// - The object is passed as an argument to any invoke other than a
+///   trivial `invokespecial <init>()V` on the object itself
 ///
 /// The analysis is a single forward pass with an abstract operand stack tracking object
 /// provenance (`Some(new_pc)` if the slot holds a reference produced by that `new`,
@@ -1519,8 +1544,16 @@ fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
 /// branches that produce indeterminate stack shapes) causes all objects to be treated
 /// as potentially escaping.
 ///
+/// `invokespecial_shapes` carries the CP-resolved shape of every
+/// `invokespecial` site. A missing entry is treated conservatively
+/// (the call escapes every tracked operand).
+///
 /// Returns the set of `new` bytecode PCs that are confirmed non-escaping.
-fn analyze_escapes(code: &[u8], code_len: usize) -> std::collections::HashSet<usize> {
+fn analyze_escapes(
+    code: &[u8],
+    code_len: usize,
+    invokespecial_shapes: &FxHashMap<usize, InvokeSpecialShape>,
+) -> std::collections::HashSet<usize> {
     // Abstract stack: each entry is Some(new_pc) if the slot holds a new-created reference,
     // or None for non-tracked values.
     let mut abs_stack: Vec<Option<usize>> = Vec::with_capacity(16);
@@ -1630,17 +1663,50 @@ fn analyze_escapes(code: &[u8], code_len: usize) -> std::collections::HashSet<us
                 abs_stack.pop();
                 pc += 1;
             }
-            // invokespecial (0xb7) — commonly `<init>` on the new-created object.
-            // The `this` argument (deepest stack slot of the call) is popped by the
-            // constructor; it does NOT cause the object to escape.  We pop just one
-            // slot (the `this`/dup'd copy) and leave the original reference in place.
-            // Without the descriptor we cannot pop the right number of parameter slots,
-            // but for the common `new; dup; invokespecial <init>()V` pattern this is
-            // exact, and for constructors with args it is a conservative approximation.
+            // invokespecial (0xb7).
+            //
+            // A trivial `<init>()V` consumes exactly one slot (the dup'd
+            // `this`) and does not let the receiver escape — the canonical
+            // `new; dup; invokespecial <init>()V` pattern that scalar
+            // replacement targets.
+            //
+            // ANY other invokespecial — an arg-bearing constructor
+            // (`<init>(I)V`, …), a `super.m()` or `private` call — must:
+            //   1. pop the correct number of operand slots (receiver +
+            //      params), or the abstract stack desyncs and every
+            //      object below the call is mis-tracked; and
+            //   2. escape every tracked operand it consumes, because the
+            //      callee writes the receiver's fields from a separate,
+            //      un-inlined method body that the JIT frame cannot
+            //      reproduce. Scalar-replacing such a receiver would drop
+            //      those field initializations (observed as boxed values
+            //      coming back as 0 — the `Integer.valueOf` /
+            //      `String.toLowerCase` allocate-then-putfield miscompile).
             0xb7 => {
-                // Pop the `this` arg (dup'd copy of the reference).
-                abs_stack.pop();
-                // No push: invokespecial return type is typically void for <init>.
+                match invokespecial_shapes.get(&pc) {
+                    Some(shape) if shape.is_trivial_void_init => {
+                        // `<init>()V`: pop only `this`; receiver does not escape.
+                        abs_stack.pop();
+                    }
+                    Some(shape) => {
+                        // Arg-bearing invokespecial: pop receiver + params,
+                        // escaping any tracked object among them.
+                        for _ in 0..shape.arg_slots {
+                            if let Some(p) = abs_stack.pop().flatten() {
+                                escaped.insert(p);
+                            }
+                        }
+                    }
+                    None => {
+                        // Descriptor unknown — conservatively escape the
+                        // whole operand stack and clear it.
+                        escape_all!();
+                        abs_stack.clear();
+                    }
+                }
+                // No push: invokespecial return type is void for <init>;
+                // non-void private/super calls are rare and the cleared/
+                // conservative state above already covers them.
                 pc += 3;
             }
             // invokevirtual/invokeinterface/invokestatic — all args on the stack escape
@@ -6910,7 +6976,43 @@ impl Compiler {
     /// is needed. Forward branches within the callee are tracked and patched after
     /// emission. On return, the callee's result (if any) is on the caller's operand
     /// stack.
+    /// Speculatively inline the callee at `pc`. On any mid-body bail this
+    /// rolls back ALL speculative state — emitted machine code, the
+    /// simulated operand stack, its oop-mark vector, and the spill
+    /// cursor — so the caller can cleanly fall back to a normal call.
+    ///
+    /// Historically the `return false` bail points inside the inline
+    /// interpreter reset only `next_spill_offset`; the partially-emitted
+    /// callee body (and any operand-stack pops) were left in place. The
+    /// caller then emitted a *second*, full dispatch for the same call
+    /// site — duplicate/garbage code that miscompiled the method (boxed
+    /// values came back as 0). Snapshotting + rollback here makes a bail
+    /// fully transparent.
     fn try_emit_inline(&mut self, pc: usize) -> bool {
+        let buf_checkpoint = self.buf.pos();
+        let stack_checkpoint = self.stack.clone();
+        let oop_marks_checkpoint = self.stack_oop_marks.clone();
+        let spill_checkpoint = self.next_spill_offset;
+        if self.try_emit_inline_body(pc) {
+            true
+        } else {
+            // Discard every speculative side effect of the abandoned
+            // inline attempt so the fall-through normal-call path starts
+            // from exactly the pre-inline machine state.
+            self.buf.rewind_to(buf_checkpoint);
+            self.stack = stack_checkpoint;
+            self.stack_oop_marks = oop_marks_checkpoint;
+            self.next_spill_offset = spill_checkpoint;
+            false
+        }
+    }
+
+    /// Inline-emission body. MUST only be called via [`Self::try_emit_inline`],
+    /// which snapshots and restores compiler state around it. A `false`
+    /// return from anywhere inside is safe precisely because of that
+    /// wrapper — the bail sites here therefore no longer need to unwind
+    /// `next_spill_offset` by hand.
+    fn try_emit_inline_body(&mut self, pc: usize) -> bool {
         let site = match self.inline_sites.get(&pc) {
             Some(s) => s.clone(),
             None => return false,
@@ -7031,10 +7133,15 @@ impl Compiler {
                 }
 
                 // ldc
+                //
+                // `site.ldc_info` / `site.ldc2w_info` are keyed by the
+                // callee bytecode PC (see the inline resolver in
+                // `try_jit_compile_callee`), NOT the CP index. Match on
+                // `cpc` — the prior CP-index lookup silently missed and
+                // pushed 0 for the constant.
                 0x12 => {
                     if cpc + 1 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let idx = callee_code[cpc + 1] as usize; // Widening: always safe
-                    if let Some((_, val)) = site.ldc_info.iter().find(|(i, _)| *i == idx) {
+                    if let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) {
                         self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
                     } else {
                         self.emit_xor_reg_self(RAX);
@@ -7046,8 +7153,7 @@ impl Compiler {
                 // ldc_w
                 0x13 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let idx = ((callee_code[cpc + 1] as usize) << 8) | callee_code[cpc + 2] as usize; // Widening: always safe
-                    if let Some((_, val)) = site.ldc_info.iter().find(|(i, _)| *i == idx) {
+                    if let Some((_, val)) = site.ldc_info.iter().find(|(p, _)| *p == cpc) {
                         self.emit_mov_imm32_sx(RAX, *val as i32); // Cast: x86-64 immediate encoding
                     } else {
                         self.emit_xor_reg_self(RAX);
@@ -7059,8 +7165,7 @@ impl Compiler {
                 // ldc2_w
                 0x14 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let idx = ((callee_code[cpc + 1] as usize) << 8) | callee_code[cpc + 2] as usize; // Widening: always safe
-                    if let Some((_, val)) = site.ldc2w_info.iter().find(|(i, _)| *i == idx) {
+                    if let Some((_, val)) = site.ldc2w_info.iter().find(|(p, _)| *p == cpc) {
                         self.emit_mov_imm64(RAX, *val);
                     } else {
                         self.emit_xor_reg_self(RAX);
@@ -7641,9 +7746,14 @@ impl Compiler {
                 0xb4 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
                     self.flush_scratch_registers();
-                    let cp_idx = ((callee_code[cpc + 1] as usize) << 8) | callee_code[cpc + 2] as usize; // Widening: always safe
+                    // `site.field_info` is keyed by the callee bytecode PC
+                    // (`fpc` in `try_jit_compile_callee` / the inline
+                    // resolver), NOT by the constant-pool index. Using the
+                    // CP index here silently mismatched — a multi-field
+                    // callee could pick another field op's `field_index`
+                    // and read/write the wrong slot. Look up by `cpc`.
                     if let Some((_, field_index, _type_tag)) = site.field_info.iter()
-                        .find(|(p, _, _)| *p == cp_idx).copied()
+                        .find(|(p, _, _)| *p == cpc).copied()
                     {
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(ARG_REGS[0], obj_slot);
@@ -7662,9 +7772,12 @@ impl Compiler {
                 0xb5 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
                     self.flush_scratch_registers();
-                    let cp_idx = ((callee_code[cpc + 1] as usize) << 8) | callee_code[cpc + 2] as usize; // Widening: always safe
+                    // Keyed by callee bytecode PC — see the `getfield`
+                    // note above. Mismatching CP index vs PC here is the
+                    // bug that dropped constructor field writes (boxed
+                    // ints / `String.value` came back as 0).
                     if let Some((_, field_index, type_tag)) = site.field_info.iter()
-                        .find(|(p, _, _)| *p == cp_idx).copied()
+                        .find(|(p, _, _)| *p == cpc).copied()
                     {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
@@ -7704,9 +7817,11 @@ impl Compiler {
                 0xb2 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
                     self.flush_scratch_registers();
-                    let cp_idx = ((callee_code[cpc + 1] as usize) << 8) | callee_code[cpc + 2] as usize; // Widening: always safe
+                    // `static_field_info` is keyed by callee bytecode PC,
+                    // not CP index — match on `cpc` (see the `getfield`
+                    // note above).
                     if let Some((_, class_id_raw, field_index, _type_tag, is_volatile)) = site.static_field_info.iter()
-                        .find(|(p, _, _, _, _)| *p == cp_idx).copied()
+                        .find(|(p, _, _, _, _)| *p == cpc).copied()
                     {
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
@@ -7733,9 +7848,9 @@ impl Compiler {
                 0xb3 => {
                     if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
                     self.flush_scratch_registers();
-                    let cp_idx = ((callee_code[cpc + 1] as usize) << 8) | callee_code[cpc + 2] as usize; // Widening: always safe
+                    // Keyed by callee bytecode PC — match on `cpc`.
                     if let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = site.static_field_info.iter()
-                        .find(|(p, _, _, _, _)| *p == cp_idx).copied()
+                        .find(|(p, _, _, _, _)| *p == cpc).copied()
                     {
                         let val_slot = self.pop_stack();
                         let helper_fn: usize = match type_tag {
@@ -13440,6 +13555,40 @@ pub fn compile(
     // Register allocation: graph-coloring allocator for locals
     let alloc_result =
         super::regalloc::allocate_registers(code, code_len, max_locals, num_params, &loops);
+
+    // Precise escape re-analysis. `jit_scan` produced `non_escaping_new`
+    // with a conservative empty shape map (it has no CP resolver). Now
+    // that `invoke_info` carries every invokespecial's resolved
+    // descriptor, rebuild the shape map and re-run `analyze_escapes`.
+    // This lets a trivial `new; dup; invokespecial <init>()V` keep its
+    // scalar-replacement eligibility while an arg-bearing constructor
+    // (`<init>(I)V`, …) correctly escapes its receiver — the latter
+    // initializes fields in a separate, un-inlined method body that the
+    // JIT frame cannot reproduce. Skipping this re-analysis (or running
+    // it without descriptors) caused boxed values to come back as 0
+    // (the `Integer.valueOf` / `String.toLowerCase` archetype).
+    let non_escaping_new: std::collections::HashSet<usize> = if non_escaping_new.is_empty() {
+        non_escaping_new
+    } else {
+        let mut invokespecial_shapes: FxHashMap<usize, InvokeSpecialShape> =
+            FxHashMap::default();
+        for &(ipc, info_ptr) in &invoke_info {
+            // SAFETY: `info_ptr` comes from `invoke_info`, whose entries
+            // are kept live by the caller for the whole compilation.
+            let info = unsafe { &*info_ptr };
+            if info.invoke_kind == 1 {
+                invokespecial_shapes.insert(
+                    ipc,
+                    InvokeSpecialShape {
+                        arg_slots: info.num_jit_args,
+                        is_trivial_void_init: info.method_name == "<init>"
+                            && info.descriptor == "()V",
+                    },
+                );
+            }
+        }
+        analyze_escapes(code, code_len, &invokespecial_shapes)
+    };
 
     // Scalar replacement: plan frame-local storage for non-escaping object fields
     let num_hoists = hoist_info.len();
@@ -19259,7 +19408,14 @@ mod tests {
     #[test]
     fn test_jit_scan_escape_analysis_non_escaping() {
         // Pattern: new; dup; invokespecial <init>; astore_1; aload_1; getfield; ireturn
-        // The object is stored to local 1 and only used for getfield — non-escaping.
+        //
+        // `jit_scan` runs escape analysis WITHOUT a constant-pool
+        // resolver, so it cannot tell a trivial `<init>()V` from an
+        // arg-bearing constructor. It therefore runs a *conservative*
+        // pre-pass (every `invokespecial` escapes its operands); the
+        // precise pass — which re-enables scalar replacement for the
+        // `new; dup; invokespecial <init>()V` pattern — runs later in
+        // `compile`, where the resolved descriptors are available.
         let code: Vec<u8> = vec![
             0xbb, 0x00, 0x01, // 0: new #1
             0x59,             // 3: dup
@@ -19274,8 +19430,34 @@ mod tests {
         assert!(scan.is_some(), "method should be jit-compatible");
         let scan = scan.unwrap();
         assert!(
-            scan.non_escaping_new.contains(&0),
-            "new at PC=0 should be identified as non-escaping (only used via getfield)"
+            !scan.non_escaping_new.contains(&0),
+            "jit_scan's conservative pre-pass escapes invokespecial operands; \
+             precise re-analysis happens in `compile`"
+        );
+
+        // Precise pass: a trivial `<init>()V` (arg_slots=1, the dup'd
+        // `this`) keeps the object non-escaping.
+        let mut trivial: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
+        trivial.insert(
+            4,
+            InvokeSpecialShape { arg_slots: 1, is_trivial_void_init: true },
+        );
+        assert!(
+            analyze_escapes(&code, 13, &trivial).contains(&0),
+            "with a trivial `<init>()V` shape, new at PC=0 is non-escaping"
+        );
+
+        // An arg-bearing constructor (`<init>(I)V`, arg_slots=2) writes
+        // the receiver's fields from an un-inlined method body, so the
+        // receiver must escape — scalar replacement is unsound.
+        let mut arg_init: FxHashMap<usize, InvokeSpecialShape> = FxHashMap::default();
+        arg_init.insert(
+            4,
+            InvokeSpecialShape { arg_slots: 2, is_trivial_void_init: false },
+        );
+        assert!(
+            !analyze_escapes(&code, 13, &arg_init).contains(&0),
+            "an arg-bearing `<init>(I)V` must escape its receiver"
         );
     }
 
