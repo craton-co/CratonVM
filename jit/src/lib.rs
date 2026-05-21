@@ -286,6 +286,21 @@ impl ExecutableBuffer {
         self.len
     }
 
+    /// Rewind the write position back to a previously recorded `pos()`.
+    ///
+    /// Used to discard speculatively-emitted code — e.g. when
+    /// `try_emit_inline` abandons a partially-emitted callee body and
+    /// falls back to a normal call. Bytes past `offset` are left as-is
+    /// in the backing allocation (they will be overwritten by the next
+    /// `emit`); only `len` moves. Rewinding *forward* (offset > len) is
+    /// rejected so a stale checkpoint cannot expose uninitialized bytes.
+    #[inline]
+    pub fn rewind_to(&mut self, offset: usize) {
+        if offset <= self.len {
+            self.len = offset;
+        }
+    }
+
     /// Get a pointer to the start of the executable code.
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
@@ -2418,12 +2433,27 @@ fn try_compile_inner(
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
     // Both x64 and ARM64 backends have bytecode→native compilation pipelines.
     // ARM64 covers ~50+ opcodes (arithmetic, branches, float, conversions, invoke).
+    // Total incoming argument SLOTS for this method's own prologue.
+    //
+    // `count_param_slots` counts only the *declared* descriptor
+    // parameters. An instance method additionally receives the implicit
+    // `this` reference as JVM local 0, ahead of the declared params, so
+    // the prologue must load `1 + declared` argument registers. Omitting
+    // the `this` slot made the prologue zero-initialize local 0 instead
+    // of loading the receiver — a JIT-compiled instance method then
+    // operated on a null `this` (constructor field writes silently lost;
+    // boxed values / `String` fields read back as 0). The early-compile
+    // path already gets this right because it derives the count from the
+    // live `args.len()`; the callee-compile path used here did not.
+    let prologue_param_slots: usize = count_param_slots(&cached.method_descriptor)
+        + if cached.is_static { 0 } else { 1 };
+
     #[cfg(target_arch = "aarch64")]
     {
         use std::collections::HashMap;
 
         let code = &cached.code;
-        let num_params = count_param_slots(&cached.method_descriptor);
+        let num_params = prologue_param_slots;
 
         // Build method_info map: scan bytecode for invokestatic operands,
         // resolve each CP index to an argument count via the invoke resolver.
@@ -2479,7 +2509,9 @@ fn try_compile_inner(
 
     // Try IR compilation for simple integer-only methods.
     if ir::ir_compatible(&scan) {
-        let num_params = count_param_slots(&cached.method_descriptor);
+        // Includes the implicit `this` slot for instance methods — see
+        // `prologue_param_slots` above.
+        let num_params = prologue_param_slots;
         let builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         if let Some(mut graph) = builder.build(code, code_len) {
             ir_optimize::optimize(&mut graph);
@@ -2820,7 +2852,9 @@ fn try_compile_inner(
         }
     }
 
-    let param_slots = count_param_slots(&cached.method_descriptor);
+    // Prologue argument-slot count — includes the implicit `this` for
+    // instance methods (see `prologue_param_slots` above).
+    let param_slots = prologue_param_slots;
 
     let branch_hints: std::collections::HashMap<usize, bool> = profile
         .map(|prof| {

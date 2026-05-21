@@ -11554,7 +11554,30 @@ fn try_osr(
             }
         }
 
-        let param_slots = crate::jit::count_param_slots(&method_descriptor);
+        // Prologue argument-slot count. `count_param_slots` returns only
+        // the declared descriptor parameters; an instance method also
+        // receives the implicit `this` as JVM local 0, so the prologue
+        // must load `1 + declared` argument registers. Omitting `this`
+        // makes the prologue zero-init local 0 — the OSR-compiled method
+        // would then run with a null receiver.
+        let osr_method_is_static = shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|class| {
+                class
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        &*m.name == method_name_check
+                            && &*m.descriptor == method_descriptor.as_str()
+                    })
+                    .map(|m| m.is_static())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let param_slots = crate::jit::count_param_slots(&method_descriptor)
+            + if osr_method_is_static { 0 } else { 1 };
         let helpers = crate::jit::helpers::build_helpers();
         let mut cm = crate::jit::x64::compile(
             &code,
