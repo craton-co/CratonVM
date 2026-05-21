@@ -20,7 +20,10 @@ use crate::classloading::ClassId;
 use crate::error::{MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
-use crate::vm::{create_java_string, read_java_string, NativeContextImpl, SharedVm};
+use crate::vm::{
+    create_java_string, create_java_string_uninterned, read_java_string, NativeContextImpl,
+    SharedVm,
+};
 
 /// The StringConcatFactory bootstrap method class name.
 const STRING_CONCAT_FACTORY: &str = "java/lang/invoke/StringConcatFactory";
@@ -650,7 +653,10 @@ fn execute_string_concat(
         }
     }
 
-    let str_ref = create_java_string(shared, &result);
+    // `StringConcatFactory` (the `"a" + b` bytecode shape) produces a brand
+    // new String per the JVM spec — it must NOT be interned, otherwise `==`
+    // wrongly reports identity with an equal literal.
+    let str_ref = create_java_string_uninterned(shared, &result);
     thread.frames[frame_idx]
         .stack
         .push(Value::Object(Some(str_ref)))?;
