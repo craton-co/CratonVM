@@ -85,6 +85,19 @@ pub fn native_unsafe_copy_swap_memory(
     args: &[Value],
 ) -> MethodCallResult {
     // args: [this, srcBase, srcOffset, destBase, destOffset, bytes, elemSize]
+    //
+    // Copies `bytes` raw bytes from src to dst, byte-swapping every
+    // `elemSize`-byte group. This is the path `CharBuffer.getArray` /
+    // `IntBuffer.getArray` take when the buffer view's byte order differs
+    // from the host's native order (e.g. `ByteBufferAsCharBufferB` — a
+    // big-endian char view on a little-endian host — which is exactly how
+    // `ICUBinary.getChars`/`getInts` reads the `nfc.nrm` trie tables).
+    //
+    // The previous implementation copied `bytes` *slots* with `get_field`/
+    // `set_field`, treating raw byte offsets as field indices — corrupting
+    // memory whenever src/dst were primitive arrays of differing element
+    // widths. We now read the source as a byte stream, swap, and write a
+    // byte stream to the destination.
     let src_obj = unsafe_obj(args, 1);
     let src_offset = unsafe_offset(args, 2);
     let dest_obj = unsafe_obj(args, 3);
@@ -99,8 +112,10 @@ pub fn native_unsafe_copy_swap_memory(
         Some(Value::Int(s)) => *s as usize,
         _ => 0,
     };
+    if bytes == 0 {
+        return Ok(None);
+    }
 
-    // Off-heap: no source object means raw pointer operation — not supported
     let src = match src_obj {
         Some(s) => s,
         None => return Ok(None),
@@ -110,9 +125,27 @@ pub fn native_unsafe_copy_swap_memory(
         None => return Ok(None),
     };
 
-    // Number of elements = bytes (in our slot model, each slot counts as 1)
-    let count = bytes;
+    let src_is_array = ctx.heap_kind_of(src) == cratonvm_types::ObjectKind::Array
+        && ctx.heap_element_type_of(src) != cratonvm_types::ArrayElementType::Reference;
+    let dst_is_array = ctx.heap_kind_of(dst) == cratonvm_types::ObjectKind::Array
+        && ctx.heap_element_type_of(dst) != cratonvm_types::ArrayElementType::Reference;
 
+    if src_is_array && dst_is_array {
+        if let Some(mut buf) = crate::unsafe_array_read_bytes(ctx, src, src_offset, bytes) {
+            // Byte-swap each elemSize-byte group in place.
+            if elem_size >= 2 {
+                for chunk in buf.chunks_mut(elem_size) {
+                    chunk.reverse();
+                }
+            }
+            if crate::unsafe_array_write_bytes(ctx, dst, dest_offset, &buf) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // Fallback: legacy slot-by-slot swap for non-array (object-field) targets.
+    let count = bytes;
     for i in 0..count {
         let val = ctx.get_field(src, src_offset + i);
         let swapped = swap_value(val, elem_size);
