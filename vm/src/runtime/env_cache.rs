@@ -84,6 +84,10 @@ cached_is_set!(nsme_dbg, "CRATONVM_DBG_NSME");
 cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");
 cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
 cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
+/// `CRATONVM_DBG_JETTY` — trace dispatch into the `org/eclipse/jetty/start/`
+/// launcher package (every invokevirtual/invokespecial receiver + args) so
+/// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.
+cached_is_set!(dbg_jetty, "CRATONVM_DBG_JETTY");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 

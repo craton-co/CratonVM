@@ -8709,6 +8709,60 @@ fn execute_invoke_kind(
         args.push(coerce_invoke_arg_for_descriptor(pd, tmp[i + 1]));
     }
 
+    // CRATONVM_DBG_JETTY — trace every invoke into the Jetty launcher
+    // package. The boot-test target (`java -jar start.jar --list-config`)
+    // NPEs at `Main.start(Main.java:397)` on `args.getClasspath()`; this
+    // logs the receiver value and the full argument list for every
+    // `org/eclipse/jetty/start/` dispatch so the orchestrator's next run
+    // shows exactly which call passes a null `StartArgs` (or whether the
+    // `start(StartArgs)` overload is being confused with the no-arg
+    // `start()` that reads the null `jsvcStartArgs` field).
+    if crate::runtime::env_cache::dbg_jetty()
+        && method_class_name.starts_with("org/eclipse/jetty/start/")
+    {
+        let recv_desc = match args.first() {
+            Some(Value::Object(Some(r))) => {
+                let cid = shared.heap.class_id_of(*r);
+                let cn = shared
+                    .class_manager
+                    .read()
+                    .get_class(cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| format!("<cid {}>", cid.as_u32()));
+                format!("Object({cn}@{:p})", r.as_ptr())
+            }
+            Some(Value::Object(None)) => "NULL".to_string(),
+            other => format!("{other:?}"),
+        };
+        let arg_tail: Vec<String> = args
+            .iter()
+            .skip(1)
+            .map(|v| match v {
+                Value::Object(Some(r)) => {
+                    let cid = shared.heap.class_id_of(*r);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("<cid {}>", cid.as_u32()));
+                    format!("Object({cn})")
+                }
+                Value::Object(None) => "NULL".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        eprintln!(
+            "[cratonvm-jetty] invoke{} {}.{}{} receiver={} args={:?}",
+            if is_special { "special" } else { "virtual" },
+            &*method_class_name,
+            &*method_name,
+            &*method_descriptor,
+            recv_desc,
+            arg_tail,
+        );
+    }
+
     // Check for lambda proxy dispatch
     if !is_special {
         if let Value::Object(Some(obj_ref)) = &args[0] {
@@ -9110,6 +9164,33 @@ fn execute_invoke_kind(
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_default();
                             eprintln!("  [{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
+                    }
+                    // CRATONVM_DBG_JETTY — dump the full Java call stack when a
+                    // null-receiver invokevirtual fires on a Jetty launcher
+                    // method (the boot-test NPE site). This shows which frame /
+                    // pc loaded the null receiver — e.g. `Main.start` doing
+                    // `aload_1` of a null `StartArgs` param.
+                    if crate::runtime::env_cache::dbg_jetty()
+                        && method_class_name.starts_with("org/eclipse/jetty/start/")
+                    {
+                        let cm = shared.class_manager.read();
+                        eprintln!(
+                            "[cratonvm-jetty] NULL-RECEIVER invoke {}.{}{} — Java stack:",
+                            &*method_class_name, &*method_name, &*method_descriptor
+                        );
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+                            let cn = cm
+                                .get_class(f.class_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "  [{i}] {}.{}{} pc={}",
+                                cn,
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc
+                            );
                         }
                     }
                     return Err(RuntimeError::NullPointerException {
