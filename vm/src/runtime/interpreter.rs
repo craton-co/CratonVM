@@ -6513,6 +6513,9 @@ fn execute_instruction(
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
+            if class_name.contains("String") {
+                eprintln!("[DBG] NEW {} -> obj={:p}", class_name, obj_ref.as_ptr());
+            }
             // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
             if class_name == "java/util/NoSuchElementException"
                 && crate::runtime::env_cache::nsee_trace()
@@ -8967,6 +8970,18 @@ fn execute_invoke_kind(
                     // and surface as `IllegalArgumentException: invalid
                     // version "null"` (Felix framework bootstrap). The hack
                     // is removed so the spec-compliant NPE below fires.
+                    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+                        && &*method_name == "set"
+                    {
+                        let cm = shared.class_manager.read();
+                        eprintln!("MODSTATIC: NPE 'set on null' frames:");
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(12) {
+                            let cn = cm.get_class(f.class_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            eprintln!("  [{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
+                    }
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
@@ -10672,6 +10687,15 @@ fn execute_invokestatic(
             }
             found
         });
+    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+        && (method_name.as_ref() == "initBootModuleLoader"
+            || method_class_name.as_ref() == "org/jboss/modules/Module")
+    {
+        eprintln!(
+            "MODSTATIC: invokestatic {}.{} {} is_native={} direct_native={}",
+            method_class_name, method_name, method_descriptor, is_native, direct_native
+        );
+    }
     if !is_native {
         // Load and initialize the target class.
         // Always go through load_class_concurrent so synthetic stubs
@@ -10954,6 +10978,13 @@ fn execute_invokestatic_cached(
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok() {
+        if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+            if mn.as_ref() == "initBootModuleLoader" {
+                eprintln!("MODSTATIC: invokestatic_cached HIT {}.{}", mcn, mn);
+            }
+        }
+    }
 
     match target {
         CachedInvokeTarget::Native {
