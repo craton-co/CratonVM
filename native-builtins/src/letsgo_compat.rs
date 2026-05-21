@@ -503,11 +503,23 @@ fn box_character(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 fn box_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let v = match args.first() { Some(Value::Int(n)) => *n, _ => 0 };
-    let Some(w) = alloc_letsgo_wrapper(ctx, "java/lang/Boolean") else {
-        return Ok(Some(Value::Object(None)));
-    };
-    ctx.set_field(w, 0, Value::Int(if v != 0 { 1 } else { 0 }));
-    Ok(Some(Value::Object(Some(w))))
+    // `Boolean.valueOf(boolean)` MUST return the canonical `Boolean.TRUE` /
+    // `Boolean.FALSE` static-field instances (real JDK: `return b ? TRUE :
+    // FALSE`). Reference-identity checks against `Boolean.TRUE` depend on
+    // this — notably Xerces' `XML11Configuration.configurePipeline()`, which
+    // selects the namespace-aware scanner via
+    // `fFeatures.get(".../namespaces") == Boolean.TRUE`. Allocating a fresh
+    // wrapper here broke that comparison and silently disabled namespace
+    // processing. Delegate to the canonical implementation in `lang_math`.
+    crate::lang_math::native_boolean_value_of(ctx, args).or_else(|_| {
+        // Defensive fallback: if delegation somehow fails, preserve the old
+        // allocate-a-wrapper behaviour rather than propagating an error.
+        let Some(w) = alloc_letsgo_wrapper(ctx, "java/lang/Boolean") else {
+            return Ok(Some(Value::Object(None)));
+        };
+        ctx.set_field(w, 0, Value::Int(if v != 0 { 1 } else { 0 }));
+        Ok(Some(Value::Object(Some(w))))
+    })
 }
 
 fn box_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
