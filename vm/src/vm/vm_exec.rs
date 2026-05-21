@@ -355,11 +355,18 @@ pub fn safe_native_call(
             ),
             None => ("<no-frame>".to_string(), "<native>".to_string(), String::new()),
         };
+        // T19.H1 — also resolve the *callee* native's name from the
+        // ring-buffer name map. Recording only the caller frame hides
+        // which native is hung when a single bytecode method spins in a
+        // tight loop calling natives (e.g. an `Enumeration` that never
+        // exhausts). The `des` slot carries the native triple.
+        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
         crate::dispatch_trace::record_native(
             thread.thread_id.0 as usize,
             &cls,
             &mth,
-            &des,
+            &format!("{des}  ->NATIVE {callee}"),
         );
     }
     // Pin object arguments for the duration of the native: they have been
@@ -370,12 +377,21 @@ pub fn safe_native_call(
         pin_value_for_native_call(shared, &mut thread.native_pin_roots, a);
     }
 
+    // T19.H1 — record the native into the process-global ring buffer.
+    // `safe_native_call` is the central choke point for nearly every
+    // native dispatch path, so recording here (rather than only at the
+    // two interpreter call sites) means a hang inside *any* native
+    // leaves a `STILL-IN-NATIVE` breadcrumb the watchdog can dump.
+    let _ring_idx =
+        cratonvm_native_api::native_ring::record_enter(callback as usize);
+
     let result = {
         let mut ctx = NativeContextImpl { shared, thread };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             callback(&mut ctx, args)
         }))
     };
+    cratonvm_native_api::native_ring::record_exit(_ring_idx);
 
     let out: MethodCallResult = match result {
         Ok(method_result) => {
@@ -1887,12 +1903,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `wait_condvar.wait_for`. See `vm_init::dump_wait_site_thread_local`.
         crate::vm::vm_init::set_wait_site_snapshot(&*self.thread);
         let wait_start = std::time::Instant::now();
-        let was_interrupted = self.shared.monitors.wait(
-            obj,
-            self.thread.thread_id,
-            timeout_ms,
-            Some(&self.thread.interrupted),
-        )?;
+        // T19.H1 — mark this thread GC-blocked for the duration of the
+        // park so a stop-the-world GC excludes it from `wait_for_all`.
+        // The `BlockedGuard`'s `Drop` clears the mark unconditionally —
+        // even if `monitors.wait` returns `Err` and the `?` below
+        // early-returns — so the barrier's `expected` accounting cannot
+        // leak. The guard is dropped immediately after the wait so a
+        // *subsequent* STW correctly waits for this now-running thread.
+        let was_interrupted = {
+            let blk = self.shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                // A STW was already in progress when we became blocked —
+                // arrive at the barrier so its `wait_for_all` completes.
+                let _ = self
+                    .shared
+                    .gc_barrier
+                    .arrive_and_wait(self.thread.thread_id);
+            }
+            let r = self.shared.monitors.wait(
+                obj,
+                self.thread.thread_id,
+                timeout_ms,
+                Some(&self.thread.interrupted),
+            );
+            drop(blk);
+            r
+        }?;
         crate::vm::vm_init::clear_wait_site_snapshot();
         let wait_dur = wait_start.elapsed();
         // Check if GC happened while we were blocked
@@ -2256,7 +2292,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
-        self.shared.thread_registry.join(tid);
+        // T19.H1 — mark GC-blocked across the join so a stop-the-world
+        // GC excludes this thread from `wait_for_all` (it is parked in
+        // `JoinHandle::join` and cannot reach an interpreter safepoint).
+        {
+            let blk = self.shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                let _ = self
+                    .shared
+                    .gc_barrier
+                    .arrive_and_wait(self.thread.thread_id);
+            }
+            self.shared.thread_registry.join(tid);
+            drop(blk);
+        }
         // Check if GC happened while we were blocked
         self.check_post_block_gc();
         Ok(None)
@@ -2636,6 +2685,30 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         crate::runtime::interpreter::force_gc_from_native(self.shared, self.thread);
     }
 
+    fn begin_blocking_region(&mut self) {
+        // T19.H1 — a native about to spin/poll or OS-wait for a long
+        // time (e.g. `ReferenceQueue.remove`) must publish its roots and
+        // mark itself GC-blocked, otherwise a concurrent stop-the-world
+        // collector's `wait_for_all` deadlocks waiting for this thread
+        // to reach an interpreter safepoint it will never reach.
+        self.deposit_root_snapshot();
+        if self.shared.gc_barrier.mark_blocked_region_enter() {
+            // A STW was already in progress — arrive at the barrier so
+            // the initiator's `wait_for_all` can complete.
+            let _ = self
+                .shared
+                .gc_barrier
+                .arrive_and_wait(self.thread.thread_id);
+        }
+    }
+
+    fn end_blocking_region(&mut self) {
+        // T19.H1 — leave the blocked region; clear the mark and re-sync
+        // with any GC that ran while we were blocked.
+        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.check_post_block_gc();
+    }
+
     fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
         let cm = self.shared.class_manager.read();
         let Some(class) = cm.get_class(class_id) else {
@@ -2999,9 +3072,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
 
         let park_start = std::time::Instant::now();
-        self.thread
-            .park_state
-            .park_interruptible(timeout, &self.thread.interrupted);
+        // T19.H1 — mark GC-blocked across the park so a stop-the-world
+        // GC does not wait for this (parked, GC-safe) thread. The
+        // `BlockedGuard` clears the mark on drop regardless of how the
+        // park returns.
+        {
+            let blk = self.shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                let _ = self
+                    .shared
+                    .gc_barrier
+                    .arrive_and_wait(self.thread.thread_id);
+            }
+            self.thread
+                .park_state
+                .park_interruptible(timeout, &self.thread.interrupted);
+            drop(blk);
+        }
         let park_dur = park_start.elapsed();
 
         if release {

@@ -252,31 +252,12 @@ fn native_resource_open_stream(
 //   * `ModuleSpec.getDependencies` — empty array, mirrors `Module`.
 // ---------------------------------------------------------------------------
 
-/// `Module.<clinit>()` — no-op. The real clinit attempts to build a
-/// `DefaultBootModuleLoaderHolder.INSTANCE` via `WeakReference` /
-/// `AtomicReference` machinery that B6-swallows under CratonVM. Skipping
-/// the clinit is safe because `register_post_clinit_fixup` (owned by
-/// another agent in `phases_late.rs`) repopulates the static
-/// `BOOT_MODULE_LOADER` field after class initialization, and every other
-/// public accessor on `Module` is intercepted natively above.
-fn native_module_clinit(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(None)
-}
-
-/// `ModuleLoader.<clinit>()` — no-op. Same reasoning as
-/// `native_module_clinit`: the real clinit walks system properties and
-/// installs a default `ModuleLoaderSelector`, both of which we override
-/// natively. Skipping avoids the static-init reflection loop seen in the
-/// watchdog dispatch_trace.
-fn native_module_loader_clinit(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(None)
-}
+// T19.H1: `native_module_clinit` / `native_module_loader_clinit` removed.
+// They no-op'd `Module.<clinit>` / `ModuleLoader.<clinit>`, which left
+// `Module.BOOT_MODULE_LOADER` null once the compensating
+// `post_clinit_fixup` arm was deleted — `Module.initBootModuleLoader`
+// then NPE'd on `AtomicReference.set`. The real JDK `<clinit>` bytecode
+// initializes those classes correctly, so it now runs unintercepted.
 
 /// `Module.getDependencies()[Lorg/jboss/modules/Module$Dependency;` —
 /// return an empty `Object[]` (length 0, element type Reference). The
@@ -498,17 +479,21 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     // graph walk seen in the WildFly 39 watchdog dispatch_trace.
     // ------------------------------------------------------------------
 
-    // Module.<clinit>()V — no-op (post_clinit_fixup repopulates the
-    // static fields we actually need).
-    registry.register(CN_MODULE, "<clinit>", "()V", native_module_clinit);
-
-    // ModuleLoader.<clinit>()V — no-op.
-    registry.register(
-        CN_MODULE_LOADER,
-        "<clinit>",
-        "()V",
-        native_module_loader_clinit,
-    );
+    // T19.H1 (regression fix): the `Module.<clinit>` / `ModuleLoader.<clinit>`
+    // no-op shims used to be paired with a `post_clinit_fixup` arm that
+    // repopulated `Module.BOOT_MODULE_LOADER`. That fixup arm was removed
+    // (vm_util.rs, 2026-05-19) after instrumentation confirmed the real
+    // JDK `Module.<clinit>` bytecode populates every static correctly —
+    // but the matching `<clinit>` no-op registrations here were left in
+    // place. The result: the real clinit never runs, `BOOT_MODULE_LOADER`
+    // stays null, and `Module.initBootModuleLoader` NPEs on
+    // `AtomicReference.set` at WildFly bootstrap (Main.java:337).
+    //
+    // Per the no-synthetic-stubs policy, the correct fix is to let the
+    // real `<clinit>` run rather than re-introduce a backfill band-aid.
+    // The no-op callbacks (`native_module_clinit` /
+    // `native_module_loader_clinit`) are retained but no longer wired,
+    // so the real bytecode initializes both classes.
 
     // Module.getDependencies()[LModule$Dependency; — empty array.
     registry.register(

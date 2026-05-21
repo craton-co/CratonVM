@@ -397,12 +397,27 @@ fn native_rq_remove_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(60);
+    // T19.H1 — this poll loop can spin for up to 60 s without ever
+    // reaching an interpreter safepoint (the JBoss/WildFly Reference
+    // Handler thread parks here for the whole process lifetime). Mark a
+    // blocking region so a concurrent stop-the-world GC does not
+    // deadlock waiting for this thread in `wait_for_all`.
+    ctx.begin_blocking_region();
     loop {
-        let result = native_rq_poll(ctx, args)?;
+        let result = native_rq_poll(ctx, args);
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.end_blocking_region();
+                return Err(e);
+            }
+        };
         if let Some(Value::Object(Some(_))) = result {
+            ctx.end_blocking_region();
             return Ok(result);
         }
         if start.elapsed() >= timeout {
+            ctx.end_blocking_region();
             return Ok(Some(Value::Object(None)));
         }
         std::thread::yield_now();
@@ -421,12 +436,24 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
+    // T19.H1 — see `native_rq_remove_blocking`: mark a blocking region
+    // so a concurrent stop-the-world GC does not wait for this thread.
+    ctx.begin_blocking_region();
     loop {
-        let result = native_rq_poll(ctx, args)?;
+        let result = native_rq_poll(ctx, args);
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.end_blocking_region();
+                return Err(e);
+            }
+        };
         if let Some(Value::Object(Some(_))) = result {
+            ctx.end_blocking_region();
             return Ok(result);
         }
         if start.elapsed() >= timeout {
+            ctx.end_blocking_region();
             return Ok(Some(Value::Object(None)));
         }
         std::thread::yield_now();

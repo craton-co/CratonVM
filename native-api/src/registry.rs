@@ -772,6 +772,25 @@ pub trait NativeContext {
     /// Used by `System.gc()` / `Runtime.gc()`.
     fn force_gc(&mut self);
 
+    /// T19.H1 — mark the start of a *blocking region* inside a native
+    /// method (a spin/poll loop or an OS wait that may run for a long
+    /// time, e.g. `ReferenceQueue.remove`, a selector `select`, a socket
+    /// `accept`).
+    ///
+    /// While inside a blocking region the calling thread is treated as
+    /// GC-safe: its frame roots are published to the registry snapshot
+    /// and a concurrent stop-the-world collector will NOT wait for it to
+    /// reach an interpreter safepoint. Every `begin_blocking_region` MUST
+    /// be paired with exactly one `end_blocking_region`.
+    ///
+    /// The default impl is a no-op so out-of-tree `NativeContext`
+    /// implementors (tests) need not change.
+    fn begin_blocking_region(&mut self) {}
+
+    /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
+    /// Re-syncs the thread with any GC that ran while it was blocked.
+    fn end_blocking_region(&mut self) {}
+
     // -- Reflection metadata methods --
 
     /// Get metadata for all fields declared in this class (not inherited).
@@ -1846,15 +1865,17 @@ impl NativeMethodRegistry {
         self.by_method_desc.insert(md_key, callback);
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
-        // method names. The ring is disabled by default, so gate the
-        // `format!` (a String allocation) and the mutex-locking
-        // `register_name` call behind `is_enabled()` — otherwise boot
-        // does ~3,100 needless allocations + lock acquisitions for a
-        // name map nothing will ever read.
-        if crate::native_ring::is_enabled() {
-            let triple = format!("{class_name}.{method_name}{descriptor}");
-            crate::native_ring::register_name(callback as usize, &triple);
-        }
+        // method names.
+        //
+        // T19.H1: this MUST run unconditionally. The watchdog (which
+        // enables the ring) arms *after* `Vm::new` has already
+        // registered every native, so an `is_enabled()` gate here
+        // leaves the name map empty and the watchdog dump shows only
+        // `<unknown cb@0x..>`. The one-time cost is ~3,100 small
+        // String allocations during boot — negligible, and the
+        // watchdog is on by default, so the map is always wanted.
+        let triple = format!("{class_name}.{method_name}{descriptor}");
+        crate::native_ring::register_name(callback as usize, &triple);
     }
 
     /// Look up a native method implementation (zero allocation on the

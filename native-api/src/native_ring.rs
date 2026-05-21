@@ -77,6 +77,16 @@ fn name_map() -> &'static Mutex<FxHashMap<usize, String>> {
     MAP.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+/// Resolve a callback pointer back to its registered
+/// `class.method desc` name, if known. Used by diagnostic code (the
+/// dispatch tracer / watchdog) to render the hung native by name.
+pub fn name_of(cb_ptr: usize) -> Option<String> {
+    if cb_ptr == 0 {
+        return None;
+    }
+    name_map().lock().get(&cb_ptr).cloned()
+}
+
 /// Register a callback pointer → name mapping.
 pub fn register_name(cb_ptr: usize, triple: &str) {
     if cb_ptr == 0 {
