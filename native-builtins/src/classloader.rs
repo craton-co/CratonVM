@@ -1918,6 +1918,47 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let resource_name = name.trim_start_matches('/');
 
     let mut urls = ctx.find_all_resource_urls(resource_name);
+
+    // WF32-fix: bound the per-jar `META-INF/MANIFEST.MF` enumeration.
+    //
+    // Background: CratonVM approximates JBoss module isolation by dumping
+    // every resolved module's `<resource-root>` jars onto a single shared
+    // application classpath (see `jboss_module_loader::register_resource_roots`).
+    // A real JVM running `java -jar jboss-modules.jar` has exactly ONE
+    // classpath entry, so `getResources("META-INF/MANIFEST.MF")` returns one
+    // URL. Under CratonVM's flat classpath it returns one URL per module jar
+    // — 500-750 for a full WildFly install.
+    //
+    // WildFly's bootstrap iterates that enumeration, doing a
+    // `URL.openStream()` + `new Manifest(stream)` on each. With 500+ jars —
+    // several of them carrying very large manifests (e.g. `ecj-3.32.0.jar`
+    // ships an 889-section, 124 KB MANIFEST.MF) — the interpreted scan runs
+    // long past the 120 s stack-dump watchdog, so the boot never makes
+    // forward progress: a hang, not a crash.
+    //
+    // `META-INF/MANIFEST.MF` is special: it exists in essentially every jar,
+    // so a flat-classpath enumeration of it is quadratic-by-construction and
+    // is never what a module-isolated caller actually wants. Capping it back
+    // toward the real-JVM count keeps the scan bounded. The cap is generous
+    // (128 — far more than the 1 a real `java -jar` sees) so legitimate
+    // multi-jar manifest probes still work; only the pathological 500+-jar
+    // module-jar flood is truncated.
+    //
+    // This is a bounded fallback, NOT the correct end state. A real
+    // `module.xml`-driven resolver must give each JBoss module its own
+    // isolated `ModuleClassLoader` whose `getResources` only sees that
+    // module's own `<resource-root>` jars — then this cap becomes a no-op.
+    const MANIFEST_ENUM_CAP: usize = 128;
+    if resource_name == "META-INF/MANIFEST.MF" && urls.len() > MANIFEST_ENUM_CAP {
+        eprintln!(
+            "[jboss-bf] getResources(META-INF/MANIFEST.MF): capping {} flat-classpath \
+             matches to {} (CratonVM module-jar flood; see classloader.rs WF32-fix)",
+            urls.len(),
+            MANIFEST_ENUM_CAP
+        );
+        urls.truncate(MANIFEST_ENUM_CAP);
+    }
+
     // Always also offer the "classpath:<name>" form when any entry served it
     // via raw bytes but wasn't discovered via the structured walk (e.g. a
     // synthetic test loader that only overrides `find_resource`).

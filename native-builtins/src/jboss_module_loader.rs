@@ -875,16 +875,52 @@ pub(crate) fn native_loader_load_module(
     // pathological deep tree cannot stall startup.
     let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
     if is_brute_force_trigger(&name) {
-        // RKC19/WF39 Task A — always-on eprintln so the brute-force walk
-        // is observable without `CRATONVM_DBG_WF`.  These lines confirm
-        // (a) the walk runs for the expected trigger modules and (b) how
-        // many jars it physically located on disk.
-        let brute_jars = brute_force_collect_layered_jars(&roots, &name);
+        // WF32-fix: the brute-force layered-jar walk is now DISABLED by
+        // default (opt back in with `CRATONVM_JBOSS_BRUTE_FORCE_JARS=1`).
+        //
+        // Why: this walk used to register *every* `.jar` under
+        // `<root>/system/layers/*/` (750+ jars for WildFly 32) onto the
+        // shared dynamic classpath. That flood is the root cause of the
+        // WildFly boot hang:
+        //
+        //   * `ClassLoader.getResources("META-INF/MANIFEST.MF")` then
+        //     enumerates one URL per registered jar — 750 URLs instead of
+        //     the handful a properly module-isolated classloader sees.
+        //   * WildFly's `Main.main` iterates that enumeration, doing a
+        //     `URL.openStream()` + `Manifest` parse on each. Every
+        //     `openStream` re-opens and re-indexes a zip central directory
+        //     (~280 ms/jar in CratonVM), so the scan takes ~210 s and the
+        //     120 s watchdog aborts the process.
+        //
+        // The walk was only ever a belt-and-braces fallback to make the
+        // bootstrap entry-point class (`org.jboss.as.server.Main`)
+        // loadable. That class — and its real transitive dependency
+        // jars — are already registered by the normal resolution path
+        // above (`register_resource_roots(resolved.resource_roots)` +
+        // `transitive_linkage_roots` + `collect_physical_main_dir_jars`),
+        // so dumping all 750 layered jars adds nothing for class loading
+        // while quadratically poisoning every resource enumeration.
+        //
+        // NOTE for a future agent: the correct long-term design is a real
+        // `module.xml`-driven resolver that gives each JBoss module its
+        // own isolated `ModuleClassLoader`, so `getResources` from module
+        // X only sees X's `<resource-root>` jars. Until then, the normal
+        // resolution path covers the common case; re-enable this walk via
+        // the env var only if a specific app regresses with a
+        // `NoSuchMethodException` on its bootstrap entry class.
+        let brute_force_enabled =
+            std::env::var("CRATONVM_JBOSS_BRUTE_FORCE_JARS").as_deref() == Ok("1");
+        let brute_jars = if brute_force_enabled {
+            brute_force_collect_layered_jars(&roots, &name)
+        } else {
+            Vec::new()
+        };
         eprintln!(
-            "[jboss-bf] module={} | roots={:?} | jars_found={}",
+            "[jboss-bf] module={} | roots={:?} | jars_found={} | brute_force_enabled={}",
             name,
             roots,
-            brute_jars.len()
+            brute_jars.len(),
+            brute_force_enabled
         );
         if dbg_wf {
             for j in brute_jars.iter().take(32) {
