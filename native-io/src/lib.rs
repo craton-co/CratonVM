@@ -7336,8 +7336,20 @@ fn native_path_to_real_path(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 /// Normalize a synthetic-Path string into a well-formed native path:
-/// drop a leading verbatim-prefix remnant (`/?/`, `\?\`, `\\?\`) and
-/// translate separators to the platform's native separator.
+/// drop a leading verbatim-prefix remnant (`/?/`, `\?\`, `\\?\`), strip a
+/// spurious leading slash before a Windows drive letter (`/C:/foo` →
+/// `C:/foo`), and translate separators to the platform's native separator.
+///
+/// The leading-slash strip is essential for Jetty's `start.jar`: its
+/// `processCommandLine` round-trips `$JETTY_HOME` / `$JETTY_BASE` through
+/// `Path.toUri().toString()` (`BaseHome` `normalizeURI`), so synthetic
+/// Path strings frequently arrive in the URI form `/C:/jetty-home/...`.
+/// Without this strip, `Path::new("\C:\jetty-home\start.ini").exists()`
+/// reports `false` on Windows, `toRealPath` wrongly throws
+/// `NoSuchFileException` for a config/module file that actually exists,
+/// Jetty's module graph ends up empty, and `Main.start` finally NPEs on a
+/// null `Classpath` (`Cannot invoke getClasspath on null`). Mirrors
+/// `phases_late.rs::p57_to_os_path`.
 fn normalize_real_path_input(raw: &str) -> String {
     let mut s = raw;
     for prefix in [r"\\?\", "/?/", r"\?\"] {
@@ -7345,6 +7357,15 @@ fn normalize_real_path_input(raw: &str) -> String {
             s = rest;
             break;
         }
+    }
+    // `/C:/foo` → `C:/foo` (URI-style absolute path on Windows). Only when
+    // the third byte is `:` so genuine Unix-rooted paths are untouched.
+    if cfg!(windows)
+        && s.len() >= 3
+        && s.starts_with('/')
+        && s.as_bytes().get(2) == Some(&b':')
+    {
+        s = &s[1..];
     }
     if cfg!(windows) {
         s.replace('/', "\\")

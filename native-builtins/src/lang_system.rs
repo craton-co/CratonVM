@@ -1558,7 +1558,21 @@ pub(crate) fn native_system_init_phase1(
     // downstream `new OutputStreamWriter(stream, charset)` throws NPE("charset")
     // and Quarkus silently exits during command-line parsing. We must therefore
     // stamp a non-null Charset on System.out/err at bootstrap time.
+    //
+    // charset-NPE fix (2026-05-21): `set_field_by_name` resolves the
+    // `charset` slot by walking the receiver's class hierarchy. If the
+    // System.out/err object was allocated against the 1-field synthetic
+    // `java/io/PrintStream` stub (created before the real class was
+    // loaded), that walk finds no `charset` field and silently drops
+    // the write — leaving the field null. `ensure_system_streams` now
+    // force-loads the real PrintStream class first, but we also make
+    // this helper defensive: it ensures the real `java/io/PrintStream`
+    // class is loaded so the `charset` field is resolvable, and it
+    // verifies the write actually landed.
     fn install_charset(ctx: &mut dyn NativeContext, stream: ObjectRef) {
+        // Ensure the real PrintStream class is loaded so `charset` is a
+        // resolvable field name. (No-op in pure synthetic-jdk mode.)
+        let _ = ctx.ensure_class_initialized("java/io/PrintStream");
         let cs_class = match ctx.ensure_class_initialized("java/nio/charset/Charset") {
             Ok(cid) => cid,
             Err(_) => return,
@@ -1570,6 +1584,19 @@ pub(crate) fn native_system_init_phase1(
         // Use field-by-name so we hit the real-JDK `charset` slot (its
         // declared index differs from any synthetic ordering).
         ctx.set_field_by_name(stream, "charset", Value::Object(Some(cs_obj)));
+        // Verify the write landed. If `charset` did not resolve (e.g. the
+        // receiver is still a fieldless synthetic stub), the bare
+        // `set_field_by_name` above was a no-op and `PrintStream.charset()`
+        // would return null → NPE("charset") on the first `new
+        // PrintWriter(System.err)`. Fall back to resolving the slot
+        // index explicitly against `java/io/PrintStream` and, as a last
+        // resort, scan the object's reference slots is unsafe (could
+        // clobber `out`), so we only retry the explicit-index path.
+        if let Some(idx) = ctx.resolve_field_index("java/io/PrintStream", "charset") {
+            if idx < ctx.object_num_fields(stream) {
+                ctx.set_field(stream, idx, Value::Object(Some(cs_obj)));
+            }
+        }
     }
 
     if let Some(out_stream) = ctx.get_system_stream("out") {

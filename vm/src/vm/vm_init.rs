@@ -3377,6 +3377,32 @@ impl SharedVm {
         // `java/io/PrintStream` has already been loaded (real-JDK mode),
         // `ensure_synthetic_class` returns that existing id; otherwise
         // it creates a 1-field synthetic stub.
+        //
+        // charset-NPE fix (2026-05-21): in real-JDK mode this hook runs
+        // from `System.<clinit>`, which executes *before*
+        // `java/io/PrintStream` has been loaded. The old code therefore
+        // hit the `ensure_synthetic_class` "create a 1-field stub" path,
+        // and the System.out/err objects ended up backed by a synthetic
+        // stub class whose `fields` vector is EMPTY. `initPhase1`'s
+        // `install_charset` then does `set_field_by_name(stream,
+        // "charset", …)`, which resolves the field via
+        // `resolve_field_index_in_hierarchy` — that walk finds no field
+        // named `charset` on the empty-field stub, so the write is
+        // silently dropped and `PrintStream.charset` stays null. The
+        // first `new PrintWriter(System.err)` (Picocli / Quarkus
+        // `show-config`) then reads `((PrintStream)err).charset()` ==
+        // null and `OutputStreamWriter`'s `Objects.requireNonNull(cs,
+        // "charset")` throws `NullPointerException: charset`.
+        //
+        // Force-load the real `java/io/PrintStream` class first (same
+        // pattern as `ensure_system_stdin_object` for FileInputStream)
+        // so the backing objects get the real field layout — including
+        // the `charset` slot — whenever real JDK class files are
+        // available. `load_class_concurrent` also upgrades a previously
+        // created synthetic stub in place. If no real boot classes are
+        // present (pure synthetic-jdk mode) the load fails harmlessly
+        // and we fall back to the 1-field synthetic stub below.
+        let _ = self.load_class_concurrent("java/io/PrintStream");
         let ps_class_id = self.class_manager.write().ensure_synthetic_class(
             "java/io/PrintStream",
             1, // 1 field: fd_id — used only when the real class isn't loaded
