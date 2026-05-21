@@ -2674,17 +2674,42 @@ pub(crate) fn native_boolean_value_of(ctx: &mut dyn NativeContext, args: &[Value
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    // Round-9 CRIT fix: `Boolean.valueOf(z)` must return the same canonical
-    // TRUE/FALSE instance across ALL threads (JLS § 5.1.7). A thread-local
-    // cache produced two distinct ObjectRefs for `Boolean.TRUE` on two
-    // threads, breaking `==` identity. Now process-global under a lock.
     let idx = if val != 0 { 1 } else { 0 };
+
+    // JLS §5.1.7 / `Boolean.valueOf(boolean)` contract: the method returns
+    // the canonical `Boolean.TRUE` / `Boolean.FALSE` static-field instances
+    // (real JDK source is literally `return b ? TRUE : FALSE`). Code that
+    // does reference-identity checks against `Boolean.TRUE` — most notably
+    // Xerces' `XML11Configuration.configurePipeline()`, which decides
+    // between the namespace-aware and non-namespace scanner via
+    // `fFeatures.get("…/namespaces") == Boolean.TRUE` — depends on this.
+    //
+    // The previous implementation minted its own `BOOLEAN_CACHE` instances,
+    // which were NOT identical to the `Boolean.TRUE`/`FALSE` objects created
+    // by `Boolean.<clinit>`, so `valueOf(true) == Boolean.TRUE` was false.
+    // Resolve and return the actual static fields instead. `ensure_class_
+    // initialized` runs `<clinit>`, so `TRUE`/`FALSE` are populated by the
+    // time we read them.
+    if let Ok(class_id) = ctx.ensure_class_initialized("java/lang/Boolean") {
+        let field_name = if idx == 1 { "TRUE" } else { "FALSE" };
+        if let Some(field_idx) = ctx.static_field_index_by_name(class_id, field_name) {
+            if let Value::Object(Some(o)) = ctx.get_static_field(class_id, field_idx) {
+                // Return the live static field directly. The field is a GC
+                // root in its own right (class statics are scanned), so no
+                // private mirror is needed and none can go stale.
+                return Ok(Some(Value::Object(Some(o))));
+            }
+        }
+    }
+
+    // Fallback (Boolean class somehow unavailable / fields not yet set):
+    // keep the canonical-cache behaviour so repeated calls are at least
+    // self-consistent.
     if let Some(o) = { let c = boolean_cache().lock(); c[idx] } {
         return Ok(Some(Value::Object(Some(o))));
     }
     let obj = alloc_wrapper(ctx, "java/lang/Boolean");
-    ctx.set_field(obj, 0, Value::Int(if val != 0 { 1 } else { 0 }));
-    // Re-check under the lock — another thread may have raced us.
+    ctx.set_field(obj, 0, Value::Int(idx as i32));
     let mut cache = boolean_cache().lock();
     if let Some(existing) = cache[idx] {
         return Ok(Some(Value::Object(Some(existing))));
