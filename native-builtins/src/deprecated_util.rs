@@ -1005,10 +1005,19 @@ fn native_locale_get_iso3_language(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Field 0 of a Locale holds the language string (e.g. "en", "fr").
-    let lang2 = match ctx.get_field(this, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+    // `java.util.Locale`'s real-JDK instance slots are `baseLocale` /
+    // `localeExtensions` (typed objects), NOT String language fields — so
+    // the language is read from the ObjectRef-keyed side table populated by
+    // `locale_alloc` / the Locale `<init>` natives, falling back to the
+    // synthetic-stub slot 0 only for test contexts that write it directly.
+    let (side_lang, _, _) = crate::locale_data_get(this);
+    let lang2 = if !side_lang.is_empty() {
+        side_lang
+    } else {
+        match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
     };
     let iso3 = iso2_to_iso3(&lang2);
     let result = if iso3.is_empty() { &lang2 } else { iso3 };

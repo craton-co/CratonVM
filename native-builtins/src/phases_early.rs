@@ -13403,13 +13403,32 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     r.register(huc, "HTTP_UNAVAILABLE", "I", |_ctx, _args| Ok(Some(Value::Int(503))));
 
     // --- InetAddress additions ---
+    //
+    // `java.net.InetAddress` is a real bootstrap class: its instance slots
+    // 0/1 are the `holder` reference fields, NOT `hostName` / `address`
+    // Strings. CratonVM-synthesised InetAddress objects keep their host/IP
+    // in the `net_phase_e` ObjectRef-keyed side table; these natives must
+    // consult it rather than reading the (intentionally unpopulated)
+    // instance slots — reading a String out of the `holder` slot is exactly
+    // what caused bogus `NoSuchMethodError java/lang/String.getHostName()`.
     let ia = "java/net/InetAddress";
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let host = match crate::net_phase_e::inet_addr_get(this) {
+            Some((h, _)) => h,
+            None => match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&host)))))
     });
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some((_, ip)) = crate::net_phase_e::inet_addr_get(this) {
+            let ip = if ip.is_empty() { "127.0.0.1".to_string() } else { ip };
+            return Ok(Some(Value::Object(Some(ctx.create_string(&ip)))));
+        }
         let nf = ctx.object_num_fields(this);
         if nf > 1 {
             let addr = ctx.get_field(this, 1);
@@ -13424,10 +13443,12 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     // with real DNS resolution; do NOT re-register here as it would shadow them.
     r.register(ia, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let host = if let Value::Object(Some(h)) = ctx.get_field(this, 0) {
-            ctx.read_string(h).unwrap_or_default()
-        } else {
-            String::new()
+        let host = match crate::net_phase_e::inet_addr_get(this) {
+            Some((h, _)) => h,
+            None => match ctx.get_field(this, 0) {
+                Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
+                _ => String::new(),
+            },
         };
         let s = ctx.create_string(&format!("/{host}"));
         Ok(Some(Value::Object(Some(s))))

@@ -10692,6 +10692,55 @@ fn locale_default() -> &'static parking_lot::Mutex<Option<ObjectRef>> {
     DEFAULT.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
+/// Side-table mapping a CratonVM-synthesised `java/util/Locale` ObjectRef to
+/// its `(language, country, variant)` strings.
+///
+/// CRITICAL: `java.util.Locale` is a real bootstrap class whose instance
+/// fields are `baseLocale` (a `sun.util.locale.BaseLocale`) and
+/// `localeExtensions` (a `sun.util.locale.LocaleExtensions`) — NOT plain
+/// `String` language/country/variant fields. Earlier code wrote the
+/// language/country Strings straight into instance slots 0/1/2. When a
+/// real-JDK `Locale` method that we do NOT natively override runs against
+/// such an object (e.g. `getUnicodeLocaleType`), its bytecode does
+/// `getfield localeExtensions; invokevirtual LocaleExtensions.getXxx()` —
+/// but slot 1 holds a `String`, so the `invokevirtual` retargets onto
+/// `java/lang/String` and raises a bogus
+/// `NoSuchMethodError java/lang/String.getUnicodeLocaleType(...)`.
+///
+/// To avoid poisoning the real-JDK field layout, the synthetic Locale's
+/// instance slots are left untouched (null / zero-initialised, which is the
+/// spec-correct "no extensions" shape). The language/country/variant data
+/// lives here instead, keyed by ObjectRef, and every Locale accessor native
+/// reads from this table.
+fn locale_data() -> &'static parking_lot::Mutex<
+    std::collections::HashMap<ObjectRef, (String, String, String)>,
+> {
+    use std::sync::OnceLock;
+    static DATA: OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<ObjectRef, (String, String, String)>>,
+    > = OnceLock::new();
+    DATA.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a synthetic Locale's `(language, country, variant)` in the side
+/// table. See [`locale_data`] for why instance fields must not be used.
+pub(crate) fn locale_data_set(obj: ObjectRef, lang: &str, country: &str, variant: &str) {
+    locale_data()
+        .lock()
+        .insert(obj, (lang.to_string(), country.to_string(), variant.to_string()));
+}
+
+/// Read a synthetic Locale's `(language, country, variant)` from the side
+/// table. Returns empty strings for a Locale we never recorded (e.g. a
+/// real-JDK-constructed Locale) — callers treat that as the root locale.
+pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
+    locale_data()
+        .lock()
+        .get(&obj)
+        .cloned()
+        .unwrap_or_default()
+}
+
 pub(crate) fn native_noop_with_this(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -28414,23 +28463,9 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(loc, "equals", "(Ljava/lang/Object;)Z", native_locale_equals);
     registry.register(loc, "hashCode", "()I", native_locale_hash_code);
-    registry.register(loc, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let lang = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let country = match ctx.get_field(this, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let result = if country.is_empty() {
-            lang
-        } else {
-            format!("{}_{}", lang, country)
-        };
-        Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
-    });
+    // Second `toString` registration kept for parity with the historical
+    // layout; delegates to the side-table-backed implementation.
+    registry.register(loc, "toString", "()Ljava/lang/String;", native_locale_to_string);
 
     // Static constants
     registry.register(
@@ -28443,64 +28478,53 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
     registry.register(loc, "UK", "()Ljava/util/Locale;", native_locale_uk);
     registry.register(loc, "ROOT", "()Ljava/util/Locale;", native_locale_root);
     registry.register(loc, "FRENCH", "()Ljava/util/Locale;", |ctx, _args| {
-        let s1 = ctx.create_string("fr"); let s2 = ctx.create_string("");
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        ctx.set_field(l, 0, Value::Object(Some(s1))); ctx.set_field(l, 1, Value::Object(Some(s2)));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "fr", "")))))
     });
     registry.register(loc, "GERMAN", "()Ljava/util/Locale;", |ctx, _args| {
-        let s1 = ctx.create_string("de"); let s2 = ctx.create_string("");
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        ctx.set_field(l, 0, Value::Object(Some(s1))); ctx.set_field(l, 1, Value::Object(Some(s2)));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "de", "")))))
     });
     registry.register(loc, "JAPAN", "()Ljava/util/Locale;", |ctx, _args| {
-        let s1 = ctx.create_string("ja"); let s2 = ctx.create_string("JP");
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        ctx.set_field(l, 0, Value::Object(Some(s1))); ctx.set_field(l, 1, Value::Object(Some(s2)));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "ja", "JP")))))
     });
     registry.register(loc, "CHINA", "()Ljava/util/Locale;", |ctx, _args| {
-        let s1 = ctx.create_string("zh"); let s2 = ctx.create_string("CN");
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        ctx.set_field(l, 0, Value::Object(Some(s1))); ctx.set_field(l, 1, Value::Object(Some(s2)));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "zh", "CN")))))
     });
     registry.register(loc, "CANADA", "()Ljava/util/Locale;", |ctx, _args| {
-        let s1 = ctx.create_string("en"); let s2 = ctx.create_string("CA");
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        ctx.set_field(l, 0, Value::Object(Some(s1))); ctx.set_field(l, 1, Value::Object(Some(s2)));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "CA")))))
     });
     registry.register(loc, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        ctx.set_field(this, 1, args[2]);
-        ctx.set_field(this, 2, args[3]);
+        let read = |i: usize| -> String {
+            match args.get(i) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            }
+        };
+        let (lang, country, variant) = (read(1), read(2), read(3));
+        locale_data_set(this, &lang, &country, &variant);
         Ok(None)
     });
     registry.register(loc, "getVariant", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        let (_, _, variant) = locale_fields(ctx, this);
+        Ok(Some(Value::Object(Some(ctx.create_string(&variant)))))
     });
     registry.register(loc, "getDisplayLanguage", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0))) // return language code as display name
+        let (lang, _, _) = locale_fields(ctx, this);
+        Ok(Some(Value::Object(Some(ctx.create_string(&lang)))))
     });
     registry.register(loc, "getDisplayCountry", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let (_, country, _) = locale_fields(ctx, this);
+        Ok(Some(Value::Object(Some(ctx.create_string(&country)))))
     });
     registry.register(loc, "getAvailableLocales", "()[Ljava/util/Locale;", |ctx, _args| {
         let locales_data = [("en", "US"), ("en", "GB"), ("en", ""), ("fr", "FR"), ("de", "DE"),
             ("ja", "JP"), ("zh", "CN"), ("es", "ES"), ("it", "IT"), ("pt", "BR")];
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), locales_data.len());
         for (i, (lang, country)) in locales_data.iter().enumerate() {
-            let s1 = ctx.create_string(lang);
-            let s2 = ctx.create_string(country);
-            let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-            ctx.set_field(l, 0, Value::Object(Some(s1)));
-            ctx.set_field(l, 1, Value::Object(Some(s2)));
+            let l = locale_alloc(ctx, lang, country);
             ctx.set_array_element(arr, i, Value::Object(Some(l)));
         }
         Ok(Some(Value::Object(Some(arr))))
@@ -28525,25 +28549,13 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(stored))));
         }
         // Fallback: en_US
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        let lang = ctx.create_string("en");
-        let country = ctx.create_string("US");
-        ctx.set_field(l, 0, Value::Object(Some(lang)));
-        ctx.set_field(l, 1, Value::Object(Some(country)));
-        ctx.set_field(l, 2, Value::Object(None));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "US")))))
     });
     registry.register(loc, "getDefault", "(Ljava/util/Locale$Category;)Ljava/util/Locale;", |ctx, _args| {
         if let Some(stored) = *locale_default().lock() {
             return Ok(Some(Value::Object(Some(stored))));
         }
-        let l = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        let lang = ctx.create_string("en");
-        let country = ctx.create_string("US");
-        ctx.set_field(l, 0, Value::Object(Some(lang)));
-        ctx.set_field(l, 1, Value::Object(Some(country)));
-        ctx.set_field(l, 2, Value::Object(None));
-        Ok(Some(Value::Object(Some(l))))
+        Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "US")))))
     });
     registry.register(
         loc,
@@ -28553,18 +28565,25 @@ fn register_locale_natives(registry: &mut NativeMethodRegistry) {
     );
 }
 
-const LOC_FIELD_LANG: usize = 0;
-const LOC_FIELD_COUNTRY: usize = 1;
-const LOC_FIELD_VARIANT: usize = 2;
+// NOTE: `java/util/Locale` is a real bootstrap class. Its instance slots
+// 0/1/… are `baseLocale` / `localeExtensions` (typed objects), NOT
+// String language/country/variant fields. The synthetic Locale's slots are
+// therefore left at their zero-initialised (null) defaults — that is the
+// spec-correct "no extensions" shape and prevents real-JDK Locale bytecode
+// (e.g. `getUnicodeLocaleType`) from dispatching `invokevirtual` onto a
+// String. All language/country/variant data lives in the `locale_data`
+// side table instead. See `locale_data()` for the full rationale.
 
 pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
     let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-    let l = ctx.create_string(lang);
-    let c = ctx.create_string(country);
-    ctx.set_field(loc, LOC_FIELD_LANG, Value::Object(Some(l)));
-    ctx.set_field(loc, LOC_FIELD_COUNTRY, Value::Object(Some(c)));
-    ctx.set_field(loc, LOC_FIELD_VARIANT, Value::Object(None));
+    locale_data_set(loc, lang, country, "");
     loc
+}
+
+/// Read a Locale arg's `(language, country, variant)` — side table first,
+/// with no instance-field fallback (the slots are not String-typed).
+fn locale_fields(_ctx: &dyn NativeContext, this: ObjectRef) -> (String, String, String) {
+    locale_data_get(this)
 }
 
 fn native_locale_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -28572,13 +28591,11 @@ fn native_locale_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(
-        this,
-        LOC_FIELD_LANG,
-        args.get(1).copied().unwrap_or(Value::Object(None)),
-    );
-    ctx.set_field(this, LOC_FIELD_COUNTRY, Value::Object(None));
-    ctx.set_field(this, LOC_FIELD_VARIANT, Value::Object(None));
+    let lang = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    locale_data_set(this, &lang, "", "");
     Ok(None)
 }
 
@@ -28587,17 +28604,15 @@ fn native_locale_init2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(
-        this,
-        LOC_FIELD_LANG,
-        args.get(1).copied().unwrap_or(Value::Object(None)),
-    );
-    ctx.set_field(
-        this,
-        LOC_FIELD_COUNTRY,
-        args.get(2).copied().unwrap_or(Value::Object(None)),
-    );
-    ctx.set_field(this, LOC_FIELD_VARIANT, Value::Object(None));
+    let lang = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let country = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    locale_data_set(this, &lang, &country, "");
     Ok(None)
 }
 
@@ -28611,7 +28626,8 @@ fn native_locale_get_lang(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, LOC_FIELD_LANG)))
+    let (lang, _, _) = locale_fields(ctx, this);
+    Ok(Some(Value::Object(Some(ctx.create_string(&lang)))))
 }
 
 fn native_locale_get_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -28619,7 +28635,8 @@ fn native_locale_get_country(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, LOC_FIELD_COUNTRY)))
+    let (_, country, _) = locale_fields(ctx, this);
+    Ok(Some(Value::Object(Some(ctx.create_string(&country)))))
 }
 
 fn native_locale_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -28627,14 +28644,7 @@ fn native_locale_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let lang = match ctx.get_field(this, LOC_FIELD_LANG) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let country = match ctx.get_field(this, LOC_FIELD_COUNTRY) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let (lang, country, _) = locale_fields(ctx, this);
     let s = if country.is_empty() {
         lang
     } else {
@@ -28649,14 +28659,7 @@ fn native_locale_to_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let lang = match ctx.get_field(this, LOC_FIELD_LANG) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let country = match ctx.get_field(this, LOC_FIELD_COUNTRY) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let (lang, country, _) = locale_fields(ctx, this);
     let s = if country.is_empty() {
         lang
     } else {
@@ -28675,24 +28678,10 @@ fn native_locale_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a_lang = match ctx.get_field(this, LOC_FIELD_LANG) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    };
-    let b_lang = match ctx.get_field(other, LOC_FIELD_LANG) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    };
-    let a_country = match ctx.get_field(this, LOC_FIELD_COUNTRY) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    };
-    let b_country = match ctx.get_field(other, LOC_FIELD_COUNTRY) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    };
+    let (a_lang, a_country, a_variant) = locale_fields(ctx, this);
+    let (b_lang, b_country, b_variant) = locale_fields(ctx, other);
     Ok(Some(Value::Int(
-        if a_lang == b_lang && a_country == b_country {
+        if a_lang == b_lang && a_country == b_country && a_variant == b_variant {
             1
         } else {
             0
@@ -28705,10 +28694,7 @@ fn native_locale_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let lang = match ctx.get_field(this, LOC_FIELD_LANG) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let (lang, _, _) = locale_fields(ctx, this);
     let mut h: i32 = 0;
     for b in lang.bytes() {
         h = h.wrapping_mul(31).wrapping_add(b as i32);

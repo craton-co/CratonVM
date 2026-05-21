@@ -228,6 +228,77 @@ fn stream_owner_get(stream: ObjectRef) -> Option<ObjectRef> {
     stream_owner_table().lock().get(&stream).copied()
 }
 
+// InetAddress side-table — same rationale as the Socket / ServerSocket
+// tables above. `java.net.InetAddress` is a real bootstrap class whose only
+// instance fields are `holder` (a `java.net.InetAddress$InetAddressHolder`)
+// and `holder6`/cached-lookup state — NOT plain `hostName` / `address`
+// String fields. Writing the host/IP Strings straight into instance slots
+// 0/1 puts a `String` in the `holder` slot; when a real-JDK `InetAddress`
+// (or `Inet4Address`) method that we do not natively override runs, its
+// bytecode does `getfield holder; invokevirtual InetAddressHolder.getXxx()`
+// and the sub-`invokevirtual` retargets onto `java/lang/String`, raising a
+// bogus `NoSuchMethodError java/lang/String.getHostName()`.
+//
+// Keeping host/IP in this ObjectRef-keyed table leaves the real-JDK
+// instance slots at their zero-initialised (null) defaults, so any
+// real-JDK InetAddress bytecode that does run sees the spec-correct
+// "uninitialised holder" shape instead of a poisoned String.
+fn inet_addr_side_table() -> &'static Mutex<HashMap<ObjectRef, (String, String)>> {
+    static T: OnceLock<Mutex<HashMap<ObjectRef, (String, String)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record an InetAddress's `(hostName, ipAddress)` in the side table.
+fn inet_addr_set(this: ObjectRef, host: &str, ip: &str) {
+    inet_addr_side_table()
+        .lock()
+        .insert(this, (host.to_string(), ip.to_string()));
+}
+
+/// `pub(crate)` re-export of [`inet_addr_set`] for sibling modules that
+/// allocate InetAddress mirrors (e.g. `inet_address.rs`'s real DNS resolver).
+pub(crate) fn inet_addr_set_external(this: ObjectRef, host: &str, ip: &str) {
+    inet_addr_set(this, host, ip);
+}
+
+/// Read an InetAddress's `(hostName, ipAddress)` from the side table.
+/// Returns `None` for an InetAddress we never recorded.
+///
+/// `pub(crate)` so the duplicate InetAddress natives registered in
+/// `phases_early.rs` can consult the same table — otherwise they would read
+/// the (now intentionally unpopulated) instance slots and return null.
+pub(crate) fn inet_addr_get(this: ObjectRef) -> Option<(String, String)> {
+    inet_addr_side_table().lock().get(&this).cloned()
+}
+
+/// Read one logical InetAddress field (`IA_HOST` or `IA_ADDR`) — side table
+/// first, falling back to the legacy synthetic instance slot for any
+/// InetAddress object not built by `alloc_inet_address` (e.g. one allocated
+/// by a different synthetic path or by real-JDK `<init>`).
+fn inet_addr_field(ctx: &mut dyn NativeContext, this: ObjectRef, which: usize) -> Value {
+    if let Some((host, ip)) = inet_addr_get(this) {
+        let s = if which == IA_HOST { host } else { ip };
+        return Value::Object(Some(ctx.create_string(&s)));
+    }
+    ctx.get_field(this, which)
+}
+
+/// String form of one logical InetAddress field, with a default for the
+/// missing/empty case. Mirrors `read_field_string_or` but consults the
+/// side table first.
+fn inet_addr_field_string_or(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    which: usize,
+    default: &str,
+) -> String {
+    if let Some((host, ip)) = inet_addr_get(this) {
+        let s = if which == IA_HOST { host } else { ip };
+        return if s.is_empty() { default.to_string() } else { s };
+    }
+    read_field_string_or(ctx, this, which, default)
+}
+
 const SEL_OPEN: usize = 0;
 
 const HS_ADDRESS: usize = 0;
@@ -333,13 +404,28 @@ fn read_inet_socket_address(
                 }
                 if resolved.is_none() {
                     if let Value::Object(Some(addr_obj)) = ctx.get_field(holder, 1) {
-                        // synthetic InetAddress: slot 0 = hostName String, slot 1 = ip String
-                        for slot in [IA_HOST, IA_ADDR] {
-                            if let Value::Object(Some(s)) = ctx.get_field(addr_obj, slot) {
-                                if let Some(t) = ctx.read_string(s) {
-                                    if !t.is_empty() {
-                                        resolved = Some(t);
-                                        break;
+                        // CratonVM-synthesised InetAddress: host/IP live in the
+                        // ObjectRef-keyed side table (instance slots are the
+                        // real-JDK `holder` reference fields — see
+                        // `inet_addr_side_table`).
+                        if let Some((host, ip)) = inet_addr_get(addr_obj) {
+                            if !host.is_empty() {
+                                resolved = Some(host);
+                            } else if !ip.is_empty() {
+                                resolved = Some(ip);
+                            }
+                        }
+                        // Legacy synthetic InetAddress: slot 0 = hostName
+                        // String, slot 1 = ip String (kept for objects not
+                        // built by `alloc_inet_address`).
+                        if resolved.is_none() {
+                            for slot in [IA_HOST, IA_ADDR] {
+                                if let Value::Object(Some(s)) = ctx.get_field(addr_obj, slot) {
+                                    if let Some(t) = ctx.read_string(s) {
+                                        if !t.is_empty() {
+                                            resolved = Some(t);
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -440,10 +526,12 @@ fn new_java_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> ObjectRef {
 
 fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> ObjectRef {
     let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-    let h = ctx.create_string(host);
-    let a = ctx.create_string(ip);
-    ctx.set_field(ia, IA_HOST, Value::Object(Some(h)));
-    ctx.set_field(ia, IA_ADDR, Value::Object(Some(a)));
+    // Record host/IP in the ObjectRef-keyed side table. Do NOT write Strings
+    // into instance slots 0/1: those are the real-JDK `holder` reference
+    // fields, and a String there poisons real-JDK InetAddress bytecode
+    // dispatch (bogus `NoSuchMethodError java/lang/String.getHostName()`).
+    // See `inet_addr_side_table()` for the full rationale.
+    inet_addr_set(ia, host, ip);
     ia
 }
 
@@ -1224,7 +1312,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let addr = obj_arg(args, 1)?;
-            let host = read_field_string_or(ctx, addr, IA_ADDR, "127.0.0.1");
+            let host = inet_addr_field_string_or(ctx, addr, IA_ADDR, "127.0.0.1");
             let port = args
                 .get(2)
                 .and_then(|v| v.as_int())
@@ -1602,7 +1690,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
-            Some(Value::Object(Some(ia))) => read_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
+            Some(Value::Object(Some(ia))) => inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
             _ => "0.0.0.0".to_string(),
         };
         eprintln!("[w3a2] ServerSocket <init>(IILjava/net/InetAddress;)V port={port} backlog={backlog} host={host}");
@@ -1819,19 +1907,19 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
 
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, IA_ADDR)))
+        Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
     });
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, IA_HOST)))
+        Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
     });
     r.register(ia, "getCanonicalHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, IA_HOST)))
+        Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
     });
     r.register(ia, "getAddress", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ip_str = read_field_string_or(ctx, this, IA_ADDR, "0.0.0.0");
+        let ip_str = inet_addr_field_string_or(ctx, this, IA_ADDR, "0.0.0.0");
         let bytes: Vec<u8> = if let Ok(v4) = ip_str.parse::<Ipv4Addr>() {
             v4.octets().to_vec()
         } else if let Ok(v6) = ip_str.parse::<Ipv6Addr>() {
@@ -1845,7 +1933,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
 
     r.register(ia, "isLoopbackAddress", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ip_str = read_field_string_or(ctx, this, IA_ADDR, "");
+        let ip_str = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
         let is_lb = ip_str
             .parse::<IpAddr>()
             .map(|ip| ip.is_loopback())
@@ -1854,7 +1942,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
     });
     r.register(ia, "isAnyLocalAddress", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ip_str = read_field_string_or(ctx, this, IA_ADDR, "");
+        let ip_str = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
         let any = ip_str
             .parse::<IpAddr>()
             .map(|ip| match ip {
@@ -1866,7 +1954,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
     });
     r.register(ia, "isMulticastAddress", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ip_str = read_field_string_or(ctx, this, IA_ADDR, "");
+        let ip_str = inet_addr_field_string_or(ctx, this, IA_ADDR, "");
         let m = ip_str
             .parse::<IpAddr>()
             .map(|ip| ip.is_multicast())
@@ -1900,11 +1988,11 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
     for cls in ["java/net/Inet4Address", "java/net/Inet6Address"] {
         r.register(cls, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, IA_ADDR)))
+            Ok(Some(inet_addr_field(ctx, this, IA_ADDR)))
         });
         r.register(cls, "getHostName", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, IA_HOST)))
+            Ok(Some(inet_addr_field(ctx, this, IA_HOST)))
         });
     }
 }
@@ -4053,7 +4141,7 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let host = match args.get(2) {
-            Some(Value::Object(Some(ia))) => read_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
+            Some(Value::Object(Some(ia))) => inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
             _ => "0.0.0.0".to_string(),
         };
         let fd = ctx
@@ -4087,7 +4175,7 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let len = ctx.get_field(pkt, DP_LENGTH).as_int().unwrap_or(0);
         let port = ctx.get_field(pkt, DP_PORT).as_int().unwrap_or(0);
         let host = match ctx.get_field(pkt, DP_ADDR) {
-            Value::Object(Some(ia)) => read_field_string_or(ctx, ia, IA_ADDR, ""),
+            Value::Object(Some(ia)) => inet_addr_field_string_or(ctx, ia, IA_ADDR, ""),
             _ => String::new(),
         };
         if host.is_empty() || !(1..=65535).contains(&port) {

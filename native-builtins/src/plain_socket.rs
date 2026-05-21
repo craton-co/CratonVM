@@ -204,18 +204,28 @@ fn write_fd(ctx: &dyn NativeContext, this: ObjectRef, id: i32) {
 }
 
 // ---------------------------------------------------------------------------
-// InetAddress helpers — read the IP-string field (slot 1) shared with
-// `net_phase_e::IA_ADDR`. We can't call into net_phase_e directly without
-// touching it, but the synthetic layout is part of the contract: 0=host,
-// 1=ipString.
+// InetAddress helpers — read the IP-string for an InetAddress.
+//
+// `java.net.InetAddress` is a real bootstrap class whose instance slots are
+// the `holder` reference fields, NOT a `hostName`/`address` String pair.
+// CratonVM-synthesised InetAddress objects keep host/IP in the
+// `net_phase_e` ObjectRef-keyed side table; consult it first, falling back
+// to the legacy synthetic slot 1 only for objects not built by
+// `alloc_inet_address`.
 // ---------------------------------------------------------------------------
 
 fn read_inet_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<std::net::IpAddr> {
-    let v = ctx.get_field(addr, 1);
-    let s = match v {
-        Value::Object(Some(s)) => ctx.read_string(s)?,
-        _ => return None,
+    let s = if let Some((_, ip)) = crate::net_phase_e::inet_addr_get(addr) {
+        ip
+    } else {
+        match ctx.get_field(addr, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s)?,
+            _ => return None,
+        }
     };
+    if s.is_empty() {
+        return None;
+    }
     if let Ok(v4) = s.parse::<Ipv4Addr>() {
         return Some(std::net::IpAddr::V4(v4));
     }

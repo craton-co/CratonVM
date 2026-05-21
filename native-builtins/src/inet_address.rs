@@ -41,10 +41,6 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
-// Shared with `net_phase_e.rs::IA_HOST` / `IA_ADDR` — same synthetic layout.
-const IA_HOST: usize = 0;
-const IA_ADDR: usize = 1;
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -112,17 +108,20 @@ fn alloc_inet_address_mirror(
     host: &str,
     ip: &IpAddr,
 ) -> ObjectRef {
-    // Match net_phase_e's synthetic layout exactly: 2 fields, host then addr.
-    // alloc_concurrent_synthetic loads + initializes the class.
+    // `java.net.Inet4Address` / `Inet6Address` are real bootstrap classes:
+    // their instance slots 0/1 are the inherited `holder` reference fields,
+    // NOT `hostName` / `address` Strings. Record host/IP in the shared
+    // `net_phase_e` ObjectRef-keyed side table and leave the instance slots
+    // at their zero-initialised (null) defaults — writing a String into the
+    // `holder` slot is what caused bogus
+    // `NoSuchMethodError java/lang/String.getHostName()` when real-JDK
+    // InetAddress bytecode ran against these mirrors.
     let class_name = match ip {
         IpAddr::V4(_) => "java/net/Inet4Address",
         IpAddr::V6(_) => "java/net/Inet6Address",
     };
     let mirror = alloc_concurrent_synthetic(ctx, class_name, 2);
-    let h = ctx.create_string(host);
-    let a = ctx.create_string(&ip.to_string());
-    ctx.set_field(mirror, IA_HOST, Value::Object(Some(h)));
-    ctx.set_field(mirror, IA_ADDR, Value::Object(Some(a)));
+    crate::net_phase_e::inet_addr_set_external(mirror, host, &ip.to_string());
     mirror
 }
 

@@ -1167,13 +1167,13 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
         let language = parts.first().copied().unwrap_or("en");
         let country = parts.get(1).copied().unwrap_or("");
 
-        let locale = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-        let lang_s = ctx.create_string(language);
-        let country_s = ctx.create_string(country);
-        let variant_s = ctx.create_string("");
-        ctx.set_field(locale, 0, Value::Object(Some(lang_s)));
-        ctx.set_field(locale, 1, Value::Object(Some(country_s)));
-        ctx.set_field(locale, 2, Value::Object(Some(variant_s)));
+        // Use the shared `locale_alloc` helper: it records the
+        // language/country in the ObjectRef-keyed side table and leaves the
+        // real-JDK `Locale` instance slots (baseLocale / localeExtensions)
+        // untouched. Writing Strings into those typed-object slots used to
+        // poison real-JDK Locale bytecode dispatch (bogus
+        // `NoSuchMethodError java/lang/String.getUnicodeLocaleType`).
+        let locale = crate::locale_alloc(ctx, language, country);
         Ok(Some(Value::Object(Some(locale))))
     });
 
