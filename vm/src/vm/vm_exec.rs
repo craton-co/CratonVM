@@ -8109,44 +8109,16 @@ fn invoke_on_class_shared_inner(
                         // does the same plus prints diagnostics.
                         || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
                             && method_name == "<init>")
-                        // Jetty 11 launcher (`jetty_extras.rs`): the real
-                        // `Main.processCommandLine` walks Props/BaseHome plumbing
-                        // that on CratonVM's partial bootstrap returns null, so
-                        // the JDK bytecode would surface as a downstream
-                        // `Cannot invoke isHelp/getClasspath on null` in
-                        // `Main.start(StartArgs)`. Force our synthetic
-                        // non-null StartArgs to win — `check_override` is
-                        // normally false because the method is not abstract
-                        // and not ACC_NATIVE in the .class file.
-                        || (class_name == "org/eclipse/jetty/start/Main"
-                            && method_name == "processCommandLine")
-                        // Companion to the `processCommandLine` override:
-                        // the launcher's `start(StartArgs)` invokes a fixed
-                        // set of boolean predicates and reference getters on
-                        // the synthetic StartArgs. Force our null/false-returning
-                        // natives to win so the synthetic object doesn't
-                        // exercise the real JDK bytecode (which would read
-                        // uninitialised fields and either NPE or return
-                        // garbage).
-                        || (class_name == "org/eclipse/jetty/start/StartArgs"
-                            && matches!(
-                                method_name,
-                                "isHelp"
-                                | "isListClasspath"
-                                | "isListConfig"
-                                | "isDryRun"
-                                | "isStopCommand"
-                                | "isTestingModeEnabled"
-                                | "isRun"
-                                | "isExec"
-                                | "isCreateFiles"
-                                | "hasJvmArgs"
-                                | "hasSystemProperties"
-                                | "getListModules"
-                                | "getShowModules"
-                                | "getModuleGraphFilename"
-                                | "getClasspath"
-                            ))
+                        // NOTE: the Jetty 11 launcher force-override entries
+                        // (`org/eclipse/jetty/start/Main.processCommandLine`
+                        // and the `StartArgs` predicate/getter list) were
+                        // removed. They pointed at `jetty_extras.rs` synthetic
+                        // stubs that are now DISABLED per the "no synthetic
+                        // stubs" policy (`register_jetty_stubs` is a no-op), so
+                        // the `check_override && native_methods.find(..)` guard
+                        // at the bottom of this expression never promoted them
+                        // anyway — they were dead weight. Jetty's launcher now
+                        // runs as pure real bytecode with no special-casing.
                         // SigProbe / WP6.4 / WP6.6: real-JDK
                         // `java.security.KeyPairGenerator.getInstance(String)`
                         // is a concrete static that routes through

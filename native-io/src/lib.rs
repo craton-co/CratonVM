@@ -652,16 +652,40 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
+    let dbg_jetty = std::env::var("CRATONVM_DBG_JETTY").is_ok();
     let path = validated_path(&path)?;
     let entries: Vec<String> = match fs::read_dir(&path) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect(),
-        Err(_) => return Ok(Some(Value::Object(None))),
+        Err(_) => {
+            if dbg_jetty {
+                eprintln!("[cratonvm-jetty] File.list({path}) -> null (read_dir failed)");
+            }
+            return Ok(Some(Value::Object(None)));
+        }
     };
-    // Create a String[] array
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), entries.len());
+    if dbg_jetty {
+        eprintln!(
+            "[cratonvm-jetty] File.list({}) -> {} entries: {:?}",
+            path,
+            entries.len(),
+            entries
+        );
+    }
+    // Create a String[] array. The component class MUST be `java/lang/String`
+    // — `java.io.File.list()` is declared to return `String[]`, and callers
+    // (e.g. Jetty's module discovery) may `checkcast [Ljava/lang/String;` or
+    // store the result into a `String[]`-typed field. A `ClassId(0)` (Object)
+    // component would make that fail. Fall back to `ClassId(0)` only if the
+    // String class is somehow not loadable.
+    let string_cid = ctx
+        .ensure_class_initialized("java/lang/String")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/lang/String"))
+        .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
+    let arr = ctx.new_ref_array(string_cid, entries.len());
     for (i, name) in entries.iter().enumerate() {
         let s = ctx.create_string(name);
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
@@ -10717,17 +10741,32 @@ fn collect_dir_entries_inner(
     recursive: bool,
     results: &mut Vec<Value>,
 ) {
+    let dbg_jetty = std::env::var("CRATONVM_DBG_JETTY").is_ok();
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return,
+        Err(e) => {
+            if dbg_jetty {
+                eprintln!(
+                    "[cratonvm-jetty] Files.list/walk read_dir({dir}) failed: {e}"
+                );
+            }
+            return;
+        }
     };
+    let mut count = 0usize;
     for entry in entries.flatten() {
         let path_str = entry.path().to_string_lossy().to_string();
         let path_obj = alloc_path(ctx, &path_str);
         results.push(Value::Object(Some(path_obj)));
+        count += 1;
         if recursive && entry.path().is_dir() {
             collect_dir_entries_inner(ctx, &path_str, true, results);
         }
+    }
+    if dbg_jetty {
+        eprintln!(
+            "[cratonvm-jetty] Files.list/walk({dir}) -> {count} entries (recursive={recursive})"
+        );
     }
 }
 

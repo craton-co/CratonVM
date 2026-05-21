@@ -26729,6 +26729,17 @@ fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Parse the address string stored on field 1 into an `IpAddr`. Returns
 /// `None` if the field is absent or not parseable.
 fn inet_addr_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<std::net::IpAddr> {
+    // Layout-aware: a CratonVM-synthesised `InetAddress` keeps its IP in the
+    // `net_phase_e` ObjectRef-keyed side table / real `InetAddressHolder`,
+    // NOT in instance slot 1 (which is the typed `holder` reference field).
+    // Reading the raw slot would parse a `holder` object reference as a
+    // String and return `None`. Consult the shared resolver first; only
+    // fall back to the legacy slot for objects built by a different path.
+    if let Some((_, ip)) = crate::net_phase_e::inet_addr_resolve(ctx, this) {
+        if let Ok(parsed) = ip.parse::<std::net::IpAddr>() {
+            return Some(parsed);
+        }
+    }
     let s = match ctx.get_field(this, 1) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return None,

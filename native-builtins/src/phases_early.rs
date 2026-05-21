@@ -10786,9 +10786,14 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(h)) = ctx.get_field(this, SOCK_HOST) {
             let host_str = ctx.read_string(h).unwrap_or_default();
-            let addr = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-            let hn = ctx.create_string(&host_str);
-            ctx.set_field(addr, 0, Value::Object(Some(hn)));
+            // Route through the shared allocator: it records host/IP in the
+            // `net_phase_e` side table AND populates a real-JDK
+            // `InetAddress$InetAddressHolder`. Writing a bare `String` into
+            // instance slot 0 (the typed `holder` reference field) is what
+            // poisoned real-JDK InetAddress bytecode dispatch.
+            let addr = crate::net_phase_e::alloc_inet_address_external(
+                ctx, &host_str, &host_str,
+            );
             Ok(Some(Value::Object(Some(addr))))
         } else {
             Ok(Some(Value::Object(None)))
@@ -13459,7 +13464,8 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     let ia = "java/net/InetAddress";
     r.register(ia, "getHostName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let host = match crate::net_phase_e::inet_addr_get(this) {
+        // Layout-aware: side table → real-JDK `holder` → legacy slot 0.
+        let host = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
             Some((h, _)) => h,
             None => match ctx.get_field(this, 0) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -13470,7 +13476,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(ia, "getHostAddress", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Some((_, ip)) = crate::net_phase_e::inet_addr_get(this) {
+        if let Some((_, ip)) = crate::net_phase_e::inet_addr_resolve(ctx, this) {
             let ip = if ip.is_empty() { "127.0.0.1".to_string() } else { ip };
             return Ok(Some(Value::Object(Some(ctx.create_string(&ip)))));
         }
@@ -13488,14 +13494,18 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     // with real DNS resolution; do NOT re-register here as it would shadow them.
     r.register(ia, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let host = match crate::net_phase_e::inet_addr_get(this) {
-            Some((h, _)) => h,
-            None => match ctx.get_field(this, 0) {
-                Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
-                _ => String::new(),
-            },
+        // Real-JDK `InetAddress.toString()` => `hostName + "/" + ipString`.
+        let (host, ip) = match crate::net_phase_e::inet_addr_resolve(ctx, this) {
+            Some(pair) => pair,
+            None => {
+                let h = match ctx.get_field(this, 0) {
+                    Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                (h, String::new())
+            }
         };
-        let s = ctx.create_string(&format!("/{host}"));
+        let s = ctx.create_string(&format!("{host}/{ip}"));
         Ok(Some(Value::Object(Some(s))))
     });
 }
