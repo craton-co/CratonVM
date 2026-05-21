@@ -327,11 +327,13 @@ pub(crate) fn property_key_from_java_string(ctx: &mut dyn NativeContext, key_obj
         let num_units = len / 2;
         let mut utf16 = Vec::with_capacity(num_units);
         for i in 0..num_units {
-            let hi = match ctx.get_array_element(arr, i * 2) {
+            // Little-endian: low byte at even index, high byte at odd index
+            // (matches StringUTF16.isBigEndian()==false on x86/ARM).
+            let lo = match ctx.get_array_element(arr, i * 2) {
                 Value::Int(v) => (v & 0xFF) as u16,
                 _ => 0,
             };
-            let lo = match ctx.get_array_element(arr, i * 2 + 1) {
+            let hi = match ctx.get_array_element(arr, i * 2 + 1) {
                 Value::Int(v) => (v & 0xFF) as u16,
                 _ => 0,
             };

@@ -108,22 +108,30 @@ pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
             // write_barrier fires automatically inside set_field
             shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
         } else {
-            // UTF16: two bytes per char in native byte order (JDK uses big-endian)
+            // UTF16: two bytes per char. HotSpot's `StringUTF16` stores each
+            // char in the host's native byte order — `StringUTF16.isBigEndian()`
+            // is an intrinsic bound to the platform endianness. Every tier-1
+            // target CratonVM runs on (x86_64, aarch64) is LITTLE-endian, so
+            // the low byte is stored first. This MUST agree with both
+            // `StringUTF16.isBigEndian()` (native_string_utf16_is_big_endian
+            // in lang_string.rs) and the native String readers; a mismatch
+            // byte-swaps every non-LATIN-1 char and corrupts e.g.
+            // `CharacterData00`'s packed lookup tables.
             let utf16: Vec<u16> = text.encode_utf16().collect();
             let byte_len = utf16.len() * 2;
             let byte_array = shared
                 .heap
                 .alloc_array(ClassId::new(0), ArrayElementType::Byte, byte_len);
             for (i, &unit) in utf16.iter().enumerate() {
-                // Store as two bytes, big-endian, matching HotSpot's UTF16 coder
-                let hi = (unit >> 8) as u8;
+                // Little-endian: low byte at even index, high byte at odd index.
                 let lo = (unit & 0xFF) as u8;
+                let hi = (unit >> 8) as u8;
                 let _ = shared
                     .heap
-                    .set_array_element(byte_array, i * 2, Value::Int(hi as i32));
+                    .set_array_element(byte_array, i * 2, Value::Int(lo as i32));
                 let _ = shared
                     .heap
-                    .set_array_element(byte_array, i * 2 + 1, Value::Int(lo as i32));
+                    .set_array_element(byte_array, i * 2 + 1, Value::Int(hi as i32));
             }
             shared.heap.set_field(str_obj, 0, Value::Object(Some(byte_array)));
             // write_barrier fires automatically inside set_field
@@ -184,11 +192,13 @@ pub fn decode_java_string_value_array(
                 let num_units = len / 2;
                 let mut utf16 = Vec::with_capacity(num_units);
                 for i in 0..num_units {
-                    let hi = match heap.get_array_element(value_array, i * 2) {
+                    // Little-endian: low byte at even index (matches
+                    // StringUTF16.isBigEndian()==false and create_java_string).
+                    let lo = match heap.get_array_element(value_array, i * 2) {
                         Ok(Value::Int(v)) => (v & 0xFF) as u16,
                         _ => 0,
                     };
-                    let lo = match heap.get_array_element(value_array, i * 2 + 1) {
+                    let hi = match heap.get_array_element(value_array, i * 2 + 1) {
                         Ok(Value::Int(v)) => (v & 0xFF) as u16,
                         _ => 0,
                     };

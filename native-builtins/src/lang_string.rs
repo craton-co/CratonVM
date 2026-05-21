@@ -32,50 +32,93 @@ thread_local! {
         std::cell::RefCell::new(Vec::with_capacity(64));
 }
 
-/// Fill the given `Vec<u16>` with the characters of the String object's
-/// underlying char[] (or its compact-string byte[] when applicable).
-/// The vector is cleared first; capacity is pre-reserved to `len`.
-fn fill_string_chars(
+/// Decode a String object's backing `value` array into a `Vec<u16>` of
+/// UTF-16 code units, handling all three storage layouts:
+///   * legacy `char[]` value (one u16 per element);
+///   * JDK 9+ compact `byte[]` value, LATIN-1 coder (one byte per char,
+///     zero-extended);
+///   * JDK 9+ compact `byte[]` value, UTF-16 coder (two big-endian bytes
+///     per char).
+///
+/// This is the single source of truth for "String object -> Vec<u16>".
+/// The crucial detail is that for a UTF-16-coded compact string the
+/// `value` byte[] has length `2 * char_count`: callers MUST NOT treat the
+/// raw array length as the character count, and MUST NOT read individual
+/// bytes as characters. Getting this wrong silently corrupts every
+/// non-LATIN-1 string (e.g. `CharacterData00`'s packed lookup-table data,
+/// which is loaded via `String.toCharArray()` in its `<clinit>`).
+fn decode_string_chars(
     ctx: &dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
     dst: &mut Vec<u16>,
 ) {
     dst.clear();
-    let (arr, len) = match string_char_array(ctx, obj) {
+    let (arr, raw_len) = match string_char_array(ctx, obj) {
         Some(v) => v,
         None => return,
     };
-    if dst.capacity() < len {
-        dst.reserve(len - dst.capacity());
-    }
-    // Fast path: when the backing array is a primitive `char[]`, ask the
-    // VM for a bulk copy via `read_char_array_into`. This collapses N
-    // virtual-dispatched `get_array_element` calls into a single
-    // `copy_nonoverlapping` from the compact char-array payload, which
-    // dominates `String.equals` / `indexOf(String)` / `startsWith` /
-    // `contains` performance on long strings. Per-element fallback handles
-    // compact-string byte[] backings (LATIN-1 or UTF-16 BE) where the
-    // bulk intrinsic does not apply.
     let elem_type = ctx.heap_element_type_of(arr);
-    if matches!(elem_type, cratonvm_types::ArrayElementType::Char) {
-        // Safety: we reserved capacity above; set the length and have the
-        // VM fill the buffer in one shot.
-        dst.resize(len, 0);
+    let is_byte_array = matches!(
+        elem_type,
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
+    );
+
+    if !is_byte_array {
+        // Legacy `char[]` value: one u16 per element. Bulk-copy fast path.
+        dst.resize(raw_len, 0);
         let written = ctx.read_char_array_into(arr, 0, &mut dst[..]);
         // Defensive: trim to what the VM actually wrote (the default
         // impl can short-circuit on a non-Int slot).
         dst.truncate(written);
         return;
     }
-    // Tight loop with hoisted bounds; falls back to per-element reads for
-    // compact-string byte[] backings.
-    for i in 0..len {
-        let ch = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v as u16,
-            _ => 0,
-        };
-        dst.push(ch);
+
+    // Compact `byte[]` value. `coder` lives in field index 1: 1 = UTF-16,
+    // 0 = LATIN-1.
+    let is_utf16 = matches!(ctx.get_field(obj, 1), Value::Int(1));
+    if is_utf16 {
+        // Two bytes per char, little-endian (low byte first) — matches
+        // StringUTF16.isBigEndian()==false on x86/ARM and the byte order
+        // written by create_java_string. `raw_len` is 2 * char_count.
+        let char_count = raw_len / 2;
+        if dst.capacity() < char_count {
+            dst.reserve(char_count - dst.capacity());
+        }
+        for c in 0..char_count {
+            let lo = match ctx.get_array_element(arr, c * 2) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            let hi = match ctx.get_array_element(arr, c * 2 + 1) {
+                Value::Int(v) => (v as u8) as u16,
+                _ => 0,
+            };
+            dst.push((hi << 8) | lo);
+        }
+    } else {
+        // LATIN-1: one byte per char, zero-extended.
+        if dst.capacity() < raw_len {
+            dst.reserve(raw_len - dst.capacity());
+        }
+        for i in 0..raw_len {
+            let ch = match ctx.get_array_element(arr, i) {
+                Value::Int(v) => (v & 0xff) as u16,
+                _ => 0,
+            };
+            dst.push(ch);
+        }
     }
+}
+
+/// Fill the given `Vec<u16>` with the characters of the String object's
+/// underlying value (char[] or compact-string byte[]). The vector is
+/// cleared first.
+fn fill_string_chars(
+    ctx: &dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    dst: &mut Vec<u16>,
+) {
+    decode_string_chars(ctx, obj, dst);
 }
 
 /// Run `f` with the thread-local scratch buffer A populated from `obj`.
@@ -487,6 +530,28 @@ pub(crate) fn string_char_array(
     }
 }
 
+/// Number of UTF-16 code units (== `String.length()`) for a String object,
+/// accounting for the JDK 9+ compact layout: a UTF-16-coded `byte[]` value
+/// holds `2 * length` bytes, so the raw array length must be halved.
+pub(crate) fn string_char_count(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+) -> usize {
+    let (arr, raw_len) = match string_char_array(ctx, this) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let is_byte_array = matches!(
+        ctx.heap_element_type_of(arr),
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
+    );
+    if is_byte_array && matches!(ctx.get_field(this, 1), Value::Int(1)) {
+        raw_len / 2
+    } else {
+        raw_len
+    }
+}
+
 pub(crate) fn native_string_intern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -576,12 +641,13 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
                 buf.reserve(chars - cap);
             }
             // Phase 1: drain (virtual-dispatched but trivial body).
+            // Little-endian: low byte at even index, high byte at odd index.
             for c in 0..chars {
-                let hi = match ctx.get_array_element(arr, c * 2) {
+                let lo = match ctx.get_array_element(arr, c * 2) {
                     Value::Int(v) => (v as u8) as u16,
                     _ => 0,
                 };
-                let lo = match ctx.get_array_element(arr, c * 2 + 1) {
+                let hi = match ctx.get_array_element(arr, c * 2 + 1) {
                     Value::Int(v) => (v as u8) as u16,
                     _ => 0,
                 };
@@ -634,10 +700,10 @@ pub(crate) fn native_string_length(ctx: &mut dyn NativeContext, args: &[Value]) 
         _ => return Ok(Some(Value::Int(0))),
     };
 
-    let len = match string_char_array(ctx, this) {
-        Some((_, len)) => len as i32,
-        None => 0,
-    };
+    // `String.length()` is the code-unit count. For a UTF-16-coded compact
+    // string the backing byte[] is 2 bytes/char, so the raw array length
+    // must be halved.
+    let len = string_char_count(ctx, this) as i32;
     Ok(Some(Value::Int(len)))
 }
 
@@ -656,7 +722,7 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
         _ => 0,
     };
 
-    let (arr, len) = match string_char_array(ctx, this) {
+    let (arr, raw_len) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => {
             return Err(
@@ -664,12 +730,40 @@ pub(crate) fn native_string_char_at(ctx: &mut dyn NativeContext, args: &[Value])
             )
         }
     };
+    let is_byte_array = matches!(
+        ctx.heap_element_type_of(arr),
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
+    );
+    let is_utf16 = is_byte_array && matches!(ctx.get_field(this, 1), Value::Int(1));
+    // Code-unit count: UTF-16-coded compact strings store 2 bytes/char.
+    let char_count = if is_utf16 { raw_len / 2 } else { raw_len };
 
-    if index < 0 || index >= len as i32 {
+    if index < 0 || index >= char_count as i32 {
         return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
     }
 
-    let ch = ctx.get_array_element(arr, index as usize);
+    let i = index as usize;
+    let ch = if is_utf16 {
+        // Two bytes per char, little-endian (low byte first).
+        let lo = match ctx.get_array_element(arr, i * 2) {
+            Value::Int(v) => (v as u8) as i32,
+            _ => 0,
+        };
+        let hi = match ctx.get_array_element(arr, i * 2 + 1) {
+            Value::Int(v) => (v as u8) as i32,
+            _ => 0,
+        };
+        Value::Int((hi << 8) | lo)
+    } else if is_byte_array {
+        // LATIN-1: one byte per char, zero-extended.
+        match ctx.get_array_element(arr, i) {
+            Value::Int(v) => Value::Int(v & 0xff),
+            other => other,
+        }
+    } else {
+        // Legacy char[] value.
+        ctx.get_array_element(arr, i)
+    };
     Ok(Some(ch))
 }
 
@@ -874,13 +968,14 @@ pub(crate) fn native_string_substring(ctx: &mut dyn NativeContext, args: &[Value
     let mut sub_utf16: Vec<u16> = Vec::with_capacity(sub_len);
     if let Some(arr) = arr_opt {
         if is_byte_array && is_utf16 {
-            // Read just the bytes in [b*2 .. e*2)
+            // Read just the bytes in [b*2 .. e*2).
+            // Little-endian: low byte at even index, high byte at odd index.
             for c in b..e {
-                let hi = match ctx.get_array_element(arr, c * 2) {
+                let lo = match ctx.get_array_element(arr, c * 2) {
                     Value::Int(v) => (v as u8) as u16,
                     _ => 0,
                 };
-                let lo = match ctx.get_array_element(arr, c * 2 + 1) {
+                let hi = match ctx.get_array_element(arr, c * 2 + 1) {
                     Value::Int(v) => (v as u8) as u16,
                     _ => 0,
                 };
@@ -1896,21 +1991,12 @@ pub(crate) fn format_float(v: f32) -> String {
 /// endsWith, contains, replace) should prefer `with_string_chars_scratch`
 /// or `with_two_string_chars_scratches` to avoid this allocation entirely.
 pub(crate) fn read_string_chars(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Vec<u16> {
-    // Pre-size the result Vec, then fill via the same tight loop used by
-    // the scratch path. One allocation per call (down from the previous
-    // alloc + per-element trait-dispatched pushes).
-    let (arr, len) = match string_char_array(ctx, obj) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    let mut chars = Vec::with_capacity(len);
-    for i in 0..len {
-        let ch = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v as u16,
-            _ => 0,
-        };
-        chars.push(ch);
-    }
+    // Layout-aware decode: handles legacy char[] values as well as JDK 9+
+    // compact byte[] values in either LATIN-1 or UTF-16 coding. Reading the
+    // raw byte[] length as a char count (or each byte as a char) silently
+    // corrupts every non-LATIN-1 string.
+    let mut chars = Vec::new();
+    decode_string_chars(ctx, obj, &mut chars);
     chars
 }
 
@@ -2241,12 +2327,13 @@ pub(crate) fn native_string_substring_one(ctx: &mut dyn NativeContext, args: &[V
     let mut sub_utf16: Vec<u16> = Vec::with_capacity(sub_len);
     if let Some(arr) = arr_opt {
         if is_byte_array && is_utf16 {
+            // Little-endian: low byte at even index, high byte at odd index.
             for c in b..e {
-                let hi = match ctx.get_array_element(arr, c * 2) {
+                let lo = match ctx.get_array_element(arr, c * 2) {
                     Value::Int(v) => (v as u8) as u16,
                     _ => 0,
                 };
-                let lo = match ctx.get_array_element(arr, c * 2 + 1) {
+                let hi = match ctx.get_array_element(arr, c * 2 + 1) {
                     Value::Int(v) => (v as u8) as u16,
                     _ => 0,
                 };
@@ -3604,14 +3691,15 @@ fn native_string_index_of_static_helper(
     let src_bytes_len = ctx.array_length(src_arr);
     let mut src_units: Vec<u16> = Vec::with_capacity(src_count);
     if coder == 1 {
-        // UTF-16: big-endian u16 pairs, srcCount = number of code units.
+        // UTF-16: little-endian u16 pairs (low byte first), srcCount = number
+        // of code units.
         let pairs = src_count.min(src_bytes_len / 2);
         for i in 0..pairs {
-            let hi = match ctx.get_array_element(src_arr, i * 2) {
+            let lo = match ctx.get_array_element(src_arr, i * 2) {
                 Value::Int(v) => (v as u8) as u16,
                 _ => 0,
             };
-            let lo = match ctx.get_array_element(src_arr, i * 2 + 1) {
+            let hi = match ctx.get_array_element(src_arr, i * 2 + 1) {
                 Value::Int(v) => (v as u8) as u16,
                 _ => 0,
             };
