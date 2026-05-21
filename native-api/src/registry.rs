@@ -1846,15 +1846,18 @@ impl NativeMethodRegistry {
         self.by_method_desc.insert(md_key, callback);
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
-        // method names. The ring is disabled by default, so gate the
-        // `format!` (a String allocation) and the mutex-locking
-        // `register_name` call behind `is_enabled()` — otherwise boot
-        // does ~3,100 needless allocations + lock acquisitions for a
-        // name map nothing will ever read.
-        if crate::native_ring::is_enabled() {
-            let triple = format!("{class_name}.{method_name}{descriptor}");
-            crate::native_ring::register_name(callback as usize, &triple);
-        }
+        // method names.
+        //
+        // WF32-fix: this used to be gated behind `native_ring::is_enabled()`,
+        // but native registration happens during VM boot *before* the
+        // watchdog arms the ring — so by the time recording turns on, every
+        // name was already skipped and the watchdog dump showed only raw
+        // `<unknown cb@0x...>` pointers (useless for diagnosing a native
+        // livelock). The name map is a one-shot ~3,100-entry population at
+        // boot; the cost is a few ms of allocation, paid once, and it makes
+        // the hang dump actually actionable. Always populate it.
+        let triple = format!("{class_name}.{method_name}{descriptor}");
+        crate::native_ring::register_name(callback as usize, &triple);
     }
 
     /// Look up a native method implementation (zero allocation on the

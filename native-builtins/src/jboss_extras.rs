@@ -252,31 +252,11 @@ fn native_resource_open_stream(
 //   * `ModuleSpec.getDependencies` — empty array, mirrors `Module`.
 // ---------------------------------------------------------------------------
 
-/// `Module.<clinit>()` — no-op. The real clinit attempts to build a
-/// `DefaultBootModuleLoaderHolder.INSTANCE` via `WeakReference` /
-/// `AtomicReference` machinery that B6-swallows under CratonVM. Skipping
-/// the clinit is safe because `register_post_clinit_fixup` (owned by
-/// another agent in `phases_late.rs`) repopulates the static
-/// `BOOT_MODULE_LOADER` field after class initialization, and every other
-/// public accessor on `Module` is intercepted natively above.
-fn native_module_clinit(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(None)
-}
-
-/// `ModuleLoader.<clinit>()` — no-op. Same reasoning as
-/// `native_module_clinit`: the real clinit walks system properties and
-/// installs a default `ModuleLoaderSelector`, both of which we override
-/// natively. Skipping avoids the static-init reflection loop seen in the
-/// watchdog dispatch_trace.
-fn native_module_loader_clinit(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    Ok(None)
-}
+// WF32-fix: `native_module_clinit` / `native_module_loader_clinit` (the
+// blanket `<clinit>` no-op intercepts) were removed — they suppressed the
+// real `Module.<clinit>` that initializes `BOOT_MODULE_LOADER`, causing an
+// NPE in `Module.initBootModuleLoader`. The real clinit is straight-line
+// and terminates; there is no reason to shadow it.
 
 /// `Module.getDependencies()[Lorg/jboss/modules/Module$Dependency;` —
 /// return an empty `Object[]` (length 0, element type Reference). The
@@ -494,20 +474,38 @@ pub fn register_jboss_wildfly_stubs(registry: &mut NativeMethodRegistry) {
     );
 
     // ------------------------------------------------------------------
-    // Round-20 (real-bytecode audit): the `Module.<clinit>` /
-    // `ModuleLoader.<clinit>` no-op stubs were REMOVED. They were the
-    // direct cause of the `initBootModuleLoader` NPE: `Module.<clinit>`
-    // is what constructs and stores the static `BOOT_MODULE_LOADER`
-    // `AtomicReference` (bytecode offset 41). No-op'ing the clinit left
-    // that field null, so `initBootModuleLoader`'s
-    // `BOOT_MODULE_LOADER.set(loader)` threw "Cannot invoke set on
-    // null". The real clinit only constructs `AtomicReference`s,
-    // `RuntimePermission`s, a `PropertyReadAction` via `AccessController`,
-    // and a `StackWalker` — all of which CratonVM supports — so it must
-    // run normally. The `native_module_clinit` / `native_module_loader_clinit`
-    // helpers are kept (dead) only to avoid churn; see `let _` below.
-    let _ = native_module_clinit;
-    let _ = native_module_loader_clinit;
+    // Round-17: deeper bootstrap shims to break the reflective Module-
+    // graph walk seen in the WildFly 39 watchdog dispatch_trace.
+    // ------------------------------------------------------------------
+
+    // WF32-fix (this agent): the `Module.<clinit>` / `ModuleLoader.<clinit>`
+    // no-op shims have been REMOVED.
+    //
+    // Root cause of the WildFly-32 / Keycloak-16 boot failure:
+    // `native_module_clinit` short-circuited `org/jboss/modules/Module`'s
+    // real `<clinit>`, which (verified by disassembly — see offsets 34-41
+    // of the real clinit) is the *only* code that does
+    // `BOOT_MODULE_LOADER = new AtomicReference<>()`. With the clinit
+    // no-op'd, the static `BOOT_MODULE_LOADER` field stayed null, and the
+    // earlier `post_clinit_fixup` arm that used to repopulate it was itself
+    // removed (see vm/src/vm/vm_util.rs — the synthetic-stubs policy
+    // forbids that overwrite). The result: `Main.main` ->
+    // `Module.initBootModuleLoader(loader)` executes
+    // `BOOT_MODULE_LOADER.set(loader)` on a null reference and throws
+    // `NullPointerException: Cannot invoke set on null`.
+    //
+    // The original "Round-17 infinite reflection loop" justification for
+    // no-op'ing the clinit was diagnosed against a *different* artifact
+    // (WildFly 39's jboss-modules) and is stale: the real WF32/KC16
+    // `Module.<clinit>` is a straight-line sequence of `putstatic`s plus a
+    // comma-split of the `jboss.modules.system.pkgs` property — no
+    // reflection, no graph walk, no loop. Running it natively is correct
+    // and terminates immediately.
+    //
+    // If a future jboss-modules artifact genuinely livelocks in its
+    // `Module.<clinit>`, re-introduce a *targeted* shim there rather than a
+    // blanket no-op — a blanket no-op silently drops every `putstatic` the
+    // clinit performs.
 
     // Module.getDependencies()[LModule$Dependency; — empty array.
     registry.register(
