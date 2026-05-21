@@ -1110,6 +1110,7 @@ pub(crate) fn sb_append_str(ctx: &mut dyn NativeContext, this: cratonvm_types::O
 
 pub(crate) fn native_sb_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ArrayElementType;
+    eprintln!("[DBG] native_sb_init_default ENTERED");
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
@@ -1475,6 +1476,7 @@ pub(crate) fn native_sb_append_charsequence_off_len(
 }
 
 pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    eprintln!("[DBG] native_sb_to_string ENTERED");
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1495,7 +1497,12 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
         chars.push(ch);
     }
     let text = String::from_utf16_lossy(&chars);
-    let result = ctx.create_string(&text);
+    // `StringBuilder.toString()` must return a *fresh* String distinct from
+    // any equal literal — the JVM spec only pools literals and `intern()`.
+    // Routing it through the interned pool made `==` wrongly report identity
+    // (e.g. `sb.toString() == "xmlns"`), which silently broke xerces'
+    // `NamespaceSupport` symbol identity checks → empty namespace URIs.
+    let result = ctx.create_string_uninterned(&text);
     Ok(Some(Value::Object(Some(result))))
 }
 

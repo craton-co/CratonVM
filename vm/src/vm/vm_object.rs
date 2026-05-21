@@ -41,6 +41,9 @@ fn is_latin1(text: &str) -> bool {
 /// - Legacy (pre-JDK 9 / synthetic): `char[] value` (field 0) + `int hash`
 ///   (field 1).
 pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
+    if text == "zqwv9" {
+        eprintln!("[DBG] create_java_string POOLED for 'zqwv9'");
+    }
     // Fast path: check pool
     if let Some(&obj) = shared.string_pool.read().get(text) {
         return obj;
@@ -53,6 +56,31 @@ pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
         return obj;
     }
 
+    let str_obj = alloc_java_string_object(shared, text);
+    pool.insert(text.to_string(), str_obj);
+    str_obj
+}
+
+/// Create a Java String object from a Rust `&str` **without** consulting or
+/// populating the interned-string pool.
+///
+/// This is the correct constructor for *dynamically produced* strings —
+/// `StringBuilder.toString()`, `String.substring()`, `new String(...)`,
+/// `String.concat(...)`, etc. The JVM spec requires those to return a brand
+/// new, distinct object: only string literals (`ldc`) and explicit
+/// `String.intern()` participate in the constant pool. Routing dynamic
+/// producers through the pooled `create_java_string` made `==` wrongly
+/// report identity between, e.g., `sb.toString()` and a literal of equal
+/// content — which silently broke xerces' `NamespaceSupport` (it relies on
+/// `==` reference identity of symbols) and any other code using identity
+/// comparison of strings.
+pub fn create_java_string_uninterned(shared: &SharedVm, text: &str) -> ObjectRef {
+    alloc_java_string_object(shared, text)
+}
+
+/// Allocate and populate a fresh `java/lang/String` object for `text`.
+/// Performs no pool lookup or insertion — callers decide pooling policy.
+fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
     // Load java/lang/String class and resolve field count (cached after first call).
     // The field count is cached in an AtomicUsize to avoid lock contention:
     // once resolved, subsequent calls skip the class_manager lock entirely.
@@ -157,7 +185,6 @@ pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
         shared.heap.set_field(str_obj, 1, Value::Int(0));
     }
 
-    pool.insert(text.to_string(), str_obj);
     str_obj
 }
 

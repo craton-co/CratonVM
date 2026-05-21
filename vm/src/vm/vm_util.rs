@@ -86,6 +86,14 @@ pub fn ensure_class_initialized_shared(
     // the class manager + one `Arc<AtomicU8>::load(Acquire)`. The
     // load needs no lock because the embedded atomic lives inside the
     // `Class` we just borrowed.
+    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok() {
+        let nm = shared.class_manager.read().get_class(class_id).map(|c| c.name.to_string());
+        if nm.as_deref() == Some("org/jboss/modules/Module") {
+            let fast = is_class_initialized_via_manager(shared, class_id);
+            let st = shared.class_manager.read().get_class(class_id).map(|c| c.state);
+            eprintln!("MODSTATIC: ensure_init(Module) fast_initialized={fast} state={st:?}");
+        }
+    }
     if is_class_initialized_via_manager(shared, class_id) {
         return Ok(());
     }
@@ -512,6 +520,11 @@ fn initialize_class_shared(
         }
     };
 
+    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+        && &*class_name_for_jfr == "org/jboss/modules/Module"
+    {
+        eprintln!("MODSTATIC: Module init reached, has_clinit={has_clinit}");
+    }
     if has_clinit {
         tracing::debug!(class = %class_name_for_jfr, "running <clinit>");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -536,6 +549,25 @@ fn initialize_class_shared(
         match result {
             Ok(_) => {
                 finalize_init(shared, class_id, ClassState::Initialized);
+                if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+                    && &*class_name_for_jfr == "org/jboss/modules/Module"
+                {
+                    let cm = shared.class_manager.read();
+                    if let Some(class) = cm.get_class(class_id) {
+                        let mut sidx = 0usize;
+                        for f in &class.fields {
+                            if f.is_static() {
+                                let v = super::get_static_shared(shared, class_id, sidx);
+                                eprintln!(
+                                    "MODSTATIC[{sidx}] {} {} = {:?}",
+                                    f.name, f.descriptor, v
+                                );
+                                sidx += 1;
+                            }
+                        }
+                    }
+                    drop(cm);
+                }
                 // RBIGDEC.1 — even when `<clinit>` succeeds, java/math/BigInteger
                 // (and a few other classes whose static constants are read by
                 // synthetic-stub-style natives in `native-builtins/src/lib.rs`)
@@ -602,6 +634,11 @@ fn initialize_class_shared(
                 Ok(())
             }
             Err(e) => {
+                if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+                    && &*class_name_for_jfr == "org/jboss/modules/Module"
+                {
+                    eprintln!("MODSTATIC: Module <clinit> FAILED: {:?}", &e);
+                }
                 // If <clinit> failed with a stack underflow (broken invokedynamic
                 // in JDK internal classes), treat the class as initialized anyway.
                 // This happens for JDK classes like jdk.internal.util.Preconditions

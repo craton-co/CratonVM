@@ -436,7 +436,25 @@ pub trait NativeContext {
     fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType;
 
     /// Create a Java String object from a Rust &str. Returns the ObjectRef.
+    ///
+    /// Consults and populates the VM's interned-string pool: equal text yields
+    /// the *same* ObjectRef. Use this only for content that should behave like
+    /// a string literal (constants, symbols). For dynamically produced strings
+    /// — `StringBuilder.toString()`, `substring`, `new String(...)` — use
+    /// [`create_string_uninterned`](Self::create_string_uninterned) instead, so
+    /// that `==` correctly reports them as distinct objects.
     fn create_string(&mut self, text: &str) -> ObjectRef;
+
+    /// Create a Java String object from a Rust &str **without** interning.
+    ///
+    /// Always allocates a fresh, distinct String object. This is the correct
+    /// constructor for dynamically produced strings, matching the JVM spec
+    /// requirement that only literals and `String.intern()` participate in the
+    /// constant pool. The default implementation falls back to
+    /// [`create_string`](Self::create_string) for mock/test contexts.
+    fn create_string_uninterned(&mut self, text: &str) -> ObjectRef {
+        self.create_string(text)
+    }
 
     /// Read a Java String object back to a Rust String.
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
