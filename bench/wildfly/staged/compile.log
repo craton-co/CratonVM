@@ -5,4 +5,4 @@ stage-ejbca-min: compiling 2 sources with cp=C:\craton\ejbca-test-run\junit.jar;
 
 
 stage-ejbca-min: main class = DirectRunner
-stage-ejbca-min: staged classes at C:\craton\rust-jvm\bench\wildfly\staged\classes
+stage-ejbca-min: staged classes at C:\craton\cratonvm\bench\wildfly\staged\classes

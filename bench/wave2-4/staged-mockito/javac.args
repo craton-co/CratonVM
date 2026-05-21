@@ -1,8 +1,8 @@
 --release
 21
 -d
-"C:/craton/rust-jvm/bench/wave2-4/staged-mockito/classes"
+"C:/craton/cratonvm/bench/wave2-4/staged-mockito/classes"
 -cp
-"C:/craton/rust-jvm/bench/wave2-4/staged-mockito/mockito-core.jar;C:/craton/rust-jvm/bench/wave2-4/staged-mockito/byte-buddy.jar;C:/craton/rust-jvm/bench/wave2-4/staged-mockito/byte-buddy-agent.jar;C:/craton/rust-jvm/bench/wave2-4/staged-mockito/objenesis.jar"
-"C:/craton/rust-jvm/apps/mockito_probe/SomeInterface.java"
-"C:/craton/rust-jvm/apps/mockito_probe/Main.java"
+"C:/craton/cratonvm/bench/wave2-4/staged-mockito/mockito-core.jar;C:/craton/cratonvm/bench/wave2-4/staged-mockito/byte-buddy.jar;C:/craton/cratonvm/bench/wave2-4/staged-mockito/byte-buddy-agent.jar;C:/craton/cratonvm/bench/wave2-4/staged-mockito/objenesis.jar"
+"C:/craton/cratonvm/apps/mockito_probe/SomeInterface.java"
+"C:/craton/cratonvm/apps/mockito_probe/Main.java"

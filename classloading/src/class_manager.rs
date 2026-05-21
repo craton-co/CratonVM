@@ -2208,6 +2208,18 @@ impl ClassManager {
         };
         let stub_total = stub_parent_fields + stub_instance_count;
         let num_total_fields = num_total_fields.max(stub_total);
+        if field_trace_enabled()
+            && (name.contains("DefaultHttpMessageConverters")
+                || name.contains("AnsiOutputApplicationListener")
+                || name.contains("AutoConfigurationPackages")
+                || name.contains("ClearCachesApplicationListener")
+                || name.contains("FileEncodingApplicationListener"))
+        {
+            let sup = superclass_id
+                .and_then(|s| self.class_store.get(s))
+                .map(|c| (c.name.to_string(), c.num_total_fields));
+            eprintln!("[FIELD-TRACE] define {name}: first_field_index={first_field_index} num_total_fields={num_total_fields} (own_instance computed via compute_field_layout) super={sup:?}");
+        }
 
         // Build the runtime Class
         let id = self.class_store.next_id();
@@ -4726,6 +4738,17 @@ impl ClassManager {
             };
             let new_first = parent_total;
             let new_total = parent_total + own_instance_fields;
+            if field_trace_enabled() {
+                if let Some(class) = self.class_store.get(cid) {
+                    if class.name.contains("DefaultHttpMessageConverters")
+                        || class.name.contains("AnsiOutputApplicationListener")
+                        || class.name.contains("AutoConfigurationPackages")
+                    {
+                        eprintln!("[FIELD-TRACE] recompute {}: old(ffi={},ntf={}) -> new(ffi={},ntf={}) changed_id={changed_id:?}",
+                            class.name, class.first_field_index, class.num_total_fields, new_first, new_total);
+                    }
+                }
+            }
             if let Some(class) = self.class_store.get_mut(cid) {
                 class.first_field_index = new_first;
                 // Grow-only: never shrink below the count an existing
@@ -6945,6 +6968,10 @@ fn compute_field_layout(
     let num_total_fields = parent_total + own_instance_fields;
 
     (first_field_index, num_total_fields)
+}
+
+fn field_trace_enabled() -> bool {
+    std::env::var("CRATON_FIELD_TRACE").is_ok()
 }
 
 // ---------------------------------------------------------------------------

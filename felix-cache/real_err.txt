@@ -1,0 +1,9 @@
+log4j:WARN No appenders could be found for logger (kafka.utils.Log4jControllerRegistration$).
+log4j:WARN Please initialize the log4j system properly.
+log4j:WARN See http://logging.apache.org/log4j/1.2/faq.html#noconfig for more info.
+USAGE: java [options] kafka.Kafka server.properties [--override property=value]*
+Option               Description                                         
+------               -----------                                         
+--override <String>  Optional property that should override values set in
+                       server.properties file                            
+--version            Print version information and exit.                 

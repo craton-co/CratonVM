@@ -8207,6 +8207,10 @@ fn resolve_field_ref(
                     )?;
 
                     let is_ref = f.descriptor.starts_with('L') || f.descriptor.starts_with('[');
+                    if std::env::var("CRATON_FIELD_TRACE").is_ok() && !is_static && index >= class.num_total_fields {
+                        eprintln!("[FIELD-TRACE] OOB resolve(own): decl={} field={} field_index={} num_total_fields={} first_field_index={}",
+                            class.name, field_name, index, class.num_total_fields, class.first_field_index);
+                    }
                     let resolved = ResolvedField {
                         declaring_class_id: declaring_id,
                         field_index: index,
@@ -8260,6 +8264,16 @@ fn resolve_field_ref(
         is_volatile,
         is_reference: is_ref,
     };
+    if std::env::var("CRATON_FIELD_TRACE").is_ok() && !is_static {
+        let cm = shared.class_manager.read();
+        let decl = cm.get_class(declaring_id);
+        let ntf = decl.map(|c| c.num_total_fields).unwrap_or(0);
+        let ffi = decl.map(|c| c.first_field_index).unwrap_or(0);
+        let dname = decl.map(|c| c.name.to_string()).unwrap_or_default();
+        if idx >= ntf {
+            eprintln!("[FIELD-TRACE] OOB resolve: decl={dname} field_index={idx} num_total_fields={ntf} first_field_index={ffi}");
+        }
+    }
     shared
         .resolution_cache
         .write()
@@ -8699,6 +8713,14 @@ fn execute_invoke_kind(
     }
     tmp.push(thread.frames[frame_idx].stack.pop()?); // receiver
     tmp.reverse();
+    if std::env::var_os("CRATONVM_DBG_JETTY2").is_some()
+        && &*method_name == "getClasspath"
+    {
+        eprintln!(
+            "[jetty2-eik] execute_invoke_kind {}.{}{} receiver={:?}",
+            &*method_class_name, &*method_name, &*method_descriptor, tmp.first()
+        );
+    }
     let mut args = Vec::with_capacity(total_args);
     args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", tmp[0]));
     for i in 0..num_params {
@@ -9002,6 +9024,23 @@ fn execute_invoke_kind(
                 }
             }
             Value::Object(None) => {
+                if std::env::var_os("CRATONVM_DBG_JETTY2").is_some() {
+                    let cm = shared.class_manager.read();
+                    eprintln!(
+                        "[jetty2] NULL-RECEIVER invoke {}.{}{} — Java stack:",
+                        &*method_class_name, &*method_name, &*method_descriptor
+                    );
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+                        let cn = cm
+                            .get_class(f.class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  [{i}] {}.{}{} pc={}",
+                            cn, f.method_name(), f.method_descriptor(), f.pc
+                        );
+                    }
+                }
                 // C11/C16: if this is a call into jdk/internal/misc/Unsafe or
                 // sun/misc/Unsafe with a null receiver (e.g. a static-init
                 // failed to populate `theUnsafe`), we still want the Unsafe
@@ -13331,6 +13370,14 @@ fn execute_invokevirtual_vtable_fast(
     // down the operand stack from the top.
     let num_params = num_params_slots;
     let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
+    if std::env::var_os("CRATONVM_DBG_JETTY2").is_some()
+        && &*method_name == "getClasspath"
+    {
+        eprintln!(
+            "[jetty2-vtfast] {}{} receiver={:?}",
+            &*method_name, &*method_descriptor, receiver_val
+        );
+    }
     let receiver_obj = match receiver_val {
         Value::Object(Some(obj_ref)) => obj_ref,
         Value::Object(None) => {

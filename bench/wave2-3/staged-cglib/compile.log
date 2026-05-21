@@ -8,4 +8,4 @@ stage-cglib-probe: compiling CglibProbe2 with jar on cp
 
 
 stage-cglib-probe: main class = CglibProbe2
-stage-cglib-probe: staged classes at C:\craton\rust-jvm\bench\wave2-3\staged-cglib\classes
+stage-cglib-probe: staged classes at C:\craton\cratonvm\bench\wave2-3\staged-cglib\classes

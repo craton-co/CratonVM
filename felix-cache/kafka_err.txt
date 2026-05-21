@@ -1,0 +1,37 @@
+[cratonvm] stack-dump watchdog armed: will dump + abort after 120s
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320910
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320998
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320a20
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320af0
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320b78
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320c00
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b320c88
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/String$CaseInsensitiveComparator -> obj=0x3b320f08
+[DBG] NEW java/lang/String -> obj=0x3b320fd8
+[DBG] NEW java/lang/String -> obj=0x3b3211b8
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b321de0
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW scala/collection/mutable/StringBuilder$ -> obj=0x3b3228b8
+[DBG] NEW java/lang/String -> obj=0x3b324a68
+[2m2026-05-21T23:22:08.694013Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[DBG] NEW scala/collection/StringOps$ -> obj=0x3b326928
+[DBG] NEW java/lang/String -> obj=0x3b326978
+[DBG] NEW java/lang/StringBuilder -> obj=0x3b3269e0
+[DBG] native_sb_to_string ENTERED
+USAGE: java [options] kafka.Kafka server.properties [--override property=value]*
+[cratonvm] System.exit(1) called — process terminating

@@ -1697,6 +1697,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         // step further by routing directly through `bail_to_interpreter` so the bail is
         // explicit at the call site (matches the MIC fast-path at `:1722`).
         if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+            if crate::runtime::env_cache::jit_dispatch_dbg() {
+                eprintln!(
+                    "[JIT_DISPATCH_RET/dcache] {}.{}{} ret=0x{:x}",
+                    info.class_name, info.method_name, info.descriptor, rc,
+                );
+            }
             return rc;
         }
         // Overflow: decode args once and hand off to the interpreter.
@@ -1729,6 +1735,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // wave-2 fall-through was already correct; this just makes the bail
             // explicit at the call site to match the MIC fast-path).
             if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
+                if crate::runtime::env_cache::jit_dispatch_dbg() {
+                    eprintln!(
+                        "[JIT_DISPATCH_RET/jcache] {}.{}{} ret=0x{:x}",
+                        info.class_name, info.method_name, info.descriptor, rc,
+                    );
+                }
                 return rc;
             }
             if let Some((thread, _guard)) = jit_thread_mut() {

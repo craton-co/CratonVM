@@ -1,7 +1,7 @@
 # Continue prompt — CratonVM real-Java-app gauntlet
 
 You are continuing work on **CratonVM**, a JVM written in Rust at `C:\craton\CratonVM`.
-(The project was previously called "rust-jvm"; it has been renamed to CratonVM —
+(The project was previously called "cratonvm"; it has been renamed to CratonVM —
 the binary is `target/release/java.exe`, with `rustjvm.exe` as an alias.)
 
 Real JDK 25 boot classes: `C:/Program Files/Java/jdk-25`.

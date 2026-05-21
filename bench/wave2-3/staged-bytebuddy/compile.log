@@ -8,4 +8,4 @@ stage-bytebuddy-probe: compiling ByteBuddyProbe with jar on cp
 
 
 stage-bytebuddy-probe: main class = ByteBuddyProbe
-stage-bytebuddy-probe: staged classes at C:\craton\rust-jvm\bench\wave2-3\staged-bytebuddy\classes
+stage-bytebuddy-probe: staged classes at C:\craton\cratonvm\bench\wave2-3\staged-bytebuddy\classes

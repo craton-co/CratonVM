@@ -1,0 +1,12 @@
+[cratonvm] stack-dump watchdog armed: will dump + abort after 120s
+[DBG] NEW java/lang/StringBuilder -> obj=0x25f8de90
+[DBG] native_sb_init_default ENTERED
+[DBG] native_sb_to_string ENTERED
+[DBG] NEW java/lang/String$CaseInsensitiveComparator -> obj=0x25f8e5a8
+Exception in thread "main" java/lang/UnsupportedOperationException: remove
+	at HelpProbe.main(HelpProbe.java:9)
+	at joptsimple/OptionParser.printHelpOn(OptionParser.java:342)
+	at joptsimple/BuiltinHelpFormatter.format(BuiltinHelpFormatter.java:101)
+	at joptsimple/BuiltinHelpFormatter.addRows(BuiltinHelpFormatter.java:198)
+	at joptsimple/BuiltinHelpFormatter.addNonOptionsDescription(BuiltinHelpFormatter.java:227)
+	at joptsimple/BuiltinHelpFormatter.findAndRemoveNonOptionsSpec(BuiltinHelpFormatter.java:294)

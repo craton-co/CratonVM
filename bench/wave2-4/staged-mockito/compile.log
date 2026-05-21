@@ -9,4 +9,4 @@ stage-mockito-probe: compiling 2 sources with mockito on cp
 
 
 stage-mockito-probe: main class = Main
-stage-mockito-probe: staged classes at C:\craton\rust-jvm\bench\wave2-4\staged-mockito\classes
+stage-mockito-probe: staged classes at C:\craton\cratonvm\bench\wave2-4\staged-mockito\classes

@@ -3850,6 +3850,19 @@ fn al_itr_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
     }
 }
 
+/// Resolve the `lastRet` slot of `ArrayList$Itr`. The native `next()` /
+/// `remove()` implementations must keep this field consistent with real-JDK
+/// semantics: `next()` records the index it just returned, and the real-JDK
+/// `ArrayList$Itr.remove()` bytecode — when *not* intercepted — guards with
+/// `if (lastRet < 0) throw new IllegalStateException()`. Falls back to the
+/// real-JDK slot index (1, immediately after `cursor`) when the class is not
+/// available for name resolution.
+#[inline]
+fn al_itr_last_ret_slot(ctx: &dyn NativeContext) -> usize {
+    ctx.resolve_field_index("java/util/ArrayList$Itr", "lastRet")
+        .unwrap_or(1)
+}
+
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
@@ -3868,6 +3881,12 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         "next",
         "()Ljava/lang/Object;",
         native_al_itr_next,
+    );
+    r.register(
+        "java/util/ArrayList$Itr",
+        "remove",
+        "()V",
+        native_al_itr_remove,
     );
 
     // HashMap$KeyItr
@@ -3927,7 +3946,53 @@ fn native_al_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let val = ctx.get_array_element(data, cursor as usize);
     ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    // Record the index just consumed in `lastRet` so a subsequent
+    // `Iterator.remove()` is legal. Real-JDK `next()` does `lastRet = i`
+    // via `dup_x1; putfield`; because this native shadows the bytecode that
+    // write must be reproduced here, otherwise `remove()` sees the
+    // constructor's `lastRet == -1` and throws `IllegalStateException`.
+    let last_ret_slot = al_itr_last_ret_slot(ctx);
+    ctx.set_field(this, last_ret_slot, Value::Int(cursor));
     Ok(Some(val))
+}
+
+/// Native `ArrayList$Itr.remove()` — removes the last element returned by
+/// `next()`. The real-JDK bytecode for `remove()` reads `expectedModCount`
+/// and calls back into `ArrayList.remove(int)`; because the native-collections
+/// model maintains list state outside the real `modCount` machinery, the whole
+/// iterator (`hasNext` / `next` / `remove`) must be serviced natively and
+/// kept self-consistent. Mirrors real-JDK semantics: remove `data[lastRet]`,
+/// rewind `cursor` to `lastRet`, then reset `lastRet` to `-1`.
+fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let (cursor_slot, list_slot, _) = al_itr_slots(ctx);
+    let last_ret_slot = al_itr_last_ret_slot(ctx);
+    let last_ret = match ctx.get_field(this, last_ret_slot) {
+        Value::Int(l) => l,
+        _ => -1,
+    };
+    if last_ret < 0 {
+        // JDK contract: `remove()` before `next()` (or twice in a row)
+        // throws IllegalStateException.
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let list = match ctx.get_field(this, list_slot) {
+        Value::Object(Some(l)) => l,
+        _ => return Ok(None),
+    };
+    // Delegate to the list's own native removal so backing-array shifting and
+    // size bookkeeping stay in one place.
+    native_al_remove_at(ctx, &[Value::Object(Some(list)), Value::Int(last_ret)])?;
+    // Real-JDK: cursor = lastRet; lastRet = -1;
+    ctx.set_field(this, cursor_slot, Value::Int(last_ret));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    Ok(None)
 }
 
 fn native_map_key_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9991,10 +10056,15 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
         native_ll_list_iterator_idx,
     );
 
-    // LinkedList$Itr
+    // LinkedList$Itr — synthetic 3-field overlay:
+    //   field 0 = current node (the next node to be returned by `next()`)
+    //   field 1 = list ref
+    //   field 2 = last node returned by `next()` (for `remove()`); null when
+    //             `next()` has not been called or after a `remove()`.
     let itr = "java/util/LinkedList$Itr";
     registry.register(itr, "hasNext", "()Z", native_ll_itr_has_next);
     registry.register(itr, "next", "()Ljava/lang/Object;", native_ll_itr_next);
+    registry.register(itr, "remove", "()V", native_ll_itr_remove);
 
     // LinkedList$ListItr — synthetic 3-field overlay
     //   field 0 = Object[] snapshot of list elements
@@ -10755,9 +10825,10 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let head = ll_get(this, "head");
-    let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 2);
+    let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3);
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
+    ctx.set_field(itr, 2, Value::Object(None)); // last returned node
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -10792,7 +10863,39 @@ fn native_ll_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let element = ctx.get_field(cur, LL_NODE_ELEM);
     let next = ctx.get_field(cur, LL_NODE_NEXT);
     ctx.set_field(this, 0, next);
+    // Record the node just returned so `remove()` can unlink it.
+    ctx.set_field(this, 2, Value::Object(Some(cur)));
     Ok(Some(element))
+}
+
+/// Native `LinkedList$Itr.remove()` — removes the element returned by the most
+/// recent `next()`. `LinkedList$Itr` is a synthetic class (real-JDK `LinkedList`
+/// exposes only `ListItr`), so `Iterator.remove()` would otherwise resolve to
+/// the interface default method, which throws `UnsupportedOperationException`.
+fn native_ll_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let last = match ctx.get_field(this, 2) {
+        Value::Object(Some(n)) => n,
+        _ => {
+            // `remove()` before `next()`, or twice in a row.
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "remove".to_string(),
+            }
+            .into());
+        }
+    };
+    let list = match ctx.get_field(this, 1) {
+        Value::Object(Some(l)) => l,
+        _ => return Ok(None),
+    };
+    ll_unlink_node(ctx, list, last);
+    // Clear `lastReturned` so a second `remove()` without an intervening
+    // `next()` correctly throws.
+    ctx.set_field(this, 2, Value::Object(None));
+    Ok(None)
 }
 
 // ===========================================================================
