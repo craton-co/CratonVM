@@ -1133,26 +1133,47 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // Try to read the other collection as an ArrayList
+    // Fast path: the source is a plain ArrayList whose synthetic
+    // (data, size) slots are directly readable — copy its backing
+    // array in one shot.
     let (other_data, other_size) = al_state(ctx, other);
     let other_size = other_size as usize;
-    if other_size == 0 {
+    if let (Some(other_data), true) = (other_data, other_size > 0) {
+        let (_, my_size) = al_state(ctx, this);
+        let my_size = my_size as usize;
+        let buf = al_ensure_capacity(ctx, this, my_size + other_size);
+        if !ctx.bulk_array_copy(other_data, 0, buf, my_size, other_size) {
+            for i in 0..other_size {
+                let val = ctx.get_array_element(other_data, i);
+                ctx.set_array_element(buf, my_size + i, val);
+            }
+        }
+        al_set_size(ctx, this, (my_size + other_size) as i32);
+        return Ok(Some(Value::Int(1)));
+    }
+    // General path: the source is NOT a plain ArrayList — it may be a
+    // `Collections.unmodifiableList(...)` view, an `Arrays.asList(...)`
+    // (`java/util/Arrays$ArrayList`), a `List.of(...)` snapshot, a
+    // HashSet, etc. `al_state` only understands the synthetic ArrayList
+    // layout, so it reports size 0 for all of these and the elements
+    // are silently dropped. Fall back to `collect_collection_elements`,
+    // which sees through every wrapper and reads arbitrary collections
+    // via their real layout / iterator. This is the path WildFly's
+    // `PathAddress.append(...)` depends on (`ArrayList.addAll` of a
+    // `Collections.unmodifiableList` parent address) — without it the
+    // appended PathAddress comes out empty and resource-tree
+    // registration NPEs in `ConcreteResourceRegistration.registerSubModel`.
+    let elems = collect_collection_elements(ctx, other);
+    if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
-    let other_data = match other_data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Int(0))),
-    };
     let (_, my_size) = al_state(ctx, this);
     let my_size = my_size as usize;
-    let buf = al_ensure_capacity(ctx, this, my_size + other_size);
-    if !ctx.bulk_array_copy(other_data, 0, buf, my_size, other_size) {
-        for i in 0..other_size {
-            let val = ctx.get_array_element(other_data, i);
-            ctx.set_array_element(buf, my_size + i, val);
-        }
+    let buf = al_ensure_capacity(ctx, this, my_size + elems.len());
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(buf, my_size + i, *val);
     }
-    al_set_size(ctx, this, (my_size + other_size) as i32);
+    al_set_size(ctx, this, (my_size + elems.len()) as i32);
     Ok(Some(Value::Int(1)))
 }
 
