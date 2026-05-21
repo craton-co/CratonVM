@@ -2150,6 +2150,14 @@ impl SharedVm {
         cratonvm_gc::install_gc_start_hook(gc_start_adapter);
         cratonvm_gc::install_gc_finish_hook(gc_finish_adapter);
 
+        // Install the class-info resolver used by the heap's
+        // layout-mismatch diagnostics. When `gen_heap::{get,set}_field`
+        // drops an out-of-bounds access it logs the raw `ClassId`; this
+        // hook lets it also print the class NAME and the class's REAL
+        // declared field count, turning `ClassId(275)` into an
+        // actionable `org/jboss/.../Foo (real layout has 7 fields)`.
+        cratonvm_gc::install_class_info_hook(class_info_adapter);
+
         // Round 4 audit fix (CRIT) — publish the global Weak<SharedVm>
         // handle used by `resolution_invalidate_adapter`. Done at the
         // very end of `SharedVm::new` so the Arc returned by the caller
@@ -2225,6 +2233,26 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // `ResolutionCache::invalidate_class` (drops by key-class OR
     // resolved-declaring-class match).
     shared.link_resolver.invalidate_class(cid);
+}
+
+/// The `ClassInfoHook` adapter handed to `cratonvm_gc::install_class_info_hook`.
+///
+/// Resolves a raw `ClassId` to `(class_name, num_total_fields)` so the
+/// heap's out-of-bounds field-access diagnostic (`gen_heap::set_field` /
+/// `get_field`) can print actionable class identity instead of a bare
+/// numeric id. Reuses the `RESOLUTION_INVALIDATE_VM` weak handle — both
+/// hooks are plain captureless `fn` pointers bridged to the VM-owned
+/// `SharedVm` through the same `OnceLock`.
+///
+/// Returns `None` before the VM handle is wired, after the VM is dropped,
+/// or for a class id that is not registered in the class store.
+fn class_info_adapter(class_id: u32) -> Option<(String, usize)> {
+    let weak = RESOLUTION_INVALIDATE_VM.get()?;
+    let shared = weak.upgrade()?;
+    let cid = crate::classloading::ClassId::new(class_id);
+    let cm = shared.class_manager.read();
+    let class = cm.class_store.get(cid)?;
+    Some((class.name.to_string(), class.num_total_fields))
 }
 
 

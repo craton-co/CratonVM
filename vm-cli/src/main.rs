@@ -2078,6 +2078,61 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            // Missing-stack-trace diagnostic (2026-05-21).
+            //
+            // When an exception escapes `main()` and NEITHER the heap-side
+            // `Throwable.stackTrace[]` NOR the per-thread `throwable_stacks`
+            // capture produced a single `\tat ...` frame, the bare
+            // `Exception in thread "main" <class>: <msg>` line is useless
+            // for diagnosis — exactly the keycloak26 `NullPointerException:
+            // charset` symptom. Rather than exit silently, emit an explicit
+            // marker so the failure mode is unambiguous, retry the
+            // identity-hash trace lookup for the head exception, and point
+            // the operator at the live-stack diagnostic env var.
+            let emitted_any_frame = lines.iter().any(|l| l.starts_with("\tat "));
+            if !emitted_any_frame {
+                lines.push(
+                    "[cratonvm-cli] (no Java stack frames were captured for this exception)"
+                        .to_string(),
+                );
+                // Last-ditch: dump whatever the head exception's
+                // `throwable_stacks` entry holds, even if the cause-chain
+                // walk above skipped it.
+                match vm.throwable_stack_for(exc_ref) {
+                    Some(frames) if !frames.is_empty() => {
+                        lines.push(format!(
+                            "[cratonvm-cli] recovered {} captured frame(s) from the trace store:",
+                            frames.len()
+                        ));
+                        for frame in frames.iter().take(40) {
+                            let location = match (frame.file.as_deref(), frame.line) {
+                                (Some(f), n) if !f.is_empty() && n >= 0 => format!("{f}:{n}"),
+                                (Some(f), _) if !f.is_empty() => f.to_string(),
+                                _ => "Unknown Source".to_string(),
+                            };
+                            lines.push(format!(
+                                "\tat {}.{}({})",
+                                frame.class, frame.method, location
+                            ));
+                        }
+                    }
+                    _ => {
+                        lines.push(
+                            "[cratonvm-cli] the per-thread trace store has no entry for this \
+                             throwable either — the exception was likely thrown on a \
+                             non-main thread, or its constructor was shadowed by a native \
+                             that skipped fillInStackTrace."
+                                .to_string(),
+                        );
+                        lines.push(
+                            "[cratonvm-cli] re-run with CRATONVM_DBG_CHARSET=1 to dump the \
+                             full live Java thread stack at throw time (NullPointerException: \
+                             charset), or CRATONVM_DBG_ATHROW=1 for every exception throw."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             bail!("{}", lines.join("\n"));
         }
     }

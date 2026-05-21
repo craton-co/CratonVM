@@ -285,10 +285,47 @@ pub(crate) fn native_exc_init_message_cause(ctx: &mut dyn NativeContext, args: &
     Ok(None)
 }
 
-/// Exception <init>(Ljava/lang/Throwable;)V — sets cause.
+/// Exception <init>(Ljava/lang/Throwable;)V — sets cause AND detailMessage.
+///
+/// JDK semantics (`java.lang.Throwable(Throwable cause)`):
+/// ```text
+///     fillInStackTrace();
+///     detailMessage = (cause == null ? null : cause.toString());
+///     this.cause = cause;
+/// ```
+/// The `detailMessage = cause.toString()` step is NOT optional — it is the
+/// whole reason a cause-only constructor produces a non-null `getMessage()`.
+/// Omitting it left `detailMessage` null. `native_throwable_get_message`
+/// then fell back to reading raw slot 0 (which `capture_throwable_trace`
+/// populates with a self-reference as the `backtrace` non-null marker), so
+/// `getMessage()` returned the *exception object itself*. Any caller doing
+/// `String msg = ex.getMessage(); msg.contains(...)` then dispatched
+/// `String.contains` against the exception's runtime class and crashed with
+/// `NoSuchMethodError: <ExceptionClass>.contains(Ljava/lang/CharSequence;)Z`
+/// — the canonical Spring Boot `throw new IllegalStateException(cause)`
+/// rewrap path. Mirroring the JDK initializer here keeps `detailMessage`
+/// a real `String`.
 pub(crate) fn native_exc_init_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let (Some(Value::Object(Some(this))), Some(cause)) = (args.first(), args.get(1)) {
         write_throwable_cause(ctx, *this, *cause);
+        // detailMessage = (cause == null ? null : cause.toString())
+        let detail_msg: Value = match cause {
+            Value::Object(Some(cause_ref)) => {
+                match ctx.invoke_virtual(
+                    *cause_ref,
+                    "toString",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(v @ Value::Object(Some(_)))) => v,
+                    // toString returned null / non-object, or dispatch failed:
+                    // leave detailMessage null rather than smuggle a bad value.
+                    _ => Value::Object(None),
+                }
+            }
+            _ => Value::Object(None),
+        };
+        write_throwable_detail_message(ctx, *this, detail_msg);
         capture_throwable_trace(ctx, *this);
     }
     Ok(None)
@@ -503,12 +540,30 @@ pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[
     // `backtrace` at slot 0); synthetic-stub layout puts it at slot 0
     // (unnamed `_f0`). Prefer the field-name lookup so the real-JDK
     // bytecode (which writes via `putfield detailMessage`) and our
-    // native init helpers (which now mirror to both) agree.
+    // native init helpers agree.
+    //
+    // CRITICAL: the raw slot-0 fallback is ONLY valid for the synthetic-stub
+    // layout. In the real-JDK layout slot 0 is `backtrace`, which
+    // `capture_throwable_trace` populates with a self-reference (the
+    // Throwable itself) as a non-null marker. Blindly falling back to slot 0
+    // for a real-JDK Throwable therefore returns the *exception object* as
+    // the "message" — a caller doing `getMessage().contains(...)` then
+    // dispatches `String.contains` against the exception's class and dies
+    // with `NoSuchMethodError`. Gate the fallback on the class genuinely
+    // lacking a named `detailMessage` field.
+    let has_named_detail_message = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .and_then(|cn| ctx.resolve_field_index(&cn, "detailMessage"))
+        .is_some();
     let by_name = ctx.get_field_by_name(this, "detailMessage");
     let detail = match by_name {
         Value::Object(Some(_)) => by_name,
-        // Fallback: synthetic-stub layout where the field has no `detailMessage`
-        // name and the canonical slot is index 0.
+        // `detailMessage` resolved by name but is null/absent: that is a
+        // legitimately message-less exception — return null, do NOT read
+        // slot 0 (it is `backtrace` in the real-JDK layout).
+        _ if has_named_detail_message => Value::Object(None),
+        // Synthetic-stub layout: no named `detailMessage` field at all; the
+        // canonical slot really is index 0.
         _ => ctx.get_field(this, 0),
     };
     // Return the field value directly. The previous `read_string` validation

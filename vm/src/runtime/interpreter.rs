@@ -6765,6 +6765,66 @@ fn execute_instruction(
                             eprintln!("  ATHROW-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                         }
                     }
+                    // charset-NPE diagnostic (2026-05-21) — gated by
+                    // `CRATONVM_DBG_CHARSET=1`. When a `NullPointerException`
+                    // whose detail message is exactly `charset` is thrown via
+                    // an `athrow` (the genuine JDK `OutputStreamWriter(out, cs)`
+                    // / `PrintStream`/`PrintWriter` `new NullPointerException(
+                    // "charset")` site), dump the ENTIRE live Java thread
+                    // stack — `class.method:pc` for every frame, deepest
+                    // first. The frames are still fully intact here (athrow
+                    // has not unwound anything yet), so this is the ground
+                    // truth of which JDK method and which app/JDK call site
+                    // dereferenced the null Charset. This works even when the
+                    // CLI uncaught-exception renderer prints zero `\tat`
+                    // frames (its `throwable_stacks` lookup having missed).
+                    if crate::runtime::env_cache::charset_dbg() {
+                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(exc_class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        // Detail message: scan slots 0..8 for a String
+                        // (Throwable layout puts `detailMessage` at slot 1,
+                        // but synthetic stubs may differ — so probe a range).
+                        let mut detail = String::new();
+                        for fi in 0..8 {
+                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi) {
+                                if let Some(s) = read_java_string(&shared.heap, msg_ref) {
+                                    if !s.is_empty() {
+                                        detail = s;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if exc_class_name == "java/lang/NullPointerException"
+                            && detail == "charset"
+                        {
+                            eprintln!(
+                                "[CHARSET-NPE] NullPointerException(\"charset\") thrown via athrow \
+                                 — full live Java thread stack ({} frames, deepest first):",
+                                thread.frames.len()
+                            );
+                            for (i, f) in thread.frames.iter().enumerate().rev() {
+                                let cn = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(f.class_id)
+                                    .map(|c| c.name.to_string())
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "[CHARSET-NPE-STK {i}] {}.{}{} pc={}",
+                                    cn,
+                                    f.method_name(),
+                                    f.method_descriptor(),
+                                    f.pc
+                                );
+                            }
+                        }
+                    }
                     // Round-5 MED-fix (Bug 6, 2026-05-17): emit
                     // `jdk.JavaErrorThrow` for `java.lang.Error` subclasses.
                     // The emit fn was previously dead code. Gated by

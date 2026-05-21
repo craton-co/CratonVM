@@ -1609,9 +1609,54 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    // StandardCharsets constants
+    // StandardCharsets constants.
+    //
+    // charset-NPE fix (2026-05-21): this registration is the LAST writer
+    // for `java/nio/charset/StandardCharsets.<clinit>` — `register_core_stdlib_extras`
+    // runs after `register_charset_natives` (see `lib.rs`: 33236 vs 9120),
+    // and `NativeMethodRegistry::register` is last-write-wins. The previous
+    // `native_noop` therefore SHADOWED the field-populating `<clinit>`
+    // installed by `register_charset_natives`, so in real-JDK mode the
+    // `StandardCharsets.UTF_8` / `US_ASCII` / `ISO_8859_1` / `UTF_16*`
+    // static fields were NEVER assigned and stayed null.
+    //
+    // Any app code that does `new OutputStreamWriter(stream,
+    // StandardCharsets.UTF_8)` or `new PrintStream/PrintWriter(out,
+    // autoFlush, StandardCharsets.X)` then passed `null` for the charset,
+    // and the JDK bytecode `OutputStreamWriter(OutputStream, Charset)`
+    // (`if (cs == null) throw new NullPointerException("charset")`) threw
+    // the bare `NullPointerException: charset` — the keycloak26 Picocli /
+    // Hazelcast JAXP-XPath blocker. (`<clinit>` is dispatched as a native
+    // override of the real bytecode initializer when one is registered —
+    // see `vm/src/vm/vm_util.rs::ensure_class_initialized_shared`.)
+    //
+    // Replace the no-op with the same field-populating body used by
+    // `register_charset_natives` so the static slots always hold non-null
+    // synthetic Charset objects (1-field layout, slot 0 = canonical name)
+    // that the rest of the charset native surface already understands.
     let scs = "java/nio/charset/StandardCharsets";
-    r.register(scs, "<clinit>", "()V", native_noop);
+    r.register(scs, "<clinit>", "()V", |ctx, _args| {
+        // Field order matches the JDK declaration; populate every public
+        // standard-charset static so a later `getstatic` reads a live ref.
+        for (field_name, charset_name) in [
+            ("UTF_8", "UTF-8"),
+            ("US_ASCII", "US-ASCII"),
+            ("ISO_8859_1", "ISO-8859-1"),
+            ("UTF_16", "UTF-16"),
+            ("UTF_16BE", "UTF-16BE"),
+            ("UTF_16LE", "UTF-16LE"),
+        ] {
+            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let name = ctx.create_string(charset_name);
+            ctx.set_field(obj, 0, Value::Object(Some(name)));
+            ctx.set_static_field_by_name(
+                "java/nio/charset/StandardCharsets",
+                field_name,
+                Value::Object(Some(obj)),
+            );
+        }
+        Ok(None)
+    });
 
     // -----------------------------------------------------------------------
     // Phase 37: registerNatives for all core JDK classes

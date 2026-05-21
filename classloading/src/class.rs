@@ -887,10 +887,39 @@ pub fn find_field_recursive<'a>(
 }
 
 /// Find a method by name and descriptor, walking the superclass chain and
-/// then the interface hierarchy (for default methods).
+/// then the interface hierarchy.
 ///
 /// Returns `(&ClassFileMethod, ClassId)` where `ClassId` is the class that
 /// actually declares the method.
+///
+/// # Resolution rules (JVMS §5.4.3.3 / §5.4.3.4)
+///
+/// Phase 1 walks the superclass chain; Phase 2 walks the *transitive*
+/// superinterface closure. Both phases *prefer a concrete (non-abstract)
+/// method* and only fall back to an abstract declaration when no concrete
+/// dispatch target exists anywhere.
+///
+/// Virtual-dispatch correctness (Phase 1): when the superclass chain contains
+/// BOTH an abstract declaration (e.g. `java/net/JarURLConnection.getJarFile()`
+/// — abstract, no Code attribute) AND a concrete override, the walk prefers
+/// the concrete one. It keeps walking past an abstract declaration, recording
+/// it only as a last-resort fallback, so dispatch never lands on a method with
+/// no Code attribute when a real implementation exists.
+///
+/// Interface-method resolution (Phase 2): the superinterface closure is walked
+/// transitively. A concrete (default) method wins; otherwise the first
+/// abstract declaration is returned rather than `None`. This matters when
+/// `class_id` is itself an interface: resolving e.g. `invokeinterface
+/// java/util/concurrent/ScheduledFuture.cancel(Z)Z` must succeed even though
+/// `cancel` is inherited (abstractly) from the `java/util/concurrent/Future`
+/// superinterface. Previously Phase 2 skipped abstract methods unconditionally,
+/// so the VM raised a spurious `NoSuchMethodError` for inherited interface
+/// methods.
+///
+/// Callers that need to distinguish a real implementation from an abstract
+/// declaration must inspect `ClassFileMethod::is_abstract()` /
+/// `ClassFileMethod::code()` on the result (the bytecode-verifier and the
+/// interpreter's dispatch paths already do).
 pub fn find_method_recursive<'a>(
     class_id: ClassId,
     method_name: &str,
@@ -898,24 +927,57 @@ pub fn find_method_recursive<'a>(
     store: &'a ClassStore,
 ) -> Option<(&'a ClassFileMethod, ClassId)> {
     // Phase 1: walk the superclass chain (concrete + inherited methods).
+    //
+    // Prefer the first NON-abstract match. If only abstract declarations are
+    // found on the chain, remember the first one as a fallback — but give
+    // Phase 2 (interface default methods) a chance first, since a concrete
+    // default body is a valid dispatch target whereas an abstract superclass
+    // declaration is not.
     let mut current_id = class_id;
+    let mut abstract_fallback: Option<(&'a ClassFileMethod, ClassId)> = None;
     loop {
-        let class = store.get(current_id)?;
+        let Some(class) = store.get(current_id) else { break };
         if let Some(method) = class.find_method(method_name, method_descriptor) {
-            return Some((method, current_id));
+            if !method.is_abstract() {
+                // Concrete method (has a Code attribute, or is ACC_NATIVE) —
+                // this is the most-specific real dispatch target.
+                return Some((method, current_id));
+            }
+            // Abstract declaration: record the first one seen and continue
+            // walking — a concrete override may live on a more-derived class
+            // we have not visited yet only if `class_id` was itself derived,
+            // but in the abstract-receiver case there is nothing more derived.
+            // Keeping the fallback lets us still return a usable answer.
+            if abstract_fallback.is_none() {
+                abstract_fallback = Some((method, current_id));
+            }
         }
         match class.superclass {
             Some(sc) => current_id = sc,
             None => break,
         }
     }
+    // No concrete superclass-chain method — but before falling back to an
+    // abstract declaration, try Phase 2: a concrete interface default method
+    // is a valid dispatch target, an abstract class method is not.
 
-    // Phase 2: walk the interface hierarchy for default methods.
-    // BFS over all interfaces of the class and its superclasses.
+    // Phase 2: walk the interface hierarchy.
+    // BFS over all interfaces of the class and its superclasses, including
+    // the transitive superinterface closure.
     let mut queue: Vec<ClassId> = Vec::new();
     let mut current_id = class_id;
     loop {
         if let Some(class) = store.get(current_id) {
+            // When `class_id` is itself an interface, the interface's own
+            // declarations must be searched too — its `find_method` was
+            // already probed in Phase 1, but a *superinterface* method (e.g.
+            // `Future.cancel` reached via `ScheduledFuture`) is only found by
+            // seeding the BFS with the interface node itself so the
+            // `queue.extend_from_slice(&iface.interfaces)` step below pulls
+            // in its superinterfaces.
+            if class.is_interface() {
+                queue.push(current_id);
+            }
             queue.extend_from_slice(&class.interfaces);
             match class.superclass {
                 Some(sc) => current_id = sc,
@@ -926,6 +988,13 @@ pub fn find_method_recursive<'a>(
         }
     }
 
+    // Continue tracking the abstract fallback across Phase 2: an abstract
+    // class-method declaration found in Phase 1 already lives in
+    // `abstract_fallback` and takes precedence; Phase 2 only fills it when
+    // Phase 1 found nothing. Interface-method resolution still succeeds for an
+    // inherited abstract method (JVMS §5.4.3.4 — an abstract method is a valid
+    // resolution result). Note: `abstract_fallback` is intentionally NOT
+    // re-declared here so the Phase 1 result survives.
     let mut visited: FxHashSet<ClassId> = FxHashSet::default();
     let mut i = 0;
     while i < queue.len() {
@@ -937,7 +1006,14 @@ pub fn find_method_recursive<'a>(
         if let Some(iface) = store.get(iface_id) {
             if let Some(method) = iface.find_method(method_name, method_descriptor) {
                 if !method.is_abstract() {
+                    // Concrete (default) interface method — preferred result.
                     return Some((method, iface_id));
+                }
+                // Abstract declaration — remember it as a fallback but keep
+                // searching for a concrete default method elsewhere in the
+                // closure.
+                if abstract_fallback.is_none() && !method.is_static() {
+                    abstract_fallback = Some((method, iface_id));
                 }
             }
             // Also search super-interfaces.
@@ -945,7 +1021,14 @@ pub fn find_method_recursive<'a>(
         }
     }
 
-    None
+    // No concrete dispatch target anywhere. Return the abstract
+    // superclass-chain declaration (if any) so callers get a stable
+    // `(method, declaring_class)` answer — `interpreter::execute` and
+    // `invoke_on_class_shared_inner` already detect the missing Code
+    // attribute and surface a spec-compliant `AbstractMethodError` (or run
+    // the receiver-walk / native-override rescues) rather than a confusing
+    // `NoSuchMethodError`.
+    abstract_fallback
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,6 +1743,25 @@ mod tests {
         }
     }
 
+    /// Build a class flagged as an `interface` (so `Class::is_interface()`
+    /// reports true). `make_class` hard-codes `PUBLIC | SUPER`, which is fine
+    /// for concrete-class tests but wrong when the test needs the node to be
+    /// recognised as an interface (e.g. interface-method resolution where
+    /// `class_id` is itself an interface).
+    fn make_interface(
+        id: ClassId,
+        name: &str,
+        object_id: ClassId,
+        superinterfaces: Vec<ClassId>,
+        methods: Vec<ClassFileMethod>,
+    ) -> Class {
+        let mut c = make_class(id, name, Some(object_id), superinterfaces, vec![], methods, 0, 0);
+        c.access_flags = ClassAccessFlags::PUBLIC
+            | ClassAccessFlags::INTERFACE
+            | ClassAccessFlags::ABSTRACT;
+        c
+    }
+
     #[test]
     fn m2_find_method_recursive_finds_default_on_interface() {
         let mut store = ClassStore::new();
@@ -1703,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn m2_find_method_recursive_skips_abstract_interface_methods() {
+    fn m2_find_method_recursive_prefers_concrete_over_abstract_interface_methods() {
         let mut store = ClassStore::new();
 
         let obj_id = store.next_id();
@@ -1711,11 +1813,9 @@ mod tests {
 
         // Interface with only abstract method (no default)
         let iface_id = store.next_id();
-        store.add(make_class(
-            iface_id, "Runnable", Some(obj_id), vec![],
-            vec![],
+        store.add(make_interface(
+            iface_id, "Runnable", obj_id, vec![],
             vec![make_abstract_method("run", "()V")],
-            0, 0,
         ));
 
         // Concrete class implementing Runnable with run()
@@ -1727,7 +1827,8 @@ mod tests {
             0, 0,
         ));
 
-        // run() found on concrete class
+        // run() found on concrete class — the concrete declaration must win
+        // over the abstract interface declaration.
         let found = find_method_recursive(class_id, "run", "()V", &store);
         assert!(found.is_some());
         assert_eq!(found.unwrap().1, class_id);
@@ -1735,6 +1836,64 @@ mod tests {
         // missing() not found anywhere
         let found = find_method_recursive(class_id, "missing", "()V", &store);
         assert!(found.is_none());
+    }
+
+    /// Regression: interface-method resolution must walk transitive
+    /// superinterfaces and return an *abstract* inherited declaration.
+    ///
+    /// Mirrors the Kafka 3.7.0 boot failure: `invokeinterface
+    /// java/util/concurrent/ScheduledFuture.cancel(Z)Z`. `cancel(boolean)` is
+    /// declared abstractly on `java/util/concurrent/Future`, and
+    /// `ScheduledFuture` only inherits it (via `extends Delayed, Future`).
+    /// Resolving against the `ScheduledFuture` interface itself must still
+    /// find `Future.cancel` (JVMS §5.4.3.4) — previously Phase 2 skipped all
+    /// abstract methods and returned `None`, surfacing a spurious
+    /// `NoSuchMethodError`.
+    #[test]
+    fn m2_find_method_recursive_resolves_inherited_abstract_interface_method() {
+        let mut store = ClassStore::new();
+
+        let obj_id = store.next_id();
+        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+
+        // `Future` — declares `cancel(Z)Z` abstractly.
+        let future_id = store.next_id();
+        store.add(make_interface(
+            future_id, "java/util/concurrent/Future", obj_id, vec![],
+            vec![make_abstract_method("cancel", "(Z)Z")],
+        ));
+
+        // `Delayed` — sibling superinterface, declares nothing relevant.
+        let delayed_id = store.next_id();
+        store.add(make_interface(
+            delayed_id, "java/util/concurrent/Delayed", obj_id, vec![],
+            vec![make_abstract_method("getDelay", "(Ljava/util/concurrent/TimeUnit;)J")],
+        ));
+
+        // `ScheduledFuture extends Delayed, Future` — declares no methods of
+        // its own; `cancel` is inherited from `Future`.
+        let scheduled_id = store.next_id();
+        store.add(make_interface(
+            scheduled_id,
+            "java/util/concurrent/ScheduledFuture",
+            obj_id,
+            vec![delayed_id, future_id],
+            vec![],
+        ));
+
+        // Resolving `cancel(Z)Z` against the `ScheduledFuture` interface must
+        // succeed, returning the abstract declaration from `Future`.
+        let found = find_method_recursive(scheduled_id, "cancel", "(Z)Z", &store);
+        assert!(
+            found.is_some(),
+            "cancel(Z)Z inherited from Future must resolve via ScheduledFuture",
+        );
+        let (method, declaring) = found.unwrap();
+        assert_eq!(declaring, future_id, "cancel is declared on Future");
+        assert!(method.is_abstract(), "the resolved declaration is abstract");
+
+        // A truly absent method still resolves to None.
+        assert!(find_method_recursive(scheduled_id, "nope", "()V", &store).is_none());
     }
 
     #[test]

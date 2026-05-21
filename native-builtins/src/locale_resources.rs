@@ -306,6 +306,31 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
     ctx.set_field(obj, 0, Value::Object(Some(map)));
     ctx.set_field(obj, 1, Value::Object(None));
 
+    // CRITICAL (Tomcat boot): `java.util.ResourceBundle.getLocale()` is a
+    // `final` JDK method whose body is `return this.locale;`. Our synthetic
+    // bundle carries the *real* `java/util/ResourceBundle` class, so in
+    // real-JDK mode a caller that bypasses the `getLocale` native override
+    // (e.g. JIT-compiled callsite, or a resolution path that runs the
+    // bytecode `getfield locale` directly) reads slot `locale` — which the
+    // two `set_field` calls above leave NULL. Tomcat's
+    // `StringManager.<init>` then does `bundle.getLocale().equals(Locale.ROOT)`
+    // and NPEs ("Cannot invoke equals on null"), which converts to an
+    // `ExceptionInInitializerError` on `org/apache/catalina/startup/Catalina`
+    // and aborts Tomcat's `Bootstrap.init`.
+    //
+    // Fix: resolve the real `locale` field by NAME (layout-independent) and
+    // store a non-null `Locale.ROOT`-equivalent (empty language/country)
+    // there. The `getLocale` native override still returns the same value;
+    // this just guarantees correctness when the override is bypassed.
+    let root_locale = crate::locale_alloc(ctx, "", "");
+    if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
+        ctx.set_field(obj, loc_idx, Value::Object(Some(root_locale)));
+    } else {
+        // Synthetic-JDK mode (class not loaded with real layout): slot 1 is
+        // the conventional `locale` placement used by the synthetic layout.
+        ctx.set_field(obj, 1, Value::Object(Some(root_locale)));
+    }
+
     // .properties fallback for user resources.
     let resource_name = format!("{}.properties", bundle_name.replace('.', "/"));
     let mut populated_from_props = false;
@@ -367,6 +392,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
+    if std::env::var("CRATONVM_DBG_CATALINA").is_ok() {
+        eprintln!("CATALINA-DBG: ResourceBundle.getBundle native — name={bundle_name:?}");
+    }
     let obj = build_bundle(ctx, &bundle_name);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -558,6 +586,11 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // never registers a ServletWebServerFactory bean →
     // MissingWebServerFactoryBeanException at app startup.
     registry.register(rb, "getLocale", "()Ljava/util/Locale;", |ctx, _args| {
+        if std::env::var("CRATONVM_DBG_CATALINA").is_ok() {
+            eprintln!(
+                "CATALINA-DBG: ResourceBundle.getLocale native HIT — returning non-null empty Locale"
+            );
+        }
         Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
     });
     registry.register(rb, "getBaseBundleName", "()Ljava/lang/String;", |_ctx, _args| {

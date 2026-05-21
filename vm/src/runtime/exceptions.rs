@@ -200,6 +200,42 @@ pub fn throw_runtime_error(
     thread: &mut JvmThread,
     error: RuntimeError,
 ) -> MethodCallFailed {
+    // charset-NPE diagnostic (2026-05-21) — gated by `CRATONVM_DBG_CHARSET=1`.
+    // Defensive companion to the `Athrow`-opcode dump in `interpreter.rs`:
+    // catches the case where a `NullPointerException` with message exactly
+    // `charset` originates Rust-side (a native that fails a charset arg
+    // check) rather than from genuine JDK `new NullPointerException(
+    // "charset")` bytecode. Dumps the full live Java thread stack —
+    // `class.method:pc`, deepest first — which is the ground truth even
+    // when the CLI uncaught-exception renderer later prints zero frames.
+    // The env-var read is a single cached atomic load, so the no-debug
+    // path is free; it is intentionally NOT gated behind `tracing::enabled!`.
+    if crate::runtime::env_cache::charset_dbg() {
+        if let RuntimeError::NullPointerException { message: Some(m) } = &error {
+            if m == "charset" {
+                eprintln!(
+                    "[CHARSET-NPE] RuntimeError::NullPointerException(\"charset\") raised \
+                     Rust-side — full live Java thread stack ({} frames, deepest first):",
+                    thread.frames.len()
+                );
+                for (i, f) in thread.frames.iter().enumerate().rev() {
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(f.class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[CHARSET-NPE-STK {i}] {}.{}{} pc={}",
+                        cn,
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.pc
+                    );
+                }
+            }
+        }
+    }
     // T15: trace the origin of RuntimeErrors so users can see where
     // a silent NPE/IOOBE/etc. is coming from during class init.
     //

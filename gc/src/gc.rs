@@ -74,6 +74,40 @@ pub fn fire_gc_finish() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Class-info diagnostic hook (layout-mismatch triage)
+// ---------------------------------------------------------------------------
+//
+// When `gen_heap::{get,set}_field` detects an out-of-bounds field access it
+// can only log the raw numeric `ClassId`, which is useless for triage — the
+// orchestrator has to reverse-map it by hand. The `gc` crate cannot depend on
+// `classloading`, so (mirroring the JVMTI GC hooks above) the VM installs a
+// resolver function at boot. Given a raw class-id `u32` it returns the class
+// NAME and the class's REAL declared `num_total_fields`, converting an
+// opaque `ClassId(275)` into an actionable `org/jboss/.../Foo (real layout
+// has 7 fields)`.
+
+/// Signature of the class-info resolver installed by the VM crate.
+///
+/// Argument: the raw `ClassId` value (`ClassId::as_u32`).
+/// Returns: `Some((class_name, num_total_fields))` if the id is known,
+/// `None` if it is not registered (e.g. a raw test-only id).
+pub type ClassInfoHook = fn(u32) -> Option<(String, usize)>;
+
+static CLASS_INFO_HOOK: OnceLock<ClassInfoHook> = OnceLock::new();
+
+/// Install the class-info resolver used by heap layout-mismatch diagnostics.
+/// Idempotent — only the first installation wins.
+pub fn install_class_info_hook(hook: ClassInfoHook) {
+    let _ = CLASS_INFO_HOOK.set(hook);
+}
+
+/// Resolve a raw class id to `(name, declared_field_count)` if a resolver
+/// has been installed. Used only on cold diagnostic paths.
+pub fn resolve_class_info(class_id: u32) -> Option<(String, usize)> {
+    CLASS_INFO_HOOK.get().and_then(|hook| hook(class_id))
+}
+
 /// Statistics returned after a GC collection.
 #[derive(Debug, Clone)]
 pub struct GcStats {

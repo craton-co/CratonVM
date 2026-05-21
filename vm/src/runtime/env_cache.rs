@@ -93,6 +93,15 @@ cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
 cached_is_ok!(athrow_dbg, "CRATONVM_DBG_ATHROW");
 cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 
+/// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
+/// `NullPointerException: charset` blocker (keycloak26 Picocli /
+/// Hazelcast JAXP-XPath). When set, the `Athrow` opcode handler and
+/// `throw_runtime_error` dump the full live Java thread stack
+/// (`class.method:pc` for every frame) the moment an NPE whose message
+/// is exactly `charset` is thrown — pinpointing the JDK method and app
+/// call site that dereferenced a null `Charset`.
+cached_is_ok!(charset_dbg, "CRATONVM_DBG_CHARSET");
+
 // ── `CRATONVM_STRICT_SWALLOWS` is read for its value, not just presence ──
 
 /// `CRATONVM_STRICT_SWALLOWS=1` switches several diagnostic sites into a

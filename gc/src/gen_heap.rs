@@ -697,8 +697,26 @@ impl GenerationalHeap {
         }
         if index >= num_slots {
             // Layout mismatch — return null/zero instead of reading past
-            // the object.  A one-line trace at debug level would help
-            // diagnose future drift without flooding stderr.
+            // the object. Resolve the class name + real declared field
+            // count so the orchestrator can spot undersized-layout bugs
+            // (see the matching `set_field` diagnostic below).
+            let (class_name, real_fields) =
+                match crate::gc::resolve_class_info(header.class_id.as_u32()) {
+                    Some((name, n)) => (name, Some(n)),
+                    None => ("<unresolved>".to_string(), None),
+                };
+            tracing::error!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                class_name = %class_name,
+                real_field_count = ?real_fields,
+                "gen_heap::get_field: out-of-bounds field read dropped \
+                 (undersized object layout — class declares more fields \
+                 than the object was allocated with)",
+            );
             return Value::Object(None);
         }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
@@ -745,14 +763,31 @@ impl GenerationalHeap {
             // Out-of-bounds writes are dropped rather than corrupting the
             // neighboring object, but log first — silently swallowing this
             // masks real layout-mismatch bugs in the caller.
+            //
+            // Triage diagnostic: resolve the raw `ClassId` to the class
+            // NAME and its REAL declared field count via the VM-installed
+            // hook. `real_field_count > num_slots` is the smoking gun for
+            // an undersized synthetic-stub allocation: the object was
+            // allocated with `num_slots` slots but the class actually
+            // declares more — the same bug class as the `PrintStream`
+            // 1-field-stub fix (commit cf1b478).
+            let (class_name, real_fields) =
+                match crate::gc::resolve_class_info(header.class_id.as_u32()) {
+                    Some((name, n)) => (name, Some(n)),
+                    None => ("<unresolved>".to_string(), None),
+                };
             tracing::error!(
                 target: "cratonvm::gc::guard",
                 obj = ?obj_ref.as_ptr(),
                 index,
                 num_slots,
                 class_id = ?header.class_id,
+                class_name = %class_name,
+                real_field_count = ?real_fields,
                 value = ?value,
-                "gen_heap::set_field: out-of-bounds field write dropped",
+                "gen_heap::set_field: out-of-bounds field write dropped \
+                 (undersized object layout — class declares more fields \
+                 than the object was allocated with)",
             );
             return;
         }

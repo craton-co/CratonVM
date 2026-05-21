@@ -1299,11 +1299,61 @@ impl ClassManager {
     /// Prefer real `.class` files for application-visible types; see `docs/jvm-no-synthetic-stubs.md`.
     pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         if let Some(id) = self.get_loaded_class_id(name) {
-            // Already loaded — check if it's a real class with more fields.
-            // If so, we can't replace it (other code may hold references).
-            // For the System.out bootstrap, the caller handles this by
-            // checking the field count before calling us.
+            // Already loaded — but it might be a synthetic stub created by
+            // an earlier `ensure_synthetic_class` call with an undersized
+            // `num_fields`. If a real `.class` file is now reachable on the
+            // classpath, upgrade the stub in place so its `num_total_fields`
+            // (and hence every subsequently-allocated object) reflects the
+            // real field layout. Without this, an object allocated against
+            // the stub's tiny layout drops every `putfield` past the stub's
+            // slot count — the WildFly `WFLYCTL0002` boot failure and the
+            // `PrintStream` charset-NPE (commit cf1b478) are both instances
+            // of this bug class.
+            let is_synthetic = self
+                .class_store
+                .get(id)
+                .map(|c| c.is_synthetic_stub)
+                .unwrap_or(false);
+            if is_synthetic && !name.starts_with('[') {
+                if let Ok((bytes, loader_id)) = self.find_class_bytes_delegated(name) {
+                    if let Err(e) = self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                        tracing::debug!(
+                            class = name,
+                            "ensure_synthetic_class: real-class upgrade failed: {e:?}"
+                        );
+                    }
+                }
+            }
             return id;
+        }
+        // Not loaded yet: prefer the real `.class` file over a possibly
+        // undersized synthetic stub. `ensure_synthetic_class` is frequently
+        // called with a hand-picked `num_fields` (often 1) that predates the
+        // real JDK/app class being on the classpath; allocating objects
+        // against that stub layout silently truncates field writes. Try a
+        // real classpath load first — but only when the bytes are actually
+        // present, so pure synthetic-jdk mode (no real boot/app jars) skips
+        // straight to the synthetic stub below with no behaviour change.
+        //
+        // `load_class` is the authoritative loader: it handles the
+        // circular-load guard, registers the name in `loaded_classes`, and
+        // computes the real field layout. If it succeeds we MUST return its
+        // id — falling through would mint a second `Class` for an
+        // already-registered name and mis-key `loaded_classes`. When the
+        // bytes are genuinely absent (`find_class_bytes_delegated` errs) we
+        // skip this entirely and build the requested-size synthetic stub
+        // below, exactly as before.
+        if !name.starts_with('[') && self.find_class_bytes_delegated(name).is_ok() {
+            match self.load_class(name) {
+                Ok(id) => return id,
+                Err(e) => {
+                    tracing::debug!(
+                        class = name,
+                        "ensure_synthetic_class: real-class load failed, \
+                         falling back to synthetic stub: {e:?}"
+                    );
+                }
+            }
         }
         let id = self.class_store.next_id();
         let class = Class {

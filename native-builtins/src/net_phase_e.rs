@@ -2764,6 +2764,93 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(new_url))))
         },
     );
+    // java/net/JarURLConnection.getJarFile() — return a `java/util/jar/JarFile`
+    // opened on the enclosing JAR.
+    //
+    // `JarURLConnection` is ABSTRACT and `getJarFile()` is an abstract method
+    // (no Code attribute). The concrete implementation lives in
+    // `sun.net.www.protocol.jar.JarURLConnection` (or Spring Boot's own
+    // nested-jar `URLConnection`). Our `URL.openConnection()` above hands out
+    // a synthetic object whose *runtime* class is the abstract
+    // `java/net/JarURLConnection`, so a virtual `getJarFile()` dispatch lands
+    // on the abstract declaration and throws
+    //   `AbstractMethodError: java/net/JarURLConnection.getJarFile() has no
+    //    Code attribute`
+    // which aborts Spring Boot 4's `JarLauncher` before it can read the fat
+    // jar. Registering the native here completes the synthetic carrier the
+    // same way `getJarFileURL()` / `getInputStream()` already do.
+    //
+    // The originating `jar:file:…!/entry` URL is stored in HUC_URL; strip the
+    // `jar:file:` prefix and the `!/entry` suffix to recover the bare on-disk
+    // jar path, then construct a `java/util/jar/JarFile` via its
+    // `<init>(Ljava/lang/String;)V` native (`p59_jar_file_init`).
+    r.register(
+        "java/net/JarURLConnection",
+        "getJarFile",
+        "()Ljava/util/jar/JarFile;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("JarURLConnection.getJarFile: no URL")),
+            };
+            // Recover the full `jar:file:…!/…` external form.
+            let mut ext = read_field_string_or(ctx, url_obj, 5, "");
+            if !ext.starts_with("jar:") {
+                if let Ok(Some(Value::Object(Some(o)))) = ctx.invoke_virtual(
+                    url_obj, "toExternalForm", "()Ljava/lang/String;", &[],
+                ) {
+                    ext = ctx.read_string(o).unwrap_or_default();
+                }
+            }
+            // jar:file:<path>!/<entry>  →  <path>  (the outer jar on disk).
+            // For a double-nested Spring Boot 2.x URL
+            //   jar:file:/fat.jar!/BOOT-INF/lib/inner.jar!/entry
+            // the *first* `!/`-delimited segment is still the outer jar.
+            let after_scheme = ext
+                .strip_prefix("jar:file:")
+                .or_else(|| ext.strip_prefix("jar:"))
+                .unwrap_or(&ext);
+            let jar_part = after_scheme
+                .split("!/")
+                .next()
+                .unwrap_or("")
+                .trim_start_matches("file:")
+                .to_string();
+            if jar_part.is_empty() {
+                return Err(ioex("JarURLConnection.getJarFile: malformed URL"));
+            }
+            // Resolve to a real on-disk path. `file:` URLs use a leading `/`
+            // before a Windows drive letter (`/C:/…`); try the trimmed form
+            // first, then the raw form for POSIX absolute paths — mirrors the
+            // `URL.openStream` resolution above.
+            let trimmed = jar_part.trim_start_matches('/');
+            let disk_path = if std::path::Path::new(trimmed).exists() {
+                trimmed.to_string()
+            } else if std::path::Path::new(&jar_part).exists() {
+                jar_part.clone()
+            } else {
+                // Path doesn't exist yet (or is virtual) — hand the trimmed
+                // form to JarFile.<init>; its own open will surface a real
+                // IOException if the jar is genuinely missing.
+                trimmed.to_string()
+            };
+            // Allocate the JarFile and run its <init>(String) native so the
+            // `path` (field 0) and parsed `manifest` (field 1) are populated.
+            let jar_file = match ctx.new_object("java/util/jar/JarFile")? {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Err(ioex("JarURLConnection.getJarFile: alloc JarFile")),
+            };
+            let path_str = ctx.create_string(&disk_path);
+            ctx.invoke_special(
+                "java/util/jar/JarFile",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(jar_file)), Value::Object(Some(path_str))],
+            )?;
+            Ok(Some(Value::Object(Some(jar_file))))
+        },
+    );
     // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
     // `ResourceUtils.useCachesIfNecessary` calls setUseCaches(false) on
     // file: URLs; without these no-op natives the call would fall through

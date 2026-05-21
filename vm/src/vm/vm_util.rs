@@ -804,6 +804,25 @@ fn initialize_class_shared(
                             );
                         }
                     } else {
+                        // CRATONVM_DBG_CATALINA — log every <clinit> error
+                        // swallowed during Tomcat-related class init. A
+                        // swallowed clinit in a class `Catalina` depends on
+                        // leaves a static field null and surfaces later as the
+                        // bare NPE that aborts `Catalina.<clinit>`.
+                        if std::env::var("CRATONVM_DBG_CATALINA").is_ok()
+                            && (class_name_for_jfr.starts_with("org/apache/catalina/")
+                                || class_name_for_jfr.starts_with("org/apache/tomcat/")
+                                || class_name_for_jfr.starts_with("org/apache/coyote/")
+                                || class_name_for_jfr.starts_with("org/apache/juli/")
+                                || class_name_for_jfr.starts_with("java/util/")
+                                || class_name_for_jfr.starts_with("sun/util/"))
+                        {
+                            eprintln!(
+                                "CATALINA-DBG: SWALLOWED <clinit> error class={} exc={} \
+                                 — a static field of this class is now NULL",
+                                class_name_for_jfr, exc_detail
+                            );
+                        }
                         crate::runtime::diagnostics::record_swallow(
                             shared,
                             "<clinit>",
