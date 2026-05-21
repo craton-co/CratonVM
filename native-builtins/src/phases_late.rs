@@ -5585,6 +5585,52 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(result))))
     });
 
+    // `Path.toRealPath(LinkOption...)` — resolve to the real, canonical path of
+    // an *existing* file. Per the JDK contract this method throws
+    // `java.nio.file.NoSuchFileException` when the file does not exist; callers
+    // such as Jetty's `start.jar` (`DirConfigSource.<init>`) rely on that
+    // specific exception type — its bytecode has an exception-table entry that
+    // catches `NoSuchFileException` to fall through to `start.d` scanning.
+    // Previously `toRealPath` was unregistered and the real-JDK `WindowsPath`
+    // bytecode (whose `WindowsNativeDispatcher` natives are not implemented)
+    // returned `null`, so `FS.canReadFile(null)` -> `Files.exists(null)` raised
+    // an uncatchable NPE. We must return a non-null Path or throw the *typed*
+    // `NoSuchFileException` so the catch clause matches.
+    r.register(
+        path,
+        "toRealPath",
+        "([Ljava/nio/file/LinkOption;)Ljava/nio/file/Path;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, this);
+            // jar-filesystem entries: a real path inside a mounted jar. If the
+            // entry is present, the path itself is already "real"; otherwise
+            // it does not exist.
+            if let Some((jar, entry)) = jarfs_decode(&p) {
+                if matches!(jarfs_classify(&jar, &entry), JarFsKind::Absent) {
+                    return Err(p57_no_such_file(ctx, &p));
+                }
+                let result = p57_alloc_path(ctx, &p);
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            match std::fs::canonicalize(&p) {
+                Ok(c) => {
+                    let real = c.to_string_lossy().replace('\\', "/");
+                    // Strip the Windows `\\?\` extended-length prefix that
+                    // `canonicalize` adds, so the path stays usable by other
+                    // string-based Path natives.
+                    let real = real
+                        .strip_prefix("//?/")
+                        .map(|s| s.to_string())
+                        .unwrap_or(real);
+                    let result = p57_alloc_path(ctx, &real);
+                    Ok(Some(Value::Object(Some(result))))
+                }
+                Err(_) => Err(p57_no_such_file(ctx, &p)),
+            }
+        },
+    );
+
     r.register(path, "normalize", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
@@ -6128,6 +6174,25 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let s = ctx.create_string(path);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
     obj
+}
+
+/// Build a *typed* `java.nio.file.NoSuchFileException` for `path` and return it
+/// wrapped as a thrown Java exception.
+///
+/// Using `alloc_concurrent_synthetic` resolves the real
+/// `java.nio.file.NoSuchFileException` class, so the thrown object carries the
+/// genuine `ClassId` — exception handlers that `catch (NoSuchFileException)` (or
+/// any superclass: `FileSystemException`, `IOException`, `Exception`) match it
+/// correctly. We populate the `FileSystemException.file` slot (carries the
+/// offending path); `FileSystemException.getMessage()` builds the human
+/// message from that field, so we deliberately leave `Throwable.detailMessage`
+/// null to avoid a doubled `<path>: <path>` message.
+fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NoSuchFileException", 4);
+    let file_str = ctx.create_string(path);
+    // FileSystemException stores the offending path in its `file` field.
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    MethodCallFailed::ExceptionThrown(exc)
 }
 
 // --- jar-filesystem path encoding ---------------------------------------

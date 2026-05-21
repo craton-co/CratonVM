@@ -476,6 +476,19 @@ fn alloc_arraylist_with(
 
 /// Extract ArrayList state: (elementData, size).
 fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32) {
+    // See through CratonVM's unmodifiable wrapper views. A generic
+    // `java/util/List` interface native (e.g. `native_al_equals`) can be
+    // dispatched with a `cratonvm/internal/UnmodifiableList` receiver — and,
+    // critically, with such a wrapper as the *other* argument: e.g.
+    // `List.of(...).equals(List.of(...))` delegates `equals` to the backing
+    // ArrayList, which then reads the wrapper argument's slots. Slot 0 of a
+    // wrapper is the backing collection ObjectRef, NOT the element array;
+    // without this unwrap `al_state` sees a non-array there, reports
+    // `data = None` / `size = 0`, and `equals` wrongly returns false. Reading
+    // from the backing ArrayList is always correct here — all wrapper mutators
+    // throw, so callers reaching `al_state` are read-only. Mirrors the same
+    // unwrap that `map_state` already performs for unmodifiable maps.
+    let this = unwrap_unmod(ctx, this);
     let (data_slot, size_slot, _) = al_slots(ctx);
     let data = match ctx.get_field(this, data_slot) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
