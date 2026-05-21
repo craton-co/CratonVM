@@ -13450,6 +13450,7 @@ fn native_unsafe_unpark(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // args: [unsafe, thread_obj]
     if let Some(Value::Object(Some(thread_obj))) = args.get(1) {
         ctx.unpark(*thread_obj);
+    } else {
     }
     Ok(None)
 }
@@ -14935,6 +14936,7 @@ fn native_lock_support_unpark(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // args: [thread_obj]
     if let Some(Value::Object(Some(thread_obj))) = args.first() {
         ctx.unpark(*thread_obj);
+    } else {
     }
     Ok(None)
 }
@@ -16832,18 +16834,74 @@ fn day_of_week_from_epoch_day(epoch_day: i64) -> i32 {
 
 // ==================== Phase 24: java.util.concurrent ====================
 //
-// ReentrantLock = 3-field synthetic (owner=0 Long, holdCount=1 Int, fair=2 Int)
 // Condition = 1-field synthetic (lock=0 reference to owning ReentrantLock)
 // CountDownLatch = 1-field synthetic (count=0 Int)
 // Semaphore = 2-field synthetic (permits=0 Int, fair=1 Int)
 // CyclicBarrier = 3-field synthetic (parties=0 Int, count=1 Int, broken=2 Int)
 // CopyOnWriteArrayList = 2-field synthetic (same as ArrayList: data=0, size=1)
+//
+// ReentrantLock: lock state lives in a SIDE TABLE (`rl_state_table`), not in
+// object fields. `java.util.concurrent.locks.ReentrantLock` is loaded as the
+// real JDK class, whose sole instance field (slot 0) is the `Sync`
+// reference. The lock natives used to scribble `owner`/`holdCount`/`fair`
+// into slots 0/1/2 — slot 0 collided with `sync`, so a `long` owner written
+// there did not round-trip (a typed reference read decodes the bits as
+// `Object`), and slots 1/2 were out of bounds. The side table, keyed by the
+// lock's GC-stable monotonic identity-hash, sidesteps the layout entirely.
 
-const RL_FIELD_OWNER: usize = 0;
-const RL_FIELD_HOLD_COUNT: usize = 1;
-const RL_FIELD_FAIR: usize = 2;
+/// Logical "no owner" for a `ReentrantLock`.
+const RL_UNOWNED: i64 = -1;
 
 const COND_FIELD_LOCK: usize = 0;
+
+/// Per-`ReentrantLock` lock state held in the side table.
+#[derive(Clone, Copy, Default)]
+struct RlState {
+    /// Owning thread id, or `-1` ([`RL_UNOWNED`]) when unheld.
+    owner: i64,
+    /// Reentrant hold count (0 when unheld).
+    hold: i32,
+    /// `true` for a fair lock.
+    fair: bool,
+}
+
+/// Side table: lock identity-hash → [`RlState`].
+fn rl_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, RlState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, RlState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stable key for a lock object — its monotonic identity-hash code.
+fn rl_key(ctx: &mut dyn NativeContext, lock: ObjectRef) -> i32 {
+    ctx.identity_hash_code(lock)
+}
+
+/// Read the current [`RlState`] for a lock (default = unheld).
+fn rl_get(key: i32) -> RlState {
+    rl_state_table()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).copied())
+        .unwrap_or(RlState {
+            owner: RL_UNOWNED,
+            hold: 0,
+            fair: false,
+        })
+}
+
+/// Run `f` with exclusive access to a lock's [`RlState`], creating a
+/// default (unheld) entry on first touch. The whole closure runs under the
+/// side-table mutex, so a read-modify-write of the lock state is atomic.
+fn rl_with<R>(key: i32, f: impl FnOnce(&mut RlState) -> R) -> R {
+    let mut t = rl_state_table().lock().unwrap_or_else(|e| e.into_inner());
+    let st = t.entry(key).or_insert(RlState {
+        owner: RL_UNOWNED,
+        hold: 0,
+        fair: false,
+    });
+    f(st)
+}
 
 const CDL_FIELD_COUNT: usize = 0;
 
@@ -19860,9 +19918,14 @@ fn native_rl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, RL_FIELD_OWNER, Value::Long(0)); // no owner
-    ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(0));
-    ctx.set_field(this, RL_FIELD_FAIR, Value::Int(0));
+    let key = rl_key(ctx, this);
+    rl_with(key, |st| {
+        *st = RlState {
+            owner: RL_UNOWNED,
+            hold: 0,
+            fair: false,
+        };
+    });
     Ok(None)
 }
 
@@ -19871,13 +19934,15 @@ fn native_rl_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let fair = match args.get(1) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    ctx.set_field(this, RL_FIELD_OWNER, Value::Long(0));
-    ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(0));
-    ctx.set_field(this, RL_FIELD_FAIR, Value::Int(fair));
+    let fair = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+    let key = rl_key(ctx, this);
+    rl_with(key, |st| {
+        *st = RlState {
+            owner: RL_UNOWNED,
+            hold: 0,
+            fair,
+        };
+    });
     Ok(None)
 }
 
@@ -19887,42 +19952,31 @@ fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(None),
     };
     let tid = ctx.thread_id() as i64;
+    let key = rl_key(ctx, this);
     loop {
-        let owner = match ctx.get_field_volatile(this, RL_FIELD_OWNER) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        if owner == tid {
-            // Reentrant: increment hold count (only this thread can touch it)
-            let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(hold + 1));
+        // Atomically claim (or reentrantly re-claim) the lock under the
+        // side-table mutex. `claimed` is true iff this call now holds it.
+        let claimed = rl_with(key, |st| {
+            if st.owner == RL_UNOWNED || st.owner == tid {
+                st.owner = tid;
+                st.hold += 1;
+                true
+            } else {
+                false
+            }
+        });
+        if claimed {
             return Ok(None);
         }
-        if owner == 0 {
-            // Atomically claim the lock.
-            if ctx.compare_and_swap_field(
-                this,
-                RL_FIELD_OWNER,
-                Value::Long(0),
-                Value::Long(tid),
-            ) {
-                ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(1));
-                return Ok(None);
-            }
-            // Lost the race; spin once and retry.
-            continue;
-        }
-        // Owned by another thread — park on the object monitor until released.
+        // Owned by another thread — park on the lock object's monitor until
+        // a releaser notifies. The 5ms timeout re-checks defensively.
         ctx.monitor_enter(this);
-        let still_owned = match ctx.get_field_volatile(this, RL_FIELD_OWNER) {
-            Value::Long(v) => v != 0 && v != tid,
-            _ => false,
+        let still_owned = {
+            let st = rl_get(key);
+            st.owner != RL_UNOWNED && st.owner != tid
         };
         if still_owned {
-            ctx.monitor_wait(this, Some(5))?; // short timeout to re-check
+            ctx.monitor_wait(this, Some(5))?;
         }
         ctx.monitor_exit(this);
     }
@@ -19934,32 +19988,37 @@ fn native_rl_unlock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field(this, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-
-    if owner != tid {
-        return Err(RuntimeError::IllegalMonitorStateException {
+    let key = rl_key(ctx, this);
+    // Atomically verify ownership and decrement; report whether the lock is
+    // now fully released so we can notify a waiter outside the mutex.
+    let outcome = rl_with(key, |st| {
+        if st.owner != tid {
+            return None;
+        }
+        st.hold -= 1;
+        if st.hold <= 0 {
+            st.hold = 0;
+            st.owner = RL_UNOWNED;
+            Some(true)
+        } else {
+            Some(false)
+        }
+    });
+    match outcome {
+        None => Err(RuntimeError::IllegalMonitorStateException {
             message: "current thread is not owner".to_string(),
         }
-        .into());
+        .into()),
+        Some(fully_released) => {
+            if fully_released {
+                // Wake one thread waiting in `native_rl_lock` to acquire.
+                ctx.monitor_enter(this);
+                ctx.monitor_notify(this)?;
+                ctx.monitor_exit(this);
+            }
+            Ok(None)
+        }
     }
-    let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if hold <= 1 {
-        ctx.set_field(this, RL_FIELD_OWNER, Value::Long(0));
-        ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(0));
-        // Notify one waiting thread that the lock is available
-        ctx.monitor_enter(this);
-        ctx.monitor_notify(this)?;
-        ctx.monitor_exit(this);
-    } else {
-        ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(hold - 1));
-    }
-    Ok(None)
 }
 
 fn native_rl_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -19968,26 +20027,17 @@ fn native_rl_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field_volatile(this, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    if owner == tid {
-        // Reentrant
-        let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(hold + 1));
-        return Ok(Some(Value::Int(1)));
-    }
-    // Atomic claim via CAS.
-    if ctx.compare_and_swap_field(this, RL_FIELD_OWNER, Value::Long(0), Value::Long(tid)) {
-        ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(1));
-        Ok(Some(Value::Int(1)))
-    } else {
-        Ok(Some(Value::Int(0)))
-    }
+    let key = rl_key(ctx, this);
+    let claimed = rl_with(key, |st| {
+        if st.owner == RL_UNOWNED || st.owner == tid {
+            st.owner = tid;
+            st.hold += 1;
+            true
+        } else {
+            false
+        }
+    });
+    Ok(Some(Value::Int(if claimed { 1 } else { 0 })))
 }
 
 fn native_rl_try_lock_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20009,22 +20059,19 @@ fn native_rl_try_lock_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if timeout_ms <= 0 {
         return native_rl_try_lock(ctx, args);
     }
+    let key = rl_key(ctx, this);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
     loop {
-        let owner = match ctx.get_field_volatile(this, RL_FIELD_OWNER) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        if owner == tid {
-            let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(hold + 1));
-            return Ok(Some(Value::Int(1)));
-        }
-        if owner == 0 && ctx.compare_and_swap_field(this, RL_FIELD_OWNER, Value::Long(0), Value::Long(tid)) {
-            ctx.set_field(this, RL_FIELD_HOLD_COUNT, Value::Int(1));
+        let claimed = rl_with(key, |st| {
+            if st.owner == RL_UNOWNED || st.owner == tid {
+                st.owner = tid;
+                st.hold += 1;
+                true
+            } else {
+                false
+            }
+        });
+        if claimed {
             return Ok(Some(Value::Int(1)));
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -20048,11 +20095,8 @@ fn native_rl_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(if hold > 0 { 1 } else { 0 })))
+    let key = rl_key(ctx, this);
+    Ok(Some(Value::Int(if rl_get(key).owner != RL_UNOWNED { 1 } else { 0 })))
 }
 
 fn native_rl_is_held_by_current_thread(
@@ -20064,11 +20108,8 @@ fn native_rl_is_held_by_current_thread(
         _ => return Ok(Some(Value::Int(0))),
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field(this, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(if owner == tid { 1 } else { 0 })))
+    let key = rl_key(ctx, this);
+    Ok(Some(Value::Int(if rl_get(key).owner == tid { 1 } else { 0 })))
 }
 
 fn native_rl_get_hold_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20076,11 +20117,11 @@ fn native_rl_get_hold_count(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(hold)))
+    let tid = ctx.thread_id() as i64;
+    let key = rl_key(ctx, this);
+    let st = rl_get(key);
+    // `getHoldCount()` reports the count for the *current* thread only.
+    Ok(Some(Value::Int(if st.owner == tid { st.hold } else { 0 })))
 }
 
 fn native_rl_is_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20088,11 +20129,8 @@ fn native_rl_is_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let fair = match ctx.get_field(this, RL_FIELD_FAIR) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    Ok(Some(Value::Int(fair)))
+    let key = rl_key(ctx, this);
+    Ok(Some(Value::Int(if rl_get(key).fair { 1 } else { 0 })))
 }
 
 fn native_rl_new_condition(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20110,17 +20148,33 @@ fn native_rl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let hold = match ctx.get_field(this, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
+    let key = rl_key(ctx, this);
+    let state = if rl_get(key).owner != RL_UNOWNED {
+        "locked"
+    } else {
+        "unlocked"
     };
-    let state = if hold > 0 { "locked" } else { "unlocked" };
     let s = format!(
         "java.util.concurrent.locks.ReentrantLock@{:x}[{state}]",
         this.as_ptr() as usize
     );
     let obj = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Release a `ReentrantLock` for a thread that is about to `await()` on one
+/// of its conditions. Returns the saved hold count to restore on re-acquire,
+/// or `None` if the caller does not own the lock.
+fn rl_release_for_await(key: i32, tid: i64) -> Option<i32> {
+    rl_with(key, |st| {
+        if st.owner != tid {
+            return None;
+        }
+        let saved = if st.hold <= 0 { 1 } else { st.hold };
+        st.owner = RL_UNOWNED;
+        st.hold = 0;
+        Some(saved)
+    })
 }
 
 // --- Condition ---
@@ -20141,34 +20195,36 @@ fn native_cond_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field(lock_ref, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    if owner != tid {
-        return Err(RuntimeError::IllegalMonitorStateException {
-            message: "current thread is not owner".to_string(),
+    let lock_key = rl_key(ctx, lock_ref);
+    // FELIX FIX (lost-wakeup race): acquire the *condition* monitor BEFORE
+    // releasing the ReentrantLock. `signal`/`signalAll` must `monitor_enter`
+    // this same monitor to notify, so holding it here forces a concurrent
+    // signaller to block until we reach `monitor_wait` (which atomically
+    // releases the monitor and waits). Previously the lock was released and
+    // lock-waiters notified BEFORE `monitor_enter(this)`, leaving a window
+    // where a `signalAll()` from the lock's new owner ran to completion and
+    // its `notify_all` reached no waiter — the awaiter then blocked on
+    // `monitor_wait` forever. This is exactly Felix's `acquireBundleLock`/
+    // `releaseBundleLock` handoff, which otherwise deadlocks `Felix.start()`.
+    ctx.monitor_enter(this);
+    let saved_hold = match rl_release_for_await(lock_key, tid) {
+        Some(h) => h,
+        None => {
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "current thread is not owner".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    // Release lock, wait (simplified: non-blocking), reacquire
-    let saved_hold = match ctx.get_field(lock_ref, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 1,
     };
-    // RD.5: atomic lock release — clear hold count first, then owner via volatile.
-    ctx.set_field(lock_ref, RL_FIELD_HOLD_COUNT, Value::Int(0));
-    ctx.set_field_volatile(lock_ref, RL_FIELD_OWNER, Value::Long(0));
-    // Notify any threads waiting to acquire the lock
+    // Notify any threads waiting to acquire the now-free lock.
     ctx.monitor_enter(lock_ref);
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
-    // Park the current thread until signaled on the condition
-    ctx.monitor_enter(this);
+    // Atomically release the condition monitor and wait for a signal.
     ctx.monitor_wait(this, None)?;
     ctx.monitor_exit(this);
-    // Reacquire lock via CAS (no lost-update window vs concurrent lock()).
-    reacquire_lock_cas(ctx, lock_ref, tid, saved_hold)?;
+    reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
     Ok(None)
 }
 
@@ -20192,51 +20248,52 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(1))),
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field_volatile(lock_ref, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
+    let lock_key = rl_key(ctx, lock_ref);
+    // FELIX FIX (lost-wakeup race): hold the condition monitor across the
+    // lock release — see `native_cond_await` for the full rationale.
+    ctx.monitor_enter(this);
+    let saved_hold = match rl_release_for_await(lock_key, tid) {
+        Some(h) => h,
+        None => {
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "current thread is not owner".to_string(),
+            }
+            .into());
+        }
     };
-    if owner != tid {
-        return Err(RuntimeError::IllegalMonitorStateException {
-            message: "current thread is not owner".to_string(),
-        }.into());
-    }
-    let saved_hold = match ctx.get_field(lock_ref, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 1,
-    };
-    // Release lock and notify any thread waiting to acquire.
-    ctx.set_field(lock_ref, RL_FIELD_HOLD_COUNT, Value::Int(0));
-    ctx.set_field_volatile(lock_ref, RL_FIELD_OWNER, Value::Long(0));
     ctx.monitor_enter(lock_ref);
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     let start = std::time::Instant::now();
-    ctx.monitor_enter(this);
     ctx.monitor_wait(this, Some(timeout_ms))?;
     ctx.monitor_exit(this);
     let timed_out = start.elapsed().as_millis() as u64 >= timeout_ms;
-    reacquire_lock_cas(ctx, lock_ref, tid, saved_hold)?;
+    reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
     Ok(Some(Value::Int(if timed_out { 0 } else { 1 })))
 }
 
-fn reacquire_lock_cas(
+/// Re-acquire a `ReentrantLock` after a condition `await()` returns,
+/// restoring the saved reentrant hold count. Spins (with a short monitor
+/// wait) until the lock is free.
+fn reacquire_lock_after_await(
     ctx: &mut dyn NativeContext,
     lock_ref: ObjectRef,
+    lock_key: i32,
     tid: i64,
     saved_hold: i32,
 ) -> MethodCallResult {
     loop {
-        if ctx.compare_and_swap_field(lock_ref, RL_FIELD_OWNER, Value::Long(0), Value::Long(tid)) {
-            ctx.set_field(lock_ref, RL_FIELD_HOLD_COUNT, Value::Int(saved_hold));
-            return Ok(None);
-        }
-        let owner = match ctx.get_field_volatile(lock_ref, RL_FIELD_OWNER) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        if owner == tid {
-            ctx.set_field(lock_ref, RL_FIELD_HOLD_COUNT, Value::Int(saved_hold));
+        let claimed = rl_with(lock_key, |st| {
+            if st.owner == RL_UNOWNED || st.owner == tid {
+                st.owner = tid;
+                st.hold = saved_hold;
+                true
+            } else {
+                false
+            }
+        });
+        if claimed {
             return Ok(None);
         }
         ctx.monitor_enter(lock_ref);
@@ -20261,31 +20318,29 @@ fn native_cond_await_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Long(0))),
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field(lock_ref, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
+    let lock_key = rl_key(ctx, lock_ref);
+    // FELIX FIX (lost-wakeup race): hold the condition monitor across the
+    // lock release — see `native_cond_await` for the full rationale.
+    ctx.monitor_enter(this);
+    let saved_hold = match rl_release_for_await(lock_key, tid) {
+        Some(h) => h,
+        None => {
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "current thread is not owner".to_string(),
+            }
+            .into());
+        }
     };
-    if owner != tid {
-        return Err(RuntimeError::IllegalMonitorStateException {
-            message: "current thread is not owner".to_string(),
-        }.into());
-    }
-    let saved_hold = match ctx.get_field(lock_ref, RL_FIELD_HOLD_COUNT) {
-        Value::Int(v) => v,
-        _ => 1,
-    };
-    ctx.set_field(lock_ref, RL_FIELD_HOLD_COUNT, Value::Int(0));
-    ctx.set_field_volatile(lock_ref, RL_FIELD_OWNER, Value::Long(0));
     ctx.monitor_enter(lock_ref);
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     let start = std::time::Instant::now();
-    ctx.monitor_enter(this);
     ctx.monitor_wait(this, Some(timeout_ms))?;
     ctx.monitor_exit(this);
     let elapsed_nanos = start.elapsed().as_nanos() as i64;
     let remaining = nanos.saturating_sub(elapsed_nanos).max(0);
-    reacquire_lock_cas(ctx, lock_ref, tid, saved_hold)?;
+    reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
     Ok(Some(Value::Long(remaining)))
 }
 
@@ -20305,11 +20360,8 @@ fn native_cond_signal(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field(lock_ref, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    if owner != tid {
+    let lock_key = rl_key(ctx, lock_ref);
+    if rl_get(lock_key).owner != tid {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "current thread does not hold the lock".to_string(),
         }
@@ -20338,11 +20390,8 @@ fn native_cond_signal_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let tid = ctx.thread_id() as i64;
-    let owner = match ctx.get_field(lock_ref, RL_FIELD_OWNER) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    if owner != tid {
+    let lock_key = rl_key(ctx, lock_ref);
+    if rl_get(lock_key).owner != tid {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "current thread does not hold the lock".to_string(),
         }
@@ -34454,13 +34503,13 @@ mod concurrency_tests {
 
         // Lock: hold count should become 1
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(1));
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(ctx.thread_id() as i64));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 1);
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, ctx.thread_id() as i64);
 
         // Unlock: hold count should become 0, owner should become 0
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(0));
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 0);
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
     }
 
     #[test]
@@ -34471,7 +34520,7 @@ mod concurrency_tests {
 
         let result = native_rl_try_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         assert_eq!(result, Some(Value::Int(1))); // true
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(1));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 1);
     }
 
     #[test]
@@ -34483,17 +34532,17 @@ mod concurrency_tests {
         // Lock twice -- should increment hold count to 2
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(2));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 2);
 
         // First unlock decrements to 1 (still locked)
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(1));
-        assert_ne!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 1);
+        assert_ne!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
 
         // Second unlock fully releases
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(0));
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 0);
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
     }
 
     #[test]
@@ -34507,7 +34556,7 @@ mod concurrency_tests {
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         // This should succeed (calls monitor_notify internally)
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
     }
 
     // -----------------------------------------------------------------------
@@ -34533,7 +34582,7 @@ mod concurrency_tests {
         native_cond_await(&mut ctx, &[Value::Object(Some(cond))]).unwrap();
 
         // After await returns, lock should be reacquired
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(ctx.thread_id() as i64));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, ctx.thread_id() as i64);
     }
 
     #[test]
@@ -34950,12 +34999,12 @@ mod concurrency_tests {
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(1));
-        assert_ne!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 1);
+        assert_ne!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
 
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(0));
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 0);
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
     }
 
     // ------- Condition with real timeout -------
@@ -34979,7 +35028,7 @@ mod concurrency_tests {
         // In mock, returns immediately so not timed out
         assert_eq!(result, Value::Int(1));
         // Lock should be reacquired
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(ctx.thread_id() as i64));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, ctx.thread_id() as i64);
     }
 
     #[test]
@@ -35002,7 +35051,7 @@ mod concurrency_tests {
             _ => panic!("expected Long"),
         }
         // Lock should be reacquired
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(ctx.thread_id() as i64));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, ctx.thread_id() as i64);
     }
 
     // ------- CopyOnWriteArrayList (already real) -------
@@ -35243,12 +35292,12 @@ mod concurrency_tests {
         assert_eq!(hc, Value::Int(3));
 
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(2));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 2);
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(1));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 1);
         native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
-        assert_eq!(ctx.get_field(lock, RL_FIELD_HOLD_COUNT), Value::Int(0));
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(0));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).hold, 0);
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, RL_UNOWNED);
 
         // Unlock without holding must raise IllegalMonitorStateException.
         let err = native_rl_unlock(&mut ctx, &[Value::Object(Some(lock))]);
@@ -35284,7 +35333,7 @@ mod concurrency_tests {
             _ => panic!("expected Int"),
         }
         // Lock reacquired on return.
-        assert_eq!(ctx.get_field(lock, RL_FIELD_OWNER), Value::Long(ctx.thread_id() as i64));
+        assert_eq!(rl_get(rl_key(&mut ctx, lock)).owner, ctx.thread_id() as i64);
     }
 
     /// RD.8 — CompletableFuture.thenApply propagates exceptional state
