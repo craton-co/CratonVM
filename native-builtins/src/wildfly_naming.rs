@@ -486,13 +486,137 @@ fn read_string_arg(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Optio
     }
 }
 
+// ---------------------------------------------------------------------------
+// `java:` URL-context-factory delegation
+//
+// The flat process-wide binding store above is the *WildFly / Keycloak*
+// naming substitute — WildFly's naming subsystem never runs the JDK's stock
+// `InitialContext` bytecode, so the natives own the `java:jboss/...` /
+// `java:comp/...` namespace directly.
+//
+// Apache Tomcat is the opposite case: it ships its own
+// `org.apache.naming.*` `Context` implementations and relies on the *stock*
+// JDK `InitialContext` → `NamingManager.getURLContext("java", env)` →
+// `org.apache.naming.java.javaURLContextFactory` dispatch chain. A name
+// like `java:/comp/env` must be resolved against Tomcat's per-thread
+// `org.apache.naming.ContextBindings`, NOT against our flat store (where it
+// was never bound, since Tomcat binds through its own `NamingContext`).
+//
+// Because a registered native unconditionally shadows the real JDK
+// bytecode, the native cannot simply "fall through" to `InitialContext`'s
+// own body. Instead it reproduces the spec'd `getURLOrDefaultInitCtx`
+// step: ask `NamingManager.getURLContext` for the `java:` URL context and,
+// if a real one comes back, delegate the operation onto it via *virtual*
+// dispatch. The returned context's concrete class is Tomcat's
+// `SelectorContext` / `javaURLContext` (never `InitialContext`), so this
+// does not recurse back into these natives.
+//
+// When `getURLContext` returns null / throws (no URL factory installed —
+// e.g. a plain WildFly run, or a unit test), the caller falls back to the
+// flat in-memory store, preserving the existing WildFly behaviour.
+
+/// True iff `name` is an absolute JNDI name in the `java:` URL scheme.
+fn is_java_url_scheme(name: &str) -> bool {
+    name.trim_start().starts_with("java:")
+}
+
+/// Ask the JDK's `NamingManager` for the `java:` URL context.
+///
+/// Returns:
+/// * `Ok(Some(ctx))` — a real `Context` was produced; the caller delegates
+///   the JNDI operation onto it (this is the Apache Tomcat path);
+/// * `Ok(None)` — no `java:` URL factory is installed, so the caller
+///   should fall back to the flat in-memory store;
+/// * `Err(_)` — a non-exception VM failure escaped.
+///
+/// The `Ok(None)` result is also the WildFly / Keycloak path: a stock JDK
+/// has *no* `java:` URL context factory, so `getURLContext("java", …)`
+/// returns `null` there and the `java:jboss/...` traffic keeps using the
+/// flat store. The decision is therefore made by the JDK's own
+/// `getURLContext` contract — exactly the spec'd `getURLOrDefaultInitCtx`
+/// behaviour — rather than by guessing which app server is running.
+///
+/// `env` is the `InitialContext`'s environment `Hashtable` (may be null —
+/// `getURLContext` accepts a null environment and consults the
+/// `java.naming.factory.url.pkgs` system property, which Tomcat sets).
+fn java_url_context(
+    ctx: &mut dyn NativeContext,
+    env: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    // `NamingManager` is a stock `java.naming` class. If the module is not
+    // present (it always is for a real-JDK run) treat the scheme as
+    // unhandled and let the caller fall back to the flat store.
+    if ctx
+        .ensure_class_initialized("javax/naming/spi/NamingManager")
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let scheme = ctx.create_string("java");
+    let result = ctx.invoke(
+        "javax/naming/spi/NamingManager",
+        "getURLContext",
+        "(Ljava/lang/String;Ljava/util/Hashtable;)Ljavax/naming/Context;",
+        &[Value::Object(Some(scheme)), env],
+    );
+    match result {
+        Ok(Some(Value::Object(Some(c)))) => Ok(Some(c)),
+        Ok(_) => Ok(None),
+        // A throwing `getURLContext` (e.g. factory class missing) is not
+        // fatal here: fall back to the flat store rather than aborting the
+        // whole lookup.
+        Err(MethodCallFailed::ExceptionThrown(_)) => Ok(None),
+        Err(other) => Err(other),
+    }
+}
+
+/// Read the `InitialContext` environment table to forward to
+/// `getURLContext`.
+///
+/// Slot 0 is the environment table *only* under our synthetic layout
+/// (see `class_manager::synthetic_stub_fields`). When the real JDK
+/// `javax/naming/InitialContext` class is loaded its field order differs
+/// (`myProps` / `defaultInitCtx` / `gotDefault`), so reading slot 0 would
+/// hand `getURLContext` an arbitrary object. `getURLContext` accepts a
+/// null `Hashtable` and Tomcat's `javaURLContextFactory` does not consult
+/// the environment, so we conservatively pass null whenever the class is
+/// not our synthetic stub.
+fn initial_context_env(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
+    let is_synthetic = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .map(|n| ctx.is_class_synthetic_stub(&n))
+        .unwrap_or(false);
+    if is_synthetic {
+        ctx.get_field(this, INIT_CTX_FIELD_ENV)
+    } else {
+        Value::Object(None)
+    }
+}
+
 fn native_context_lookup(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
+
+    // `java:` URL-scheme names: hand off to the JDK's URL-context-factory
+    // chain so Tomcat's own `org.apache.naming` context resolves the name
+    // against `ContextBindings`. Falls back to the flat store on null/err.
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "lookup",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+    }
+
     match lookup_value(&name) {
         Ok(obj) => Ok(Some(Value::Object(Some(obj)))),
         Err(msg) => {
@@ -511,13 +635,30 @@ fn native_context_bind(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Err(throw_naming_exception("bind: null value not supported")),
     };
+
+    // `java:` URL-scheme names go through the JDK URL-context factory so
+    // the binding lands in Tomcat's own context (kept consistent with the
+    // namespace its `lookup` reads from).
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "bind",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+                &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
+            );
+        }
+    }
+
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
@@ -535,13 +676,27 @@ fn native_context_rebind(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Err(throw_naming_exception("rebind: null value not supported")),
     };
+
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "rebind",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+                &[Value::Object(Some(name_obj)), Value::Object(Some(value))],
+            );
+        }
+    }
+
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
@@ -559,9 +714,23 @@ fn native_context_unbind(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
+
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "unbind",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+    }
+
     unbind_value(&name).map_err(|msg| throw_invalid_name(&msg))?;
     Ok(None)
 }
@@ -570,9 +739,23 @@ fn native_context_create_subcontext(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
+
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "createSubcontext",
+                "(Ljava/lang/String;)Ljavax/naming/Context;",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+    }
+
     create_subcontext(&name).map_err(|msg| throw_invalid_name(&msg))?;
     // Return a fresh synthetic Context so the caller can chain bind().
     let sub = alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", INIT_CTX_NUM_SLOTS);
@@ -583,9 +766,23 @@ fn native_context_destroy_subcontext(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
+
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "destroySubcontext",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+    }
+
     destroy_subcontext(&name).map_err(|msg| throw_invalid_name(&msg))?;
     Ok(None)
 }
@@ -617,9 +814,23 @@ fn native_context_list_bindings(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = obj_arg(args, 0)?;
+    let this = obj_arg(args, 0)?;
     let name = read_string_arg(ctx, args, 1)
         .ok_or_else(|| throw_invalid_name("null name"))?;
+
+    if is_java_url_scheme(&name) {
+        let env = initial_context_env(ctx, this);
+        if let Some(url_ctx) = java_url_context(ctx, env)? {
+            let name_obj = ctx.create_string(&name);
+            return ctx.invoke_virtual(
+                url_ctx,
+                "listBindings",
+                "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
+                &[Value::Object(Some(name_obj))],
+            );
+        }
+    }
+
     let children = list_bindings(&name).map_err(|msg| throw_invalid_name(&msg))?;
     // Build a reference-array of `Binding` objects as the
     // NamingEnumeration backing.

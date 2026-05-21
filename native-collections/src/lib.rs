@@ -44,6 +44,51 @@ fn dbg_sbload() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_SBLOAD").is_some())
 }
 
+/// `true` iff `CRATONVM_DBG_KCBOOL` is set — traces enum-keyed map lookups,
+/// the prime suspect for Keycloak's `Profile.isFeatureEnabled` NPE
+/// (`features.get(feature)` returning null → `Boolean.booleanValue()` on
+/// null). When set, an enum-keyed `Map.get` that misses logs the key's
+/// `(class_id, ordinal)` plus, for every node in the map, that node's enum
+/// identity — so the orchestrator can confirm whether a duplicate enum
+/// constant object exists (same `(class_id, ordinal)`, different pointer).
+fn dbg_kcbool() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_KCBOOL").is_some())
+}
+
+/// Diagnostic: on an enum-keyed `Map.get` miss, dump the lookup key's enum
+/// identity and every node's enum identity in the map. `nodes` is an iterator
+/// of `(node_key_ref)` for each entry currently in the map.
+fn dbg_kcbool_report_miss(
+    ctx: &dyn NativeContext,
+    kind: &str,
+    key: ObjectRef,
+    node_keys: &[ObjectRef],
+) {
+    let key_id = enum_key_identity(ctx, key);
+    eprintln!(
+        "[cratonvm-dbg KCBOOL] {kind} MISS: key ptr={:p} enum_id={:?} entries={}",
+        key.as_ptr(),
+        key_id,
+        node_keys.len(),
+    );
+    if let Some((kcls, kord)) = key_id {
+        for nk in node_keys {
+            if let Some((ncls, nord)) = enum_key_identity(ctx, *nk) {
+                let same_logical = ncls == kcls && nord == kord;
+                if same_logical {
+                    eprintln!(
+                        "[cratonvm-dbg KCBOOL]   DUPLICATE ENUM CONSTANT: node ptr={:p} \
+                         enum_id=({ncls},{nord}) == key but pointer differs — \
+                         this is the VM enum-canonicalization bug",
+                        nk.as_ptr(),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Create an iterator backed by a snapshot array of the given size.
 /// The iterator uses the HashMap$KeyItr layout (field 0 = keys array, field 1 = cursor, field 2 = total).
 pub fn make_iterator_from_array(
@@ -412,10 +457,17 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
             }
             // String value equality
             if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
-                sa == sb
-            } else {
-                false
+                return sa == sb;
             }
+            // Enum constants: compare by (declaring class, ordinal) so an
+            // enum-keyed List/Set still finds a member when the VM produced a
+            // duplicate object for the same constant. See `enum_key_identity`.
+            if let (Some(ia), Some(ib)) =
+                (enum_key_identity(ctx, *oa), enum_key_identity(ctx, *ob))
+            {
+                return ia == ib;
+            }
+            false
         }
         (Value::Object(None), Value::Object(None)) => true,
         (Value::Int(a), Value::Int(b)) => a == b,
@@ -1457,9 +1509,76 @@ fn try_set_jdk_map_field(
     }
 }
 
+/// Determine whether `obj`'s runtime class is a `java.lang.Enum` subclass and,
+/// if so, return a *canonical logical identity* for the enum constant as
+/// `(declaring_class_id, ordinal)`.
+///
+/// # Why this exists
+///
+/// `java.lang.Enum` declares `equals`/`hashCode` `final` with pure-identity
+/// semantics, so a correct VM only ever has ONE object per enum constant and
+/// `HashMap` keyed by enum constants works on pointer identity. CratonVM's
+/// class-loading / `$VALUES` plumbing can, on some boot paths, materialise a
+/// *second* object for the same constant (e.g. the constant read back via
+/// `Enum.values()` during one `<clinit>` is not pointer-equal to the one a
+/// later `getstatic Foo.BAR` resolves). When that happens, an enum-keyed
+/// `HashMap`/`LinkedHashMap` silently misses every lookup — `Map.get` returns
+/// `null` even though the key was `put`.
+///
+/// Concrete victim: Keycloak's `Profile.isFeatureEnabled(Feature)` does
+/// `features.get(feature)` then unboxes the result; a missing entry yields
+/// `NullPointerException: Cannot invoke "java.lang.Boolean.booleanValue()"`.
+///
+/// Keying enum constants by `(declaring class name, constant name)` is
+/// *semantically identical* to identity — the JLS guarantees exactly one
+/// constant per (class, name) — so this never makes two genuinely-distinct
+/// constants compare equal, and it makes enum-keyed maps immune to the
+/// duplicate-object bug.
+///
+/// The *class name string* (not the `ClassId`) is used deliberately: if the
+/// VM materialised the duplicate by loading the enum class under two
+/// different `ClassId`s, the names still agree, whereas the ids would not.
+/// The constant's `name` (slot 0) and `ordinal` (slot 1) layout is fixed by
+/// `Enum.<init>` (see `native-builtins` `native_enum_init`).
+fn enum_key_identity(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String, String)> {
+    let cid = ctx.class_id_of_object(obj);
+    // Walk the superclass chain looking for java/lang/Enum. Cap the walk to
+    // guard against malformed class hierarchies.
+    let mut cur = Some(cid);
+    let mut is_enum = false;
+    for _ in 0..64 {
+        match cur {
+            Some(c) => {
+                match ctx.class_name_of_id(c) {
+                    Some(n) if n == "java/lang/Enum" => {
+                        is_enum = true;
+                        break;
+                    }
+                    Some(n) if n == "java/lang/Object" => break,
+                    Some(_) => cur = ctx.superclass_of(c),
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+    if !is_enum {
+        return None;
+    }
+    // Declaring-class name — stable across ClassId duplication.
+    let class_name = ctx.class_name_of_id(cid)?;
+    // Enum layout: slot 0 = name (String), slot 1 = ordinal (int).
+    let const_name = match ctx.get_field(obj, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s)?,
+        _ => return None,
+    };
+    Some((class_name, const_name))
+}
+
 /// Compute hash for a key.
 fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
-    // Try to read as string for better distribution.
+    // Try to read as string for better distribution (the common case, so it
+    // is checked first).
     // Must match Java's String.hashCode (UTF-16 code units, i32 wrapping mul+add),
     // otherwise non-ASCII keys hash differently from bytecode-computed hashes and
     // HashMap.containsKey silently returns false. See vm::vm_exec::java_string_hash.
@@ -1469,6 +1588,23 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
             h = h.wrapping_mul(31).wrapping_add(cu as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
+        return h ^ (h >> 16);
+    }
+    // Enum constants: hash by (declaring class name, constant name) — the
+    // JLS-canonical identity of an enum constant — so an enum-keyed map's
+    // `put` and `get` agree on the bucket even if the VM materialised two
+    // objects for the same constant. See `enum_key_identity` for the full
+    // rationale.
+    if let Some((class_name, const_name)) = enum_key_identity(ctx, key) {
+        let mut h: i32 = 0;
+        for b in class_name.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(b as i32);
+        }
+        // Separator byte so ("AB","C") and ("A","BC") do not collide.
+        h = h.wrapping_mul(31).wrapping_add(0x1F);
+        for b in const_name.bytes() {
+            h = h.wrapping_mul(31).wrapping_add(b as i32);
+        }
         return h ^ (h >> 16);
     }
     if let Some(prim) = unbox_wrapper(ctx, key) {
@@ -1545,9 +1681,18 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
         return true;
     }
-    // String value equality
+    // String value equality (the common case, checked first).
     if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
         return sa == sb;
+    }
+    // Enum constants: compare by (declaring class, ordinal). `Enum.equals` is
+    // `final` identity, so a correct VM never reaches here for two non-equal
+    // enum objects; but if the VM produced a duplicate object for the same
+    // constant, identity comparison spuriously fails. (class, ordinal) is the
+    // JLS-canonical identity and cannot collide across distinct constants.
+    // See `enum_key_identity`.
+    if let (Some(ia), Some(ib)) = (enum_key_identity(ctx, a), enum_key_identity(ctx, b)) {
+        return ia == ib;
     }
     // Wrapper type equality: unbox and compare primitives
     if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
@@ -2601,6 +2746,31 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
         }
         node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+
+    // Diagnostic: enum-keyed HashMap miss — prime suspect for Keycloak's
+    // `Profile.isFeatureEnabled` NPE. Dump every node's enum identity.
+    if dbg_kcbool() {
+        if let Some(k) = key_ref {
+            if enum_key_identity(ctx, k).is_some() {
+                let mut node_keys: Vec<ObjectRef> = Vec::new();
+                for b in 0..(cap.max(0) as usize) {
+                    let mut nv = ctx.get_array_element(buckets, b);
+                    let mut guard = 0;
+                    while let Value::Object(Some(node)) = nv {
+                        guard += 1;
+                        if guard > 4096 {
+                            break;
+                        }
+                        if let Value::Object(Some(nk)) = get_node_key(ctx, node) {
+                            node_keys.push(nk);
+                        }
+                        nv = ctx.get_field(node, NODE_FIELD_NEXT);
+                    }
+                }
+                dbg_kcbool_report_miss(ctx, "HashMap.get", k, &node_keys);
+            }
+        }
     }
 
     Ok(Some(Value::Object(None)))
@@ -11189,6 +11359,22 @@ fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
         Ok(Some(value))
     } else {
+        // Diagnostic: an enum-keyed LinkedHashMap miss is the prime suspect
+        // for the Keycloak `Profile.isFeatureEnabled` NPE.
+        if dbg_kcbool() {
+            if let Value::Object(Some(k)) = key {
+                if enum_key_identity(ctx, k).is_some() {
+                    let node_keys: Vec<ObjectRef> = lhm_collect_keys(ctx, this)
+                        .into_iter()
+                        .filter_map(|v| match v {
+                            Value::Object(Some(r)) => Some(r),
+                            _ => None,
+                        })
+                        .collect();
+                    dbg_kcbool_report_miss(ctx, "LinkedHashMap.get", k, &node_keys);
+                }
+            }
+        }
         Ok(Some(Value::Object(None)))
     }
 }
