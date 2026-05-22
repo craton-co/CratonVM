@@ -2282,13 +2282,17 @@ impl G1Collector {
             // can't accidentally "validate" the address of a filler.
             ObjectKind::HumongousFiller => return None,
         }
+        // Multi-array reloc fix (2026-05-22): `alloc_array` mirrors the
+        // array length into `num_slots`, so a legitimate 256 MB int[] has
+        // num_slots = 2^26 > 1<<24 and would be falsely rejected here.
+        // Gate num_slots only for non-arrays, and bound array_length at
+        // the JVM `Integer.MAX_VALUE` ceiling (matches `array_length()`).
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
-        if header.num_slots > MAX_PLAUSIBLE_SLOTS {
+        let is_array = matches!(header.kind, ObjectKind::Array);
+        if !is_array && header.num_slots > MAX_PLAUSIBLE_SLOTS {
             return None;
         }
-        if matches!(header.kind, ObjectKind::Array)
-            && header.array_length as usize > (1 << 27)
-        {
+        if is_array && header.array_length > i32::MAX as u32 {
             return None;
         }
         Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })

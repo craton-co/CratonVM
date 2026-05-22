@@ -612,14 +612,20 @@ impl GenerationalHeap {
         }
         // Cap num_slots at a sanity limit so a stale word can't fool us
         // into "validating" a slot count that would exceed the arena.
+        // Multi-array reloc fix (2026-05-22): for arrays, `num_slots` is a
+        // mirror of `array_length` (see `alloc_array` and `try_alloc_array`),
+        // so a legitimate 256 MB int[] has num_slots = 2^26 > 1<<24 and
+        // would be falsely rejected here. Bound num_slots only for non-arrays.
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24; // 16M slots → 256 MB obj
-        if header.num_slots > MAX_PLAUSIBLE_SLOTS {
+        let is_array = matches!(header.kind, ObjectKind::Array);
+        if !is_array && header.num_slots > MAX_PLAUSIBLE_SLOTS {
             return None;
         }
-        // Array length, if it's an array, must also be plausible.
-        if matches!(header.kind, ObjectKind::Array)
-            && header.array_length as usize > (1 << 27)
-        {
+        // Array length, if it's an array, must also be plausible. The JVM
+        // spec caps arrays at `Integer.MAX_VALUE` elements, so use that as
+        // the upper bound (matches `MAX_REASONABLE_ARRAY_LEN` in
+        // `array_length()`).
+        if is_array && header.array_length > i32::MAX as u32 {
             return None;
         }
 
@@ -2059,9 +2065,16 @@ impl GenerationalHeap {
             let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
             // Reject implausible headers — a conservative root may point
             // at a non-object word. `is_object_address`-style sanity.
-            if (header.kind as u8) > 1
-                || header.num_slots > (1 << 24)
-                || header.array_length > (1 << 27)
+            // Multi-array reloc fix (2026-05-22): `num_slots` mirrors
+            // `array_length` for arrays, so a legitimate 256 MB int[] has
+            // num_slots = 2^26 > 1<<24 and would be skipped (then swept as
+            // garbage, despite being a live root). Gate num_slots on
+            // non-arrays; bound array_length at the JVM ceiling.
+            let kind_byte = header.kind as u8;
+            let is_array = header.kind == ObjectKind::Array;
+            if kind_byte > 1
+                || (!is_array && header.num_slots > (1 << 24))
+                || (is_array && header.array_length > i32::MAX as u32)
             {
                 return;
             }
@@ -2644,11 +2657,26 @@ impl GenerationalHeap {
         // ObjectRef) would cause forward_object to walk into arbitrary memory.
         // Emitting forensic output here converts a silent SIGSEGV into a visible
         // diagnostic.
+        //
+        // Multi-array reloc fix (2026-05-22): the `num_slots > 1<<24` clause
+        // used to trip for ANY array whose length exceeds 2^24 elements,
+        // because `alloc_array` stores the array length in BOTH
+        // `array_length` and `num_slots`. With three back-to-back 2^26-int
+        // arrays the third allocation triggers a minor GC; `forward_object`
+        // would then refuse to relocate the first two large arrays, return
+        // their old pointers without inserting into the pointer map, and
+        // young_from.reset() would zero the original headers. After the
+        // semispace swap, the still-unremapped roots dereferenced the now-
+        // zeroed memory, giving the all-zero `kind/class_id/element_type/
+        // array_length` symptom and a `.length` of 0. Guard num_slots only
+        // for non-arrays (where it really is a field count). For arrays,
+        // gate on `array_length` against the JVM's i32::MAX ceiling — the
+        // same cap as `MAX_REASONABLE_ARRAY_LEN` in `array_length()`.
         let kind_byte = header.kind as u8;
-        if kind_byte > 1
-            || header.num_slots > (1 << 24)
-            || header.array_length > (1 << 27)
-        {
+        let is_array = header.kind == ObjectKind::Array;
+        let array_length_too_large = is_array && header.array_length > i32::MAX as u32;
+        let num_slots_too_large = !is_array && header.num_slots > (1 << 24);
+        if kind_byte > 1 || num_slots_too_large || array_length_too_large {
             tracing::debug!(
                 target: "cratonvm::gc::guard",
                 old_ptr = ?old_ptr,
@@ -3355,6 +3383,49 @@ mod tests {
         assert_eq!(heap.array_length(new_arr), n);
         assert_eq!(heap.get_array_element(new_arr, 0), Ok(Value::Int(7)));
         assert_eq!(heap.get_array_element(new_arr, n - 1), Ok(Value::Int(12345)));
+    }
+
+    #[test]
+    fn multiple_large_arrays_survive_gc() {
+        // Multi-array reloc regression (2026-05-22): when three back-to-back
+        // 2^26-element int[] (256 MiB each) survive a minor GC, every array's
+        // length must remain intact after the swap. The previous
+        // `forward_object` guard rejected any array whose `num_slots > 2^24`
+        // (because `alloc_array` mirrors the length into `num_slots`),
+        // leaving the roots pointing at original young-from memory that
+        // `reset()` then zeroed — every header looked all-zero
+        // (kind=Object, class_id=0, element_type=Reference, array_length=0)
+        // and `.length` reported 0. Use a smaller scale (2^20-elt) here to
+        // keep the unit test cheap; the failing condition is `num_slots`
+        // exceeding the old 2^24 ceiling.
+        //
+        // We use three arrays so the third allocation forces the same
+        // copying-collection codepath the real workload triggers.
+        let n: usize = 17 * 1024 * 1024; // 17M elements; num_slots = 17M > 1<<24
+        let payload = (n * 4 + 7) & !7usize;
+        let arr_bytes = HEADER_SIZE + payload;
+        let young_semi = (arr_bytes * 4).max(80 * 1024 * 1024);
+        let heap = GenerationalHeap::with_sizes(young_semi, 64 * 1024 * 1024);
+        let monitors = NoOpMonitors;
+
+        let a = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        heap.set_array_element(a, n - 1, Value::Int(0xAAAA_AAAAu32 as i32)).unwrap();
+        let b = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        heap.set_array_element(b, n - 1, Value::Int(0xBBBB_BBBBu32 as i32)).unwrap();
+        let c = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        heap.set_array_element(c, n - 1, Value::Int(0xCCCC_CCCCu32 as i32)).unwrap();
+
+        let mut roots = vec![a, b, c];
+        let result = heap.collect_garbage(&mut roots, &monitors);
+        assert_eq!(result.stats.objects_copied, 3, "all three large arrays must be forwarded");
+
+        let (na, nb, nc) = (roots[0], roots[1], roots[2]);
+        assert_eq!(heap.array_length(na), n, "a.length corrupted after GC");
+        assert_eq!(heap.array_length(nb), n, "b.length corrupted after GC");
+        assert_eq!(heap.array_length(nc), n, "c.length corrupted after GC");
+        assert_eq!(heap.get_array_element(na, n - 1), Ok(Value::Int(0xAAAA_AAAAu32 as i32)));
+        assert_eq!(heap.get_array_element(nb, n - 1), Ok(Value::Int(0xBBBB_BBBBu32 as i32)));
+        assert_eq!(heap.get_array_element(nc, n - 1), Ok(Value::Int(0xCCCC_CCCCu32 as i32)));
     }
 
     #[test]
