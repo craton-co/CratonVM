@@ -989,12 +989,14 @@ impl GenerationalHeap {
             }
             return 0;
         }
-        // Bug 1 fix (Opus 3-bugs agent): cap array length to a sane bound so
-        // a corrupt synthetic header (e.g. 795308655 ≈ 3 GB) cannot propagate
-        // into a `Vec::with_capacity(...)` panic in callers. 16M elements is
-        // large enough for any realistic array but small enough that
-        // pre-allocating one is a finite cost rather than an OOM.
-        const MAX_REASONABLE_ARRAY_LEN: u32 = 1 << 24; // 16M elements
+        // Guard against a corrupt synthetic header whose length field is
+        // garbage. The only sound ceiling is the JVM's own limit: a Java
+        // array cannot exceed `Integer.MAX_VALUE` elements, so any larger
+        // value is provably a corrupt header. An earlier `1 << 24` cap also
+        // rejected *legitimate* arrays larger than 16M elements (e.g. a
+        // 2^26-int vector), clobbering their length to 0 and raising a
+        // spurious ArrayIndexOutOfBoundsException on every access.
+        const MAX_REASONABLE_ARRAY_LEN: u32 = i32::MAX as u32; // JVM array ceiling
         let raw_len = header.array_length;
         if raw_len > MAX_REASONABLE_ARRAY_LEN {
             static SUSPECT_LEN_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
