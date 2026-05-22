@@ -565,6 +565,42 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     (data, size)
 }
 
+/// Snapshot the elements of a collection whose receiver is **not** one of
+/// our ArrayList-layout objects (so `al_state` reported `data = None`).
+///
+/// The ArrayList-shaped natives (`stream`, `forEach`, …) are registered on
+/// the `Collection` / `List` / `Iterable` interfaces, so they also catch
+/// foreign collections — Guava's `ImmutableList`, `Maps$Values`, etc. For
+/// those, `al_state`'s hardcoded `elementData`/`size` slots read past the
+/// (shorter) object and yield an empty result, silently dropping every
+/// element. Instead, walk the receiver's *real* `iterator()` — which
+/// dispatches to the collection's own bytecode — so the elements survive.
+///
+/// The 64M cap is a runaway guard; a well-behaved iterator terminates long
+/// before it.
+fn collection_elements_generic(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let iter = match ctx.invoke_virtual(this, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return out,
+    };
+    const MAX_ELEMENTS: usize = 64 * 1024 * 1024;
+    while out.len() < MAX_ELEMENTS {
+        match ctx.invoke_virtual(iter, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            _ => break,
+        }
+        match ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => out.push(v),
+            _ => break,
+        }
+    }
+    out
+}
+
 #[inline]
 fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
     let (data_slot, _, _) = al_slots(ctx);
@@ -6231,7 +6267,10 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(d) => (0..size as usize)
             .map(|i| ctx.get_array_element(d, i))
             .collect(),
-        None => Vec::new(),
+        // Foreign collection (not ArrayList-shaped): the interface-level
+        // `stream` registration caught e.g. a Guava `Maps$Values`. Walk
+        // its real iterator instead of returning an empty stream.
+        None => collection_elements_generic(ctx, this),
     };
     make_stream(ctx, &elements)
 }
@@ -7148,6 +7187,73 @@ fn native_collectors_partitioning_by_downstream(
     Ok(Some(Value::Object(Some(c))))
 }
 
+/// Run a *real* `java.util.stream.Collector` (one not produced by our
+/// `make_collector` fast-path — e.g. the collector from
+/// `ImmutableList.toImmutableList()` or any `Collector.of(...)`) via the
+/// standard JLS collector contract:
+///   `c = supplier().get(); accumulator().accept(c, e)*; finisher().apply(c)`.
+///
+/// Without this, `native_stream_collect` returned `null` for every
+/// non-tagged collector, which surfaced downstream as a bogus NPE — e.g.
+/// cassandra's airline `MetadataLoader.mergeOptionSet` does
+/// `... .collect(ImmutableList.toImmutableList())` and then iterates the
+/// result: a `null` there throws `Cannot invoke iterator on null`.
+fn collect_via_collector_protocol(
+    ctx: &mut dyn NativeContext,
+    collector: ObjectRef,
+    elements: &[Value],
+) -> MethodCallResult {
+    let supplier = match ctx.invoke_virtual(
+        collector,
+        "supplier",
+        "()Ljava/util/function/Supplier;",
+        &[],
+    )? {
+        Some(Value::Object(Some(s))) => s,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let container = ctx
+        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    let accumulator = match ctx.invoke_virtual(
+        collector,
+        "accumulator",
+        "()Ljava/util/function/BiConsumer;",
+        &[],
+    )? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for elem in elements {
+        ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[container, *elem],
+        )?;
+    }
+    let finisher = match ctx.invoke_virtual(
+        collector,
+        "finisher",
+        "()Ljava/util/function/Function;",
+        &[],
+    )? {
+        Some(Value::Object(Some(f))) => f,
+        // An IDENTITY_FINISH collector with no finisher: the accumulated
+        // container is itself the result.
+        _ => return Ok(Some(container)),
+    };
+    let result = ctx
+        .invoke_virtual(
+            finisher,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[container],
+        )?
+        .unwrap_or(Value::Object(None));
+    Ok(Some(result))
+}
+
 fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -7160,7 +7266,10 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let elements = stream_elements_mut(ctx, this);
     let tag = match ctx.get_field(collector, COLLECTOR_FIELD_TAG) {
         Value::Int(t) => t,
-        _ => return Ok(Some(Value::Object(None))),
+        // Not one of our `make_collector` tagged fast-path collectors —
+        // a real JDK/Guava `Collector`. Honour the standard contract
+        // instead of returning `null`.
+        _ => return collect_via_collector_protocol(ctx, collector, &elements),
     };
 
     match tag {

@@ -3569,6 +3569,13 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
 // Path = 1-field synthetic (field 0 = String path)
 // ---------------------------------------------------------------------------
 const P57_PATH_FIELD: usize = 0;
+/// Field index on a synthetic `java/nio/file/Path` that holds the
+/// `FileSystem` object the path was created from. `Path.getFileSystem()`
+/// returns this so callers that identity-compare
+/// `path.getFileSystem() == FileSystems.getDefault()` — e.g. cassandra's
+/// `org.apache.cassandra.io.util.File` constructor — observe a match.
+/// Null when the path was created without a known owning FileSystem.
+const P57_PATH_FS_FIELD: usize = 1;
 /// Field index on a synthetic `java/nio/file/FileSystem` that, when set, holds
 /// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
 const P57_FS_JAR_FIELD: usize = 1;
@@ -3841,13 +3848,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- Path.getFileSystem() → synthetic FileSystem singleton ---
-    // FileSystem = 1-field synthetic (field 0 = separator String)
+    // --- Path.getFileSystem() → the FileSystem this Path belongs to ---
+    // FileSystem = 2-field synthetic (field 0 = separator String).
+    // If the Path was produced by `FileSystem.getPath`, return that exact
+    // FileSystem object (stored in P57_PATH_FS_FIELD) so identity checks
+    // hold; otherwise fall back to a default FileSystem.
     r.register(
         path,
         "getFileSystem",
         "()Ljava/nio/file/FileSystem;",
-        |ctx, _args| {
+        |ctx, args| {
+            if let Ok(this) = obj_arg(args, 0) {
+                if let Value::Object(Some(fs)) =
+                    ctx.get_field(this, P57_PATH_FS_FIELD)
+                {
+                    return Ok(Some(Value::Object(Some(fs))));
+                }
+            }
             let fs = p57_alloc_default_filesystem(ctx);
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -4131,6 +4148,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             } else {
                 p57_alloc_path(ctx, &jarfs_encode(&jar, &first))
             };
+            // Record the FileSystem that produced this Path so
+            // `Path.getFileSystem()` returns the *same* object — required by
+            // identity checks like cassandra's `File(Path)` constructor
+            // (`path.getFileSystem() == FileSystems.getDefault()`).
+            ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -6170,7 +6192,9 @@ fn p57_to_os_path(p: &str) -> String {
 }
 
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+    // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
+    // null unless set by `FileSystem.getPath`).
+    let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
     let s = ctx.create_string(path);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
     obj
@@ -8206,7 +8230,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "toPath", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+        let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
         let s = ctx.create_string(&path);
         ctx.set_field(p, 0, Value::Object(Some(s)));
         Ok(Some(Value::Object(Some(p))))
@@ -17155,7 +17179,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(fname);
             ctx.set_field(p, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(p))))
@@ -17176,7 +17200,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                 Some(i) => &trimmed[..i],
                 None => "",
             };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(&jarfs_encode(&jar, parent_entry));
             ctx.set_field(p, 0, Value::Object(Some(s)));
             return Ok(Some(Value::Object(Some(p))));
@@ -17188,7 +17212,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             if parent.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(parent);
             ctx.set_field(p, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(p))))
@@ -17214,7 +17238,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or(path_str)
             };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(&abs);
             ctx.set_field(p, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(p))))
@@ -17242,7 +17266,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     .to_string_lossy()
                     .into_owned()
             };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(&resolved);
             ctx.set_field(p, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(p))))
@@ -17274,7 +17298,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
                     .to_string_lossy()
                     .into_owned()
             };
-            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(&resolved);
             ctx.set_field(p, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(p))))
@@ -22675,7 +22699,7 @@ fn p98_walk_dir(
         for entry in entries.flatten() {
             let ep = entry.path();
             let es = ep.to_string_lossy().to_string();
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 1);
+            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
             let s = ctx.create_string(&es);
             ctx.set_field(epo, 0, Value::Object(Some(s)));
             if ep.is_dir() {

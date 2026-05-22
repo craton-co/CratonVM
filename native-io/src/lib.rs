@@ -11799,7 +11799,11 @@ fn native_ws_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     let we = alloc_synthetic(ctx, "java/nio/file/WatchEvent", WE_NUM_FIELDS);
                     ctx.set_field(we, WE_FIELD_KIND, Value::Int(*kind));
                     let path_s = ctx.create_string(name);
-                    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 1);
+                    // 2 fields: [0] = path String, [1] = owning FileSystem
+                    // (left null here — a WatchEvent context path has no
+                    // originating FileSystem; `Path.getFileSystem()` falls
+                    // back to the default).
+                    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
                     ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
                     ctx.set_field(we, WE_FIELD_CONTEXT, Value::Object(Some(path_obj)));
                     ctx.set_array_element(pending, j, Value::Object(Some(we)));
