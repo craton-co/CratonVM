@@ -15334,10 +15334,66 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             ctx.set_array_element(snap, i, v);
         }
     }
-    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 2);
+    // Field 0 = snapshot array, field 1 = cursor, field 2 = owning TreeSet.
+    // The back-reference to the owning set lets `TreeSet$Itr.remove()` delete
+    // the last-returned element from the live set (real-JDK `Iterator.remove`
+    // contract) rather than throwing UnsupportedOperationException.
+    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3);
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
+    ctx.set_field(itr, 2, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(itr))))
+}
+
+/// `TreeSet$Itr.remove()` — delete the last element returned by `next()` from
+/// the owning `TreeSet`. The snapshot iterator stores the owning set in field
+/// 2; the last-returned element is the snapshot entry at `cursor - 1`.
+fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "remove".to_string(),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // `next()` advances the cursor past the element it returned, so the
+    // last-returned element lives at `cursor - 1`. A cursor of 0 means
+    // `next()` was never called (or `remove()` was already invoked).
+    if cursor <= 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let owner = match ctx.get_field(this, 2) {
+        Value::Object(Some(o)) => o,
+        _ => {
+            // No owning set recorded — nothing to remove from. Stay silent
+            // rather than throwing UOE so the iteration can still complete.
+            return Ok(None);
+        }
+    };
+    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
+    // Delete the element from the live set via the existing TreeSet remove
+    // path (binary search + side-table size update).
+    let (data_opt, size, comparator) = ts_state(ctx, owner);
+    if let Some(data) = data_opt {
+        if let Ok(idx) = ts_binary_search(ctx, data, size, &comparator, &last)? {
+            ts_remove_at(ctx, data, size, idx);
+            ts_set_slot(ctx, owner, TS_FIELD_SIZE, Value::Int(size - 1));
+        }
+    }
+    Ok(None)
 }
 
 fn native_ts_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15838,6 +15894,9 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
     let ti = "java/util/TreeSet$Itr";
     registry.register(ti, "hasNext", "()Z", native_snapshot_itr_has_next);
     registry.register(ti, "next", "()Ljava/lang/Object;", native_snapshot_itr_next);
+    // `Iterator.remove()` is a supported operation for TreeSet's iterator —
+    // delete the last-returned element from the owning set (field 2).
+    registry.register(ti, "remove", "()V", native_ts_itr_remove);
 
     // SortedSet/NavigableSet interface dispatch
     let ss = "java/util/SortedSet";

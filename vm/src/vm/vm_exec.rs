@@ -1679,6 +1679,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // One synthetic class per distinct field count, shared across
             // all callers — keeps the class store from growing unbounded.
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
+            if std::env::var("CRATONVM_DBG_ANONALLOC").is_ok() {
+                let stack: Vec<String> = self
+                    .thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(12)
+                    .map(|f| {
+                        format!(
+                            "    at {}.{}{}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor()
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "[ANONALLOC] alloc_object ClassId(0) num_fields={num_fields} -> {name}\n{}",
+                    stack.join("\n")
+                );
+            }
             self.shared
                 .class_manager
                 .write()

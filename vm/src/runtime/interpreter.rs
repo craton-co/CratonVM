@@ -11911,6 +11911,13 @@ fn try_osr(
         None => return None,
     };
 
+    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] OSR-compile {}.{}{} entry_pc={}",
+            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+        );
+    }
+
     // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret)
     let frame = &thread.frames[frame_idx];
     let num_locals = frame.locals_len();
@@ -12743,6 +12750,12 @@ pub fn try_jit_compile_callee(
         &helpers,
         Some(&inline_resolver),
     )?;
+    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] full-compile {}.{}{}",
+            cached.class_name, cached.method_name, cached.method_descriptor
+        );
+    }
     let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
     let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
