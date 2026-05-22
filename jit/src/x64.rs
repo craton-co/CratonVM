@@ -12004,11 +12004,343 @@ impl Compiler {
                         // `if let Some(...) = direct` chain stays valid.
                         //
                         // ===== INTRINSIC REGION BEGIN: INT_BITS =====
-
+                        // java.lang.Integer bit-manipulation intrinsics
+                        // (Phase 1a). Each pops `num_params` ints off the
+                        // operand stack, computes into EAX and pushes the
+                        // result. All emitted code is bit-identical to the
+                        // JDK semantics (verified by intrinsic_int_bits.rs).
+                        else if callee_entry
+                            == super::JitIntrinsic::IntBitCount.as_entry()
+                        {
+                            // Integer.bitCount(i): POPCNT EAX, EAX. The
+                            // matcher only registers this when has_popcnt()
+                            // is true, so the instruction is always valid.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // POPCNT EAX, EAX: F3 0F B8 C0
+                            self.buf.emit(&[0xF3, 0x0F, 0xB8, 0xC0]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntNumberOfLeadingZeros.as_entry()
+                        {
+                            // Integer.numberOfLeadingZeros(i): result is 32
+                            // for input 0, else 31 - floor(log2(i)).
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            if super::x64::has_lzcnt() {
+                                // LZCNT EAX, EAX: F3 0F BD C0 — defined to
+                                // return 32 for a zero input, matching JDK.
+                                self.buf.emit(&[0xF3, 0x0F, 0xBD, 0xC0]);
+                            } else {
+                                // Fallback: BSR ECX, EAX gives the MSB index
+                                // and sets ZF iff the input is zero. We pick
+                                // ECX = -1 on a zero input so the subsequent
+                                // `31 - ECX` formula yields 32.
+                                //   MOV EDX, -1
+                                self.buf.emit(&[0xBA]);
+                                self.buf.emit(&(-1i32).to_le_bytes());
+                                // BSR ECX, EAX: 0F BD C8 (ZF=1 if EAX==0)
+                                self.buf.emit(&[0x0F, 0xBD, 0xC8]);
+                                // CMOVZ ECX, EDX: 0F 44 CA (consumes BSR's ZF)
+                                self.buf.emit(&[0x0F, 0x44, 0xCA]);
+                                // MOV EAX, 31: B8 1F 00 00 00
+                                self.buf.emit(&[0xB8]);
+                                self.buf.emit(&31i32.to_le_bytes());
+                                // SUB EAX, ECX: 29 C8  → EAX = 31 - index
+                                self.buf.emit(&[0x29, 0xC8]);
+                            }
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntNumberOfTrailingZeros.as_entry()
+                        {
+                            // Integer.numberOfTrailingZeros(i): result is 32
+                            // for input 0, else the LSB index.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            if super::x64::has_bmi1() {
+                                // TZCNT EAX, EAX: F3 0F BC C0 — defined to
+                                // return 32 for a zero input, matching JDK.
+                                self.buf.emit(&[0xF3, 0x0F, 0xBC, 0xC0]);
+                            } else {
+                                // Fallback: BSF ECX, EAX gives the LSB index
+                                // and sets ZF iff the input is zero; pick 32
+                                // for the zero case.
+                                //   MOV EDX, 32
+                                self.buf.emit(&[0xBA]);
+                                self.buf.emit(&32i32.to_le_bytes());
+                                // BSF ECX, EAX: 0F BC C8 (ZF=1 if EAX==0)
+                                self.buf.emit(&[0x0F, 0xBC, 0xC8]);
+                                // CMOVZ ECX, EDX: 0F 44 CA
+                                self.buf.emit(&[0x0F, 0x44, 0xCA]);
+                                // MOV EAX, ECX: 89 C8
+                                self.buf.emit(&[0x89, 0xC8]);
+                            }
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntReverseBytes.as_entry()
+                        {
+                            // Integer.reverseBytes(i): BSWAP EAX (0F C8).
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            self.buf.emit(&[0x0F, 0xC8]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntHighestOneBit.as_entry()
+                        {
+                            // Integer.highestOneBit(i): the value with only
+                            // the highest set bit of `i`, or 0 when i == 0.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // MOV EDX, EAX: 89 C2 — preserve the original.
+                            self.buf.emit(&[0x89, 0xC2]);
+                            // BSR ECX, EAX: 0F BD C8 — ECX = MSB index
+                            // (undefined for input 0, handled below).
+                            self.buf.emit(&[0x0F, 0xBD, 0xC8]);
+                            // MOV EAX, 1: B8 01 00 00 00
+                            self.buf.emit(&[0xB8]);
+                            self.buf.emit(&1i32.to_le_bytes());
+                            // SHL EAX, CL: D3 E0 — EAX = 1 << index.
+                            self.buf.emit(&[0xD3, 0xE0]);
+                            // TEST EDX, EDX: 85 D2 — set ZF iff input was 0.
+                            self.buf.emit(&[0x85, 0xD2]);
+                            // CMOVZ EAX, EDX: 0F 44 C2 — input 0 → result 0.
+                            self.buf.emit(&[0x0F, 0x44, 0xC2]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntLowestOneBit.as_entry()
+                        {
+                            // Integer.lowestOneBit(i): i & -i. Naturally
+                            // yields 0 for input 0, matching the JDK.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // MOV ECX, EAX: 89 C1
+                            self.buf.emit(&[0x89, 0xC1]);
+                            // NEG EAX: F7 D8  → EAX = -i
+                            self.buf.emit(&[0xF7, 0xD8]);
+                            // AND EAX, ECX: 21 C8  → EAX = -i & i
+                            self.buf.emit(&[0x21, 0xC8]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntReverse.as_entry()
+                        {
+                            // Integer.reverse(i): reverse the bit order via
+                            // the standard SWAR sequence. The JDK does five
+                            // stages; the final two (swap byte pairs, then
+                            // swap halves) are exactly BSWAP, so we emit
+                            // three SWAR stages followed by BSWAP.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // One SWAR stage for (mask, shift):
+                            //   MOV ECX, EAX
+                            //   SHR EAX, shift
+                            //   AND EAX, mask
+                            //   AND ECX, mask
+                            //   SHL ECX, shift
+                            //   OR  EAX, ECX
+                            for &(mask, shift) in
+                                &[(0x5555_5555u32, 1u8), (0x3333_3333, 2), (0x0F0F_0F0F, 4)]
+                            {
+                                // MOV ECX, EAX: 89 C1
+                                self.buf.emit(&[0x89, 0xC1]);
+                                // SHR EAX, imm8: C1 E8 ib
+                                self.buf.emit(&[0xC1, 0xE8, shift]);
+                                // AND EAX, imm32: 25 id
+                                self.buf.emit(&[0x25]);
+                                self.buf.emit(&mask.to_le_bytes());
+                                // AND ECX, imm32: 81 E1 id
+                                self.buf.emit(&[0x81, 0xE1]);
+                                self.buf.emit(&mask.to_le_bytes());
+                                // SHL ECX, imm8: C1 E1 ib
+                                self.buf.emit(&[0xC1, 0xE1, shift]);
+                                // OR EAX, ECX: 09 C8
+                                self.buf.emit(&[0x09, 0xC8]);
+                            }
+                            // BSWAP EAX: 0F C8 — swaps the four bytes, which
+                            // completes the 8- and 16-bit reversal stages.
+                            self.buf.emit(&[0x0F, 0xC8]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntCompare.as_entry()
+                        {
+                            // Integer.compare(x, y): branchless (x>y)-(x<y).
+                            // The stack holds x (deeper) then y.
+                            let y = self.pop_stack();
+                            let x = self.pop_stack();
+                            self.load_slot_to_reg(RAX, x);
+                            self.load_slot_to_reg(RCX, y);
+                            // CMP EAX, ECX: 39 C8 — signed compare x vs y.
+                            self.buf.emit(&[0x39, 0xC8]);
+                            // SETG AL:  0F 9F C0 — AL = 1 if x > y.
+                            self.buf.emit(&[0x0F, 0x9F, 0xC0]);
+                            // SETL DL:  0F 9C C2 — DL = 1 if x < y.
+                            self.buf.emit(&[0x0F, 0x9C, 0xC2]);
+                            // MOVZX EAX, AL: 0F B6 C0
+                            self.buf.emit(&[0x0F, 0xB6, 0xC0]);
+                            // MOVZX EDX, DL: 0F B6 D2
+                            self.buf.emit(&[0x0F, 0xB6, 0xD2]);
+                            // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
+                            self.buf.emit(&[0x29, 0xD0]);
+                            self.push_from_rax();
+                        }
                         // ===== INTRINSIC REGION END: INT_BITS =====
 
                         // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
-
+                        // java.lang.Long bit ops (Phase 1b). Each long operand
+                        // occupies one 64-bit JIT stack slot; load_slot_to_reg
+                        // loads the full 64 bits. All instructions below are
+                        // REX.W-prefixed (0x48) so they operate on the whole
+                        // 64-bit value. bitCount/numberOfLeadingZeros/
+                        // numberOfTrailingZeros return an int (0..=64) which
+                        // is left in EAX with the upper 32 bits cleared.
+                        else if callee_entry
+                            == super::JitIntrinsic::LongBitCount.as_entry()
+                        {
+                            // Long.bitCount(j): 64-bit POPCNT. Matcher gates
+                            // this on has_popcnt(), so the instruction is
+                            // always valid here. Result 0..=64 fits in EAX.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // POPCNT RAX, RAX: F3 48 0F B8 C0
+                            self.buf.emit(&[0xF3, 0x48, 0x0F, 0xB8, 0xC0]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongNumberOfLeadingZeros.as_entry()
+                        {
+                            // Long.numberOfLeadingZeros(j).
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            if super::x64::has_lzcnt() {
+                                // LZCNT RAX, RAX: F3 48 0F BD C0 — defined to
+                                // yield 64 for a zero input, matching the JDK.
+                                self.buf.emit(&[0xF3, 0x48, 0x0F, 0xBD, 0xC0]);
+                            } else {
+                                // BSR fallback. BSR RCX, RAX sets ZF iff the
+                                // source is zero and otherwise leaves the
+                                // highest set-bit index (0..=63) in RCX.
+                                //   nlz = 63 - index   (for a non-zero input)
+                                //   nlz = 64           (for a zero input)
+                                // 63 - index == index ^ 63 for index in 0..=63,
+                                // computed with XOR so RAX is left untouched
+                                // for the TEST that re-derives the zero case.
+                                // BSR RCX, RAX: 48 0F BD C8
+                                self.buf.emit(&[0x48, 0x0F, 0xBD, 0xC8]);
+                                // XOR ECX, 63: 83 F1 3F — ECX = 63 - index
+                                // (garbage if input was 0; fixed up below).
+                                self.buf.emit(&[0x83, 0xF1, 0x3F]);
+                                // MOV EDX, 64: BA 40 00 00 00
+                                self.buf.emit(&[0xBA]);
+                                self.buf.emit(&64i32.to_le_bytes());
+                                // TEST RAX, RAX: 48 85 C0 — ZF iff input == 0.
+                                self.buf.emit(&[0x48, 0x85, 0xC0]);
+                                // CMOVZ RCX, RDX: 48 0F 44 CA — input 0 → 64.
+                                self.buf.emit(&[0x48, 0x0F, 0x44, 0xCA]);
+                                // MOV EAX, ECX: 89 C8
+                                self.buf.emit(&[0x89, 0xC8]);
+                            }
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongNumberOfTrailingZeros.as_entry()
+                        {
+                            // Long.numberOfTrailingZeros(j).
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            if super::x64::has_bmi1() {
+                                // TZCNT RAX, RAX: F3 48 0F BC C0 — defined to
+                                // yield 64 for a zero input, matching the JDK.
+                                self.buf.emit(&[0xF3, 0x48, 0x0F, 0xBC, 0xC0]);
+                            } else {
+                                // BSF fallback. BSF RCX, RAX sets ZF iff the
+                                // source is zero and otherwise leaves the
+                                // lowest set-bit index (0..=63) in RCX, which
+                                // is exactly ntz for a non-zero input. For a
+                                // zero input the result must be 64.
+                                // BSF RCX, RAX: 48 0F BC C8
+                                self.buf.emit(&[0x48, 0x0F, 0xBC, 0xC8]);
+                                // MOV EDX, 64: BA 40 00 00 00
+                                self.buf.emit(&[0xBA]);
+                                self.buf.emit(&64i32.to_le_bytes());
+                                // TEST RAX, RAX: 48 85 C0 — ZF iff input == 0.
+                                self.buf.emit(&[0x48, 0x85, 0xC0]);
+                                // CMOVZ RCX, RDX: 48 0F 44 CA — input 0 → 64.
+                                self.buf.emit(&[0x48, 0x0F, 0x44, 0xCA]);
+                                // MOV EAX, ECX: 89 C8
+                                self.buf.emit(&[0x89, 0xC8]);
+                            }
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongReverseBytes.as_entry()
+                        {
+                            // Long.reverseBytes(j): 64-bit BSWAP.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // BSWAP RAX: 48 0F C8
+                            self.buf.emit(&[0x48, 0x0F, 0xC8]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongHighestOneBit.as_entry()
+                        {
+                            // Long.highestOneBit(j): 1L << bitIndex of the MSB,
+                            // or 0 for a zero input. BSR leaves the index in
+                            // RCX; SHL forms the mask; a CMOVZ keyed on the
+                            // original input restores 0 for the zero case.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // BSR RCX, RAX: 48 0F BD C8 — RCX = MSB index.
+                            self.buf.emit(&[0x48, 0x0F, 0xBD, 0xC8]);
+                            // MOV EDX, 1: BA 01 00 00 00 (RDX = 1, upper bits 0).
+                            self.buf.emit(&[0xBA]);
+                            self.buf.emit(&1i32.to_le_bytes());
+                            // SHL RDX, CL: 48 D3 E2 — RDX = 1 << index
+                            // (garbage if input was 0; fixed up below).
+                            self.buf.emit(&[0x48, 0xD3, 0xE2]);
+                            // XOR ECX, ECX: 31 C9 — RCX = 0 (zero-input result).
+                            self.buf.emit(&[0x31, 0xC9]);
+                            // TEST RAX, RAX: 48 85 C0 — ZF iff input == 0.
+                            self.buf.emit(&[0x48, 0x85, 0xC0]);
+                            // CMOVZ RDX, RCX: 48 0F 44 D1 — input 0 → 0.
+                            self.buf.emit(&[0x48, 0x0F, 0x44, 0xD1]);
+                            // MOV RAX, RDX: 48 89 D0
+                            self.buf.emit(&[0x48, 0x89, 0xD0]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongLowestOneBit.as_entry()
+                        {
+                            // Long.lowestOneBit(j): j & -j. Naturally yields 0
+                            // for a zero input, matching the JDK.
+                            let arg = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arg);
+                            // MOV RCX, RAX: 48 89 C1
+                            self.buf.emit(&[0x48, 0x89, 0xC1]);
+                            // NEG RCX: 48 F7 D9 — RCX = -j
+                            self.buf.emit(&[0x48, 0xF7, 0xD9]);
+                            // AND RAX, RCX: 48 21 C8 — RAX = j & -j
+                            self.buf.emit(&[0x48, 0x21, 0xC8]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongCompare.as_entry()
+                        {
+                            // Long.compare(x, y): branchless signed
+                            // (x > y) - (x < y). The stack holds x (deeper)
+                            // then y. SETcc reads the flags from CMP without
+                            // disturbing them; the int result lands in EAX.
+                            let y = self.pop_stack();
+                            let x = self.pop_stack();
+                            self.load_slot_to_reg(RAX, x);
+                            self.load_slot_to_reg(RCX, y);
+                            // CMP RAX, RCX: 48 39 C8 — signed 64-bit compare.
+                            self.buf.emit(&[0x48, 0x39, 0xC8]);
+                            // SETG AL:  0F 9F C0 — AL = 1 if x > y.
+                            self.buf.emit(&[0x0F, 0x9F, 0xC0]);
+                            // SETL DL:  0F 9C C2 — DL = 1 if x < y.
+                            self.buf.emit(&[0x0F, 0x9C, 0xC2]);
+                            // MOVZX EAX, AL: 0F B6 C0
+                            self.buf.emit(&[0x0F, 0xB6, 0xC0]);
+                            // MOVZX EDX, DL: 0F B6 D2
+                            self.buf.emit(&[0x0F, 0xB6, 0xD2]);
+                            // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
+                            self.buf.emit(&[0x29, 0xD0]);
+                            self.push_from_rax();
+                        }
                         // ===== INTRINSIC REGION END: LONG_BITS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
@@ -12360,15 +12692,43 @@ impl Compiler {
                         let mut intrinsic_handled = false;
 
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
-
+                        // No codegen: the STRING_ACCESS family
+                        // (String.length/charAt/isEmpty/hashCode) is not
+                        // registered in `try_resolve_intrinsic`, so no
+                        // `callee_entry` ever matches a String-access
+                        // intrinsic and `intrinsic_handled` stays false —
+                        // these calls fall through to normal dispatch.
+                        // Inlining is unsound because String's field layout
+                        // (value array, coder byte, hash int) is
+                        // runtime-determined, not statically known to the
+                        // JIT. See the matcher's STRING_ACCESS region in
+                        // lib.rs and jit/tests/intrinsic_string_access.rs.
                         // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
                         // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-
+                        // java.lang.String search/compare intrinsics — BAILED, emits nothing.
+                        //
+                        // String.equals/compareTo/indexOf are NOT registered by
+                        // `try_resolve_intrinsic` (see its STRING_SEARCH region for the full
+                        // rationale): String's field layout is decided at runtime (compact
+                        // byte[]+coder vs legacy char[]), the `coder` field index is not even
+                        // constant across layouts, and the JIT has no inline instance-field or
+                        // array-element access — every getfield/baload is a helper CALL.
+                        // Inlining could not be proven bit-identical to JDK semantics, so no
+                        // JitIntrinsic variant exists for this family and `callee_entry` can
+                        // never equal one here. `intrinsic_handled` is left false; control
+                        // falls through to the unchanged plain direct-call dispatch path.
                         // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
                         // ===== INTRINSIC REGION BEGIN: CRC32 =====
-
+                        // No CRC32/CRC32C codegen: the family bails entirely.
+                        // The matcher in lib.rs registers no `JitIntrinsic`
+                        // variant for this family (no CRC32C native oracle
+                        // exists; the CRC32/IEEE receiver layout is not
+                        // statically known), so `callee_entry` can never
+                        // equal a CRC32 sentinel here. `intrinsic_handled`
+                        // stays untouched and control falls through to the
+                        // plain direct-call path.
                         // ===== INTRINSIC REGION END: CRC32 =====
 
                         if !intrinsic_handled {

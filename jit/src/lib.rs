@@ -1277,23 +1277,61 @@ pub enum JitIntrinsic {
     MathMaxLong = 13,
 
     // ===== INTRINSIC REGION BEGIN: INT_BITS =====
-
+    // java.lang.Integer bit-manipulation intrinsics (Phase 1a). Variant
+    // ordering within this region is local and not externally observed —
+    // only the Math family's declaration order is load-bearing.
+    IntBitCount,
+    IntNumberOfLeadingZeros,
+    IntNumberOfTrailingZeros,
+    IntReverseBytes,
+    IntHighestOneBit,
+    IntLowestOneBit,
+    IntReverse,
+    IntCompare,
     // ===== INTRINSIC REGION END: INT_BITS =====
 
     // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
-
+    // java.lang.Long bit-manipulation intrinsics (Phase 1b). Variant
+    // ordering within this region is local and not externally observed —
+    // only the Math family's declaration order is load-bearing.
+    LongBitCount,
+    LongNumberOfLeadingZeros,
+    LongNumberOfTrailingZeros,
+    LongReverseBytes,
+    LongHighestOneBit,
+    LongLowestOneBit,
+    LongCompare,
     // ===== INTRINSIC REGION END: LONG_BITS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
-
+    /// `java.lang.System.arraycopy(Object,int,Object,int,int)` (Phase 2).
+    ///
+    /// The descriptor is type-erased — the element kind is only known at
+    /// runtime. The codegen inlines a primitive-array fast path (null
+    /// checks, fused bounds checks, then a memmove-correct `REP MOVSB`)
+    /// and routes every uncertain case — null receiver, non-array,
+    /// reference array, mismatched element types, or any out-of-bounds
+    /// position — through the uncommon-trap deopt stub. The interpreter
+    /// then re-runs the call via the native `System.arraycopy`, which
+    /// preserves `NullPointerException` / `ArrayStoreException` /
+    /// `ArrayIndexOutOfBoundsException` and the GC store barrier exactly.
+    ArraycopyPrimitive,
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
-
+    // No variants: String.length/charAt/isEmpty/hashCode cannot be inlined
+    // correctly. String's field layout (the `value` array, the `coder`
+    // byte, the cached `hash` int) is runtime-determined, not statically
+    // known to the JIT. See the bail rationale in the matching
+    // `try_resolve_intrinsic` STRING_ACCESS region below and in
+    // jit/tests/intrinsic_string_access.rs.
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-
+    // No variants: String.equals/compareTo/indexOf cannot be inlined
+    // correctly (String's field layout is runtime-determined, not
+    // statically known to the JIT). See the bail rationale in the
+    // matching `try_resolve_intrinsic` STRING_SEARCH region below.
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
@@ -1301,11 +1339,24 @@ pub enum JitIntrinsic {
     // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
-
+    // java.util.Arrays.sort for primitive integral arrays (Phase 4b). One
+    // variant per element width; the emitted insertion sort differs only in
+    // the element load/store encoding (scale + sign/zero extension). Variant
+    // ordering within this region is local and not externally observed.
+    ArraysSortInt,
+    ArraysSortLong,
+    ArraysSortChar,
+    ArraysSortShort,
+    ArraysSortByte,
     // ===== INTRINSIC REGION END: ARRAYS_SORT =====
 
     // ===== INTRINSIC REGION BEGIN: CRC32 =====
-
+    // No CRC32/CRC32C variants are declared: the family bails entirely.
+    // See the matching matcher region in `try_resolve_intrinsic` for the
+    // full rationale (no CRC32C native oracle exists; the CRC32/IEEE field
+    // layout — Value::Long vs int, complemented value, unknown offset — is
+    // not statically known to the JIT). Adding a variant here would create
+    // a sentinel the codegen ladder can never legitimately emit.
     // ===== INTRINSIC REGION END: CRC32 =====
 }
 
@@ -1412,23 +1463,167 @@ pub fn try_resolve_intrinsic(
     }
 
     // ===== INTRINSIC REGION BEGIN: INT_BITS =====
-
+    // java.lang.Integer bit-manipulation intrinsics (Phase 1a). Each maps to
+    // one or two x86-64 instructions, all pure leaves with no memory access.
+    // CPU-feature gates here MUST match the codegen ladder in x64.rs exactly:
+    //   * bitCount needs POPCNT.
+    //   * numberOfLeadingZeros / numberOfTrailingZeros are emitted on every
+    //     host — LZCNT/TZCNT when available, otherwise a BSR/BSF sequence
+    //     with the input-zero fixup — so they are not feature-gated.
+    //   * reverseBytes (BSWAP), highestOneBit, lowestOneBit, reverse and
+    //     compare use only baseline instructions.
+    if class == "java/lang/Integer" {
+        let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            ("bitCount", "(I)I") if x64::has_popcnt() => {
+                Some((JitIntrinsic::IntBitCount, 1, b'I'))
+            }
+            ("numberOfLeadingZeros", "(I)I") => {
+                Some((JitIntrinsic::IntNumberOfLeadingZeros, 1, b'I'))
+            }
+            ("numberOfTrailingZeros", "(I)I") => {
+                Some((JitIntrinsic::IntNumberOfTrailingZeros, 1, b'I'))
+            }
+            ("reverseBytes", "(I)I") => Some((JitIntrinsic::IntReverseBytes, 1, b'I')),
+            ("highestOneBit", "(I)I") => Some((JitIntrinsic::IntHighestOneBit, 1, b'I')),
+            ("lowestOneBit", "(I)I") => Some((JitIntrinsic::IntLowestOneBit, 1, b'I')),
+            ("reverse", "(I)I") => Some((JitIntrinsic::IntReverse, 1, b'I')),
+            ("compare", "(II)I") => Some((JitIntrinsic::IntCompare, 2, b'I')),
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = hit {
+            return Some((intrinsic.as_entry(), num_params, ret));
+        }
+    }
     // ===== INTRINSIC REGION END: INT_BITS =====
 
     // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
-
+    // java.lang.Long bit-manipulation intrinsics (Phase 1b). All operate on a
+    // single 64-bit operand (occupying one JIT stack slot) and lower to
+    // REX.W-prefixed instructions. CPU-feature gates here MUST match the
+    // codegen ladder in x64.rs exactly:
+    //   * bitCount needs POPCNT.
+    //   * numberOfLeadingZeros / numberOfTrailingZeros are emitted on every
+    //     host — LZCNT/TZCNT when available, otherwise a BSR/BSF sequence
+    //     with the input-zero fixup — so they are not feature-gated.
+    //   * reverseBytes (BSWAP), highestOneBit, lowestOneBit and compare use
+    //     only baseline instructions.
+    //   * Long.reverse is intentionally NOT registered: it has no single-
+    //     instruction lowering and the multi-mask SWAR sequence is omitted in
+    //     favour of safe fallback to normal dispatch (roadmap §3.4).
+    if class == "java/lang/Long" {
+        let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            ("bitCount", "(J)I") if x64::has_popcnt() => {
+                Some((JitIntrinsic::LongBitCount, 1, b'I'))
+            }
+            ("numberOfLeadingZeros", "(J)I") => {
+                Some((JitIntrinsic::LongNumberOfLeadingZeros, 1, b'I'))
+            }
+            ("numberOfTrailingZeros", "(J)I") => {
+                Some((JitIntrinsic::LongNumberOfTrailingZeros, 1, b'I'))
+            }
+            ("reverseBytes", "(J)J") => Some((JitIntrinsic::LongReverseBytes, 1, b'J')),
+            ("highestOneBit", "(J)J") => Some((JitIntrinsic::LongHighestOneBit, 1, b'J')),
+            ("lowestOneBit", "(J)J") => Some((JitIntrinsic::LongLowestOneBit, 1, b'J')),
+            ("compare", "(JJ)I") => Some((JitIntrinsic::LongCompare, 2, b'I')),
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = hit {
+            return Some((intrinsic.as_entry(), num_params, ret));
+        }
+    }
     // ===== INTRINSIC REGION END: LONG_BITS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
-
+    // java.lang.System.arraycopy (Phase 2). The descriptor is type-erased
+    // — the element kind is unknown until runtime — so a SINGLE variant
+    // (`ArraycopyPrimitive`) is registered. The x64 codegen emits a
+    // runtime dispatch: if both arrays are non-null, are arrays, share the
+    // same PRIMITIVE element kind, and all five positions are in bounds,
+    // it inlines a memmove-correct `REP MOVSB`. Every other case (null,
+    // non-array, reference array, mismatched/incompatible element kinds,
+    // out-of-bounds) takes the uncommon-trap deopt stub, which re-runs the
+    // call in the interpreter via the native `System.arraycopy` — that
+    // path preserves NPE / ArrayStoreException / AIOOBE and the GC store
+    // barrier verbatim. Reference arrays therefore intentionally bail to
+    // native (roadmap §3.4: never trade correctness for inlining).
+    if class == "java/lang/System"
+        && name == "arraycopy"
+        && descriptor == "(Ljava/lang/Object;ILjava/lang/Object;II)V"
+    {
+        return Some((JitIntrinsic::ArraycopyPrimitive.as_entry(), 5, b'V'));
+    }
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
-
+    // java.lang.String access intrinsics (length/charAt/isEmpty/hashCode):
+    // INTENTIONALLY NOT REGISTERED. Returning None here makes these calls
+    // fall back to normal native dispatch (native-builtins/lang_string.rs),
+    // which is correct — inlining them would be unsound in this VM:
+    //   1. No static class-layout registry. `getfield` offsets are resolved
+    //      only from the *currently-compiled method's* constant pool, per
+    //      bytecode PC — there is no `String -> {value,coder,hash}` offset
+    //      map. This matcher only sees (class, name, descriptor) strings.
+    //   2. String's layout is not fixed: native-builtins/lang_string.rs
+    //      (native_string_hash_code) loads two layouts — JDK-25 {value:[B,
+    //      coder:B, hash:I, hashIsZero:Z} and legacy {value:[C, hash:I} —
+    //      so the `hash` slot is index 2 or 1 depending on the runtime
+    //      object. A hard-coded offset would corrupt one of them.
+    //   3. length()/charAt() also need the runtime `coder` byte and the
+    //      `value` array element type to decode (byte[] LATIN1/UTF16 vs
+    //      char[]) — heap-object properties unknowable at compile time.
+    //   4. Object fields are 16-byte `Value` enums, not raw scalars, so a
+    //      known offset still can't be read with a plain MOV.
+    // See jit/tests/intrinsic_string_access.rs for the full write-up and a
+    // fixed-layout contract sketch for a future revisit.
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-
+    // java.lang.String search/compare intrinsics — INVESTIGATED, BAILED.
+    //
+    // Targets considered: String.equals(Ljava/lang/Object;)Z,
+    // compareTo(Ljava/lang/String;)I, indexOf(I)I, indexOf(Ljava/lang/
+    // String;)I. None can be inlined correctly, so this region registers
+    // NOTHING — every such call falls through to normal dispatch (the
+    // native-builtins implementations in `native-builtins/src/
+    // lang_string.rs`).
+    //
+    // Why bailing is mandatory (roadmap §3.4: correctness over coverage):
+    //
+    //  1. String's field layout is NOT statically fixed. `native-builtins/
+    //     src/lang_string.rs` (`native_string_hash_code`, ~line 590)
+    //     documents TWO coexisting layouts the VM may load:
+    //       * JDK 9+ compact:   {value:[B, coder:B, hash:I, hashIsZero:Z}
+    //       * legacy synthetic: {value:[C, hash:I}
+    //     Which one applies is decided at RUNTIME by inspecting the
+    //     `value` array's element type (`byte[]` vs `char[]`). A method is
+    //     JIT-compiled once and cannot know which layout an arbitrary
+    //     String receiver carries.
+    //
+    //  2. The `coder` field index is not even constant: `coder` is field
+    //     index 1 in the compact layout, but field index 1 is `hash` in
+    //     the legacy layout. An inlined `getfield 1` would misread `hash`
+    //     as `coder` and silently corrupt LATIN1/UTF16 decoding.
+    //
+    //  3. The JIT has NO inline instance-field access. Every `getfield`
+    //     (x64.rs opcode 0xb4) emits a CALL to the `jit_getfield` helper
+    //     keyed by an abstract field index; `jit_getfield` reads a 16-byte
+    //     `Value` enum, not a packed primitive. Array element loads
+    //     (baload/iaload) are likewise helper calls, and the element width
+    //     depends on the runtime-determined layout. Inlining here would
+    //     still emit CALLs, violating roadmap §8 ("no CALL in generated
+    //     code").
+    //
+    // A fixed-layout contract would be the prerequisite to inline these:
+    //   * String must commit to a single `#[repr(C)]`-stable layout with
+    //     `value` at a known field offset and `coder` always present at a
+    //     known offset;
+    //   * the backing array element width must be pinned (always `byte[]`,
+    //     never the legacy `char[]`);
+    //   * the JIT needs inline array-length and element-load codegen with
+    //     the correct width;
+    //   * `equals` additionally needs an inline `instanceof String` check
+    //     for its `Object` argument (returning false for non-Strings).
+    // None of that exists today, so all four signatures bail to native.
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
@@ -1436,11 +1631,62 @@ pub fn try_resolve_intrinsic(
     // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
-
+    // java.util.Arrays.sort(prim[]) — single-argument overloads for the five
+    // integral element types. The codegen emits an in-place insertion sort
+    // (O(n^2), but provably correct for all lengths including empty/single).
+    //
+    // float[]/double[] are deliberately excluded: their JLS ordering uses
+    // Double.compare semantics (NaN sorts last, -0.0 before +0.0) which a
+    // plain signed compare does not honour. The 3-argument range overloads
+    // (sort([III)V etc.) are also out of scope. Both fall through to None
+    // and use the normal dispatch path.
+    if class == "java/util/Arrays" && name == "sort" {
+        let hit: Option<JitIntrinsic> = match descriptor {
+            "([I)V" => Some(JitIntrinsic::ArraysSortInt),
+            "([J)V" => Some(JitIntrinsic::ArraysSortLong),
+            "([C)V" => Some(JitIntrinsic::ArraysSortChar),
+            "([S)V" => Some(JitIntrinsic::ArraysSortShort),
+            "([B)V" => Some(JitIntrinsic::ArraysSortByte),
+            _ => None,
+        };
+        if let Some(intrinsic) = hit {
+            // num_params = 1 (the array ref), return kind 'V' (void).
+            return Some((intrinsic.as_entry(), 1, b'V'));
+        }
+    }
     // ===== INTRINSIC REGION END: ARRAYS_SORT =====
 
     // ===== INTRINSIC REGION BEGIN: CRC32 =====
-
+    // java.util.zip.CRC32 / CRC32C update intrinsics — DELIBERATELY UNREGISTERED.
+    //
+    // This family bails completely. No `JitIntrinsic` variant is declared and
+    // nothing is returned here. Investigation conclusions:
+    //
+    //  * CRC32C (the only target the hardware `CRC32` instruction could
+    //    accelerate — it computes the Castagnoli CRC-32C, poly 0x1EDC6F41):
+    //    there is NO `java/util/zip/CRC32C` implementation anywhere in this
+    //    VM. native-builtins registers natives for `java/util/zip/CRC32`
+    //    only (see native-builtins/src/zip_real.rs::register_zip_real_natives
+    //    and phases_early.rs). With no native CRC32C oracle and no class ever
+    //    instantiated, there is nothing to be bit-identical to and nothing to
+    //    inline. Roadmap §3.4 forbids registering an intrinsic without a
+    //    differential oracle.
+    //
+    //  * CRC32 (IEEE 802.3, reflected poly 0xEDB88320): the x86 `CRC32`
+    //    instruction uses the WRONG polynomial (Castagnoli), so it cannot
+    //    implement this; a correct inline path needs a 256-entry static table
+    //    or PCLMULQDQ folding — out of scope for a leaf call-site intrinsic.
+    //    Additionally the receiver layout is not statically known to the JIT:
+    //    in synthetic mode (phases_early.rs) the running crc lives in field
+    //    slot 0 as a `Value::Long` storing the *bit-complemented* public
+    //    value, while in real-JDK mode the int `crc` field sits at whatever
+    //    offset the loaded JDK class declares and `update([BII)V` is pure
+    //    Java bytecode delegating to the static native `updateBytes0`. The
+    //    JIT cannot know the active mode, the field type, or the offset at
+    //    compile time, so threading the running crc through the field would
+    //    be unsound.
+    //
+    // Bailing the whole family is the correct, roadmap-sanctioned outcome.
     // ===== INTRINSIC REGION END: CRC32 =====
 
     None
