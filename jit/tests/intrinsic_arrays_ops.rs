@@ -1,0 +1,544 @@
+//! Differential / behavioural tests for the ARRAYS_OPS JIT intrinsic family
+//! (`java.util.Arrays.fill` and `java.util.Arrays.equals`).
+//!
+//! Each test JIT-compiles a tiny method whose single bytecode of interest is
+//! an `invokestatic` resolved to an `Arrays.*` intrinsic, then runs the
+//! generated machine code against the JDK-specified reference behaviour.
+//!
+//! Array memory model (`cratonvm_types`): a 40-byte object header with the
+//! i32 element count at offset 12, element data packed at natural width from
+//! offset 40. The tests fabricate that layout in a raw, 8-byte-aligned
+//! `Vec<u8>` — the intrinsics touch only offset 12 (length) and offset 40+
+//! (data), never the GC mark word, so a real heap allocation is unnecessary.
+
+use cratonvm_jit::x64::{compile, is_jit_compatible};
+use cratonvm_jit_api::JitRuntimeHelpers;
+use std::collections::{HashMap, HashSet};
+
+const HEADER_SIZE: usize = 40;
+const ARRAY_LENGTH_OFFSET: usize = 12;
+
+/// Runtime helpers for the intrinsic tests. The fill/equals intrinsics emit
+/// no `CALL` on the success path; the ONLY helper they can reach is
+/// `bastore`, invoked by the shared null-check stub when `Arrays.fill` is
+/// handed a null array. We wire that to a benign no-op so the null test
+/// observes the deopt sentinel (`i64::MIN`) rather than panicking.
+fn arrays_helpers() -> JitRuntimeHelpers {
+    unsafe extern "C" fn stub() {
+        panic!("ARRAYS_OPS intrinsic test invoked an unexpected runtime helper");
+    }
+    // No-op bastore: the null-check stub zeroes the array arg then calls
+    // this; a real `jit_bastore` would set JIT_PENDING_NPE. For the test we
+    // only need it to return without crashing.
+    unsafe extern "C" fn noop_bastore() {}
+    let s = stub as *const () as usize;
+    JitRuntimeHelpers {
+        newarray: s,
+        new_object: s,
+        anewarray_object: s,
+        baload: s,
+        bastore: noop_bastore as *const () as usize,
+        iaload: s,
+        iastore: s,
+        aaload: s,
+        aastore: s,
+        multianewarray_2d: s,
+        arraylength: s,
+        getfield: s,
+        putfield_int: s,
+        putfield_long: s,
+        putfield_float: s,
+        putfield_double: s,
+        putfield_object: s,
+        getstatic: s,
+        putstatic_int: s,
+        putstatic_long: s,
+        putstatic_float: s,
+        putstatic_double: s,
+        putstatic_object: s,
+        checkcast: s,
+        instanceof_check: s,
+        throw_aioobe: s,
+        invoke_dispatch: s,
+        invoke_virtual_mic: s,
+        write_barrier: s,
+        satb_pre_write_barrier: s,
+        uncommon_trap: s,
+        math_fma_double: s,
+        math_fma_float: s,
+        tlab_cursor_offset_in_thread: 0,
+        tlab_end_offset_in_thread: 8,
+        class_id_offset_in_obj: 0,
+        get_current_thread: 0,
+        tlab_post_init: 0,
+    }
+}
+
+/// A fabricated primitive array: an 8-byte-aligned buffer laid out exactly
+/// like a `cratonvm` array object (40-byte header, length at +12, data
+/// at +40). Kept alive by holding the backing `Vec`.
+struct FakeArray {
+    buf: Vec<u8>,
+}
+
+impl FakeArray {
+    /// Allocate a zeroed array of `len` elements, each `elem_size` bytes.
+    fn new(len: usize, elem_size: usize) -> Self {
+        let total = HEADER_SIZE + len * elem_size;
+        // Over-allocate by 8 so we can hand out an 8-aligned start.
+        let mut backing = vec![0u8; total + 8];
+        let misalign = backing.as_ptr() as usize & 7;
+        let pad = (8 - misalign) & 7;
+        // Shift the logical start to an 8-aligned offset by rotating padding
+        // to the front: simplest is to just allocate aligned via a Vec<u64>.
+        let _ = pad;
+        backing.truncate(total + 8);
+        let mut fa = FakeArray { buf: backing };
+        fa.set_len(len as i32);
+        fa
+    }
+
+    /// 8-aligned base pointer of the fabricated object.
+    fn base(&self) -> *mut u8 {
+        let raw = self.buf.as_ptr() as usize;
+        let aligned = (raw + 7) & !7usize;
+        aligned as *mut u8
+    }
+
+    fn ptr(&self) -> i64 {
+        self.base() as i64
+    }
+
+    fn set_len(&mut self, len: i32) {
+        unsafe {
+            let p = self.base().add(ARRAY_LENGTH_OFFSET) as *mut i32;
+            p.write_unaligned(len);
+        }
+    }
+
+    fn data(&self) -> *mut u8 {
+        unsafe { self.base().add(HEADER_SIZE) }
+    }
+
+    fn read_i8(&self, idx: usize) -> i8 {
+        unsafe { (self.data() as *const i8).add(idx).read() }
+    }
+    fn read_i16(&self, idx: usize) -> i16 {
+        unsafe { (self.data() as *const i16).add(idx).read_unaligned() }
+    }
+    fn read_i32(&self, idx: usize) -> i32 {
+        unsafe { (self.data() as *const i32).add(idx).read_unaligned() }
+    }
+    fn read_i64(&self, idx: usize) -> i64 {
+        unsafe { (self.data() as *const i64).add(idx).read_unaligned() }
+    }
+    fn write_i8(&mut self, idx: usize, v: i8) {
+        unsafe { (self.data() as *mut i8).add(idx).write(v) }
+    }
+    fn write_i16(&mut self, idx: usize, v: i16) {
+        unsafe { (self.data() as *mut i16).add(idx).write_unaligned(v) }
+    }
+    fn write_i32(&mut self, idx: usize, v: i32) {
+        unsafe { (self.data() as *mut i32).add(idx).write_unaligned(v) }
+    }
+    fn write_i64(&mut self, idx: usize, v: i64) {
+        unsafe { (self.data() as *mut i64).add(idx).write_unaligned(v) }
+    }
+}
+
+/// Compile a method and return the executable `CompiledMethod`.
+#[allow(clippy::too_many_arguments)]
+fn compile_method(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    direct_calls: Vec<(usize, cratonvm_jit::JitDirectCall)>,
+) -> cratonvm_jit::CompiledMethod {
+    assert!(
+        is_jit_compatible(code, code_len, "()V"),
+        "bytecode rejected by jit_scan — test setup is wrong"
+    );
+    compile(
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        false, // needs_heap — no array opcodes, args are raw pointers
+        Vec::new(), // multianewarray_info
+        Vec::new(), // field_info
+        Vec::new(), // typecheck_info
+        Vec::new(), // static_field_info
+        Vec::new(), // new_info
+        Vec::new(), // anewarray_info
+        Vec::new(), // invoke_info
+        direct_calls,
+        Vec::new(), // mic_slots
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(), // branch_hints
+        HashMap::new(), // loop_unroll_hints
+        &arrays_helpers(),
+        HashSet::new(), // non_escaping_new
+        HashMap::new(), // inline_sites
+    )
+    .expect("JIT compilation failed")
+}
+
+fn direct_call(entry: usize, num_params: usize, return_type: u8) -> cratonvm_jit::JitDirectCall {
+    cratonvm_jit::JitDirectCall {
+        entry,
+        needs_context: false,
+        num_params,
+        return_type,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arrays.fill
+// ---------------------------------------------------------------------------
+
+/// Bytecode for `void f(<array>, <value>) { Arrays.fill(array, value); }`:
+///   aload_0, <load value local 1>, invokestatic #1, return
+/// `load_value` is the single-byte opcode that pushes local 1.
+fn fill_bytecode(load_value: u8) -> Vec<u8> {
+    // aload_0 (0x2a), <load_value>, invokestatic (0xb8 00 01), return (0xb1)
+    vec![0x2a, load_value, 0xb8, 0x00, 0x01, 0xb1, 0, 0]
+}
+
+#[test]
+fn test_arrays_fill_int() {
+    // iload_1 = 0x1b
+    let code = fill_bytecode(0x1b);
+    let compiled = compile_method(
+        &code,
+        6,
+        2,
+        2,
+        vec![(
+            2,
+            direct_call(
+                cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(),
+                2,
+                b'V',
+            ),
+        )],
+    );
+    for &len in &[0usize, 1, 5, 17, 64] {
+        let mut arr = FakeArray::new(len, 4);
+        for i in 0..len {
+            arr.write_i32(i, -1);
+        }
+        let fill_val: i32 = 0x12345678;
+        // SAFETY: JIT-compiled code; args are (array_ptr, fill_value).
+        unsafe { compiled.call(&[arr.ptr(), fill_val as i64]) };
+        for i in 0..len {
+            assert_eq!(arr.read_i32(i), fill_val, "int fill len={len} idx={i}");
+        }
+    }
+}
+
+#[test]
+fn test_arrays_fill_long() {
+    let code = fill_bytecode(0x1f); // lload_1 = 0x1f
+    let compiled = compile_method(
+        &code,
+        6,
+        2,
+        3,
+        vec![(
+            2,
+            direct_call(
+                cratonvm_jit::JitIntrinsic::ArraysFill8.as_entry(),
+                2,
+                b'V',
+            ),
+        )],
+    );
+    for &len in &[0usize, 1, 3, 9] {
+        let mut arr = FakeArray::new(len, 8);
+        let fill_val: i64 = -0x0123_4567_89AB_CDEF;
+        // SAFETY: JIT-compiled code.
+        unsafe { compiled.call(&[arr.ptr(), fill_val]) };
+        for i in 0..len {
+            assert_eq!(arr.read_i64(i), fill_val, "long fill len={len} idx={i}");
+        }
+    }
+}
+
+#[test]
+fn test_arrays_fill_byte() {
+    let code = fill_bytecode(0x1b); // iload_1
+    let compiled = compile_method(
+        &code,
+        6,
+        2,
+        2,
+        vec![(
+            2,
+            direct_call(
+                cratonvm_jit::JitIntrinsic::ArraysFill1.as_entry(),
+                2,
+                b'V',
+            ),
+        )],
+    );
+    for &len in &[0usize, 1, 7, 33] {
+        let mut arr = FakeArray::new(len, 1);
+        let fill_val: i8 = -7;
+        // SAFETY: JIT-compiled code.
+        unsafe { compiled.call(&[arr.ptr(), fill_val as i64]) };
+        for i in 0..len {
+            assert_eq!(arr.read_i8(i), fill_val, "byte fill len={len} idx={i}");
+        }
+    }
+}
+
+#[test]
+fn test_arrays_fill_char_short() {
+    let code = fill_bytecode(0x1b); // iload_1
+    let compiled = compile_method(
+        &code,
+        6,
+        2,
+        2,
+        vec![(
+            2,
+            direct_call(
+                cratonvm_jit::JitIntrinsic::ArraysFill2.as_entry(),
+                2,
+                b'V',
+            ),
+        )],
+    );
+    for &len in &[0usize, 1, 4, 21] {
+        let mut arr = FakeArray::new(len, 2);
+        let fill_val: i16 = -12345;
+        // SAFETY: JIT-compiled code.
+        unsafe { compiled.call(&[arr.ptr(), fill_val as i64]) };
+        for i in 0..len {
+            assert_eq!(arr.read_i16(i), fill_val, "short fill len={len} idx={i}");
+        }
+    }
+}
+
+#[test]
+fn test_arrays_fill_does_not_overrun() {
+    // Sentinel byte just past the last element must be untouched.
+    let code = fill_bytecode(0x1b);
+    let compiled = compile_method(
+        &code,
+        6,
+        2,
+        2,
+        vec![(
+            2,
+            direct_call(
+                cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(),
+                2,
+                b'V',
+            ),
+        )],
+    );
+    let len = 8usize;
+    // Allocate len+2 elements but tell the array its length is `len`.
+    let mut arr = FakeArray::new(len + 2, 4);
+    arr.set_len(len as i32);
+    arr.write_i32(len, 0x7777_7777);
+    arr.write_i32(len + 1, 0x6666_6666);
+    // SAFETY: JIT-compiled code.
+    unsafe { compiled.call(&[arr.ptr(), 0x1111_1111]) };
+    for i in 0..len {
+        assert_eq!(arr.read_i32(i), 0x1111_1111);
+    }
+    assert_eq!(arr.read_i32(len), 0x7777_7777, "fill overran array end");
+    assert_eq!(arr.read_i32(len + 1), 0x6666_6666, "fill overran array end");
+}
+
+#[test]
+fn test_arrays_fill_null_array_deopts() {
+    // Arrays.fill(null, v) must take the NPE path. The shared null-check
+    // stub returns the deopt sentinel i64::MIN.
+    let code = fill_bytecode(0x1b);
+    let compiled = compile_method(
+        &code,
+        6,
+        2,
+        2,
+        vec![(
+            2,
+            direct_call(
+                cratonvm_jit::JitIntrinsic::ArraysFill4.as_entry(),
+                2,
+                b'V',
+            ),
+        )],
+    );
+    // SAFETY: JIT-compiled code; null array argument exercises the NPE stub.
+    let r = unsafe { compiled.call(&[0i64, 0x1111_1111]) };
+    assert_eq!(
+        r,
+        i64::MIN,
+        "Arrays.fill(null, ..) must deopt out via the NPE stub"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Arrays.equals
+// ---------------------------------------------------------------------------
+
+/// Bytecode for `boolean f(<a>, <b>) { return Arrays.equals(a, b); }`:
+///   aload_0, aload_1, invokestatic #1, ireturn
+fn equals_bytecode() -> Vec<u8> {
+    // aload_0 (0x2a), aload_1 (0x2b), invokestatic (0xb8 00 01), ireturn (0xac)
+    vec![0x2a, 0x2b, 0xb8, 0x00, 0x01, 0xac, 0, 0]
+}
+
+fn equals_compiled(intrinsic: cratonvm_jit::JitIntrinsic) -> cratonvm_jit::CompiledMethod {
+    let code = equals_bytecode();
+    compile_method(
+        &code,
+        6,
+        2,
+        2,
+        vec![(2, direct_call(intrinsic.as_entry(), 2, b'Z'))],
+    )
+}
+
+#[test]
+fn test_arrays_equals_int() {
+    let compiled = equals_compiled(cratonvm_jit::JitIntrinsic::ArraysEquals4);
+
+    // Equal content, multiple lengths.
+    for &len in &[0usize, 1, 4, 19] {
+        let mut a = FakeArray::new(len, 4);
+        let mut b = FakeArray::new(len, 4);
+        for i in 0..len {
+            a.write_i32(i, i as i32 * 7 - 3);
+            b.write_i32(i, i as i32 * 7 - 3);
+        }
+        // SAFETY: JIT-compiled code.
+        let r = unsafe { compiled.call(&[a.ptr(), b.ptr()]) };
+        assert_eq!(r, 1, "equal int[] len={len} must be true");
+    }
+
+    // Single differing element at various positions.
+    for diff_at in 0..6usize {
+        let mut a = FakeArray::new(6, 4);
+        let mut b = FakeArray::new(6, 4);
+        for i in 0..6 {
+            a.write_i32(i, 100 + i as i32);
+            b.write_i32(i, 100 + i as i32);
+        }
+        b.write_i32(diff_at, -999);
+        // SAFETY: JIT-compiled code.
+        let r = unsafe { compiled.call(&[a.ptr(), b.ptr()]) };
+        assert_eq!(r, 0, "int[] differing at idx {diff_at} must be false");
+    }
+
+    // Length mismatch.
+    let a = FakeArray::new(5, 4);
+    let b = FakeArray::new(6, 4);
+    // SAFETY: JIT-compiled code.
+    let r = unsafe { compiled.call(&[a.ptr(), b.ptr()]) };
+    assert_eq!(r, 0, "length-mismatched int[] must be false");
+}
+
+#[test]
+fn test_arrays_equals_long() {
+    let compiled = equals_compiled(cratonvm_jit::JitIntrinsic::ArraysEquals8);
+    let mut a = FakeArray::new(4, 8);
+    let mut b = FakeArray::new(4, 8);
+    for i in 0..4 {
+        a.write_i64(i, (i as i64) << 40 | 0xABCD);
+        b.write_i64(i, (i as i64) << 40 | 0xABCD);
+    }
+    // SAFETY: JIT-compiled code.
+    assert_eq!(unsafe { compiled.call(&[a.ptr(), b.ptr()]) }, 1);
+    b.write_i64(2, 0);
+    // SAFETY: JIT-compiled code.
+    assert_eq!(unsafe { compiled.call(&[a.ptr(), b.ptr()]) }, 0);
+}
+
+#[test]
+fn test_arrays_equals_byte() {
+    let compiled = equals_compiled(cratonvm_jit::JitIntrinsic::ArraysEquals1);
+    let mut a = FakeArray::new(11, 1);
+    let mut b = FakeArray::new(11, 1);
+    for i in 0..11 {
+        a.write_i8(i, (i as i8).wrapping_mul(13));
+        b.write_i8(i, (i as i8).wrapping_mul(13));
+    }
+    // SAFETY: JIT-compiled code.
+    assert_eq!(unsafe { compiled.call(&[a.ptr(), b.ptr()]) }, 1);
+    b.write_i8(10, b.read_i8(10).wrapping_add(1));
+    // SAFETY: JIT-compiled code.
+    assert_eq!(unsafe { compiled.call(&[a.ptr(), b.ptr()]) }, 0);
+}
+
+#[test]
+fn test_arrays_equals_char_short() {
+    let compiled = equals_compiled(cratonvm_jit::JitIntrinsic::ArraysEquals2);
+    let mut a = FakeArray::new(7, 2);
+    let mut b = FakeArray::new(7, 2);
+    for i in 0..7 {
+        a.write_i16(i, (i as i16).wrapping_mul(1111));
+        b.write_i16(i, (i as i16).wrapping_mul(1111));
+    }
+    // SAFETY: JIT-compiled code.
+    assert_eq!(unsafe { compiled.call(&[a.ptr(), b.ptr()]) }, 1);
+    b.write_i16(0, b.read_i16(0).wrapping_add(1));
+    // SAFETY: JIT-compiled code.
+    assert_eq!(unsafe { compiled.call(&[a.ptr(), b.ptr()]) }, 0);
+}
+
+#[test]
+fn test_arrays_equals_empty() {
+    // Two distinct empty arrays compare equal.
+    let compiled = equals_compiled(cratonvm_jit::JitIntrinsic::ArraysEquals4);
+    let a = FakeArray::new(0, 4);
+    let b = FakeArray::new(0, 4);
+    // SAFETY: JIT-compiled code.
+    assert_eq!(
+        unsafe { compiled.call(&[a.ptr(), b.ptr()]) },
+        1,
+        "two empty arrays must compare equal"
+    );
+}
+
+#[test]
+fn test_arrays_equals_null_semantics() {
+    // JDK: both null -> true; one null -> false; same ref -> true.
+    let compiled = equals_compiled(cratonvm_jit::JitIntrinsic::ArraysEquals4);
+    let a = FakeArray::new(3, 4);
+
+    // both null
+    // SAFETY: JIT-compiled code.
+    assert_eq!(
+        unsafe { compiled.call(&[0i64, 0i64]) },
+        1,
+        "equals(null, null) must be true"
+    );
+    // a null, b non-null
+    // SAFETY: JIT-compiled code.
+    assert_eq!(
+        unsafe { compiled.call(&[0i64, a.ptr()]) },
+        0,
+        "equals(null, arr) must be false"
+    );
+    // a non-null, b null
+    // SAFETY: JIT-compiled code.
+    assert_eq!(
+        unsafe { compiled.call(&[a.ptr(), 0i64]) },
+        0,
+        "equals(arr, null) must be false"
+    );
+    // same reference
+    // SAFETY: JIT-compiled code.
+    assert_eq!(
+        unsafe { compiled.call(&[a.ptr(), a.ptr()]) },
+        1,
+        "equals(arr, arr) must be true (same reference)"
+    );
+}
