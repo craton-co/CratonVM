@@ -16149,6 +16149,14 @@ fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
         "Latin_Extended-A" | "LatinExtendedA" => Some(r"\u{0100}-\u{017F}"),
         "Latin_Extended-B" | "LatinExtendedB" => Some(r"\u{0180}-\u{024F}"),
         "IPA_Extensions" | "IPAExtensions" => Some(r"\u{0250}-\u{02AF}"),
+        "Spacing_Modifier_Letters" | "SpacingModifierLetters" => {
+            Some(r"\u{02B0}-\u{02FF}")
+        }
+        // U+0300-U+036F — the block `StringUtils.stripAccents` filters via
+        // `\p{InCombiningDiacriticalMarks}` (commons-lang3 StringUtils.<clinit>).
+        "Combining_Diacritical_Marks" | "CombiningDiacriticalMarks" => {
+            Some(r"\u{0300}-\u{036F}")
+        }
         "Greek" | "Greek_and_Coptic" => Some(r"\u{0370}-\u{03FF}"),
         "Cyrillic" => Some(r"\u{0400}-\u{04FF}"),
         "General_Punctuation" | "GeneralPunctuation" => Some(r"\u{2000}-\u{206F}"),
