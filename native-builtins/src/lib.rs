@@ -7163,14 +7163,11 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // Logback / Spring early formatters: `SimpleDateFormat(String)` on a
-    // partially-resolved `java.text` stub can surface NSME in real-JDK mode.
-    registry.register(
-        "java/text/SimpleDateFormat",
-        "<init>",
-        "(Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // NOTE: no `SimpleDateFormat.<init>` override. A former no-op stub here
+    // left every field (`pattern`, `calendar`, `numberFormat`, `formatData`)
+    // null, so the real `DateFormat.format`/`getDateFormatSymbols` bytecode
+    // NPE'd. The real `java.text.SimpleDateFormat` constructor runs instead —
+    // its dependencies (`Calendar`, `DateFormatSymbols`, `NumberFormat`) work.
 
     // Real-JDK CLI builds omit `synthetic-jdk`, so `register_synthetic_overrides`
     // (which used to be the only caller of `register_exception_extras_natives`)
