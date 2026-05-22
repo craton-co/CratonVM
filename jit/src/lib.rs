@@ -1394,42 +1394,27 @@ impl JitIntrinsic {
 
 /// Sentinel `entry` values for JitDirectCall indicating inlined Math intrinsics.
 ///
-/// These are deprecated aliases retained for one release so existing
-/// `x64.rs` comparisons keep compiling unchanged. New code should use
-/// [`JitIntrinsic`] variants and [`JitIntrinsic::as_entry`] directly.
-#[allow(deprecated)]
+/// Backward-compatible aliases for the [`JitIntrinsic`] Math variants so
+/// existing `x64.rs` comparisons and the VM interpreter keep compiling
+/// unchanged. New code should use [`JitIntrinsic`] variants and
+/// [`JitIntrinsic::as_entry`] directly.
 mod math_intrinsic_aliases {
     use super::JitIntrinsic;
-    #[deprecated(note = "use JitIntrinsic::MathSqrt.as_entry()")]
     pub const MATH_SQRT_INTRINSIC: usize = JitIntrinsic::MathSqrt.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathFloor.as_entry()")]
     pub const MATH_FLOOR_INTRINSIC: usize = JitIntrinsic::MathFloor.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathCeil.as_entry()")]
     pub const MATH_CEIL_INTRINSIC: usize = JitIntrinsic::MathCeil.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathRint.as_entry()")]
     pub const MATH_RINT_INTRINSIC: usize = JitIntrinsic::MathRint.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathAbsDouble.as_entry()")]
     pub const MATH_ABS_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathAbsDouble.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathAbsFloat.as_entry()")]
     pub const MATH_ABS_FLOAT_INTRINSIC: usize = JitIntrinsic::MathAbsFloat.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathAbsInt.as_entry()")]
     pub const MATH_ABS_INT_INTRINSIC: usize = JitIntrinsic::MathAbsInt.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathAbsLong.as_entry()")]
     pub const MATH_ABS_LONG_INTRINSIC: usize = JitIntrinsic::MathAbsLong.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathFmaDouble.as_entry()")]
     pub const MATH_FMA_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathFmaDouble.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathFmaFloat.as_entry()")]
     pub const MATH_FMA_FLOAT_INTRINSIC: usize = JitIntrinsic::MathFmaFloat.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathMinInt.as_entry()")]
     pub const MATH_MIN_INT_INTRINSIC: usize = JitIntrinsic::MathMinInt.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathMaxInt.as_entry()")]
     pub const MATH_MAX_INT_INTRINSIC: usize = JitIntrinsic::MathMaxInt.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathMinLong.as_entry()")]
     pub const MATH_MIN_LONG_INTRINSIC: usize = JitIntrinsic::MathMinLong.as_entry();
-    #[deprecated(note = "use JitIntrinsic::MathMaxLong.as_entry()")]
     pub const MATH_MAX_LONG_INTRINSIC: usize = JitIntrinsic::MathMaxLong.as_entry();
 }
-#[allow(deprecated)]
 pub use math_intrinsic_aliases::*;
 
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
