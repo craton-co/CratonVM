@@ -2996,6 +2996,33 @@ fn try_compile_inner(
                 }
             }
 
+            // Call-site intrinsics for instance-method invokes
+            // (invokevirtual / invokeinterface). The static/special path
+            // above already runs the matcher; this covers `invoke_kind`
+            // 0 and 2. Classes carrying instance-method intrinsics
+            // (`java.lang.String`, `java.util.zip.CRC32`, …) are `final`,
+            // so a virtual site keyed on the constant-pool declared class
+            // is monomorphic and sound to inline. `num_params` from the
+            // matcher excludes the receiver; the x64 codegen ladder for
+            // 0xb6/b7/b9 adds it back (`callee_params + 1`).
+            if !is_self_call && (invoke_kind == 0 || invoke_kind == 2) {
+                if let Some((entry, num_params, ret)) =
+                    try_resolve_intrinsic(&class_name, &method_name, &descriptor)
+                {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                        },
+                    ));
+                    continue;
+                }
+            }
+
             if is_self_call {
                 continue;
             }
