@@ -66420,6 +66420,7 @@ public class SkippedTest {
             std::collections::HashMap::new(),
             &helpers,
             std::collections::HashSet::new(), std::collections::HashMap::new(),
+            None, // string_layout
         ).expect("compilation failed");
 
         for input in -60..110 {
@@ -66480,6 +66481,7 @@ public class SkippedTest {
             std::collections::HashMap::new(),
             &helpers,
             std::collections::HashSet::new(), std::collections::HashMap::new(),
+            None, // string_layout
         ).expect("compilation failed");
 
         unsafe {

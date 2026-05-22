@@ -1231,6 +1231,102 @@ pub struct InlineSite {
     pub descriptor: String,
 }
 
+/// Compile-time resolved field layout of `java/lang/String`, for the
+/// String call-site intrinsics (`length`/`charAt`/`hashCode`/`isEmpty`/
+/// `equals`/`compareTo`/`indexOf`, implemented by a later wave).
+///
+/// # Why this exists
+///
+/// The intrinsic matcher ([`try_resolve_intrinsic`]) and the x64 codegen
+/// only ever see `(class, name, descriptor)` strings — they have no view
+/// of any class's heap layout. A String intrinsic, however, must read the
+/// receiver's `value` (`byte[]`/`char[]`), `coder` (`byte`), and `hash`
+/// (`int`) instance fields with inline machine code. This struct carries
+/// the field positions resolved from the live `java/lang/String` class so
+/// the codegen can emit `MOV [receiver + cell_offset + payload]` directly.
+///
+/// It is produced once per JIT compilation by the
+/// `string_layout_resolver` callback passed to [`try_compile`] and threaded
+/// unchanged into [`x64::compile`]. When the resolver returns `None` (e.g.
+/// `java/lang/String` not yet loaded) the String intrinsics simply bail to
+/// normal dispatch — exactly today's behaviour.
+///
+/// # How an intrinsic obtains a field offset
+///
+/// Each `*_field_index` is the abstract field slot index. The matching
+/// `*_cell_offset` is the **byte offset of that field's 16-byte `Value`
+/// cell from the object base**, precomputed as
+/// `HEADER_SIZE + field_index * SLOT_SIZE`. To load the field's payload,
+/// add the in-cell payload offset from `cratonvm_types`:
+///
+/// ```text
+/// // `hash` is an int  → 4-byte payload at FIELD_CELL_PAYLOAD32_OFFSET:
+/// MOVSXD rax, [receiver + layout.hash_cell_offset  + FIELD_CELL_PAYLOAD32_OFFSET]
+/// // `coder` is a byte → also a 4-byte Value::Int payload:
+/// MOVSXD rax, [receiver + layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET]
+/// // `value` is a ref  → 8-byte payload at FIELD_CELL_PAYLOAD64_OFFSET:
+/// MOV    rax, [receiver + layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET]
+/// ```
+///
+/// This is the same cell-offset math the inline `getfield` codegen uses;
+/// see `x64.rs` opcode `0xb4`.
+///
+/// # `coder` may be absent
+///
+/// The legacy synthetic `{value:[C, hash:I}` String layout has no `coder`
+/// field (the backing array is `char[]`, always UTF-16). `has_coder` is
+/// `false` in that case and `coder_field_index`/`coder_cell_offset` are
+/// meaningless — an intrinsic that needs `coder` MUST check `has_coder`
+/// first and bail to native dispatch when it is `false`. The compact
+/// JDK-9+ `{value:[B, coder:B, hash:I, hashIsZero:Z}` layout sets it
+/// `true`. The resolver decides which layout applies by inspecting the
+/// loaded `java/lang/String` class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StringFieldLayout {
+    /// Abstract field slot index of `String.value` (the backing array ref).
+    pub value_field_index: usize,
+    /// Byte offset of `value`'s 16-byte `Value` cell from the object base
+    /// (`HEADER_SIZE + value_field_index * SLOT_SIZE`).
+    pub value_cell_offset: i32,
+    /// Abstract field slot index of `String.hash` (the cached `int` hash).
+    pub hash_field_index: usize,
+    /// Byte offset of `hash`'s `Value` cell from the object base.
+    pub hash_cell_offset: i32,
+    /// Whether this String layout has a `coder` field (`true` for the
+    /// compact `byte[]` layout, `false` for the legacy `char[]` layout).
+    pub has_coder: bool,
+    /// Abstract field slot index of `String.coder`. Meaningful only when
+    /// [`has_coder`](Self::has_coder) is `true`.
+    pub coder_field_index: usize,
+    /// Byte offset of `coder`'s `Value` cell from the object base.
+    /// Meaningful only when [`has_coder`](Self::has_coder) is `true`.
+    pub coder_cell_offset: i32,
+}
+
+impl StringFieldLayout {
+    /// Build a layout from raw field indices, precomputing the cell offsets.
+    /// `coder_field_index` is ignored (and the offset zeroed) when
+    /// `has_coder` is `false`.
+    pub fn new(
+        value_field_index: usize,
+        coder_field_index: Option<usize>,
+        hash_field_index: usize,
+    ) -> Self {
+        let cell = |idx: usize| -> i32 {
+            (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
+        };
+        StringFieldLayout {
+            value_field_index,
+            value_cell_offset: cell(value_field_index),
+            hash_field_index,
+            hash_cell_offset: cell(hash_field_index),
+            has_coder: coder_field_index.is_some(),
+            coder_field_index: coder_field_index.unwrap_or(0),
+            coder_cell_offset: coder_field_index.map_or(0, cell),
+        }
+    }
+}
+
 /// Compile-time resolved info for a method invocation from JIT code.
 pub struct JitInvokeInfo {
     pub class_name: &'static str,
@@ -2877,6 +2973,11 @@ pub fn try_compile(
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    // Resolves the field layout of `java/lang/String` for the String
+    // call-site intrinsics. Called at most once per compilation; see
+    // `StringFieldLayout`. `None` (resolver absent, or it returns `None`)
+    // makes String intrinsics bail to normal dispatch.
+    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -2906,6 +3007,7 @@ pub fn try_compile(
         profile,
         helpers,
         inline_resolver,
+        string_layout_resolver,
         &mut backend_attempted,
     );
 
@@ -2936,6 +3038,8 @@ fn try_compile_inner(
     profile: Option<&profile::MethodProfile>,
     helpers: &JitRuntimeHelpers,
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    // Resolves `java/lang/String`'s field layout — see `try_compile`.
+    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -3407,6 +3511,14 @@ fn try_compile_inner(
         })
         .unwrap_or_default();
 
+    // Resolve `java/lang/String`'s field layout once, for the String
+    // call-site intrinsics. `None` (no resolver, or String not yet
+    // loadable) is fine — String intrinsic codegen treats it as "bail to
+    // normal dispatch". Resolved here (cheap, once) so neither the
+    // intrinsic matcher nor `x64::compile` needs the VM class registry.
+    let string_layout: Option<StringFieldLayout> =
+        string_layout_resolver.and_then(|r| r());
+
     // round-7 fix (bug 1): from this point on, any `None` return is a
     // permanent backend bail — the resolver pre-checks all completed
     // successfully and we're about to walk the full
@@ -3437,6 +3549,7 @@ fn try_compile_inner(
         helpers,
         std::collections::HashSet::new(), // non_escaping_new — escape analysis done inside x64 too
         inline_sites,
+        string_layout,
     )?;
 
     compiled._jit_strings = owned_strings;

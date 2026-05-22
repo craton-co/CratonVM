@@ -78,6 +78,40 @@ pub const SLOT_SIZE: usize = 16;
 /// 16-byte Value enums. This halves memory usage for reference arrays.
 pub const REF_ELEMENT_SIZE: usize = 8;
 
+// --- Instance-field cell (`Value` enum) inline-access layout ---------------
+//
+// Java instance fields are stored on the heap as the full 16-byte `crate::Value`
+// enum (one cell == one `SLOT_SIZE`-byte region). The JIT's `getfield` codegen
+// emits a raw `MOV` against a field cell instead of calling the `jit_getfield`
+// helper, so it needs the byte offset of the payload *within* the cell.
+//
+// `Value` has no `#[repr(...)]`; the layout below is what rustc deterministically
+// chooses for it (a 4-byte discriminant word at offset 0, payload after it).
+// The `field_cell_layout_matches_value_enum` test in this module pins the layout
+// at runtime — if rustc ever changes it, that test fails loudly and the JIT
+// inline path must be revisited (or `Value` given an explicit `#[repr(C)]`).
+//
+// Observed layout (verified by the test below, identical in debug + release):
+//   bytes 0..4    : discriminant word (Int=0, Long=1, Float=2, Double=3,
+//                   Object=4, ReturnAddress=5, Uninitialized=6)
+//   bytes 4..8    : payload of a 4-byte variant (Int / Float / ReturnAddress)
+//   bytes 8..16   : payload of an 8-byte variant (Long / Double / Object ptr)
+//
+// For `Value::Object`, the 8-byte word at offset 8 is exactly the raw object
+// pointer: a non-null reference stores its pointer there, and `Object(None)`
+// (the JVM `null`) leaves it zero — matching `jit_getfield`'s
+// `Object(Some(r)) => r.as_ptr()` / `Object(None) => 0`.
+
+/// Byte offset of the discriminant word within a 16-byte `Value` field cell.
+pub const FIELD_CELL_TAG_OFFSET: usize = 0;
+
+/// Byte offset of a 4-byte payload (`Int` / `Float`) within a `Value` field cell.
+pub const FIELD_CELL_PAYLOAD32_OFFSET: usize = 4;
+
+/// Byte offset of an 8-byte payload (`Long` / `Double` / object pointer) within
+/// a `Value` field cell.
+pub const FIELD_CELL_PAYLOAD64_OFFSET: usize = 8;
+
 /// Special class ID for auto-boxed primitive values in compact reference arrays.
 /// When a non-Object Value (Int, Long, Float, Double) is stored in a Reference
 /// array via `set_array_element`, it is automatically wrapped in a 1-field object
@@ -377,6 +411,72 @@ mod tests {
     #[test]
     fn ref_element_size_is_8() {
         assert_eq!(REF_ELEMENT_SIZE, 8);
+    }
+
+    /// Pin the in-memory layout of a `Value` field cell so the JIT's inline
+    /// `getfield` codegen (which emits a raw `MOV [recv + FIELD_CELL_*]`)
+    /// stays correct. `Value` has no `#[repr]`; this test transmutes real
+    /// values and asserts the discriminant / payload land at the documented
+    /// offsets. If rustc ever changes `Value`'s layout this fails loudly.
+    #[test]
+    fn field_cell_layout_matches_value_enum() {
+        use crate::Value;
+
+        // A 4-byte (`Int`) payload lives at FIELD_CELL_PAYLOAD32_OFFSET.
+        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Int(0x1234_5678)) };
+        let tag = u32::from_le_bytes(
+            cell[FIELD_CELL_TAG_OFFSET..FIELD_CELL_TAG_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(tag, 0, "Int discriminant must be 0 at FIELD_CELL_TAG_OFFSET");
+        let p32 = i32::from_le_bytes(
+            cell[FIELD_CELL_PAYLOAD32_OFFSET..FIELD_CELL_PAYLOAD32_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p32, 0x1234_5678, "Int payload at FIELD_CELL_PAYLOAD32_OFFSET");
+
+        // An 8-byte (`Long`) payload lives at FIELD_CELL_PAYLOAD64_OFFSET.
+        let cell: [u8; 16] =
+            unsafe { std::mem::transmute(Value::Long(0x0102_0304_0506_0708_i64)) };
+        let tag = u32::from_le_bytes(
+            cell[FIELD_CELL_TAG_OFFSET..FIELD_CELL_TAG_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(tag, 1, "Long discriminant must be 1");
+        let p64 = i64::from_le_bytes(
+            cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p64, 0x0102_0304_0506_0708_i64, "Long payload at +8");
+
+        // `Object(None)` (JVM null) must leave the 8-byte payload word zero.
+        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Object(None)) };
+        let p64 = u64::from_le_bytes(
+            cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p64, 0, "Object(None) payload word must be zero");
+
+        // A non-null `Object` stores its raw pointer at FIELD_CELL_PAYLOAD64_OFFSET.
+        let backing = Box::leak(Box::new(0u64));
+        let raw = backing as *mut u64 as usize as u64;
+        let oref = unsafe {
+            crate::ObjectRef::from_raw(backing as *mut u64 as *mut u8)
+        };
+        let cell: [u8; 16] = unsafe { std::mem::transmute(Value::Object(Some(oref))) };
+        let p64 = u64::from_le_bytes(
+            cell[FIELD_CELL_PAYLOAD64_OFFSET..FIELD_CELL_PAYLOAD64_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(p64, raw, "Object(Some) payload word must be the raw pointer");
+        // SAFETY: reclaim the leaked allocation.
+        unsafe { drop(Box::from_raw(backing)) };
     }
 
     #[test]

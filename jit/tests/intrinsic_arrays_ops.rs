@@ -182,6 +182,7 @@ fn compile_method(
         &arrays_helpers(),
         HashSet::new(), // non_escaping_new
         HashMap::new(), // inline_sites
+        None, // string_layout
     )
     .expect("JIT compilation failed")
 }

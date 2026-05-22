@@ -222,6 +222,7 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
         &helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation of the arraycopy wrapper failed");
 

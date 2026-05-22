@@ -100,6 +100,7 @@ unsafe fn jit_run_no_args(code: &[u8], descriptor: &str, num_locals: usize) -> i
         &dummy_helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation failed");
     // SAFETY: `compiled` was produced by the JIT from valid bytecode and the

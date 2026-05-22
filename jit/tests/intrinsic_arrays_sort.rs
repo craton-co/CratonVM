@@ -156,6 +156,7 @@ fn compile_sort(entry: usize) -> impl Fn(*mut u8) {
         &stub_helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation of Arrays.sort intrinsic failed");
     move |arr: *mut u8| {

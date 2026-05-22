@@ -128,6 +128,7 @@ unsafe fn run_unary(intrinsic: JitIntrinsic, ret_type: u8, arg: i64) -> i64 {
         &dummy_helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation failed");
     // SAFETY: machine code produced by the JIT from valid bytecode.
@@ -175,6 +176,7 @@ unsafe fn run_binary(intrinsic: JitIntrinsic, ret_type: u8, x: i64, y: i64) -> i
         &dummy_helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation failed");
     // SAFETY: machine code produced by the JIT from valid bytecode.

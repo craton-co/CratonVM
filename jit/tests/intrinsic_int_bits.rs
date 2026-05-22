@@ -110,6 +110,7 @@ fn compile_unary(entry: usize) -> impl Fn(i32) -> i32 {
         &stub_helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation of unary INT_BITS intrinsic failed");
     move |x: i32| {
@@ -155,6 +156,7 @@ fn compile_binary(entry: usize) -> impl Fn(i32, i32) -> i32 {
         &stub_helpers(),
         HashSet::new(),
         HashMap::new(),
+        None, // string_layout
     )
     .expect("JIT compilation of binary INT_BITS intrinsic failed");
     move |x: i32, y: i32| {
