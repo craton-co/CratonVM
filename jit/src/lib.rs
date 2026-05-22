@@ -1335,7 +1335,27 @@ pub enum JitIntrinsic {
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
-
+    // java.util.Arrays.fill / Arrays.equals intrinsics (Phase 4a). Variant
+    // ordering within this region is local and not externally observed.
+    //
+    // `fill` variants are keyed by element width: 1-byte (byte/boolean),
+    // 2-byte (char/short), 4-byte (int), 8-byte (long). `fill([FF)V` and
+    // `fill([DD)V` are intentionally NOT registered — they are bailed (see
+    // try_resolve_intrinsic) so the matcher never registers an intrinsic
+    // whose codegen would have to special-case an FP fill value arriving in
+    // an XMM stack slot. The 3-arg ranged `fill([IIII)V` overloads are out
+    // of scope.
+    ArraysFill1, // fill([BB)V, fill([ZZ)V — REP STOSB
+    ArraysFill2, // fill([CC)V, fill([SS)V — REP STOSW
+    ArraysFill4, // fill([II)V             — REP STOSD
+    ArraysFill8, // fill([JJ)V             — REP STOSQ
+    // `equals` variants are likewise keyed by element width. All primitive
+    // `equals` overloads reduce to a raw byte-wise compare of length*width
+    // bytes (boolean arrays store 0/1, so a byte compare is exact).
+    ArraysEquals1, // equals([B[B)Z, equals([Z[Z)Z
+    ArraysEquals2, // equals([C[C)Z, equals([S[S)Z
+    ArraysEquals4, // equals([I[I)Z
+    ArraysEquals8, // equals([J[J)Z
     // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
@@ -1627,7 +1647,42 @@ pub fn try_resolve_intrinsic(
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
-
+    // java.util.Arrays.fill / Arrays.equals — Phase 4a.
+    //
+    // Both families are pure leaf calls over primitive arrays with no
+    // safepoint. `num_params` excludes the (absent) receiver: `fill` takes
+    // 2 (array, value), `equals` takes 2 (array a, array b).
+    //
+    // Deliberately NOT registered (fall back to native dispatch):
+    //   * `fill([FF)V` / `fill([DD)V` — the fill value is an FP operand that
+    //     the JIT keeps in an XMM stack slot; routing it through the integer
+    //     REP STOS path is not provably correct, so we bail.
+    //   * The 3-arg ranged `fill(...IIX)V` overloads — out of scope.
+    //   * `equals` reference-array / `Object[]` overloads — element equality
+    //     requires calling `Object.equals`, which is not a leaf op.
+    //   * `Arrays.deepEquals`, `Arrays.hashCode`, etc. — not targeted here.
+    if class == "java/util/Arrays" {
+        let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            // --- fill(array, value) : void --- (2 args, void return)
+            ("fill", "([BB)V") => Some((JitIntrinsic::ArraysFill1, 2, b'V')),
+            ("fill", "([ZZ)V") => Some((JitIntrinsic::ArraysFill1, 2, b'V')),
+            ("fill", "([CC)V") => Some((JitIntrinsic::ArraysFill2, 2, b'V')),
+            ("fill", "([SS)V") => Some((JitIntrinsic::ArraysFill2, 2, b'V')),
+            ("fill", "([II)V") => Some((JitIntrinsic::ArraysFill4, 2, b'V')),
+            ("fill", "([JJ)V") => Some((JitIntrinsic::ArraysFill8, 2, b'V')),
+            // --- equals(a, b) : boolean --- (2 args, int/boolean return)
+            ("equals", "([B[B)Z") => Some((JitIntrinsic::ArraysEquals1, 2, b'Z')),
+            ("equals", "([Z[Z)Z") => Some((JitIntrinsic::ArraysEquals1, 2, b'Z')),
+            ("equals", "([C[C)Z") => Some((JitIntrinsic::ArraysEquals2, 2, b'Z')),
+            ("equals", "([S[S)Z") => Some((JitIntrinsic::ArraysEquals2, 2, b'Z')),
+            ("equals", "([I[I)Z") => Some((JitIntrinsic::ArraysEquals4, 2, b'Z')),
+            ("equals", "([J[J)Z") => Some((JitIntrinsic::ArraysEquals8, 2, b'Z')),
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = hit {
+            return Some((intrinsic.as_entry(), num_params, ret));
+        }
+    }
     // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====

@@ -12617,7 +12617,244 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
+                        // java.util.Arrays.fill / Arrays.equals — Phase 4a.
+                        //
+                        // Array layout (cratonvm_types): a 40-byte object
+                        // header with the i32 element count at offset 12
+                        // (ARRAY_LENGTH_OFFSET); element data begins at
+                        // HEADER_SIZE (40). Primitive elements are packed at
+                        // their natural width (byte=1, char/short=2, int=4,
+                        // long=8).
+                        //
+                        // Register discipline: `flush_scratch_registers()`
+                        // ran at the top of the 0xb8 handler, so no Java
+                        // local lives in a scratch GPR — RAX/RCX/RDX/R8/R9/
+                        // R10/R11 are all free to clobber. RDI and RSI ARE
+                        // in `LOCAL_REGS` (Windows callee-saved), so the
+                        // REP STOS/CMPS sequences PUSH/POP them to keep the
+                        // owning locals intact. There is no CALL and no
+                        // safepoint between the PUSH and the POP, so the
+                        // transient RSP adjustment is invisible to the GC.
+                        else if callee_entry == super::JitIntrinsic::ArraysFill1.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysFill2.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysFill4.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysFill8.as_entry()
+                        {
+                            // Arrays.fill(array, value) : void
+                            //
+                            // Operand stack (deepest first): [array, value].
+                            // Pop value, then array.
+                            let value_slot = self.pop_stack();
+                            let array_slot = self.pop_stack();
 
+                            // Array pointer → RAX for the null check.
+                            self.load_slot_to_reg(RAX, array_slot);
+                            // Null array → JDK throws NullPointerException.
+                            // Reuse the shared null-check stub (sets
+                            // JIT_PENDING_NPE, deopts out): TEST RAX,RAX +
+                            // JZ stub.
+                            self.emit_null_check_array_load();
+
+                            // Save array base in R8 (RAX is needed as the
+                            // STOS source register).
+                            // MOV R8, RAX  (49 89 C0)
+                            self.buf.emit(&[0x49, 0x89, 0xC0]);
+                            // Element count → ECX (zero-extends to RCX, the
+                            // REP counter). MOV ECX, [RAX+12]  (8B 48 0C)
+                            self.buf.emit(&[0x8B, 0x48, ARRAY_LENGTH_OFFSET as u8]);
+
+                            // Fill value → RAX. STOSB/W/D/Q use AL/AX/EAX/
+                            // RAX, all sub-registers of RAX, so a single
+                            // 64-bit load serves every width.
+                            self.load_slot_to_reg(RAX, value_slot);
+
+                            // Save RDI (a Java local may live there), point
+                            // it at the element data, run REP STOS, restore.
+                            // PUSH RDI  (57)
+                            self.buf.emit_byte(0x57);
+                            // LEA RDI, [R8 + HEADER_SIZE]  (49 8D 78 28)
+                            self.buf
+                                .emit(&[0x49, 0x8D, 0x78, HEADER_SIZE as u8]);
+                            if callee_entry == super::JitIntrinsic::ArraysFill1.as_entry() {
+                                // REP STOSB  (F3 AA)
+                                self.buf.emit(&[0xF3, 0xAA]);
+                            } else if callee_entry == super::JitIntrinsic::ArraysFill2.as_entry() {
+                                // REP STOSW  (66 F3 AB)
+                                self.buf.emit(&[0x66, 0xF3, 0xAB]);
+                            } else if callee_entry == super::JitIntrinsic::ArraysFill4.as_entry() {
+                                // REP STOSD  (F3 AB)
+                                self.buf.emit(&[0xF3, 0xAB]);
+                            } else {
+                                // REP STOSQ  (F3 48 AB)
+                                self.buf.emit(&[0xF3, 0x48, 0xAB]);
+                            }
+                            // POP RDI  (5F)
+                            self.buf.emit_byte(0x5F);
+                            // void return — nothing pushed onto the operand
+                            // stack.
+                        } else if callee_entry == super::JitIntrinsic::ArraysEquals1.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysEquals2.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysEquals4.as_entry()
+                            || callee_entry == super::JitIntrinsic::ArraysEquals8.as_entry()
+                        {
+                            // Arrays.equals(a, b) : boolean
+                            //
+                            // JDK semantics (java.util.Arrays):
+                            //   a == b               -> true   (both null, or same ref)
+                            //   a == null || b==null -> false
+                            //   a.length != b.length -> false
+                            //   else element-wise equality.
+                            // `equals` never throws — it is a pure compare,
+                            // so no null-check stub is needed.
+                            //
+                            // The element-wise compare is a raw byte compare
+                            // of `length * elem_size` bytes via REP CMPSB.
+                            // boolean[] stores 0/1 per byte, so a byte
+                            // compare is exact for `equals([Z[Z)Z`.
+                            let b_slot = self.pop_stack();
+                            let a_slot = self.pop_stack();
+                            // a → R8, b → R9.
+                            self.load_slot_to_reg(R8, a_slot);
+                            self.load_slot_to_reg(R9, b_slot);
+
+                            let shift: u8 =
+                                if callee_entry == super::JitIntrinsic::ArraysEquals1.as_entry() {
+                                    0
+                                } else if callee_entry
+                                    == super::JitIntrinsic::ArraysEquals2.as_entry()
+                                {
+                                    1
+                                } else if callee_entry
+                                    == super::JitIntrinsic::ArraysEquals4.as_entry()
+                                {
+                                    2
+                                } else {
+                                    3
+                                };
+
+                            // CMP R8, R9  (4D 39 C8) — same reference?
+                            self.buf.emit(&[0x4D, 0x39, 0xC8]);
+                            // JE -> true  (74 rel8) — covers both-null and
+                            // identical-reference.
+                            self.buf.emit_byte(0x74);
+                            let je_true_1 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // TEST R8, R8  (4D 85 C0) — a null (b not)?
+                            self.buf.emit(&[0x4D, 0x85, 0xC0]);
+                            // JZ -> false  (74 rel8)
+                            self.buf.emit_byte(0x74);
+                            let jz_false_1 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // TEST R9, R9  (4D 85 C9) — b null (a not)?
+                            self.buf.emit(&[0x4D, 0x85, 0xC9]);
+                            // JZ -> false  (74 rel8)
+                            self.buf.emit_byte(0x74);
+                            let jz_false_2 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // Lengths: EAX = a.length, EDX = b.length.
+                            // MOV EAX, [R8+12]  (41 8B 40 0C)
+                            self.buf
+                                .emit(&[0x41, 0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]);
+                            // MOV EDX, [R9+12]  (41 8B 51 0C)
+                            self.buf
+                                .emit(&[0x41, 0x8B, 0x51, ARRAY_LENGTH_OFFSET as u8]);
+                            // CMP EAX, EDX  (39 D0)
+                            self.buf.emit(&[0x39, 0xD0]);
+                            // JNE -> false  (75 rel8)
+                            self.buf.emit_byte(0x75);
+                            let jne_false_1 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // Byte count = length << shift  → RCX (REP
+                            // counter). MOVZX is unnecessary: array lengths
+                            // are non-negative i32, so a 32-bit MOV
+                            // zero-extends cleanly into RCX.
+                            // MOV ECX, EAX  (89 C1)
+                            self.buf.emit(&[0x89, 0xC1]);
+                            if shift != 0 {
+                                // SHL RCX, shift  (48 C1 E1 ib)
+                                self.buf.emit(&[0x48, 0xC1, 0xE1, shift]);
+                            }
+                            // Empty arrays (count == 0): equal. Also avoids
+                            // running REP CMPSB with RCX==0, whose ZF would
+                            // otherwise carry over from the SHL above.
+                            // TEST RCX, RCX  (48 85 C9)
+                            self.buf.emit(&[0x48, 0x85, 0xC9]);
+                            // JZ -> true  (74 rel8)
+                            self.buf.emit_byte(0x74);
+                            let jz_true_2 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // Save RSI/RDI (Java locals may live there),
+                            // point them at the two element-data regions,
+                            // run REP CMPSB, restore. POP does not touch
+                            // flags, so ZF from CMPSB survives the restore.
+                            // PUSH RSI (56) ; PUSH RDI (57)
+                            self.buf.emit(&[0x56, 0x57]);
+                            // LEA RSI, [R8 + HEADER_SIZE]  (49 8D 70 28)
+                            self.buf
+                                .emit(&[0x49, 0x8D, 0x70, HEADER_SIZE as u8]);
+                            // LEA RDI, [R9 + HEADER_SIZE]  (49 8D 79 28)
+                            self.buf
+                                .emit(&[0x49, 0x8D, 0x79, HEADER_SIZE as u8]);
+                            // REP CMPSB  (F3 A6) — compares RCX bytes;
+                            // stops early on the first mismatch. ZF=1 iff
+                            // every byte matched.
+                            self.buf.emit(&[0xF3, 0xA6]);
+                            // POP RDI (5F) ; POP RSI (5E)
+                            self.buf.emit(&[0x5F, 0x5E]);
+                            // SETE AL  (0F 94 C0) — AL = ZF.
+                            self.buf.emit(&[0x0F, 0x94, 0xC0]);
+                            // MOVZX EAX, AL  (0F B6 C0) — boolean result.
+                            self.buf.emit(&[0x0F, 0xB6, 0xC0]);
+                            // JMP -> done  (EB rel8)
+                            self.buf.emit_byte(0xEB);
+                            let jmp_done_1 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // --- true label ---
+                            let true_label = self.buf.pos();
+                            // MOV EAX, 1  (B8 01 00 00 00)
+                            self.buf.emit(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+                            // JMP -> done  (EB rel8)
+                            self.buf.emit_byte(0xEB);
+                            let jmp_done_2 = self.buf.pos();
+                            self.buf.emit_byte(0x00);
+
+                            // --- false label ---
+                            let false_label = self.buf.pos();
+                            // XOR EAX, EAX  (31 C0)
+                            self.buf.emit(&[0x31, 0xC0]);
+
+                            // --- done label ---
+                            let done_label = self.buf.pos();
+
+                            // Patch all rel8 displacements. Every span here
+                            // is a few dozen bytes — comfortably inside the
+                            // signed-rel8 range; debug_assert guards it.
+                            for (patch, target) in [
+                                (je_true_1, true_label),
+                                (jz_true_2, true_label),
+                                (jz_false_1, false_label),
+                                (jz_false_2, false_label),
+                                (jne_false_1, false_label),
+                                (jmp_done_1, done_label),
+                                (jmp_done_2, done_label),
+                            ] {
+                                let rel = target as isize - (patch as isize + 1);
+                                debug_assert!(
+                                    (-128..=127).contains(&rel),
+                                    "Arrays.equals intrinsic rel8 out of range: {rel}"
+                                );
+                                self.buf.patch_byte(patch, rel as u8);
+                            }
+
+                            // boolean result in RAX → operand stack.
+                            self.push_from_rax();
+                        }
                         // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
