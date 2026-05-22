@@ -337,6 +337,44 @@ fn native_factory_new_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> 
     Ok(Some(Value::Object(Some(factory))))
 }
 
+/// `XMLInputFactory.setProperty(String, Object)` / `setXMLResolver` /
+/// `setEventAllocator` / `setXMLReporter` — no-ops on our synthetic factory.
+///
+/// `javax/xml/stream/XMLInputFactory` is an abstract class; in real StAX
+/// these methods are implemented by the concrete factory subclass
+/// (`com.sun.xml.internal.stream.XMLInputFactoryImpl`). CratonVM's
+/// `newInstance()`/`newFactory()` natives return a *synthetic instance of
+/// the abstract class itself*, which has no `Code` attribute for any
+/// abstract method — so a virtual dispatch to `setProperty` raised
+/// `AbstractMethodError: ... has no Code attribute` and aborted WildFly's
+/// `XMLInputFactoryUtil.create()` boot path. Registering these natives
+/// directly on the abstract class supplies a body. Property values only
+/// influence parser leniency knobs our streaming reader does not honour, so
+/// accepting-and-ignoring them is behavior-safe for config parsing.
+fn native_factory_set_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `XMLInputFactory.getProperty(String)` — report a benign default.
+///
+/// Real StAX returns the property's current value (or throws
+/// `IllegalArgumentException` for an unsupported name). Since
+/// `setProperty` is a no-op here, return `null`; callers treat an unset
+/// property as "use the default".
+fn native_factory_get_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+/// `XMLInputFactory.isPropertySupported(String)` — claim support so callers
+/// proceed to `setProperty` (which we accept-and-ignore) instead of taking a
+/// fallback path.
+fn native_factory_is_property_supported(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
 fn native_create_reader_from_input_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -596,6 +634,47 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "newFactory",
         "()Ljavax/xml/stream/XMLInputFactory;",
         native_factory_new_instance,
+    );
+
+    // Factory configuration. `XMLInputFactory` is abstract — without these
+    // its abstract `setProperty`/`getProperty`/`isPropertySupported` methods
+    // have no Code attribute and a virtual dispatch raises
+    // `AbstractMethodError`, aborting WildFly's `XMLInputFactoryUtil.create()`.
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "setProperty",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        native_factory_set_property,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        native_factory_get_property,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "isPropertySupported",
+        "(Ljava/lang/String;)Z",
+        native_factory_is_property_supported,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "setXMLResolver",
+        "(Ljavax/xml/stream/XMLResolver;)V",
+        native_factory_set_property,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "setXMLReporter",
+        "(Ljavax/xml/stream/XMLReporter;)V",
+        native_factory_set_property,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "setEventAllocator",
+        "(Ljavax/xml/stream/util/XMLEventAllocator;)V",
+        native_factory_set_property,
     );
 
     registry.register(

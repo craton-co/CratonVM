@@ -959,18 +959,20 @@ pub(crate) fn native_loader_load_module(
         // one — `mainClassName`).  But by pre-loading every candidate, we
         // guarantee that if WildFly's recorded `mainClassName` matches any of
         // these, the class is ready.
+        // NOTE: only genuine WildFly bootstrap entry points belong here.
+        // Keycloak 16 is itself a WildFly distribution: it boots through the
+        // very same `org.jboss.as.standalone` module and runs
+        // `org.jboss.as.server.Main` — there is no `org/keycloak/Main` class
+        // anywhere on its module path. Earlier revisions speculatively
+        // pre-warmed `org/keycloak/Main` here; that class can never resolve,
+        // so it only produced an alarming `ensure_class_initialized FAIL:
+        // org/keycloak/Main` line that masqueraded as the fatal boot error
+        // while being a silently-swallowed best-effort miss. Removed.
         for fallback in &[
             "org/jboss/as/server/Main",
             "org/jboss/as/Main",
             "org/jboss/as/standalone/Main",
             "org/jboss/as/embedded/EmbeddedStandaloneServerFactory$Main",
-            // RKC19/WF39 Task C — Keycloak 16 ships its own bootstrap entry-
-            // points; pre-warm them alongside the WildFly fallbacks so the
-            // synthetic no-op `main` registered in `register_jboss_module_loader`
-            // resolves cleanly when WildFly's `Module.run` looks up the
-            // declared `mainClassName`.
-            "org/keycloak/Main",
-            "org/keycloak/keycloak/Main",
         ] {
             if !entry_candidates.iter().any(|c| c == *fallback) {
                 entry_candidates.push((*fallback).to_string());
@@ -992,8 +994,13 @@ pub(crate) fn native_loader_load_module(
                     );
                 }
                 Err(e) => {
+                    // Best-effort pre-warm: a miss here is fully recoverable.
+                    // `Module.run` only ever consults the ONE class recorded
+                    // in `mainClassName`; the other candidates are speculative
+                    // pre-warms for varying WildFly versions. Mark the line
+                    // non-fatal so it is not mistaken for the real boot error.
                     eprintln!(
-                        "[jboss-bf] ensure_class_initialized FAIL: {} ({:?})",
+                        "[jboss-bf] ensure_class_initialized miss (non-fatal pre-warm): {} ({:?})",
                         candidate, e
                     );
                 }

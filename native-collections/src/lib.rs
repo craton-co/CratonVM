@@ -2141,6 +2141,9 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_keys(ctx, chm);
     }
+    if is_chm_receiver(ctx, this) {
+        return chm_collect_all_keys(ctx, this);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut keys = Vec::new();
     if let Some(b) = buckets {
@@ -2162,6 +2165,9 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_values(ctx, chm);
     }
+    if is_chm_receiver(ctx, this) {
+        return chm_collect_all_values(ctx, this);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut values = Vec::new();
     if let Some(b) = buckets {
@@ -2182,6 +2188,9 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
     let this = unwrap_unmod(ctx, this);
     if let Some(chm) = properties_backing_chm(ctx, this) {
         return chm_collect_all_entries(ctx, chm);
+    }
+    if is_chm_receiver(ctx, this) {
+        return chm_collect_all_entries(ctx, this);
     }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut entries = Vec::new();
@@ -2510,6 +2519,41 @@ fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     }
 }
 
+/// True when `this`'s runtime class is `java/util/concurrent/ConcurrentHashMap`.
+///
+/// CratonVM's CHM natives store a *segmented* layout — slot 0 is a ref-array
+/// of per-segment map objects, not a HashMap bucket array. A generic
+/// `java/util/Map.<method>` interface native (registered on `java/util/Map`)
+/// dispatched on a CHM receiver — which happens whenever JDK code accesses a
+/// CHM polymorphically through the `Map` interface, e.g. `MethodType`'s
+/// `ReferencedKeySet`/`ReferencedKeyMap` backing store — must NOT run the
+/// plain-HashMap path: `map_state` would mistake the segments array for a
+/// bucket array and the node walk would dereference a segment object (3-field
+/// synthetic map) as a 4-field `HashMap$Node`, reading field index 3 past the
+/// end (the recurring `AnonymousObject$3` out-of-bounds-field-read error).
+/// The plain-Map natives consult this and reroute to the CHM natives.
+fn is_chm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(this);
+    for _ in 0..32 {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/concurrent/ConcurrentHashMap" => return true,
+            Some(n)
+                if n == "java/util/HashMap"
+                    || n == "java/util/TreeMap"
+                    || n == "java/lang/Object" =>
+            {
+                return false
+            }
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2517,6 +2561,9 @@ fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     if is_tree_map_receiver(ctx, this) {
         return native_tm_size(ctx, args);
+    }
+    if is_chm_receiver(ctx, this) {
+        return native_chm_size(ctx, args);
     }
     let (_, size, _) = map_state(ctx, this);
     Ok(Some(Value::Int(size)))
@@ -2529,6 +2576,9 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     if is_tree_map_receiver(ctx, this) {
         return native_tm_is_empty(ctx, args);
+    }
+    if is_chm_receiver(ctx, this) {
+        return native_chm_is_empty(ctx, args);
     }
     let (_, size, _) = map_state(ctx, this);
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
@@ -2556,6 +2606,12 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // than mutating (or, worse, `map_resize`-clobbering) the private backing.
     if is_unmod_wrapper(ctx, this) {
         return Err(unsupported_op());
+    }
+    // A `java/util/Map.put` interface native dispatched on a
+    // ConcurrentHashMap receiver must use the segmented CHM path — the
+    // plain-HashMap bucket code would treat the segments array as buckets.
+    if is_chm_receiver(ctx, this) {
+        return native_chm_put(ctx, args);
     }
     // S111r34: when the receiver is a LinkedHashMap (or subclass like
     // `org/springframework/core/annotation/AnnotationAttributes`),
@@ -2724,6 +2780,9 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if is_tree_map_receiver(ctx, this) {
         return native_tm_get(ctx, args);
     }
+    if is_chm_receiver(ctx, this) {
+        return native_chm_get(ctx, args);
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -2795,6 +2854,12 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     if is_unmod_wrapper(ctx, this) {
         return Err(unsupported_op());
+    }
+    if is_chm_receiver(ctx, this) {
+        return native_chm_remove(ctx, args);
+    }
+    if is_tree_map_receiver(ctx, this) {
+        return native_tm_remove(ctx, args);
     }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
@@ -2876,6 +2941,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if is_tree_map_receiver(ctx, this) {
         return native_tm_contains_key(ctx, args);
     }
+    if is_chm_receiver(ctx, this) {
+        return native_chm_contains_key(ctx, args);
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -2916,6 +2984,9 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    if is_chm_receiver(ctx, this) {
+        return native_chm_contains_value(ctx, args);
+    }
     // Properties-backed ConcurrentHashMap path: keep the existing
     // segment-aware collection (rare; correctness over speed).
     if properties_backing_chm(ctx, this).is_some() {
@@ -2960,6 +3031,9 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     if is_unmod_wrapper(ctx, this) {
         return Err(unsupported_op());
+    }
+    if is_chm_receiver(ctx, this) {
+        return native_chm_clear(ctx, args);
     }
     let (buckets, _, cap) = map_state(ctx, this);
     if let Some(b) = buckets {

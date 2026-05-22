@@ -717,6 +717,12 @@ impl GenerationalHeap {
                  (undersized object layout — class declares more fields \
                  than the object was allocated with)",
             );
+            if std::env::var("CRATONVM_DBG_OOBFIELD").is_ok() {
+                eprintln!(
+                    "[OOBFIELD-READ] class={class_name} index={index} num_slots={num_slots}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             return Value::Object(None);
         }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
