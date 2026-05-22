@@ -61,8 +61,8 @@ use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
 #[allow(unused_imports)]
 use cratonvm_types::{
-    ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET, HEADER_SIZE,
-    SLOT_SIZE,
+    ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
+    FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
@@ -8651,6 +8651,48 @@ impl Compiler {
         self.bounds_check_stubs.push(patch_offset);
     }
 
+    /// Emit the CRC-32 (reflected) inner fold of ONE byte for the
+    /// `java.util.zip.CRC32` intrinsic — IEEE 802.3, which the hardware
+    /// `CRC32` instruction (Castagnoli) cannot compute.
+    ///
+    /// Contract:
+    ///   * `ECX` holds the running (uncomplemented) CRC state — read and
+    ///     overwritten with the folded result.
+    ///   * `EDX` holds the input byte; the caller MUST have zero-extended it
+    ///     (a `MOVZX r32, m8`), so `EDX[31:8] == 0`. `EDX` is consumed.
+    ///   * `EAX` is used as scratch and clobbered.
+    ///
+    /// No other register is touched — in particular the `update([BII)V`
+    /// loop's index (`R9`), end (`R11`) and array base (`R8`) are preserved.
+    /// No memory is accessed and no `CALL` is emitted (roadmap §8).
+    ///
+    /// The folded value is bit-identical to `native-builtins/src/zip_real.rs`
+    /// `crc32_step` / the branchless reflected-CRC step: for each of the 8
+    /// bits, `mask = -(crc & 1)` then `crc = (crc >> 1) ^ (poly & mask)`.
+    /// `poly` is the reflected IEEE polynomial `0xEDB88320`.
+    fn emit_crc32_ieee_fold_byte(&mut self, reversed_poly: u32) {
+        // crc ^= byte:  XOR ECX, EDX  (31 D1).
+        self.buf.emit(&[0x31, 0xD1]);
+        // Eight identical reflected-CRC bit steps. Unrolled (a fixed count)
+        // so the loop body has no branch and no loop counter register.
+        for _ in 0..8 {
+            // EAX = ECX:        MOV EAX, ECX        (89 C8)
+            self.buf.emit(&[0x89, 0xC8]);
+            // EAX &= 1:         AND EAX, 1          (83 E0 01)
+            self.buf.emit(&[0x83, 0xE0, 0x01]);
+            // EAX = -EAX:       NEG EAX             (F7 D8)
+            //   → mask is 0xFFFFFFFF iff the low bit was set, else 0.
+            self.buf.emit(&[0xF7, 0xD8]);
+            // ECX >>= 1 (logical):  SHR ECX, 1      (D1 E9)
+            self.buf.emit(&[0xD1, 0xE9]);
+            // EAX &= reversed_poly:  AND EAX, imm32 (25 imm32)
+            self.buf.emit_byte(0x25);
+            self.buf.emit(&reversed_poly.to_le_bytes());
+            // ECX ^= EAX:       XOR ECX, EAX        (31 C1)
+            self.buf.emit(&[0x31, 0xC1]);
+        }
+    }
+
     /// Emit a JVMS-compliant signed integer division or remainder.
     ///
     /// Assumes the dividend is in RAX and the divisor in RCX. Leaves the
@@ -13572,10 +13614,23 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| {
                             let dc = &self.direct_calls[i].1;
-                            (dc.entry, dc.needs_context, dc.num_params, dc.return_type)
+                            (
+                                dc.entry,
+                                dc.needs_context,
+                                dc.num_params,
+                                dc.return_type,
+                                dc.guard_class_id,
+                            )
                         });
 
-                    if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct {
+                    if let Some((
+                        callee_entry,
+                        callee_needs_ctx,
+                        callee_params,
+                        ret_type,
+                        guard_class_id,
+                    )) = direct
+                    {
                         // --- invokevirtual/special/interface intrinsic ladder ---
                         // Instance-method call-site intrinsics (String / CRC32)
                         // are dispatched here BEFORE the plain direct-call
@@ -14000,14 +14055,331 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
                         // ===== INTRINSIC REGION BEGIN: CRC32 =====
-                        // No CRC32/CRC32C codegen: the family bails entirely.
-                        // The matcher in lib.rs registers no `JitIntrinsic`
-                        // variant for this family (no CRC32C native oracle
-                        // exists; the CRC32/IEEE receiver layout is not
-                        // statically known), so `callee_entry` can never
-                        // equal a CRC32 sentinel here. `intrinsic_handled`
-                        // stays untouched and control falls through to the
-                        // plain direct-call path.
+                        // java.util.zip.CRC32 / CRC32C `update` call-site
+                        // intrinsics (Phase 4c). Both classes hold a single
+                        // `private int crc` at instance field slot 0 — the
+                        // running (uncomplemented) CRC state — see
+                        // docs/internal/crc_layout_contract.md. The four
+                        // sentinels handled here:
+                        //
+                        //   Crc32cUpdateByte  : CRC32C.update(I)V
+                        //   Crc32cUpdateBytes : CRC32C.update([BII)V
+                        //   Crc32UpdateByte   : CRC32.update(I)V
+                        //   Crc32UpdateBytes  : CRC32.update([BII)V
+                        //
+                        // Every variant:
+                        //   1. pops the operand stack (receiver is the
+                        //      deepest operand; `callee_params + 1` total),
+                        //   2. emits a receiver class-id guard — `CMP
+                        //      DWORD [recv+0], guard_class_id` — and deopts
+                        //      to normal dispatch on a null receiver or a
+                        //      class-id mismatch (a subclass could override
+                        //      `update`),
+                        //   3. loads the running crc from field cell slot 0
+                        //      (`HEADER_SIZE + FIELD_CELL_PAYLOAD32_OFFSET`),
+                        //   4. folds the input byte(s) into it,
+                        //   5. writes the result back to the same cell
+                        //      (Int tag word + payload word).
+                        //
+                        // CRC32C folds with the hardware `CRC32` instruction
+                        // (it computes exactly the Castagnoli polynomial);
+                        // CRC32 folds with an inline reflected-CRC bit loop
+                        // (IEEE poly 0xEDB88320 — the hardware instruction is
+                        // the wrong polynomial). Neither path emits a `CALL`.
+                        //
+                        // `update([BII)V` preserves null-array NPE and
+                        // out-of-bounds AIOOBE by deopting on a null array or
+                        // a range outside `[0, array.length]` — the
+                        // interpreter then re-runs `update` via the native
+                        // override, which raises the exact exception.
+                        {
+                            let crc32c_byte = super::JitIntrinsic::Crc32cUpdateByte.as_entry();
+                            let crc32c_bytes = super::JitIntrinsic::Crc32cUpdateBytes.as_entry();
+                            let crc32_byte = super::JitIntrinsic::Crc32UpdateByte.as_entry();
+                            let crc32_bytes = super::JitIntrinsic::Crc32UpdateBytes.as_entry();
+                            let is_crc32c = callee_entry == crc32c_byte
+                                || callee_entry == crc32c_bytes;
+                            let is_crc32_ieee = callee_entry == crc32_byte
+                                || callee_entry == crc32_bytes;
+                            let is_byte_form = callee_entry == crc32c_byte
+                                || callee_entry == crc32_byte;
+                            let is_bytes_form = callee_entry == crc32c_bytes
+                                || callee_entry == crc32_bytes;
+
+                            if is_crc32c || is_crc32_ieee {
+                                // The matcher only registers a CRC32 family
+                                // intrinsic with a resolved class id (it
+                                // skips registration when guard_class_id
+                                // would be 0), so this is always non-zero
+                                // here; assert the invariant defensively.
+                                debug_assert!(
+                                    guard_class_id != 0,
+                                    "CRC32 intrinsic reached codegen without a guard class id",
+                                );
+
+                                // Reflected polynomial for the IEEE bit loop.
+                                // Castagnoli uses the hardware instruction,
+                                // so this constant is only consumed when
+                                // `is_crc32_ieee`.
+                                const CRC32_IEEE_REVERSED_POLY: u32 = 0xEDB8_8320;
+                                // Instance field cell for the `int crc` at
+                                // slot 0: HEADER_SIZE + 0*SLOT_SIZE, then the
+                                // tag word at +0 and the 32-bit payload at
+                                // +FIELD_CELL_PAYLOAD32_OFFSET (see the
+                                // inline-getfield codegen for opcode 0xb4).
+                                let cell_off = HEADER_SIZE as i32;
+                                let tag_off =
+                                    cell_off + FIELD_CELL_TAG_OFFSET as i32;
+                                let pay_off =
+                                    cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32;
+
+                                self.flush_scratch_registers();
+
+                                // --- pop operands (deepest = receiver) ---
+                                // update(I)V    : [receiver, b]
+                                // update([BII)V : [receiver, arr, off, len]
+                                let (b_or_len_slot, off_slot, arr_slot, recv_slot);
+                                if is_byte_form {
+                                    let b = self.pop_stack();
+                                    let r = self.pop_stack();
+                                    b_or_len_slot = b;
+                                    off_slot = b; // unused
+                                    arr_slot = b; // unused
+                                    recv_slot = r;
+                                } else {
+                                    let len = self.pop_stack();
+                                    let off = self.pop_stack();
+                                    let arr = self.pop_stack();
+                                    let r = self.pop_stack();
+                                    b_or_len_slot = len;
+                                    off_slot = off;
+                                    arr_slot = arr;
+                                    recv_slot = r;
+                                }
+
+                                // Pin operands into owned frame scratch slots
+                                // below `next_spill_offset`. The call site
+                                // had >= (callee_params+1) operand-stack
+                                // entries, so these offsets are in-frame. The
+                                // intrinsic pushes nothing (void return), so
+                                // the next bytecode re-allocates spill slots
+                                // from the same base.
+                                let s_recv = self.next_spill_offset;
+                                let s_a = self.next_spill_offset + 8;
+                                let s_b = self.next_spill_offset + 16;
+                                let s_c = self.next_spill_offset + 24;
+                                self.load_slot_to_reg(RAX, recv_slot);
+                                self.emit_store_local(s_recv, RAX);
+                                if is_byte_form {
+                                    self.load_slot_to_reg(RAX, b_or_len_slot);
+                                    self.emit_store_local(s_a, RAX);
+                                } else {
+                                    self.load_slot_to_reg(RAX, arr_slot);
+                                    self.emit_store_local(s_a, RAX);
+                                    self.load_slot_to_reg(RAX, off_slot);
+                                    self.emit_store_local(s_b, RAX);
+                                    self.load_slot_to_reg(RAX, b_or_len_slot);
+                                    self.emit_store_local(s_c, RAX);
+                                }
+
+                                // Every "bail to interpreter" edge is wired
+                                // to a shared uncommon-trap deopt stub
+                                // (reason 2). The interpreter re-runs the
+                                // method and dispatches `update` normally —
+                                // preserving NPE / AIOOBE and any overriding
+                                // subclass `update` exactly.
+                                let mut bail_patches: Vec<usize> = Vec::new();
+
+                                // --- receiver class-id guard ---
+                                // RAX = receiver. A null receiver bails
+                                // (the interpreter NPEs on the virtual
+                                // dispatch). Then CMP the class id at
+                                // ObjectHeader+0 against the declared class.
+                                self.emit_load_local(RAX, s_recv);
+                                self.emit_test_r64_r64(RAX);
+                                bail_patches
+                                    .push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                                // CMP DWORD [RAX + 0], guard_class_id
+                                //   81 /7 ib? — use the imm32 form: 81 /7.
+                                //   ModRM 0x78 = mod00 reg=7(/7=CMP) rm=RAX.
+                                self.buf.emit(&[0x81, 0x78, 0x00]);
+                                self.buf
+                                    .emit(&guard_class_id.to_le_bytes());
+                                bail_patches
+                                    .push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                                // --- load running crc → ECX ---
+                                // MOV ECX, DWORD [RAX + pay_off]. The slot
+                                // holds a `Value::Int`; the running crc is
+                                // its 32-bit payload.
+                                self.emit_mov_r32_mem_disp32(RCX, RAX, pay_off);
+
+                                if is_byte_form {
+                                    // --- update(I)V: fold one byte ---
+                                    // EDX = arg byte & 0xFF.
+                                    self.emit_load_local(RDX, s_a);
+                                    // MOVZX EDX, DL  (0F B6 D2) — low 8 bits.
+                                    self.buf.emit(&[0x0F, 0xB6, 0xD2]);
+                                    if is_crc32c {
+                                        // CRC32 ECX, DL — hardware Castagnoli
+                                        // fold of one byte. F2 0F 38 F0 /r,
+                                        // ModRM 0xCA = reg=ECX rm=EDX(=DL).
+                                        self.buf
+                                            .emit(&[0xF2, 0x0F, 0x38, 0xF0, 0xCA]);
+                                    } else {
+                                        self.emit_crc32_ieee_fold_byte(
+                                            CRC32_IEEE_REVERSED_POLY,
+                                        );
+                                    }
+                                } else {
+                                    // --- update([BII)V: fold a range ---
+                                    // Guards (all bail to the deopt stub,
+                                    // matching the native override's NPE /
+                                    // AIOOBE semantics):
+                                    //   arr != null
+                                    //   off >= 0, len >= 0
+                                    //   off + len <= arr.length
+                                    //
+                                    // Register file held live across the
+                                    // guards into the fold loop:
+                                    //   R8  = array base pointer
+                                    //   R9  = current index (starts at off)
+                                    //   R11 = end index = off + len
+                                    //   RCX = running crc (already loaded)
+                                    // RDX/RAX are loop-body scratch (the
+                                    // IEEE helper consumes EDX and clobbers
+                                    // EAX), so they must NOT carry the index.
+                                    //
+                                    // R8 = array ptr; null-array → bail.
+                                    self.emit_load_local(R8, s_a);
+                                    self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
+                                    bail_patches.push(
+                                        self.emit_jcc_rel32_patch(0x84),
+                                    ); // JZ → null array
+                                    // RDX = off, sign-extended to 64-bit so
+                                    // the range arithmetic cannot overflow.
+                                    self.emit_load_local(RDX, s_b);
+                                    self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX,EDX
+                                    // off < 0 ? TEST RDX,RDX; JS bail.
+                                    self.emit_test_r64_r64(RDX);
+                                    bail_patches.push(
+                                        self.emit_jcc_rel32_patch(0x88),
+                                    ); // JS
+                                    // R11 = len, sign-extended.
+                                    self.emit_load_local(R11, s_c);
+                                    self.buf.emit(&[0x4D, 0x63, 0xDB]); // MOVSXD R11,R11D
+                                    // len < 0 ? TEST R11,R11; JS bail.
+                                    self.buf.emit(&[0x4D, 0x85, 0xDB]); // TEST R11,R11
+                                    bail_patches.push(
+                                        self.emit_jcc_rel32_patch(0x88),
+                                    ); // JS
+                                    // R11 = off + len  (the end index).
+                                    self.buf.emit(&[0x49, 0x01, 0xD3]); // ADD R11,RDX
+                                    // RAX = arr.length (zero-extended 32-bit
+                                    // load → non-negative 64-bit value).
+                                    self.buf.emit(&[
+                                        0x41,
+                                        0x8B,
+                                        0x40,
+                                        ARRAY_LENGTH_OFFSET as u8,
+                                    ]); // MOV EAX,[R8+ARRAY_LENGTH_OFFSET]
+                                    // off + len > arr.length ? CMP R11,RAX;
+                                    // JG bail (signed >).
+                                    self.buf.emit(&[0x49, 0x39, 0xC3]); // CMP R11,RAX
+                                    bail_patches.push(
+                                        self.emit_jcc_rel32_patch(0x8F),
+                                    ); // JG
+                                    // R9 = current index = off (RDX).
+                                    self.buf.emit(&[0x49, 0x89, 0xD1]); // MOV R9,RDX
+
+                                    // --- fold loop ---
+                                    // .loop: CMP R9,R11 ; JGE .done
+                                    let loop_label = self.buf.pos();
+                                    self.buf.emit(&[0x4D, 0x39, 0xD9]); // CMP R9,R11
+                                    let done_patch =
+                                        self.emit_jcc_rel32_patch(0x8D); // JGE
+                                    if is_crc32c {
+                                        // EAX = byte = arr[R9].
+                                        // MOVZX EAX, BYTE [R8 + R9 + HDR]
+                                        //   43 0F B6 44 08 dd
+                                        //   (REX.X for R9 index, REX.B for
+                                        //    R8 base → 0x43; SIB scale=1).
+                                        self.buf.emit(&[
+                                            0x43,
+                                            0x0F,
+                                            0xB6,
+                                            0x44,
+                                            0x08,
+                                            HEADER_SIZE as u8,
+                                        ]);
+                                        // CRC32 ECX, AL — hardware Castagnoli
+                                        // fold. F2 0F 38 F0 /r, ModRM 0xC8 =
+                                        // reg=ECX rm=EAX(=AL).
+                                        self.buf.emit(&[
+                                            0xF2, 0x0F, 0x38, 0xF0, 0xC8,
+                                        ]);
+                                    } else {
+                                        // EDX = byte = arr[R9] — the IEEE
+                                        // bit loop consumes the byte in EDX.
+                                        // MOVZX EDX, BYTE [R8 + R9 + HDR]
+                                        //   43 0F B6 54 08 dd
+                                        self.buf.emit(&[
+                                            0x43,
+                                            0x0F,
+                                            0xB6,
+                                            0x54,
+                                            0x08,
+                                            HEADER_SIZE as u8,
+                                        ]);
+                                        self.emit_crc32_ieee_fold_byte(
+                                            CRC32_IEEE_REVERSED_POLY,
+                                        );
+                                    }
+                                    // INC R9 ; JMP .loop
+                                    self.buf.emit(&[0x49, 0xFF, 0xC1]); // INC R9
+                                    self.buf.emit_byte(0xE9); // JMP rel32
+                                    {
+                                        let here = self.buf.pos();
+                                        let rel = (loop_label as i64)
+                                            - (here as i64 + 4);
+                                        self.buf.emit(
+                                            &(rel as i32).to_le_bytes(),
+                                        );
+                                    }
+                                    // .done:
+                                    self.patch_rel32_to_here(done_patch);
+                                }
+
+                                // --- write running crc back to slot 0 ---
+                                // RAX = receiver again (reload — RAX was
+                                // clobbered by the array-length load / loop).
+                                self.emit_load_local(RAX, s_recv);
+                                // Tag word := 0  (Value::Int discriminant —
+                                // pinned by `field_cell_layout_matches_
+                                // value_enum` in cratonvm-types). Keeps the
+                                // cell a well-formed Int even if a prior
+                                // write left a stale tag.
+                                self.emit_mov_dword_mem_disp32_imm32(
+                                    RAX, tag_off, 0,
+                                );
+                                // Payload word := ECX (running crc).
+                                // MOV DWORD [RAX + pay_off], ECX  (89 88 dd).
+                                self.buf.emit_byte(0x89);
+                                self.buf.emit_byte(0x88);
+                                self.buf.emit(&pay_off.to_le_bytes());
+
+                                // Wire every bail edge to the shared
+                                // uncommon-trap stub (reason 2). Equal
+                                // (bci, reason) pairs are coalesced by
+                                // `emit_deopt_stubs`.
+                                for patch in bail_patches {
+                                    self.deopt_stubs.push((patch, pc, 2));
+                                }
+                                // `update` is void — nothing is pushed.
+                                let _ = ret_type;
+                                intrinsic_handled = true;
+                            }
+                        }
                         // ===== INTRINSIC REGION END: CRC32 =====
 
                         if !intrinsic_handled {
@@ -17098,6 +17470,7 @@ mod tests {
                 needs_context: false,
                 num_params: 1,
                 return_type: b'D',
+                guard_class_id: 0,
             })],
             Vec::new(),
             Vec::new(),
@@ -17152,6 +17525,7 @@ mod tests {
                 needs_context: false,
                 num_params: 2,
                 return_type: b'I',
+                guard_class_id: 0,
             })],
             Vec::new(), Vec::new(),
             Vec::new(), // pic_slots
@@ -17189,6 +17563,7 @@ mod tests {
                 needs_context: false,
                 num_params: 2,
                 return_type: b'I',
+                guard_class_id: 0,
             })],
             Vec::new(), Vec::new(),
             Vec::new(), // pic_slots
@@ -17305,6 +17680,7 @@ mod tests {
                 needs_context: false,
                 num_params: 2,
                 return_type: b'J',
+                guard_class_id: 0,
             })],
             Vec::new(), Vec::new(),
             Vec::new(), // pic_slots
@@ -17342,6 +17718,7 @@ mod tests {
                 needs_context: false,
                 num_params: 2,
                 return_type: b'J',
+                guard_class_id: 0,
             })],
             Vec::new(), Vec::new(),
             Vec::new(), // pic_slots

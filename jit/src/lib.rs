@@ -1476,12 +1476,29 @@ pub enum JitIntrinsic {
     // ===== INTRINSIC REGION END: ARRAYS_SORT =====
 
     // ===== INTRINSIC REGION BEGIN: CRC32 =====
-    // No CRC32/CRC32C variants are declared: the family bails entirely.
-    // See the matching matcher region in `try_resolve_intrinsic` for the
-    // full rationale (no CRC32C native oracle exists; the CRC32/IEEE field
-    // layout — Value::Long vs int, complemented value, unknown offset — is
-    // not statically known to the JIT). Adding a variant here would create
-    // a sentinel the codegen ladder can never legitimately emit.
+    // java.util.zip.CRC32 / CRC32C `update` call-site intrinsics (Phase 4c).
+    //
+    // Both classes hold a single `private int crc` at instance field slot 0
+    // (`CRC_FIELD_SLOT`), the running (uncomplemented) CRC state — see
+    // docs/internal/crc_layout_contract.md and native-builtins/src/
+    // zip_crc32c.rs. Each intrinsic threads that slot: load slot 0, fold the
+    // input byte(s), store back. `update(I)V` folds one byte; `update([BII)V`
+    // folds a `byte[]` range (with inline null + bounds guards). A receiver
+    // class-id guard (the receiver's dynamic class must be exactly the
+    // declared CRC32/CRC32C class — a subclass could override `update`)
+    // precedes every variant; on mismatch codegen deopts to normal dispatch.
+    //
+    //   * Crc32cUpdate* — Castagnoli CRC-32C (reflected poly 0x82F63B78).
+    //     Emitted with the hardware `CRC32` instruction, which computes
+    //     exactly this polynomial. Gated on `x64::has_sse42()`.
+    //   * Crc32Update* — IEEE 802.3 CRC-32 (reflected poly 0xEDB88320). The
+    //     hardware `CRC32` instruction is the WRONG polynomial, so these emit
+    //     a tight inline reflected-CRC bit loop (8 shifts/byte, no table, no
+    //     CALL) — the exact algorithm of `crc32_step` / `crc32c_step`.
+    Crc32cUpdateByte,  // CRC32C.update(I)V
+    Crc32cUpdateBytes, // CRC32C.update([BII)V
+    Crc32UpdateByte,   // CRC32.update(I)V
+    Crc32UpdateBytes,  // CRC32.update([BII)V
     // ===== INTRINSIC REGION END: CRC32 =====
 }
 
@@ -1494,6 +1511,57 @@ impl JitIntrinsic {
     /// an intrinsic call site.
     pub const fn as_entry(self) -> usize {
         usize::MAX - (self as usize)
+    }
+
+    /// True for the CRC32/CRC32C `update` call-site intrinsics.
+    ///
+    /// These are the only `invokevirtual` intrinsics that need a runtime
+    /// receiver class-id guard, so their codegen depends on a resolved
+    /// `JitDirectCall::guard_class_id`. The resolution loop in `try_compile`
+    /// uses this to skip registering a CRC32 intrinsic whose declared class
+    /// id could not be resolved (`guard_class_id == 0`), letting the site
+    /// fall through to normal virtual dispatch instead of inlining unsoundly.
+    pub const fn is_crc32_family(self) -> bool {
+        matches!(
+            self,
+            JitIntrinsic::Crc32cUpdateByte
+                | JitIntrinsic::Crc32cUpdateBytes
+                | JitIntrinsic::Crc32UpdateByte
+                | JitIntrinsic::Crc32UpdateBytes
+        )
+    }
+
+    /// Recover a [`JitIntrinsic`] from a `JitDirectCall::entry` sentinel, if
+    /// the value is in fact an intrinsic sentinel. Used by the resolution
+    /// loop to classify a freshly-matched entry without re-running the
+    /// (class, name, descriptor) matcher.
+    pub fn from_entry(entry: usize) -> Option<JitIntrinsic> {
+        // The sentinel space is `usize::MAX - (variant as usize)`. The last
+        // declared variant bounds the valid offset range.
+        let offset = usize::MAX.checked_sub(entry)?;
+        if offset > JitIntrinsic::Crc32UpdateBytes as usize {
+            return None;
+        }
+        // Exhaustive map — keeps this in lockstep with the enum so a new
+        // variant fails to compile until added here.
+        Some(match offset {
+            x if x == JitIntrinsic::Crc32cUpdateByte as usize => {
+                JitIntrinsic::Crc32cUpdateByte
+            }
+            x if x == JitIntrinsic::Crc32cUpdateBytes as usize => {
+                JitIntrinsic::Crc32cUpdateBytes
+            }
+            x if x == JitIntrinsic::Crc32UpdateByte as usize => {
+                JitIntrinsic::Crc32UpdateByte
+            }
+            x if x == JitIntrinsic::Crc32UpdateBytes as usize => {
+                JitIntrinsic::Crc32UpdateBytes
+            }
+            // Non-CRC32 intrinsic — the resolution loop only needs CRC32
+            // classification, so any other in-range sentinel is reported as
+            // "not a CRC32 intrinsic" via the `is_crc32_family` check below.
+            _ => return None,
+        })
     }
 }
 
@@ -1748,36 +1816,54 @@ pub fn try_resolve_intrinsic(
     // ===== INTRINSIC REGION END: ARRAYS_SORT =====
 
     // ===== INTRINSIC REGION BEGIN: CRC32 =====
-    // java.util.zip.CRC32 / CRC32C update intrinsics — DELIBERATELY UNREGISTERED.
+    // java.util.zip.CRC32 / CRC32C `update` call-site intrinsics (Phase 4c).
     //
-    // This family bails completely. No `JitIntrinsic` variant is declared and
-    // nothing is returned here. Investigation conclusions:
+    // The foundation wave (commit 2fb0df0) pinned the receiver layout
+    // (docs/internal/crc_layout_contract.md): both classes carry exactly one
+    // instance field — `private int crc` at slot 0 — holding the running,
+    // uncomplemented CRC state. It also added a bit-exact native CRC32C
+    // (native-builtins/src/zip_crc32c.rs) that serves as the differential
+    // oracle. With a stable layout and an oracle, both `update` overloads are
+    // soundly inlinable:
     //
-    //  * CRC32C (the only target the hardware `CRC32` instruction could
-    //    accelerate — it computes the Castagnoli CRC-32C, poly 0x1EDC6F41):
-    //    there is NO `java/util/zip/CRC32C` implementation anywhere in this
-    //    VM. native-builtins registers natives for `java/util/zip/CRC32`
-    //    only (see native-builtins/src/zip_real.rs::register_zip_real_natives
-    //    and phases_early.rs). With no native CRC32C oracle and no class ever
-    //    instantiated, there is nothing to be bit-identical to and nothing to
-    //    inline. Roadmap §3.4 forbids registering an intrinsic without a
-    //    differential oracle.
+    //   * CRC32C — the x86 `CRC32` instruction computes exactly the
+    //     Castagnoli CRC-32C, so the codegen folds bytes with it directly.
+    //     Gated on `has_sse42()` (the codegen ladder applies the same gate;
+    //     when SSE4.2 is absent the intrinsic is not registered and the call
+    //     dispatches to the native CRC32C override).
+    //   * CRC32 — IEEE 802.3 (reflected poly 0xEDB88320). The hardware
+    //     `CRC32` instruction is the wrong polynomial; the codegen emits a
+    //     tight inline reflected-CRC bit loop instead (no table, no CALL),
+    //     correct on every host, so this variant needs no CPU gate.
     //
-    //  * CRC32 (IEEE 802.3, reflected poly 0xEDB88320): the x86 `CRC32`
-    //    instruction uses the WRONG polynomial (Castagnoli), so it cannot
-    //    implement this; a correct inline path needs a 256-entry static table
-    //    or PCLMULQDQ folding — out of scope for a leaf call-site intrinsic.
-    //    Additionally the receiver layout is not statically known to the JIT:
-    //    in synthetic mode (phases_early.rs) the running crc lives in field
-    //    slot 0 as a `Value::Long` storing the *bit-complemented* public
-    //    value, while in real-JDK mode the int `crc` field sits at whatever
-    //    offset the loaded JDK class declares and `update([BII)V` is pure
-    //    Java bytecode delegating to the static native `updateBytes0`. The
-    //    JIT cannot know the active mode, the field type, or the offset at
-    //    compile time, so threading the running crc through the field would
-    //    be unsound.
-    //
-    // Bailing the whole family is the correct, roadmap-sanctioned outcome.
+    // `num_params` excludes the receiver — `update(I)V` is 1, `update([BII)V`
+    // is 3. The 0xb6 codegen ladder adds the receiver back (`num_params + 1`)
+    // and emits the receiver class-id guard. `update([B)V` (whole-array) is
+    // intentionally NOT registered: it is a separate overload that the native
+    // path already handles; keeping the intrinsic surface to the two hot
+    // signatures the brief targets avoids speculative codegen.
+    if class == "java/util/zip/CRC32C" {
+        match (name, descriptor) {
+            ("update", "(I)V") if x64::has_sse42() => {
+                return Some((JitIntrinsic::Crc32cUpdateByte.as_entry(), 1, b'V'));
+            }
+            ("update", "([BII)V") if x64::has_sse42() => {
+                return Some((JitIntrinsic::Crc32cUpdateBytes.as_entry(), 3, b'V'));
+            }
+            _ => {}
+        }
+    }
+    if class == "java/util/zip/CRC32" {
+        match (name, descriptor) {
+            ("update", "(I)V") => {
+                return Some((JitIntrinsic::Crc32UpdateByte.as_entry(), 1, b'V'));
+            }
+            ("update", "([BII)V") => {
+                return Some((JitIntrinsic::Crc32UpdateBytes.as_entry(), 3, b'V'));
+            }
+            _ => {}
+        }
+    }
     // ===== INTRINSIC REGION END: CRC32 =====
 
     None
@@ -1861,6 +1947,21 @@ pub struct JitDirectCall {
     pub needs_context: bool,
     pub num_params: usize,
     pub return_type: u8,
+    /// Receiver class id for a call-site intrinsic that needs a runtime
+    /// receiver-class guard before its inline body is correct.
+    ///
+    /// The CRC32/CRC32C `update` intrinsics are `invokevirtual` sites: the
+    /// inline code reads/writes the receiver's `int crc` field at slot 0,
+    /// which is only sound if the receiver's *dynamic* class is exactly the
+    /// declared `java/util/zip/CRC32` / `CRC32C` (a subclass could override
+    /// `update`). The codegen emits `CMP [receiver+0], guard_class_id` and
+    /// deopts to normal dispatch on mismatch.
+    ///
+    /// `0` means "no guard class id available" — the sentinel class id 0 is
+    /// never a real CRC32/CRC32C class, so a CRC32 intrinsic whose
+    /// `guard_class_id` is 0 bails to normal dispatch. Every non-intrinsic
+    /// `JitDirectCall` leaves this 0 (unused).
+    pub guard_class_id: u32,
 }
 
 /// Monomorphic inline cache (MIC) slot for invokevirtual/invokeinterface call sites.
@@ -3005,6 +3106,13 @@ pub fn try_compile(
     // `StringFieldLayout`. `None` (resolver absent, or it returns `None`)
     // makes String intrinsics bail to normal dispatch.
     string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
+    // Maps an invoke* constant-pool index to the class id of the call's
+    // *declared* class (the receiver class statically named at the site).
+    // Consumed by the CRC32/CRC32C `update` call-site intrinsics, whose
+    // codegen emits a receiver class-id guard against this constant. `None`
+    // (resolver absent, or it returns `None` for a given site) makes the
+    // CRC32 intrinsic at that site bail to normal dispatch.
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -3035,6 +3143,7 @@ pub fn try_compile(
         helpers,
         inline_resolver,
         string_layout_resolver,
+        cp_invoke_class_id_resolver,
         &mut backend_attempted,
     );
 
@@ -3067,6 +3176,8 @@ fn try_compile_inner(
     inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
     // Resolves `java/lang/String`'s field layout — see `try_compile`.
     string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
+    // Maps an invoke* CP index to its declared class id — see `try_compile`.
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -3393,6 +3504,7 @@ fn try_compile_inner(
                                 needs_context: callee_needs_ctx,
                                 num_params,
                                 return_type: ret_type,
+                                guard_class_id: 0,
                             },
                         ));
                         continue;
@@ -3403,7 +3515,9 @@ fn try_compile_inner(
                 // Call-site intrinsics — inline machine code, no call overhead.
                 // The matcher (`try_resolve_intrinsic`) keys on
                 // (class, name, descriptor) and applies the same CPU-feature
-                // gates the x64 codegen ladder relies on.
+                // gates the x64 codegen ladder relies on. This invokestatic/
+                // invokespecial path never resolves a CRC32 intrinsic (those
+                // are `invokevirtual` only), so `guard_class_id` is 0.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
                 {
@@ -3414,6 +3528,7 @@ fn try_compile_inner(
                             needs_context: false,
                             num_params,
                             return_type: ret,
+                            guard_class_id: 0,
                         },
                     ));
                     continue;
@@ -3423,28 +3538,55 @@ fn try_compile_inner(
             // Call-site intrinsics for instance-method invokes
             // (invokevirtual / invokeinterface). The static/special path
             // above already runs the matcher; this covers `invoke_kind`
-            // 0 and 2. Classes carrying instance-method intrinsics
-            // (`java.lang.String`, `java.util.zip.CRC32`, …) are `final`,
-            // so a virtual site keyed on the constant-pool declared class
-            // is monomorphic and sound to inline. `num_params` from the
-            // matcher excludes the receiver; the x64 codegen ladder for
-            // 0xb6/b7/b9 adds it back (`callee_params + 1`).
+            // 0 and 2. `num_params` from the matcher excludes the receiver;
+            // the x64 codegen ladder for 0xb6/b7/b9 adds it back
+            // (`callee_params + 1`).
+            //
+            // Unlike a `final` class, the CRC32/CRC32C intrinsics target a
+            // class (`java.util.zip.CRC32` is *not* final) that could in
+            // principle be subclassed, so a virtual `update` site is not
+            // statically monomorphic. The codegen therefore emits a runtime
+            // receiver class-id guard; the constant it compares against is
+            // resolved here via `cp_invoke_class_id_resolver` (the declared
+            // class of the call site) and stored in `guard_class_id`. When
+            // the resolver is absent or cannot resolve the class id,
+            // `guard_class_id` stays 0 and the CRC32 codegen bails the site
+            // to normal dispatch (0 is never a real class id).
             if !is_self_call && (invoke_kind == 0 || invoke_kind == 2) {
                 // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
                 {
-                    needs_heap = true;
-                    direct_calls.push((
-                        pc,
-                        JitDirectCall {
-                            entry,
-                            needs_context: false,
-                            num_params,
-                            return_type: ret,
-                        },
-                    ));
-                    continue;
+                    let guard_class_id = cp_invoke_class_id_resolver
+                        .and_then(|r| r(cp_idx))
+                        .unwrap_or(0);
+                    // A CRC32/CRC32C intrinsic's inline code is only sound
+                    // behind a receiver class-id guard. If the declared
+                    // class id could not be resolved (`guard_class_id == 0`),
+                    // do NOT register the intrinsic — leave the site to
+                    // normal virtual dispatch (MIC/PIC). Registering it
+                    // anyway would leave a `direct_calls` entry whose
+                    // `entry` is an intrinsic sentinel the codegen could
+                    // not safely emit.
+                    if JitIntrinsic::from_entry(entry)
+                        .is_some_and(|i| i.is_crc32_family())
+                        && guard_class_id == 0
+                    {
+                        // Fall through — no `continue`, no direct_calls push.
+                    } else {
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: false,
+                                num_params,
+                                return_type: ret,
+                                guard_class_id,
+                            },
+                        ));
+                        continue;
+                    }
                 }
                 // Then the `java/lang/String` intrinsics — registered only
                 // when the String field layout has resolved (and carries a

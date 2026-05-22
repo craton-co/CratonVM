@@ -99,6 +99,7 @@ fn compile_unary(entry: usize) -> impl Fn(i32) -> i32 {
                 needs_context: false,
                 num_params: 1,
                 return_type: b'I',
+            guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
@@ -145,6 +146,7 @@ fn compile_binary(entry: usize) -> impl Fn(i32, i32) -> i32 {
                 needs_context: false,
                 num_params: 2,
                 return_type: b'I',
+            guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
