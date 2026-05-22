@@ -246,22 +246,37 @@ fn transfer(code: &[u8], pc: usize, in_mask: u64, prev_inst_pc: &[usize]) -> (u6
     let op = code[pc];
     let mut out = in_mask;
 
-    // `aload N` followed by a dereferencing opcode proves N non-null
-    // on fall-through. We look at the CURRENT op: if it's an aload,
-    // peek at the next op to see if it dereferences.
-    if let Some(local) = aload_at(code, pc) {
-        let next_pc = pc + op_len(code, pc);
-        if next_pc < code.len() && local < 64 {
-            let next_op = code[next_pc];
-            if opcode_dereferences_receiver(next_op) {
+    // A dereferencing opcode (`getfield`/`invokevirtual`/`arraylength`/…)
+    // whose receiver came from an immediately-preceding `aload N` proves
+    // N non-null — but ONLY on the dereference's *fall-through*, i.e. in
+    // `OUT[deref_pc]`, never in `IN[deref_pc]`.
+    //
+    // Soundness note (round-12 fix): the fact "N is non-null" is only
+    // established *after* the dereference executes without throwing NPE.
+    // The earlier formulation set the bit on `OUT[aload_pc]` — which is
+    // `IN[deref_pc]`, the state *before* the dereference. That made the
+    // receiver look non-null at the very PC of the dereference, so the
+    // JIT's `emit_null_check_arraylength` (which trusts `IN[pc]`) elided
+    // the null check on `arr.length` and emitted a raw `MOV [arr+12]`
+    // that SIGSEGV'd on a genuinely-null `arr` instead of throwing NPE.
+    // Placing the fact on `OUT[deref_pc]` keeps the optimization for any
+    // *subsequent* use of N while preserving the NPE at the deref itself.
+    if opcode_dereferences_receiver(op) {
+        let prev_local = prev_inst_pc.get(pc).copied().and_then(|q| {
+            if q == usize::MAX {
+                return None;
+            }
+            aload_at(code, q)
+        });
+        if let Some(local) = prev_local {
+            if local < 64 {
                 out |= 1u64 << local;
             }
-            // Array load/store opcodes (iaload..saload, iastore..sastore)
-            // also dereference the array receiver. But the receiver is
-            // the array, not the most-recent aload (an index is pushed
-            // between). Skip these — handled separately by the JIT's
-            // inline null-check stub for arrays.
         }
+        // Array load/store opcodes (iaload..saload, iastore..sastore)
+        // also dereference the array receiver, but the receiver is not
+        // the most-recent aload (an index push sits between). They are
+        // handled separately by the JIT's inline array null-check stub.
     }
 
     // `new`/`anewarray`/etc followed by `astore N` sets N non-null.

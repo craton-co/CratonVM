@@ -60,7 +60,10 @@
 use super::{CompiledMethod, ExecutableBuffer, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
 #[allow(unused_imports)]
-use cratonvm_types::{ARRAY_LENGTH_OFFSET, HEADER_SIZE, SLOT_SIZE};
+use cratonvm_types::{
+    ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET, HEADER_SIZE,
+    SLOT_SIZE,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 
@@ -3490,6 +3493,14 @@ struct Compiler {
     scalar_init_skips: std::collections::HashSet<usize>,
     /// Inline sites: bytecode PC → resolved InlineSite for inlining callee bytecode.
     inline_sites: FxHashMap<usize, crate::InlineSite>,
+    /// Compile-time resolved `java/lang/String` field layout, for the String
+    /// call-site intrinsics. `None` ⇒ String layout unavailable (intrinsic
+    /// codegen bails to normal dispatch). See `crate::StringFieldLayout`.
+    ///
+    /// Threaded in now so the API is stable; the String-intrinsic codegen
+    /// that reads it lands in a later wave. `#[allow(dead_code)]` until then.
+    #[allow(dead_code)]
+    string_layout: Option<crate::StringFieldLayout>,
     /// Deferred out-of-line deoptimization stubs: (branch_patch_offset, bci, reason_code).
     /// Speculative guards (e.g. BCE) jump here; the stub calls jit_uncommon_trap and
     /// returns i64::MIN to signal the interpreter to resume.
@@ -3734,6 +3745,7 @@ impl Compiler {
             scalar_field_ops: FxHashMap::default(),
             scalar_init_skips: std::collections::HashSet::new(),
             inline_sites: FxHashMap::default(),
+            string_layout: None,
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
@@ -6646,6 +6658,47 @@ impl Compiler {
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
         // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
         // base==RSP/R12 would require a SIB byte; neither is used here.
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit `MOVSXD dst32→r64, [base + disp32]` — a 32-bit load from memory
+    /// sign-extended into the full 64-bit `dst`. Used by inline `getfield` for
+    /// `int`-category fields so the result matches `jit_getfield`'s
+    /// `Value::Int(i) => i as i64` (sign-extending) ABI exactly.
+    ///
+    /// `dst` and `base` are register numbers 0..=15. `base` must not be
+    /// RSP/R12 (would need a SIB byte — not emitted here).
+    fn emit_movsxd_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        // REX.W (0x48) + REX.R for dst>=8 + REX.B for base>=8.
+        let mut rex = 0x48u8;
+        if dst >= 8 { rex |= 0x04; }
+        if base >= 8 { rex |= 0x01; }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x63); // MOVSXD r64, r/m32
+        // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
+    /// Emit `MOV dst32, [base + disp32]` — a 32-bit load that zero-extends
+    /// into the full 64-bit `dst` (implicit on x86-64 for any 32-bit GPR
+    /// write). Used by inline `getfield` for `float` fields so the result
+    /// matches `jit_getfield`'s `Value::Float(f) => f.to_bits() as i64`
+    /// (zero-extending the 32-bit bit pattern) ABI exactly.
+    ///
+    /// `dst` and `base` are register numbers 0..=15. `base` must not be
+    /// RSP/R12 (would need a SIB byte — not emitted here).
+    fn emit_mov_r32_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {
+        // REX is only needed for extended (>=8) registers; no REX.W (32-bit op).
+        if dst >= 8 || base >= 8 {
+            let mut rex = 0x40u8;
+            if dst >= 8 { rex |= 0x04; }
+            if base >= 8 { rex |= 0x01; }
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit_byte(0x8B); // MOV r32, r/m32
+        // ModRM: mod=10 (disp32), reg=dst&7, r/m=base&7.
         self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
         self.buf.emit(&disp.to_le_bytes());
     }
@@ -11631,17 +11684,80 @@ impl Compiler {
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
                         pc += 3;
+                    } else if let Some(&info_idx) = self.field_info_idx.get(&pc) {
+                        // Inline field load — the field index and type tag are
+                        // statically resolved (`field_info` was built from
+                        // `resolve_field_ref` in lib.rs), so we can emit a raw
+                        // MOV against the object's field cell instead of a
+                        // `CALL jit_getfield`. Bit-identical to the helper:
+                        //
+                        //   * null receiver  → result 0  (the helper's
+                        //     `if obj_ptr == 0 { return 0 }` guard);
+                        //   * int-category   → MOVSXD (sign-extend, matches
+                        //     `Value::Int(i) => i as i64`);
+                        //   * float          → 32-bit MOV (zero-extend, matches
+                        //     `Value::Float(f) => f.to_bits() as i64`);
+                        //   * long/double/ref → 64-bit MOV of the payload word
+                        //     (`Long`/`Double` bits, or the raw object pointer
+                        //     which is 0 for `Object(None)`).
+                        //
+                        // The field cell is the 16-byte `Value` enum; payload
+                        // offsets within the cell come from the
+                        // `FIELD_CELL_PAYLOAD*_OFFSET` constants in `types`
+                        // (layout pinned by `field_cell_layout_matches_value_enum`).
+                        let (_, field_index, type_tag) = self.field_info[info_idx];
+                        let cell_off =
+                            (HEADER_SIZE + field_index * SLOT_SIZE) as i32; // Cast: x86-64 disp32
+                        let obj_slot = self.pop_stack();
+                        // Receiver → RAX.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        // Null check: TEST RAX,RAX; JZ <null-path>. On null we
+                        // skip the load entirely and leave RAX = 0, matching
+                        // `jit_getfield`'s early `return 0`.
+                        self.emit_test_r64_r64(RAX);
+                        let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
+                        match type_tag {
+                            b'J' | b'D' | b'L' | b'[' => {
+                                // 8-byte payload: MOV RAX, [RAX + cell + 8].
+                                self.emit_mov_r64_mem_disp32(
+                                    RAX,
+                                    RAX,
+                                    cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                );
+                            }
+                            b'F' => {
+                                // 4-byte float bits: MOV EAX (zero-extends).
+                                self.emit_mov_r32_mem_disp32(
+                                    RAX,
+                                    RAX,
+                                    cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                );
+                            }
+                            _ => {
+                                // int / boolean / byte / char / short: MOVSXD
+                                // (sign-extend) — `Value::Int` payload.
+                                self.emit_movsxd_r64_mem_disp32(
+                                    RAX,
+                                    RAX,
+                                    cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                );
+                            }
+                        }
+                        let done_patch = self.emit_jmp_rel32_patch();
+                        // Null path: RAX := 0.
+                        self.patch_rel32_to_here(null_patch);
+                        self.emit_xor_reg_self(RAX);
+                        // Join: result in RAX.
+                        self.patch_rel32_to_here(done_patch);
+                        self.push_from_rax();
+                        pc += 3;
                     } else {
+                        // No statically-resolved field metadata for this
+                        // getfield PC — fall back to the runtime helper.
                         self.flush_scratch_registers();
-                        // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, _type_tag) = self
-                            .field_info_idx
-                            .get(&pc)
-                            .map(|&i| self.field_info[i])
-                            .unwrap_or((pc, 0, b'I'));
                         let obj_slot = self.pop_stack();
                         self.load_slot_to_reg(ARG_REGS[0], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], field_index as i32); // Cast: x86-64 immediate encoding
+                        self.emit_mov_imm32_sx(ARG_REGS[1], 0); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getfield);
                         self.push_from_rax();
                         pc += 3;
@@ -14729,6 +14845,11 @@ pub fn compile(
     helpers: &JitRuntimeHelpers,
     non_escaping_new: std::collections::HashSet<usize>,
     inline_sites: HashMap<usize, crate::InlineSite>,
+    // Compile-time resolved `java/lang/String` field layout for the String
+    // call-site intrinsics (length/charAt/hashCode/…). `None` means "String
+    // layout unavailable" — String-intrinsic codegen (added by a later
+    // wave) treats it as a bail-to-dispatch. See `crate::StringFieldLayout`.
+    string_layout: Option<crate::StringFieldLayout>,
 ) -> Option<CompiledMethod> {
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -15023,6 +15144,9 @@ pub fn compile(
     compiler.scalar_field_ops = sr_plan.field_ops;
     compiler.scalar_init_skips = sr_plan.init_skips;
     compiler.inline_sites = inline_sites.into_iter().collect();
+    // String call-site intrinsics: hand the resolved String field layout to
+    // the compiler so intrinsic codegen can emit inline field loads.
+    compiler.string_layout = string_layout;
     // T5.2.1 + T5.2.14 — transfer the pre-computed analyses.
     compiler.induction_vars = induction_vars;
     compiler.null_check_info = null_check_info;
@@ -15437,6 +15561,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some());
 
@@ -15479,6 +15604,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -15517,6 +15643,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -15555,6 +15682,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -15614,6 +15742,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -15696,6 +15825,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -15741,6 +15871,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -15788,6 +15919,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -15832,6 +15964,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // 17 / 5 = 3, 17 % 5 = 2, total = 5
@@ -15952,6 +16085,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -15989,6 +16123,7 @@ mod tests {
                 &test_helpers(),
                 std::collections::HashSet::new(),
                 HashMap::new(),
+                None, // string_layout — not needed for this test
             )
             .unwrap();
             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16029,6 +16164,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16065,6 +16201,7 @@ mod tests {
                 &test_helpers(),
                 std::collections::HashSet::new(),
                 HashMap::new(),
+                None, // string_layout — not needed for this test
             )
             .unwrap();
             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16105,6 +16242,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 3.15f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -16145,6 +16283,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 2.719f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -16185,6 +16324,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 42.5f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -16224,6 +16364,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // Positive value within byte range
@@ -16270,6 +16411,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // Positive value within char range
@@ -16316,6 +16458,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // Positive within short range
@@ -16363,6 +16506,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // Void return — result is undefined, but should not crash
@@ -16402,6 +16546,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = (-3.5f32).to_bits() as i64; // Cast: JIT ABI convention
@@ -16425,6 +16570,7 @@ mod tests {
             Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
         // f(3, 5) = 2*3 + 2*5 = 16
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16473,6 +16619,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // sqrt(4.0) == 2.0
@@ -16523,6 +16670,7 @@ mod tests {
             HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16559,6 +16707,7 @@ mod tests {
             HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16617,6 +16766,7 @@ mod tests {
             HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         )
         .unwrap();
 
@@ -16673,6 +16823,7 @@ mod tests {
             HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16709,6 +16860,7 @@ mod tests {
             HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16756,6 +16908,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = std::f64::consts::PI.to_bits() as i64; // Cast: JIT ABI convention
@@ -16835,6 +16988,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 3.5f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -16872,6 +17026,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 10.0f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -16906,6 +17061,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -16938,6 +17094,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 15.0f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -16978,6 +17135,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 1.5f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17015,6 +17173,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 100.0f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17049,6 +17208,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 6.0f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17083,6 +17243,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 22.0f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17122,6 +17283,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 3.5f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -17162,6 +17324,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 42.0f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17198,6 +17361,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -17232,6 +17396,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -17269,6 +17434,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 3.7f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -17307,6 +17473,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 1.5f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -17340,6 +17507,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 9.99f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17373,6 +17541,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 1.5f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17409,6 +17578,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -17441,6 +17611,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -17473,6 +17644,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 42.9f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -17506,6 +17678,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let input = 99.9f64.to_bits() as i64; // Cast: JIT ABI convention
@@ -17543,6 +17716,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -17603,6 +17777,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -17654,6 +17829,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -17704,6 +17880,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -17742,6 +17919,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         let a = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
@@ -17792,6 +17970,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -17847,6 +18026,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -17906,6 +18086,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -17955,6 +18136,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18007,6 +18189,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18067,6 +18250,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18119,6 +18303,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18198,6 +18383,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18256,6 +18442,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18306,6 +18493,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18365,6 +18553,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18415,6 +18604,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18430,6 +18620,154 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
         assert_eq!(result, 300); // reads field at index 2
+    }
+
+    // ── Inline getfield codegen tests (Value-cell direct MOV) ───────────
+    //
+    // These exercise the inline `getfield` path that emits a raw MOV
+    // against the 16-byte `Value` field cell instead of `CALL jit_getfield`.
+    // The cases cover int/byte/ref payloads and the null-receiver guard
+    // and confirm bit-identical results vs the helper.
+
+    /// Compile `aload_0; getfield #1; <ret>` with the given field metadata.
+    fn compile_single_getfield(
+        ret_op: u8,
+        field_index: usize,
+        type_tag: u8,
+    ) -> CompiledMethod {
+        let code: Vec<u8> = vec![0x2a, 0xb4, 0x00, 0x01, ret_op, 0, 0];
+        compile(
+            &code,
+            5,
+            1,
+            1,
+            false,
+            Vec::new(),
+            vec![(1usize, field_index, type_tag)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_getfield_inline_byte_field() {
+        // A `byte` field is stored as `Value::Int` (sign-extended) — the
+        // inline path uses MOVSXD so a negative byte round-trips.
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        let compiled = compile_single_getfield(0xac /* ireturn */, 0, b'B');
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        // Byte fields live in the cell as Value::Int(sign-extended).
+        heap.set_field(obj, 0, Value::Int(-7));
+        // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
+        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        assert_eq!(r, -7, "inline byte getfield must sign-extend like the helper");
+        heap.set_field(obj, 0, Value::Int(127));
+        // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
+        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        assert_eq!(r, 127);
+    }
+
+    #[test]
+    fn test_getfield_inline_ref_field() {
+        // A reference field: the inline path MOVs the 8-byte payload word,
+        // which is exactly the raw object pointer (0 for Object(None)).
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        let compiled = compile_single_getfield(0xb0 /* areturn */, 0, b'L');
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        let target = heap.alloc_object(ClassId::new(1), 0);
+        heap.set_field(obj, 0, Value::Object(Some(target)));
+        // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
+        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        assert_eq!(
+            r,
+            target.as_ptr() as i64,
+            "inline ref getfield must return the raw object pointer"
+        );
+        // Null reference field → 0.
+        heap.set_field(obj, 0, Value::Object(None));
+        // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
+        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        assert_eq!(r, 0, "Object(None) field must read as 0");
+    }
+
+    #[test]
+    fn test_getfield_inline_long_field() {
+        // 8-byte payload load for a `long` field, including a value whose
+        // high bit is set (no truncation / sign issues).
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        let compiled = compile_single_getfield(0xad /* lreturn */, 1, b'J');
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 2);
+        let v = 0x7EDC_BA98_7654_3210_i64;
+        heap.set_field(obj, 1, Value::Long(v));
+        // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
+        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        assert_eq!(r, v, "inline long getfield must load the full 64-bit payload");
+    }
+
+    #[test]
+    fn test_getfield_inline_null_receiver_returns_zero() {
+        // A null receiver must NOT fault: the inline null check skips the
+        // load and yields 0, bit-identical to `jit_getfield`'s
+        // `if obj_ptr == 0 { return 0 }` guard. Covered for both an int
+        // field (32-bit payload path) and a ref field (64-bit path).
+        let compiled_int = compile_single_getfield(0xac /* ireturn */, 0, b'I');
+        // SAFETY: executing JIT-compiled machine code; null receiver is the case under test.
+        let r = unsafe { compiled_int.call(&[0]) };
+        assert_eq!(r, 0, "null-receiver int getfield must return 0, not fault");
+
+        let compiled_ref = compile_single_getfield(0xb0 /* areturn */, 0, b'L');
+        // SAFETY: executing JIT-compiled machine code; null receiver is the case under test.
+        let r = unsafe { compiled_ref.call(&[0]) };
+        assert_eq!(r, 0, "null-receiver ref getfield must return 0, not fault");
+
+        let compiled_long = compile_single_getfield(0xad /* lreturn */, 0, b'J');
+        // SAFETY: executing JIT-compiled machine code; null receiver is the case under test.
+        let r = unsafe { compiled_long.call(&[0]) };
+        assert_eq!(r, 0, "null-receiver long getfield must return 0, not fault");
+    }
+
+    #[test]
+    fn test_getfield_inline_matches_helper_differential() {
+        // Differential: for a spread of int field values, the inline path
+        // result must equal what `stub_getfield` (the helper) would return.
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_types::ClassId;
+        let compiled = compile_single_getfield(0xac /* ireturn */, 0, b'I');
+        let heap = GenerationalHeap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 1);
+        for &v in &[0i32, 1, -1, i32::MAX, i32::MIN, 0x5A5A_5A5A, -0x0102_0304] {
+            heap.set_field(obj, 0, Value::Int(v));
+            // Helper reference result.
+            // SAFETY: obj is a live heap object with field index 0 in bounds.
+            let helper = unsafe { stub_getfield(obj.as_ptr() as i64, 0) };
+            // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
+            let inline = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+            assert_eq!(
+                inline, helper,
+                "inline getfield diverged from helper for value {v}"
+            );
+        }
     }
 
     // ===================================================================
@@ -18641,6 +18979,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -18889,6 +19228,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -18935,6 +19275,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // null input → branch taken → returns 1
@@ -18987,6 +19328,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // non-null input → branch taken → returns 1
@@ -19044,6 +19386,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // Same ref → branch taken → 1
@@ -19106,6 +19449,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // Different refs → branch taken → 1
@@ -19160,6 +19504,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
@@ -19208,6 +19553,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -19261,6 +19607,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -19320,6 +19667,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -19391,6 +19739,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -19588,6 +19937,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -19709,6 +20059,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(
             compiled.is_some(),
@@ -19760,6 +20111,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(
             compiled.is_some(),
@@ -19812,6 +20164,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(
             compiled.is_some(),
@@ -19866,6 +20219,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(
             compiled.is_some(),
@@ -19931,6 +20285,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -20003,6 +20358,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -20221,6 +20577,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
     }
 
@@ -20449,6 +20806,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
     }
 
@@ -20539,6 +20897,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(
             compiled.is_some(),
@@ -20656,6 +21015,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         )
         .unwrap();
 
@@ -20911,6 +21271,7 @@ mod tests {
             &helpers,
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         )
         .expect("inline-TLAB new opcode should compile");
 
@@ -20966,6 +21327,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some(), "Should compile method with `new` opcode");
 
@@ -21020,6 +21382,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(
             compiled.is_some(),
@@ -21080,6 +21443,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some(), "Constructor with putfield should be JIT-compilable");
 
@@ -21139,6 +21503,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some(), "Multi-field constructor should compile");
 
@@ -21193,6 +21558,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some(), "Lambda-style method should be JIT-compilable");
 
@@ -21237,6 +21603,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some(), "User class static method should be JIT-compilable");
 
@@ -21292,6 +21659,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout
         );
         assert!(compiled.is_some(), "Lambda with captured Object arg should compile");
 
@@ -21342,6 +21710,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = 5.0f64;
@@ -21377,6 +21746,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = 5.0f32;
@@ -21423,6 +21793,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = 2.0f64;
@@ -21578,6 +21949,7 @@ mod tests {
             ldc2w_info, HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let x = 7.5f64;
@@ -21726,6 +22098,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = std::f64::consts::PI;
@@ -21754,6 +22127,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = 2.5f32;
@@ -21783,6 +22157,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = 100.0f64;
@@ -21813,6 +22188,7 @@ mod tests {
             Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(),
             HashMap::new(),
+            None, // string_layout — not needed for this test
         ).unwrap();
 
         let a = 3.7f64;
@@ -22076,6 +22452,7 @@ mod tests {
             Vec::new(), // pic_slots (HIGH-7) — test stub: no PIC sites
             Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
             std::collections::HashSet::new(), HashMap::new(),
+            None, // string_layout
         )
     }
 
@@ -22307,6 +22684,7 @@ mod tests {
             &test_helpers(),
             std::collections::HashSet::new(),
             inline_sites,
+            None, // string_layout
         )
     }
 
@@ -22752,5 +23130,412 @@ mod tests {
             assert_eq!(compiled.call(&[10]), 12); // 10 + 1 + 1
             assert_eq!(compiled.call(&[0]), 2);
         }
+    }
+
+    // ===================================================================
+    // Inline array-access codegen tests
+    //
+    // These exercise the inline machine code emitted for `arraylength`
+    // (0xbe) and the primitive `Xaload` family (`iaload` 0x2e, `laload`
+    // 0x2f, `baload` 0x33, `caload` 0x34, `saload` 0x35). The JIT emits
+    // raw loads from the array header/data region with no helper `CALL`
+    // on the fast path:
+    //   - length:  MOV EAX, [array + ARRAY_LENGTH_OFFSET(12)]
+    //   - element: load from [array + HEADER_SIZE(40) + idx*scale]
+    //     with scale 1/2/4/8 and the correct sign/zero extension.
+    // The two exception edges (null-array NPE, out-of-bounds AIOOBE)
+    // still funnel through the shared deopt stubs, which call the
+    // `bastore` / `throw_aioobe` runtime helpers respectively.
+    //
+    // Heap arrays are allocated via the `cratonvm-gc` dev-dependency
+    // (`GenerationalHeap`), matching the existing `test_getfield_*`
+    // pattern — no `SharedVm` / `vm-tests` gating needed because the
+    // fast path takes no VM-context argument.
+    // ===================================================================
+
+    thread_local! {
+        /// Set by [`flagging_throw_aioobe`] so an inline out-of-bounds
+        /// access can be observed from a test: records `(index, length)`.
+        static TEST_AIOOBE_HIT: std::cell::Cell<Option<(i64, i64)>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by [`flagging_bastore`] when the null-check deopt stub
+        /// fires with `array_ptr == 0`.
+        static TEST_NPE_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Test stand-in for `jit_throw_aioobe`: records `(index, length)`
+    /// and returns the `i64::MIN` deopt sentinel, exactly like the real
+    /// helper. The bounds-check stub calls this when `idx >= len`.
+    ///
+    /// SAFETY: plain `extern "C"` callback invoked by JIT code with two
+    /// `i64` arguments; touches only a thread-local.
+    unsafe extern "C" fn flagging_throw_aioobe(index: i64, length: i64) -> i64 {
+        TEST_AIOOBE_HIT.with(|c| c.set(Some((index, length))));
+        i64::MIN
+    }
+
+    /// Test stand-in for `jit_bastore`: the null-check deopt stub calls
+    /// `helpers.bastore` with `array_ptr == 0` to flag a pending NPE.
+    /// Records the hit; the stub itself loads the `i64::MIN` sentinel.
+    ///
+    /// SAFETY: plain `extern "C"` callback invoked by JIT code with the
+    /// `(array_ptr, index, val)` ABI; touches only a thread-local.
+    unsafe extern "C" fn flagging_bastore(array_ptr: i64, _index: i64, _val: i64) {
+        if array_ptr == 0 {
+            TEST_NPE_HIT.with(|c| c.set(true));
+        }
+    }
+
+    /// `test_helpers()` with the `throw_aioobe` and `bastore` slots wired
+    /// to the flagging stubs above so the exception-edge tests can take
+    /// the deopt path without panicking on an unimplemented stub.
+    fn array_test_helpers() -> JitRuntimeHelpers {
+        let mut h = test_helpers();
+        h.throw_aioobe = flagging_throw_aioobe as *const () as usize;
+        h.bastore = flagging_bastore as *const () as usize;
+        h
+    }
+
+    /// Compile a single-method body with `array_test_helpers()`. Mirrors
+    /// the argument convention of the `test_getfield_*` helpers — the
+    /// `compile` positional args after `code_len` are `num_params` then
+    /// `max_locals` (there is no separate `max_stack` parameter).
+    fn compile_array_test(
+        code: &[u8],
+        code_len: usize,
+        num_params: usize,
+        max_locals: usize,
+    ) -> CompiledMethod {
+        compile(
+            code,
+            code_len,
+            num_params,
+            max_locals,
+            // needs_heap = false: inline array access (length + Xaload) is
+            // pure machine code with no hidden VM-context argument, so the
+            // tests call `CompiledMethod::call` directly with just the Java
+            // args. The deopt stubs call `bastore`/`throw_aioobe` helpers
+            // but those take no context. Mirrors the `test_getfield_*`
+            // pattern; see the note in `test_bounds_check_iaload_in_bounds`.
+            false, // needs_heap
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(), // pic_slots — no PIC sites
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &array_test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_inline_arraylength() {
+        // int f(int[] arr) { return arr.length; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0      (array)
+            0xbe, // 1: arraylength
+            0xac, // 2: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 3, 1, 1);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+
+        let arr0 = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 0);
+        let arr5 = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
+        let arr257 = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 257);
+
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        unsafe {
+            assert_eq!(compiled.call(&[arr0.as_ptr() as i64]), 0);
+            assert_eq!(compiled.call(&[arr5.as_ptr() as i64]), 5);
+            assert_eq!(compiled.call(&[arr257.as_ptr() as i64]), 257);
+        }
+    }
+
+    #[test]
+    fn test_inline_iaload() {
+        // int f(int[] arr, int i) { return arr[i]; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x2e, // 2: iaload
+            0xac, // 3: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 4);
+        // Include a negative element to confirm 32-bit values round-trip.
+        let vals = [7i32, -100_000, i32::MAX, i32::MIN];
+        for (i, v) in vals.iter().enumerate() {
+            heap.set_array_element(arr, i, Value::Int(*v)).unwrap();
+        }
+
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        unsafe {
+            for (i, v) in vals.iter().enumerate() {
+                // iaload sign-extends the 32-bit element to the 64-bit
+                // return register, so the expected value is `*v as i64`.
+                assert_eq!(
+                    compiled.call(&[arr.as_ptr() as i64, i as i64]),
+                    *v as i64,
+                    "iaload mismatch at index {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_baload_sign_extends() {
+        // int f(byte[] arr, int i) { return arr[i]; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x33, // 2: baload
+            0xac, // 3: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Byte, 4);
+        // Store raw byte patterns via Value::Int (heap narrows to i8).
+        // 0xFF -> -1, 0x80 -> -128 prove the sign extension.
+        heap.set_array_element(arr, 0, Value::Int(0x7F)).unwrap();
+        heap.set_array_element(arr, 1, Value::Int(0xFF)).unwrap();
+        heap.set_array_element(arr, 2, Value::Int(0x80)).unwrap();
+        heap.set_array_element(arr, 3, Value::Int(0x01)).unwrap();
+
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        unsafe {
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 0]), 127);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 1]), -1);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 2]), -128);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 3]), 1);
+        }
+    }
+
+    #[test]
+    fn test_inline_caload_zero_extends() {
+        // int f(char[] arr, int i) { return arr[i]; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x34, // 2: caload
+            0xac, // 3: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Char, 3);
+        // 0xFFFF must zero-extend to 65535 (not -1).
+        heap.set_array_element(arr, 0, Value::Int(0x0041)).unwrap(); // 'A'
+        heap.set_array_element(arr, 1, Value::Int(0xFFFF)).unwrap();
+        heap.set_array_element(arr, 2, Value::Int(0x8000)).unwrap();
+
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        unsafe {
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 0]), 65);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 1]), 65535);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 2]), 32768);
+        }
+    }
+
+    #[test]
+    fn test_inline_saload_sign_extends() {
+        // int f(short[] arr, int i) { return arr[i]; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x35, // 2: saload
+            0xac, // 3: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Short, 3);
+        // 0xFFFF must sign-extend to -1, 0x8000 to -32768.
+        heap.set_array_element(arr, 0, Value::Int(0x7FFF)).unwrap();
+        heap.set_array_element(arr, 1, Value::Int(0xFFFF)).unwrap();
+        heap.set_array_element(arr, 2, Value::Int(0x8000)).unwrap();
+
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        unsafe {
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 0]), 32767);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 1]), -1);
+            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 2]), -32768);
+        }
+    }
+
+    #[test]
+    fn test_inline_laload() {
+        // long f(long[] arr, int i) { return arr[i]; }
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x2f, // 2: laload
+            0xad, // 3: lreturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Long, 3);
+        let vals = [0x0123_4567_89AB_CDEFi64, i64::MIN, -1i64];
+        for (i, v) in vals.iter().enumerate() {
+            heap.set_array_element(arr, i, Value::Long(*v)).unwrap();
+        }
+
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        unsafe {
+            for (i, v) in vals.iter().enumerate() {
+                assert_eq!(
+                    compiled.call(&[arr.as_ptr() as i64, i as i64]),
+                    *v,
+                    "laload mismatch at index {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_arraylength_null_throws_npe() {
+        // int f(int[] arr) { return arr.length; }  with arr == null.
+        // The inline `MOV EAX, [arr + 12]` is guarded by a TEST/JZ that
+        // branches to the shared null-check deopt stub. That stub calls
+        // `helpers.bastore(0, ..)` (flagging our NPE thread-local) and
+        // returns the `i64::MIN` deopt sentinel.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xbe, // 1: arraylength
+            0xac, // 2: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 3, 1, 1);
+
+        TEST_NPE_HIT.with(|c| c.set(false));
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        let result = unsafe { compiled.call(&[0]) }; // null array
+        assert_eq!(result, i64::MIN, "null arraylength must deopt with sentinel");
+        assert!(
+            TEST_NPE_HIT.with(|c| c.get()),
+            "null arraylength must take the NPE deopt stub"
+        );
+    }
+
+    #[test]
+    fn test_inline_iaload_null_throws_npe() {
+        // int f(int[] arr, int i) { return arr[i]; }  with arr == null.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x2e, // 2: iaload
+            0xac, // 3: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        TEST_NPE_HIT.with(|c| c.set(false));
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        let result = unsafe { compiled.call(&[0, 0]) }; // null array
+        assert_eq!(result, i64::MIN, "null iaload must deopt with sentinel");
+        assert!(
+            TEST_NPE_HIT.with(|c| c.get()),
+            "null iaload must take the NPE deopt stub"
+        );
+    }
+
+    #[test]
+    fn test_inline_iaload_out_of_bounds_throws_aioobe() {
+        // int f(int[] arr, int i) { return arr[i]; }
+        // The bounds check (`CMP ECX, R10D; JAE stub`) treats the index
+        // as unsigned, so both `idx >= len` and negative indices land
+        // in the AIOOBE stub which calls `helpers.throw_aioobe`.
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x1b, // 1: iload_1
+            0x2e, // 2: iaload
+            0xac, // 3: ireturn
+            0, 0,
+        ];
+        let compiled = compile_array_test(&code, 4, 2, 2);
+
+        use cratonvm_gc::gen_heap::GenerationalHeap;
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_types::ClassId;
+        let heap = GenerationalHeap::new();
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
+
+        // Index == length (just past the end).
+        TEST_AIOOBE_HIT.with(|c| c.set(None));
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        let result = unsafe { compiled.call(&[arr.as_ptr() as i64, 3]) };
+        assert_eq!(result, i64::MIN, "OOB iaload must deopt with sentinel");
+        assert_eq!(
+            TEST_AIOOBE_HIT.with(|c| c.get()),
+            Some((3, 3)),
+            "OOB iaload must report (index=3, length=3) to throw_aioobe"
+        );
+
+        // Negative index — unsigned compare catches it as huge.
+        TEST_AIOOBE_HIT.with(|c| c.set(None));
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        let result = unsafe { compiled.call(&[arr.as_ptr() as i64, -1]) };
+        assert_eq!(result, i64::MIN, "negative-index iaload must deopt");
+        assert!(
+            TEST_AIOOBE_HIT.with(|c| c.get()).is_some(),
+            "negative-index iaload must take the AIOOBE stub"
+        );
+
+        // In-bounds index must NOT trip the stub.
+        heap.set_array_element(arr, 2, Value::Int(99)).unwrap();
+        TEST_AIOOBE_HIT.with(|c| c.set(None));
+        // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
+        let result = unsafe { compiled.call(&[arr.as_ptr() as i64, 2]) };
+        assert_eq!(result, 99);
+        assert_eq!(
+            TEST_AIOOBE_HIT.with(|c| c.get()),
+            None,
+            "in-bounds iaload must not call throw_aioobe"
+        );
     }
 }
