@@ -191,6 +191,78 @@ fn detect_sse41() -> bool {
     false
 }
 
+/// Cached feature support for the JIT-intrinsic families: 0 = unknown,
+/// 1 = supported, 2 = not supported. One slot per feature.
+static POPCNT_SUPPORT: AtomicU8 = AtomicU8::new(0);
+static SSE42_SUPPORT: AtomicU8 = AtomicU8::new(0);
+static LZCNT_SUPPORT: AtomicU8 = AtomicU8::new(0);
+static BMI1_SUPPORT: AtomicU8 = AtomicU8::new(0);
+static PCLMUL_SUPPORT: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_arch = "x86_64")]
+fn cpuid_bit(leaf: u32, sub: u32, reg: u8, bit: u32) -> bool {
+    // SAFETY: __cpuid_count is a read-only x86_64 intrinsic querying CPU
+    // feature flags via CPUID. The target_arch gate ensures x86_64.
+    #[allow(unused_unsafe)]
+    unsafe {
+        let r = std::arch::x86_64::__cpuid_count(leaf, sub);
+        let v = match reg {
+            0 => r.eax,
+            1 => r.ebx,
+            2 => r.ecx,
+            _ => r.edx,
+        };
+        v & (1 << bit) != 0
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn cpuid_bit(_leaf: u32, _sub: u32, _reg: u8, _bit: u32) -> bool {
+    false
+}
+
+fn cached_feature(slot: &AtomicU8, detect: impl FnOnce() -> bool) -> bool {
+    let cached = slot.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached == 1;
+    }
+    let result = detect();
+    slot.store(if result { 1 } else { 2 }, Ordering::Relaxed);
+    result
+}
+
+/// CPU supports the `POPCNT` instruction (CPUID leaf 1, ECX bit 23).
+/// Required for `Integer/Long.bitCount` intrinsics.
+pub fn has_popcnt() -> bool {
+    cached_feature(&POPCNT_SUPPORT, || cpuid_bit(1, 0, 2, 23))
+}
+
+/// CPU supports SSE4.2 — implies the `CRC32` instruction (CPUID leaf 1,
+/// ECX bit 20). Required for `CRC32C` intrinsics.
+pub fn has_sse42() -> bool {
+    cached_feature(&SSE42_SUPPORT, || cpuid_bit(1, 0, 2, 20))
+}
+
+/// CPU supports `LZCNT` (AMD ABM / Intel since Haswell — CPUID leaf
+/// 0x8000_0001, ECX bit 5). Required for branchless
+/// `numberOfLeadingZeros`. Without it, fall back to `BSR` + fixups.
+pub fn has_lzcnt() -> bool {
+    cached_feature(&LZCNT_SUPPORT, || cpuid_bit(0x8000_0001, 0, 2, 5))
+}
+
+/// CPU supports BMI1 — implies the `TZCNT` instruction (CPUID leaf 7,
+/// subleaf 0, EBX bit 3). Required for branchless
+/// `numberOfTrailingZeros`. Without it, fall back to `BSF` + fixups.
+pub fn has_bmi1() -> bool {
+    cached_feature(&BMI1_SUPPORT, || cpuid_bit(7, 0, 1, 3))
+}
+
+/// CPU supports `PCLMULQDQ` carry-less multiply (CPUID leaf 1, ECX bit 1).
+/// Required for a folding `CRC32` (IEEE polynomial) implementation.
+pub fn has_pclmulqdq() -> bool {
+    cached_feature(&PCLMUL_SUPPORT, || cpuid_bit(1, 0, 2, 1))
+}
+
 // ---------------------------------------------------------------------------
 // SIMD loop analysis and vectorization
 // ---------------------------------------------------------------------------
