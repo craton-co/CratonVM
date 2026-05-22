@@ -580,22 +580,26 @@ mod tests {
 
     #[test]
     fn merge_intersects_predecessors() {
-        // Two paths merge at PC 6. On one path local 1 is proven
-        // non-null; on the other it's not. Intersection must give us
-        // "not proven non-null" at PC 6.
+        // Two paths merge at the return (PC 8). On the fall-through
+        // path local 1 is proven non-null by the getfield; on the
+        // ifeq-taken path it is not. The dataflow meet (bitwise AND)
+        // over the two predecessors must yield "not proven non-null"
+        // at PC 8.
         //
-        //   0: iconst_0          (0x03)
-        //   1: ifeq +5 → PC 6    (0x99 00 05)
-        //   4: aload_1           (0x2B)
-        //   5: ifnonnull +1 → PC 7 (skip return)  (0xC7 00 02)  no — keep simple
-        //   ...
-        // Use a simpler shape:
-        //   0: iconst_0; ifeq +5 → PC 7
-        //   3: aload_1; getfield (proves L1 nonnull)
-        //   7: <merge>; return
+        //   0: iconst_0                    (0x03)
+        //   1: ifeq → PC 8  (offset +7)    (0x99 00 07)
+        //   4: aload_1                     (0x2B)
+        //   5: getfield #1 (proves L1)     (0xB4 00 01)
+        //   8: return  ← merge point       (0xB1)
+        //
+        // The ifeq branch offset is relative to the ifeq opcode (PC 1),
+        // so reaching the return at PC 8 needs offset 7 — NOT 6, which
+        // would land mid-getfield (PC 7 is not an instruction start),
+        // get dropped by the CFG walk, and leave PC 8 with only the
+        // getfield predecessor.
         let code = vec![
             0x03,              // 0: iconst_0
-            0x99, 0x00, 0x06,  // 1: ifeq → PC 7
+            0x99, 0x00, 0x07,  // 1: ifeq → PC 8
             0x2B,              // 4: aload_1
             0xB4, 0x00, 0x01,  // 5: getfield (proves L1 nonnull on this path)
             0xB1,              // 8: return (merge)

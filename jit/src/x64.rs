@@ -5313,12 +5313,26 @@ impl Compiler {
         let r1 = self.slot_to_gpr(val1, RAX);
         let r2 = self.slot_to_gpr(val2, RCX);
         self.emit_cmp_r32_r32(r1, r2);
-        // Load INSTR_A's value (fall-through) into RAX.
-        let a_off = self.local_offset(a_local);
-        self.emit_load_local(RAX, a_off);
-        // Load INSTR_B's value (taken) into RCX.
-        let b_off = self.local_offset(b_local);
-        self.emit_load_local(RCX, b_off);
+        // Load INSTR_A's value (fall-through) into RAX and INSTR_B's value
+        // (taken) into RCX. These must respect register allocation: when a
+        // local is register-mapped its frame slot is never written, so a
+        // raw `emit_load_local` would read uninitialized stack garbage.
+        // (CMP above is already emitted, so clobbering RAX/RCX is safe; the
+        // callee-saved home registers of the locals are never RAX/RCX.)
+        match self.reg_for_local(a_local) {
+            Some(reg) => self.emit_mov_reg_reg(RAX, reg),
+            None => {
+                let a_off = self.local_offset(a_local);
+                self.emit_load_local(RAX, a_off);
+            }
+        }
+        match self.reg_for_local(b_local) {
+            Some(reg) => self.emit_mov_reg_reg(RCX, reg),
+            None => {
+                let b_off = self.local_offset(b_local);
+                self.emit_load_local(RCX, b_off);
+            }
+        }
         // CMOVcc EAX, ECX (no REX.W; iload values are 32-bit ints):
         //   0xa1 → JL  → CMOVL  (0x4C)
         //   0xa2 → JGE → CMOVGE (0x4D)
@@ -5329,6 +5343,11 @@ impl Compiler {
         };
         // peephole-cmov: branchless lowering of user-written min/max.
         self.buf.emit(&[0x0F, cmov_cc, 0xC1]);
+        // The 32-bit CMOV zero-extends into the upper 32 bits of RAX. The
+        // JIT keeps `int` values sign-extended to 64 bits (see i2b/i2s/i2l),
+        // so re-extend the selected value — otherwise a negative result
+        // (e.g. min(-7, 4)) surfaces as a large positive. MOVSXD RAX, EAX.
+        self.buf.emit(&[0x48, 0x63, 0xC0]);
         // Push RAX as the merged result.
         self.push_from_rax();
 
@@ -12299,6 +12318,14 @@ impl Compiler {
                             };
                             // CMOVcc EAX, ECX (32-bit, no REX.W): 0F 4c C1
                             self.buf.emit(&[0x0F, cc, 0xC1]);
+                            // The 32-bit CMOV zero-extends the selected value
+                            // into the upper 32 bits of RAX. The JIT's value
+                            // ABI keeps `int`s sign-extended to 64 bits (see
+                            // i2b/i2s/i2l, which all MOVSXD to 64-bit), so a
+                            // negative result such as `Math.min(-7, 4)` must
+                            // be re-extended or it surfaces as a large
+                            // positive (`-7` → `0xFFFFFFF9`). MOVSXD RAX, EAX.
+                            self.buf.emit(&[0x48, 0x63, 0xC0]);
                             self.push_from_rax();
                         } else if callee_entry == super::MATH_MIN_LONG_INTRINSIC
                             || callee_entry == super::MATH_MAX_LONG_INTRINSIC
@@ -18165,21 +18192,25 @@ mod tests {
     fn test_compile_math_min_max_long_intrinsic() {
         // long min_f(long a, long b) { return Math.min(a, b); }
         // long max_f(long a, long b) { return Math.max(a, b); }
-        // Bytecode: lload_0 (0x1e), lload_2 (0x20), invokestatic (0xb8, 0x00, 0x01),
-        //           lreturn (0xad). Long uses 2 local slots per arg, so the
-        //           second arg lives at slot 2 (lload_2), and max_locals is 4.
+        // Bytecode: lload_0 (0x1e), lload_1 (0x1f), invokestatic (0xb8, 0x00, 0x01),
+        //           lreturn (0xad). This JIT models every parameter — long
+        //           included — as a single 64-bit local slot (the prologue
+        //           maps Java param `i` to local slot `i`), so the second
+        //           arg lives at slot 1 (lload_1) and max_locals is 2. Using
+        //           the JVM-classic `lload_2` here would read an
+        //           uninitialized slot 2 and miscompare against garbage.
         // Round-9 CRIT regression test for the swapped CMOVL/CMOVG opcodes in
         // the MATH_MIN_LONG_INTRINSIC / MATH_MAX_LONG_INTRINSIC arms — same
         // bug as the int variants but on the 64-bit REX.W CMOV path.
-        let code: Vec<u8> = vec![0x1e, 0x20, 0xb8, 0x00, 0x01, 0xad, 0, 0];
+        let code: Vec<u8> = vec![0x1e, 0x1f, 0xb8, 0x00, 0x01, 0xad, 0, 0];
         let code_len = 6;
 
         // Math.min(long, long) variant
         let compiled_min = compile(
             &code,
             code_len,
-            4, // param_slots: 2 longs * 2 slots each
-            4, // max_locals
+            2, // num_params: 2 long args, one local slot each
+            2, // max_locals
             false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(),
@@ -18216,8 +18247,8 @@ mod tests {
         let compiled_max = compile(
             &code,
             code_len,
-            4,
-            4,
+            2, // num_params: 2 long args, one local slot each
+            2, // max_locals
             false,
             Vec::new(), Vec::new(), Vec::new(), Vec::new(),
             Vec::new(), Vec::new(), Vec::new(),

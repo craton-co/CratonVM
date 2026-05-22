@@ -288,8 +288,14 @@ impl ExecutableBuffer {
     /// panicking. `len` is never advanced past `capacity`, so the buffer
     /// stays safe to slice/patch; the compile driver is expected to check
     /// `overflowed()` and discard the result.
+    ///
+    /// The `overflowed` flag is sticky: once any emit has overflowed, every
+    /// subsequent `emit`/`emit_byte` becomes a no-op. This freezes `len` at
+    /// the point of first overflow so a later (smaller) emit cannot slip
+    /// bytes in past the gap left by the dropped instruction and produce a
+    /// silently misaligned code stream.
     pub fn emit(&mut self, bytes: &[u8]) {
-        if self.len + bytes.len() > self.capacity {
+        if self.overflowed || self.len + bytes.len() > self.capacity {
             self.overflowed = true;
             return;
         }
@@ -315,10 +321,12 @@ impl ExecutableBuffer {
     /// Emit a single byte.
     ///
     /// Marks the buffer [`overflowed`](Self::overflowed) and skips the write
-    /// instead of panicking when capacity is exhausted.
+    /// instead of panicking when capacity is exhausted. Like [`emit`](Self::emit),
+    /// honors the sticky `overflowed` flag: a no-op once the buffer has
+    /// already overflowed.
     #[inline]
     pub fn emit_byte(&mut self, b: u8) {
-        if self.len >= self.capacity {
+        if self.overflowed || self.len >= self.capacity {
             self.overflowed = true;
             return;
         }
