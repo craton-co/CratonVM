@@ -2799,6 +2799,51 @@ struct SpeculativeBCEGuard {
 /// 2. Not modified by any istore/astore
 ///
 /// Returns the local index if found.
+/// Collect the JVM local indexes that are the dead "high half" of a
+/// `long`/`double` local.
+///
+/// A 64-bit local declared at index `N` reserves index `N+1`; the JVM never
+/// addresses `N+1` directly. The JIT models 64-bit values as a single
+/// register and likewise never reads `N+1`, but the register allocator still
+/// assigns it a physical register. Those assignments are the source of an OSR
+/// trampoline clobber (see the call site in `compile`), so OSR must know which
+/// indexes are high-halves and skip them.
+///
+/// Detection scans for every wide load/store opcode (`lload`/`lstore`/
+/// `dload`/`dstore`, both the `_0.._3` short forms and the `wide`-index
+/// forms): a wide access at index `N` proves `N+1` is a high-half. This is
+/// sufficient — a wide local that is never loaded or stored cannot hold a
+/// value that OSR needs to preserve.
+fn wide_local_high_halves(code: &[u8], code_len: usize) -> Vec<usize> {
+    let mut hi: Vec<usize> = Vec::new();
+    let mut mark = |base: usize, set: &mut Vec<usize>| {
+        let h = base + 1;
+        if !set.contains(&h) {
+            set.push(h);
+        }
+    };
+    let mut pc = 0usize;
+    while pc < code_len {
+        match code[pc] {
+            // lload_0..lload_3
+            0x1e..=0x21 => mark((code[pc] - 0x1e) as usize, &mut hi),
+            // dload_0..dload_3
+            0x26..=0x29 => mark((code[pc] - 0x26) as usize, &mut hi),
+            // lstore_0..lstore_3
+            0x3f..=0x42 => mark((code[pc] - 0x3f) as usize, &mut hi),
+            // dstore_0..dstore_3
+            0x47..=0x4a => mark((code[pc] - 0x47) as usize, &mut hi),
+            // lload (0x16) / dload (0x18), wide index
+            0x16 | 0x18 if pc + 1 < code_len => mark(code[pc + 1] as usize, &mut hi),
+            // lstore (0x37) / dstore (0x39), wide index
+            0x37 | 0x39 if pc + 1 < code_len => mark(code[pc + 1] as usize, &mut hi),
+            _ => {}
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+    hi
+}
+
 fn find_induction_variable(code: &[u8], header: usize, back_edge_end: usize) -> Option<usize> {
     let mut iinc_locals: Vec<(usize, i8)> = Vec::new(); // (local, increment)
     let mut stored_locals: u64 = 0; // bitmask of locals written by xstore
@@ -3337,6 +3382,17 @@ struct Compiler {
     alloc_used_xmms: Vec<u8>,
     /// Mapping from bytecode PC to native code offset (for branch patching).
     pc_to_native: Vec<i32>,
+    /// OSR entry offset per bytecode PC.
+    ///
+    /// Identical to `pc_to_native` for every PC *except* loop headers that
+    /// carry LICM-hoisted preheader code. `pc_to_native[header]` is set
+    /// *after* the hoisted code so the in-loop back-edge skips re-running it;
+    /// but an OSR entry that jumped there would run the loop body with
+    /// uninitialised hoist spill slots (garbage array pointers → SIGSEGV,
+    /// stale arithmetic → wrong result). `osr_entry_native[header]` therefore
+    /// points *before* the hoisted preheader so an OSR entry executes the
+    /// hoist initialisation exactly like a normal fall-through entry would.
+    osr_entry_native: Vec<i32>,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -3698,6 +3754,7 @@ impl Compiler {
             xmm_assignments,
             alloc_used_xmms,
             pc_to_native: Vec::new(),
+            osr_entry_native: Vec::new(),
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -9193,6 +9250,7 @@ impl Compiler {
     fn compile_bytecode(&mut self, code: &[u8], code_len: usize) -> bool {
         // Pre-allocate pc_to_native mapping
         self.pc_to_native.resize(code_len + 1, -1);
+        self.osr_entry_native.resize(code_len + 1, -1);
 
         // DCE: compute branch targets so we know which PCs are reachable
         let mut branch_targets = vec![false; code_len + 1];
@@ -9304,6 +9362,16 @@ impl Compiler {
                         self.canonicalize_stack();
                     }
                 }
+            }
+            // OSR soundness: record the pre-hoist native position as the OSR
+            // entry for this PC. The LICM preheaders emitted just below
+            // initialise hoist spill slots that the rewritten in-loop loads
+            // depend on; a normal back-edge skips them (slots already warm)
+            // but an OSR entry has cold slots, so it MUST run the preheader.
+            // `pc_to_native[pc]` (set after the preheader) stays the back-edge
+            // target; `osr_entry_native[pc]` points here, before the preheader.
+            if !dead && pc < self.osr_entry_native.len() {
+                self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
             // Hoisted code runs BEFORE pc_to_native is set, so back-edges
@@ -13528,32 +13596,407 @@ impl Compiler {
                         let mut intrinsic_handled = false;
 
                         // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
-                        // No codegen: the STRING_ACCESS family
-                        // (String.length/charAt/isEmpty/hashCode) is not
-                        // registered in `try_resolve_intrinsic`, so no
-                        // `callee_entry` ever matches a String-access
-                        // intrinsic and `intrinsic_handled` stays false —
-                        // these calls fall through to normal dispatch.
-                        // Inlining is unsound because String's field layout
-                        // (value array, coder byte, hash int) is
-                        // runtime-determined, not statically known to the
-                        // JIT. See the matcher's STRING_ACCESS region in
-                        // lib.rs and jit/tests/intrinsic_string_access.rs.
+                        // java.lang.String access intrinsics (Phase 3a):
+                        // length()I, isEmpty()Z, charAt(I)C, hashCode()I.
+                        //
+                        // These are registered by `try_resolve_string_intrinsic`
+                        // ONLY when a `StringFieldLayout` with a `coder` field
+                        // resolved for this compilation; that same layout is in
+                        // `self.string_layout`. The defensive `if let Some` below
+                        // therefore always matches when a String sentinel is
+                        // seen — but if it somehow does not (layout unexpectedly
+                        // absent), `intrinsic_handled` stays false and control
+                        // falls through to the normal direct-call path, so the
+                        // intrinsic sentinel is never mis-`CALL`ed.
+                        //
+                        // String representation (compact): `value` is a `byte[]`,
+                        // `coder` is 0 (LATIN1, 1 byte/char) or 1 (UTF16, 2 LE
+                        // bytes/char). `length() == value.length >> coder`.
+                        //
+                        // Every uncertain case — null receiver, null `value`
+                        // array, charAt index out of bounds — branches to a
+                        // shared uncommon-trap deopt stub (reason 6) which
+                        // re-runs the whole method in the interpreter; the
+                        // native `lang_string.rs` impl then reproduces the
+                        // exact NPE / StringIndexOutOfBoundsException / value
+                        // semantics. No `CALL` is emitted on the inline path.
+                        if let Some(layout) = self.string_layout {
+                            let acc = if callee_entry
+                                == super::JitIntrinsic::StringLength.as_entry()
+                            {
+                                Some(0u8)
+                            } else if callee_entry
+                                == super::JitIntrinsic::StringIsEmpty.as_entry()
+                            {
+                                Some(1)
+                            } else if callee_entry
+                                == super::JitIntrinsic::StringCharAt.as_entry()
+                            {
+                                Some(2)
+                            } else if callee_entry
+                                == super::JitIntrinsic::StringHashCode.as_entry()
+                            {
+                                Some(3)
+                            } else {
+                                None
+                            };
+                            if let Some(kind) = acc {
+                                self.flush_scratch_registers();
+                                let mut bail: Vec<usize> = Vec::new();
+
+                                // Pop operands. charAt has an index arg
+                                // (shallower); the receiver is always deepest.
+                                let index_slot = if kind == 2 {
+                                    Some(self.pop_stack())
+                                } else {
+                                    None
+                                };
+                                let recv_slot = self.pop_stack();
+
+                                // RAX = receiver. Null receiver → deopt.
+                                self.load_slot_to_reg(RAX, recv_slot);
+                                self.emit_test_r64_r64(RAX);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                // RCX = value (byte[]) ref. Null → deopt.
+                                self.emit_mov_r64_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    layout.value_cell_offset
+                                        + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                );
+                                self.emit_test_r64_r64(RCX);
+                                bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                // R10D = coder (0 LATIN1 / 1 UTF16).
+                                self.emit_movsxd_r64_mem_disp32(
+                                    R10,
+                                    RAX,
+                                    layout.coder_cell_offset
+                                        + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                );
+
+                                if kind == 3 {
+                                    // hashCode(): first read the cached `hash`
+                                    // int. A non-zero cache is the result —
+                                    // matches the native lazy cache. (A zero
+                                    // cache, or an empty string, recomputes;
+                                    // the inline path does NOT write the cache
+                                    // back — the returned value is identical
+                                    // either way, the cache is a
+                                    // non-observable optimisation.)
+                                    self.emit_movsxd_r64_mem_disp32(
+                                        RAX,
+                                        RAX,
+                                        layout.hash_cell_offset
+                                            + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    );
+                                    // TEST EAX,EAX ; JNZ cached_done
+                                    self.buf.emit(&[0x85, 0xC0]);
+                                    let cached_done =
+                                        self.emit_jcc_rel32_patch(0x85); // JNZ
+
+                                    // Recompute: char_count = value.len >> coder.
+                                    // R11D = value.length (zero-extended).
+                                    self.buf.emit(&[
+                                        0x44, 0x8B, 0x59,
+                                        ARRAY_LENGTH_OFFSET as u8,
+                                    ]); // MOV R11D,[RCX+12]
+                                    // MOV ECX, R10D ; SHR R11D, CL
+                                    self.buf.emit(&[0x44, 0x89, 0xD1]);
+                                    self.buf.emit(&[0x41, 0xD3, 0xEB]);
+                                    // Reload value ptr into RDX (RCX is now CL
+                                    // scratch). value cell is still in [RAX..]
+                                    // — but RAX now holds h(=0 region); reload
+                                    // from the receiver. Receiver was clobbered:
+                                    // re-pop is not possible. Instead keep value
+                                    // ptr safe: recompute from recv_slot.
+                                    self.load_slot_to_reg(RDX, recv_slot);
+                                    self.emit_mov_r64_mem_disp32(
+                                        RDX,
+                                        RDX,
+                                        layout.value_cell_offset
+                                            + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    );
+                                    // h = 0 (EAX) ; i = 0 (R8D).
+                                    self.emit_xor_reg_self(RAX);
+                                    self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D,R8D
+                                    // loop: CMP R8D,R11D ; JGE done
+                                    let loop_top = self.buf.pos();
+                                    self.buf.emit(&[0x45, 0x39, 0xD8]); // CMP R8D,R11D
+                                    let loop_done =
+                                        self.emit_jcc_rel32_patch(0x8D); // JGE
+                                    // decode char into ECX: coder branch.
+                                    // TEST R10D,R10D ; JNZ utf16
+                                    self.buf.emit(&[0x45, 0x85, 0xD2]);
+                                    let utf16 = self.emit_jcc_rel32_patch(0x85);
+                                    // LATIN1: MOVZX ECX, BYTE [RDX+R8*1+40]
+                                    self.buf.emit(&[
+                                        0x42, 0x0F, 0xB6, 0x4C, 0x02,
+                                        HEADER_SIZE as u8,
+                                    ]);
+                                    let dec_done = self.emit_jmp_rel32_patch();
+                                    // UTF16: MOVZX ECX, WORD [RDX+R8*2+40]
+                                    self.patch_rel32_to_here(utf16);
+                                    self.buf.emit(&[
+                                        0x42, 0x0F, 0xB7, 0x4C, 0x42,
+                                        HEADER_SIZE as u8,
+                                    ]);
+                                    self.patch_rel32_to_here(dec_done);
+                                    // h = h*31 + c  ==  (h<<5) - h + c.
+                                    // MOV R9D,EAX ; SHL EAX,5 ; SUB EAX,R9D ;
+                                    // ADD EAX,ECX
+                                    self.buf.emit(&[0x41, 0x89, 0xC1]); // MOV R9D,EAX
+                                    self.buf.emit(&[0xC1, 0xE0, 0x05]); // SHL EAX,5
+                                    self.buf.emit(&[0x44, 0x29, 0xC8]); // SUB EAX,R9D
+                                    self.buf.emit(&[0x01, 0xC8]); // ADD EAX,ECX
+                                    // INC R8D ; JMP loop
+                                    self.buf.emit(&[0x41, 0xFF, 0xC0]);
+                                    let back = self.emit_jmp_rel32_patch();
+                                    let rel = loop_top as i32
+                                        - (back as i32 + 4);
+                                    self.buf.patch_i32(back, rel);
+                                    self.patch_rel32_to_here(loop_done);
+                                    self.patch_rel32_to_here(cached_done);
+                                    // Result (EAX) is sign-extended on push.
+                                    self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX,EAX
+                                    self.push_from_rax();
+                                } else if kind == 2 {
+                                    // charAt(I)C. Register plan:
+                                    //   R8  = value ptr   (RCX freed for CL)
+                                    //   R9  = index       (survives SHR)
+                                    //   R11 = char_count
+                                    //   R10 = coder
+                                    // R9 = index.
+                                    self.load_slot_to_reg(
+                                        R9,
+                                        index_slot.unwrap(),
+                                    );
+                                    // R11D = value.length (zero-extended) —
+                                    // read BEFORE freeing RCX.
+                                    self.buf.emit(&[
+                                        0x44, 0x8B, 0x59,
+                                        ARRAY_LENGTH_OFFSET as u8,
+                                    ]); // MOV R11D,[RCX+12]
+                                    // R8 = value ptr (so CL can use RCX).
+                                    self.buf.emit(&[0x49, 0x89, 0xC8]); // MOV R8,RCX
+                                    // char_count = value.length >> coder.
+                                    // MOV ECX,R10D ; SHR R11D,CL
+                                    self.buf.emit(&[0x44, 0x89, 0xD1]);
+                                    self.buf.emit(&[0x41, 0xD3, 0xEB]);
+                                    // Bounds: (unsigned) index >= char_count
+                                    // → deopt (also catches negative index).
+                                    // CMP R9D, R11D ; JAE deopt
+                                    self.buf.emit(&[0x45, 0x39, 0xD9]);
+                                    bail.push(self.emit_jcc_rel32_patch(0x83));
+                                    // Decode: coder branch. R10D = coder,
+                                    // R9 = index, R8 = value ptr.
+                                    self.buf.emit(&[0x45, 0x85, 0xD2]); // TEST R10D,R10D
+                                    let utf16 = self.emit_jcc_rel32_patch(0x85);
+                                    // LATIN1: MOVZX EAX, BYTE [R8+R9*1+40]
+                                    self.buf.emit(&[
+                                        0x43, 0x0F, 0xB6, 0x44, 0x08,
+                                        HEADER_SIZE as u8,
+                                    ]);
+                                    let dec_done = self.emit_jmp_rel32_patch();
+                                    // UTF16: MOVZX EAX, WORD [R8+R9*2+40]
+                                    self.patch_rel32_to_here(utf16);
+                                    self.buf.emit(&[
+                                        0x43, 0x0F, 0xB7, 0x44, 0x48,
+                                        HEADER_SIZE as u8,
+                                    ]);
+                                    self.patch_rel32_to_here(dec_done);
+                                    // char result already zero-extended in EAX.
+                                    self.push_from_rax();
+                                } else {
+                                    // length()I (kind 0) / isEmpty()Z (kind 1).
+                                    // EAX = value.length (zero-extended).
+                                    self.buf.emit(&[
+                                        0x8B, 0x41,
+                                        ARRAY_LENGTH_OFFSET as u8,
+                                    ]); // MOV EAX,[RCX+12]
+                                    // MOV ECX,R10D ; SHR EAX,CL  → char count.
+                                    self.buf.emit(&[0x44, 0x89, 0xD1]);
+                                    self.buf.emit(&[0xD3, 0xE8]);
+                                    if kind == 1 {
+                                        // isEmpty: EAX = (char_count == 0).
+                                        // TEST EAX,EAX ; SETE AL ; MOVZX EAX,AL
+                                        self.buf.emit(&[0x85, 0xC0]);
+                                        self.buf.emit(&[0x0F, 0x94, 0xC0]);
+                                        self.buf.emit(&[0x0F, 0xB6, 0xC0]);
+                                    } else {
+                                        // length: sign-extend the int result.
+                                        self.buf.emit(&[0x48, 0x63, 0xC0]);
+                                    }
+                                    self.push_from_rax();
+                                }
+
+                                // Wire every bail edge to one shared
+                                // uncommon-trap stub (reason 6).
+                                for p in bail {
+                                    self.deopt_stubs.push((p, pc, 6));
+                                }
+                                intrinsic_handled = true;
+                            }
+                        }
                         // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
                         // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-                        // java.lang.String search/compare intrinsics — BAILED, emits nothing.
+                        // java.lang.String search intrinsic (Phase 3b):
+                        // equals(Ljava/lang/Object;)Z.
                         //
-                        // String.equals/compareTo/indexOf are NOT registered by
-                        // `try_resolve_intrinsic` (see its STRING_SEARCH region for the full
-                        // rationale): String's field layout is decided at runtime (compact
-                        // byte[]+coder vs legacy char[]), the `coder` field index is not even
-                        // constant across layouts, and the JIT has no inline instance-field or
-                        // array-element access — every getfield/baload is a helper CALL.
-                        // Inlining could not be proven bit-identical to JDK semantics, so no
-                        // JitIntrinsic variant exists for this family and `callee_entry` can
-                        // never equal one here. `intrinsic_handled` is left false; control
-                        // falls through to the unchanged plain direct-call dispatch path.
+                        // `compareTo` / `indexOf(I)` / `indexOf(String)` are
+                        // NOT registered by `try_resolve_string_intrinsic`, so
+                        // `callee_entry` never matches them here — they fall
+                        // through to native dispatch.
+                        //
+                        // equals strategy. The receiver is a `java/lang/String`
+                        // (monomorphic — String is final). The emitted code:
+                        //   * other == null            → result 0 (false)
+                        //   * this.ptr == other.ptr    → result 1 (true)
+                        //   * other's ObjectHeader class id != this's
+                        //                              → deopt (non-String
+                        //                                argument: native
+                        //                                equals returns false)
+                        //   * this.value/other.value null   → deopt
+                        //   * this.coder != other.coder     → deopt (rare;
+                        //                                native compares the
+                        //                                decoded char slices)
+                        //   * value-array lengths differ    → result 0
+                        //   * else REP CMPSB over the bytes → 1 iff identical
+                        // Same coder + identical backing bytes ⇒ identical
+                        // decoded strings, so the raw byte compare is exact.
+                        // No `CALL` on the inline path; every deopt edge re-runs
+                        // the method in the interpreter (native `equals`).
+                        if self.string_layout.is_some()
+                            && callee_entry
+                                == super::JitIntrinsic::StringEquals.as_entry()
+                        {
+                            let layout = self.string_layout.unwrap();
+                            self.flush_scratch_registers();
+                            let mut bail: Vec<usize> = Vec::new();
+
+                            // Operand stack (deepest first): this, other.
+                            let other_slot = self.pop_stack();
+                            let this_slot = self.pop_stack();
+
+                            // RAX = this, RDX = other.
+                            self.load_slot_to_reg(RAX, this_slot);
+                            self.load_slot_to_reg(RDX, other_slot);
+
+                            // other == null → result 0.
+                            self.emit_test_r64_r64(RDX);
+                            let other_null = self.emit_jcc_rel32_patch(0x84); // JZ
+
+                            // this.ptr == other.ptr → result 1.
+                            // CMP RAX,RDX
+                            self.buf.emit(&[0x48, 0x39, 0xD0]);
+                            let same_ref = self.emit_jcc_rel32_patch(0x84); // JZ
+
+                            // Class-id check: ObjectHeader.class_id is the i32
+                            // at offset 0. `this` is a String, so [RAX] is
+                            // String's class id; a differing [RDX] means a
+                            // non-String argument → deopt.
+                            // MOV ECX,[RAX] ; CMP ECX,[RDX]
+                            self.buf.emit(&[0x8B, 0x08]);
+                            self.buf.emit(&[0x3B, 0x0A]);
+                            bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                            // R8 = this.value, R9 = other.value (byte[] refs).
+                            self.emit_mov_r64_mem_disp32(
+                                R8,
+                                RAX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            self.emit_mov_r64_mem_disp32(
+                                R9,
+                                RDX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            // Null value array on either side → deopt.
+                            self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+                            self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+
+                            // coder mismatch → deopt.
+                            // MOV ECX,[RAX+coder] ; CMP ECX,[RDX+coder]
+                            self.emit_mov_r32_mem_disp32(
+                                RCX,
+                                RAX,
+                                layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                            );
+                            // CMP ECX,[RDX+disp32]: 3B /r, ModRM
+                            // mod=10(disp32) reg=ECX(001) r/m=RDX(010) = 0x8A.
+                            self.buf.emit(&[0x3B, 0x8A]);
+                            self.buf.emit(
+                                &(layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32)
+                                    .to_le_bytes(),
+                            );
+                            bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                            // value-array length mismatch → result 0.
+                            // MOV ECX,[R8+12] ; CMP ECX,[R9+12]
+                            self.buf.emit(&[
+                                0x41, 0x8B, 0x48, ARRAY_LENGTH_OFFSET as u8,
+                            ]);
+                            self.buf.emit(&[
+                                0x41, 0x3B, 0x49, ARRAY_LENGTH_OFFSET as u8,
+                            ]);
+                            let len_diff = self.emit_jcc_rel32_patch(0x85); // JNE
+
+                            // Byte compare of ECX bytes from
+                            // [R8+HEADER] vs [R9+HEADER] via REP CMPSB.
+                            // RSI/RDI are callee-saved + may hold locals —
+                            // bracket with PUSH/POP (no CALL in between).
+                            // PUSH RSI ; PUSH RDI
+                            self.buf.emit(&[0x56, 0x57]);
+                            // RSI = R8 + HEADER ; RDI = R9 + HEADER
+                            // LEA RSI,[R8+40]
+                            self.buf.emit(&[
+                                0x49, 0x8D, 0x70, HEADER_SIZE as u8,
+                            ]);
+                            // LEA RDI,[R9+40]
+                            self.buf.emit(&[
+                                0x49, 0x8D, 0x79, HEADER_SIZE as u8,
+                            ]);
+                            // RCX = length (ECX already holds it,
+                            // zero-extended into RCX).
+                            // REPE CMPSB  (F3 A6)
+                            self.buf.emit(&[0xF3, 0xA6]);
+                            // POP RDI ; POP RSI
+                            self.buf.emit(&[0x5F, 0x5E]);
+                            // SETE AL ; MOVZX EAX,AL → 1 iff all bytes equal
+                            // (REPE stops on the first mismatch with ZF clear).
+                            self.buf.emit(&[0x0F, 0x94, 0xC0]);
+                            self.buf.emit(&[0x0F, 0xB6, 0xC0]);
+                            let eq_done = self.emit_jmp_rel32_patch();
+
+                            // result 0 path (other null / length mismatch).
+                            self.patch_rel32_to_here(other_null);
+                            self.patch_rel32_to_here(len_diff);
+                            self.emit_xor_reg_self(RAX);
+                            let false_done = self.emit_jmp_rel32_patch();
+
+                            // result 1 path (same reference).
+                            self.patch_rel32_to_here(same_ref);
+                            // MOV EAX,1
+                            self.buf.emit(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+
+                            // join.
+                            self.patch_rel32_to_here(eq_done);
+                            self.patch_rel32_to_here(false_done);
+                            self.push_from_rax();
+
+                            for p in bail {
+                                self.deopt_stubs.push((p, pc, 6));
+                            }
+                            intrinsic_handled = true;
+                        }
                         // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
                         // ===== INTRINSIC REGION BEGIN: CRC32 =====
@@ -14871,7 +15314,11 @@ pub fn compile(
 
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
-    let hoist_info = find_loop_hoists(code, code_len, &loops);
+    let hoist_info = if std::env::var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
+        Vec::new()
+    } else {
+        find_loop_hoists(code, code_len, &loops)
+    };
 
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
@@ -14993,7 +15440,9 @@ pub fn compile(
     //   Body ≤20 bytecodes  → 4x unroll (3 extra copies)
     //   Body 20-50 bytecodes → 2x unroll (1 extra copy)
     //   Body > 50            → no unroll (unless PGO says otherwise, up to 100 bytes)
-    let unroll_loops: Vec<(usize, usize, usize)> = loops
+    let unroll_loops: Vec<(usize, usize, usize)> = if std::env::var_os("CRATONVM_DISABLE_UNROLL").is_some() {
+        Vec::new()
+    } else { loops
         .iter()
         .filter_map(|&(header, back_edge)| {
             // Only unroll loops with goto back-edge (not conditional)
@@ -15024,7 +15473,7 @@ pub fn compile(
             };
             Some((header, back_edge, extra_copies))
         })
-        .collect();
+        .collect() };
 
     // FP LICM: detect loop-invariant FP loads to hoist
     let fp_hoist_info = find_fp_loop_hoists(code, code_len, &loops);
@@ -15195,11 +15644,51 @@ pub fn compile(
     };
     cm.has_dispatch = has_dispatch;
 
-    // Store OSR metadata for On-Stack Replacement entry
-    cm.osr_pc_to_native = Some(compiler.pc_to_native);
+    // Store OSR metadata for On-Stack Replacement entry.
+    //
+    // OSR uses `osr_entry_native` rather than the branch-patch `pc_to_native`:
+    // for loop headers carrying LICM-hoisted preheader code the two differ —
+    // `pc_to_native[header]` points *after* the preheader (so in-loop
+    // back-edges skip it) while `osr_entry_native[header]` points *before* it
+    // (so a cold OSR entry runs the hoist initialisation). For every other PC
+    // the two are identical.
+    cm.osr_pc_to_native = Some(compiler.osr_entry_native);
     cm.osr_num_locals = compiler.num_locals;
     cm.osr_num_reg_locals = compiler.num_reg_locals;
-    cm.osr_local_assignments = Some(compiler.local_assignments);
+
+    // --- OSR soundness: drop register assignments for long/double high-half
+    // slots ---------------------------------------------------------------
+    // A `long`/`double` JVM local at index N reserves index N+1 as its dead
+    // "high half". The JIT models 64-bit values as a single register, so it
+    // never reads index N+1 — but the graph-colouring allocator still hands
+    // that dead slot a physical register, and freely reuses one register for
+    // *several* dead high-halves AND a live local (they never interfere, so
+    // colouring is legal for the running code).
+    //
+    // The OSR trampoline, however, copies every `jit_locals[i]` into
+    // `local_assignments[i]`'s register in ascending index order. When a dead
+    // high-half index shares a register with a live local at a *lower* index,
+    // the trampoline's write of the high-half's garbage value (the interpreter
+    // supplies 0 for the unused slot) clobbers the live local that was already
+    // loaded. For a `long` loop counter this reset the counter to 0 mid-loop,
+    // producing a wrong result; for a pointer-typed local it corrupts a heap
+    // reference and segfaults.
+    //
+    // Fix: null out the OSR register assignment for every high-half slot.
+    // The high-half carries no live value, so the trampoline simply spills its
+    // garbage to a frame slot nobody reads — and the live local keeps its
+    // register. This only touches the OSR metadata copy; the running code's
+    // `reg_for_local` (which never asks for a high-half) is unaffected.
+    let mut osr_local_assignments = compiler.local_assignments.clone();
+    {
+        let high_halves = wide_local_high_halves(code, code_len);
+        for &hh in &high_halves {
+            if hh < osr_local_assignments.len() {
+                osr_local_assignments[hh] = None;
+            }
+        }
+    }
+    cm.osr_local_assignments = Some(osr_local_assignments);
     cm.osr_xmm_assignments = Some(compiler.xmm_assignments);
     cm.osr_frame_size = compiler.frame_size;
     cm.osr_callee_saved_base = compiler.callee_saved_base;
@@ -20377,6 +20866,56 @@ mod tests {
         let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 4) };
         assert!(osr_result.is_some(), "OSR entry should succeed at PC=4");
         assert_eq!(osr_result.unwrap(), 45); // s=10 + 5+6+7+8+9 = 45
+    }
+
+    #[test]
+    fn test_osr_long_loop() {
+        // long addOnly(long n) { long s=0; for(long i=0;i<n;i++) s+=i; return s; }
+        // Locals: 0-1=n(long), 2-3=s(long), 4-5=i(long)
+        let code: Vec<u8> = vec![
+            0x09, // 0: lconst_0
+            0x41, // 1: lstore_2 (s=0)
+            0x09, // 2: lconst_0
+            0x37, 0x04, // 3: lstore 4 (i=0)
+            0x16, 0x04, // 5: lload 4 (i) — loop header
+            0x1e, // 7: lload_0 (n)
+            0x94, // 8: lcmp
+            0x9c, 0x00, 0x11, // 9: ifge +17 → 26
+            0x20, // 12: lload_2 (s)
+            0x16, 0x04, // 13: lload 4 (i)
+            0x61, // 15: ladd
+            0x41, // 16: lstore_2 (s)
+            0x16, 0x04, // 17: lload 4 (i)
+            0x0a, // 19: lconst_1
+            0x61, // 20: ladd
+            0x37, 0x04, // 21: lstore 4 (i)
+            0xa7, 0xff, 0xee, // 23: goto -18 → 5
+            0x20, // 26: lload_2
+            0xad, // 27: lreturn
+            0, 0,
+        ];
+        let code_len = 28;
+        let compiled = compile(
+            &code, code_len, 2, 6, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(),
+            &test_helpers(), std::collections::HashSet::new(), HashMap::new(),
+            None, // string_layout: Option<StringFieldLayout>
+        )
+        .unwrap();
+
+        // Normal entry: addOnly(2000) = sum(0..1999) = 1999000
+        let result = unsafe { compiled.call(&[2000]) };
+        assert_eq!(result, 1999000, "normal entry");
+
+        // OSR entry at PC=5 with i=1000, s=499500 (sum 0..999), n=2000.
+        // Remaining sum 1000..1999 = 1499500; total = 1999000.
+        // jit_locals layout: index 0=n, 1=(n high), 2=s, 3=(s high), 4=i, 5=(i high)
+        let jit_locals: [i64; 6] = [2000, 0, 499500, 0, 1000, 0];
+        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 5) };
+        assert!(osr_result.is_some(), "OSR entry should succeed at PC=5");
+        assert_eq!(osr_result.unwrap(), 1999000, "OSR long loop result");
     }
 
     #[test]

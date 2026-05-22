@@ -11974,6 +11974,13 @@ fn try_osr(
     for i in 0..num_locals {
         jit_locals.push(frame.get_local_raw(i) as i64); // Cast: JIT ABI -- i64 register convention
     }
+    if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
+        eprintln!(
+            "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?}",
+            &*class_name_arc, &*method_name_arc, &*descriptor_arc,
+            entry_pc, num_locals, jit_locals
+        );
+    }
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
