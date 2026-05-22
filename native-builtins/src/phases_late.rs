@@ -5219,6 +5219,69 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(fc_cls, "isOpen", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // write(ByteBuffer)I — `FileChannel.write` is abstract; cassandra's
+    // BufferedDataOutputStreamPlus.doFlush drives a synthetic FileChannel
+    // (from `newFileChannel`) through it. ByteBuffer layout:
+    // field 0 = backing array, 1 = position, 2 = limit.
+    r.register(fc_cls, "write", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v >= 0 => v as u32,
+            _ => return Err(RuntimeError::IOException { message: "Channel closed".into() }.into()),
+        };
+        let bb = match args.get(1) {
+            Some(Value::Object(Some(b))) => *b,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
+        let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
+        let remaining = bb_lim.saturating_sub(bb_pos);
+        if remaining == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let mut data = vec![0u8; remaining];
+        if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+            for (i, d) in data.iter_mut().enumerate() {
+                *d = ctx.get_array_element(arr, bb_pos + i).as_int().unwrap_or(0) as u8;
+            }
+        }
+        let n = ctx.fd_table().rw_write(fd_id, &data)
+            .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
+        ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
+        Ok(Some(Value::Int(n as i32)))
+    });
+    // read(ByteBuffer)I — counterpart of write above.
+    r.register(fc_cls, "read", "(Ljava/nio/ByteBuffer;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = match ctx.get_field(this, 0) {
+            Value::Int(v) if v >= 0 => v as u32,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let bb = match args.get(1) {
+            Some(Value::Object(Some(b))) => *b,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let bb_pos = ctx.get_field(bb, 1).as_int().unwrap_or(0) as usize;
+        let bb_lim = ctx.get_field(bb, 2).as_int().unwrap_or(0) as usize;
+        let remaining = bb_lim.saturating_sub(bb_pos);
+        if remaining == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let mut buf = vec![0u8; remaining];
+        match ctx.fd_table().rw_read(fd_id, &mut buf) {
+            Ok(0) => Ok(Some(Value::Int(-1))),
+            Ok(n) => {
+                if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
+                    for (i, b) in buf.iter().take(n).enumerate() {
+                        ctx.set_array_element(arr, bb_pos + i, Value::Int(*b as i8 as i32));
+                    }
+                }
+                ctx.set_field(bb, 1, Value::Int((bb_pos + n) as i32));
+                Ok(Some(Value::Int(n as i32)))
+            }
+            Err(e) => Err(RuntimeError::IOException { message: e.to_string() }.into()),
+        }
+    });
 
     // --- Files additional methods ---
     r.register(

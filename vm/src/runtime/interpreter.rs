@@ -1361,6 +1361,25 @@ pub fn execute(
         let source_file = class.source_file.clone();
         drop(cm);
         if !has_code {
+            // A native registered directly on the resolved class IS the
+            // intended implementation of an otherwise-abstract method — e.g.
+            // the synthetic `java/nio/channels/FileChannel`, whose
+            // `read`/`write`/`size`/`position`/... natives back a real fd.
+            // The receiver-walk rescue below only dispatches when the
+            // target class differs from `class_id` (to avoid re-resolving
+            // back through the same abstract declaration), so it misses the
+            // case where the receiver's runtime class IS that abstract
+            // class. A native is a concrete Rust fn — there is no
+            // re-resolution loop — so dispatch straight to it.
+            if method_name != "<init>" && method_name != "<clinit>" {
+                if let Some(cb) = shared.native_methods.find(
+                    &class_name_owned,
+                    method_name,
+                    method_descriptor,
+                ) {
+                    return crate::vm::safe_native_call(shared, thread, cb, args);
+                }
+            }
             // S111r10 — interface-dispatch receiver-walk fallback. The
             // canonical Spring Boot fat-jar tripwire is
             // `HashSet.iterator()` line 183 = `map.keySet().iterator()`:
