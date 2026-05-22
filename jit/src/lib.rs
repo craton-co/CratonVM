@@ -1431,12 +1431,21 @@ pub enum JitIntrinsic {
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
     // java.lang.String search/compare intrinsics (Phase 3b). `equals` is
     // inlined as a coder+length-guarded raw byte compare (deopts to native
-    // on a coder mismatch or a non-String argument). `compareTo` and the
-    // two `indexOf` overloads are NOT registered — they require ordered
-    // decoded-char comparison / substring search loops whose UTF-16 +
-    // legacy-char[] edge cases are not worth the codegen risk, so they
-    // bail to native dispatch. Variant ordering here is local.
-    StringEquals, // equals(Ljava/lang/Object;)Z
+    // on a coder mismatch or a non-String argument).
+    //
+    // Phase 3b follow-up: `compareTo` and both `indexOf` overloads are now
+    // ALSO inlined. Unlike `equals` (which can byte-compare only when the
+    // coders match), these three decode each receiver/argument character
+    // through a per-string `coder` branch (0 LATIN1 = 1 byte/char, 1 UTF16
+    // = 2 LE bytes/char), so EVERY coder combination — including mixed —
+    // is handled inline with no coder-mismatch deopt. The deopt stub is
+    // still used for the genuinely uncertain cases (null receiver, null
+    // String argument, null backing `value` array). Variant ordering here
+    // is local and not externally observed.
+    StringEquals,    // equals(Ljava/lang/Object;)Z
+    StringCompareTo, // compareTo(Ljava/lang/String;)I
+    StringIndexOfChar, // indexOf(I)I
+    StringIndexOfStr,  // indexOf(Ljava/lang/String;)I
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
@@ -1929,12 +1938,33 @@ pub fn try_resolve_string_intrinsic(
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-    // Only `equals` is inlined. `compareTo` / `indexOf(I)` / `indexOf(String)`
-    // are intentionally NOT registered: they need ordered decoded-char
-    // comparison or substring-search loops whose UTF-16 / legacy edge cases
-    // are not worth the codegen risk — they fall back to native dispatch.
-    if name == "equals" && descriptor == "(Ljava/lang/Object;)Z" {
-        return Some((JitIntrinsic::StringEquals.as_entry(), 1, b'Z'));
+    // `equals`, `compareTo` and both `indexOf` overloads are inlined. The
+    // codegen ladder decodes every character through the receiver's /
+    // argument's own `coder` byte, so all LATIN1/UTF16 combinations are
+    // handled inline; only null receiver / null argument / null backing
+    // array route to the deopt stub.
+    //
+    //   * compareTo(String)   — lexicographic decoded-char compare; the
+    //     unsigned-char difference at the first mismatch, else len1-len2.
+    //   * indexOf(I)          — scan for `(ch & 0xFFFF)` from index 0,
+    //     bit-identical to native `String.indexOf(int)` (which likewise
+    //     masks to a single code unit — supplementary code points match
+    //     their masked low half, no surrogate special-casing).
+    //   * indexOf(String)     — naive O(n*m) substring search from 0; an
+    //     empty needle returns 0.
+    let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+        ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
+        ("compareTo", "(Ljava/lang/String;)I") => {
+            Some((JitIntrinsic::StringCompareTo, 1, b'I'))
+        }
+        ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
+        ("indexOf", "(Ljava/lang/String;)I") => {
+            Some((JitIntrinsic::StringIndexOfStr, 1, b'I'))
+        }
+        _ => None,
+    };
+    if let Some((intrinsic, num_params, ret)) = search_hit {
+        return Some((intrinsic.as_entry(), num_params, ret));
     }
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 

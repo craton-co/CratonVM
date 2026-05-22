@@ -17,11 +17,18 @@
 //! Same coder + identical backing bytes ⇒ identical decoded strings, so the
 //! raw byte compare is exact.
 //!
-//! BAILED (NOT registered — fall back to native dispatch):
-//! `compareTo(Ljava/lang/String;)I`, `indexOf(I)I`,
-//! `indexOf(Ljava/lang/String;)I`. They need ordered decoded-char comparison
-//! or substring-search loops whose UTF-16 / legacy-char[] edge cases are not
-//! worth the codegen risk (roadmap §3.4: correctness over coverage).
+//! ALSO INLINED (Phase 3b follow-up): `compareTo(Ljava/lang/String;)I`,
+//! `indexOf(I)I`, `indexOf(Ljava/lang/String;)I`. Each character is decoded
+//! through its OWN `coder` byte, so every LATIN1/UTF16 combination —
+//! including mixed-coder receiver/argument pairs — is handled inline with no
+//! coder-mismatch deopt. The deopt stub is reached only for a null receiver,
+//! a null String argument, or a null backing `value` array. The codegen is
+//! bit-identical to `native-builtins/src/lang_string.rs`:
+//!   * compareTo — unsigned-char difference at the first mismatch, else
+//!     len1 - len2;
+//!   * indexOf(I) — scan for `(ch & 0xFFFF)` from index 0 (matches native,
+//!     which masks the argument to one code unit — no surrogate handling);
+//!   * indexOf(String) — naive O(n*m) search from 0; empty needle → 0.
 
 use cratonvm_jit::x64::compile;
 use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
@@ -264,19 +271,291 @@ fn string_equals_registered_only_with_a_layout() {
 }
 
 #[test]
-fn string_search_compare_and_index_of_are_bailed() {
-    // compareTo / indexOf are intentionally NOT inlined — they must bail to
-    // native dispatch even when a layout is available.
-    let l = Some(string_layout());
+fn string_search_compare_and_index_of_register_with_a_layout() {
+    // compareTo / indexOf(I) / indexOf(String) are inlined — they register
+    // when a StringFieldLayout is present and bail (return None) without one.
     for &(name, desc) in &[
         ("compareTo", "(Ljava/lang/String;)I"),
         ("indexOf", "(I)I"),
         ("indexOf", "(Ljava/lang/String;)I"),
     ] {
         assert!(
-            try_resolve_string_intrinsic("java/lang/String", name, desc, l).is_none(),
-            "{name}{desc} must remain bailed to native dispatch",
+            try_resolve_string_intrinsic(
+                "java/lang/String",
+                name,
+                desc,
+                Some(string_layout()),
+            )
+            .is_some(),
+            "{name}{desc} must register with a StringFieldLayout",
         );
+        assert!(
+            try_resolve_string_intrinsic("java/lang/String", name, desc, None).is_none(),
+            "{name}{desc} must NOT register without a layout",
+        );
+        // The 3-arg layout-free matcher never registers a String method.
+        assert!(
+            cratonvm_jit::try_resolve_intrinsic("java/lang/String", name, desc).is_none(),
+        );
+    }
+}
+
+/// JIT-compile `int f(String this, String other)` whose body is
+/// `aload_0; aload_1; invokevirtual <name>; ireturn` — used for the
+/// `compareTo` / `indexOf(String)` object-argument intrinsics.
+fn compile_obj_arg(name: &str, descriptor: &str) -> impl Fn(i64, i64) -> i64 {
+    let entry = try_resolve_string_intrinsic(
+        "java/lang/String",
+        name,
+        descriptor,
+        Some(string_layout()),
+    )
+    .expect("intrinsic must register with a layout")
+    .0;
+    // aload_0 (2a), aload_1 (2b), invokevirtual (b6 00 01), ireturn (ac).
+    let code: Vec<u8> = vec![0x2a, 0x2b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        2,
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            2,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 1,
+                return_type: b'I',
+                guard_class_id: 0,
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(string_layout()),
+    )
+    .expect("object-arg wrapper compilation failed");
+    move |this: i64, other: i64| unsafe { compiled.call(&[this, other]) }
+}
+
+/// JIT-compile `int f(String this, int ch)` whose body is
+/// `aload_0; iload_1; invokevirtual indexOf; ireturn` — for `indexOf(I)`.
+fn compile_index_of_char() -> impl Fn(i64, i64) -> i64 {
+    let entry = try_resolve_string_intrinsic(
+        "java/lang/String",
+        "indexOf",
+        "(I)I",
+        Some(string_layout()),
+    )
+    .expect("indexOf(I) must register with a layout")
+    .0;
+    // aload_0 (2a), iload_1 (1b), invokevirtual (b6 00 01), ireturn (ac).
+    let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        2,
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            2,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 1,
+                return_type: b'I',
+                guard_class_id: 0,
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(string_layout()),
+    )
+    .expect("indexOf(I) wrapper compilation failed");
+    move |this: i64, ch: i64| unsafe { compiled.call(&[this, ch]) }
+}
+
+/// Reference `compareTo` — the `native_string_compare_to` oracle.
+fn oracle_compare_to(a: &str, b: &str) -> i32 {
+    let ua: Vec<u16> = a.encode_utf16().collect();
+    let ub: Vec<u16> = b.encode_utf16().collect();
+    let min = ua.len().min(ub.len());
+    for i in 0..min {
+        let d = ua[i] as i32 - ub[i] as i32;
+        if d != 0 {
+            return d;
+        }
+    }
+    ua.len() as i32 - ub.len() as i32
+}
+
+/// Reference `indexOf(String)` — the `native_string_index_of_str` oracle.
+fn oracle_index_of_str(h: &str, n: &str) -> i32 {
+    let uh: Vec<u16> = h.encode_utf16().collect();
+    let un: Vec<u16> = n.encode_utf16().collect();
+    if un.is_empty() {
+        return 0;
+    }
+    if un.len() > uh.len() {
+        return -1;
+    }
+    for i in 0..=(uh.len() - un.len()) {
+        if uh[i..i + un.len()] == un[..] {
+            return i as i32;
+        }
+    }
+    -1
+}
+
+// --- compareTo ------------------------------------------------------------
+
+#[test]
+fn string_compare_to_differential() {
+    let f = compile_obj_arg("compareTo", "(Ljava/lang/String;)I");
+    // (a, b) pairs spanning equal / less / greater, prefix/suffix, empty,
+    // and both coders (LATIN1 ASCII pairs, UTF-16 CJK pairs, mixed-coder).
+    let cases = [
+        ("", ""),
+        ("a", ""),
+        ("", "a"),
+        ("abc", "abc"),
+        ("abc", "abd"),
+        ("abd", "abc"),
+        ("abc", "ab"),
+        ("ab", "abc"),
+        ("hello", "world"),
+        ("caf\u{e9}", "caf\u{e9}"),       // both UTF-16-free LATIN1
+        ("A\u{4e2d}Z", "A\u{4e2d}Z"),     // both UTF-16
+        ("A\u{4e2d}Z", "A\u{4e2e}Z"),     // UTF-16, differ at index 1
+        ("abc", "A\u{4e2d}c"),            // mixed: LATIN1 vs UTF-16
+        ("A\u{4e2d}c", "abc"),            // mixed, reversed
+        ("\u{ff}", "\u{100}"),            // LATIN1 0xFF vs UTF-16 0x100
+    ];
+    for (a, b) in cases {
+        let (sa, _aa) = string_of(a);
+        let (sb, _bb) = string_of(b);
+        let got = f(sa.ptr(), sb.ptr()) as i32;
+        let want = oracle_compare_to(a, b);
+        // Native compares raw magnitudes; the JIT must reproduce the exact
+        // sign AND value (callers rely on the difference, not just sign).
+        assert_eq!(got, want, "compareTo({a:?}, {b:?})");
+    }
+}
+
+#[test]
+fn string_compare_to_null_argument_deopts() {
+    let _guard = DEOPT_LOCK.lock().unwrap();
+    let f = compile_obj_arg("compareTo", "(Ljava/lang/String;)I");
+    let (a, _aa) = string_of("hello");
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    // null argument → deopt (the native re-run throws NullPointerException).
+    assert_eq!(f(a.ptr(), 0), i64::MIN, "null argument must deopt");
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "null argument must fire exactly one uncommon trap",
+    );
+}
+
+// --- indexOf(I) -----------------------------------------------------------
+
+#[test]
+fn string_index_of_char_differential() {
+    let f = compile_index_of_char();
+    let haystacks = ["", "a", "hello", "banana", "caf\u{e9}", "A\u{4e2d}Z\u{4e2d}"];
+    // Code-unit needles: present, absent, first/last char, supplementary
+    // (masked to its low half by both the native oracle and the JIT).
+    let needles: [i32; 8] = [
+        'a' as i32,
+        'z' as i32,
+        'o' as i32,
+        '\u{e9}' as i32,
+        '\u{4e2d}' as i32,
+        0,
+        0x1_0000 + ('a' as i32), // supplementary; & 0xFFFF == 'a'
+        '\u{ff}' as i32,
+    ];
+    for h in haystacks {
+        for &ch in &needles {
+            let (s, _ss) = string_of(h);
+            let got = f(s.ptr(), ch as i64) as i32;
+            let needle = (ch & 0xFFFF) as u16;
+            let want = h
+                .encode_utf16()
+                .position(|c| c == needle)
+                .map(|i| i as i32)
+                .unwrap_or(-1);
+            assert_eq!(got, want, "indexOf({h:?}, {ch:#x})");
+        }
+    }
+}
+
+#[test]
+fn string_index_of_char_null_receiver_deopts() {
+    let _guard = DEOPT_LOCK.lock().unwrap();
+    let f = compile_index_of_char();
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    assert_eq!(f(0, 'a' as i64), i64::MIN, "null receiver must deopt");
+    assert_eq!(TRAP_COUNT.load(Ordering::SeqCst), before + 1);
+}
+
+// --- indexOf(String) ------------------------------------------------------
+
+#[test]
+fn string_index_of_str_differential() {
+    let f = compile_obj_arg("indexOf", "(Ljava/lang/String;)I");
+    let cases = [
+        ("", ""),                       // empty needle → 0
+        ("hello", ""),                  // empty needle → 0
+        ("", "x"),                      // needle longer than haystack → -1
+        ("hello", "hello"),             // whole-string match
+        ("hello", "he"),                // prefix
+        ("hello", "lo"),                // suffix
+        ("hello", "ell"),               // interior
+        ("hello", "xyz"),               // no match
+        ("hello", "hellox"),            // needle longer → -1
+        ("banana", "ana"),              // multi-occurrence → first index
+        ("aaaa", "aa"),                 // overlapping occurrences → 0
+        ("abcabc", "bc"),               // repeated
+        ("A\u{4e2d}B\u{4e2d}C", "\u{4e2d}B"), // UTF-16 haystack + needle
+        ("caf\u{e9} bar", "\u{e9} b"),  // LATIN1 both
+        ("abcdef", "A\u{4e2d}"),        // mixed coder, no match
+        ("A\u{4e2d}cdef", "cd"),        // UTF-16 haystack, LATIN1 needle
+    ];
+    for (h, n) in cases {
+        let (sh, _hh) = string_of(h);
+        let (sn, _nn) = string_of(n);
+        let got = f(sh.ptr(), sn.ptr()) as i32;
+        let want = oracle_index_of_str(h, n);
+        assert_eq!(got, want, "indexOf({h:?}, {n:?})");
     }
 }
 

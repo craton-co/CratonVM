@@ -6852,6 +6852,108 @@ impl Compiler {
         self.buf.emit_byte(0xC0 | ((reg & 7) << 3) | (reg & 7));
     }
 
+    /// Emit an inline "decode the String character at `idx`" sequence for
+    /// the STRING_SEARCH `compareTo` / `indexOf` intrinsics.
+    ///
+    /// Reads the code unit at element index `idx_reg` of the backing
+    /// `byte[]` whose payload starts at `val_reg + HEADER_SIZE`, branching
+    /// on `coder_reg` (0 = LATIN1, one byte/char zero-extended; non-zero =
+    /// UTF16, two little-endian bytes/char). The zero-extended `u16` result
+    /// lands in the low 16 bits of `dst` (upper bits cleared). The four
+    /// register operands are distinct 0..=15 GPR numbers; `idx_reg` is the
+    /// SIB index and so must not be RSP (4) — and an index field of 100
+    /// means "no index", so it must not be R12 (12) either. `val_reg` is
+    /// the SIB base and may be any register (R12/RSP as a base is legal
+    /// with the disp8 ModRM used here). No CALL; no memory beyond the array
+    /// payload is touched.
+    fn emit_string_decode_char(
+        &mut self,
+        dst: u8,
+        val_reg: u8,
+        idx_reg: u8,
+        coder_reg: u8,
+    ) {
+        // TEST coder_reg, coder_reg ; JNZ utf16
+        let mut rex = 0x48u8;
+        if coder_reg >= 8 {
+            rex |= 0x05;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x85);
+        self.buf
+            .emit_byte(0xC0 | ((coder_reg & 7) << 3) | (coder_reg & 7));
+        let utf16 = self.emit_jcc_rel32_patch(0x85); // JNZ
+
+        // LATIN1: MOVZX dst32, BYTE [val_reg + idx_reg*1 + HEADER_SIZE].
+        // 0F B6 /r with a SIB byte (scale=00 → *1).
+        let mut rex = 0x40u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if idx_reg >= 8 {
+            rex |= 0x02;
+        }
+        if val_reg >= 8 {
+            rex |= 0x01;
+        }
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit(&[0x0F, 0xB6]);
+        // ModRM: mod=01 (disp8), reg=dst, r/m=100 (SIB follows).
+        self.buf.emit_byte(0x40 | ((dst & 7) << 3) | 0x04);
+        // SIB: scale=00, index=idx_reg, base=val_reg.
+        self.buf
+            .emit_byte(((idx_reg & 7) << 3) | (val_reg & 7));
+        self.buf.emit_byte(HEADER_SIZE as u8);
+        let done = self.emit_jmp_rel32_patch();
+
+        // UTF16: MOVZX dst32, WORD [val_reg + idx_reg*2 + HEADER_SIZE].
+        self.patch_rel32_to_here(utf16);
+        let mut rex = 0x40u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if idx_reg >= 8 {
+            rex |= 0x02;
+        }
+        if val_reg >= 8 {
+            rex |= 0x01;
+        }
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit(&[0x0F, 0xB7]);
+        self.buf.emit_byte(0x40 | ((dst & 7) << 3) | 0x04);
+        // SIB: scale=01 (*2), index=idx_reg, base=val_reg.
+        self.buf
+            .emit_byte(0x40 | ((idx_reg & 7) << 3) | (val_reg & 7));
+        self.buf.emit_byte(HEADER_SIZE as u8);
+        self.patch_rel32_to_here(done);
+    }
+
+    /// Emit a 32-bit register-to-register ALU op `dst op= src` for the
+    /// STRING_SEARCH intrinsics. `opcode` is the primary opcode of the
+    /// `r/m32, r32` form (0x01 ADD, 0x29 SUB, 0x39 CMP, 0x89 MOV, 0x31
+    /// XOR). ModRM uses mod=11, reg=src, r/m=dst (so the source is the
+    /// ModRM.reg field). REX is emitted only when an extended register is
+    /// involved (32-bit op, no REX.W).
+    fn emit_alu_r32_r32(&mut self, opcode: u8, dst: u8, src: u8) {
+        if dst >= 8 || src >= 8 {
+            let mut rex = 0x40u8;
+            if src >= 8 {
+                rex |= 0x04; // REX.R for the ModRM.reg (src)
+            }
+            if dst >= 8 {
+                rex |= 0x01; // REX.B for the ModRM.r/m (dst)
+            }
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit_byte(opcode);
+        self.buf
+            .emit_byte(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
     /// Emit `Jcc rel32` and return the byte offset of the 4-byte
     /// displacement so the caller can patch it once the branch target
     /// is known. `cc` is the condition-code suffix byte (e.g. 0x84 = JE,
@@ -13897,15 +13999,11 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
                         // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-                        // java.lang.String search intrinsic (Phase 3b):
-                        // equals(Ljava/lang/Object;)Z.
+                        // java.lang.String search intrinsics (Phase 3b):
+                        // equals(Ljava/lang/Object;)Z, compareTo(String)I,
+                        // indexOf(I)I and indexOf(String)I.
                         //
-                        // `compareTo` / `indexOf(I)` / `indexOf(String)` are
-                        // NOT registered by `try_resolve_string_intrinsic`, so
-                        // `callee_entry` never matches them here — they fall
-                        // through to native dispatch.
-                        //
-                        // equals strategy. The receiver is a `java/lang/String`
+                        // `equals` strategy. The receiver is a `java/lang/String`
                         // (monomorphic — String is final). The emitted code:
                         //   * other == null            → result 0 (false)
                         //   * this.ptr == other.ptr    → result 1 (true)
@@ -14045,6 +14143,416 @@ impl Compiler {
                             // join.
                             self.patch_rel32_to_here(eq_done);
                             self.patch_rel32_to_here(false_done);
+                            self.push_from_rax();
+
+                            for p in bail {
+                                self.deopt_stubs.push((p, pc, 6));
+                            }
+                            intrinsic_handled = true;
+                        }
+
+                        // --- compareTo(Ljava/lang/String;)I ---------------
+                        // Lexicographic decoded-char compare. Each side is
+                        // decoded through ITS OWN `coder` byte, so every
+                        // LATIN1/UTF16 combination (including mixed) is
+                        // handled inline — no coder-mismatch deopt. The deopt
+                        // stub is reached only for a null receiver, a null
+                        // String argument (native throws NPE on the re-run),
+                        // or a null backing `value` array. After those checks
+                        // the result is fully determined: the unsigned-char
+                        // difference at the first mismatch, else len1-len2.
+                        // Identical to `native_string_compare_to`.
+                        if self.string_layout.is_some()
+                            && callee_entry
+                                == super::JitIntrinsic::StringCompareTo.as_entry()
+                        {
+                            let layout = self.string_layout.unwrap();
+                            self.flush_scratch_registers();
+                            let mut bail: Vec<usize> = Vec::new();
+
+                            // Operand stack (deepest first): this, other.
+                            let other_slot = self.pop_stack();
+                            let this_slot = self.pop_stack();
+
+                            // --- deopt checks + field reads happen BEFORE
+                            // any PUSH, into CALLER-saved registers only.
+                            // Two reasons: (1) the deopt stub's epilogue
+                            // assumes RSP is at the post-prologue value, so
+                            // the stack must stay balanced on every path that
+                            // can reach a bail; (2) a `this`/`other` operand
+                            // slot may itself be a callee-saved register that
+                            // the loop is about to overwrite — reading it
+                            // before the loop's registers are clobbered (and
+                            // before the PUSH, while it is still the live
+                            // local) is the only sound order.
+                            //
+                            // RAX = this; null receiver → deopt.
+                            self.load_slot_to_reg(RAX, this_slot);
+                            self.emit_test_r64_r64(RAX);
+                            bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                            // RDX = other; null argument → deopt.
+                            self.load_slot_to_reg(RDX, other_slot);
+                            self.emit_test_r64_r64(RDX);
+                            bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                            // R8 = this.value, R9 = other.value; null → deopt.
+                            self.emit_mov_r64_mem_disp32(
+                                R8,
+                                RAX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+                            self.emit_mov_r64_mem_disp32(
+                                R9,
+                                RDX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+                            // R10 = this.coder, R11 = other.coder.
+                            self.emit_movsxd_r64_mem_disp32(
+                                R10,
+                                RAX,
+                                layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                            );
+                            self.emit_movsxd_r64_mem_disp32(
+                                R11,
+                                RDX,
+                                layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                            );
+
+                            // --- past every deopt edge: save the callee-
+                            // saved registers the loop uses, then park the
+                            // pre-computed caller-saved values into them.
+                            // PUSH RBX,RSI,RDI,R12,R13,R14,R15.
+                            self.buf.emit(&[0x53, 0x56, 0x57]);
+                            self.buf.emit(&[0x41, 0x54, 0x41, 0x55]);
+                            self.buf.emit(&[0x41, 0x56, 0x41, 0x57]);
+                            // RSI=this.value, RDI=other.value, R12=coder1,
+                            // R13=coder2 (moves out of the caller-saved regs;
+                            // the original callee-saved values are safely on
+                            // the machine stack).
+                            self.emit_mov_r64_r64(RSI, R8);
+                            self.emit_mov_r64_r64(RDI, R9);
+                            self.emit_mov_r64_r64(R12, R10);
+                            self.emit_mov_r64_r64(R13, R11);
+                            // len1 = this.value.length >> coder1  → R14D.
+                            self.emit_mov_r32_mem_disp32(
+                                RAX,
+                                RSI,
+                                ARRAY_LENGTH_OFFSET as i32,
+                            );
+                            self.emit_alu_r32_r32(0x89, RCX, R12); // MOV ECX,R12D
+                            self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
+                            self.emit_alu_r32_r32(0x89, R14, RAX); // MOV R14D,EAX
+                            // len2 = other.value.length >> coder2 → R15D.
+                            self.emit_mov_r32_mem_disp32(
+                                RAX,
+                                RDI,
+                                ARRAY_LENGTH_OFFSET as i32,
+                            );
+                            self.emit_alu_r32_r32(0x89, RCX, R13); // MOV ECX,R13D
+                            self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
+                            self.emit_alu_r32_r32(0x89, R15, RAX); // MOV R15D,EAX
+                            // min_len = min(len1,len2) → EBX.
+                            self.emit_alu_r32_r32(0x89, RBX, R14); // MOV EBX,R14D
+                            self.emit_alu_r32_r32(0x39, RBX, R15); // CMP EBX,R15D
+                            // CMOVG EBX,R15D (EBX > R15D ⇒ keep R15D as min).
+                            self.buf.emit(&[0x41, 0x0F, 0x4F, 0xDF]);
+
+                            // i = 0 (R8D).
+                            self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D,R8D
+                            let loop_top = self.buf.pos();
+                            // CMP R8D,EBX ; JGE loop_done (i >= min_len).
+                            self.emit_alu_r32_r32(0x39, R8, RBX); // CMP R8D,EBX
+                            let loop_done = self.emit_jcc_rel32_patch(0x8D);
+                            // char_a = this[i]  → R9D ; char_b = other[i] → R10D.
+                            self.emit_string_decode_char(R9, RSI, R8, R12);
+                            self.emit_string_decode_char(R10, RDI, R8, R13);
+                            // diff = char_a - char_b ; JNZ mismatch.
+                            self.emit_alu_r32_r32(0x29, R9, R10); // SUB R9D,R10D
+                            let mismatch = self.emit_jcc_rel32_patch(0x85);
+                            // INC R8D ; JMP loop_top.
+                            self.buf.emit(&[0x41, 0xFF, 0xC0]);
+                            let back = self.emit_jmp_rel32_patch();
+                            let rel = loop_top as i32 - (back as i32 + 4);
+                            self.buf.patch_i32(back, rel);
+                            // loop_done: result = len1 - len2.
+                            self.patch_rel32_to_here(loop_done);
+                            self.emit_alu_r32_r32(0x89, RAX, R14); // MOV EAX,R14D
+                            self.emit_alu_r32_r32(0x29, RAX, R15); // SUB EAX,R15D
+                            let cmp_join = self.emit_jmp_rel32_patch();
+                            // mismatch: result = diff (R9D).
+                            self.patch_rel32_to_here(mismatch);
+                            self.emit_alu_r32_r32(0x89, RAX, R9); // MOV EAX,R9D
+                            self.patch_rel32_to_here(cmp_join);
+                            // Sign-extend the int result for the push ABI.
+                            self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX,EAX
+                            // POP R15,R14,R13,R12,RDI,RSI,RBX.
+                            self.buf.emit(&[0x41, 0x5F, 0x41, 0x5E]);
+                            self.buf.emit(&[0x41, 0x5D, 0x41, 0x5C]);
+                            self.buf.emit(&[0x5F, 0x5E, 0x5B]);
+                            self.push_from_rax();
+
+                            for p in bail {
+                                self.deopt_stubs.push((p, pc, 6));
+                            }
+                            intrinsic_handled = true;
+                        }
+
+                        // --- indexOf(I)I ----------------------------------
+                        // Scan the receiver for the first code unit equal to
+                        // `(ch & 0xFFFF)`, from index 0. Bit-identical to
+                        // `native_string_index_of`, which likewise masks the
+                        // argument to a single UTF-16 code unit — supplementary
+                        // code points therefore match their masked low half
+                        // (no surrogate special-casing, by design of the
+                        // oracle). The deopt stub is reached only for a null
+                        // receiver or a null backing `value` array. Uses only
+                        // caller-saved registers, so no PUSH/POP is needed.
+                        if self.string_layout.is_some()
+                            && callee_entry
+                                == super::JitIntrinsic::StringIndexOfChar
+                                    .as_entry()
+                        {
+                            let layout = self.string_layout.unwrap();
+                            self.flush_scratch_registers();
+                            let mut bail: Vec<usize> = Vec::new();
+
+                            // Operand stack (deepest first): this, ch.
+                            let ch_slot = self.pop_stack();
+                            let this_slot = self.pop_stack();
+
+                            // RAX = this; null receiver → deopt.
+                            self.load_slot_to_reg(RAX, this_slot);
+                            self.emit_test_r64_r64(RAX);
+                            bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                            // R8 = this.value; null → deopt.
+                            self.emit_mov_r64_mem_disp32(
+                                R8,
+                                RAX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+                            // R10 = this.coder.
+                            self.emit_movsxd_r64_mem_disp32(
+                                R10,
+                                RAX,
+                                layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                            );
+                            // R9D = needle = ch & 0xFFFF.
+                            self.load_slot_to_reg(R9, ch_slot);
+                            // AND R9D, 0xFFFF  (REX.B + 81 /4 id).
+                            self.buf.emit(&[0x41, 0x81, 0xE1]);
+                            self.buf.emit(&0xFFFFu32.to_le_bytes());
+                            // len = this.value.length >> coder → R11D.
+                            self.emit_mov_r32_mem_disp32(
+                                RAX,
+                                R8,
+                                ARRAY_LENGTH_OFFSET as i32,
+                            );
+                            self.emit_alu_r32_r32(0x89, RCX, R10); // MOV ECX,R10D
+                            self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
+                            self.emit_alu_r32_r32(0x89, R11, RAX); // MOV R11D,EAX
+                            // i = 0 (EDX).
+                            self.emit_xor_reg_self(RDX);
+                            let loop_top = self.buf.pos();
+                            // CMP EDX,R11D ; JGE not_found.
+                            self.emit_alu_r32_r32(0x39, RDX, R11);
+                            let not_found = self.emit_jcc_rel32_patch(0x8D);
+                            // c = this[i] → ECX ; CMP ECX,R9D ; JE found.
+                            self.emit_string_decode_char(RCX, R8, RDX, R10);
+                            self.emit_alu_r32_r32(0x39, RCX, R9); // CMP ECX,R9D
+                            let found = self.emit_jcc_rel32_patch(0x84);
+                            // INC EDX ; JMP loop_top.
+                            self.buf.emit(&[0xFF, 0xC2]);
+                            let back = self.emit_jmp_rel32_patch();
+                            let rel = loop_top as i32 - (back as i32 + 4);
+                            self.buf.patch_i32(back, rel);
+                            // found: result = i.
+                            self.patch_rel32_to_here(found);
+                            self.emit_alu_r32_r32(0x89, RAX, RDX); // MOV EAX,EDX
+                            let join = self.emit_jmp_rel32_patch();
+                            // not_found: result = -1.
+                            self.patch_rel32_to_here(not_found);
+                            self.buf.emit(&[0xB8]);
+                            self.buf.emit(&(-1i32).to_le_bytes());
+                            self.patch_rel32_to_here(join);
+                            self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX,EAX
+                            self.push_from_rax();
+
+                            for p in bail {
+                                self.deopt_stubs.push((p, pc, 6));
+                            }
+                            intrinsic_handled = true;
+                        }
+
+                        // --- indexOf(Ljava/lang/String;)I -----------------
+                        // Naive O(n*m) substring search from index 0; an
+                        // empty needle returns 0. Each haystack/needle char is
+                        // decoded through its own `coder`, so all coder combos
+                        // are handled inline. Bit-identical to
+                        // `native_string_index_of_str`. The deopt stub is
+                        // reached only for a null receiver or a null backing
+                        // `value` array on either side; a null String argument
+                        // also deopts — the native re-run then returns -1,
+                        // which is the same answer.
+                        if self.string_layout.is_some()
+                            && callee_entry
+                                == super::JitIntrinsic::StringIndexOfStr
+                                    .as_entry()
+                        {
+                            let layout = self.string_layout.unwrap();
+                            self.flush_scratch_registers();
+                            let mut bail: Vec<usize> = Vec::new();
+
+                            // Operand stack (deepest first): this, needle.
+                            let needle_slot = self.pop_stack();
+                            let this_slot = self.pop_stack();
+
+                            // --- deopt checks + field reads BEFORE any PUSH,
+                            // into CALLER-saved registers only (see the
+                            // compareTo block for the rationale: balanced
+                            // stack on deopt edges, and an operand slot may
+                            // itself be a callee-saved register the loop is
+                            // about to clobber).
+                            self.load_slot_to_reg(RAX, this_slot);
+                            self.emit_test_r64_r64(RAX);
+                            bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                            self.load_slot_to_reg(RDX, needle_slot);
+                            self.emit_test_r64_r64(RDX);
+                            bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+                            self.emit_mov_r64_mem_disp32(
+                                R8,
+                                RAX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+                            self.emit_mov_r64_mem_disp32(
+                                R9,
+                                RDX,
+                                layout.value_cell_offset
+                                    + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                            );
+                            self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
+                            bail.push(self.emit_jcc_rel32_patch(0x84));
+                            // R10 = haystack coder, R11 = needle coder.
+                            self.emit_movsxd_r64_mem_disp32(
+                                R10,
+                                RAX,
+                                layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                            );
+                            self.emit_movsxd_r64_mem_disp32(
+                                R11,
+                                RDX,
+                                layout.coder_cell_offset
+                                    + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                            );
+
+                            // PUSH RBX,RSI,RDI,R12,R13,R14,R15.
+                            self.buf.emit(&[0x53, 0x56, 0x57]);
+                            self.buf.emit(&[0x41, 0x54, 0x41, 0x55]);
+                            self.buf.emit(&[0x41, 0x56, 0x41, 0x57]);
+                            // RSI=haystack value, RDI=needle value,
+                            // R12=haystack coder, R13=needle coder.
+                            self.emit_mov_r64_r64(RSI, R8);
+                            self.emit_mov_r64_r64(RDI, R9);
+                            self.emit_mov_r64_r64(R12, R10);
+                            self.emit_mov_r64_r64(R13, R11);
+                            // hlen → R14D, nlen → R15D.
+                            self.emit_mov_r32_mem_disp32(
+                                RAX,
+                                RSI,
+                                ARRAY_LENGTH_OFFSET as i32,
+                            );
+                            self.emit_alu_r32_r32(0x89, RCX, R12); // MOV ECX,R12D
+                            self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
+                            self.emit_alu_r32_r32(0x89, R14, RAX); // MOV R14D,EAX
+                            self.emit_mov_r32_mem_disp32(
+                                RAX,
+                                RDI,
+                                ARRAY_LENGTH_OFFSET as i32,
+                            );
+                            self.emit_alu_r32_r32(0x89, RCX, R13); // MOV ECX,R13D
+                            self.buf.emit(&[0xD3, 0xE8]); // SHR EAX,CL
+                            self.emit_alu_r32_r32(0x89, R15, RAX); // MOV R15D,EAX
+
+                            // empty needle (nlen == 0) → result 0.
+                            self.buf.emit(&[0x45, 0x85, 0xFF]); // TEST R15D,R15D
+                            let needle_empty =
+                                self.emit_jcc_rel32_patch(0x84); // JZ
+                            // nlen > hlen → not_found.
+                            self.emit_alu_r32_r32(0x39, R15, R14); // CMP R15D,R14D
+                            let too_long = self.emit_jcc_rel32_patch(0x8F); // JG
+                            // max_start = hlen - nlen → EBX (inclusive bound).
+                            self.emit_alu_r32_r32(0x89, RBX, R14); // MOV EBX,R14D
+                            self.emit_alu_r32_r32(0x29, RBX, R15); // SUB EBX,R15D
+
+                            // outer: i = 0 (R8D).
+                            self.buf.emit(&[0x45, 0x31, 0xC0]); // XOR R8D,R8D
+                            let outer_top = self.buf.pos();
+                            // CMP R8D,EBX ; JG not_found (i > max_start).
+                            self.emit_alu_r32_r32(0x39, R8, RBX);
+                            let outer_done = self.emit_jcc_rel32_patch(0x8F);
+                            // inner: j = 0 (R9D).
+                            self.buf.emit(&[0x45, 0x31, 0xC9]); // XOR R9D,R9D
+                            let inner_top = self.buf.pos();
+                            // CMP R9D,R15D ; JGE match_found (j >= nlen).
+                            self.emit_alu_r32_r32(0x39, R9, R15);
+                            let match_found = self.emit_jcc_rel32_patch(0x8D);
+                            // h = haystack[i+j]: R10D = i+j, decode → R11D.
+                            self.emit_alu_r32_r32(0x89, R10, R8); // MOV R10D,R8D
+                            self.emit_alu_r32_r32(0x01, R10, R9); // ADD R10D,R9D
+                            self.emit_string_decode_char(R11, RSI, R10, R12);
+                            // n = needle[j]: decode → R10D.
+                            self.emit_string_decode_char(R10, RDI, R9, R13);
+                            // CMP R11D,R10D ; JNE inner_break.
+                            self.emit_alu_r32_r32(0x39, R11, R10);
+                            let inner_break = self.emit_jcc_rel32_patch(0x85);
+                            // INC R9D ; JMP inner_top.
+                            self.buf.emit(&[0x41, 0xFF, 0xC1]);
+                            let inner_back = self.emit_jmp_rel32_patch();
+                            let rel =
+                                inner_top as i32 - (inner_back as i32 + 4);
+                            self.buf.patch_i32(inner_back, rel);
+                            // inner_break: INC R8D ; JMP outer_top.
+                            self.patch_rel32_to_here(inner_break);
+                            self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D
+                            let outer_back = self.emit_jmp_rel32_patch();
+                            let rel =
+                                outer_top as i32 - (outer_back as i32 + 4);
+                            self.buf.patch_i32(outer_back, rel);
+                            // match_found: result = i (R8D).
+                            self.patch_rel32_to_here(match_found);
+                            self.emit_alu_r32_r32(0x89, RAX, R8); // MOV EAX,R8D
+                            let join = self.emit_jmp_rel32_patch();
+                            // not_found (nlen>hlen or outer exhausted): -1.
+                            self.patch_rel32_to_here(too_long);
+                            self.patch_rel32_to_here(outer_done);
+                            self.buf.emit(&[0xB8]);
+                            self.buf.emit(&(-1i32).to_le_bytes());
+                            let join2 = self.emit_jmp_rel32_patch();
+                            // needle_empty: result = 0.
+                            self.patch_rel32_to_here(needle_empty);
+                            self.emit_xor_reg_self(RAX);
+                            // join.
+                            self.patch_rel32_to_here(join);
+                            self.patch_rel32_to_here(join2);
+                            self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX,EAX
+                            // POP R15,R14,R13,R12,RDI,RSI,RBX.
+                            self.buf.emit(&[0x41, 0x5F, 0x41, 0x5E]);
+                            self.buf.emit(&[0x41, 0x5D, 0x41, 0x5C]);
+                            self.buf.emit(&[0x5F, 0x5E, 0x5B]);
                             self.push_from_rax();
 
                             for p in bail {
