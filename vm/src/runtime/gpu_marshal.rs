@@ -68,15 +68,27 @@ pub fn host_view_i32(
         "host_view_i32: not an int[]"
     );
     let len = header.array_length as usize;
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        // SAFETY of unwrap: i < array_length by construction.
-        let v = heap
-            .get_array_element(obj, i)
-            .expect("host_view_i32: in-bounds index returned OOB");
-        match v {
-            Value::Int(x) => out.push(x),
-            other => panic!("host_view_i32: expected Value::Int, got {other:?}"),
+    // PERF: `int[]` elements are stored as a contiguous native-`i32`
+    // little-endian region starting at `array_data_ptr`. A single
+    // `copy_nonoverlapping` replaces `len` boxed `Value`-returning
+    // accessor calls (each with a bounds check + enum match) — for a
+    // 2^24-element array that is 16.7M calls eliminated per array per
+    // marshal. The SafepointToken proves the heap is in a no-GC
+    // critical section, so the payload cannot move under the copy.
+    let mut out = vec![0i32; len];
+    if len != 0 {
+        let src = heap.array_data_ptr(obj);
+        // SAFETY: `obj` is a live `int[]` (kind + element_type asserted
+        // above); its payload is `len * 4` contiguous bytes at
+        // `array_data_ptr`. `out` was just allocated with `len` i32s.
+        // Source (heap arena) and destination (fresh Vec) do not
+        // overlap. The GC is paused (token held), so `src` stays valid.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src,
+                out.as_mut_ptr() as *mut u8,
+                len * 4,
+            );
         }
     }
     out
@@ -96,14 +108,16 @@ pub fn host_view_i64(
         "host_view_i64: not a long[]"
     );
     let len = header.array_length as usize;
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let v = heap
-            .get_array_element(obj, i)
-            .expect("host_view_i64: in-bounds index returned OOB");
-        match v {
-            Value::Long(x) => out.push(x),
-            other => panic!("host_view_i64: expected Value::Long, got {other:?}"),
+    // PERF: bulk copy — see `host_view_i32`. `long[]` is contiguous
+    // native `i64` little-endian.
+    let mut out = vec![0i64; len];
+    if len != 0 {
+        let src = heap.array_data_ptr(obj);
+        // SAFETY: live `long[]` (asserted); `len * 8` contiguous bytes
+        // at `array_data_ptr`; `out` holds `len` i64s; no overlap; GC
+        // paused (token held).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 8);
         }
     }
     out
@@ -123,14 +137,16 @@ pub fn host_view_f32(
         "host_view_f32: not a float[]"
     );
     let len = header.array_length as usize;
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let v = heap
-            .get_array_element(obj, i)
-            .expect("host_view_f32: in-bounds index returned OOB");
-        match v {
-            Value::Float(x) => out.push(x),
-            other => panic!("host_view_f32: expected Value::Float, got {other:?}"),
+    // PERF: bulk copy — see `host_view_i32`. `float[]` is contiguous
+    // native `f32` little-endian (IEEE-754 bit pattern preserved).
+    let mut out = vec![0f32; len];
+    if len != 0 {
+        let src = heap.array_data_ptr(obj);
+        // SAFETY: live `float[]` (asserted); `len * 4` contiguous bytes
+        // at `array_data_ptr`; `out` holds `len` f32s; no overlap; GC
+        // paused (token held).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 4);
         }
     }
     out
@@ -150,14 +166,16 @@ pub fn host_view_f64(
         "host_view_f64: not a double[]"
     );
     let len = header.array_length as usize;
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let v = heap
-            .get_array_element(obj, i)
-            .expect("host_view_f64: in-bounds index returned OOB");
-        match v {
-            Value::Double(x) => out.push(x),
-            other => panic!("host_view_f64: expected Value::Double, got {other:?}"),
+    // PERF: bulk copy — see `host_view_i32`. `double[]` is contiguous
+    // native `f64` little-endian (IEEE-754 bit pattern preserved).
+    let mut out = vec![0f64; len];
+    if len != 0 {
+        let src = heap.array_data_ptr(obj);
+        // SAFETY: live `double[]` (asserted); `len * 8` contiguous bytes
+        // at `array_data_ptr`; `out` holds `len` f64s; no overlap; GC
+        // paused (token held).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 8);
         }
     }
     out
@@ -253,9 +271,23 @@ pub fn write_back_i32(
         src.len(),
         len
     );
-    for (i, &v) in src.iter().enumerate() {
-        heap.set_array_element(obj, i, Value::Int(v))
-            .expect("write_back_i32: in-bounds index returned OOB");
+    // PERF: bulk store — `int[]` payload is contiguous native `i32`
+    // little-endian, so one `copy_nonoverlapping` replaces `len`
+    // boxed `set_array_element` calls. No write barrier is needed:
+    // primitive-array stores never create cross-generation references.
+    if len != 0 {
+        let dst = heap.array_data_ptr(obj);
+        // SAFETY: `obj` is a live `int[]` (asserted); payload is
+        // `len * 4` contiguous bytes at `array_data_ptr`. `src` holds
+        // exactly `len` i32s. Heap arena and `src` slice do not
+        // overlap. GC is paused (token held), so `dst` stays valid.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr() as *const u8,
+                dst,
+                len * 4,
+            );
+        }
     }
 }
 
@@ -285,9 +317,15 @@ pub fn write_back_i64(
         src.len(),
         len
     );
-    for (i, &v) in src.iter().enumerate() {
-        heap.set_array_element(obj, i, Value::Long(v))
-            .expect("write_back_i64: in-bounds index returned OOB");
+    // PERF: bulk store — see `write_back_i32`.
+    if len != 0 {
+        let dst = heap.array_data_ptr(obj);
+        // SAFETY: live `long[]` (asserted); `len * 8` contiguous bytes
+        // at `array_data_ptr`; `src` holds `len` i64s; no overlap; GC
+        // paused (token held).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst, len * 8);
+        }
     }
 }
 
@@ -317,9 +355,15 @@ pub fn write_back_f32(
         src.len(),
         len
     );
-    for (i, &v) in src.iter().enumerate() {
-        heap.set_array_element(obj, i, Value::Float(v))
-            .expect("write_back_f32: in-bounds index returned OOB");
+    // PERF: bulk store — see `write_back_i32`.
+    if len != 0 {
+        let dst = heap.array_data_ptr(obj);
+        // SAFETY: live `float[]` (asserted); `len * 4` contiguous bytes
+        // at `array_data_ptr`; `src` holds `len` f32s; no overlap; GC
+        // paused (token held).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst, len * 4);
+        }
     }
 }
 
@@ -349,9 +393,15 @@ pub fn write_back_f64(
         src.len(),
         len
     );
-    for (i, &v) in src.iter().enumerate() {
-        heap.set_array_element(obj, i, Value::Double(v))
-            .expect("write_back_f64: in-bounds index returned OOB");
+    // PERF: bulk store — see `write_back_i32`.
+    if len != 0 {
+        let dst = heap.array_data_ptr(obj);
+        // SAFETY: live `double[]` (asserted); `len * 8` contiguous bytes
+        // at `array_data_ptr`; `src` holds `len` f64s; no overlap; GC
+        // paused (token held).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, dst, len * 8);
+        }
     }
 }
 
