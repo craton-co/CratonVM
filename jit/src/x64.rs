@@ -3320,6 +3320,20 @@ struct Compiler {
     /// method epilogue with `RAX = i64::MIN`. The interpreter's post-JIT
     /// path drains the NPE flag and surfaces the exception.
     null_check_store_stubs: Vec<usize>,
+    /// Post-invoke exception checks. After every JIT-dispatched invoke
+    /// (`invoke_dispatch` / `invoke_virtual_mic`) whose callee can throw,
+    /// the codegen emits a `CMP RAX, i64::MIN; JE rel32` guard. The
+    /// dispatch helpers return `i64::MIN` (instead of 0) when they stash a
+    /// pending Java exception into `JIT_PENDING_EXCEPTION`. Each recorded
+    /// offset is the rel32 placeholder of that JE; `emit_exception_check_stub`
+    /// patches them all to a single shared out-of-line stub that loads the
+    /// `i64::MIN` deopt sentinel and runs the epilogue. The interpreter's
+    /// post-JIT path then drains `take_jit_pending_exception()` and routes
+    /// the real exception through the method's exception table — instead of
+    /// letting the JIT keep running with a bogus `0` return value (which
+    /// previously masked the true exception with a downstream NPE; see the
+    /// Jetty `Main.main` "getClasspath on null" miscompile).
+    exception_check_stubs: Vec<usize>,
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
@@ -3622,6 +3636,7 @@ impl Compiler {
             bounds_safe_pcs: FxHashSet::default(),
             bounds_check_stubs: Vec::new(),
             null_check_store_stubs: Vec::new(),
+            exception_check_stubs: Vec::new(),
             speculative_bce_guards: Vec::new(),
             new_info: Vec::new(),
             anewarray_info: Vec::new(),
@@ -8751,6 +8766,71 @@ impl Compiler {
         }
     }
 
+    /// Emit the post-invoke pending-exception guard.
+    ///
+    /// Called immediately after a JIT-dispatched invoke helper
+    /// (`invoke_dispatch` / `invoke_virtual_mic`) returns, with the
+    /// helper's return value still in RAX. The dispatch helpers return
+    /// `i64::MIN` when the callee threw a Java exception (the exception
+    /// object is stashed in the thread-local `JIT_PENDING_EXCEPTION`).
+    ///
+    /// Without this guard the JIT pushed the bogus `0` return value and
+    /// kept executing — running arbitrary follow-on bytecode against a
+    /// null/garbage value and masking the real exception with a downstream
+    /// secondary failure (the Jetty `Main.main` "getClasspath on null"
+    /// miscompile: `processCommandLine` threw a `SecurityException`, the
+    /// dispatch helper returned 0, `astore_3` stored null, and the later
+    /// `start(null)` call NPE'd — hiding the genuine exception).
+    ///
+    /// The guard `CMP RAX, i64::MIN; JE rel32` branches to a single
+    /// shared out-of-line stub (`emit_exception_check_stub`) that loads
+    /// the `i64::MIN` deopt sentinel and runs the method epilogue. The
+    /// interpreter's post-JIT path (`vm/src/runtime/interpreter.rs`,
+    /// `take_jit_pending_exception`) then routes the stashed exception
+    /// through this method's exception table.
+    ///
+    /// RAX is caller-saved and already clobbered by the dispatch call, so
+    /// using R10 as the `i64::MIN` scratch is safe here.
+    fn emit_post_invoke_exception_check(&mut self) {
+        // MOV R10, i64::MIN  (49 BA <imm64>)
+        self.buf.emit(&[0x49, 0xBA]);
+        self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+        // CMP RAX, R10  (4C 39 D0)
+        self.buf.emit(&[0x4C, 0x39, 0xD0]);
+        // JE rel32 → shared exception-check stub (patched later)
+        self.buf.emit(&[0x0F, 0x84]);
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
+        self.exception_check_stubs.push(patch_offset);
+    }
+
+    /// Emit the single shared out-of-line stub for post-invoke exception
+    /// guards. Loads the `i64::MIN` deopt sentinel into RAX and runs the
+    /// standard method epilogue. All `CMP/JE` guards emitted by
+    /// `emit_post_invoke_exception_check` are patched to branch here.
+    fn emit_exception_check_stub(&mut self) {
+        if self.exception_check_stubs.is_empty() {
+            return;
+        }
+
+        let stub_offset = self.buf.pos();
+
+        // MOV RAX, i64::MIN  — deopt sentinel so the interpreter's post-JIT
+        // path treats this as a deopt return and drains the pending
+        // exception. 48 B8 <imm64>
+        self.buf.emit(&[0x48, 0xB8]);
+        self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+
+        // Standard method epilogue: restore callee-saved regs and return.
+        self.emit_epilogue();
+
+        // Patch every recorded JE branch to point to the shared stub.
+        for &patch_off in &self.exception_check_stubs {
+            let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
+            self.buf.patch_i32(patch_off, rel32);
+        }
+    }
+
     /// Emit out-of-line deoptimization stubs at the end of the method.
     ///
     /// Each stub calls `jit_uncommon_trap(vm_ptr, reason, bci)` and then
@@ -11317,8 +11397,16 @@ impl Compiler {
 
                 // return (void)
                 0xb1 => {
-                    // No return value needed, just emit epilogue
+                    // No return value needed, just emit epilogue.
                     self.flush_scratch_registers();
+                    // Zero RAX on the normal void-return path so callers can
+                    // reliably distinguish a clean return (RAX == 0) from the
+                    // `i64::MIN` deopt sentinel. Without this RAX is whatever
+                    // the last op left, which could spuriously equal i64::MIN
+                    // and trip the caller's post-invoke exception guard / the
+                    // interpreter's post-JIT deopt check.
+                    // XOR EAX, EAX  (31 C0) — zero-extends to RAX.
+                    self.buf.emit(&[0x31, 0xC0]);
                     self.emit_epilogue();
                     self.reset_spills();
                     dead = true;
@@ -11953,6 +12041,18 @@ impl Compiler {
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
 
+                            // A directly-called compiled callee that throws
+                            // (or deopts) returns the `i64::MIN` sentinel.
+                            // Without this guard the JIT would push the
+                            // sentinel as the return value — for an L/[
+                            // return it would then be tagged as an oop
+                            // (`mark_top_as_oop` below) and the next deref
+                            // of that `0x8000_0000_0000_0000` wild pointer
+                            // segfaults. Deopt out so the interpreter routes
+                            // the stashed exception through the exception
+                            // table instead.
+                            self.emit_post_invoke_exception_check();
+
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {
                                     self.push_from_rax_as_xmm0();
@@ -12015,6 +12115,21 @@ impl Compiler {
                         // that survives the call (args are already popped,
                         // return value not yet pushed).
                         self.emit_oop_map_for_safepoint();
+
+                        // After the dispatch returns, check whether the
+                        // static callee threw a Java exception. `jit_invoke_
+                        // dispatch` returns `i64::MIN` (and stashes the
+                        // exception in `JIT_PENDING_EXCEPTION`) when the
+                        // callee throws. Without this guard — which the
+                        // invokevirtual/invokespecial paths already have —
+                        // the JIT pushes the `i64::MIN` sentinel as the
+                        // return value; for an L/[ static method it is then
+                        // tagged as an oop (`mark_top_as_oop` below) and the
+                        // next deref of that wild `0x8000_0000_0000_0000`
+                        // pointer segfaults (the Tomcat boot regression).
+                        // Deopt out so the interpreter routes the stashed
+                        // exception through the method's exception table.
+                        self.emit_post_invoke_exception_check();
 
                         // Reclaim spill slots used for invoke args
                         self.next_spill_offset = pre_pop_spill;
@@ -12095,6 +12210,12 @@ impl Compiler {
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.self_call_patches.push(call_patch);
                         self.emit_stack_arg_cleanup(total_sub);
+                        // A self-recursive compiled call that throws (or
+                        // deopts) returns the `i64::MIN` sentinel — same
+                        // hazard as the direct/dispatch invokestatic paths
+                        // above. Guard it so the sentinel is never pushed
+                        // (and never tagged as an oop) as a return value.
+                        self.emit_post_invoke_exception_check();
                         self.push_from_rax();
                     }
                     pc += 3;
@@ -12150,6 +12271,11 @@ impl Compiler {
                         self.emit_pre_safepoint_spill();
                         self.emit_call_absolute(callee_entry);
                         self.emit_stack_arg_cleanup(total_sub);
+
+                        // A directly-called compiled callee that throws (or
+                        // deopts) returns the `i64::MIN` sentinel. Propagate
+                        // the deopt instead of running on with a bogus value.
+                        self.emit_post_invoke_exception_check();
 
                         if ret_type != b'V' {
                             if matches!(ret_type, b'D' | b'F') {
@@ -12762,6 +12888,18 @@ impl Compiler {
                             // walker has precise coverage at the return PC.
                             self.emit_oop_map_for_safepoint();
 
+                            // After the dispatch returns, check whether the
+                            // callee threw a Java exception. The dispatch
+                            // helpers return `i64::MIN` (and stash the
+                            // exception object in `JIT_PENDING_EXCEPTION`)
+                            // when the callee throws; without this guard the
+                            // JIT would push the bogus return value and keep
+                            // running, masking the real exception with a
+                            // downstream secondary failure. The guard deopts
+                            // out so the interpreter routes the exception
+                            // through this method's exception table.
+                            self.emit_post_invoke_exception_check();
+
                             // Reclaim spill slots used for invoke args — they are
                             // no longer needed after the helper returns.
                             self.next_spill_offset = pre_pop_spill;
@@ -13291,6 +13429,11 @@ impl Compiler {
         // bounds-check would deref NULL on a null array and the signal
         // handler would re-raise instead of throwing NPE.
         self.emit_null_check_store_stubs();
+        // Shared out-of-line stub for post-invoke pending-exception guards.
+        // Without this, a JIT-dispatched callee that throws would leave the
+        // exception stashed in TLS while the JIT kept running with a bogus
+        // `0` return value (Jetty `Main.main` "getClasspath on null").
+        self.emit_exception_check_stub();
         self.emit_deopt_stubs();
         true
     }

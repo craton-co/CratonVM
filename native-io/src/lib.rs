@@ -114,6 +114,34 @@ fn is_within_sandbox(candidate: &Path, cwd_root: &Path) -> bool {
     roots.iter().any(|r| candidate.starts_with(r))
 }
 
+/// Whether to confine the *canonicalized* path to the current working
+/// directory. Default `false`.
+///
+/// CratonVM is a general-purpose JVM, not a sandbox: applications
+/// legitimately read and write files anywhere the host process can —
+/// e.g. `java -jar /opt/jetty/start.jar` must read `$JETTY_HOME/modules/*`
+/// even though `$JETTY_HOME` is not the CWD. An earlier audit added an
+/// unconditional "resolved path must start with `current_dir()`" check,
+/// which broke every app whose data files live outside the launch
+/// directory (Jetty's launcher being the canonical example).
+///
+/// The genuine path-traversal protection — rejecting a `..` *segment* in
+/// the path string, and rejecting null bytes — always runs in
+/// [`validate_path`] regardless of this flag. CWD confinement is an
+/// additional, deployment-specific restriction that is therefore opt-in.
+static PATH_CONFINE_TO_CWD: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable confining canonicalized paths to the process CWD.
+/// Off by default — see [`PATH_CONFINE_TO_CWD`].
+pub fn set_path_confine_to_cwd(enabled: bool) {
+    PATH_CONFINE_TO_CWD.store(enabled, Ordering::Relaxed);
+}
+
+/// Returns `true` if CWD confinement is currently enabled.
+pub fn is_path_confine_to_cwd() -> bool {
+    PATH_CONFINE_TO_CWD.load(Ordering::Relaxed)
+}
+
 /// Validate a file path to prevent path traversal and null-byte injection.
 /// Returns the canonicalized path string on success, or an error on failure.
 ///
@@ -150,20 +178,42 @@ fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
         return Ok(path.to_string());
     }
 
-    // AUDIT 2026-05-19: TOCTOU / canonicalize-after-check fix.
+    // Always-on traversal guard: reject any `..` *segment* in the path
+    // string. This stops the common path-traversal attack (a relative
+    // path that climbs out of an intended directory) without breaking
+    // legitimate absolute-path access. A literal `..` substring inside a
+    // single filename component (e.g. `foo..bar.txt`) is NOT a
+    // `ParentDir` component and is correctly accepted.
+    if Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::SecurityException {
+                message: format!("Path traversal detected: {}", path),
+            },
+        )));
+    }
+
+    // CWD confinement is an opt-in, deployment-specific restriction (see
+    // `PATH_CONFINE_TO_CWD`). A general-purpose JVM must let applications
+    // read/write files anywhere the host process can — confining to the
+    // launch directory broke every app (e.g. Jetty's `start.jar`
+    // launcher) whose data files live outside CWD. When confinement is
+    // off we are done: the `..`-segment and null-byte checks above are
+    // the security guarantee.
+    if !is_path_confine_to_cwd() {
+        return Ok(path.to_string());
+    }
+
+    // --- Opt-in CWD confinement path -------------------------------------
     //
-    // The previous implementation rejected `..` only as a literal path
-    // *component* and then canonicalized AFTER the traversal check. That
-    // is unsound: a symlink whose target escapes the sandbox contains no
-    // `..` component, so it passed the textual check, and the canonical
-    // (symlink-resolved) result was never re-validated. An attacker could
-    // therefore reach any file the host process can see.
+    // AUDIT 2026-05-19: TOCTOU / canonicalize-after-check fix.
     //
     // The sound order is: canonicalize FIRST (resolving every symlink and
     // `..`/`.` segment against the real filesystem), THEN check that the
     // fully-resolved path is contained within the sandbox root. The
-    // sandbox root is the process current working directory — the same
-    // boundary the old `..` check was implicitly trying to enforce.
+    // sandbox root is the process current working directory.
     let sandbox_root = match fs::canonicalize(std::env::current_dir().unwrap_or_default()) {
         Ok(r) => r,
         Err(_) => {
@@ -13217,26 +13267,39 @@ mod io_tests {
     #[test]
     fn path_validation_rejects_dotdot() {
         set_path_validation_enabled(true);
-        // A `..` segment that escapes the sandbox (cwd) is rejected.
-        // The canonicalize-first logic resolves `..` against the real
-        // filesystem and the containment check then fails.
+        // A `..` *segment* in the path string is always rejected — this
+        // is the always-on traversal guard, independent of CWD confinement.
         let result = validate_path("../escapes-sandbox.txt");
         assert!(result.is_err());
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
     }
 
-    /// AUDIT 2026-05-19: a path that resolves (after canonicalization)
-    /// outside the sandbox root is rejected even with no literal `..`
-    /// segment. This is the canonicalize-after-check / symlink-escape
-    /// regression guard.
+    /// With CWD confinement OFF (the default), an absolute path with no
+    /// `..` segment is accepted: CratonVM is a general-purpose JVM, not a
+    /// sandbox, so applications may read files anywhere the host process
+    /// can. (Jetty's `start.jar` launcher reads `$JETTY_HOME/modules/*`.)
     #[test]
-    fn path_validation_rejects_out_of_sandbox_absolute() {
+    fn path_validation_accepts_absolute_path_by_default() {
         set_path_validation_enabled(true);
+        set_path_confine_to_cwd(false);
+        let result = validate_path("/etc/passwd");
+        assert!(result.is_ok(), "absolute path rejected by default: {result:?}");
+    }
+
+    /// AUDIT 2026-05-19: with CWD confinement explicitly ON, a path that
+    /// resolves outside the sandbox root is rejected even with no literal
+    /// `..` segment. This is the canonicalize-after-check / symlink-escape
+    /// regression guard for the opt-in confinement mode.
+    #[test]
+    fn path_validation_rejects_out_of_sandbox_absolute_when_confined() {
+        set_path_validation_enabled(true);
+        set_path_confine_to_cwd(true);
         let result = validate_path("/etc/passwd");
         assert!(result.is_err(), "out-of-sandbox path accepted: {result:?}");
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
+        set_path_confine_to_cwd(false);
     }
 
     #[test]
