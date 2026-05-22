@@ -201,6 +201,7 @@ fn compile_equals() -> impl Fn(i64, i64) -> i64 {
                 needs_context: false,
                 num_params: 1, // other (receiver excluded)
                 return_type: b'Z',
+                guard_class_id: 0,
             },
         )],
         Vec::new(),

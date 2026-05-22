@@ -3610,6 +3610,10 @@ fn try_compile_inner(
                             needs_context: false,
                             num_params,
                             return_type: ret,
+                            // String is `final` — a virtual site keyed on the
+                            // declared class is monomorphic, so no receiver
+                            // class-id guard is needed.
+                            guard_class_id: 0,
                         },
                     ));
                     continue;

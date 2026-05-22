@@ -236,6 +236,7 @@ fn compile_unary(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
                 needs_context: false,
                 num_params: 0, // receiver excluded
                 return_type: b'I',
+                guard_class_id: 0,
             },
         )],
         Vec::new(),
@@ -285,6 +286,7 @@ fn compile_char_at() -> impl Fn(i64, i32) -> i64 {
                 needs_context: false,
                 num_params: 1, // index (receiver excluded)
                 return_type: b'C',
+                guard_class_id: 0,
             },
         )],
         Vec::new(),
