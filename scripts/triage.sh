@@ -44,7 +44,10 @@ run felix 20 --Xmx 256m --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
 HZCP=$(cp_of "$APPS/hazelcast-5.4.0/lib")
 run hazelcast 25 --Xmx 512m -c "$HZCP" com.hazelcast.core.server.HazelcastMemberStarter
 
-SOCP=$(cp_of "$APPS/solr-9.5.0/server/lib")
+# org.apache.solr.cli.SolrCLI lives in solr-core-*.jar under
+# server/solr-webapp/webapp/WEB-INF/lib (NOT server/lib). This mirrors
+# bin/solr.cmd's own classpath: WEB-INF/lib/* plus server/lib/ext/*.
+SOCP="$(cp_of "$APPS/solr-9.5.0/server/solr-webapp/webapp/WEB-INF/lib");$(cp_of "$APPS/solr-9.5.0/server/lib/ext")"
 run solr 25 --Xmx 512m -c "$SOCP" org.apache.solr.cli.SolrCLI version
 
 run wildfly 40 --Xmx 512m --jar "$APPS/wildfly-32.0.1.Final/jboss-modules.jar" -mp "$APPS/wildfly-32.0.1.Final/modules" \
