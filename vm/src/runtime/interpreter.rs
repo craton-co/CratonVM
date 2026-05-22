@@ -1749,6 +1749,7 @@ pub fn execute(
                                     needs_context: false,
                                     num_params: 1,
                                     return_type: b'D',
+                                    guard_class_id: 0,
                                 },
                             ));
                             continue;
@@ -11723,6 +11724,7 @@ fn try_osr(
                             needs_context: false,
                             num_params: 1,
                             return_type: b'D',
+                            guard_class_id: 0,
                         },
                     ));
                     continue;
@@ -11778,6 +11780,7 @@ fn try_osr(
                         needs_context: needs_ctx,
                         num_params: param_count,
                         return_type: crate::jit::return_type(&callee_desc),
+                        guard_class_id: 0,
                     },
                 ));
             } else {
@@ -12300,6 +12303,20 @@ fn try_jit_upgrade_with_gate(
         let num_fields = cm.get_class(target_id).map_or(0, |c| c.num_total_fields);
         Some((target_id.as_u32(), num_fields))
     };
+    // invoke class-id resolver: maps an invoke* CP index to the class id of
+    // its declared (Methodref) class. Used by the CRC32/CRC32C `update`
+    // call-site intrinsics for the receiver class-id guard.
+    let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        let class_idx = match class.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
+            Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => *class_index,
+            _ => return None,
+        };
+        let target_class = class.constant_pool.get_class_name(class_idx)?;
+        Some(cm.find_class_by_name(target_class)?.as_u32())
+    };
 
     let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
         let cm = shared.class_manager.read();
@@ -12459,6 +12476,22 @@ fn try_jit_upgrade_with_gate(
                 let num_fields = cm.get_class(target_id).map_or(0, |c| c.num_total_fields);
                 Some((target_id.as_u32(), num_fields))
             };
+            // invoke class-id resolver for the callee's constant pool — maps
+            // an invoke* CP index to its declared class id, for the CRC32/
+            // CRC32C `update` receiver class-id guard.
+            let c_invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
+                let cm = shared.class_manager.read();
+                let class = cm.get_class(callee_cid)?;
+                let class_idx = match class.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
+                    Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => {
+                        *class_index
+                    }
+                    _ => return None,
+                };
+                let target_class = class.constant_pool.get_class_name(class_idx)?;
+                Some(cm.find_class_by_name(target_class)?.as_u32())
+            };
 
             let c_ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
                 let cm = shared.class_manager.read();
@@ -12500,6 +12533,7 @@ fn try_jit_upgrade_with_gate(
                 // `shared.class_manager` + `Class::find_own_field`, then calls
                 // `StringFieldLayout::new(value_idx, coder_idx_opt, hash_idx)`.
                 None,
+                Some(&c_invoke_class_id_resolver),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -12543,6 +12577,7 @@ fn try_jit_upgrade_with_gate(
         // string_layout_resolver: None until the String call-site intrinsics
         // land — see the matching comment at the early-compile call site.
         None,
+        Some(&invoke_class_id_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -12769,6 +12804,19 @@ pub fn try_jit_compile_callee(
         let num_fields = cm.get_class(target_id).map_or(0, |c| c.num_total_fields);
         Some((target_id.as_u32(), num_fields))
     };
+    // invoke class-id resolver — maps an invoke* CP index to its declared
+    // class id, consumed by the CRC32/CRC32C `update` receiver class-id guard.
+    let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(cid)?;
+        let class_idx = match class.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
+            Some(ConstantPoolEntry::InterfaceMethodReference { class_index, .. }) => *class_index,
+            _ => return None,
+        };
+        let target_class = class.constant_pool.get_class_name(class_idx)?;
+        Some(cm.find_class_by_name(target_class)?.as_u32())
+    };
     let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
@@ -12831,6 +12879,7 @@ pub fn try_jit_compile_callee(
         &helpers,
         Some(&inline_resolver),
         Some(&string_layout_resolver),
+        Some(&invoke_class_id_resolver),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(

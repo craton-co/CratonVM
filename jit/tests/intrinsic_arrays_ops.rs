@@ -193,6 +193,7 @@ fn direct_call(entry: usize, num_params: usize, return_type: u8) -> cratonvm_jit
         needs_context: false,
         num_params,
         return_type,
+        guard_class_id: 0,
     }
 }
 

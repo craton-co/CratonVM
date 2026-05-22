@@ -145,6 +145,7 @@ fn compile_sort(entry: usize) -> impl Fn(*mut u8) {
                 needs_context: false,
                 num_params: 1,
                 return_type: b'V',
+            guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots

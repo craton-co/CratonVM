@@ -211,6 +211,7 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
                 needs_context: false,
                 num_params: 5,
                 return_type: b'V',
+            guard_class_id: 0,
             },
         )],
         Vec::new(), // mic_slots
