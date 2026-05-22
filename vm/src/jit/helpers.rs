@@ -141,6 +141,22 @@ pub fn take_jit_pending_exception() -> Option<ObjectRef> {
     JIT_PENDING_EXCEPTION.with(|e| e.take())
 }
 
+/// Non-consuming peek: returns `true` if a pending Java exception is set.
+///
+/// Used by `jit_invoke_dispatch` (and its bail/cache paths) to decide
+/// whether to return the `i64::MIN` deopt sentinel — so the JIT caller's
+/// post-invoke exception guard fires and the interpreter routes the
+/// stashed exception through the method's exception table — instead of
+/// returning a bogus `0` that the JIT would keep computing with.
+pub(crate) fn jit_pending_exception_is_set() -> bool {
+    JIT_PENDING_EXCEPTION.with(|e| {
+        let v = e.take();
+        let present = v.is_some();
+        e.set(v);
+        present
+    })
+}
+
 /// Take (consume) a pending AIOOBE from JIT bounds check.
 /// Returns `Some((index, length))` if an AIOOBE was pending.
 pub fn take_jit_pending_aioobe() -> Option<(i64, i64)> {
@@ -410,10 +426,7 @@ unsafe fn bail_to_interpreter(
         Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
         Ok(Some(Value::Object(None))) | Ok(None) => 0,
         Ok(_) => 0,
-        Err(e) => {
-            handle_jit_dispatch_error(vm, thread, e, info);
-            0
-        }
+        Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
     }
 }
 
@@ -1538,12 +1551,24 @@ const DISPATCH_JIT_THRESHOLD: u32 = 500;
 /// error unstored — the original "swallow and return 0" behaviour. That
 /// keeps this purely additive: it never makes a previously-working scenario
 /// worse, only converts silent rc=0 into a visible stack trace.
+/// Route a failed JIT dispatch into the thread-local pending-exception
+/// slot and return the value the dispatch helper should hand back to its
+/// JIT caller: `i64::MIN` (the deopt sentinel) when a pending Java
+/// exception was successfully stashed, or `0` if the failure could not be
+/// turned into a throwable (legacy silent-drop fallback).
+///
+/// Returning `i64::MIN` makes the JIT caller's post-invoke exception guard
+/// (`emit_post_invoke_exception_check` in `jit/src/x64.rs`) fire and deopt
+/// out, so the interpreter routes the real exception through the method's
+/// exception table — instead of the JIT running on with a bogus `0` and
+/// masking the true failure with a downstream secondary error.
+#[must_use]
 fn handle_jit_dispatch_error(
     vm: &SharedVm,
     thread: &mut JvmThread,
     err: crate::error::MethodCallFailed,
     info: &JitInvokeInfo,
-) {
+) -> i64 {
     use crate::error::{MethodCallFailed, RuntimeError, VmError};
     match err {
         MethodCallFailed::ExceptionThrown(exc) => {
@@ -1617,6 +1642,14 @@ fn handle_jit_dispatch_error(
                 set_jit_pending_exception(exc);
             }
         }
+    }
+    // Return the deopt sentinel iff a pending exception was actually
+    // stashed; otherwise `0` (legacy silent-drop — exception construction
+    // itself failed, nothing for the caller to route).
+    if jit_pending_exception_is_set() {
+        i64::MIN
+    } else {
+        0
     }
 }
 
@@ -1856,17 +1889,16 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             match r {
                                 Ok(v) => v,
                                 Err(e2) => {
-                                    handle_jit_dispatch_error(vm, thread, e2, info);
-                                    return 0;
+                                    return handle_jit_dispatch_error(
+                                        vm, thread, e2, info,
+                                    );
                                 }
                             }
                         } else {
-                            handle_jit_dispatch_error(vm, thread, e, info);
-                            return 0;
+                            return handle_jit_dispatch_error(vm, thread, e, info);
                         }
                     } else {
-                        handle_jit_dispatch_error(vm, thread, e, info);
-                        return 0;
+                        return handle_jit_dispatch_error(vm, thread, e, info);
                     }
                 }
             }
@@ -1883,8 +1915,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             match r {
                 Ok(v) => v,
                 Err(e) => {
-                    handle_jit_dispatch_error(vm, thread, e, info);
-                    return 0;
+                    return handle_jit_dispatch_error(vm, thread, e, info);
                 }
             }
         }
@@ -2127,6 +2158,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         );
         // S111r12 — JIT MIC fast-path rescue: same CP-class fallback
         // as the cache-miss branch below (see comment there).
+        //
+        // Round-fix (Jetty): a thrown exception from the MIC dispatch must
+        // be routed through `handle_jit_dispatch_error` (stash + return the
+        // `i64::MIN` deopt sentinel) — the old code merely logged it and
+        // returned 0, silently swallowing the exception and letting the JIT
+        // caller run on with a bogus value.
         let result = match invoke_res {
             Ok(v) => v,
             Err(crate::error::MethodCallFailed::InternalError(
@@ -2136,22 +2173,22 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             )) if !info.class_name.is_empty()
                 && &*class_name != info.class_name =>
             {
-                crate::vm::invoke_or_native(
+                match crate::vm::invoke_or_native(
                     vm,
                     thread,
                     info.class_name,
                     info.method_name,
                     info.descriptor,
                     &full_args,
-                )
-                .unwrap_or_else(|e2| {
-                    tracing::error!("JIT MIC fast-path CP-class rescue error: {:?}", e2);
-                    None
-                })
+                ) {
+                    Ok(v) => v,
+                    Err(e2) => {
+                        return handle_jit_dispatch_error(vm, thread, e2, info);
+                    }
+                }
             }
             Err(e) => {
-                tracing::error!("JIT virtual MIC dispatch error: {:?}", e);
-                None
+                return handle_jit_dispatch_error(vm, thread, e, info);
             }
         };
 
@@ -2237,22 +2274,25 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         )) if !info.class_name.is_empty()
             && &*class_name != info.class_name =>
         {
-            crate::vm::invoke_or_native(
+            match crate::vm::invoke_or_native(
                 vm,
                 thread,
                 info.class_name,
                 info.method_name,
                 info.descriptor,
                 &full_args,
-            )
-            .unwrap_or_else(|e2| {
-                tracing::error!("JIT MIC CP-class rescue error: {:?}", e2);
-                None
-            })
+            ) {
+                Ok(v) => v,
+                Err(e2) => {
+                    return handle_jit_dispatch_error(vm, thread, e2, info);
+                }
+            }
         }
+        // Round-fix (Jetty): route a thrown exception through
+        // `handle_jit_dispatch_error` (stash + return the `i64::MIN` deopt
+        // sentinel) rather than logging and returning a bogus 0.
         Err(e) => {
-            tracing::error!("JIT virtual MIC dispatch error: {:?}", e);
-            None
+            return handle_jit_dispatch_error(vm, thread, e, info);
         }
     };
 
