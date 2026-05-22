@@ -69,7 +69,10 @@ ASCP=$(find "$APPS/apache-cassandra-4.1.4/lib" -name "*.jar" 2>/dev/null | sed '
 NJCP=$(find "$APPS/neo4j-community-5.18.1/lib" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
 [ -n "$NJCP" ] && run neo4j CRATONVM_NEO4J_REAL 30 -c "$NJCP" org.neo4j.server.startup.Neo4jBoot -- version
 
-SOCP=$(find "$APPS/solr-9.5.0" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
+# SolrCLI lives in solr-core-*.jar under server/solr-webapp/webapp/WEB-INF/lib;
+# match bin/solr.cmd's classpath (WEB-INF/lib/* + server/lib/ext/*) rather than
+# globbing every jar in the distro (which drags in 300+ optional module jars).
+SOCP=$(find "$APPS/solr-9.5.0/server/solr-webapp/webapp/WEB-INF/lib" "$APPS/solr-9.5.0/server/lib/ext" -name "*.jar" 2>/dev/null | sed 's|^/c|C:|' | tr '\n' ';' | sed 's/;$//')
 [ -n "$SOCP" ] && run solr CRATONVM_SOLR_REAL 30 -c "$SOCP" org.apache.solr.cli.SolrCLI -- version
 
 JTHOME=$APPS/jetty-home-11.0.20
