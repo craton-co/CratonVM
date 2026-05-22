@@ -183,7 +183,19 @@ fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: us
     // `NoSuchMethodError Object.iterator()`.
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => class_id,
-        Err(_) => ctx.class_id_by_name(class_name).unwrap_or(ClassId::new(0)),
+        Err(_) => match ctx.class_id_by_name(class_name) {
+            Some(id) => id,
+            // No real or already-registered class with this name. Previously
+            // this degraded to `ClassId::new(0)` (`java/lang/Object`), which
+            // (a) the GC field-bounds guard rejects as an undersized layout
+            // and (b) loses the class identity — natives registered on
+            // `class_name` (e.g. the `hasMoreElements`/`nextElement` on
+            // `cratonvm/internal/SnapshotEnumeration`) no longer resolve, so
+            // callers hit a `NoSuchMethodError`. Instead create a synthetic
+            // class carrying THIS name + `num_fields`, so those name-keyed
+            // natives dispatch and the object layout is well-sized.
+            None => ctx.ensure_synthetic_class(class_name, num_fields),
+        },
     };
     ctx.alloc_object(cid, num_fields)
 }
