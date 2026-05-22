@@ -1,0 +1,513 @@
+//! Differential tests for the ARRAYCOPY JIT intrinsic family — the
+//! `java.lang.System.arraycopy` call-site intrinsic (Phase 2).
+//!
+//! Unlike the pure-leaf bit-op intrinsics, `arraycopy` touches the heap: the
+//! emitted code dereferences real array objects laid out exactly like the
+//! VM's `ObjectHeader` (`cratonvm_types::heap_types`). Each test therefore
+//! builds a byte buffer with that precise layout — a 40-byte header followed
+//! by compact element data — passes raw pointers to the JIT-compiled wrapper,
+//! and asserts the destination buffer matches a host-computed reference.
+//!
+//! Coverage:
+//!   * forward copy between two distinct primitive arrays,
+//!   * overlapping copy within one array, dst > src (must copy backward),
+//!   * overlapping copy within one array, dst < src (forward is correct),
+//!   * empty copy (len == 0) — a no-op,
+//!   * out-of-bounds copy — must NOT corrupt memory; the inline guard
+//!     branches to the uncommon-trap deopt stub (the interpreter then
+//!     re-runs the call via native `System.arraycopy`, which throws AIOOBE),
+//!   * the matcher registers exactly the one type-erased descriptor.
+//!
+//! The inline fast path runs entirely without calling a runtime helper, so a
+//! stub `JitRuntimeHelpers` is sufficient. The single exception is the
+//! out-of-bounds test, whose deopt stub does call `uncommon_trap`; a counting
+//! stub there confirms the trap fired and that no copy was performed.
+
+use cratonvm_jit::x64::compile;
+use cratonvm_jit::JitDirectCall;
+use cratonvm_jit_api::JitRuntimeHelpers;
+use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// Records every `uncommon_trap` invocation so the deopt tests can assert the
+/// inline guard bailed instead of copying. `uncommon_trap` is a fixed
+/// `extern "C"` pointer baked into every compiled method, so the counter must
+/// be a process-global; the `DEOPT_LOCK` below serialises the deopt tests so
+/// their before/after reads of this counter are not interleaved.
+static TRAP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Serialises the deopt-path tests. They share the global `TRAP_COUNT`, so
+/// without this lock two of them running in parallel would each observe the
+/// other's increment and the `before + 1` assertion would spuriously fail.
+static DEOPT_LOCK: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" fn recording_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) -> i64 {
+    TRAP_COUNT.fetch_add(1, Ordering::SeqCst);
+    0 // deopt action code; the JIT stub then returns i64::MIN itself
+}
+
+/// Runtime helpers. The arraycopy fast path never calls a helper; only the
+/// deopt stub calls `uncommon_trap`, so that one slot is wired to a real
+/// recording function and the rest are panic stubs.
+fn helpers() -> JitRuntimeHelpers {
+    unsafe extern "C" fn stub() {
+        panic!("ARRAYCOPY intrinsic test invoked an unwired runtime helper");
+    }
+    let s = stub as *const () as usize;
+    JitRuntimeHelpers {
+        newarray: s,
+        new_object: s,
+        anewarray_object: s,
+        baload: s,
+        bastore: s,
+        iaload: s,
+        iastore: s,
+        aaload: s,
+        aastore: s,
+        multianewarray_2d: s,
+        arraylength: s,
+        getfield: s,
+        putfield_int: s,
+        putfield_long: s,
+        putfield_float: s,
+        putfield_double: s,
+        putfield_object: s,
+        getstatic: s,
+        putstatic_int: s,
+        putstatic_long: s,
+        putstatic_float: s,
+        putstatic_double: s,
+        putstatic_object: s,
+        checkcast: s,
+        instanceof_check: s,
+        throw_aioobe: s,
+        invoke_dispatch: s,
+        invoke_virtual_mic: s,
+        write_barrier: s,
+        satb_pre_write_barrier: s,
+        uncommon_trap: recording_uncommon_trap as *const () as usize,
+        math_fma_double: s,
+        math_fma_float: s,
+        tlab_cursor_offset_in_thread: 0,
+        tlab_end_offset_in_thread: 8,
+        class_id_offset_in_obj: 0,
+        get_current_thread: 0,
+        tlab_post_init: 0,
+    }
+}
+
+/// A heap array object laid out byte-for-byte like the VM's compact array:
+/// a `HEADER_SIZE`-byte `ObjectHeader` followed by tightly packed element
+/// data. Backed by a `Vec<u64>` so the base address is 8-byte aligned.
+struct FakeArray {
+    storage: Vec<u64>,
+    elem_size: usize,
+    length: usize,
+}
+
+impl FakeArray {
+    /// Build an array of `length` elements of the given primitive kind,
+    /// element data initialised from `init` (one byte value per element,
+    /// broadcast across the element's bytes is *not* done — only byte arrays
+    /// use 1-byte elements; `init` is written into the low byte and the rest
+    /// zeroed, which is enough to make the differential comparison precise).
+    fn new(kind: ArrayElementType, elem_size: usize, length: usize) -> Self {
+        let data_bytes = length * elem_size;
+        let total = HEADER_SIZE + data_bytes;
+        let words = total.div_ceil(8).max(1);
+        let mut storage = vec![0u64; words];
+        // Write the header fields at their documented offsets.
+        let base = storage.as_mut_ptr() as *mut u8;
+        unsafe {
+            // class_id (offset 0): leave 0 — primitive arrays carry ClassId(0).
+            // kind (offset 4): ObjectKind::Array == 1.
+            *base.add(4) = ObjectKind::Array as u8;
+            // element_type (offset 5).
+            *base.add(5) = kind as u8;
+            // array_length (offset 12, u32 little-endian).
+            let len_le = (length as u32).to_le_bytes();
+            std::ptr::copy_nonoverlapping(len_le.as_ptr(), base.add(12), 4);
+        }
+        FakeArray {
+            storage,
+            elem_size,
+            length,
+        }
+    }
+
+    fn ptr(&self) -> i64 {
+        self.storage.as_ptr() as i64
+    }
+
+    fn data_ptr(&self) -> *mut u8 {
+        unsafe { (self.storage.as_ptr() as *mut u8).add(HEADER_SIZE) }
+    }
+
+    /// Write element `idx` from the low `elem_size` bytes of `value`.
+    fn set(&mut self, idx: usize, value: u64) {
+        assert!(idx < self.length);
+        let p = self.data_ptr();
+        let le = value.to_le_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(le.as_ptr(), p.add(idx * self.elem_size), self.elem_size);
+        }
+    }
+
+    /// Read element `idx` zero-extended into a u64.
+    fn get(&self, idx: usize) -> u64 {
+        assert!(idx < self.length);
+        let p = self.data_ptr();
+        let mut buf = [0u8; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                p.add(idx * self.elem_size),
+                buf.as_mut_ptr(),
+                self.elem_size,
+            );
+        }
+        u64::from_le_bytes(buf)
+    }
+}
+
+/// JIT-compile the wrapper method
+///   `void f(Object src, int srcPos, Object dst, int dstPos, int len)
+///        { System.arraycopy(src, srcPos, dst, dstPos, len); }`
+/// and return a closure that runs it.
+///
+/// Bytecode (invokestatic at pc 6):
+///   aload_0 (2a), iload_1 (1b), aload_2 (2c), iload_3 (1d),
+///   iload 4 (15 04), invokestatic (b8 00 01), return (b1)
+fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
+    let entry = cratonvm_jit::try_resolve_intrinsic(
+        "java/lang/System",
+        "arraycopy",
+        "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+    )
+    .expect("System.arraycopy must register as an intrinsic")
+    .0;
+
+    let code: Vec<u8> = vec![
+        0x2a, 0x1b, 0x2c, 0x1d, 0x15, 0x04, 0xb8, 0x00, 0x01, 0xb1, 0, 0,
+    ];
+    let compiled = compile(
+        &code,
+        code.len(),
+        5, // num_params: src, srcPos, dst, dstPos, len
+        5, // max_locals
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            6,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 5,
+                return_type: b'V',
+            },
+        )],
+        Vec::new(), // mic_slots
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+    )
+    .expect("JIT compilation of the arraycopy wrapper failed");
+
+    move |src: i64, src_pos: i32, dst: i64, dst_pos: i32, len: i32| {
+        // SAFETY: `compiled` was produced by the JIT from valid bytecode and
+        // the mmap region is executable. The pointer args reference live
+        // `FakeArray` storage owned by the caller for the call's duration.
+        unsafe {
+            compiled.call(&[
+                src,
+                src_pos as i64,
+                dst,
+                dst_pos as i64,
+                len as i64,
+            ]);
+        }
+    }
+}
+
+#[test]
+fn arraycopy_matcher_registers_only_the_erased_descriptor() {
+    // The single type-erased descriptor is registered.
+    assert!(
+        cratonvm_jit::try_resolve_intrinsic(
+            "java/lang/System",
+            "arraycopy",
+            "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+        )
+        .is_some(),
+        "the canonical System.arraycopy descriptor must register"
+    );
+    // Nothing else on System is an arraycopy intrinsic.
+    assert!(
+        cratonvm_jit::try_resolve_intrinsic("java/lang/System", "currentTimeMillis", "()J")
+            .is_none()
+    );
+    assert!(
+        cratonvm_jit::try_resolve_intrinsic("java/lang/Object", "arraycopy", "()V").is_none()
+    );
+}
+
+#[test]
+fn arraycopy_forward_distinct_int_arrays() {
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Int, 4, 8);
+    let mut dst = FakeArray::new(ArrayElementType::Int, 4, 8);
+    for i in 0..8 {
+        src.set(i, 0x1000 + i as u64);
+        dst.set(i, 0xEEEE_0000 + i as u64);
+    }
+    // Copy src[1..6] -> dst[2..7].
+    f(src.ptr(), 1, dst.ptr(), 2, 5);
+    for i in 0..8 {
+        let expected = if (2..7).contains(&i) {
+            0x1000 + (i as u64 - 1)
+        } else {
+            0xEEEE_0000 + i as u64
+        };
+        assert_eq!(dst.get(i), expected, "dst[{i}] after forward copy");
+    }
+    // src is untouched.
+    for i in 0..8 {
+        assert_eq!(src.get(i), 0x1000 + i as u64, "src[{i}] must be unchanged");
+    }
+}
+
+#[test]
+fn arraycopy_overlapping_same_array_dst_greater_than_src() {
+    // dst > src within one array: regions overlap "forward", so a naive
+    // forward byte copy would corrupt the tail. The intrinsic must copy
+    // backward (STD) and behave like memmove.
+    let f = compile_arraycopy();
+    let mut a = FakeArray::new(ArrayElementType::Int, 4, 10);
+    for i in 0..10 {
+        a.set(i, i as u64);
+    }
+    // a[0..6] -> a[3..9].
+    f(a.ptr(), 0, a.ptr(), 3, 6);
+    let mut expected = [0u64; 10];
+    for i in 0..10 {
+        expected[i] = i as u64;
+    }
+    // memmove reference.
+    let snapshot = expected;
+    for i in 0..6 {
+        expected[3 + i] = snapshot[i];
+    }
+    for i in 0..10 {
+        assert_eq!(a.get(i), expected[i], "a[{i}] after overlap dst>src");
+    }
+}
+
+#[test]
+fn arraycopy_overlapping_same_array_dst_less_than_src() {
+    // dst < src within one array: a forward copy is already correct, but the
+    // intrinsic must still produce memmove semantics.
+    let f = compile_arraycopy();
+    let mut a = FakeArray::new(ArrayElementType::Int, 4, 10);
+    for i in 0..10 {
+        a.set(i, 100 + i as u64);
+    }
+    // a[4..10] -> a[1..7].
+    f(a.ptr(), 4, a.ptr(), 1, 6);
+    let mut expected = [0u64; 10];
+    for i in 0..10 {
+        expected[i] = 100 + i as u64;
+    }
+    let snapshot = expected;
+    for i in 0..6 {
+        expected[1 + i] = snapshot[4 + i];
+    }
+    for i in 0..10 {
+        assert_eq!(a.get(i), expected[i], "a[{i}] after overlap dst<src");
+    }
+}
+
+#[test]
+fn arraycopy_byte_arrays_overlap_backward() {
+    // 1-byte elements stress the REP MOVSB path with shift == 0.
+    let f = compile_arraycopy();
+    let mut a = FakeArray::new(ArrayElementType::Byte, 1, 16);
+    for i in 0..16 {
+        a.set(i, i as u64);
+    }
+    // a[0..10] -> a[5..15], overlapping, dst > src.
+    f(a.ptr(), 0, a.ptr(), 5, 10);
+    let mut expected = [0u64; 16];
+    for i in 0..16 {
+        expected[i] = i as u64;
+    }
+    let snapshot = expected;
+    for i in 0..10 {
+        expected[5 + i] = snapshot[i];
+    }
+    for i in 0..16 {
+        assert_eq!(a.get(i), expected[i], "byte a[{i}] after overlap");
+    }
+}
+
+#[test]
+fn arraycopy_long_arrays_distinct() {
+    // 8-byte elements stress the REP MOVSB path with shift == 3.
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Long, 8, 6);
+    let mut dst = FakeArray::new(ArrayElementType::Long, 8, 6);
+    for i in 0..6 {
+        src.set(i, 0xDEAD_0000_0000_0000 | i as u64);
+        dst.set(i, 0);
+    }
+    f(src.ptr(), 0, dst.ptr(), 0, 6);
+    for i in 0..6 {
+        assert_eq!(
+            dst.get(i),
+            0xDEAD_0000_0000_0000 | i as u64,
+            "long dst[{i}]"
+        );
+    }
+}
+
+#[test]
+fn arraycopy_empty_copy_is_a_noop() {
+    let _g = DEOPT_LOCK.lock().unwrap();
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Int, 4, 4);
+    let mut dst = FakeArray::new(ArrayElementType::Int, 4, 4);
+    for i in 0..4 {
+        src.set(i, 7 + i as u64);
+        dst.set(i, 0xABCD_0000 + i as u64);
+    }
+    let before_traps = TRAP_COUNT.load(Ordering::SeqCst);
+    // len == 0 with valid in-range positions: no copy, no deopt.
+    f(src.ptr(), 1, dst.ptr(), 2, 0);
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before_traps,
+        "empty copy with valid positions must not deopt"
+    );
+    for i in 0..4 {
+        assert_eq!(dst.get(i), 0xABCD_0000 + i as u64, "dst[{i}] after empty copy");
+    }
+}
+
+#[test]
+fn arraycopy_out_of_bounds_deopts_without_corruption() {
+    let _g = DEOPT_LOCK.lock().unwrap();
+    // srcPos + len exceeds src.length. The inline bounds guard must branch
+    // to the uncommon-trap deopt stub — NOT perform a partial/over-run copy.
+    // The interpreter would then re-run the call via native arraycopy, which
+    // throws ArrayIndexOutOfBoundsException; here we only verify the JIT side
+    // bailed cleanly and left the destination untouched.
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Int, 4, 4);
+    let mut dst = FakeArray::new(ArrayElementType::Int, 4, 8);
+    for i in 0..4 {
+        src.set(i, 1 + i as u64);
+    }
+    for i in 0..8 {
+        dst.set(i, 0x5555_0000 + i as u64);
+    }
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    // srcPos=2, len=5 -> 2+5 = 7 > src.length(4): out of bounds.
+    f(src.ptr(), 2, dst.ptr(), 0, 5);
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "out-of-bounds arraycopy must trigger exactly one uncommon-trap deopt"
+    );
+    // The destination must be byte-identical to its pre-call contents.
+    for i in 0..8 {
+        assert_eq!(
+            dst.get(i),
+            0x5555_0000 + i as u64,
+            "dst[{i}] must be untouched after an out-of-bounds bail"
+        );
+    }
+}
+
+#[test]
+fn arraycopy_negative_position_deopts() {
+    let _g = DEOPT_LOCK.lock().unwrap();
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Int, 4, 4);
+    let mut dst = FakeArray::new(ArrayElementType::Int, 4, 4);
+    for i in 0..4 {
+        src.set(i, 9 + i as u64);
+        dst.set(i, 0x3333_0000 + i as u64);
+    }
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    // srcPos = -1: negative position must bail.
+    f(src.ptr(), -1, dst.ptr(), 0, 2);
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "negative srcPos must trigger an uncommon-trap deopt"
+    );
+    for i in 0..4 {
+        assert_eq!(dst.get(i), 0x3333_0000 + i as u64, "dst[{i}] untouched");
+    }
+}
+
+#[test]
+fn arraycopy_mismatched_element_kinds_deopts() {
+    let _g = DEOPT_LOCK.lock().unwrap();
+    // src is int[], dst is long[]: incompatible element kinds. The inline
+    // element-kind guard must bail so the interpreter can throw
+    // ArrayStoreException via native arraycopy.
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Int, 4, 4);
+    let mut dst = FakeArray::new(ArrayElementType::Long, 8, 4);
+    for i in 0..4 {
+        src.set(i, i as u64);
+        dst.set(i, 0x7777_0000 + i as u64);
+    }
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    f(src.ptr(), 0, dst.ptr(), 0, 2);
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "mismatched element kinds must trigger an uncommon-trap deopt"
+    );
+    for i in 0..4 {
+        assert_eq!(dst.get(i), 0x7777_0000 + i as u64, "dst[{i}] untouched");
+    }
+}
+
+#[test]
+fn arraycopy_reference_array_deopts() {
+    let _g = DEOPT_LOCK.lock().unwrap();
+    // A reference array (element_type == Reference == 0) is never inlined:
+    // the GC store barrier and ArrayStoreException semantics make it unsafe.
+    // The element-kind guard's "< 4" primitive check must bail.
+    let f = compile_arraycopy();
+    let mut src = FakeArray::new(ArrayElementType::Reference, 8, 4);
+    let mut dst = FakeArray::new(ArrayElementType::Reference, 8, 4);
+    for i in 0..4 {
+        src.set(i, 0);
+        dst.set(i, 0xBEEF_0000 + i as u64);
+    }
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    f(src.ptr(), 0, dst.ptr(), 0, 2);
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "reference-array arraycopy must bail to native (one deopt)"
+    );
+    for i in 0..4 {
+        assert_eq!(dst.get(i), 0xBEEF_0000 + i as u64, "dst[{i}] untouched");
+    }
+}

@@ -12344,7 +12344,276 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: LONG_BITS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
+                        else if callee_entry
+                            == super::JitIntrinsic::ArraycopyPrimitive.as_entry()
+                        {
+                            // Phase 2 — System.arraycopy(src, srcPos, dst,
+                            // dstPos, len). The descriptor is type-erased;
+                            // the element kind is only known at runtime.
+                            //
+                            // Strategy (roadmap §3.3/§3.4): inline a
+                            // primitive fast path. The emitted code performs
+                            // a runtime dispatch — null checks, an
+                            // is-array + same-primitive-element-kind check,
+                            // and the five fused bounds checks of
+                            // `native_system_arraycopy`. Whenever ANY guard
+                            // is unsatisfied — null receiver, non-array,
+                            // reference array, mismatched/incompatible
+                            // element kinds, or an out-of-bounds position —
+                            // control branches to the uncommon-trap deopt
+                            // stub (DEOPT_REASON_BOUNDS_CHECK = 2). That
+                            // re-runs the whole method in the interpreter,
+                            // which dispatches `System.arraycopy` through
+                            // the native registry. The native impl throws
+                            // NullPointerException / ArrayStoreException /
+                            // ArrayIndexOutOfBoundsException and applies the
+                            // GC store barrier exactly — so correctness for
+                            // every bailed case is delegated verbatim and
+                            // reference arrays are never inlined.
+                            //
+                            // The proven-safe primitive case copies via
+                            // `REP MOVSB` with memmove semantics: when src
+                            // and dst are the SAME array and dstPos > srcPos
+                            // the regions may overlap forward, so the copy
+                            // runs backward (STD) in that case and forward
+                            // (CLD) otherwise. Distinct arrays are distinct
+                            // allocations and never overlap.
+                            //
+                            // Operand stack (deepest first): src, srcPos,
+                            // dst, dstPos, len.
+                            self.flush_scratch_registers();
+                            let len_slot = self.pop_stack();
+                            let dst_pos_slot = self.pop_stack();
+                            let dst_slot = self.pop_stack();
+                            let src_pos_slot = self.pop_stack();
+                            let src_slot = self.pop_stack();
 
+                            // Pin all five operands into owned frame scratch
+                            // slots. After the five pops `next_spill_offset`
+                            // sits below the slots the operands occupied, so
+                            // these offsets are guaranteed in-frame (the
+                            // call site had >=5 operand-stack entries, hence
+                            // max_stack >= 5). They are scratch-only:
+                            // arraycopy pushes nothing, so the next bytecode
+                            // re-allocates spill slots from the same base.
+                            let s_src = self.next_spill_offset;
+                            let s_src_pos = self.next_spill_offset + 8;
+                            let s_dst = self.next_spill_offset + 16;
+                            let s_dst_pos = self.next_spill_offset + 24;
+                            let s_len = self.next_spill_offset + 32;
+                            self.load_slot_to_reg(RAX, src_slot);
+                            self.emit_store_local(s_src, RAX);
+                            self.load_slot_to_reg(RAX, src_pos_slot);
+                            self.emit_store_local(s_src_pos, RAX);
+                            self.load_slot_to_reg(RAX, dst_slot);
+                            self.emit_store_local(s_dst, RAX);
+                            self.load_slot_to_reg(RAX, dst_pos_slot);
+                            self.emit_store_local(s_dst_pos, RAX);
+                            self.load_slot_to_reg(RAX, len_slot);
+                            self.emit_store_local(s_len, RAX);
+
+                            // Collect every "bail to native" branch patch
+                            // here; they are all wired to one shared deopt
+                            // stub (reason 2) after the inline body.
+                            let mut bail_patches: Vec<usize> = Vec::new();
+
+                            // --- Guard 1: src != null ---
+                            self.emit_load_local(RAX, s_src);
+                            self.emit_test_r64_r64(RAX);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                            // --- Guard 2: dst != null ---
+                            self.emit_load_local(RCX, s_dst);
+                            self.emit_test_r64_r64(RCX);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                            // --- Guard 3: both are arrays (ObjectHeader.kind
+                            // at offset 4 == ObjectKind::Array == 1) ---
+                            // MOVZX EDX, BYTE [RAX + 4]  (src kind)
+                            self.buf.emit(&[0x0F, 0xB6, 0x50, 0x04]);
+                            // CMP EDX, 1
+                            self.buf.emit(&[0x83, 0xFA, 0x01]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                            // MOVZX EDX, BYTE [RCX + 4]  (dst kind)
+                            self.buf.emit(&[0x0F, 0xB6, 0x51, 0x04]);
+                            self.buf.emit(&[0x83, 0xFA, 0x01]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+
+                            // --- Guard 4: same element kind AND primitive ---
+                            // ObjectHeader.element_type is the byte at
+                            // offset 5. ArrayElementType: Reference=0,
+                            // Boolean=4, Char=5, Float=6, Double=7, Byte=8,
+                            // Short=9, Int=10, Long=11.
+                            // MOVZX EDX, BYTE [RAX + 5]  (src element_type)
+                            self.buf.emit(&[0x0F, 0xB6, 0x50, 0x05]);
+                            // MOVZX R10D, BYTE [RCX + 5] (dst element_type)
+                            self.buf.emit(&[0x44, 0x0F, 0xB6, 0x51, 0x05]);
+                            // CMP EDX, R10D  → element kinds must be equal
+                            self.buf.emit(&[0x44, 0x3B, 0xD2]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                            // CMP EDX, 4 → primitive kinds are 4..=11; a
+                            // value < 4 means Reference (0) — bail (the GC
+                            // store barrier / ArrayStoreException make
+                            // reference copies unsafe to inline).
+                            self.buf.emit(&[0x83, 0xFA, 0x04]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB (unsigned <)
+
+                            // shift = (element_type - 4) & 3, where
+                            //   width == 1 << shift  for every primitive
+                            //   kind (verified: 4→0,5→1,6→2,7→3,8→0,9→1,
+                            //   10→2,11→3). Stash the shift in R11 (scratch,
+                            //   untouched until the copy below).
+                            // SUB EDX, 4
+                            self.buf.emit(&[0x83, 0xEA, 0x04]);
+                            // AND EDX, 3
+                            self.buf.emit(&[0x83, 0xE2, 0x03]);
+                            // MOV R11D, EDX
+                            self.buf.emit(&[0x41, 0x89, 0xD3]);
+
+                            // --- Guard 5: bounds checks ---
+                            // Load srcPos, dstPos, len sign-extended to
+                            // 64-bit so the pos+len additions cannot
+                            // overflow.
+                            // srcPos → RAX
+                            self.emit_load_local(RAX, s_src_pos);
+                            self.buf.emit(&[0x48, 0x63, 0xC0]); // MOVSXD RAX, EAX
+                            // dstPos → RDX
+                            self.emit_load_local(RDX, s_dst_pos);
+                            self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX, EDX
+                            // len → RCX
+                            self.emit_load_local(RCX, s_len);
+                            self.buf.emit(&[0x48, 0x63, 0xC9]); // MOVSXD RCX, ECX
+
+                            // srcPos < 0 ?  TEST RAX,RAX; JS bail
+                            self.emit_test_r64_r64(RAX);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
+                            // dstPos < 0 ?  TEST RDX,RDX; JS bail
+                            self.emit_test_r64_r64(RDX);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
+                            // len < 0 ?  TEST RCX,RCX; JS bail
+                            self.emit_test_r64_r64(RCX);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x88)); // JS
+
+                            // srcPos + len > src.length ?
+                            // R10 = srcPos + len
+                            self.buf.emit(&[0x49, 0x89, 0xC2]); // MOV R10, RAX
+                            self.buf.emit(&[0x49, 0x01, 0xCA]); // ADD R10, RCX
+                            // RAX = src ptr; EAX = src.length (zero-extended,
+                            // so the 64-bit value is non-negative).
+                            self.emit_load_local(RAX, s_src);
+                            self.buf.emit(&[0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RAX+12]
+                            // CMP R10, RAX  (srcPos+len vs src.length)
+                            self.buf.emit(&[0x49, 0x39, 0xC2]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG (signed >)
+
+                            // dstPos + len > dst.length ?
+                            self.buf.emit(&[0x49, 0x89, 0xD2]); // MOV R10, RDX
+                            self.buf.emit(&[0x49, 0x01, 0xCA]); // ADD R10, RCX
+                            self.emit_load_local(RAX, s_dst);
+                            self.buf.emit(&[0x8B, 0x40, ARRAY_LENGTH_OFFSET as u8]); // MOV EAX,[RAX+12]
+                            self.buf.emit(&[0x49, 0x39, 0xC2]); // CMP R10, RAX
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x8F)); // JG
+
+                            // --- len == 0 fast exit ---
+                            // All bounds are validated; an empty copy is a
+                            // no-op. RCX still holds the sign-extended len.
+                            self.emit_test_r64_r64(RCX);
+                            let zero_len_skip = self.emit_jcc_rel32_patch(0x84); // JZ → done
+
+                            // --- compute byte addresses & count ---
+                            // Preserve RSI / RDI: on Windows they are
+                            // callee-saved AND used by the local register
+                            // allocator (LOCAL_REGS), so they may hold live
+                            // locals. PUSH/POP brackets the REP MOVSB; no
+                            // CALL occurs in between, so RSP stays balanced.
+                            // PUSH RSI ; PUSH RDI
+                            self.buf.emit(&[0x56, 0x57]);
+
+                            // shift → CL
+                            // MOV ECX, R11D
+                            self.buf.emit(&[0x44, 0x89, 0xD9]);
+
+                            // srcAddr = src + HEADER_SIZE + (srcPos << shift)
+                            self.emit_load_local(RSI, s_src_pos);
+                            self.buf.emit(&[0x48, 0x63, 0xF6]); // MOVSXD RSI, ESI
+                            self.buf.emit(&[0x48, 0xD3, 0xE6]); // SHL RSI, CL
+                            self.emit_load_local(RAX, s_src);
+                            self.buf.emit(&[0x48, 0x01, 0xC6]); // ADD RSI, RAX
+                            self.buf.emit(&[0x48, 0x83, 0xC6, HEADER_SIZE as u8]); // ADD RSI, HEADER_SIZE
+
+                            // dstAddr = dst + HEADER_SIZE + (dstPos << shift)
+                            self.emit_load_local(RDI, s_dst_pos);
+                            self.buf.emit(&[0x48, 0x63, 0xFF]); // MOVSXD RDI, EDI
+                            self.buf.emit(&[0x48, 0xD3, 0xE7]); // SHL RDI, CL
+                            self.emit_load_local(RAX, s_dst);
+                            self.buf.emit(&[0x48, 0x01, 0xC7]); // ADD RDI, RAX
+                            self.buf.emit(&[0x48, 0x83, 0xC7, HEADER_SIZE as u8]); // ADD RDI, HEADER_SIZE
+
+                            // byteCount = len << shift  → RDX (kept for the
+                            // backward-copy adjust, then copied into RCX
+                            // for REP).
+                            self.emit_load_local(RDX, s_len);
+                            self.buf.emit(&[0x48, 0x63, 0xD2]); // MOVSXD RDX, EDX
+                            self.buf.emit(&[0x48, 0xD3, 0xE2]); // SHL RDX, CL
+
+                            // --- direction select ---
+                            // Overlap is possible only within the SAME
+                            // array; distinct arrays are distinct heap
+                            // allocations. Copy backward iff
+                            //   src_ptr == dst_ptr  &&  dstPos > srcPos.
+                            // Otherwise forward is always memmove-correct.
+                            self.emit_load_local(RAX, s_src);
+                            self.emit_load_local(RCX, s_dst);
+                            // CMP RAX, RCX
+                            self.buf.emit(&[0x48, 0x39, 0xC8]);
+                            let fwd_if_diff = self.emit_jcc_rel32_patch(0x85); // JNE → forward
+                            // same array: compare dstPos vs srcPos (signed
+                            // 32-bit; both already validated >= 0).
+                            self.emit_load_local(RAX, s_dst_pos);
+                            self.emit_load_local(RCX, s_src_pos);
+                            // CMP EAX, ECX  (dstPos vs srcPos)
+                            self.buf.emit(&[0x39, 0xC8]);
+                            let fwd_if_le = self.emit_jcc_rel32_patch(0x8E); // JLE → forward
+
+                            // --- backward copy (STD) ---
+                            // Point RSI/RDI at the LAST byte of each region:
+                            //   addr += byteCount - 1.
+                            // LEA RSI, [RSI + RDX - 1]
+                            self.buf.emit(&[0x48, 0x8D, 0x74, 0x16, 0xFF]);
+                            // LEA RDI, [RDI + RDX - 1]
+                            self.buf.emit(&[0x48, 0x8D, 0x7C, 0x17, 0xFF]);
+                            // MOV RCX, RDX  (byte count)
+                            self.buf.emit(&[0x48, 0x89, 0xD1]);
+                            // STD ; REP MOVSB ; CLD
+                            self.buf.emit(&[0xFD, 0xF3, 0xA4, 0xFC]);
+                            let backward_done = self.emit_jmp_rel32_patch();
+
+                            // --- forward copy (CLD) ---
+                            self.patch_rel32_to_here(fwd_if_diff);
+                            self.patch_rel32_to_here(fwd_if_le);
+                            // MOV RCX, RDX  (byte count)
+                            self.buf.emit(&[0x48, 0x89, 0xD1]);
+                            // CLD ; REP MOVSB
+                            self.buf.emit(&[0xFC, 0xF3, 0xA4]);
+
+                            // Both copy paths converge here.
+                            self.patch_rel32_to_here(backward_done);
+                            // POP RDI ; POP RSI
+                            self.buf.emit(&[0x5F, 0x5E]);
+
+                            // --- done ---
+                            self.patch_rel32_to_here(zero_len_skip);
+
+                            // Wire every bail branch to a shared deopt stub
+                            // (reason 2 = DEOPT_REASON_BOUNDS_CHECK). The
+                            // emit_deopt_stubs pass coalesces equal
+                            // (bci, reason) pairs into one stub, so all the
+                            // bail edges share a single trap.
+                            for patch in bail_patches {
+                                self.deopt_stubs.push((patch, pc, 2));
+                            }
+                            // arraycopy returns void: nothing is pushed.
+                        }
                         // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
