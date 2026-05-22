@@ -7,9 +7,11 @@ pub mod charset;
 pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
+pub mod intrinsic;
 pub mod native_ring;
 pub mod registry;
 
+pub use intrinsic::InterpIntrinsic;
 pub use registry::{
     AnnotationData, AnnotationElementValue, DefineClassFull, FieldMetadata, MethodMetadata,
     NativeCallback, NativeContext, NativeMethodRegistry, StackTraceEntry,

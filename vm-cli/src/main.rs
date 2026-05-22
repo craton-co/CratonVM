@@ -1550,6 +1550,17 @@ fn run() -> Result<()> {
         }
     }
 
+    // Interpreter intrinsic-table stats. `CRATONVM_INTRINSIC_STATS=1` prints
+    // the steady-state intrinsic-dispatch hit count on shutdown — the
+    // counter that verifies acceptance criterion §9 of
+    // docs/feature_roadmap_interpreter_intrinsic_table.md.
+    if matches!(std::env::var("CRATONVM_INTRINSIC_STATS").as_deref(), Ok("1")) {
+        eprintln!(
+            "[cratonvm] interpreter intrinsic dispatches: {}",
+            cratonvm_vm::runtime::interpreter::intrinsic_hit_count()
+        );
+    }
+
     // B6: Silent-exit guard. If main() returned Ok but the VM has recorded
     // one or more swallowed errors during class init / invokedynamic / native
     // calls, surface a WARN to stderr so users (and CI) don't mistake a

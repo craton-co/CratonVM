@@ -69,6 +69,24 @@ pub fn disable_jit() -> bool {
     })
 }
 
+/// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
+/// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
+/// forcing every call through the ordinary native/bytecode dispatch path.
+///
+/// This is the off-switch for the intrinsic-table differential tests: running
+/// a program once with intrinsics on and once with this set to `1` must
+/// produce identical output. Semantics match `disable_jit()` — empty or `"0"`
+/// is treated as disabled (i.e. intrinsics stay enabled), anything else
+/// disables intrinsics.
+#[inline]
+pub fn intrinsics_disabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_DISABLE_INTRINSICS") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");

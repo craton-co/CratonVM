@@ -1950,6 +1950,7 @@ pub fn execute(
                     &helpers,
                     scan.non_escaping_new.clone(), // escape analysis results
                     std::collections::HashMap::new(), // inline_sites
+                    None, // string_layout — String intrinsics land in a later wave
                 )?;
                 // Attach owned metadata to compiled method
                 cm._jit_strings = owned_jit_strings;
@@ -10941,6 +10942,103 @@ fn execute_invokestatic(
     Ok(CachedCallResult::Handled)
 }
 
+// ───────────────────────── Interpreter intrinsic table ─────────────────────
+//
+// See `docs/feature_roadmap_interpreter_intrinsic_table.md`. An intrinsic is a
+// hot JDK method (`String.length`, `Object.getClass`, `System.arraycopy`, …)
+// resolved ONCE at inline-cache fill time into a `CachedInvokeTarget::Intrinsic`
+// entry. The steady-state hit pops args and calls the stored callback with no
+// `RwLock`, no descriptor parse, and no native-registry `HashMap` probe.
+
+/// Process-wide count of intrinsic fast-path dispatches. Incremented on every
+/// `CachedInvokeTarget::Intrinsic` hit (static and virtual). Exposed for the
+/// differential-test harness and profiling/acceptance counters.
+static INTRINSIC_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of interpreter intrinsic fast-path dispatches since process start.
+pub fn intrinsic_hit_count() -> u64 {
+    INTRINSIC_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Dispatch a resolved intrinsic: count the hit, run the callback through the
+/// same `safe_native_call` machinery the `Native`/`VirtualNative` arms use,
+/// and push any return value onto the caller's operand stack.
+///
+/// `args` follows the native-registry convention — `[receiver, param0, …]`
+/// for a virtual call, `[param0, …]` for a static call — so an intrinsic
+/// handler is byte-for-byte interchangeable with the native it shadows.
+#[inline]
+/// Phase 3 — dispatch a resolved interpreter intrinsic. The return-type byte
+/// is pre-computed (stored in the IC entry), so unlike
+/// `invoke_cached_native_callback` this path does NOT scan a descriptor
+/// string at steady state. `safe_native_call` already records the native
+/// ring enter/exit, so — unlike `invoke_cached_native_callback` — this path
+/// does not redundantly record it a second time.
+fn invoke_cached_intrinsic(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    callback: cratonvm_native_api::NativeCallback,
+    args: &[Value],
+    return_type: u8,
+) -> Result<(), MethodCallFailed> {
+    INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+    if let Some(value) = result {
+        let value = if return_type != b'V' {
+            coerce_value_for_return(value, return_type)
+        } else {
+            value
+        };
+        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+        crate::vm::native_return_pushed_to_stack(shared, thread);
+    }
+    Ok(())
+}
+
+/// Largest `num_params + receiver` across the whole intrinsic table — the
+/// widest is `System.arraycopy` (5 static params). An 8-slot stack buffer
+/// covers every intrinsic with headroom, so the steady-state arg pop needs
+/// no heap allocation.
+const MAX_INTRINSIC_ARGS: usize = 8;
+
+/// Phase 3 — pop intrinsic call arguments into a caller-provided stack
+/// buffer using the parameter descriptors cached in the IC entry (split once
+/// at fill time). The steady-state cost is a stack pop per arg plus
+/// `coerce_invoke_arg_for_descriptor`: no `resolve_method_ref` (so no
+/// resolution-cache `RwLock`, no `HashMap` probe), no `split_method_descriptor`
+/// parse, and no heap allocation. `with_receiver` is true for virtual
+/// intrinsics, where the receiver occupies args[0].
+fn pop_coerced_invoke_args_intrinsic<'b>(
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    num_params: usize,
+    param_descs: &[Arc<str>],
+    with_receiver: bool,
+    buf: &'b mut [Value; MAX_INTRINSIC_ARGS],
+) -> Result<&'b [Value], MethodCallFailed> {
+    let total = num_params + with_receiver as usize;
+    debug_assert!(total <= MAX_INTRINSIC_ARGS);
+    // The operand-stack top is the last argument: fill the buffer back-to-front.
+    for i in (0..total).rev() {
+        buf[i] = thread.frames[frame_idx].stack.pop()?;
+    }
+    let base = if with_receiver {
+        buf[0] = coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", buf[0]);
+        1
+    } else {
+        0
+    };
+    for i in 0..num_params {
+        let pd = param_descs
+            .get(i)
+            .map(|s| &**s)
+            .unwrap_or("Ljava/lang/Object;");
+        buf[base + i] = coerce_invoke_arg_for_descriptor(pd, buf[base + i]);
+    }
+    Ok(&buf[..total])
+}
+
 /// Populate the invoke cache for a given (caller_class, cp_index) pair.
 /// Called after the first successful invokestatic to cache everything needed
 /// for subsequent calls to bypass the entire invoke chain.
@@ -10989,6 +11087,46 @@ fn populate_invoke_cache(
             None => RedefineGate::never_stale(),
         };
         drop(cm);
+        // Interpreter intrinsic probe (invokestatic only). The cp class IS
+        // the declaring class for a static call, so keying the table on
+        // `class_name` is correct and needs no receiver guard
+        // (`receiver_class_id: None`). We gate on `!is_special` and on
+        // `intrinsics::is_static(kind)` so an `invokespecial` site (e.g.
+        // `super.hashCode()`) — which targets an instance method and pops
+        // a receiver — is never cached here; that case is left to the slow
+        // path. `intrinsics_disabled()` is the differential-test off-switch.
+        if !is_special && !crate::runtime::env_cache::intrinsics_disabled() {
+            if let Some(kind) = cratonvm_native_builtins::intrinsics::lookup(
+                &class_name,
+                &method_name,
+                &descriptor,
+            )
+            .filter(|k| cratonvm_native_builtins::intrinsics::is_static(*k))
+            {
+                // Phase 3 — split the descriptor ONCE here so the
+                // steady-state dispatch path never re-resolves or re-parses.
+                let (pd_vec, _) = split_method_descriptor(&descriptor);
+                let param_descs: Arc<[Arc<str>]> =
+                    pd_vec.iter().map(|s| Arc::from(s.as_str())).collect();
+                let return_type = crate::jit::return_type(&descriptor);
+                let target = CachedInvokeTarget::Intrinsic {
+                    kind,
+                    callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
+                    num_params: num_params as u16,
+                    param_descs,
+                    return_type,
+                    receiver_class_id: None,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, is_special, target);
+                return;
+            }
+        }
         let target = CachedInvokeTarget::Native {
             callback,
             num_params: num_params as u16, // Widening: parameter count conversion
@@ -11138,6 +11276,40 @@ fn execute_invokestatic_cached(
                 callback,
                 &args,
                 &method_descriptor,
+            )?;
+            Ok(CachedCallResult::Handled)
+        }
+        // Interpreter intrinsic — invokestatic has no receiver guard
+        // (`receiver_class_id` is `None` for static-resolved entries).
+        // Phase 3: args are popped against the IC-cached `param_descs` and
+        // the result coerced with the cached `return_type` — the
+        // steady-state path touches no shared lock, no HashMap, and parses
+        // no descriptor string.
+        CachedInvokeTarget::Intrinsic {
+            callback,
+            num_params,
+            param_descs,
+            return_type,
+            kind: _,
+            receiver_class_id: _,
+            gate: _,
+        } => {
+            let mut arg_buf = [Value::Uninitialized; MAX_INTRINSIC_ARGS];
+            let args = pop_coerced_invoke_args_intrinsic(
+                thread,
+                frame_idx,
+                num_params as usize,
+                &param_descs,
+                false,
+                &mut arg_buf,
+            )?;
+            invoke_cached_intrinsic(
+                shared,
+                thread,
+                frame_idx,
+                callback,
+                args,
+                return_type,
             )?;
             Ok(CachedCallResult::Handled)
         }
@@ -11769,6 +11941,7 @@ fn try_osr(
             &helpers,
             scan.non_escaping_new.clone(), // escape analysis results
             std::collections::HashMap::new(), // inline_sites
+            None, // string_layout — String intrinsics land in a later wave
         )?;
         cm._jit_strings = owned_jit_strings2;
         cm._jit_invoke_infos = owned_jit_invoke_infos2;
@@ -12320,6 +12493,13 @@ fn try_jit_upgrade_with_gate(
                 c_pgo_profile.as_ref(),
                 &c_helpers,
                 None, // no inlining in early-compile path
+                // string_layout_resolver: None until the String call-site
+                // intrinsics land (a later wave). To enable, pass a closure
+                // `|| -> Option<cratonvm_jit::StringFieldLayout>` that resolves
+                // java/lang/String's value/coder/hash field indices via
+                // `shared.class_manager` + `Class::find_own_field`, then calls
+                // `StringFieldLayout::new(value_idx, coder_idx_opt, hash_idx)`.
+                None,
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -12360,6 +12540,9 @@ fn try_jit_upgrade_with_gate(
         pgo_profile.as_ref(),
         &helpers,
         None, // no inlining in this compile path
+        // string_layout_resolver: None until the String call-site intrinsics
+        // land — see the matching comment at the early-compile call site.
+        None,
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -12611,6 +12794,28 @@ pub fn try_jit_compile_callee(
         resolve_inline_site(shared, callee_class, callee_method, callee_desc)
     };
 
+    // Resolve java/lang/String's field layout for the JIT String call-site
+    // intrinsics. Looks up the loaded `java/lang/String` class and reads the
+    // absolute instance-field indices of `value`, `coder`, `hash` via
+    // `Class::find_own_field` (String extends Object, which has no instance
+    // fields, so `first_field_index == 0` and these indices match the slot
+    // indices used by `get_field` / `jit_getfield`). `coder` is optional —
+    // the legacy synthetic `char[]`-backed String has no `coder` field, in
+    // which case `StringFieldLayout::new` records `has_coder = false`.
+    // Returns `None` (intrinsics bail to dispatch) if String is not loaded
+    // or lacks the mandatory `value` / `hash` fields.
+    let string_layout_resolver = || -> Option<cratonvm_jit::StringFieldLayout> {
+        let cm = shared.class_manager.read();
+        let string_id = cm.find_class_by_name("java/lang/String")?;
+        let class = cm.get_class(string_id)?;
+        let (value_idx, _) = class.find_own_field("value")?;
+        let (hash_idx, _) = class.find_own_field("hash")?;
+        let coder_idx = class.find_own_field("coder").map(|(idx, _)| idx);
+        Some(cratonvm_jit::StringFieldLayout::new(
+            value_idx, coder_idx, hash_idx,
+        ))
+    };
+
     let compile_start = std::time::Instant::now();
     let compiled = crate::jit::try_compile(
         &cached,
@@ -12625,6 +12830,7 @@ pub fn try_jit_compile_callee(
         pgo_profile.as_ref(),
         &helpers,
         Some(&inline_resolver),
+        Some(&string_layout_resolver),
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
@@ -13299,6 +13505,52 @@ fn execute_invokevirtual_vtable_fast(
         return Ok(CachedCallResult::CacheMiss);
     }
 
+    // Interpreter intrinsic shadowing guard.
+    //
+    // This vtable fast path runs BEFORE `execute_invokevirtual_cached` (it is
+    // dispatched first at the 0xb6/0xb9 opcode sites) — so if it dispatched a
+    // method body here, the intrinsic inline cache in
+    // `execute_invokevirtual_cached` would never be consulted for that site.
+    //
+    // In practice every intrinsic-eligible virtual method (`String.length`,
+    // `Object.getClass`/`hashCode`, `StringBuilder.append`/`toString`/`length`)
+    // already has a Rust native registered, and the native-override block
+    // below returns `CacheMiss` for those — so the call falls through to the
+    // cached path that owns the intrinsic IC. This explicit check makes that
+    // guarantee independent of native-registration coverage: when the
+    // resolved declaring class + (name, descriptor) is in the intrinsic
+    // table we always emit `CacheMiss`, ceding dispatch to
+    // `execute_invokevirtual_cached`. Keyed on the *resolved* declaring class
+    // so an overriding subclass (whose body is NOT in the table) is
+    // unaffected and dispatches here normally. Suppressed by
+    // `intrinsics_disabled()` (the differential-test off-switch) so the
+    // off-run behaves byte-for-byte like the pre-intrinsic VM.
+    if !crate::runtime::env_cache::intrinsics_disabled() {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        let is_intrinsic = crate::classloading::find_method_recursive(
+            receiver_class_id,
+            &method_name,
+            &method_descriptor,
+            store,
+        )
+        .and_then(|(_m, declaring_id)| {
+            store.get(declaring_id).map(|c| {
+                cratonvm_native_builtins::intrinsics::lookup(
+                    &c.name,
+                    &method_name,
+                    &method_descriptor,
+                )
+                .is_some()
+            })
+        })
+        .unwrap_or(false);
+        drop(cm);
+        if is_intrinsic {
+            return Ok(CachedCallResult::CacheMiss);
+        }
+    }
+
     // WP0.1 — Native override priority. A Rust native registered for
     // (receiver_class, method_name, descriptor) MUST take priority over
     // bytecode from the class file. This matches the dispatch order in
@@ -13806,6 +14058,82 @@ fn execute_invokevirtual_cached(
                 _ => Ok(CachedCallResult::CacheMiss),
             }
         }
+        // Interpreter intrinsic reached via invokevirtual/invokeinterface/
+        // invokespecial. Modelled on the `VirtualNative` arm: the
+        // `receiver_class_id` guard is the virtual-dispatch soundness check
+        // (roadmap §3.4) — an overriding subclass produces a different
+        // class id and falls to `CacheMiss`, re-resolving down the slow
+        // path. A `None` `receiver_class_id` means a static intrinsic
+        // (only reachable here via invokespecial); it carries no guard.
+        CachedInvokeTarget::Intrinsic {
+            kind: _,
+            callback,
+            num_params,
+            param_descs,
+            return_type,
+            receiver_class_id,
+            gate: _,
+        } => {
+            if let Some(guard_class_id) = receiver_class_id {
+                let num_params_usize = num_params as usize;
+                let receiver_val =
+                    thread.frames[frame_idx].stack.peek_at(num_params_usize);
+                match receiver_val {
+                    Value::Object(Some(obj_ref)) => {
+                        let actual_class_id = shared.heap.class_id_of(obj_ref);
+                        if crate::jit::profile::is_profiling_enabled() {
+                            let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
+                            shared.profile_store.record_receiver_borrowed(
+                                cid,
+                                mn,
+                                md,
+                                site_pc,
+                                actual_class_id.as_u32(),
+                            );
+                        }
+                        // Virtual-dispatch soundness guard: a receiver whose
+                        // actual class differs from the resolved one may
+                        // override the method — miss the intrinsic.
+                        if actual_class_id != guard_class_id {
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
+                        // Phase 3: pop against the IC-cached `param_descs`
+                        // (receiver included) into a stack buffer — no
+                        // resolve, no descriptor parse, no heap alloc on the
+                        // steady-state path.
+                        let mut arg_buf =
+                            [Value::Uninitialized; MAX_INTRINSIC_ARGS];
+                        let args = pop_coerced_invoke_args_intrinsic(
+                            thread,
+                            frame_idx,
+                            num_params_usize,
+                            &param_descs,
+                            true,
+                            &mut arg_buf,
+                        )?;
+                        invoke_cached_intrinsic(
+                            shared,
+                            thread,
+                            frame_idx,
+                            callback,
+                            args,
+                            return_type,
+                        )?;
+                        Ok(CachedCallResult::Handled)
+                    }
+                    Value::Object(None) => Ok(CachedCallResult::CacheMiss),
+                    _ => Ok(CachedCallResult::CacheMiss),
+                }
+            } else {
+                // `receiver_class_id: None` is only ever produced by the
+                // invokestatic populator, which is consulted via
+                // `execute_invokestatic_cached` — never this function. So
+                // this arm is unreachable in practice; degrade safely to
+                // the slow path rather than guess the arg-pop convention.
+                let _ = callback;
+                Ok(CachedCallResult::CacheMiss)
+            }
+        }
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
             if thread.frames.len() >= shared.config.max_stack_depth {
@@ -13924,6 +14252,70 @@ fn populate_virtual_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+
+    // Interpreter intrinsic probe (invokevirtual/invokeinterface).
+    //
+    // CRITICAL — virtual-dispatch soundness (roadmap §3.4): the table is
+    // keyed on the *resolved declaring class* — the class that actually
+    // provides the method body for THIS receiver — NOT the static cp
+    // class. We walk `find_method_recursive` from the receiver's actual
+    // class: an overriding subclass resolves to its own class name, which
+    // is not in the intrinsic table, so it correctly MISSES the intrinsic
+    // and falls through to ordinary dispatch. A non-overriding subclass
+    // resolves to `java/lang/Object` (etc.) and may legitimately hit.
+    //
+    // The entry stores `receiver_class_id: Some(receiver_class_id)`; the
+    // execute path additionally guards `actual == receiver` at dispatch
+    // time, so even a megamorphic call site stays sound.
+    //
+    // `intrinsics_disabled()` suppresses population entirely — the
+    // differential-test off-switch.
+    if !crate::runtime::env_cache::intrinsics_disabled() {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        if let Some((_method, declaring_id)) = crate::classloading::find_method_recursive(
+            receiver_class_id,
+            &method_name,
+            &descriptor,
+            store,
+        ) {
+            let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
+            if let Some(kind) =
+                cratonvm_native_builtins::intrinsics::lookup(declaring_name, &method_name, &descriptor)
+            {
+                // Gate bound to the receiver class — a redefine of the
+                // receiver swaps the dispatched body, mirroring the
+                // `VirtualNative` gate binding below.
+                let gate = RedefineGate::snapshot(
+                    cm.class_redefine_generation_handle(receiver_class_id),
+                );
+                drop(cm);
+                // Phase 3 — split the descriptor ONCE here so the
+                // steady-state dispatch path never re-resolves or re-parses.
+                let (pd_vec, _) = split_method_descriptor(&descriptor);
+                let param_descs: Arc<[Arc<str>]> =
+                    pd_vec.iter().map(|s| Arc::from(s.as_str())).collect();
+                let return_type = crate::jit::return_type(&descriptor);
+                let target = CachedInvokeTarget::Intrinsic {
+                    kind,
+                    callback: cratonvm_native_builtins::intrinsics::callback_for(kind),
+                    num_params: num_params as u16,
+                    param_descs,
+                    return_type,
+                    receiver_class_id: Some(receiver_class_id),
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, false, target);
+                return;
+            }
+        }
+        drop(cm);
+    }
 
     // Check native overrides FIRST — a Rust native registered for a method
     // takes priority over bytecode from the class file.  This matches the

@@ -995,6 +995,36 @@ pub enum CachedInvokeTarget {
         /// `fire_jit_invalidate_hook` in `redefine_class` step 8).
         gate: RedefineGate,
     },
+    /// Interpreter intrinsic: a hot JDK method resolved once at IC-fill time
+    /// to a direct intrinsic handler. Steady-state dispatch pays no native
+    /// registry probe, no class-manager `RwLock`, and no descriptor parse.
+    /// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+    Intrinsic {
+        /// The resolved intrinsic identity — kept for the hit counter, the
+        /// on/off debug flag, and `Debug` formatting.
+        kind: cratonvm_native_api::InterpIntrinsic,
+        /// Directly-callable handler trampoline (same shape as a
+        /// `NativeCallback`); forwards into the `native-builtins` intrinsics.
+        callback: NativeCallback,
+        /// Parameter slot count (receiver excluded).
+        num_params: u16,
+        /// Phase 3 — parameter descriptors, split ONCE at IC-fill time. The
+        /// steady-state dispatch path coerces args against these without
+        /// re-resolving the method ref (no resolution-cache `RwLock`, no
+        /// `HashMap` probe) and without re-parsing the descriptor string.
+        param_descs: Arc<[Arc<str>]>,
+        /// Phase 3 — return-type byte (`b'I'`/`b'J'`/`b'V'`/…), precomputed
+        /// at IC-fill time so the steady-state path does no descriptor scan.
+        return_type: u8,
+        /// `Some(class)` for `invokevirtual`/`invokeinterface` — the IC must
+        /// verify the receiver's actual class matches before dispatching
+        /// (roadmap §3.4 virtual-dispatch soundness). `None` for
+        /// `invokestatic`, which needs no receiver guard.
+        receiver_class_id: Option<ClassId>,
+        /// WP2.4-F1 — redefine staleness gate; bound to the resolved
+        /// declaring class.
+        gate: RedefineGate,
+    },
 }
 
 impl CachedInvokeTarget {
@@ -1009,7 +1039,8 @@ impl CachedInvokeTarget {
             | CachedInvokeTarget::Native { gate, .. }
             | CachedInvokeTarget::VirtualBytecode { gate, .. }
             | CachedInvokeTarget::VirtualNative { gate, .. }
-            | CachedInvokeTarget::Jit { gate, .. } => gate.is_stale(),
+            | CachedInvokeTarget::Jit { gate, .. }
+            | CachedInvokeTarget::Intrinsic { gate, .. } => gate.is_stale(),
         }
     }
 }
@@ -1112,6 +1143,7 @@ impl fmt::Debug for CachedInvokeTarget {
             }
             CachedInvokeTarget::VirtualNative { .. } => write!(f, "VirtualNative(...)"),
             CachedInvokeTarget::Jit { .. } => write!(f, "Jit(...)"),
+            CachedInvokeTarget::Intrinsic { kind, .. } => write!(f, "Intrinsic({kind:?})"),
         }
     }
 }

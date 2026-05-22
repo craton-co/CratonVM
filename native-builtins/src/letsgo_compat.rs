@@ -490,7 +490,15 @@ fn boxed_int_field(ctx: &mut dyn NativeContext, args: &[Value], cls: &'static st
 }
 
 fn box_integer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    boxed_int_field(ctx, args, "java/lang/Integer")
+    // `Integer.valueOf(int)` MUST return the canonical cached instance for
+    // values in [-128, 127] (JLS §5.1.7 / `IntegerCache`); real JDK code
+    // does `return IntegerCache.cache[...]`. Reference-identity checks
+    // (`Integer.valueOf(x) == Integer.valueOf(x)`) depend on this. Allocating
+    // a fresh wrapper here broke that invariant — delegate to the
+    // cache-preserving implementation in `lang_math`, exactly as
+    // `box_boolean` does for the canonical `Boolean.TRUE`/`FALSE`.
+    crate::lang_math::native_integer_value_of(ctx, args)
+        .or_else(|_| boxed_int_field(ctx, args, "java/lang/Integer"))
 }
 fn box_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     boxed_int_field(ctx, args, "java/lang/Short")

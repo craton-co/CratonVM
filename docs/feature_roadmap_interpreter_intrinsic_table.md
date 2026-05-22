@@ -1,6 +1,28 @@
 # Feature Roadmap — Interpreter Intrinsic Table
 
-Status: **Proposed** · Owner: _unassigned_ · Target: post-0.2.0
+Status: **Implemented** (Phases 0–3) · Target: post-0.2.0
+
+> Implemented. The `InterpIntrinsic` table, inline-cache integration, the
+> Phase 1+2 intrinsic set, and Phase 3 tuning all landed. Differential tests
+> (`vm/tests/intrinsic_diff.rs`) pass with intrinsics on vs. off. The
+> steady-state dispatch path holds no `RwLock`, probes no `HashMap`, and
+> parses no descriptor (Phase 3 — the IC entry caches the split parameter
+> descriptors and the return-type byte). The implementation contract is in
+> `docs/internal/intrinsic_table_contract.md`; the benchmark is
+> `bench/IntrinsicBench.java` (run with `CRATONVM_DISABLE_JIT=1`, compare
+> `CRATONVM_DISABLE_INTRINSICS` unset vs. `=1`; `CRATONVM_INTRINSIC_STATS=1`
+> prints the dispatch counter).
+>
+> Deviation from §3.1: the table is a dependency-free `match` in
+> `lookup()`, not a `phf::Map` — `phf` is not a workspace dependency and a
+> `match` compiles to direct branches (faster, zero new deps). Resolution
+> still happens once per call site.
+>
+> Measured (Phase 3, `bench/IntrinsicBench.java`, JIT disabled, 6 interleaved
+> on/off runs on a noisy host): intrinsics-on was faster in **every** run;
+> the minimum-time (least-noise) run gives ≈1.6× on the String/`arraycopy`
+> loop — clearing the §9 ≥1.3× target. Counter: 29,999,988 dispatches with
+> intrinsics on, 0 with `CRATONVM_DISABLE_INTRINSICS=1`.
 
 ## 1. Goal
 

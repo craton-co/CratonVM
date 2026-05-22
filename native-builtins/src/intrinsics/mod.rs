@@ -1,0 +1,290 @@
+//! Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
+//!
+//! This module provides two functions used by the interpreter inline cache:
+//!
+//! * [`lookup`] — called **once per call site**, at IC-fill time, to map a
+//!   `(class, name, descriptor)` triple to an [`InterpIntrinsic`] tag.
+//! * [`dispatch`] — the steady-state fast path: a plain `match` over the
+//!   enum tag that calls the per-method handler directly, with no `RwLock`,
+//!   no descriptor parse, and no `HashMap` probe.
+//!
+//! Every handler is byte-for-byte behavior-identical to the normal native
+//! registry dispatch path (project rule: no synthetic stubs) — the handlers
+//! delegate to the same `crate::lang_*` / `crate::util_*` native functions
+//! the registry would have invoked.
+//!
+//! See `docs/feature_roadmap_interpreter_intrinsic_table.md` and
+//! `docs/internal/intrinsic_table_contract.md`.
+
+pub mod integer;
+pub mod long;
+pub mod math;
+pub mod object;
+pub mod string;
+pub mod stringbuilder;
+pub mod system;
+
+use cratonvm_native_api::{InterpIntrinsic, NativeContext};
+use cratonvm_types::{error::MethodCallResult, Value};
+
+/// One-time resolution: static `(class, name, descriptor)` -> intrinsic kind.
+///
+/// Returns `None` for any method not in the intrinsic table — the caller then
+/// falls back to the ordinary native/bytecode dispatch path. The match is
+/// keyed on the **exact** descriptor so overloads resolve independently
+/// (roadmap §3.4: no fuzzy descriptor matching).
+///
+/// A plain `match` is deliberately used instead of `phf` — resolution happens
+/// once per call site, and direct branches beat hashing while keeping the
+/// workspace dependency-free.
+pub fn lookup(class: &str, name: &str, desc: &str) -> Option<InterpIntrinsic> {
+    use InterpIntrinsic::*;
+    Some(match (class, name, desc) {
+        // java/lang/Object — virtual
+        ("java/lang/Object", "getClass", "()Ljava/lang/Class;") => ObjectGetClass,
+        ("java/lang/Object", "hashCode", "()I") => ObjectHashCode,
+
+        // java/lang/String — virtual (String is final, no override risk)
+        ("java/lang/String", "length", "()I") => StringLength,
+        ("java/lang/String", "charAt", "(I)C") => StringCharAt,
+        ("java/lang/String", "isEmpty", "()Z") => StringIsEmpty,
+
+        // java/lang/System — static
+        (
+            "java/lang/System",
+            "arraycopy",
+            "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+        ) => SystemArraycopy,
+
+        // java/lang/StringBuilder — virtual
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+        ) => StringBuilderAppendString,
+        ("java/lang/StringBuilder", "append", "(I)Ljava/lang/StringBuilder;") => {
+            StringBuilderAppendInt
+        }
+        ("java/lang/StringBuilder", "append", "(C)Ljava/lang/StringBuilder;") => {
+            StringBuilderAppendChar
+        }
+        ("java/lang/StringBuilder", "append", "(J)Ljava/lang/StringBuilder;") => {
+            StringBuilderAppendLong
+        }
+        ("java/lang/StringBuilder", "append", "(Z)Ljava/lang/StringBuilder;") => {
+            StringBuilderAppendBool
+        }
+        (
+            "java/lang/StringBuilder",
+            "append",
+            "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+        ) => StringBuilderAppendObject,
+        ("java/lang/StringBuilder", "toString", "()Ljava/lang/String;") => {
+            StringBuilderToString
+        }
+        ("java/lang/StringBuilder", "length", "()I") => StringBuilderLength,
+
+        // java/lang/Integer
+        ("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;") => IntegerValueOf,
+        ("java/lang/Integer", "intValue", "()I") => IntegerIntValue,
+        ("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I") => IntegerParseInt,
+
+        // java/lang/Long
+        ("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;") => LongValueOf,
+        ("java/lang/Long", "longValue", "()J") => LongLongValue,
+        ("java/lang/Long", "parseLong", "(Ljava/lang/String;)J") => LongParseLong,
+
+        // java/lang/Math — static, pure arithmetic
+        ("java/lang/Math", "abs", "(I)I") => MathAbsInt,
+        ("java/lang/Math", "abs", "(J)J") => MathAbsLong,
+        ("java/lang/Math", "abs", "(D)D") => MathAbsDouble,
+        ("java/lang/Math", "min", "(II)I") => MathMinInt,
+        ("java/lang/Math", "max", "(II)I") => MathMaxInt,
+        ("java/lang/Math", "min", "(JJ)J") => MathMinLong,
+        ("java/lang/Math", "max", "(JJ)J") => MathMaxLong,
+        ("java/lang/Math", "sqrt", "(D)D") => MathSqrt,
+
+        _ => return None,
+    })
+}
+
+/// `true` if `kind` names a *static* JDK method (`invokestatic` target with
+/// no receiver), `false` for an instance method (`invokevirtual`/
+/// `invokeinterface` target whose `args[0]` is the receiver).
+///
+/// The interpreter uses this to pick the correct argument-pop helper and to
+/// avoid caching an instance intrinsic on an `invokespecial` site.
+pub fn is_static(kind: InterpIntrinsic) -> bool {
+    use InterpIntrinsic::*;
+    matches!(
+        kind,
+        SystemArraycopy
+            | IntegerValueOf
+            | IntegerParseInt
+            | LongValueOf
+            | LongParseLong
+            | MathAbsInt
+            | MathAbsLong
+            | MathAbsDouble
+            | MathMinInt
+            | MathMaxInt
+            | MathMinLong
+            | MathMaxLong
+            | MathSqrt
+    )
+}
+
+/// Steady-state dispatch — no lock, no hashmap, no descriptor parse.
+///
+/// `args` follows the native-registry convention: for an INSTANCE method it
+/// is `[receiver, param0, ...]`; for a STATIC method it is `[param0, ...]`.
+pub fn dispatch(
+    kind: InterpIntrinsic,
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use InterpIntrinsic::*;
+    match kind {
+        // Object
+        ObjectGetClass => object::intrinsic_object_get_class(ctx, args),
+        ObjectHashCode => object::intrinsic_object_hash_code(ctx, args),
+        // String
+        StringLength => string::intrinsic_string_length(ctx, args),
+        StringCharAt => string::intrinsic_string_char_at(ctx, args),
+        StringIsEmpty => string::intrinsic_string_is_empty(ctx, args),
+        // System
+        SystemArraycopy => system::intrinsic_system_arraycopy(ctx, args),
+        // StringBuilder
+        StringBuilderAppendString => stringbuilder::intrinsic_sb_append_string(ctx, args),
+        StringBuilderAppendInt => stringbuilder::intrinsic_sb_append_int(ctx, args),
+        StringBuilderAppendChar => stringbuilder::intrinsic_sb_append_char(ctx, args),
+        StringBuilderAppendLong => stringbuilder::intrinsic_sb_append_long(ctx, args),
+        StringBuilderAppendBool => stringbuilder::intrinsic_sb_append_bool(ctx, args),
+        StringBuilderAppendObject => stringbuilder::intrinsic_sb_append_object(ctx, args),
+        StringBuilderToString => stringbuilder::intrinsic_sb_to_string(ctx, args),
+        StringBuilderLength => stringbuilder::intrinsic_sb_length(ctx, args),
+        // Integer
+        IntegerValueOf => integer::intrinsic_integer_value_of(ctx, args),
+        IntegerIntValue => integer::intrinsic_integer_int_value(ctx, args),
+        IntegerParseInt => integer::intrinsic_integer_parse_int(ctx, args),
+        // Long
+        LongValueOf => long::intrinsic_long_value_of(ctx, args),
+        LongLongValue => long::intrinsic_long_long_value(ctx, args),
+        LongParseLong => long::intrinsic_long_parse_long(ctx, args),
+        // Math
+        MathAbsInt => math::intrinsic_math_abs_int(ctx, args),
+        MathAbsLong => math::intrinsic_math_abs_long(ctx, args),
+        MathAbsDouble => math::intrinsic_math_abs_double(ctx, args),
+        MathMinInt => math::intrinsic_math_min_int(ctx, args),
+        MathMaxInt => math::intrinsic_math_max_int(ctx, args),
+        MathMinLong => math::intrinsic_math_min_long(ctx, args),
+        MathMaxLong => math::intrinsic_math_max_long(ctx, args),
+        MathSqrt => math::intrinsic_math_sqrt(ctx, args),
+    }
+}
+
+/// Return a directly-callable [`NativeCallback`](cratonvm_native_api::NativeCallback)
+/// (a plain `fn` pointer) that dispatches `kind`.
+///
+/// The interpreter inline cache stores a `NativeCallback` so an intrinsic
+/// entry is dispatched through the exact same `safe_native_call` machinery
+/// (arg pinning, panic catch, JNI exception drain) as a `Native` entry. A
+/// `NativeCallback` cannot close over `kind`, so we hand out one zero-cost
+/// trampoline `fn` per intrinsic; each forwards to [`dispatch`]. This keeps
+/// the steady-state path going through the real handler code in the group
+/// submodules — the differential tests exercise exactly this path.
+pub fn callback_for(kind: InterpIntrinsic) -> cratonvm_native_api::NativeCallback {
+    use InterpIntrinsic::*;
+    macro_rules! tramp {
+        ($k:expr) => {{
+            fn cb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+                dispatch($k, ctx, args)
+            }
+            cb as cratonvm_native_api::NativeCallback
+        }};
+    }
+    match kind {
+        ObjectGetClass => tramp!(ObjectGetClass),
+        ObjectHashCode => tramp!(ObjectHashCode),
+        StringLength => tramp!(StringLength),
+        StringCharAt => tramp!(StringCharAt),
+        StringIsEmpty => tramp!(StringIsEmpty),
+        SystemArraycopy => tramp!(SystemArraycopy),
+        StringBuilderAppendString => tramp!(StringBuilderAppendString),
+        StringBuilderAppendInt => tramp!(StringBuilderAppendInt),
+        StringBuilderAppendChar => tramp!(StringBuilderAppendChar),
+        StringBuilderAppendLong => tramp!(StringBuilderAppendLong),
+        StringBuilderAppendBool => tramp!(StringBuilderAppendBool),
+        StringBuilderAppendObject => tramp!(StringBuilderAppendObject),
+        StringBuilderToString => tramp!(StringBuilderToString),
+        StringBuilderLength => tramp!(StringBuilderLength),
+        IntegerValueOf => tramp!(IntegerValueOf),
+        IntegerIntValue => tramp!(IntegerIntValue),
+        IntegerParseInt => tramp!(IntegerParseInt),
+        LongValueOf => tramp!(LongValueOf),
+        LongLongValue => tramp!(LongLongValue),
+        LongParseLong => tramp!(LongParseLong),
+        MathAbsInt => tramp!(MathAbsInt),
+        MathAbsLong => tramp!(MathAbsLong),
+        MathAbsDouble => tramp!(MathAbsDouble),
+        MathMinInt => tramp!(MathMinInt),
+        MathMaxInt => tramp!(MathMaxInt),
+        MathMinLong => tramp!(MathMinLong),
+        MathMaxLong => tramp!(MathMaxLong),
+        MathSqrt => tramp!(MathSqrt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_resolves_known_methods() {
+        assert_eq!(
+            lookup("java/lang/String", "length", "()I"),
+            Some(InterpIntrinsic::StringLength)
+        );
+        assert_eq!(
+            lookup(
+                "java/lang/System",
+                "arraycopy",
+                "(Ljava/lang/Object;ILjava/lang/Object;II)V"
+            ),
+            Some(InterpIntrinsic::SystemArraycopy)
+        );
+        assert_eq!(
+            lookup("java/lang/Math", "max", "(JJ)J"),
+            Some(InterpIntrinsic::MathMaxLong)
+        );
+    }
+
+    #[test]
+    fn lookup_is_descriptor_exact() {
+        // Wrong descriptor for an otherwise-known (class,name) must miss.
+        assert_eq!(lookup("java/lang/String", "length", "()J"), None);
+        // append overloads must resolve independently.
+        assert_eq!(
+            lookup(
+                "java/lang/StringBuilder",
+                "append",
+                "(I)Ljava/lang/StringBuilder;"
+            ),
+            Some(InterpIntrinsic::StringBuilderAppendInt)
+        );
+        assert_eq!(
+            lookup(
+                "java/lang/StringBuilder",
+                "append",
+                "(C)Ljava/lang/StringBuilder;"
+            ),
+            Some(InterpIntrinsic::StringBuilderAppendChar)
+        );
+    }
+
+    #[test]
+    fn lookup_misses_unknown() {
+        assert_eq!(lookup("java/lang/String", "concat", "(Ljava/lang/String;)Ljava/lang/String;"), None);
+        assert_eq!(lookup("com/example/Foo", "bar", "()V"), None);
+    }
+}

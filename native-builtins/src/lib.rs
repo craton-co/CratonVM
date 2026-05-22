@@ -632,6 +632,10 @@ pub mod proxy_selector;
 // by Maven, Spring, Hibernate, every build/runtime that consumes XML.
 pub mod xml_stax;
 
+/// Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
+/// See `docs/feature_roadmap_interpreter_intrinsic_table.md`.
+pub mod intrinsics;
+
 #[cfg(test)]
 pub(crate) mod test_utils;
 
