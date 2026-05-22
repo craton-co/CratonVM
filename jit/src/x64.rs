@@ -12041,6 +12041,18 @@ impl Compiler {
                             self.emit_oop_map_for_safepoint();
                             self.emit_stack_arg_cleanup(total_sub);
 
+                            // A directly-called compiled callee that throws
+                            // (or deopts) returns the `i64::MIN` sentinel.
+                            // Without this guard the JIT would push the
+                            // sentinel as the return value — for an L/[
+                            // return it would then be tagged as an oop
+                            // (`mark_top_as_oop` below) and the next deref
+                            // of that `0x8000_0000_0000_0000` wild pointer
+                            // segfaults. Deopt out so the interpreter routes
+                            // the stashed exception through the exception
+                            // table instead.
+                            self.emit_post_invoke_exception_check();
+
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {
                                     self.push_from_rax_as_xmm0();
@@ -12103,6 +12115,21 @@ impl Compiler {
                         // that survives the call (args are already popped,
                         // return value not yet pushed).
                         self.emit_oop_map_for_safepoint();
+
+                        // After the dispatch returns, check whether the
+                        // static callee threw a Java exception. `jit_invoke_
+                        // dispatch` returns `i64::MIN` (and stashes the
+                        // exception in `JIT_PENDING_EXCEPTION`) when the
+                        // callee throws. Without this guard — which the
+                        // invokevirtual/invokespecial paths already have —
+                        // the JIT pushes the `i64::MIN` sentinel as the
+                        // return value; for an L/[ static method it is then
+                        // tagged as an oop (`mark_top_as_oop` below) and the
+                        // next deref of that wild `0x8000_0000_0000_0000`
+                        // pointer segfaults (the Tomcat boot regression).
+                        // Deopt out so the interpreter routes the stashed
+                        // exception through the method's exception table.
+                        self.emit_post_invoke_exception_check();
 
                         // Reclaim spill slots used for invoke args
                         self.next_spill_offset = pre_pop_spill;
@@ -12183,6 +12210,12 @@ impl Compiler {
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.self_call_patches.push(call_patch);
                         self.emit_stack_arg_cleanup(total_sub);
+                        // A self-recursive compiled call that throws (or
+                        // deopts) returns the `i64::MIN` sentinel — same
+                        // hazard as the direct/dispatch invokestatic paths
+                        // above. Guard it so the sentinel is never pushed
+                        // (and never tagged as an oop) as a return value.
+                        self.emit_post_invoke_exception_check();
                         self.push_from_rax();
                     }
                     pc += 3;
