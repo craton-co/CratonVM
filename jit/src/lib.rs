@@ -1415,19 +1415,28 @@ pub enum JitIntrinsic {
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
-    // No variants: String.length/charAt/isEmpty/hashCode cannot be inlined
-    // correctly. String's field layout (the `value` array, the `coder`
-    // byte, the cached `hash` int) is runtime-determined, not statically
-    // known to the JIT. See the bail rationale in the matching
-    // `try_resolve_intrinsic` STRING_ACCESS region below and in
-    // jit/tests/intrinsic_string_access.rs.
+    // java.lang.String access intrinsics (Phase 3a). The foundation waves
+    // (commits 06bfac0 / 544cbea) added inline getfield + array-access
+    // codegen and the `StringFieldLayout` API, so these are now inlined
+    // when a `StringFieldLayout` with a `coder` field is available. The
+    // matcher only registers them when the layout resolves; otherwise the
+    // call falls back to normal native dispatch. Variant ordering within
+    // this region is local and not externally observed.
+    StringLength,   // length()I
+    StringIsEmpty,  // isEmpty()Z
+    StringCharAt,   // charAt(I)C
+    StringHashCode, // hashCode()I
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-    // No variants: String.equals/compareTo/indexOf cannot be inlined
-    // correctly (String's field layout is runtime-determined, not
-    // statically known to the JIT). See the bail rationale in the
-    // matching `try_resolve_intrinsic` STRING_SEARCH region below.
+    // java.lang.String search/compare intrinsics (Phase 3b). `equals` is
+    // inlined as a coder+length-guarded raw byte compare (deopts to native
+    // on a coder mismatch or a non-String argument). `compareTo` and the
+    // two `indexOf` overloads are NOT registered — they require ordered
+    // decoded-char comparison / substring search loops whose UTF-16 +
+    // legacy-char[] edge cases are not worth the codegen risk, so they
+    // bail to native dispatch. Variant ordering here is local.
+    StringEquals, // equals(Ljava/lang/Object;)Z
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
@@ -1656,75 +1665,21 @@ pub fn try_resolve_intrinsic(
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
-    // java.lang.String access intrinsics (length/charAt/isEmpty/hashCode):
-    // INTENTIONALLY NOT REGISTERED. Returning None here makes these calls
-    // fall back to normal native dispatch (native-builtins/lang_string.rs),
-    // which is correct — inlining them would be unsound in this VM:
-    //   1. No static class-layout registry. `getfield` offsets are resolved
-    //      only from the *currently-compiled method's* constant pool, per
-    //      bytecode PC — there is no `String -> {value,coder,hash}` offset
-    //      map. This matcher only sees (class, name, descriptor) strings.
-    //   2. String's layout is not fixed: native-builtins/lang_string.rs
-    //      (native_string_hash_code) loads two layouts — JDK-25 {value:[B,
-    //      coder:B, hash:I, hashIsZero:Z} and legacy {value:[C, hash:I} —
-    //      so the `hash` slot is index 2 or 1 depending on the runtime
-    //      object. A hard-coded offset would corrupt one of them.
-    //   3. length()/charAt() also need the runtime `coder` byte and the
-    //      `value` array element type to decode (byte[] LATIN1/UTF16 vs
-    //      char[]) — heap-object properties unknowable at compile time.
-    //   4. Object fields are 16-byte `Value` enums, not raw scalars, so a
-    //      known offset still can't be read with a plain MOV.
-    // See jit/tests/intrinsic_string_access.rs for the full write-up and a
-    // fixed-layout contract sketch for a future revisit.
+    // java.lang.String access intrinsics (length/charAt/isEmpty/hashCode).
+    // These ARE intrinsified, but only when a `StringFieldLayout` is
+    // available — and the layout is NOT a parameter of this 3-argument
+    // matcher (kept stable for the INT_BITS / LONG_BITS / ARRAYCOPY /
+    // ARRAYS_* / CRC32 families and their tests). The String family is
+    // therefore matched by the layout-aware `try_resolve_string_intrinsic`
+    // below, which `try_compile_inner` calls instead. This 3-arg entry
+    // point deliberately registers nothing for `java/lang/String`, so a
+    // bare 3-arg call (no layout context) safely falls back to dispatch.
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
-    // java.lang.String search/compare intrinsics — INVESTIGATED, BAILED.
-    //
-    // Targets considered: String.equals(Ljava/lang/Object;)Z,
-    // compareTo(Ljava/lang/String;)I, indexOf(I)I, indexOf(Ljava/lang/
-    // String;)I. None can be inlined correctly, so this region registers
-    // NOTHING — every such call falls through to normal dispatch (the
-    // native-builtins implementations in `native-builtins/src/
-    // lang_string.rs`).
-    //
-    // Why bailing is mandatory (roadmap §3.4: correctness over coverage):
-    //
-    //  1. String's field layout is NOT statically fixed. `native-builtins/
-    //     src/lang_string.rs` (`native_string_hash_code`, ~line 590)
-    //     documents TWO coexisting layouts the VM may load:
-    //       * JDK 9+ compact:   {value:[B, coder:B, hash:I, hashIsZero:Z}
-    //       * legacy synthetic: {value:[C, hash:I}
-    //     Which one applies is decided at RUNTIME by inspecting the
-    //     `value` array's element type (`byte[]` vs `char[]`). A method is
-    //     JIT-compiled once and cannot know which layout an arbitrary
-    //     String receiver carries.
-    //
-    //  2. The `coder` field index is not even constant: `coder` is field
-    //     index 1 in the compact layout, but field index 1 is `hash` in
-    //     the legacy layout. An inlined `getfield 1` would misread `hash`
-    //     as `coder` and silently corrupt LATIN1/UTF16 decoding.
-    //
-    //  3. The JIT has NO inline instance-field access. Every `getfield`
-    //     (x64.rs opcode 0xb4) emits a CALL to the `jit_getfield` helper
-    //     keyed by an abstract field index; `jit_getfield` reads a 16-byte
-    //     `Value` enum, not a packed primitive. Array element loads
-    //     (baload/iaload) are likewise helper calls, and the element width
-    //     depends on the runtime-determined layout. Inlining here would
-    //     still emit CALLs, violating roadmap §8 ("no CALL in generated
-    //     code").
-    //
-    // A fixed-layout contract would be the prerequisite to inline these:
-    //   * String must commit to a single `#[repr(C)]`-stable layout with
-    //     `value` at a known field offset and `coder` always present at a
-    //     known offset;
-    //   * the backing array element width must be pinned (always `byte[]`,
-    //     never the legacy `char[]`);
-    //   * the JIT needs inline array-length and element-load codegen with
-    //     the correct width;
-    //   * `equals` additionally needs an inline `instanceof String` check
-    //     for its `Object` argument (returning false for non-Strings).
-    // None of that exists today, so all four signatures bail to native.
+    // java.lang.String search intrinsics (equals): same story as
+    // STRING_ACCESS — matched by the layout-aware
+    // `try_resolve_string_intrinsic` below, not this 3-arg entry point.
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
@@ -1824,6 +1779,78 @@ pub fn try_resolve_intrinsic(
     //
     // Bailing the whole family is the correct, roadmap-sanctioned outcome.
     // ===== INTRINSIC REGION END: CRC32 =====
+
+    None
+}
+
+/// Layout-aware matcher for the `java/lang/String` call-site intrinsics
+/// (the STRING_ACCESS and STRING_SEARCH families).
+///
+/// Unlike [`try_resolve_intrinsic`], a String intrinsic can only be inlined
+/// when the JIT has resolved `java/lang/String`'s heap field layout — the
+/// codegen must read the receiver's `value` (`byte[]`), `coder` (`byte`)
+/// and `hash` (`int`) fields with inline machine code. That layout is not a
+/// `(class, name, descriptor)` property, so it cannot live in the 3-arg
+/// `try_resolve_intrinsic` (whose signature is shared with — and pinned by
+/// the tests of — every non-String family). `try_compile_inner` therefore
+/// calls THIS function for instance-method invokes, passing the
+/// `StringFieldLayout` it resolved once for the compilation.
+///
+/// Returns `Some((entry, num_params, return_type))` exactly like
+/// [`try_resolve_intrinsic`]. Returns `None` — so the call falls back to
+/// normal native dispatch — when:
+///   * `class` is not `java/lang/String`;
+///   * `string_layout` is `None` (String not loaded / resolver unavailable);
+///   * the resolved layout has no `coder` field (`has_coder == false`, the
+///     legacy `char[]` String layout) — every inlined String intrinsic
+///     decodes via `coder`, so a layout without it cannot be inlined;
+///   * `(name, descriptor)` is not one of the inlined signatures.
+///
+/// The codegen ladder in `x64.rs` (the 0xb6/b7/b9 STRING_ACCESS /
+/// STRING_SEARCH regions) consumes `compiler.string_layout`, which is
+/// populated from the SAME `string_layout_resolver`, so the matcher's
+/// "registered" decision and the codegen's "can emit" decision are always
+/// consistent within one compilation — a registered String sentinel is
+/// never left for the plain direct-call path to mis-`CALL`.
+pub fn try_resolve_string_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+    string_layout: Option<StringFieldLayout>,
+) -> Option<(usize, usize, u8)> {
+    if class != "java/lang/String" {
+        return None;
+    }
+    // Every inlined String intrinsic reads the `coder` byte to pick the
+    // LATIN1/UTF16 decode path. A layout without `coder` (legacy `char[]`
+    // String) cannot be inlined — bail to native dispatch.
+    let layout = string_layout?;
+    if !layout.has_coder {
+        return None;
+    }
+
+    // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
+    let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+        ("length", "()I") => Some((JitIntrinsic::StringLength, 0, b'I')),
+        ("isEmpty", "()Z") => Some((JitIntrinsic::StringIsEmpty, 0, b'Z')),
+        ("charAt", "(I)C") => Some((JitIntrinsic::StringCharAt, 1, b'C')),
+        ("hashCode", "()I") => Some((JitIntrinsic::StringHashCode, 0, b'I')),
+        _ => None,
+    };
+    if let Some((intrinsic, num_params, ret)) = hit {
+        return Some((intrinsic.as_entry(), num_params, ret));
+    }
+    // ===== INTRINSIC REGION END: STRING_ACCESS =====
+
+    // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
+    // Only `equals` is inlined. `compareTo` / `indexOf(I)` / `indexOf(String)`
+    // are intentionally NOT registered: they need ordered decoded-char
+    // comparison or substring-search loops whose UTF-16 / legacy edge cases
+    // are not worth the codegen risk — they fall back to native dispatch.
+    if name == "equals" && descriptor == "(Ljava/lang/Object;)Z" {
+        return Some((JitIntrinsic::StringEquals.as_entry(), 1, b'Z'));
+    }
+    // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
     None
 }
@@ -3302,6 +3329,13 @@ fn try_compile_inner(
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
     let mut inline_budget_remaining: usize = MAX_INLINE_BUDGET;
     let mut inlined_methods: Vec<(String, String, String)> = Vec::new();
+    // `java/lang/String` field layout, resolved ONCE for the whole
+    // compilation. `try_resolve_string_intrinsic` (in the invoke loop
+    // below) uses it to decide whether a String intrinsic can be
+    // registered; the SAME resolver feeds `x64::compile`'s
+    // `compiler.string_layout`, so matcher and codegen stay consistent.
+    let resolved_string_layout: Option<StringFieldLayout> =
+        string_layout_resolver.and_then(|r| r());
     if !scan.invoke_ops.is_empty() {
         let resolver = cp_invoke_resolver?;
         for &(pc, cp_idx, opcode) in &scan.invoke_ops {
@@ -3396,9 +3430,36 @@ fn try_compile_inner(
             // matcher excludes the receiver; the x64 codegen ladder for
             // 0xb6/b7/b9 adds it back (`callee_params + 1`).
             if !is_self_call && (invoke_kind == 0 || invoke_kind == 2) {
+                // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
                 {
+                    needs_heap = true;
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                        },
+                    ));
+                    continue;
+                }
+                // Then the `java/lang/String` intrinsics — registered only
+                // when the String field layout has resolved (and carries a
+                // `coder` field). `string_layout` is resolved ONCE per
+                // compilation; the same value is threaded into `x64::compile`
+                // (`compiler.string_layout`), so the matcher's "registered"
+                // decision and the codegen's "can emit inline" decision
+                // never disagree — a String sentinel is never registered
+                // for a site whose codegen would then bail to a raw `CALL`.
+                if let Some((entry, num_params, ret)) = try_resolve_string_intrinsic(
+                    &class_name,
+                    &method_name,
+                    &descriptor,
+                    resolved_string_layout,
+                ) {
                     needs_heap = true;
                     direct_calls.push((
                         pc,

@@ -1,121 +1,489 @@
-//! STRING_ACCESS intrinsic family — bail verification.
+//! Differential tests for the STRING_ACCESS JIT intrinsic family — the
+//! `java/lang/String` instance-method call-site intrinsics (Phase 3a):
+//! `length()I`, `isEmpty()Z`, `charAt(I)C`, `hashCode()I`.
 //!
-//! Family: `java/lang/String` instance methods `length()I`, `charAt(I)C`,
-//! `isEmpty()Z`, `hashCode()I`.
+//! The foundation waves (commits 06bfac0 / 544cbea) added inline `getfield`
+//! and inline array-access codegen plus the `StringFieldLayout` API, so these
+//! four methods are now inlined as machine code with NO `CALL` on the fast
+//! path. They are registered ONLY when a `StringFieldLayout` (carrying a
+//! `coder` field) is available — `cratonvm_jit::try_resolve_string_intrinsic`
+//! takes the layout as a parameter; the layout-free `try_resolve_intrinsic`
+//! deliberately never registers a String method, so a bare 3-arg matcher call
+//! safely falls back to native dispatch.
 //!
-//! OUTCOME: every one of these is INTENTIONALLY NOT inlined. The JIT
-//! intrinsic matcher (`cratonvm_jit::try_resolve_intrinsic`) returns `None`
-//! for all of them, so each call falls back to the normal native-dispatch
-//! path (the implementations in `native-builtins/src/lang_string.rs`, which
-//! are the differential oracle).
+//! Each test builds a real heap `java/lang/String` object byte-for-byte like
+//! the VM's compact layout — a 40-byte `ObjectHeader` followed by three
+//! 16-byte `Value` field cells (`value` ref, `coder` int, `hash` int) — with
+//! a `byte[]` backing array, JIT-compiles a one-line wrapper that invokes the
+//! method, runs it, and asserts the result against a host-computed reference
+//! that mirrors `native-builtins/src/lang_string.rs`.
 //!
-//! WHY BAIL — inlining these would be unsound in this VM:
-//!
-//!   1. No static class-layout registry. The JIT resolves `getfield` field
-//!      offsets only from the *currently-compiled method's* constant pool,
-//!      keyed per bytecode PC (`field_info` in `x64.rs`). There is no
-//!      `String -> {value@N, coder@M, hash@K}` offset table that either the
-//!      matcher or the codegen could consult. `try_resolve_intrinsic` is
-//!      handed only `(class, name, descriptor)` strings — nothing about the
-//!      target class's field layout.
-//!
-//!   2. String's runtime layout is genuinely variable. The native code in
-//!      `native-builtins/src/lang_string.rs` (`native_string_hash_code`,
-//!      ~lines 590-604) documents two distinct String layouts the VM
-//!      actually loads at runtime:
-//!        * JDK-25 compact:  { value: [B, coder: B, hash: I, hashIsZero: Z }
-//!        * legacy synthetic:{ value: [C, hash: I }
-//!      The cached `hash` field is at index 2 in the first layout and index
-//!      1 in the second. The native code picks the slot at runtime by
-//!      inspecting `heap_element_type_of(value)`. Machine code emitted with
-//!      a hard-coded field offset would read/clobber the wrong slot (e.g.
-//!      corrupt `coder`) on whichever layout it was not compiled for.
-//!
-//!   3. `length()` and `charAt(I)C` need runtime information even given the
-//!      field offsets:
-//!        * `length()` is `value.length` for a legacy `char[]` value but
-//!          `value.length >> coder` for a compact `byte[]` value — and
-//!          whether `value` is `byte[]` or `char[]`, plus the `coder` byte
-//!          value, are properties of the heap object, not statically known.
-//!        * `charAt(i)` decodes a LATIN1 byte (zero-extend) or a UTF-16 LE
-//!          byte pair depending on `coder`; same runtime dependency.
-//!
-//!   4. Object fields are stored as the 16-byte Rust enum `Value` (tag +
-//!      payload, implementation-defined repr) — not raw scalars. Even with a
-//!      known offset, a field cannot be loaded with a plain `MOV`; the
-//!      `getfield` path goes through a helper performing `ptr::read::<Value>`
-//!      and a tag match. `x64.rs` (the `putfield` 0xb5 arm) explicitly calls
-//!      this out as a known inlining gap.
-//!
-//! Per roadmap §3.4 ("Never trade correctness for inlining"), the matcher
-//! registers nothing for this family and these calls dispatch normally.
-//!
-//! WHAT A FIXED-LAYOUT CONTRACT WOULD NEED (so a future agent can revisit):
-//!   - A single canonical, VM-wide `java/lang/String` layout (drop the
-//!     legacy synthetic `{value:[C], hash:I}` layout entirely), with
-//!     `value`, `coder`, `hash` at fixed, documented field indices.
-//!   - A static layout descriptor the JIT can query by class name at
-//!     compile time (a `String -> {value_idx, coder_idx, hash_idx}` map, or
-//!     a hard pin in `jit/src`), pinned to `lang_string.rs`.
-//!   - A compact, plain-scalar field storage for the `coder`/`hash` int
-//!     fields (or at least a stable `#[repr]` on `Value`) so the JIT can
-//!     emit a direct load instead of the `Value`-enum helper call.
-//!   - The `value` array's element type (`byte[]` vs `char[]`) likewise
-//!     pinned, so `length`/`charAt` decoding can be selected at compile
-//!     time rather than via a runtime `heap_element_type_of` check.
-//! Until all of that holds, `length`/`charAt`/`isEmpty`/`hashCode` must
-//! stay on the native-dispatch path.
+//! `length()`/`isEmpty()` compute `value.length >> coder`; `charAt` decodes a
+//! LATIN1 byte (zero-extend) or a UTF-16 little-endian byte pair; `hashCode`
+//! runs the `h = 31*h + c` polynomial. Out-of-bounds `charAt` indices and
+//! null receivers branch to the uncommon-trap deopt stub.
 
-use cratonvm_jit::try_resolve_intrinsic;
+use cratonvm_jit::x64::compile;
+use cratonvm_jit::{try_resolve_string_intrinsic, JitDirectCall, StringFieldLayout};
+use cratonvm_jit_api::JitRuntimeHelpers;
+use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE, SLOT_SIZE};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-/// The four targeted `java/lang/String` instance methods. The matcher must
-/// return `None` for every one — they are not registered as intrinsics.
-const STRING_ACCESS_SIGNATURES: &[(&str, &str)] = &[
-    ("length", "()I"),
-    ("charAt", "(I)C"),
-    ("isEmpty", "()Z"),
-    ("hashCode", "()I"),
-];
+/// Counts every `uncommon_trap` invocation so the deopt tests can assert the
+/// inline guard bailed. `uncommon_trap` is a fixed `extern "C"` pointer baked
+/// into every compiled method, so the counter is process-global; `DEOPT_LOCK`
+/// serialises the deopt tests.
+static TRAP_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEOPT_LOCK: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" fn recording_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) -> i64 {
+    TRAP_COUNT.fetch_add(1, Ordering::SeqCst);
+    0 // deopt action code; the JIT stub then returns i64::MIN itself
+}
+
+fn helpers() -> JitRuntimeHelpers {
+    unsafe extern "C" fn stub() {
+        panic!("STRING_ACCESS intrinsic test invoked an unwired runtime helper");
+    }
+    let s = stub as *const () as usize;
+    JitRuntimeHelpers {
+        newarray: s,
+        new_object: s,
+        anewarray_object: s,
+        baload: s,
+        bastore: s,
+        iaload: s,
+        iastore: s,
+        aaload: s,
+        aastore: s,
+        multianewarray_2d: s,
+        arraylength: s,
+        getfield: s,
+        putfield_int: s,
+        putfield_long: s,
+        putfield_float: s,
+        putfield_double: s,
+        putfield_object: s,
+        getstatic: s,
+        putstatic_int: s,
+        putstatic_long: s,
+        putstatic_float: s,
+        putstatic_double: s,
+        putstatic_object: s,
+        checkcast: s,
+        instanceof_check: s,
+        throw_aioobe: s,
+        invoke_dispatch: s,
+        invoke_virtual_mic: s,
+        write_barrier: s,
+        satb_pre_write_barrier: s,
+        uncommon_trap: recording_uncommon_trap as *const () as usize,
+        math_fma_double: s,
+        math_fma_float: s,
+        tlab_cursor_offset_in_thread: 0,
+        tlab_end_offset_in_thread: 8,
+        class_id_offset_in_obj: 0,
+        get_current_thread: 0,
+        tlab_post_init: 0,
+    }
+}
+
+/// The compact `java/lang/String` field layout used by every test:
+/// `value` at field index 0, `coder` at 1, `hash` at 2.
+fn string_layout() -> StringFieldLayout {
+    StringFieldLayout::new(0, Some(1), 2)
+}
+
+/// An arbitrary non-zero class id stamped into every fake String header.
+const STRING_CLASS_ID: u32 = 0x5712_3400;
+
+/// A heap object: a `HEADER_SIZE`-byte `ObjectHeader` followed by tightly
+/// packed element data (for arrays) or 16-byte `Value` field cells (for
+/// instances). Backed by a `Vec<u64>` so the base address is 8-byte aligned.
+struct FakeObj {
+    storage: Vec<u64>,
+}
+
+impl FakeObj {
+    fn with_bytes(total: usize) -> Self {
+        FakeObj {
+            storage: vec![0u64; total.div_ceil(8).max(1)],
+        }
+    }
+    fn base(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr() as *mut u8
+    }
+    fn ptr(&self) -> i64 {
+        self.storage.as_ptr() as i64
+    }
+}
+
+/// Build a `byte[]` heap array holding `data`.
+fn make_byte_array(data: &[u8]) -> FakeObj {
+    let mut obj = FakeObj::with_bytes(HEADER_SIZE + data.len());
+    let base = obj.base();
+    unsafe {
+        *base.add(4) = ObjectKind::Array as u8;
+        *base.add(5) = ArrayElementType::Byte as u8;
+        let len_le = (data.len() as u32).to_le_bytes();
+        std::ptr::copy_nonoverlapping(len_le.as_ptr(), base.add(12), 4);
+        std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(HEADER_SIZE), data.len());
+    }
+    obj
+}
+
+/// Build a compact `java/lang/String` instance object with the given backing
+/// `value` byte-array pointer, `coder` and cached `hash`. Returns the String
+/// object; the caller must keep the backing `FakeObj` array alive.
+fn make_string(value_ptr: i64, coder: i32, hash: i32) -> FakeObj {
+    // 3 field cells: value (0), coder (1), hash (2).
+    let mut obj = FakeObj::with_bytes(HEADER_SIZE + 3 * SLOT_SIZE);
+    let base = obj.base();
+    unsafe {
+        // ObjectHeader: class id at offset 0, kind = Object.
+        let cid = STRING_CLASS_ID.to_le_bytes();
+        std::ptr::copy_nonoverlapping(cid.as_ptr(), base, 4);
+        *base.add(4) = ObjectKind::Object as u8;
+        // A `Value` field cell: tag (u32) at offset 0. An 8-byte payload
+        // (Object pointer) lives at FIELD_CELL_PAYLOAD64_OFFSET (8); a 4-byte
+        // payload (Int) at FIELD_CELL_PAYLOAD32_OFFSET (4).
+        let write_ref_cell = |idx: usize, payload: i64| {
+            let cell = base.add(HEADER_SIZE + idx * SLOT_SIZE);
+            std::ptr::copy_nonoverlapping(4u32.to_le_bytes().as_ptr(), cell, 4); // tag=Object
+            std::ptr::copy_nonoverlapping(payload.to_le_bytes().as_ptr(), cell.add(8), 8);
+        };
+        let write_int_cell = |idx: usize, payload: i32| {
+            let cell = base.add(HEADER_SIZE + idx * SLOT_SIZE);
+            std::ptr::copy_nonoverlapping(0u32.to_le_bytes().as_ptr(), cell, 4); // tag=Int
+            std::ptr::copy_nonoverlapping(payload.to_le_bytes().as_ptr(), cell.add(4), 4);
+        };
+        write_ref_cell(0, value_ptr); // value : Object → byte[] ptr
+        write_int_cell(1, coder); // coder : Int
+        write_int_cell(2, hash); // hash  : Int
+    }
+    obj
+}
+
+/// Encode a Rust `&str` into a compact-String `byte[]`: LATIN1 (1 byte/char)
+/// when every code point fits in a byte, else UTF-16 little-endian. Returns
+/// `(bytes, coder)`.
+fn encode(s: &str) -> (Vec<u8>, i32) {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if units.iter().all(|&u| u <= 0xFF) {
+        (units.iter().map(|&u| u as u8).collect(), 0)
+    } else {
+        let mut bytes = Vec::with_capacity(units.len() * 2);
+        for u in units {
+            bytes.push((u & 0xFF) as u8);
+            bytes.push((u >> 8) as u8);
+        }
+        (bytes, 1)
+    }
+}
+
+/// Host reference for `String.length()`.
+fn ref_length(s: &str) -> i32 {
+    s.encode_utf16().count() as i32
+}
+
+/// Host reference for `String.charAt(i)`.
+fn ref_char_at(s: &str, i: usize) -> i32 {
+    s.encode_utf16().nth(i).unwrap() as i32
+}
+
+/// Host reference for `String.hashCode()` — the JDK `h = 31*h + c` polynomial
+/// over the UTF-16 code units, with `i32` wrapping arithmetic.
+fn ref_hash(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for c in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(c as i32);
+    }
+    h
+}
+
+/// JIT-compile a single-arg-receiver wrapper `int f(String this)` whose body
+/// is `aload_0; invokevirtual <method>; xreturn`. `ret` is the xreturn opcode
+/// (`0xac` ireturn for length/hashCode/isEmpty/charAt — all int-category).
+fn compile_unary(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
+    let entry = try_resolve_string_intrinsic(
+        "java/lang/String",
+        name,
+        descriptor,
+        Some(string_layout()),
+    )?
+    .0;
+    // aload_0 (2a), invokevirtual (b6 00 01), ireturn (ac)
+    let code: Vec<u8> = vec![0x2a, 0xb6, 0x00, 0x01, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        1, // num_params: the receiver
+        1, // max_locals
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            1,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 0, // receiver excluded
+                return_type: b'I',
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(string_layout()),
+    )?;
+    Some(move |this: i64| unsafe { compiled.call(&[this]) })
+}
+
+/// JIT-compile `int f(String this, int idx)` whose body is
+/// `aload_0; iload_1; invokevirtual charAt; ireturn`.
+fn compile_char_at() -> impl Fn(i64, i32) -> i64 {
+    let entry = try_resolve_string_intrinsic(
+        "java/lang/String",
+        "charAt",
+        "(I)C",
+        Some(string_layout()),
+    )
+    .expect("charAt must register with a layout")
+    .0;
+    // aload_0 (2a), iload_1 (1b), invokevirtual (b6 00 01), ireturn (ac)
+    let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        2, // receiver + index
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            2,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 1, // index (receiver excluded)
+                return_type: b'C',
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(string_layout()),
+    )
+    .expect("charAt wrapper compilation failed");
+    move |this: i64, idx: i32| unsafe { compiled.call(&[this, idx as i64]) }
+}
+
+// --- matcher integration --------------------------------------------------
 
 #[test]
-fn string_access_methods_are_not_registered_as_intrinsics() {
-    for &(name, descriptor) in STRING_ACCESS_SIGNATURES {
-        let hit = try_resolve_intrinsic("java/lang/String", name, descriptor);
+fn string_access_registered_only_with_a_layout() {
+    let l = Some(string_layout());
+    for &(name, desc) in &[
+        ("length", "()I"),
+        ("isEmpty", "()Z"),
+        ("charAt", "(I)C"),
+        ("hashCode", "()I"),
+    ] {
+        // With a layout → registered.
         assert!(
-            hit.is_none(),
-            "java/lang/String.{name}{descriptor} must NOT resolve to a JIT \
-             intrinsic — String's field layout is runtime-determined, so \
-             inlining would be unsound. Matcher returned {hit:?}. See the \
-             module-level doc comment for the full bail rationale.",
+            try_resolve_string_intrinsic("java/lang/String", name, desc, l).is_some(),
+            "{name}{desc} must register when a StringFieldLayout is present",
+        );
+        // Without a layout → bail to native dispatch.
+        assert!(
+            try_resolve_string_intrinsic("java/lang/String", name, desc, None).is_none(),
+            "{name}{desc} must NOT register without a layout",
+        );
+        // The layout-free matcher never registers a String method.
+        assert!(
+            cratonvm_jit::try_resolve_intrinsic("java/lang/String", name, desc).is_none(),
+            "the 3-arg try_resolve_intrinsic must never register a String method",
         );
     }
 }
 
-/// Defence in depth: the same methods on `java/lang/StringLatin1` (the JDK
-/// helper class the compact-string fast paths delegate to) must also not be
-/// intrinsified — it has the same unknowable-layout problem.
 #[test]
-fn string_latin1_access_methods_are_not_registered_as_intrinsics() {
-    for &(name, descriptor) in STRING_ACCESS_SIGNATURES {
-        let hit = try_resolve_intrinsic("java/lang/StringLatin1", name, descriptor);
-        assert!(
-            hit.is_none(),
-            "java/lang/StringLatin1.{name}{descriptor} must NOT resolve to a \
-             JIT intrinsic. Matcher returned {hit:?}.",
-        );
-    }
-}
-
-/// Sanity check that the matcher is wired up and *can* return `Some` — this
-/// guards against a false-negative where the bail assertions above pass only
-/// because `try_resolve_intrinsic` is trivially broken. `Math.sqrt` is a
-/// long-standing registered intrinsic (Phase 0 baseline).
-#[test]
-fn matcher_is_live_math_sqrt_still_resolves() {
-    let hit = try_resolve_intrinsic("java/lang/Math", "sqrt", "(D)D");
+fn string_access_bails_without_a_coder_field() {
+    // The legacy `char[]` String layout has no `coder` field; every String
+    // intrinsic decodes via `coder`, so such a layout must bail.
+    let no_coder = StringFieldLayout::new(0, None, 1);
+    assert!(!no_coder.has_coder);
     assert!(
-        hit.is_some(),
-        "sanity: Math.sqrt(D)D should still resolve as an intrinsic; if this \
-         fails the STRING_ACCESS bail assertions are vacuous",
+        try_resolve_string_intrinsic("java/lang/String", "length", "()I", Some(no_coder))
+            .is_none(),
+        "length must bail when the layout has no coder field",
+    );
+}
+
+#[test]
+fn string_access_ignores_non_string_classes() {
+    assert!(
+        try_resolve_string_intrinsic(
+            "java/lang/StringBuilder",
+            "length",
+            "()I",
+            Some(string_layout()),
+        )
+        .is_none(),
+        "only java/lang/String is intrinsified by this family",
+    );
+}
+
+// --- length ---------------------------------------------------------------
+
+#[test]
+fn string_length_latin1_and_utf16() {
+    let f = compile_unary("length", "()I").expect("length must register");
+    for s in ["", "a", "hello", "0123456789abcdef", "caf\u{e9}"] {
+        let (bytes, coder) = encode(s);
+        let arr = make_byte_array(&bytes);
+        let strobj = make_string(arr.ptr(), coder, 0);
+        let got = f(strobj.ptr()) as i32;
+        assert_eq!(got, ref_length(s), "length({s:?}) coder={coder}");
+    }
+    // A genuine UTF-16 string (code point > 0xFF forces 2-byte coder).
+    let s = "A\u{4e2d}Z"; // 'A', CJK char, 'Z'
+    let (bytes, coder) = encode(s);
+    assert_eq!(coder, 1, "this string must be UTF-16 coded");
+    let arr = make_byte_array(&bytes);
+    let strobj = make_string(arr.ptr(), coder, 0);
+    assert_eq!(f(strobj.ptr()) as i32, 3);
+}
+
+// --- isEmpty --------------------------------------------------------------
+
+#[test]
+fn string_is_empty() {
+    let f = compile_unary("isEmpty", "()Z").expect("isEmpty must register");
+    for (s, expect) in [("", 1i64), ("x", 0), ("hello", 0)] {
+        let (bytes, coder) = encode(s);
+        let arr = make_byte_array(&bytes);
+        let strobj = make_string(arr.ptr(), coder, 0);
+        assert_eq!(f(strobj.ptr()), expect, "isEmpty({s:?})");
+    }
+}
+
+// --- charAt ---------------------------------------------------------------
+
+#[test]
+fn string_char_at_latin1() {
+    let f = compile_char_at();
+    let s = "hello world";
+    let (bytes, coder) = encode(s);
+    assert_eq!(coder, 0);
+    let arr = make_byte_array(&bytes);
+    let strobj = make_string(arr.ptr(), coder, 0);
+    for i in 0..s.len() {
+        assert_eq!(f(strobj.ptr(), i as i32) as i32, ref_char_at(s, i), "charAt {i}");
+    }
+}
+
+#[test]
+fn string_char_at_utf16() {
+    let f = compile_char_at();
+    let s = "A\u{4e2d}\u{00e9}Z"; // mixed, forces UTF-16
+    let (bytes, coder) = encode(s);
+    assert_eq!(coder, 1);
+    let arr = make_byte_array(&bytes);
+    let strobj = make_string(arr.ptr(), coder, 0);
+    let count = s.encode_utf16().count();
+    for i in 0..count {
+        assert_eq!(f(strobj.ptr(), i as i32) as i32, ref_char_at(s, i), "charAt {i}");
+    }
+}
+
+#[test]
+fn string_char_at_out_of_bounds_deopts() {
+    let _guard = DEOPT_LOCK.lock().unwrap();
+    let f = compile_char_at();
+    let (bytes, coder) = encode("abc");
+    let arr = make_byte_array(&bytes);
+    let strobj = make_string(arr.ptr(), coder, 0);
+    // index == length and a negative index must both trap, not read OOB.
+    for bad in [3i32, -1, 999] {
+        let before = TRAP_COUNT.load(Ordering::SeqCst);
+        let r = f(strobj.ptr(), bad);
+        assert_eq!(r, i64::MIN, "OOB charAt({bad}) must return the deopt sentinel");
+        assert_eq!(
+            TRAP_COUNT.load(Ordering::SeqCst),
+            before + 1,
+            "OOB charAt({bad}) must fire exactly one uncommon trap",
+        );
+    }
+}
+
+// --- hashCode -------------------------------------------------------------
+
+#[test]
+fn string_hash_code_computes_when_cache_zero() {
+    let f = compile_unary("hashCode", "()I").expect("hashCode must register");
+    for s in ["", "a", "hello", "The quick brown fox", "caf\u{e9}", "A\u{4e2d}Z"] {
+        let (bytes, coder) = encode(s);
+        let arr = make_byte_array(&bytes);
+        // hash cache = 0 → recompute.
+        let strobj = make_string(arr.ptr(), coder, 0);
+        assert_eq!(f(strobj.ptr()) as i32, ref_hash(s), "hashCode({s:?})");
+    }
+}
+
+#[test]
+fn string_hash_code_returns_cached_value() {
+    let f = compile_unary("hashCode", "()I").expect("hashCode must register");
+    // Non-zero cached hash must be returned verbatim (lazy-cache semantics):
+    // a deliberately "wrong" cached value proves the cache short-circuit is
+    // taken rather than the recompute path.
+    let (bytes, coder) = encode("hello");
+    let arr = make_byte_array(&bytes);
+    let bogus_cached = 0x1234_5678;
+    let strobj = make_string(arr.ptr(), coder, bogus_cached);
+    assert_eq!(
+        f(strobj.ptr()) as i32,
+        bogus_cached,
+        "a non-zero cached hash must be returned without recomputing",
+    );
+}
+
+// --- null receiver --------------------------------------------------------
+
+#[test]
+fn string_length_null_receiver_deopts() {
+    let _guard = DEOPT_LOCK.lock().unwrap();
+    let f = compile_unary("length", "()I").expect("length must register");
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let r = f(0); // null receiver
+    assert_eq!(r, i64::MIN, "null-receiver length must return the deopt sentinel");
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "null-receiver length must fire exactly one uncommon trap",
     );
 }
