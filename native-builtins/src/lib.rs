@@ -491,6 +491,8 @@ pub mod lookup_define;
 pub mod system_bootstrap;
 pub mod boot_loader;
 pub mod zip_real;
+/// `java.util.zip.CRC32C` native overrides (Castagnoli CRC-32C).
+pub mod zip_crc32c;
 pub mod security_manager;
 pub mod keystore;
 // WP6.7 — `java.security.SecureRandom` (OS CSPRNG) + `java.util.Random`
@@ -1411,6 +1413,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // unconditionally; in synthetic-jdk mode the phase71 overrides run after
     // register_synthetic_overrides and supersede these.
     zip_real::register_zip_real_natives(registry);
+
+    // java.util.zip.CRC32C — Java-method overrides for the Castagnoli CRC-32C.
+    // CRC32C has NO native methods in JDK 25 (pure-Java, Unsafe-backed hot
+    // loop); these overrides give a bit-exact CRC-32C and a stable differential
+    // oracle for a future JIT CRC32C.update intrinsic. See zip_crc32c.rs.
+    zip_crc32c::register_crc32c_natives(registry);
 
     // NOTE: apps_h2 per-method Thread.getState/getPriority/isDaemon
     // overrides were removed once `current_thread_object` began
