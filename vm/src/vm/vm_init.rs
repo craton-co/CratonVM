@@ -654,6 +654,49 @@ pub struct SharedVm {
 impl SharedVm {
     /// Create a new SharedVm from a VmConfig.
     pub fn new(config: VmConfig) -> Self {
+        // Register the application's own directories as trusted file-I/O
+        // sandbox roots. native-io confines file operations to the process
+        // CWD by default; that is far too strict for a real JVM, which is
+        // routinely pointed at an application installed elsewhere on disk
+        // (e.g. WildFly launched from a worktree but reading `standalone.xml`
+        // out of its `-Djboss.home.dir` tree). Every directory registered
+        // here was supplied explicitly on the command line — the classpath
+        // / `--jar`, `--java-home`, and `-D*.home` / `-D*.dir` properties —
+        // and is therefore trusted. Symlink-escape and `..`-traversal
+        // protection is preserved: native-io still canonicalizes and
+        // containment-checks against this set.
+        {
+            // Classpath entries: register the entry itself if it is a
+            // directory, and its parent directory either way (so sibling
+            // resources next to an application jar resolve).
+            for entry in &config.classpath {
+                let p = std::path::Path::new(entry);
+                cratonvm_native_io::add_sandbox_root(p);
+                if let Some(parent) = p.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        cratonvm_native_io::add_sandbox_root(parent);
+                    }
+                }
+            }
+            if let Some(jh) = &config.java_home {
+                cratonvm_native_io::add_sandbox_root(jh);
+            }
+            // `-Djboss.home.dir=...`, `-Dcatalina.home=...`,
+            // `-Duser.dir=...` and similar location properties name an
+            // application root directory the program will read from.
+            for (k, v) in &config.system_properties {
+                let lk = k.to_ascii_lowercase();
+                if (lk.ends_with(".home")
+                    || lk.ends_with(".dir")
+                    || lk.ends_with(".home.dir")
+                    || lk.ends_with(".base"))
+                    && std::path::Path::new(v).is_dir()
+                {
+                    cratonvm_native_io::add_sandbox_root(v);
+                }
+            }
+        }
+
         // Auto-discover boot/ext classpath when not explicitly provided.
         //
         // When `use_synthetic_jdk` is true (default for tests), skip discovery

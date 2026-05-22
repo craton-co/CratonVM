@@ -76,6 +76,44 @@ pub fn is_path_validation_enabled() -> bool {
     PATH_VALIDATION_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Additional directories — beyond the process current working directory —
+/// that file operations are permitted to reach. The CWD-only sandbox is too
+/// strict for a real JVM: a launcher commonly passes `--jar` and `-D*.home`
+/// / `-D*.dir` properties pointing at an application installed elsewhere
+/// (e.g. WildFly's `jboss.home.dir` and its `standalone/configuration`
+/// tree). Those directories are supplied explicitly on the command line and
+/// are therefore trusted. The launcher registers them here at startup so
+/// `validate_path`'s containment check accepts files inside them while still
+/// rejecting genuine traversal attempts to unrelated locations.
+static SANDBOX_ROOTS: OnceLock<Mutex<Vec<std::path::PathBuf>>> = OnceLock::new();
+
+fn sandbox_roots() -> &'static Mutex<Vec<std::path::PathBuf>> {
+    SANDBOX_ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register an additional trusted sandbox root. The path is canonicalized
+/// (resolving symlinks and `..` segments) so the later containment check is
+/// sound. Non-existent or non-canonicalizable paths are ignored. Safe to
+/// call repeatedly with the same path.
+pub fn add_sandbox_root<P: AsRef<Path>>(path: P) {
+    if let Ok(canon) = fs::canonicalize(path.as_ref()) {
+        let mut roots = sandbox_roots().lock();
+        if !roots.iter().any(|r| r == &canon) {
+            roots.push(canon);
+        }
+    }
+}
+
+/// Returns `true` if `candidate` is contained within the process CWD or any
+/// registered additional sandbox root.
+fn is_within_sandbox(candidate: &Path, cwd_root: &Path) -> bool {
+    if candidate.starts_with(cwd_root) {
+        return true;
+    }
+    let roots = sandbox_roots().lock();
+    roots.iter().any(|r| candidate.starts_with(r))
+}
+
 /// Validate a file path to prevent path traversal and null-byte injection.
 /// Returns the canonicalized path string on success, or an error on failure.
 ///
@@ -209,10 +247,14 @@ fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     };
 
     // Re-validate: the fully-resolved path must stay inside the sandbox
-    // root. This is the check that catches a symlink whose target escapes
-    // the sandbox, as well as any `..`-based escape that canonicalization
-    // collapsed into a real out-of-sandbox path.
-    if !canonical.starts_with(&sandbox_root) {
+    // root (the process CWD) OR inside one of the explicitly-registered
+    // additional roots (the application directories the launcher was told
+    // to run — e.g. `--jar` location, `-Djboss.home.dir`). This catches a
+    // symlink whose target escapes every sandbox root, as well as any
+    // `..`-based escape that canonicalization collapsed into a real
+    // out-of-sandbox path, while still permitting a JVM to read the
+    // application it was explicitly pointed at.
+    if !is_within_sandbox(&canonical, &sandbox_root) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::SecurityException {
                 message: format!(

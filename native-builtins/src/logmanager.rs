@@ -881,6 +881,71 @@ fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 
+/// Surface a throwable that was passed to a logging native. WildFly's
+/// `WFLYSRV0055: Caught exception during boot` is logged with the real
+/// boot exception as the trailing `Throwable` argument — but the previous
+/// code only printed the literal text `(with throwable)` and discarded the
+/// exception entirely, hiding the actual boot-failure cause.
+///
+/// This walks the throwable: class name + `detailMessage`, the captured
+/// stack trace (keyed by identity hash, as `fillInStackTrace` stores it),
+/// and the full `cause` chain. It mirrors HotSpot's `printStackTrace`
+/// shape closely enough to diagnose boot failures from the log alone.
+fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, indent: &str) {
+    let mut current = Some(throwable);
+    let mut depth = 0usize;
+    let mut seen: Vec<ObjectRef> = Vec::new();
+    while let Some(t) = current {
+        // Guard against cyclic cause chains.
+        if seen.contains(&t) || depth > 16 {
+            break;
+        }
+        seen.push(t);
+
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(t))
+            .unwrap_or_else(|| "java/lang/Throwable".to_string())
+            .replace('/', ".");
+        let detail = match ctx.get_field_by_name(t, "detailMessage") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        };
+        let prefix = if depth == 0 { "" } else { "Caused by: " };
+        match &detail {
+            Some(m) if !m.is_empty() => eprintln!("{indent}{prefix}{cls}: {m}"),
+            _ => eprintln!("{indent}{prefix}{cls}"),
+        }
+
+        // Stack trace is captured by `fillInStackTrace` keyed on the
+        // throwable's identity hash.
+        let hash = ctx.identity_hash_code(t);
+        if let Some(frames) = ctx.get_stack_trace(hash) {
+            for f in frames.iter().take(48) {
+                let where_ = match (&f.source_file, f.line_number) {
+                    (Some(sf), n) if n >= 0 => format!("({sf}:{n})"),
+                    (Some(sf), _) => format!("({sf})"),
+                    (None, -2) => "(Native Method)".to_string(),
+                    _ => "(Unknown Source)".to_string(),
+                };
+                eprintln!(
+                    "{indent}    at {}.{}{where_}",
+                    f.class_name.replace('/', "."),
+                    f.method_name
+                );
+            }
+        }
+
+        // Walk to the cause (named `cause`; `this` is the JDK
+        // "uninitialized" sentinel and means no cause).
+        let next = match ctx.get_field_by_name(t, "cause") {
+            Value::Object(Some(c)) if c != t => Some(c),
+            _ => None,
+        };
+        current = next;
+        depth += 1;
+    }
+}
+
 /// WildFly visibility: intercept
 /// `org/jboss/logging/JBossLogManagerLogger.doLog(Level,String fqcn,Object
 /// message,Object[] params,Throwable)` and emit the formatted line to
@@ -911,8 +976,8 @@ fn native_jboss_logging_logger_do_log(ctx: &mut dyn NativeContext, args: &[Value
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
     eprintln!("{level_name} [{logger_name}] {message}");
-    if throwable_obj.is_some() {
-        eprintln!("    (with throwable)");
+    if let Some(t) = throwable_obj {
+        dump_throwable_to_stderr(ctx, t, "    ");
     }
     Ok(None)
 }
@@ -942,8 +1007,8 @@ fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Valu
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
     eprintln!("{level_name} [{logger_name}] {format}");
-    if throwable_obj.is_some() {
-        eprintln!("    (with throwable)");
+    if let Some(t) = throwable_obj {
+        dump_throwable_to_stderr(ctx, t, "    ");
     }
     Ok(None)
 }
@@ -974,18 +1039,42 @@ fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     // be a String, an Object whose toString() we can't easily call, or a
     // format-string followed by varargs. Print whatever String we find.
     let mut message = String::new();
+    let mut throwable: Option<ObjectRef> = None;
     for arg in args.iter().skip(1) {
         if let Value::Object(Some(o)) = arg {
-            if let Some(s) = ctx.read_string(*o) {
-                if !message.is_empty() {
-                    message.push(' ');
+            if message.is_empty() {
+                if let Some(s) = ctx.read_string(*o) {
+                    message.push_str(&s);
+                    continue;
                 }
-                message.push_str(&s);
-                break; // first string is enough
+            }
+            // A non-String object argument that subclasses Throwable is
+            // the exception passed to `error(Object, Throwable)` etc. —
+            // surface it instead of silently dropping it.
+            if throwable.is_none() {
+                let cn = ctx.class_name_of_id(ctx.class_id_of_object(*o));
+                let is_throwable = cn
+                    .as_deref()
+                    .map(|n| {
+                        n.ends_with("Exception")
+                            || n.ends_with("Error")
+                            || n.ends_with("Throwable")
+                    })
+                    .unwrap_or(false)
+                    || ctx
+                        .get_field_by_name(*o, "detailMessage")
+                        .as_object()
+                        .is_some();
+                if is_throwable {
+                    throwable = Some(*o);
+                }
             }
         }
     }
     eprintln!("{level} [{logger_name}] {message}");
+    if let Some(t) = throwable {
+        dump_throwable_to_stderr(ctx, t, "    ");
+    }
 }
 
 fn native_jboss_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
