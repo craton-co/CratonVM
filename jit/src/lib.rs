@@ -1241,37 +1241,210 @@ pub struct JitInvokeInfo {
     pub invoke_kind: u8,
 }
 
-/// Sentinel `entry` values for JitDirectCall indicating inlined Math intrinsics.
-/// These are never valid code pointers (kernel address space).
-pub const MATH_SQRT_INTRINSIC: usize = usize::MAX;
-pub const MATH_FLOOR_INTRINSIC: usize = usize::MAX - 1;
-pub const MATH_CEIL_INTRINSIC: usize = usize::MAX - 2;
-pub const MATH_RINT_INTRINSIC: usize = usize::MAX - 3;
-pub const MATH_ABS_DOUBLE_INTRINSIC: usize = usize::MAX - 4;
-pub const MATH_ABS_FLOAT_INTRINSIC: usize = usize::MAX - 5;
-pub const MATH_ABS_INT_INTRINSIC: usize = usize::MAX - 6;
-pub const MATH_ABS_LONG_INTRINSIC: usize = usize::MAX - 7;
-/// T1.1.28 — `Math.fma(a, b, c)` intrinsic (fused multiply-add).
+/// Enumeration of every JIT call-site intrinsic.
 ///
-/// Per JLS: `Math.fma(a, b, c)` returns `a*b + c` computed as if with
-/// unlimited intermediate precision and then rounded once. On x86-64
-/// with FMA3 support this maps to `VFMADD231SD` / `VFMADD231SS`; the
-/// JIT path falls back to a helper call into `f64::mul_add` /
-/// `f32::mul_add` which correctly uses the host FMA instruction when
-/// the target CPU supports it and otherwise performs a
-/// software-correct fused operation.
-pub const MATH_FMA_DOUBLE_INTRINSIC: usize = usize::MAX - 8;
-pub const MATH_FMA_FLOAT_INTRINSIC: usize = usize::MAX - 9;
-// Round-8 Bug 8: branchless `Math.min(int,int)` / `Math.max(int,int)` /
-// long variants via CMOV. Per JLS these are total functions with no NaN /
-// trap edge cases on integral inputs — straight `cmp` + `cmovl`/`cmovg`
-// in two GPRs. Replaces a compare + Jcc + branch with a single CMOV;
-// removes a hard-to-predict branch on sorting / argmin kernels where
-// the input distribution beats the branch predictor.
-pub const MATH_MIN_INT_INTRINSIC: usize = usize::MAX - 10;
-pub const MATH_MAX_INT_INTRINSIC: usize = usize::MAX - 11;
-pub const MATH_MIN_LONG_INTRINSIC: usize = usize::MAX - 12;
-pub const MATH_MAX_LONG_INTRINSIC: usize = usize::MAX - 13;
+/// Each variant is mapped onto the `JitDirectCall.entry` sentinel space via
+/// [`JitIntrinsic::as_entry`] (`usize::MAX - (variant as usize)`). These
+/// sentinels are never valid code pointers (kernel address space), so the
+/// `callee_entry` dispatch in `x64.rs` stays a single integer comparison.
+///
+/// **Variant ordering is load-bearing.** The first 14 variants — the
+/// `java.lang.Math` family — MUST keep their declaration order so that the
+/// deprecated `MATH_*_INTRINSIC` const aliases below resolve to exactly the
+/// same `usize::MAX - N` values they had before the enum was introduced.
+///
+/// Per-family regions are marked with `INTRINSIC REGION BEGIN/END: <TAG>`
+/// comment pairs. A follow-up agent adding family `<TAG>` appends its
+/// variants strictly between that family's BEGIN/END markers and nowhere
+/// else, so 8 agents editing 8 disjoint regions never collide.
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JitIntrinsic {
+    // --- java.lang.Math family (variants 0..=13 — ORDER IS LOAD-BEARING) ---
+    MathSqrt = 0,
+    MathFloor = 1,
+    MathCeil = 2,
+    MathRint = 3,
+    MathAbsDouble = 4,
+    MathAbsFloat = 5,
+    MathAbsInt = 6,
+    MathAbsLong = 7,
+    MathFmaDouble = 8,
+    MathFmaFloat = 9,
+    MathMinInt = 10,
+    MathMaxInt = 11,
+    MathMinLong = 12,
+    MathMaxLong = 13,
+
+    // ===== INTRINSIC REGION BEGIN: INT_BITS =====
+
+    // ===== INTRINSIC REGION END: INT_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
+
+    // ===== INTRINSIC REGION END: LONG_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION END: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
+
+    // ===== INTRINSIC REGION END: STRING_ACCESS =====
+
+    // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
+
+    // ===== INTRINSIC REGION END: STRING_SEARCH =====
+
+    // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
+
+    // ===== INTRINSIC REGION END: ARRAYS_OPS =====
+
+    // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
+
+    // ===== INTRINSIC REGION END: ARRAYS_SORT =====
+
+    // ===== INTRINSIC REGION BEGIN: CRC32 =====
+
+    // ===== INTRINSIC REGION END: CRC32 =====
+}
+
+impl JitIntrinsic {
+    /// Map this intrinsic onto the `JitDirectCall.entry` sentinel space.
+    ///
+    /// Returns `usize::MAX - (self as usize)`, a value that can never be a
+    /// valid code pointer. The `x64.rs` codegen ladder compares
+    /// `callee_entry` against `JitIntrinsic::Foo.as_entry()` to recognise
+    /// an intrinsic call site.
+    pub const fn as_entry(self) -> usize {
+        usize::MAX - (self as usize)
+    }
+}
+
+/// Sentinel `entry` values for JitDirectCall indicating inlined Math intrinsics.
+///
+/// These are deprecated aliases retained for one release so existing
+/// `x64.rs` comparisons keep compiling unchanged. New code should use
+/// [`JitIntrinsic`] variants and [`JitIntrinsic::as_entry`] directly.
+#[allow(deprecated)]
+mod math_intrinsic_aliases {
+    use super::JitIntrinsic;
+    #[deprecated(note = "use JitIntrinsic::MathSqrt.as_entry()")]
+    pub const MATH_SQRT_INTRINSIC: usize = JitIntrinsic::MathSqrt.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathFloor.as_entry()")]
+    pub const MATH_FLOOR_INTRINSIC: usize = JitIntrinsic::MathFloor.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathCeil.as_entry()")]
+    pub const MATH_CEIL_INTRINSIC: usize = JitIntrinsic::MathCeil.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathRint.as_entry()")]
+    pub const MATH_RINT_INTRINSIC: usize = JitIntrinsic::MathRint.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathAbsDouble.as_entry()")]
+    pub const MATH_ABS_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathAbsDouble.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathAbsFloat.as_entry()")]
+    pub const MATH_ABS_FLOAT_INTRINSIC: usize = JitIntrinsic::MathAbsFloat.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathAbsInt.as_entry()")]
+    pub const MATH_ABS_INT_INTRINSIC: usize = JitIntrinsic::MathAbsInt.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathAbsLong.as_entry()")]
+    pub const MATH_ABS_LONG_INTRINSIC: usize = JitIntrinsic::MathAbsLong.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathFmaDouble.as_entry()")]
+    pub const MATH_FMA_DOUBLE_INTRINSIC: usize = JitIntrinsic::MathFmaDouble.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathFmaFloat.as_entry()")]
+    pub const MATH_FMA_FLOAT_INTRINSIC: usize = JitIntrinsic::MathFmaFloat.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathMinInt.as_entry()")]
+    pub const MATH_MIN_INT_INTRINSIC: usize = JitIntrinsic::MathMinInt.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathMaxInt.as_entry()")]
+    pub const MATH_MAX_INT_INTRINSIC: usize = JitIntrinsic::MathMaxInt.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathMinLong.as_entry()")]
+    pub const MATH_MIN_LONG_INTRINSIC: usize = JitIntrinsic::MathMinLong.as_entry();
+    #[deprecated(note = "use JitIntrinsic::MathMaxLong.as_entry()")]
+    pub const MATH_MAX_LONG_INTRINSIC: usize = JitIntrinsic::MathMaxLong.as_entry();
+}
+#[allow(deprecated)]
+pub use math_intrinsic_aliases::*;
+
+/// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
+///
+/// Returns `Some((entry, num_params, return_type))` where `entry` is the
+/// [`JitIntrinsic::as_entry`] sentinel, `num_params` is the JLS argument
+/// count *excluding* any receiver, and `return_type` is the JVM type tag
+/// of the result. Returns `None` when no intrinsic matches, when the
+/// required CPU feature is absent, or when inlining would be incorrect —
+/// in which case the call falls back to the normal dispatch path.
+///
+/// CPU-feature gating must match the codegen ladder in `x64.rs` exactly
+/// (e.g. floor/ceil/rint require `x64::has_sse41()`), so that a method is
+/// never registered as an intrinsic the codegen cannot emit.
+///
+/// **Per-family regions.** The Math family is matched inline below. Every
+/// other family has an empty `INTRINSIC REGION BEGIN/END: <TAG>` block;
+/// a follow-up agent fills exactly one region with an
+/// `if let Some(hit) = <match>; return Some(hit)` block. Because each
+/// region is an independent statement, 8 agents editing 8 regions never
+/// produce a merge conflict.
+pub fn try_resolve_intrinsic(
+    class: &str,
+    name: &str,
+    descriptor: &str,
+) -> Option<(usize, usize, u8)> {
+    // --- java.lang.Math / java.lang.StrictMath family ---
+    if class == "java/lang/Math" || class == "java/lang/StrictMath" {
+        let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            ("sqrt", "(D)D") => Some((JitIntrinsic::MathSqrt, 1, b'D')),
+            ("floor", "(D)D") if x64::has_sse41() => Some((JitIntrinsic::MathFloor, 1, b'D')),
+            ("ceil", "(D)D") if x64::has_sse41() => Some((JitIntrinsic::MathCeil, 1, b'D')),
+            ("rint", "(D)D") if x64::has_sse41() => Some((JitIntrinsic::MathRint, 1, b'D')),
+            ("abs", "(D)D") => Some((JitIntrinsic::MathAbsDouble, 1, b'D')),
+            ("abs", "(F)F") => Some((JitIntrinsic::MathAbsFloat, 1, b'F')),
+            ("abs", "(I)I") => Some((JitIntrinsic::MathAbsInt, 1, b'I')),
+            ("abs", "(J)J") => Some((JitIntrinsic::MathAbsLong, 1, b'J')),
+            // T1.1.28 — Math.fma (fused multiply-add).
+            ("fma", "(DDD)D") => Some((JitIntrinsic::MathFmaDouble, 3, b'D')),
+            ("fma", "(FFF)F") => Some((JitIntrinsic::MathFmaFloat, 3, b'F')),
+            // Round-8 Bug 8 — branchless integer min/max via CMOV.
+            ("min", "(II)I") => Some((JitIntrinsic::MathMinInt, 2, b'I')),
+            ("max", "(II)I") => Some((JitIntrinsic::MathMaxInt, 2, b'I')),
+            ("min", "(JJ)J") => Some((JitIntrinsic::MathMinLong, 2, b'J')),
+            ("max", "(JJ)J") => Some((JitIntrinsic::MathMaxLong, 2, b'J')),
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = hit {
+            return Some((intrinsic.as_entry(), num_params, ret));
+        }
+    }
+
+    // ===== INTRINSIC REGION BEGIN: INT_BITS =====
+
+    // ===== INTRINSIC REGION END: INT_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
+
+    // ===== INTRINSIC REGION END: LONG_BITS =====
+
+    // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION END: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
+
+    // ===== INTRINSIC REGION END: STRING_ACCESS =====
+
+    // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
+
+    // ===== INTRINSIC REGION END: STRING_SEARCH =====
+
+    // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
+
+    // ===== INTRINSIC REGION END: ARRAYS_OPS =====
+
+    // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
+
+    // ===== INTRINSIC REGION END: ARRAYS_SORT =====
+
+    // ===== INTRINSIC REGION BEGIN: CRC32 =====
+
+    // ===== INTRINSIC REGION END: CRC32 =====
+
+    None
+}
 
 /// A resolved direct-call target.
 pub struct JitDirectCall {
@@ -2803,42 +2976,23 @@ fn try_compile_inner(
                 }
                 needs_heap = true;
 
-                // Math intrinsics — inline SSE/SSE4.1 instructions, no call overhead
-                if class_name == "java/lang/Math" || class_name == "java/lang/StrictMath" {
-                    let intrinsic = match (method_name.as_str(), descriptor.as_str()) {
-                        ("sqrt", "(D)D") => Some((MATH_SQRT_INTRINSIC, 1, b'D')),
-                        ("floor", "(D)D") if x64::has_sse41() =>
-                            Some((MATH_FLOOR_INTRINSIC, 1, b'D')),
-                        ("ceil", "(D)D") if x64::has_sse41() =>
-                            Some((MATH_CEIL_INTRINSIC, 1, b'D')),
-                        ("rint", "(D)D") if x64::has_sse41() =>
-                            Some((MATH_RINT_INTRINSIC, 1, b'D')),
-                        ("abs", "(D)D") => Some((MATH_ABS_DOUBLE_INTRINSIC, 1, b'D')),
-                        ("abs", "(F)F") => Some((MATH_ABS_FLOAT_INTRINSIC, 1, b'F')),
-                        ("abs", "(I)I") => Some((MATH_ABS_INT_INTRINSIC, 1, b'I')),
-                        ("abs", "(J)J") => Some((MATH_ABS_LONG_INTRINSIC, 1, b'J')),
-                        // T1.1.28 — Math.fma (fused multiply-add).
-                        ("fma", "(DDD)D") => Some((MATH_FMA_DOUBLE_INTRINSIC, 3, b'D')),
-                        ("fma", "(FFF)F") => Some((MATH_FMA_FLOAT_INTRINSIC, 3, b'F')),
-                        // Round-8 Bug 8 — branchless integer min/max via CMOV.
-                        ("min", "(II)I") => Some((MATH_MIN_INT_INTRINSIC, 2, b'I')),
-                        ("max", "(II)I") => Some((MATH_MAX_INT_INTRINSIC, 2, b'I')),
-                        ("min", "(JJ)J") => Some((MATH_MIN_LONG_INTRINSIC, 2, b'J')),
-                        ("max", "(JJ)J") => Some((MATH_MAX_LONG_INTRINSIC, 2, b'J')),
-                        _ => None,
-                    };
-                    if let Some((entry, num_params, ret)) = intrinsic {
-                        direct_calls.push((
-                            pc,
-                            JitDirectCall {
-                                entry,
-                                needs_context: false,
-                                num_params,
-                                return_type: ret,
-                            },
-                        ));
-                        continue;
-                    }
+                // Call-site intrinsics — inline machine code, no call overhead.
+                // The matcher (`try_resolve_intrinsic`) keys on
+                // (class, name, descriptor) and applies the same CPU-feature
+                // gates the x64 codegen ladder relies on.
+                if let Some((entry, num_params, ret)) =
+                    try_resolve_intrinsic(&class_name, &method_name, &descriptor)
+                {
+                    direct_calls.push((
+                        pc,
+                        JitDirectCall {
+                            entry,
+                            needs_context: false,
+                            num_params,
+                            return_type: ret,
+                        },
+                    ));
+                    continue;
                 }
             }
 

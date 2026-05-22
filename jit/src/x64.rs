@@ -4525,21 +4525,6 @@ impl Compiler {
     // The current emitter performs those selects via compare+conditional
     // jump+move, which mispredicts on hard-to-predict data (e.g. random
     // array element comparisons in sorting kernels).
-    //
-    // Round-8 wiring attempt: Math.min/Math.max are NOT yet registered
-    // as JIT intrinsics in `lib.rs` (no MATH_MIN_INTRINSIC sentinel and
-    // no detection in `try_resolve_intrinsic`). Adding the intrinsic
-    // dispatch requires edits to `lib.rs` (sentinel constant + matcher
-    // in `try_resolve_intrinsic`) plus an x64.rs callee_entry arm that
-    // emits the CMOV sequence. That cross-file change is owned by a
-    // separate agent in this wave (lib.rs is in another agent's scope).
-    // When wiring lands, the planned sequence for Math.min(int a,int b):
-    //     MOV   EAX, a            ; result := a (default)
-    //     CMP   EAX, b            ; flags := a - b
-    //     CMOVG EAX, b            ; if a > b, take b instead
-    // and symmetric for Math.max (CMOVL EAX, b). This avoids the
-    // misprediction penalty that a JL/JG + MOV would incur on data
-    // with poor branch entropy.
 
     /// Emit `CMOVcc dst, src` (64-bit) with the given condition opcode byte
     /// (0x40..0x4F). dst/src are encoded register-direct (mod=11).
@@ -9076,6 +9061,10 @@ impl Compiler {
     // Bytecode compilation
     // -----------------------------------------------------------------------
 
+    // The intrinsic-dispatch ladders below compare `callee_entry` against the
+    // deprecated `super::MATH_*_INTRINSIC` aliases; new code should compare
+    // against `JitIntrinsic::Foo.as_entry()` instead.
+    #[allow(deprecated)]
     fn compile_bytecode(&mut self, code: &[u8], code_len: usize) -> bool {
         // Pre-allocate pc_to_native mapping
         self.pc_to_native.resize(code_len + 1, -1);
@@ -11933,7 +11922,36 @@ impl Compiler {
                             // CMOVcc RAX, RCX (REX.W): 48 0F 4c C1
                             self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
                             self.push_from_rax();
-                        } else {
+                        }
+                        // --- invokestatic intrinsic family regions ---
+                        // A follow-up agent for family <TAG> appends its
+                        // codegen as `else if callee_entry ==
+                        // super::JitIntrinsic::Foo.as_entry() { ... }`
+                        // strictly between that family's BEGIN/END markers.
+                        // An empty region contributes nothing, so the
+                        // `if let Some(...) = direct` chain stays valid.
+                        //
+                        // ===== INTRINSIC REGION BEGIN: INT_BITS =====
+
+                        // ===== INTRINSIC REGION END: INT_BITS =====
+
+                        // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
+
+                        // ===== INTRINSIC REGION END: LONG_BITS =====
+
+                        // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
+
+                        // ===== INTRINSIC REGION END: ARRAYCOPY =====
+
+                        // ===== INTRINSIC REGION BEGIN: ARRAYS_OPS =====
+
+                        // ===== INTRINSIC REGION END: ARRAYS_OPS =====
+
+                        // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
+
+                        // ===== INTRINSIC REGION END: ARRAYS_SORT =====
+
+                        else {
                             // Direct call to a JIT-compiled callee
                             let n = callee_params;
                             let mut arg_slots = Vec::with_capacity(n);
@@ -12250,6 +12268,38 @@ impl Compiler {
                         });
 
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct {
+                        // --- invokevirtual/special/interface intrinsic ladder ---
+                        // Instance-method call-site intrinsics (String / CRC32)
+                        // are dispatched here BEFORE the plain direct-call
+                        // handling below. Unlike the invokestatic ladder,
+                        // instance intrinsics treat the deepest stack operand
+                        // as the receiver (`this`): the JLS argument count is
+                        // `callee_params`, and total operands popped is
+                        // `callee_params + 1`.
+                        //
+                        // A follow-up agent for family <TAG> fills exactly one
+                        // region with `if callee_entry ==
+                        // super::JitIntrinsic::Foo.as_entry() {
+                        //     <emit inline code>; <handled = true>; }`.
+                        // When every region is empty `intrinsic_handled`
+                        // stays false and control falls through to the
+                        // unchanged plain direct-call path.
+                        #[allow(unused_mut)]
+                        let mut intrinsic_handled = false;
+
+                        // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
+
+                        // ===== INTRINSIC REGION END: STRING_ACCESS =====
+
+                        // ===== INTRINSIC REGION BEGIN: STRING_SEARCH =====
+
+                        // ===== INTRINSIC REGION END: STRING_SEARCH =====
+
+                        // ===== INTRINSIC REGION BEGIN: CRC32 =====
+
+                        // ===== INTRINSIC REGION END: CRC32 =====
+
+                        if !intrinsic_handled {
                         // Direct call: pop receiver + params, call compiled entry
                         // invokespecial has a receiver, so total args = callee_params + 1
                         let n = callee_params + 1; // receiver + params
@@ -12284,6 +12334,7 @@ impl Compiler {
                                 self.push_from_rax();
                             }
                         }
+                        } // end `if !intrinsic_handled` (plain direct call)
                     } else {
                         // Dispatch via helper (MIC-optimized for virtual/interface, plain for others)
                         // MED-4 / Fix 3 — O(1) pc-indexed lookups for invoke/MIC/PIC.
@@ -15236,6 +15287,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // uses MATH_*_INTRINSIC aliases
     fn test_compile_math_sqrt_intrinsic() {
         // double f(double x) { return Math.sqrt(x); }
         // dload_0 (0x26), invokestatic (0xb8, 0x00, 0x01), dreturn (0xaf)
@@ -15286,6 +15338,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // uses MATH_*_INTRINSIC aliases
     fn test_compile_math_min_max_int_intrinsic() {
         // int min_f(int a, int b) { return Math.min(a, b); }
         // int max_f(int a, int b) { return Math.max(a, b); }
@@ -15434,6 +15487,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // uses MATH_*_INTRINSIC aliases
     fn test_compile_math_min_max_long_intrinsic() {
         // long min_f(long a, long b) { return Math.min(a, b); }
         // long max_f(long a, long b) { return Math.max(a, b); }
