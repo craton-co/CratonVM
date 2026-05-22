@@ -531,12 +531,20 @@ fn box_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 }
 
 fn box_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let v = match args.first() { Some(Value::Long(n)) => *n, _ => 0 };
-    let Some(w) = alloc_letsgo_wrapper(ctx, "java/lang/Long") else {
-        return Ok(Some(Value::Object(None)));
-    };
-    ctx.set_field(w, 0, Value::Long(v));
-    Ok(Some(Value::Object(Some(w))))
+    // `Long.valueOf(long)` MUST return the canonical cached instance for
+    // values in [-128, 127] (JLS §5.1.7 / `LongCache`). Reference-identity
+    // checks (`Long.valueOf(x) == Long.valueOf(x)`) depend on this.
+    // Allocating a fresh wrapper here broke that invariant — delegate to the
+    // cache-preserving implementation in `lang_math`, exactly as `box_integer`
+    // does for `IntegerCache`.
+    crate::lang_math::native_long_value_of(ctx, args).or_else(|_| {
+        let v = match args.first() { Some(Value::Long(n)) => *n, _ => 0 };
+        let Some(w) = alloc_letsgo_wrapper(ctx, "java/lang/Long") else {
+            return Ok(Some(Value::Object(None)));
+        };
+        ctx.set_field(w, 0, Value::Long(v));
+        Ok(Some(Value::Object(Some(w))))
+    })
 }
 
 fn box_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

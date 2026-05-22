@@ -2293,6 +2293,18 @@ fn boolean_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::Object
     BOOLEAN_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 2]))
 }
 
+/// `LongCache` for `Long.valueOf(long)` — JLS §5.1.7 mandates the canonical
+/// cached instance for values in [-128, 127] so `Long.valueOf(x) ==
+/// Long.valueOf(x)` holds. Process-wide (not thread-local) and GC-scanned for
+/// the same reasons documented above for `INTEGER_CACHE`.
+static LONG_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]>,
+> = std::sync::OnceLock::new();
+
+fn long_cache() -> &'static parking_lot::Mutex<[Option<cratonvm_types::ObjectRef>; 256]> {
+    LONG_CACHE.get_or_init(|| parking_lot::Mutex::new([None; 256]))
+}
+
 /// GC root scan hook — called from `vm/src/memory/roots.rs::collect_roots`.
 /// Reports every cached Integer/Boolean ObjectRef so the GC keeps it live.
 pub fn gc_scan_value_of_cache_roots(out: &mut Vec<cratonvm_types::ObjectRef>) {
@@ -2306,6 +2318,14 @@ pub fn gc_scan_value_of_cache_roots(out: &mut Vec<cratonvm_types::ObjectRef>) {
     }
     {
         let cache = boolean_cache().lock();
+        for slot in cache.iter() {
+            if let Some(o) = slot {
+                out.push(*o);
+            }
+        }
+    }
+    {
+        let cache = long_cache().lock();
         for slot in cache.iter() {
             if let Some(o) = slot {
                 out.push(*o);
@@ -2334,6 +2354,18 @@ pub fn gc_update_value_of_cache_refs(pointer_map: &std::collections::HashMap<usi
     }
     {
         let mut cache = boolean_cache().lock();
+        for slot in cache.iter_mut() {
+            if let Some(obj_ref) = slot {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+    {
+        let mut cache = long_cache().lock();
         for slot in cache.iter_mut() {
             if let Some(obj_ref) = slot {
                 let old_addr = obj_ref.as_ptr() as usize;
@@ -2590,6 +2622,25 @@ pub(crate) fn native_long_value_of(ctx: &mut dyn NativeContext, args: &[Value]) 
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    if (-128..=127).contains(&val) {
+        let idx = (val + 128) as usize;
+        // Fast path: lock, read, drop lock before any heap allocation.
+        if let Some(cached) = { let c = long_cache().lock(); c[idx] } {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+        let obj = alloc_wrapper(ctx, "java/lang/Long");
+        ctx.set_field(obj, 0, Value::Long(val));
+        // Re-check under the lock — another thread may have populated the
+        // slot while we were allocating. If so, drop ours and return theirs
+        // (the loser allocation is collectible — but the race is rare and
+        // it preserves the JLS identity invariant).
+        let mut cache = long_cache().lock();
+        if let Some(existing) = cache[idx] {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        cache[idx] = Some(obj);
+        return Ok(Some(Value::Object(Some(obj))));
+    }
     let obj = alloc_wrapper(ctx, "java/lang/Long");
     ctx.set_field(obj, 0, Value::Long(val));
     Ok(Some(Value::Object(Some(obj))))
