@@ -12621,7 +12621,221 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: ARRAYS_OPS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYS_SORT =====
+                        else if callee_entry
+                            == super::JitIntrinsic::ArraysSortInt.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::ArraysSortLong.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::ArraysSortChar.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::ArraysSortShort.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::ArraysSortByte.as_entry()
+                        {
+                            // Phase 4b — java.util.Arrays.sort(prim[]) inline
+                            // insertion sort. Void return: nothing is pushed.
+                            //
+                            // The matcher (try_resolve_intrinsic ARRAYS_SORT
+                            // region) registers only the five integral
+                            // single-arg overloads. Insertion sort is O(n^2)
+                            // but provably correct for EVERY length — empty,
+                            // single, sorted, reverse, duplicates, negatives.
+                            // There is deliberately no runtime "bail to native
+                            // for large arrays": once the call site resolves
+                            // to this intrinsic there is no native call left
+                            // to fall through to, so bailing would silently
+                            // leave a long array unsorted. Correctness wins
+                            // over the constant factor (roadmap §3.4).
+                            //
+                            // All work uses caller-saved scratch only
+                            // (RAX/RCX/RDX/R8/R9/R10/R11) — `flush_scratch_
+                            // registers()` already spilled them and Java
+                            // locals live in callee-saved registers, so the
+                            // loop never clobbers live state.
+                            //
+                            // Register file for the emitted routine:
+                            //   R8  = array base pointer
+                            //   R9  = n (element count)
+                            //   R10 = i (outer index)
+                            //   R11 = j (inner index)
+                            //   RAX = key (= a[i])
+                            //   RCX = a[j] scratch
+                            //   RDX = j+1 (store index)
+                            //
+                            // Every element is loaded sign-/zero-extended to
+                            // a full 64-bit register, so a single signed
+                            // 64-bit CMP orders all five element kinds
+                            // correctly (char is unsigned 0..=65535, which is
+                            // non-negative, so signed compare still works).
 
+                            // SIB scale bits + load/store encodings per width.
+                            let is_int = callee_entry
+                                == super::JitIntrinsic::ArraysSortInt.as_entry();
+                            let is_long = callee_entry
+                                == super::JitIntrinsic::ArraysSortLong.as_entry();
+                            let is_char = callee_entry
+                                == super::JitIntrinsic::ArraysSortChar.as_entry();
+                            let is_short = callee_entry
+                                == super::JitIntrinsic::ArraysSortShort.as_entry();
+                            // is_byte is the remaining case.
+                            let scale_ss: u8 = if is_long {
+                                0b11 // *8
+                            } else if is_int {
+                                0b10 // *4
+                            } else if is_char || is_short {
+                                0b01 // *2
+                            } else {
+                                0b00 // *1 (byte)
+                            };
+                            // HEADER_SIZE / ARRAY_LENGTH_OFFSET both fit in a
+                            // signed disp8 (asserted in cratonvm_types).
+                            let hdr = HEADER_SIZE as u8;
+                            let len_off = ARRAY_LENGTH_OFFSET as u8;
+
+                            // Pop the array reference, null-check it (reusing
+                            // the shared NPE stub), then park it in R8.
+                            let arr_slot = self.pop_stack();
+                            self.load_slot_to_reg(RAX, arr_slot);
+                            // TEST RAX,RAX / JZ -> shared null-check stub.
+                            self.emit_null_check_array_load();
+                            // MOV R8, RAX  (49 89 C0)
+                            self.buf.emit(&[0x49, 0x89, 0xC0]);
+                            // MOV R9D, [R8 + ARRAY_LENGTH_OFFSET]  (45 8B 48 dd)
+                            // (32-bit load zero-extends n into R9.)
+                            self.buf.emit(&[0x45, 0x8B, 0x48, len_off]);
+                            // MOV R10D, 1   (41 BA 01 00 00 00) — i = 1
+                            self.buf.emit(&[0x41, 0xBA, 0x01, 0x00, 0x00, 0x00]);
+
+                            // --- inline emitters for width-specific access ---
+                            // Access form: [R8 + idx*scale + hdr] with a
+                            // ModRM.reg operand `r` (the GPR load dest /
+                            // store source). REX bits MUST be derived per
+                            // register: REX.R from `r`, REX.X from `idx`,
+                            // REX.B is always 1 (base is R8). REX.W comes
+                            // from the caller (`w`). A prior version hard-
+                            // coded REX.X=1, which silently re-routed a
+                            // store through a non-extended index register
+                            // (RDX -> R10) and left the array unsorted.
+                            let rex = |w: u8, r: u8, idx: u8| -> u8 {
+                                0x40 | (w << 3)
+                                    | (((r >= 8) as u8) << 2)
+                                    | (((idx >= 8) as u8) << 1)
+                                    | 1 // REX.B: base = R8
+                            };
+                            // load r <- [R8 + idx*scale + hdr]
+                            let emit_load =
+                                |buf: &mut super::ExecutableBuffer, r: u8, idx: u8| {
+                                    let sib = (scale_ss << 6) | ((idx & 7) << 3);
+                                    let modrm = 0x40 | ((r & 7) << 3) | 0x04;
+                                    if is_long {
+                                        // MOV r64,[..]  REX.W, 8B
+                                        buf.emit(&[rex(1, r, idx), 0x8B, modrm, sib, hdr]);
+                                    } else if is_int {
+                                        // MOVSXD r64,[..]  REX.W, 63
+                                        buf.emit(&[rex(1, r, idx), 0x63, modrm, sib, hdr]);
+                                    } else if is_char {
+                                        // MOVZX r32,m16  0F B7. char is
+                                        // unsigned 0..=65535; zero-extending
+                                        // to 32 bits also clears RAX[63:32],
+                                        // so the 64-bit signed CMP is correct.
+                                        buf.emit(&[rex(0, r, idx), 0x0F, 0xB7, modrm, sib, hdr]);
+                                    } else if is_short {
+                                        // MOVSX r64,m16  REX.W 0F BF — MUST
+                                        // sign-extend to the FULL 64-bit
+                                        // register: the inner-loop CMP is
+                                        // 64-bit, and a 32-bit MOVSX would
+                                        // leave a negative short looking like
+                                        // a large positive (0x0000_0000_FFFF…).
+                                        buf.emit(&[rex(1, r, idx), 0x0F, 0xBF, modrm, sib, hdr]);
+                                    } else {
+                                        // MOVSX r64,m8  REX.W 0F BE — sign-
+                                        // extend a signed byte to 64 bits
+                                        // (same rationale as short above).
+                                        buf.emit(&[rex(1, r, idx), 0x0F, 0xBE, modrm, sib, hdr]);
+                                    }
+                                };
+                            // store [R8 + idx*scale + hdr] <- r
+                            let emit_store =
+                                |buf: &mut super::ExecutableBuffer, r: u8, idx: u8| {
+                                    let sib = (scale_ss << 6) | ((idx & 7) << 3);
+                                    let modrm = 0x40 | ((r & 7) << 3) | 0x04;
+                                    if is_long {
+                                        // MOV [..],r64  REX.W, 89
+                                        buf.emit(&[rex(1, r, idx), 0x89, modrm, sib, hdr]);
+                                    } else if is_int {
+                                        // MOV [..],r32  89
+                                        buf.emit(&[rex(0, r, idx), 0x89, modrm, sib, hdr]);
+                                    } else if is_char || is_short {
+                                        // MOV [..],r16  66 prefix, 89
+                                        buf.emit(&[0x66, rex(0, r, idx), 0x89, modrm, sib, hdr]);
+                                    } else {
+                                        // MOV [..],r8   88
+                                        buf.emit(&[rex(0, r, idx), 0x88, modrm, sib, hdr]);
+                                    }
+                                };
+
+                            // .outer:
+                            let outer_label = self.buf.pos();
+                            // CMP R10, R9   (4D 39 CA) — i vs n
+                            self.buf.emit(&[0x4D, 0x39, 0xCA]);
+                            // JGE .done  (0F 8D rel32) — signed: i >= n
+                            let done_patch = self.emit_jcc_rel32_patch(0x8D);
+                            // key = a[i]
+                            emit_load(&mut self.buf, RAX, R10);
+                            // MOV R11, R10  (4D 89 D3) — j = i
+                            self.buf.emit(&[0x4D, 0x89, 0xD3]);
+                            // DEC R11       (49 FF CB) — j = i - 1
+                            self.buf.emit(&[0x49, 0xFF, 0xCB]);
+
+                            // .inner:
+                            let inner_label = self.buf.pos();
+                            // TEST R11,R11  (4D 85 DB)
+                            self.buf.emit(&[0x4D, 0x85, 0xDB]);
+                            // JS .insert    (0F 88 rel32) — j < 0 -> stop
+                            let insert_patch = self.emit_jcc_rel32_patch(0x88);
+                            // RCX = a[j]
+                            emit_load(&mut self.buf, RCX, R11);
+                            // CMP RCX, RAX  (48 39 C1) — a[j] vs key, signed64
+                            self.buf.emit(&[0x48, 0x39, 0xC1]);
+                            // JLE .insert   (0F 8E rel32) — a[j] <= key -> stop
+                            //   (stable: equal keys are never shifted past.)
+                            let insert_patch2 = self.emit_jcc_rel32_patch(0x8E);
+                            // a[j+1] = a[j]
+                            // LEA RDX, [R11 + 1]  (49 8D 53 01)
+                            self.buf.emit(&[0x49, 0x8D, 0x53, 0x01]);
+                            emit_store(&mut self.buf, RCX, RDX);
+                            // DEC R11  (49 FF CB)  — j--
+                            self.buf.emit(&[0x49, 0xFF, 0xCB]);
+                            // JMP .inner  (E9 rel32) — backward branch.
+                            self.buf.emit_byte(0xE9);
+                            {
+                                let here = self.buf.pos();
+                                let rel = (inner_label as i64) - (here as i64 + 4);
+                                self.buf.emit(&(rel as i32).to_le_bytes());
+                            }
+
+                            // .insert: both JS and JLE land here.
+                            self.patch_rel32_to_here(insert_patch);
+                            self.patch_rel32_to_here(insert_patch2);
+                            // a[j+1] = key
+                            // LEA RDX, [R11 + 1]  (49 8D 53 01)
+                            self.buf.emit(&[0x49, 0x8D, 0x53, 0x01]);
+                            emit_store(&mut self.buf, RAX, RDX);
+                            // INC R10  (49 FF C2)  — i++
+                            self.buf.emit(&[0x49, 0xFF, 0xC2]);
+                            // JMP .outer  (E9 rel32) — backward branch.
+                            self.buf.emit_byte(0xE9);
+                            {
+                                let here = self.buf.pos();
+                                let rel = (outer_label as i64) - (here as i64 + 4);
+                                self.buf.emit(&(rel as i32).to_le_bytes());
+                            }
+
+                            // .done: the top-of-loop JGE lands here.
+                            self.patch_rel32_to_here(done_patch);
+                            // Void method — nothing pushed; `ret_type` is 'V'.
+                            let _ = ret_type;
+                        }
                         // ===== INTRINSIC REGION END: ARRAYS_SORT =====
 
                         else {
