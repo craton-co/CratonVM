@@ -1,38 +1,21 @@
 //! Jenkins LTS 2.452.3 boot-test shim.
 //!
-//! Jenkins's executable.Main (Winstone launcher) detects Java 25 as
-//! unsupported and exits rc=1 unless `--enable-future-java` is passed.
-//! Short-circuit Main.main directly so the JVM exits rc=0 — boot-test
-//! success.
+//! **HISTORY**: Previously this module short-circuited the Winstone
+//! launcher's `executable.Main.main` (plus a defensive no-op `<clinit>`)
+//! so the JVM exited rc=0 instead of running the real Java-version
+//! detection in Jenkins's bootstrap.
+//!
+//! **CURRENT STATE (real-bytecode audit)**: every short-circuit
+//! registration has been REMOVED per the "no synthetic stubs" policy.
+//! Real Jenkins / Winstone bytecode now runs. This file is kept so the
+//! call site in `lib.rs::register_essential_natives` continues to compile.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
 
-fn jenkins_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[jenkins-shim] Main.main short-circuited (Java-25 bypass)");
-    Ok(None)
-}
-
-pub fn register_jenkins_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when CRATONVM_JENKINS_REAL=1, skip the short-circuit so
-    // the real Winstone launcher runs end-to-end (used for `--version`).
-    if std::env::var("CRATONVM_JENKINS_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    registry.register(
-        "executable/Main",
-        "main",
-        "([Ljava/lang/String;)V",
-        jenkins_main_noop,
-    );
-    // Defensive: also handle <clinit> in case Jenkins moves the check.
-    registry.register(
-        "executable/Main",
-        "<clinit>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
+/// Audit cleanup: no longer registers any natives. Previously short-
+/// circuited `executable/Main.main` and `<clinit>`.
+pub fn register_jenkins_stubs(_registry: &mut NativeMethodRegistry) {
+    // Intentionally empty. Real Winstone Main bytecode runs.
 }
 
 #[cfg(test)]

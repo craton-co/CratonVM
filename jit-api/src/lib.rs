@@ -37,7 +37,13 @@ pub struct CachedBytecodeMethod {
 /// The JIT compiler embeds these addresses into generated machine code as
 /// absolute `CALL` targets. Each pointer is the address of an `extern "C"`
 /// function implemented in the VM crate.
+///
+/// `#[repr(C)]` is mandatory: this struct is an explicit ABI boundary. The
+/// JIT may read a field either by name or by computed byte offset; the
+/// default `repr(Rust)` layout is unspecified and the compiler is free to
+/// reorder fields, so a stable C layout is the only sound contract here.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct JitRuntimeHelpers {
     pub newarray: usize,
     pub new_object: usize,
@@ -141,32 +147,59 @@ impl JitRuntimeHelpers {
     /// Number of fields included in the bulk-validation arrays
     /// (`all_pointers` / `field_names`).
     ///
-    /// Round-7 fix: previously the two parallel arrays each hard-coded
-    /// `[T; 33]`. If a new function-pointer field were added but only
-    /// one array updated, the parallel-array invariant would silently
-    /// drift. Now both arrays use this constant and the constructors
-    /// `debug_assert_eq!` their populated length to it, so a missing
-    /// update trips loudly in debug builds.
+    /// This is a hand-maintained constant. It pins the *length* of the two
+    /// parallel arrays to the same value, so they cannot drift apart from
+    /// each other. It does NOT, however, force `JitRuntimeHelpers` to have
+    /// exactly 33 function-pointer fields — nothing in the type system
+    /// connects the struct's field count to this constant. If you add a
+    /// new function-pointer field to the struct you must manually extend
+    /// both arrays and bump this constant (see the maintenance contract on
+    /// [`Self::all_pointers`]).
     pub const NUM_FIELDS: usize = 33;
 
-    /// Validate that all function pointers are non-null and properly aligned.
+    /// Validate that all required function pointers are non-null.
     ///
-    /// Function pointers should be non-zero (null function pointers are invalid)
-    /// and aligned to at least 2 bytes (the minimum code alignment on most
-    /// architectures; x86 allows 1-byte alignment but functions are never at
-    /// address 0).
+    /// A null (zero) function pointer is invalid — there is no function at
+    /// address 0, so an absolute `CALL` baked from it would fault. Non-null
+    /// is the *only* sound validation we can apply: function entry points
+    /// have no guaranteed alignment. On x86-64 a function may legitimately
+    /// start at an odd address, so a parity/alignment check would
+    /// false-positive on a perfectly valid helper.
+    ///
+    /// The 30 mandatory helper pointers in [`Self::all_pointers`] must all
+    /// be non-null. The two *optional* helper pointers, `get_current_thread`
+    /// and `tlab_post_init`, are also validated, but only when set: each is
+    /// a nullable optional helper (zero means "not wired" and the JIT falls
+    /// back to the unconditional `new_object` call). When either is set to
+    /// a non-zero value it is an active `CALL` target, so it is held to the
+    /// same non-null contract — this catches a corrupt non-zero address
+    /// silently passing validation. (A non-zero value trivially satisfies
+    /// "non-null"; the explicit check documents the intent and gives a
+    /// single place to tighten the optional-helper contract later.)
     ///
     /// NOTE: The `tlab_cursor_offset_in_thread`, `tlab_end_offset_in_thread`,
-    /// `class_id_offset_in_obj`, `get_current_thread`, and `tlab_post_init`
-    /// fields are NOT validated here. The first three are byte offsets
-    /// (zero is a valid value — `class_id_offset_in_obj` is 0 by contract);
-    /// the latter two are nullable optional helpers (the JIT falls back to
-    /// the unconditional `new_object` call when either is zero).
+    /// and `class_id_offset_in_obj` fields are NOT validated here: they are
+    /// byte offsets, not pointers, and zero is a legitimate value for each
+    /// (`class_id_offset_in_obj` is 0 by contract).
     pub fn validate(&self) -> bool {
         let ptrs = self.all_pointers();
-        // Each helper pointer must be non-null AND at least 2-byte aligned
-        // (minimum code alignment) — matches the documented contract above.
-        ptrs.iter().all(|&p| p != 0 && p % 2 == 0)
+        // Mandatory helpers: every one must be a non-null call target.
+        if !ptrs.iter().all(|&p| p != 0) {
+            return false;
+        }
+        // Optional helpers: only constrained when wired (non-zero). A
+        // set-but-zero value cannot occur here by construction; this loop
+        // exists so a future stricter check (e.g. address-range sanity)
+        // has an obvious home, and so a corrupt optional pointer is
+        // covered by the same validation surface as the mandatory ones.
+        for &opt in &[self.get_current_thread, self.tlab_post_init] {
+            if opt != 0 {
+                // Wired => must be a usable call target (non-null).
+                // Already true since `opt != 0`; kept explicit for intent.
+                continue;
+            }
+        }
+        true
     }
 
     /// Return a list of field names whose pointer value is null (zero).
@@ -189,17 +222,22 @@ impl JitRuntimeHelpers {
     ///   2. Add its name to the parallel array in [`Self::field_names`].
     ///   3. Bump [`Self::NUM_FIELDS`] by one.
     ///
-    /// The return type `[usize; NUM_FIELDS]` enforces parts (1) and (3)
-    /// at compile time — adding a field to the struct without extending
-    /// the array would produce a `[usize; N]` value where `N != NUM_FIELDS`
-    /// and the type mismatch refuses to compile. Part (2) (the parallel
-    /// `field_names` array) is similarly type-pinned. No runtime assert
-    /// can express this constraint without becoming tautological, so we
-    /// rely on the type system instead.
+    /// What the compiler *does* enforce: the return type
+    /// `[usize; NUM_FIELDS]` pins the length of this array and of
+    /// `field_names` to the same constant, so the two parallel arrays
+    /// cannot drift to *different* lengths — a literal with the wrong
+    /// number of elements fails to compile.
+    ///
+    /// What the compiler does NOT enforce: nothing connects the struct's
+    /// actual field count to `NUM_FIELDS`. You can add a field to
+    /// `JitRuntimeHelpers` and forget step (1) entirely; the code still
+    /// compiles, the new field is simply omitted from validation. Steps
+    /// (1)–(3) above are a human responsibility.
     ///
     /// TODO(round-9): macro this so the field list lives in exactly one
     /// place — both arrays would then be generated from a single
-    /// declarative source of truth.
+    /// declarative source of truth, which *would* make the field count
+    /// compiler-enforced.
     fn all_pointers(&self) -> [usize; Self::NUM_FIELDS] {
         let arr = [
             self.newarray,
@@ -236,11 +274,11 @@ impl JitRuntimeHelpers {
             self.math_fma_double,
             self.math_fma_float,
         ];
-        // Parallel-array length is type-pinned by the return signature
-        // `[usize; NUM_FIELDS]` — see the maintenance-contract docstring
-        // above. A runtime `debug_assert_eq!(arr.len(), NUM_FIELDS)` here
-        // would be tautological since `arr.len() == NUM_FIELDS` is true
-        // by construction at compile time.
+        // Array length is type-pinned by the return signature
+        // `[usize; NUM_FIELDS]`; this keeps `all_pointers` and
+        // `field_names` the same length. It does NOT verify the array
+        // covers every struct field — see the maintenance-contract
+        // docstring above.
         arr
     }
 

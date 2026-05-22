@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - JIT OSR trampoline now transfers float/double locals into their assigned XMM registers.
 - JIT `getstatic` caching: unique static field values are loaded once in the method prologue and cached in frame slots.
 - JIT `StackSlot::Xmm` operand-stack variant so consecutive double operations chain in XMM registers without memory traffic.
-- Extracted 11 crates from the monolithic vm: classloading, gc, jit, jit-api, types, native-api, native-builtins, native-collections, native-io, native-sql, jfr.
+- Extracted 10 crates from the monolithic vm: classloading, gc, jit, jit-api, types, native-api, native-builtins, native-collections, native-io, jfr.
 - G1 and ZGC garbage collectors.
 - AArch64 JIT backend (partial; 45% of x86-64 opcode coverage).
 - Java Flight Recorder support.

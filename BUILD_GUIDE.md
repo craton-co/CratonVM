@@ -6,7 +6,7 @@ CratonVM is a Java Virtual Machine written entirely in Rust with a custom x86-64
 
 **Project stats:**
 - **~323,000+ lines** of Rust across ~200+ files
-- 16 crates: `reader`, `types`, `native-api`, `native-collections`, `native-io`, `native-builtins`, `native-awt`, `jit-api`, `jit`, `jit-cuda`, `cuda-bridge`, `classloading`, `gc`, `vm`, `vm-cli`, `jfr`
+- 17 crates: `reader`, `types`, `native-api`, `native-collections`, `native-io`, `native-builtins`, `native-awt`, `jit-api`, `jit`, `jit-cuda`, `cuda-bridge`, `craton-gpu`, `classloading`, `gc`, `vm`, `vm-cli`, `jfr`
 - **6,000+ tests** passing, **0** clippy warnings
 - **~3,100+ native method** registrations
 - **~7,200 lines** of JIT compiler code (custom x86-64)
@@ -144,6 +144,7 @@ cratonvm/
   jit/                 # x86-64 / AArch64 JIT compiler
   jit-cuda/            # Java bytecode -> PTX lowering for GPU offload
   cuda-bridge/         # Thin CUDA Driver API bridge for GPU offload
+  craton-gpu/          # GPU offload runtime integration
   classloading/        # Class loading & bytecode verification
   gc/                  # Garbage collectors (semi-space, G1, ZGC)
   jfr/                 # Java Flight Recorder

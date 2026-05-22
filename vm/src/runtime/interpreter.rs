@@ -1229,65 +1229,6 @@ pub fn execute(
     }
     let _exec_depth_guard = DepthGuard;
 
-    // S-bytebuddy r2 — hard cap on `JavaDispatcher`-shaped reentry.
-    //
-    // The generic EXEC_DEPTH guard above catches the *aggregate* recursion
-    // depth, but in practice ByteBuddy's reflective dispatch can build a
-    // tight Rust-stack-growing loop that consumes the 64 MB stack faster
-    // than EXEC_DEPTH counts (each turn of the loop adds 10+ Rust frames,
-    // not 1). A targeted reentry counter on JavaDispatcher.run shortcuts
-    // the cascade an order of magnitude earlier — depth 10 here is *much*
-    // smaller than any plausible legitimate ByteBuddy reflective fan-out
-    // (real chains observed: ≤4 reentries; pathological probes: 1000+).
-    //
-    // Match is on method-name + class-name substring so we catch both the
-    // outer `JavaDispatcher` and any of its nested `$DynamicDispatcher` /
-    // `$DefaultInvoker` / `$Direct$Constructing` subclass-shape variants.
-    thread_local! {
-        static BB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    }
-    // Function-scope BB-depth drop holder: pairs with the increment below
-    // (only does work if BB_DEPTH was actually incremented this call).
-    struct BbFunctionScopeGuard {
-        active: bool,
-    }
-    impl Drop for BbFunctionScopeGuard {
-        fn drop(&mut self) {
-            if self.active {
-                BB_DEPTH.with(|c| {
-                    let v = c.get();
-                    c.set(v.saturating_sub(1));
-                });
-            }
-        }
-    }
-    let bb_match = method_name == "run" && {
-        let cm = shared.class_manager.read();
-        cm.get_class(class_id)
-            .map(|c| {
-                let n = c.name.as_ref();
-                n.contains("bytebuddy") && n.contains("Dispatcher")
-            })
-            .unwrap_or(false)
-    };
-    let _bb_function_scope_guard = BbFunctionScopeGuard { active: bb_match };
-    if bb_match {
-        let bb_depth = BB_DEPTH.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
-        if bb_depth > 10 {
-            // Trip BEFORE we recurse further. The guard above will
-            // decrement on function exit so the next top-level call
-            // starts at a sane depth.
-            crate::dispatch_trace::note_bb_dispatcher_cap_hit(bb_depth);
-            return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::StackOverflowError,
-            )));
-        }
-    }
-
     // letsgo postmortem instrumentation: record every bytecode-method
     // entry into the global dispatch ring. Gated by `CRATONVM_DBG_LETSGO=1`
     // (cheap atomic-bool check on the disabled path).
@@ -1560,93 +1501,12 @@ pub fn execute(
                                 return Ok(r);
                             }
                         }
-                        // S111r10 FINAL fallback — for interface methods on
-                        // an unrecognised receiver, synthesize a benign
-                        // result so the caller's boot path does not abort
-                        // on AbstractMethodError. The values picked here
-                        // mirror the empty-collection contract:
-                        //   * iterator()  → an empty iterator (hasNext=false)
-                        //   * hasNext()   → false (Z=0)
-                        //   * isEmpty()   → true  (Z=1)
-                        //   * size()      → 0
-                        //   * any other Z return → 0
-                        //   * any other I/J/F/D return → 0
-                        //   * reference return → null
-                        // Many Spring boot paths walk a collection only to
-                        // copy entries; if the collection appears empty,
-                        // they just skip the work and continue.
-                        let ret_byte = method_descriptor
-                            .rsplit(')')
-                            .next()
-                            .and_then(|s| s.bytes().next())
-                            .unwrap_or(b'V');
-                        let synth = match ret_byte {
-                            b'V' => None,
-                            b'Z' => {
-                                // hasNext on an "empty" iterator returns false;
-                                // isEmpty() returns true. Default to false (0).
-                                let v = if method_name == "isEmpty" { 1 } else { 0 };
-                                Some(Value::Int(v))
-                            }
-                            b'I' | b'B' | b'S' | b'C' => Some(Value::Int(0)),
-                            b'J' => Some(Value::Long(0)),
-                            b'F' => Some(Value::Float(0.0)),
-                            b'D' => Some(Value::Double(0.0)),
-                            b'L' | b'[' => {
-                                // For iterator()-shaped returns, allocate a
-                                // synthetic empty Iterator (2-field: array=0,
-                                // cursor=1) so the caller's hasNext() loop
-                                // terminates cleanly. For other reference
-                                // returns, hand back null.
-                                if method_name == "iterator"
-                                    && method_descriptor == "()Ljava/util/Iterator;"
-                                {
-                                    // The synthetic empty iterator needs a
-                                    // *concrete 2-field* class (array, cursor).
-                                    // The `java/util/Iterator` interface
-                                    // declares zero instance fields, and
-                                    // `ClassId::new(0)` (`java/lang/Object`)
-                                    // likewise declares zero — either would
-                                    // make this a 2-slot object whose class
-                                    // claims 0 fields, which the GC's
-                                    // `get_field` bounds guard rejects.
-                                    // Register a dedicated synthetic class
-                                    // declaring the 2 fields instead.
-                                    let itr_cid = shared
-                                        .class_manager
-                                        .write()
-                                        .ensure_synthetic_class(
-                                            "cratonvm/synthetic/EmptyIterator",
-                                            2,
-                                        );
-                                    let itr = shared.heap.alloc_object(itr_cid, 2);
-                                    // empty array placeholder + cursor=0
-                                    let empty = shared.heap.alloc_array(
-                                        ClassId::new(0),
-                                        crate::memory::heap::ArrayElementType::Reference,
-                                        0,
-                                    );
-                                    shared.heap.set_field(
-                                        itr,
-                                        0,
-                                        Value::Object(Some(empty)),
-                                    );
-                                    shared
-                                        .heap
-                                        .set_field(itr, 1, Value::Int(0));
-                                    Some(Value::Object(Some(itr)))
-                                } else {
-                                    Some(Value::Object(None))
-                                }
-                            }
-                            _ => Some(Value::Object(None)),
-                        };
-                        if crate::runtime::env_cache::nocode_dbg() {
-                            eprintln!(
-                                "[DBG_NOCODE_SYNTH] cp={class_name_owned}.{method_name}{method_descriptor} -> synth={synth:?}"
-                            );
-                        }
-                        return Ok(synth);
+                        // No native implements this interface method on the
+                        // unrecognised receiver. The cp class resolves to an
+                        // abstract method declaration, so fall through to the
+                        // AbstractMethodError path below. Fabricating a benign
+                        // result here is forbidden: it would make a non-empty
+                        // collection silently appear empty.
                     }
                 }
             }
@@ -6602,9 +6462,6 @@ fn execute_instruction(
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let obj_ref = gc_alloc_object(shared, thread, target_class_id, num_fields)?;
-            if class_name.contains("String") {
-                eprintln!("[DBG] NEW {} -> obj={:p}", class_name, obj_ref.as_ptr());
-            }
             // SPORTME-NSEE-TRACE: print full Java stack when NoSuchElementException is constructed.
             if class_name == "java/util/NoSuchElementException"
                 && crate::runtime::env_cache::nsee_trace()

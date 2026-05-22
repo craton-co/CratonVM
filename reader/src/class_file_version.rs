@@ -123,8 +123,12 @@ impl ClassFileVersion {
         }
     }
 
+    /// Returns `true` if this class file version is within the range the
+    /// JVM supports: major version 45 (Java 1.1) through 69 (Java 25)
+    /// inclusive. Versions below major 45 predate the class file format
+    /// and are rejected as spec-invalid.
     pub fn is_supported(&self) -> bool {
-        *self <= Self::MAX_SUPPORTED
+        self.major >= Self::JAVA_1.major && *self <= Self::MAX_SUPPORTED
     }
 }
 
@@ -165,6 +169,10 @@ mod tests {
         assert!(ClassFileVersion::JAVA_21.is_supported());
         assert!(ClassFileVersion::JAVA_22.is_supported());
         assert!(ClassFileVersion::JAVA_25.is_supported());
+        assert!(ClassFileVersion::JAVA_1.is_supported());
         assert!(!ClassFileVersion::new(70, 0).is_supported());
+        // Versions below major 45 predate the class file format.
+        assert!(!ClassFileVersion::new(44, 0).is_supported());
+        assert!(!ClassFileVersion::new(0, 0).is_supported());
     }
 }

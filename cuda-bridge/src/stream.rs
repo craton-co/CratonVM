@@ -286,7 +286,7 @@ impl Stream {
         self.inner
             .ops
             .lock()
-            .expect("stream op log poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
 
@@ -305,7 +305,7 @@ impl Stream {
         self.inner
             .ops
             .lock()
-            .expect("stream op log poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .push(op);
     }
 }

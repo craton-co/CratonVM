@@ -1,3 +1,9 @@
+//! Heap object layout types and constants.
+//!
+//! Defines the on-heap object header layout shared by the GC, JIT, and
+//! interpreter, including [`HEADER_SIZE`] — the fixed object-header size in
+//! bytes — and the related compile-time layout invariants.
+
 use crate::ClassId;
 use std::sync::atomic::AtomicU64;
 

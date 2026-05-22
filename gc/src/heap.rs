@@ -1262,36 +1262,19 @@ pub fn coerce_field_value_by_descriptor(value: Value, desc_byte: u8) -> Value {
             //   `(oldTab == null) ? 0 : oldTab.length` branch handle the
             // never-initialized case correctly.
             Value::Int(_) | Value::Long(_) => Value::Object(None),
-            // WP4.1 closer — under heavy AQS contention, the invoke-arg pop
-            // boundary surfaces an untagged 64-bit raw-pointer slot as
-            // `Value::Double` because `CompactValue::to_value()` decodes any
-            // non-NaN-tagged u64 as `Double(f64::from_bits(bits))`.  When the
-            // declared field type is a reference (`L`/`[`) and the raw bits
-            // look like a heap-aligned, in-canonical-address-space pointer,
-            // recover the `ObjectRef` from those bits.  Plain numeric doubles
-            // fail the alignment check and degrade to `Object(None)` to match
-            // the verifier's "primitive in reference slot" recovery above.
+            // A `Value::Double` landing in a reference-typed (`L`/`[`) field is
+            // a genuine type error — the bytecode wrote a primitive where the
+            // class layout declares a reference. Degrade it to null, exactly
+            // like the `Int`/`Long` case above.
             //
-            // Heuristic guard: pointers in our arenas are 8-byte aligned and
-            // fit in 48 bits (canonical x86-64 user space).  Patterns that
-            // miss either constraint cannot be live `ObjectRef`s and must be
-            // bytecode-level junk.
-            Value::Double(d) => {
-                let bits = d.to_bits();
-                if bits == 0 {
-                    Value::Object(None)
-                } else if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                    // SAFETY: bit pattern reconstructs the original `ObjectRef`
-                    // that was stored via the same untagged path on the writer
-                    // side.  Subsequent heap accesses validate liveness via
-                    // `class_id_of` header reads.
-                    Value::Object(Some(unsafe {
-                        ObjectRef::from_raw(bits as usize as *mut u8)
-                    }))
-                } else {
-                    Value::Object(None)
-                }
-            }
+            // SAFETY/UAF NOTE: a previous revision reinterpreted an 8-aligned,
+            // sub-2^48 double bit-pattern as a live `ObjectRef` via
+            // `ObjectRef::from_raw`. That fabricates a wild heap pointer out of
+            // arbitrary numeric data: any double that happens to bit-match an
+            // aligned address would be handed to the GC and field accessors as
+            // a real object, causing a use-after-free or worse. Numeric data
+            // is NOT a pointer — never manufacture one. Coerce to null.
+            Value::Double(_) => Value::Object(None),
             _ => value,
         },
         _ => value,

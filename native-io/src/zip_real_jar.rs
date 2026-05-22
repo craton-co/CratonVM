@@ -55,6 +55,104 @@ fn next_handle() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Decompression-bomb guard
+// ---------------------------------------------------------------------------
+
+/// Default maximum *declared* uncompressed size, in bytes, of a single zip
+/// entry that `getInputStream` / manifest reads will fully inflate into
+/// memory. 512 MiB is comfortably larger than any legitimate class-bytes or
+/// resource entry while still bounding a malicious archive's ability to OOM
+/// the process. Overridable at startup via the `CRATONVM_ZIP_MAX_ENTRY_BYTES`
+/// environment variable (consistent with the crate's other `CRATONVM_*`
+/// env-driven knobs).
+const DEFAULT_MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Maximum allowed compression ratio (declared-uncompressed / compressed).
+/// A genuine deflate stream of real content tops out well under ~100:1; a
+/// ratio beyond this is the signature of a "zip bomb" entry (e.g. a 4 GiB
+/// run of zeros compressed to a few KiB) and is rejected. A `compressed_size`
+/// of 0 (a STORED empty entry, or a size the archive failed to report) skips
+/// the ratio check — the absolute-size cap still applies.
+const MAX_COMPRESSION_RATIO: u64 = 1000;
+
+/// Returns the configured per-entry uncompressed-size cap. Reads
+/// `CRATONVM_ZIP_MAX_ENTRY_BYTES` once on first call; falls back to
+/// [`DEFAULT_MAX_ENTRY_BYTES`] when unset, empty, or unparseable.
+fn max_entry_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CRATONVM_ZIP_MAX_ENTRY_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_ENTRY_BYTES)
+    })
+}
+
+/// Validate a zip entry's *declared* sizes against the decompression-bomb
+/// guards before any large allocation is made. On success returns the
+/// uncompressed size as a `usize` (already known to fit the cap, hence the
+/// target's `usize`). On failure returns a descriptive error.
+///
+/// `declared_uncompressed` and `compressed` are the untrusted values taken
+/// straight from the archive's central directory — they must NOT be used to
+/// size an allocation until this check has passed.
+fn guard_zip_entry_size(
+    entry_name: &str,
+    declared_uncompressed: u64,
+    compressed: u64,
+) -> Result<usize, MethodCallFailed> {
+    let cap = max_entry_bytes();
+    if declared_uncompressed > cap {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: format!(
+                "zip entry '{entry_name}': declared uncompressed size \
+                 {declared_uncompressed} exceeds the {cap}-byte cap \
+                 (CRATONVM_ZIP_MAX_ENTRY_BYTES); refusing to inflate \
+                 (possible decompression bomb)",
+            ),
+        }));
+    }
+    // Compression-ratio sanity check: a wildly-better-than-real ratio is the
+    // hallmark of a crafted bomb. Skip when `compressed` is 0 (STORED empty
+    // entry, or an unreported size) since the absolute cap above still holds.
+    if compressed > 0 {
+        let ratio = declared_uncompressed / compressed;
+        if ratio > MAX_COMPRESSION_RATIO {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!(
+                    "zip entry '{entry_name}': compression ratio {ratio}:1 \
+                     (uncompressed {declared_uncompressed} / compressed \
+                     {compressed}) exceeds the {MAX_COMPRESSION_RATIO}:1 \
+                     limit; refusing to inflate (possible decompression bomb)",
+                ),
+            }));
+        }
+    }
+    // Known to be <= cap, which is itself far below usize::MAX on any
+    // supported target, so this conversion cannot fail in practice; map the
+    // error anyway rather than unwrap.
+    usize::try_from(declared_uncompressed).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!(
+                "zip entry '{entry_name}': uncompressed size \
+                 {declared_uncompressed} exceeds usize::MAX on this target",
+            ),
+        })
+    })
+}
+
+/// Cap applied to `Vec::with_capacity` for a zip entry. We never pre-allocate
+/// more than 16 MiB up front even when the (validated) declared size is
+/// larger: `read_to_end` will grow the buffer as real bytes arrive, so an
+/// entry that *lies* about its size cannot trick us into a huge eager
+/// allocation. The declared size has already passed [`guard_zip_entry_size`].
+fn prealloc_hint(declared_size: usize) -> usize {
+    const PREALLOC_CAP: usize = 16 * 1024 * 1024;
+    declared_size.min(PREALLOC_CAP)
+}
+
+// ---------------------------------------------------------------------------
 // JarFile field helpers
 // ---------------------------------------------------------------------------
 
@@ -403,17 +501,17 @@ fn native_jarfile_get_input_stream(
         // (ZIP64). On 32-bit targets `as usize` would silently truncate
         // the capacity hint to its low 32 bits, leaving us under-reserved
         // and — worse — masking a genuinely-too-big entry as a benign
-        // small allocation. Fail loudly instead.
+        // small allocation.
+        //
+        // Decompression-bomb guard: the declared uncompressed size comes
+        // from an untrusted archive. `guard_zip_entry_size` rejects entries
+        // exceeding the configurable per-entry cap or an implausible
+        // compression ratio, and `prealloc_hint` bounds the eager
+        // `with_capacity` so a lying size cannot OOM us before any bytes
+        // are read.
         let raw_size = zf.size();
-        let size: usize = raw_size.try_into().map_err(|_| {
-            MethodCallFailed::InternalError(VmError::Internal {
-                message: format!(
-                    "JarFile.getInputStream({name}): entry uncompressed size \
-                     {raw_size} exceeds usize::MAX on this target",
-                ),
-            })
-        })?;
-        let mut buf: Vec<u8> = Vec::with_capacity(size);
+        let size = guard_zip_entry_size(&name, raw_size, zf.compressed_size())?;
+        let mut buf: Vec<u8> = Vec::with_capacity(prealloc_hint(size));
         zf.read_to_end(&mut buf).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("JarFile.getInputStream({name}): read failed: {e}"),
@@ -594,17 +692,16 @@ fn native_jarfile_get_manifest(
                 message: format!("manifest read by_index({idx}): {e}"),
             })
         })?;
-        // Same ZIP64 truncation guard as `getInputStream`.
+        // Same ZIP64 truncation + decompression-bomb guard as
+        // `getInputStream`: reject an oversized or bomb-ratio manifest
+        // entry, and bound the eager pre-allocation.
         let raw_size = zf.size();
-        let cap: usize = raw_size.try_into().map_err(|_| {
-            MethodCallFailed::InternalError(VmError::Internal {
-                message: format!(
-                    "manifest read: uncompressed size {raw_size} exceeds \
-                     usize::MAX on this target",
-                ),
-            })
-        })?;
-        let mut buf = Vec::with_capacity(cap);
+        let size = guard_zip_entry_size(
+            "META-INF/MANIFEST.MF",
+            raw_size,
+            zf.compressed_size(),
+        )?;
+        let mut buf = Vec::with_capacity(prealloc_hint(size));
         zf.read_to_end(&mut buf).map_err(|e| {
             MethodCallFailed::InternalError(VmError::Internal {
                 message: format!("manifest read body: {e}"),

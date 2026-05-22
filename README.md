@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A565%25-brightgreen.svg)](BUILD_GUIDE.md#running-tests)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
 A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
@@ -139,7 +138,8 @@ cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
 
 ## Limitations
 
-- **No AWT/Swing/JavaFX** — headless only (no GUI).
+- **AWT/Swing** — implemented natively (headless) via the `native-awt` crate;
+  no on-screen rendering. **JavaFX** is out of tree (see [docs/javafx-status.md](docs/javafx-status.md)).
 - **No `java.sql`/JDBC** — no database connectivity.
 - **Limited reflection** — `Class.forName` / `Method.invoke` work; some edge cases unsupported.
 - **No custom classloaders** — only the three built-in loaders.
@@ -176,19 +176,27 @@ cargo fmt --all --check
 
 ## Architecture
 
+The workspace has 17 member crates:
+
 ```
 cratonvm/
   reader/              - .class file parser
   types/               - Shared types (Value, ClassId, ObjectRef)
-  classloading/        - Class loading & bytecode verification
-  gc/                  - Garbage collectors (semi-space, G1, ZGC)
-  jit/                 - x86-64 / AArch64 JIT compiler
+  native-api/          - NativeContext trait & FD table
   native-builtins/     - java.lang.* native methods
   native-collections/  - java.util.* native methods
   native-io/           - java.io/nio native methods
+  native-awt/          - AWT/Swing/Java2D native peers
+  jit-api/             - JIT compiler API types
+  jit/                 - x86-64 / AArch64 JIT compiler
+  jit-cuda/            - Java bytecode -> PTX lowering for GPU offload
+  cuda-bridge/         - Thin CUDA Driver API bridge for GPU offload
+  craton-gpu/          - GPU offload runtime integration
+  classloading/        - Class loading & bytecode verification
+  gc/                  - Garbage collectors (semi-space, G1, ZGC)
+  jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
-  (+ types, native-api, native-awt, jit-api, jit-cuda, cuda-bridge, jfr)
 ```
 
 - **Bytecode interpreter** — fast-path dispatch with 140+ opcodes

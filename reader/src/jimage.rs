@@ -170,8 +170,10 @@ impl AttributeKind {
 pub enum JImageError {
     /// The file could not be opened or read from disk.
     Io(std::io::Error),
-    /// The magic number did not match `0xCAFEDADA`.
-    BadMagic(u32),
+    /// The magic number did not match `0xCAFEDADA`. Carries the first
+    /// four bytes of the file exactly as read from disk (MSB-first), so
+    /// the diagnostic is unambiguous regardless of the file's endianness.
+    BadMagic([u8; 4]),
     /// The header declared an unsupported major version.
     UnsupportedVersion { major: u16, minor: u16 },
     /// A section (redirect / offset / locations / strings) extends past
@@ -193,8 +195,17 @@ impl std::fmt::Display for JImageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JImageError::Io(e) => write!(f, "jimage io error: {e}"),
-            JImageError::BadMagic(m) => {
-                write!(f, "not a jimage file (bad magic 0x{m:08x})")
+            JImageError::BadMagic(bytes) => {
+                // Report both endian interpretations so the diagnostic is
+                // not misleading regardless of how the file was written.
+                let le = u32::from_le_bytes(*bytes);
+                let be = u32::from_be_bytes(*bytes);
+                write!(
+                    f,
+                    "not a jimage file (bad magic bytes [{:02x} {:02x} {:02x} {:02x}], \
+                     LE 0x{le:08x} / BE 0x{be:08x})",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                )
             }
             JImageError::UnsupportedVersion { major, minor } => write!(
                 f,
@@ -273,7 +284,9 @@ impl Header {
         } else if magic_be == JIMAGE_MAGIC {
             false
         } else {
-            return Err(JImageError::BadMagic(magic_le));
+            return Err(JImageError::BadMagic([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]));
         };
 
         let read_u16 = |off: usize| -> u16 {
@@ -648,8 +661,14 @@ impl JImageReader {
             Some(o) => o as usize,
             None => return Ok(None),
         };
+        // A location offset that points past the locations buffer is data
+        // corruption, not an "absent" resource — surface it as a hard error
+        // so the same corruption is reported consistently by `iter_entries`
+        // (which propagates `decode_location` errors) and by this path.
         if loc_offset >= self.locations_buffer().len() {
-            return Ok(None);
+            return Err(JImageError::BadLocationRecord(
+                "location offset past end of locations buffer",
+            ));
         }
         let loc = decode_location(self.locations_buffer(), loc_offset)?;
         // Verify the reconstructed path matches exactly: hash collisions
@@ -741,8 +760,13 @@ impl JImageReader {
             if loc_offset == 0 || !seen.insert(loc_offset) {
                 continue;
             }
+            // Mirror `find_location`: an offset past the locations buffer is
+            // corruption and is surfaced as a hard error rather than silently
+            // skipped, so both lookup paths treat a corrupt buffer alike.
             if loc_offset >= self.locations_buffer().len() {
-                continue;
+                return Err(JImageError::BadLocationRecord(
+                    "location offset past end of locations buffer",
+                ));
             }
             let loc = decode_location(self.locations_buffer(), loc_offset)?;
             let path = self.location_path(&loc)?;

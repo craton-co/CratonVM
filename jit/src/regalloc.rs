@@ -3,6 +3,20 @@
 //! Performs backward dataflow liveness analysis on the bytecode CFG,
 //! builds an interference graph, and uses Chaitin-Briggs graph coloring
 //! to assign callee-saved registers to locals optimally.
+//!
+//! ## 64-local cap
+//!
+//! Liveness sets, gen/kill sets, and the interference graph are all
+//! represented as `u64` bitsets, one bit per local. This imposes a hard
+//! ceiling of **64 locals**: only locals with index `< 64` participate in
+//! allocation. Methods with more than 64 locals are not rejected — locals
+//! at index `>= 64` are simply never assigned a register and fall back to
+//! the unallocated (frame-slot / spill) path, which is always correct.
+//!
+//! This cap is a deliberate simplification: methods with >64 locals are
+//! rare and the bitset representation keeps liveness analysis fast for the
+//! common case. Raising it would require switching every `u64` bitset (and
+//! the `interference: Vec<u64>` graph) to a wider/dynamic bitset type.
 
 use super::x64::{LOCAL_REGS, LOCAL_XMMS};
 
@@ -327,6 +341,13 @@ fn compute_gen_kill(code: &[u8], block: &mut BasicBlock) {
     let mut pc = block.start_pc;
     while pc < block.end_pc {
         if let Some((idx, is_use, is_def)) = local_access(code, pc) {
+            // 64-local cap: gen/kill sets are `u64` bitsets (one bit per
+            // local), so only locals with index < 64 can be tracked.
+            // Locals at index >= 64 are skipped here and therefore never
+            // receive a register — they fall back to the unallocated
+            // frame-slot path, which is always correct. See the
+            // module-level docs for the rationale. Do NOT widen this
+            // bound without also widening the bitset type.
             if idx < 64 {
                 let bit = 1u64 << idx;
                 // For iinc: use comes before def
@@ -516,6 +537,11 @@ fn color_graph(
         return vec![None; num_locals];
     }
 
+    // 64-local cap: the interference graph and the `removed` working set
+    // are `u64` bitsets, so coloring only ever considers the first 64
+    // locals. Any local with index >= 64 gets `None` (no register) and
+    // falls back to the unallocated frame-slot path. See the module-level
+    // docs for the rationale; widening this requires a wider bitset type.
     let n = num_locals.min(64);
     let mut removed = 0u64; // bitmask of removed nodes
     let mut stack: Vec<(usize, bool)> = Vec::with_capacity(n); // (local_idx, is_potential_spill)

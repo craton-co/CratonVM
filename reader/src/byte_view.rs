@@ -34,8 +34,16 @@ pub struct ByteView {
 }
 
 impl ByteView {
-    /// Construct a view into `source[range]`. Panics if the range falls
-    /// outside `source`.
+    /// Construct a view into `source[range]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range.start > range.end`, or if `range.end` exceeds
+    /// `source.len()`. The class-file hot path always passes ranges that
+    /// were validated by a preceding `read_bytes` bounds check, so this
+    /// panic is never reached in practice. Callers that cannot guarantee
+    /// the range is in bounds must use [`ByteView::try_new`] instead,
+    /// which returns `None` rather than panicking.
     #[inline]
     pub fn new(source: Arc<[u8]>, range: Range<usize>) -> Self {
         assert!(range.start <= range.end, "ByteView range start > end");
@@ -50,6 +58,24 @@ impl ByteView {
             start: range.start,
             end: range.end,
         }
+    }
+
+    /// Checked constructor: construct a view into `source[range]`, or
+    /// return `None` if the range is malformed (`start > end`) or falls
+    /// outside `source`.
+    ///
+    /// Use this instead of [`ByteView::new`] whenever the range is not
+    /// already known to be in bounds — it never panics.
+    #[inline]
+    pub fn try_new(source: Arc<[u8]>, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > source.len() {
+            return None;
+        }
+        Some(Self {
+            source,
+            start: range.start,
+            end: range.end,
+        })
     }
 
     /// Build a view from an owned `Vec<u8>` — convenience for tests and
@@ -274,5 +300,21 @@ mod tests {
     fn new_panics_on_out_of_bounds_range() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3]);
         let _ = ByteView::new(parent, 0..10);
+    }
+
+    #[test]
+    fn try_new_returns_none_for_invalid_ranges() {
+        let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
+        // Out-of-bounds end.
+        assert!(ByteView::try_new(Arc::clone(&parent), 0..10).is_none());
+        // Inverted range.
+        assert!(ByteView::try_new(Arc::clone(&parent), 3..1).is_none());
+        // Valid range succeeds and yields the expected slice.
+        let v = ByteView::try_new(Arc::clone(&parent), 1..3)
+            .expect("in-bounds range");
+        assert_eq!(v.as_bytes(), &[2u8, 3][..]);
+        // Whole-buffer and empty-at-end ranges are valid.
+        assert!(ByteView::try_new(Arc::clone(&parent), 0..4).is_some());
+        assert!(ByteView::try_new(parent, 4..4).is_some());
     }
 }

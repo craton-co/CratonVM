@@ -31,12 +31,13 @@ enum FileEntry {
     TcpStream(Mutex<std::net::TcpStream>),
     /// TCP listener socket (ServerSocketChannel).
     ///
-    /// The `pending` queue holds connections that have already been
-    /// `accept()`-ed off the OS backlog but not yet handed to a Java-level
-    /// `tcp_accept` caller. `poll_ready` accepts a connection to test
-    /// readiness; rather than discarding the accepted stream (which would
-    /// consume and reset a real peer connection), it stashes it here so the
-    /// next `tcp_accept` returns it instead of calling `accept()` again.
+    /// The `pending` queue holds connections that were `accept()`-ed off
+    /// the OS backlog but not yet handed to a Java-level `tcp_accept`
+    /// caller. It is kept for backward compatibility: `poll_ready` now
+    /// uses a non-destructive `poll` probe and never pre-`accept()`s, so
+    /// the queue normally stays empty and `tcp_accept` drains it (if a
+    /// legacy/stashed entry exists) before falling back to a live
+    /// `accept()`.
     TcpListener {
         listener: Mutex<std::net::TcpListener>,
         pending: Mutex<VecDeque<(std::net::TcpStream, std::net::SocketAddr)>>,
@@ -57,6 +58,150 @@ enum FileEntry {
     /// WP1.12 — subprocess stdin pipe (write side). Bytes written go to
     /// the child process's standard input.
     ChildStdinPipe(Mutex<std::process::ChildStdin>),
+}
+
+/// Non-destructive socket readiness probe.
+///
+/// Polls the raw OS socket handle for read/write readiness **without**
+/// mutating any shared socket state. Unlike a `set_nonblocking(true);
+/// peek(); set_nonblocking(false)` dance, this:
+///
+///  * does not flip the socket's persistent blocking mode (so a
+///    concurrent blocking `tcp_read` / `udp_recv` on the same fd can
+///    never observe a transient non-blocking window and return a
+///    spurious `WouldBlock`), and
+///  * does not consume or peek datagram/stream payload.
+///
+/// It uses the OS `poll` (Unix) / `WSAPoll` (Windows) primitive with a
+/// zero timeout, which is purely a query of kernel socket state.
+///
+/// Returns `(readable, writable)`. On any error the socket is reported
+/// as not-readable / not-writable, matching the previous fallback
+/// behaviour of `poll_ready`.
+fn poll_socket_readiness<S>(sock: &S) -> (bool, bool)
+where
+    S: socket2_raw::AsRawHandle,
+{
+    socket2_raw::poll_readiness(sock.as_raw())
+}
+
+/// Thin, dependency-free wrapper over the OS `poll` / `WSAPoll`
+/// readiness primitive. Kept in its own module so the platform `extern`
+/// blocks and constants do not leak into the rest of `fd_table`.
+mod socket2_raw {
+    /// Abstraction over "give me the raw socket handle for polling".
+    pub trait AsRawHandle {
+        fn as_raw(&self) -> RawHandle;
+    }
+
+    #[cfg(unix)]
+    pub type RawHandle = std::os::fd::RawFd;
+    #[cfg(windows)]
+    pub type RawHandle = std::os::windows::io::RawSocket;
+
+    #[cfg(unix)]
+    impl<T: std::os::fd::AsRawFd> AsRawHandle for T {
+        fn as_raw(&self) -> RawHandle {
+            self.as_raw_fd()
+        }
+    }
+    #[cfg(windows)]
+    impl<T: std::os::windows::io::AsRawSocket> AsRawHandle for T {
+        fn as_raw(&self) -> RawHandle {
+            self.as_raw_socket()
+        }
+    }
+
+    // `nfds_t` (the `poll` count argument) is `unsigned long` on Linux
+    // and the BSDs but `unsigned int` on macOS/iOS — declare it with the
+    // matching width so the FFI ABI is correct on every Unix target.
+    #[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+    type NfdsT = u32;
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+    type NfdsT = u64;
+
+    #[cfg(unix)]
+    pub fn poll_readiness(fd: RawHandle) -> (bool, bool) {
+        // struct pollfd { int fd; short events; short revents; }
+        #[repr(C)]
+        struct PollFd {
+            fd: i32,
+            events: i16,
+            revents: i16,
+        }
+        const POLLIN: i16 = 0x0001;
+        const POLLOUT: i16 = 0x0004;
+        // Error/hangup conditions also make the fd "ready" — the
+        // subsequent read/write will surface the actual error rather
+        // than blocking, which is the readiness contract callers want.
+        const POLLERR: i16 = 0x0008;
+        const POLLHUP: i16 = 0x0010;
+        const POLLNVAL: i16 = 0x0020;
+
+        extern "C" {
+            fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+        }
+
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN | POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a single, properly-initialised `pollfd`;
+        // `nfds == 1` matches the one-element buffer; timeout 0 makes
+        // the call return immediately without blocking.
+        let rc = unsafe { poll(&mut pfd as *mut PollFd, 1 as NfdsT, 0) };
+        if rc < 0 {
+            return (false, false);
+        }
+        if pfd.revents & POLLNVAL != 0 {
+            return (false, false);
+        }
+        let err = pfd.revents & (POLLERR | POLLHUP) != 0;
+        let readable = pfd.revents & POLLIN != 0 || err;
+        let writable = pfd.revents & POLLOUT != 0;
+        (readable, writable)
+    }
+
+    #[cfg(windows)]
+    pub fn poll_readiness(socket: RawHandle) -> (bool, bool) {
+        // WSAPOLLFD { SOCKET fd; SHORT events; SHORT revents; }
+        #[repr(C)]
+        struct WsaPollFd {
+            fd: usize,
+            events: i16,
+            revents: i16,
+        }
+        const POLLRDNORM: i16 = 0x0100;
+        const POLLWRNORM: i16 = 0x0010;
+        const POLLERR: i16 = 0x0001;
+        const POLLHUP: i16 = 0x0002;
+        const POLLNVAL: i16 = 0x0004;
+
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
+        }
+
+        let mut pfd = WsaPollFd {
+            fd: socket as usize,
+            events: POLLRDNORM | POLLWRNORM,
+            revents: 0,
+        };
+        // SAFETY: single properly-initialised WSAPOLLFD, `nfds == 1`
+        // matches the buffer length, timeout 0 returns immediately.
+        let rc = unsafe { WSAPoll(&mut pfd as *mut WsaPollFd, 1, 0) };
+        if rc < 0 {
+            return (false, false);
+        }
+        if pfd.revents & POLLNVAL != 0 {
+            return (false, false);
+        }
+        let err = pfd.revents & (POLLERR | POLLHUP) != 0;
+        let readable = pfd.revents & POLLRDNORM != 0 || err;
+        let writable = pfd.revents & POLLWRNORM != 0;
+        (readable, writable)
+    }
 }
 
 /// Thread-safe registry of open file handles, keyed by integer file descriptors.
@@ -463,12 +608,19 @@ impl FileDescriptorTable {
                 Ok(n)
             }
             FileEntry::FileRead(reader) => {
+                // Seek the `BufReader` itself (not the file behind its
+                // back). `BufReader`'s `Seek` impl reconciles or discards
+                // its internal buffer, and `stream_position()` returns
+                // the logical position accounting for buffered-but-
+                // unconsumed bytes — so saving and restoring it leaves a
+                // subsequent sequential `read()` returning the correct
+                // bytes. Seeking the inner file directly would leave the
+                // buffer stale and corrupt the next sequential read.
                 let mut r = reader.lock();
-                let inner = r.get_mut();
-                let saved = inner.stream_position()?;
-                inner.seek(SeekFrom::Start(position))?;
-                let n = inner.read(buf)?;
-                inner.seek(SeekFrom::Start(saved))?;
+                let saved = r.stream_position()?;
+                r.seek(SeekFrom::Start(position))?;
+                let n = r.read(buf)?;
+                r.seek(SeekFrom::Start(saved))?;
                 Ok(n)
             }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for pread")),
@@ -490,12 +642,21 @@ impl FileDescriptorTable {
                 Ok(data.len())
             }
             FileEntry::FileWrite(writer) => {
+                // Seek the `BufWriter` itself, not the file behind its
+                // back. `BufWriter`'s `Seek` impl flushes any pending
+                // buffered bytes to their original offset *before*
+                // moving the cursor — so the positional write below
+                // cannot interleave with stale buffer contents, and the
+                // restore-seek leaves a subsequent sequential write
+                // appending at the correct offset. Seeking the inner
+                // file directly would strand un-flushed bytes and write
+                // them at the wrong offset on the next flush.
                 let mut w = writer.lock();
-                let inner = w.get_mut();
-                let saved = inner.stream_position()?;
-                inner.seek(SeekFrom::Start(position))?;
-                inner.write_all(data)?;
-                inner.seek(SeekFrom::Start(saved))?;
+                let saved = w.stream_position()?;
+                w.seek(SeekFrom::Start(position))?;
+                w.write_all(data)?;
+                w.flush()?;
+                w.seek(SeekFrom::Start(saved))?;
                 Ok(data.len())
             }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for pwrite")),
@@ -823,35 +984,25 @@ impl FileDescriptorTable {
         let Some(entry) = self.get_entry(fd) else { return (false, false); };
         match &*entry {
             FileEntry::UdpSocket(sock) => {
+                // Non-destructive readiness probe via the OS `poll`
+                // primitive: it neither flips the socket's persistent
+                // blocking mode nor consumes the pending datagram, so a
+                // concurrent blocking `udp_recv` on the same fd can never
+                // observe a transient non-blocking window. The lock is
+                // still taken so the raw handle stays valid for the call.
                 let s = sock.lock();
-                // Temporarily set non-blocking, peek for data, then restore.
-                // Use a 65536-byte buffer because on Windows, peek with a
-                // buffer smaller than the datagram returns WSAEMSGSIZE error.
-                let _ = s.set_nonblocking(true);
-                let mut peek_buf = [0u8; 65536];
-                let readable = match s.peek(&mut peek_buf) {
-                    Ok(n) => n > 0,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
-                    // On Windows, WSAEMSGSIZE (10040) means data IS available
-                    // but larger than the peek buffer — treat as readable.
-                    #[cfg(target_os = "windows")]
-                    Err(ref e) if e.raw_os_error() == Some(10040) => true,
-                    Err(_) => false,
-                };
-                // Restore to blocking mode
-                let _ = s.set_nonblocking(false);
+                let (readable, _) = poll_socket_readiness(&*s);
                 (readable, true) // UDP sockets are always writable
             }
             FileEntry::TcpStream(stream) => {
+                // Non-destructive readiness probe — see the UdpSocket arm.
+                // Avoids the previous set_nonblocking(true)/peek/
+                // set_nonblocking(false) dance, which could race a
+                // concurrent blocking `tcp_read` into a spurious
+                // `WouldBlock` and also clobbered a deliberately
+                // non-blocking socket back to blocking.
                 let s = stream.lock();
-                let _ = s.set_nonblocking(true);
-                let mut peek_buf = [0u8; 1];
-                let readable = match s.peek(&mut peek_buf) {
-                    Ok(n) => n > 0,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
-                    Err(_) => false,
-                };
-                let _ = s.set_nonblocking(false);
+                let (readable, _) = poll_socket_readiness(&*s);
                 (readable, true) // TCP streams are generally writable
             }
             FileEntry::TcpListener { listener, pending } => {
@@ -860,21 +1011,12 @@ impl FileDescriptorTable {
                 if !pending.lock().is_empty() {
                     return (true, false);
                 }
+                // Non-destructive readiness probe: `poll` reports the
+                // listening socket readable when a connection is waiting
+                // in the backlog, without `accept()`-ing it and without
+                // touching the listener's blocking mode.
                 let l = listener.lock();
-                let _ = l.set_nonblocking(true);
-                let readable = match l.accept() {
-                    Ok((stream, addr)) => {
-                        // Don't discard the accepted connection — that would
-                        // consume a real pending peer and reset it. Stash it
-                        // so the next `tcp_accept` returns it.
-                        let _ = stream.set_nonblocking(false);
-                        pending.lock().push_back((stream, addr));
-                        true
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
-                    Err(_) => false,
-                };
-                let _ = l.set_nonblocking(false);
+                let (readable, _) = poll_socket_readiness(&*l);
                 (readable, false) // listeners are readable (acceptable), not writable
             }
             FileEntry::FileRead(_) => (true, false),

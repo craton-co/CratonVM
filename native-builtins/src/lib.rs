@@ -106,7 +106,22 @@ fn essential_dur_parse(
             .into())
         }
     };
-    let text = ctx.read_string(s_obj).unwrap_or_default();
+    // Distinguish a genuine read failure (`None`) from an empty string
+    // (`Some("")`). Previously this used `.unwrap_or_default()`, which
+    // silently coerced an unreadable CharSequence into `""` and then
+    // produced a misleading "Text cannot be parsed to a Duration: "
+    // error — masking the real problem (the argument's String layout
+    // could not be decoded). Surface that as an explicit error instead.
+    let text = match ctx.read_string(s_obj) {
+        Some(t) => t,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Duration.parse: text argument could not be read as a CharSequence"
+                    .to_string(),
+            }
+            .into())
+        }
+    };
     let trimmed = text.trim().to_string();
     let raw_err = || cratonvm_types::error::RuntimeError::IllegalArgumentException {
         message: format!("Text cannot be parsed to a Duration: {trimmed}"),

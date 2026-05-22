@@ -452,8 +452,16 @@ fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + '
 /// A typed device-side allocation backed by cudarc's safe `CudaSlice<T>`.
 /// The buffer also retains the streams it participates in so `to_host`
 /// can host-block on the compute stream before issuing the D→H copy.
+///
+/// AUDIT 2026-05-22 (UAF fix): the `CudaSlice<T>` is held behind an
+/// `Arc`. The slice owns the device allocation and frees it on `Drop`;
+/// `device_ptr_arg` hands a *clone* of this `Arc` to `KernelArgs` so the
+/// device memory is provably kept alive until the launch that reads it
+/// has run. Previously `device_ptr_arg` returned only a bare `u64`
+/// address with no lifetime tie, so dropping the `DeviceBuffer` before
+/// `launch_raw` left the kernel reading freed device memory.
 pub(crate) struct DeviceBufferInner<T> {
-    slice: CudaSlice<T>,
+    slice: Arc<CudaSlice<T>>,
     /// The stream the allocation is bound to. For uploaded buffers this
     /// is `copy_h2d`; for `uninit`/`zeros` it's `compute` (most kernels
     /// write into these output buffers).
@@ -500,7 +508,7 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
                 .map_err(map_err("alloc uninit"))?
         };
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             stream: ctx.compute.clone(),
             dev: ctx.dev.clone(),
             copy_d2h: ctx.copy_d2h.clone(),
@@ -516,7 +524,7 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
             .alloc_zeros::<T>(len)
             .map_err(map_err("alloc_zeros"))?;
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             stream: ctx.compute.clone(),
             dev: ctx.dev.clone(),
             copy_d2h: ctx.copy_d2h.clone(),
@@ -548,7 +556,7 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         // Wait for copy_h2d to complete before compute stream
         ctx.dev.wait_for(&ctx.copy_h2d).map_err(map_err("wait_for copy_h2d"))?;
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             stream: ctx.copy_h2d.clone(),
             dev: ctx.dev.clone(),
             copy_d2h: ctx.copy_d2h.clone(),
@@ -587,29 +595,52 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
             .synchronize()
             .map_err(map_err("synchronize device before D→H"))?;
         self.dev
-            .dtoh_sync_copy_into(&self.slice, dst)
+            // `self.slice` is `Arc<CudaSlice<T>>`; deref the `Arc` so the
+            // argument is `&CudaSlice<T>`, which implements cudarc's
+            // `DevicePtr` (an `&Arc<CudaSlice<T>>` does not).
+            .dtoh_sync_copy_into(&*self.slice, dst)
             .map_err(map_err("memcpy device→host"))
     }
 
     pub(crate) fn len(&self) -> usize {
-        DeviceSlice::len(&self.slice)
+        DeviceSlice::len(&*self.slice)
     }
 }
 
-// `device_ptr_arg` only needs `DevicePtr<T>`, which cudarc implements
-// for `CudaSlice<T>` for *every* `T`. Keeping it in a separate,
-// unbounded `impl` block lets `KernelArgs::push_device_ptr<T>` (which
-// is generic with no trait bounds on `T`) call it — the heavyweight
-// `Pod + DeviceRepr + ValidAsZeroBits + …` bounds on the allocation
-// methods above must not leak onto this accessor.
-impl<T> DeviceBufferInner<T> {
-    /// Return the raw device address.
+/// Type-erased keep-alive handle for a device allocation.
+///
+/// AUDIT 2026-05-22 (UAF fix): `device_ptr_arg` returns one of these
+/// alongside the raw device address. It is a clone of the buffer's
+/// `Arc<CudaSlice<T>>` erased to `dyn Any`, so a `KernelArg::DevicePtr`
+/// can hold it without naming `T`. As long as the `KernelArg` (and thus
+/// the owning `KernelArgs`) is alive, the underlying `CudaSlice` is not
+/// dropped, so the device allocation the kernel reads stays valid even
+/// if the original `DeviceBuffer` is dropped before the launch runs.
+pub(crate) type BufferKeepAlive = Arc<dyn std::any::Any + Send + Sync + 'static>;
+
+// `device_ptr_arg` needs `DevicePtr<T>` (which cudarc implements for
+// `CudaSlice<T>` for *every* `T`) plus `T: Send + Sync + 'static` so the
+// `Arc<CudaSlice<T>>` keep-alive can be erased to `Arc<dyn Any + Send +
+// Sync>`. `Send + Sync + 'static` is satisfied by every type that can
+// back a `DeviceBuffer` (`DeviceElem` already requires it), so this is
+// not a real restriction on callers; the heavyweight `Pod + DeviceRepr +
+// ValidAsZeroBits + …` allocation bounds still do not leak here.
+impl<T: Send + Sync + 'static> DeviceBufferInner<T> {
+    /// Return the raw device address together with a type-erased
+    /// keep-alive handle to the owning `CudaSlice`.
     ///
     /// AUDIT 2026-05-16 (CRIT-1 fix): In cudarc 0.13, SyncRecord was removed.
     /// Stream ordering is now handled via CudaDevice::wait_for and
     /// fork_default_stream, which we use in from_host and launch_raw.
-    pub(crate) fn device_ptr_arg(&self) -> u64 {
+    ///
+    /// AUDIT 2026-05-22 (UAF fix): also returns `BufferKeepAlive`. The
+    /// caller (`KernelArgs::push_device_ptr`) stores this in the
+    /// `KernelArg::DevicePtr`, so the device allocation behind `addr`
+    /// cannot be freed before the launch that consumes the `KernelArgs`.
+    pub(crate) fn device_ptr_arg(&self) -> (u64, BufferKeepAlive) {
         let _ = (&self.dev, &self.copy_d2h); // retained for future use
-        *DevicePtr::device_ptr(&self.slice)
+        let addr = *DevicePtr::device_ptr(&*self.slice);
+        let keep_alive: BufferKeepAlive = self.slice.clone();
+        (addr, keep_alive)
     }
 }

@@ -38,18 +38,18 @@ pub trait ClassHierarchy {
     /// Is the named class currently resolvable — i.e. already loaded so
     /// that hierarchy queries about it can return a definitive answer?
     ///
-    /// The verifier runs at class-define time and only sees classes that
-    /// the bootstrap loader has already pulled in. When a referenced type
-    /// is *not* yet loaded the verifier cannot prove (or disprove) a
-    /// subtype relationship; per JVMS §4.10.1.2 the runtime `checkcast` /
-    /// `invoke*` resolution then enforces the actual type. Callers use
-    /// this hook to stay lenient for genuinely-unresolved reference types
-    /// instead of raising a spurious `VerifyError`.
+    /// SOUNDNESS NOTE (RVERIF.3): the verifier's assignability check no
+    /// longer consults this hook to *accept* an otherwise-unprovable
+    /// reference assignment. Treating "not yet loaded" as "assignable"
+    /// was a verification escape hatch — a crafted class file could keep
+    /// a type unloaded to bypass the type checker entirely. Per JVMS
+    /// §4.10.1.2 the verifier must be conservative and reject what it
+    /// cannot prove. This hook is retained for diagnostics / callers that
+    /// want to distinguish "definitely not a subtype" from "unknown".
     ///
     /// The default returns `true` ("assume resolvable") so mock
-    /// hierarchies used in unit tests keep their existing strict
-    /// behaviour; the real `ClassStore`-backed implementation reports
-    /// actual load state.
+    /// hierarchies used in unit tests keep their existing behaviour; the
+    /// real `ClassStore`-backed implementation reports actual load state.
     fn is_resolvable(&self, _name: &str) -> bool {
         true
     }
@@ -246,37 +246,22 @@ impl VType {
             (VType::ObjectRef(child), VType::ObjectRef(parent)) => {
                 // `child` / `parent` are `&Arc<str>`; deref to `&str` for
                 // the `ClassHierarchy` trait methods.
+                //
+                // SOUNDNESS (RVERIF.3): an unresolved reference type must
+                // NOT make the assignment silently pass. The previous
+                // `!is_resolvable(parent) || !is_resolvable(child)` arms
+                // were a general verification escape hatch — ANY
+                // reference-to-reference assignment was accepted whenever
+                // either side happened to be unloaded, which a crafted
+                // class file can trivially arrange to bypass the type
+                // checker entirely. Per JVMS §4.10.1.2 the verifier must
+                // be conservative: when it cannot prove the subtype
+                // relationship it rejects the class. The runtime
+                // `checkcast` / `invoke*` resolution is a defence in
+                // depth, not a substitute for verification.
                 hierarchy.is_subclass(child, parent)
                     || hierarchy.is_interface(parent)
                     || is_known_jdk_interface(parent)
-                    // Jetty / ByteBuddy fix: the verifier runs at
-                    // class-define time and can only see classes the
-                    // bootstrap loader has already pulled in. A subtype
-                    // relationship between two reference types can only be
-                    // proven once BOTH are loaded — `is_subclass` walks the
-                    // child's superclass/interface chain, and that walk
-                    // needs the child loaded; the interface relaxation
-                    // needs the parent loaded. When EITHER side is not yet
-                    // resolvable the verifier can neither prove the
-                    // relationship nor prove a mismatch. Per JVMS §4.10.1.2
-                    // it then defers to the runtime `checkcast` / `invoke*`
-                    // / `putfield` resolution, which performs the real
-                    // assignability check once the types are loaded.
-                    //
-                    // Rejecting here produced spurious `VerifyError`s on
-                    // real bytecode:
-                    //   * ByteBuddy `ByteBuddy.<init>` — `ElementMatcher$Junction`
-                    //     where the not-yet-loaded interface `ElementMatcher`
-                    //     is declared (unresolved parent);
-                    //   * Jetty `Main.start` — a `new Main$2` (an anonymous
-                    //     `Thread` subclass) passed where `java/lang/Thread`
-                    //     is declared (unresolved child).
-                    //
-                    // `Null` / primitive mismatches are handled by earlier
-                    // arms, so this only loosens reference-vs-reference
-                    // checks where genuine resolution is pending.
-                    || !hierarchy.is_resolvable(parent)
-                    || !hierarchy.is_resolvable(child)
             }
 
             // Array to Object: all arrays are subclasses of java/lang/Object.
@@ -297,18 +282,24 @@ impl VType {
             // UninitializedThis → UninitializedThis (equality handled above)
             // Uninitialized(n) → Uninitialized(n) (equality handled above)
 
-            // UninitializedThis is assignable to any ObjectRef.
-            // In practice, `this` before super.<init>() should only be used
-            // as the receiver of the upcoming invokespecial.  Relaxing this
-            // to any ObjectRef avoids false verification errors when the
-            // StackMapTable declares the resolved type at a merge point
-            // that our verifier reaches with UninitializedThis still live.
-            (VType::UninitializedThis, VType::ObjectRef(_)) => true,
-
-            // Uninitialized(n) → ObjectRef: accept during frame merge.
-            // This handles cases where the StackMapTable frame is declared after
-            // new+init but the verifier hasn't fully tracked initialization yet.
-            (VType::Uninitialized(_), VType::ObjectRef(_)) => true,
+            // SOUNDNESS (RVERIF.3): an uninitialized object is NOT
+            // assignable where an initialized reference is expected. This
+            // is the classic uninitialized-object attack: if
+            // `UninitializedThis` / `Uninitialized(n)` were assignable to
+            // an `ObjectRef`, bytecode could pass an object to any method
+            // or store it to any field *before* its `<init>` has run,
+            // observing or corrupting a partially-constructed instance.
+            //
+            // Per JVMS §4.10.1.2 / §4.10.1.9 an uninitialized type is only
+            // compatible with itself; it becomes an `ObjectRef` only after
+            // the verifier sees the matching `invokespecial <init>` (see
+            // `replace_vtype_in_frame` in `verify_insn.rs`). A
+            // StackMapTable frame that legitimately declares the resolved
+            // type at a merge point will only be reached *after* that
+            // initialization has been applied, so the equality check at
+            // the top of this function already covers the sound cases.
+            // The arms accepting `Uninitialized*` → `ObjectRef` are
+            // therefore removed.
 
             _ => false,
         }
@@ -402,18 +393,15 @@ fn array_is_assignable(
             // ObjectRef arm (covers e.g. `[List` -> `[Collection` when
             // both element types are loaded as flag-less stubs).
             //
-            // Jetty / Spring fix: also apply the "unresolved → defer to
-            // runtime" leniency from the scalar arm. The verifier sees
-            // array element types (e.g. `[TaskOption` vs the declared
-            // `[Enum` in Spring's `ConcurrentReferenceHashMap$Task.<init>`)
-            // before the element classes are loaded; rejecting here raised
-            // spurious `VerifyError`s. The runtime `aastore` / `checkcast`
-            // enforces the real element type.
+            // SOUNDNESS (RVERIF.3): the "unresolved → accept" leniency
+            // was removed here for the same reason as the scalar
+            // `ObjectRef` arm — an unloaded element type must not make an
+            // array-covariance assignment pass unchecked. When the
+            // verifier cannot prove the element subtype relationship it
+            // rejects the class (conservative, per JVMS §4.10.1.2).
             hierarchy.is_subclass(child_class, parent_class)
                 || hierarchy.is_interface(parent_class)
                 || is_known_jdk_interface(parent_class)
-                || !hierarchy.is_resolvable(parent_class)
-                || !hierarchy.is_resolvable(child_class)
         }
         // Both nested arrays
         (Some(b'['), Some(b'[')) => array_is_assignable(child_elem, parent_elem, hierarchy),
@@ -673,8 +661,21 @@ pub fn return_type_from_descriptor(descriptor: &str) -> Option<VType> {
 pub fn param_types_from_descriptor(descriptor: &str) -> Vec<VType> {
     let mut types = Vec::new();
 
-    // Skip the opening '('
-    let inner = &descriptor[1..descriptor.rfind(')').unwrap_or(descriptor.len())];
+    // Skip the opening '(' and stop at the closing ')'. A malformed
+    // descriptor with no leading '(' (in particular the empty string)
+    // must not panic on a `[1..]` slice — return an empty parameter list
+    // so verification fails cleanly downstream instead of crashing the
+    // verifier. `splitn`/`find` keep all indexing in-bounds.
+    let after_open = match descriptor.strip_prefix('(') {
+        Some(rest) => rest,
+        None => return types, // malformed: no '(' — no parameters
+    };
+    // Everything up to the first ')' (or the whole remainder if ')' is
+    // absent, which is itself malformed but handled without panic).
+    let inner = match after_open.find(')') {
+        Some(close) => &after_open[..close],
+        None => after_open,
+    };
     let bytes = inner.as_bytes();
     let mut i = 0;
 
@@ -1124,6 +1125,69 @@ mod tests {
         let foo = VType::ObjectRef(Arc::from("com/example/Foo"));
         let bar = VType::ObjectRef(Arc::from("com/example/Bar"));
         assert!(!foo.is_assignable_to(&bar, &h));
+    }
+
+    // --- RVERIF.3 soundness regressions -----------------------------------
+
+    #[test]
+    fn uninitialized_not_assignable_to_object() {
+        // The classic uninitialized-object attack: an uninitialized object
+        // must NOT be assignable where an initialized reference is
+        // expected (JVMS §4.10.1.2). It becomes an ObjectRef only after
+        // the verifier sees the matching invokespecial <init>.
+        let h = MockHierarchy;
+        let obj = VType::ObjectRef(Arc::from("java/lang/Object"));
+        assert!(!VType::UninitializedThis.is_assignable_to(&obj, &h));
+        assert!(!VType::Uninitialized(7).is_assignable_to(&obj, &h));
+    }
+
+    #[test]
+    fn uninitialized_assignable_only_to_itself() {
+        // An uninitialized type is compatible with itself (equality) but
+        // nothing else among reference types.
+        let h = MockHierarchy;
+        assert!(VType::UninitializedThis.is_assignable_to(&VType::UninitializedThis, &h));
+        assert!(VType::Uninitialized(3).is_assignable_to(&VType::Uninitialized(3), &h));
+        assert!(!VType::Uninitialized(3).is_assignable_to(&VType::Uninitialized(4), &h));
+    }
+
+    #[test]
+    fn unresolved_type_does_not_bypass_assignability() {
+        // RVERIF.3: a hierarchy that reports a type as not-yet-resolvable
+        // must NOT make an otherwise-unprovable reference assignment pass.
+        struct UnresolvedHierarchy;
+        impl ClassHierarchy for UnresolvedHierarchy {
+            fn is_subclass(&self, c: &str, p: &str) -> bool {
+                c == p || p == "java/lang/Object"
+            }
+            fn common_superclass(&self, _a: &str, _b: &str) -> String {
+                "java/lang/Object".to_string()
+            }
+            fn is_interface(&self, _name: &str) -> bool {
+                false
+            }
+            fn is_resolvable(&self, _name: &str) -> bool {
+                false // everything unresolved
+            }
+        }
+        let h = UnresolvedHierarchy;
+        let foo = VType::ObjectRef(Arc::from("com/example/Foo"));
+        let bar = VType::ObjectRef(Arc::from("com/example/Bar"));
+        // Unprovable class-to-class assignment must be rejected even
+        // though both types are "unresolved".
+        assert!(!foo.is_assignable_to(&bar, &h));
+        // Same for reference-array element types.
+        let afoo = VType::ArrayRef(Arc::from("[Lcom/example/Foo;"));
+        let abar = VType::ArrayRef(Arc::from("[Lcom/example/Bar;"));
+        assert!(!afoo.is_assignable_to(&abar, &h));
+    }
+
+    #[test]
+    fn param_types_from_empty_descriptor_does_not_panic() {
+        // RVERIF.3: a zero-length descriptor must not panic on slicing.
+        assert!(param_types_from_descriptor("").is_empty());
+        assert!(param_types_from_descriptor("(").is_empty());
+        assert!(param_types_from_descriptor(")V").is_empty());
     }
 
     #[test]

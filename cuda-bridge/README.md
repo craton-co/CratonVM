@@ -28,9 +28,21 @@ let ctx = cuda_bridge::DeviceContext::new(0)?;
 let module = cuda_bridge::DeviceModule::from_ptx(&ctx, PTX, &["vector_add"])?;
 let a = cuda_bridge::DeviceBuffer::from_host(&ctx, &[1i32, 2, 3, 4])?;
 let b = cuda_bridge::DeviceBuffer::from_host(&ctx, &[10i32, 20, 30, 40])?;
-let mut out = cuda_bridge::DeviceBuffer::<i32>::zeros(&ctx, 4)?;
+let out = cuda_bridge::DeviceBuffer::<i32>::zeros(&ctx, 4)?;
 let cfg = cuda_bridge::LaunchConfig::elementwise(4);
-module.launch(&ctx, "vector_add", &cfg, (&a, &b, &mut out, 4i32))?;
+
+// Build the argument list with the `KernelArgs` builder: each
+// `push_*` call appends one kernel parameter in declaration order.
+// `push_device_ptr` retains a keep-alive handle to the buffer's
+// device allocation, so the buffers cannot be freed before the
+// launch reads them.
+let args = cuda_bridge::KernelArgs::new()
+    .push_device_ptr(&a)
+    .push_device_ptr(&b)
+    .push_device_ptr(&out)
+    .push_i32(4);
+module.launch_raw(&ctx, "vector_add", &cfg, args)?;
+
 let mut host = vec![0i32; 4];
 out.to_host(&mut host)?;
 assert_eq!(host, vec![11, 22, 33, 44]);

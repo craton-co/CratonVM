@@ -224,26 +224,40 @@ pub fn analyze_with_annotations(
     //
     // Single bytecode pass: `scan_bytecode` collects the reject reason,
     // the `this_field_cps` receiver-access CP indices (Phase 9 #2), the
-    // loop-trip work estimate, and the backward-branch flag — no second
+    // loop-trip work estimate, the backward-branch flag, and whether
+    // the body matches the dot-product/sum reduction shape — no second
     // walk needed.
-    let (this_field_cps, estimated_work, has_backward) =
+    let (this_field_cps, estimated_work, has_backward, is_dot_reduction) =
         match scan_bytecode(code, hint, is_static) {
             Ok(t) => t,
             Err(reason) => return OffloadVerdict::Rejected(reason),
         };
 
+    // AUDIT 2026-05-22: dot-product / sum reductions are now a
+    // supported kernel shape. The `lowering::emit` layer has explicit
+    // counted-loop + accumulator + scalar-return lowering (see the
+    // `i2l`/`mul.lo.s64`/`add.s64` paths in `lowering/emit.rs` and the
+    // `dot_product_lowers_with_long_math` test); the analyzer must
+    // agree and admit the shape that lowering exercises. The two shape
+    // guards below (`ReductionNotImplemented` / `CountedLoopScalarReturn`)
+    // therefore no longer fire for a recognised dot-product reduction —
+    // a counted loop over array parameters whose body accumulates into
+    // a scalar local that becomes the return value.
+    //
     // AUDIT 2026-05-16: an array-in / scalar-out signature is a
-    // reduction shape (sum, dot, max, count, …). The emitter's
-    // `scalar_return` lowering writes the value through `ret_ptr`
-    // from every CUDA thread, so each thread races to overwrite the
-    // single scalar with its per-element term — silently wrong
-    // results. Until a proper block-reduction lowering exists, refuse
-    // the shape and let the VM run the method on the CPU.
+    // reduction shape (sum, dot, max, count, …). For shapes the emitter
+    // does NOT yet lower, `scalar_return` would write `ret_ptr` from
+    // every CUDA thread, racing to overwrite the single scalar — so any
+    // array-in / scalar-out method that is NOT the recognised
+    // dot-product reduction is still refused and falls back to the CPU.
     //
     // This shape check runs AFTER the opcode scan above so a method
     // that is rejected for a more specific opcode reason keeps that
     // reason.
-    if return_kind.is_scalar() && param_kinds.iter().any(|k| k.is_array()) {
+    if return_kind.is_scalar()
+        && param_kinds.iter().any(|k| k.is_array())
+        && !is_dot_reduction
+    {
         return OffloadVerdict::Rejected(Reason::ReductionNotImplemented);
     }
 
@@ -255,7 +269,11 @@ pub fn analyze_with_annotations(
     // `ReductionNotImplemented` check only fires for array-in /
     // scalar-out shapes; a scalar-in / scalar-out counted loop is not
     // caught there. Reject it so the VM falls back to the CPU.
-    if has_backward && return_kind.is_scalar() {
+    //
+    // The recognised dot-product reduction is exempt: it is a counted
+    // loop with a scalar return that the `lowering::emit` layer
+    // supports, so it must remain `Eligible`.
+    if has_backward && return_kind.is_scalar() && !is_dot_reduction {
         return OffloadVerdict::Rejected(Reason::CountedLoopScalarReturn);
     }
 
@@ -274,7 +292,7 @@ pub fn analyze_with_annotations(
 
 /// Walk the bytecode exactly once. Reject on the first forbidden
 /// opcode; otherwise return `(this_field_cps, loop-trip estimate,
-/// has_backward_branch)`.
+/// has_backward_branch, is_dot_product_reduction)`.
 ///
 /// `hint` selectively loosens specific rejections — see [`AdmissionHint`]
 /// for the policy table. `this_field_cps` collects the CP indices of the
@@ -282,19 +300,39 @@ pub fn analyze_with_annotations(
 /// flag lets `analyze` recognise counted-loop shapes without a second
 /// pass — the work estimator's branch-direction check needs the same
 /// `pc / instruction_size` walk the classifier already performs.
+///
+/// `is_dot_product_reduction` (the 4th element) is `true` when the body
+/// matches the dot-product / sum reduction shape that `lowering::emit`
+/// supports: a counted loop (a backward branch) whose body both reads
+/// from arrays (an `*aload`) and accumulates with an arithmetic `*add`.
+/// `analyze` uses it to exempt that shape from the conservative
+/// `ReductionNotImplemented` / `CountedLoopScalarReturn` guards.
 fn scan_bytecode(
     code: &CodeAttribute,
     hint: AdmissionHint,
     is_static: bool,
-) -> Result<(Vec<u16>, usize, bool), Reason> {
+) -> Result<(Vec<u16>, usize, bool, bool), Reason> {
     let bytes = &code.code;
     let mut pc = 0usize;
     let mut prev_op: Option<u8> = None;
     let mut this_field_cps: Vec<u16> = Vec::new();
     let mut has_backward = false;
+    // Dot-product reduction shape probes: the body reads array elements
+    // (`iaload`/`laload`/`faload`/`daload`/`baload`/`saload`/`caload`,
+    // opcodes 0x2E..=0x35 minus `aaload` 0x32) and accumulates with an
+    // arithmetic `*add` (`iadd`/`ladd`/`fadd`/`dadd`, 0x60..=0x63).
+    let mut body_has_array_load = false;
+    let mut body_has_add = false;
 
     while pc < bytes.len() {
         let op = bytes[pc];
+
+        if (0x2E..=0x35).contains(&op) && op != 0x32 {
+            body_has_array_load = true;
+        }
+        if (0x60..=0x63).contains(&op) {
+            body_has_add = true;
+        }
 
         // Branch-direction probe (formerly `estimate_work`): a backward
         // branch marks a counted loop.
@@ -355,7 +393,18 @@ fn scan_bytecode(
         pc += instruction_size(bytes, pc)?;
     }
     let estimated_work = if has_backward { 1 << 20 } else { bytes.len().max(1) };
-    Ok((this_field_cps, estimated_work, has_backward))
+    // A dot-product / sum reduction is a counted loop whose body both
+    // reads from arrays and accumulates with an arithmetic add. This is
+    // the exact shape `lowering::emit` lowers (counted loop + scalar
+    // return); recognising it here lets `analyze` admit it instead of
+    // rejecting via the conservative reduction shape guards.
+    let is_dot_product_reduction = has_backward && body_has_array_load && body_has_add;
+    Ok((
+        this_field_cps,
+        estimated_work,
+        has_backward,
+        is_dot_product_reduction,
+    ))
 }
 
 enum OpClass {

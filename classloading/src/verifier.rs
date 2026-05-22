@@ -1,4 +1,4 @@
-//! Class verification вЂ” Pass 2 (structural) and Pass 3 (bytecode).
+//! Class verification — Pass 2 (structural) and Pass 3 (bytecode).
 //!
 //! **Pass 2** validates class file structural integrity:
 //! - Access flag validity (conflicting combinations)
@@ -10,12 +10,12 @@
 //! **Pass 3** performs bytecode type-checking using StackMapTable frames (JVM spec 4.10.1).
 //! Requires Java 7+ (version >= 51). Delegated to [`super::bytecode_verifier`].
 //!
-//! ## Pre-Java-7 JSR/RET subroutines (JVMS В§4.10.2.5)
+//! ## Pre-Java-7 JSR/RET subroutines (JVMS §4.10.2.5)
 //!
-//! Class files compiled for major version в‰¤ 50 (Java 6 and earlier) may emit
+//! Class files compiled for major version ≤ 50 (Java 6 and earlier) may emit
 //! `jsr` / `jsr_w` / `ret` instructions to implement `try-finally` blocks.
 //! These were deprecated in Java 7 (which mandates `StackMapTable`) and are
-//! formally specified in JVMS В§4.10.2.5 to require **subroutine inlining** вЂ”
+//! formally specified in JVMS §4.10.2.5 to require **subroutine inlining** —
 //! each `jsr` call site is verified independently with its own
 //! `returnAddress` type, and the subroutine body is conceptually inlined per
 //! call site. The naive type-inference verifier (which our
@@ -32,7 +32,7 @@
 //! handler. ByteBuddy 1.12 (compiled `--release 5`) ships several
 //! `TypePool$AbstractBase$Hierarchical.clear` is one example.
 //!
-//! Per JVMS В§4.10.2 the type-inference verifier "MAY be lenient" on
+//! Per JVMS §4.10.2 the type-inference verifier "MAY be lenient" on
 //! pre-Java-7 class files. HotSpot's hand-written subroutine-inlining
 //! verifier handles these correctly; reproducing it here is non-trivial
 //! (~1k LOC of bytecode rewriting). Until that work lands, we relax
@@ -46,7 +46,7 @@
 //! existing `bytecode_verifier::verify_bytecode` path, so the relaxation
 //! is bounded to the exact set of methods that the worklist verifier
 //! cannot model. Java 7+ classes (which never emit `jsr`/`ret` and are
-//! required to ship `StackMapTable`) are unaffected вЂ” the fast path
+//! required to ship `StackMapTable`) are unaffected — the fast path
 //! delegates to `bytecode_verifier::verify_bytecode` unchanged.
 
 #[cfg(test)]
@@ -67,7 +67,7 @@ use cratonvm_types::error::LinkageError;
 
 /// Verify a class: structural (Pass 2) + bytecode (Pass 3).
 ///
-/// Called during the Loaded в†’ Verified transition. Returns `LinkageError::VerifyError`
+/// Called during the Loaded → Verified transition. Returns `LinkageError::VerifyError`
 /// or `LinkageError::ClassFormatError` on failure.
 pub fn verify_class(
     class: &Class,
@@ -85,11 +85,11 @@ pub fn verify_class(
 /// anywhere in the class) delegates to
 /// [`super::bytecode_verifier::verify_bytecode`] verbatim. Otherwise,
 /// each method is verified individually:
-///   * methods using subroutines в†’ structural-only fallback (no
+///   * methods using subroutines → structural-only fallback (no
 ///     type-state worklist, since our worklist verifier collapses two
 ///     distinct `ReturnAddress` values into `Top` at the subroutine
 ///     entry, which the spec-compliant inlining verifier would not);
-///   * everything else в†’ the same per-method type-state algorithm that
+///   * everything else → the same per-method type-state algorithm that
 ///     `bytecode_verifier::verify_bytecode` runs (StackMapTable-driven
 ///     for Java 7+, worklist-based for Java 6 and earlier).
 ///
@@ -102,7 +102,7 @@ pub fn verify_class(
 /// called [`super::bytecode_verifier::verify_bytecode`] should call
 /// this function instead for any class that may legitimately contain
 /// pre-Java-7 subroutine bytecode (every classpath class with major
-/// version в‰¤ 50 qualifies).
+/// version ≤ 50 qualifies).
 pub fn verify_class_bytecode(
     class: &Class,
     hierarchy: &dyn ClassHierarchy,
@@ -125,7 +125,7 @@ pub fn verify_class_bytecode(
     }
 
     if !any_jsr {
-        // Common path вЂ” no subroutines anywhere. Delegate to the
+        // Common path — no subroutines anywhere. Delegate to the
         // standard verifier unchanged.
         return super::bytecode_verifier::verify_bytecode(class, hierarchy);
     }
@@ -139,9 +139,9 @@ pub fn verify_class_bytecode(
         }
         if method_uses_jsr_or_ret(method) {
             // Subroutine-using method: structural sanity only. JVMS
-            // В§4.10.2 explicitly says the type-inference verifier MAY
+            // §4.10.2 explicitly says the type-inference verifier MAY
             // be lenient, and our worklist implementation does not
-            // perform the subroutine inlining that В§4.10.2.5 requires
+            // perform the subroutine inlining that §4.10.2.5 requires
             // for these methods.
             verify_method_structural_only(class, method)?;
         } else {
@@ -161,14 +161,14 @@ pub fn verify_class_bytecode(
 /// `bytecode_verifier::verify_method`.
 ///
 /// Branches on the class file version:
-/// - **Java 7+ (major в‰Ґ 51)**: requires `StackMapTable` for any method
+/// - **Java 7+ (major ≥ 51)**: requires `StackMapTable` for any method
 ///   with branches or exception handlers. Walks bytecode linearly,
 ///   adopting declared frames at branch targets and confirming the
 ///   current frame is assignable to each declared frame at the merge
-///   points. Lenient mode вЂ” branch targets without declared frames
+///   points. Lenient mode — branch targets without declared frames
 ///   are tolerated (matches the existing
 ///   `bytecode_verifier::verify_bytecode` behaviour).
-/// - **Pre-Java-7 (major в‰¤ 50)** without StackMapTable but with branches
+/// - **Pre-Java-7 (major ≤ 50)** without StackMapTable but with branches
 ///   or exception handlers: runs a worklist-based type inference.
 /// - Pre-Java-7 with neither branches nor handlers: linear walk with
 ///   the initial frame.
@@ -227,13 +227,13 @@ fn verify_method_typestate(
         if has_handlers || has_branches {
             // Run the worklist-based pre-Java-7 type inference. We
             // re-use `bytecode_verifier::verify_bytecode` on a
-            // single-method synthetic Class вЂ” but since `Class` is
+            // single-method synthetic Class — but since `Class` is
             // not `Clone`able, we instead replicate the inference
             // worklist here. The algorithm is the same that lives in
             // `bytecode_verifier::verify_by_inference`.
             return verify_pre_java7_inference(class, method, hierarchy);
         }
-        // No branches, no handlers вЂ” fall through to the linear walk
+        // No branches, no handlers — fall through to the linear walk
         // below.
     }
 
@@ -354,7 +354,7 @@ fn verify_method_typestate(
             && !declared_frames.contains_key(&(pc as u16))
             && !handler_targets.contains_key(&(pc as u16))
         {
-            // Lenient mode вЂ” skip unreachable code silently.
+            // Lenient mode — skip unreachable code silently.
             let (_, next_pc) = match Instruction::decode(bytecode, pc) {
                 Ok(r) => r,
                 Err(_) => break,
@@ -372,7 +372,7 @@ fn verify_method_typestate(
         })?;
 
         let result = verify_instruction(
-            &insn, pc, &mut current, cp, class_name, &method.name, hierarchy,
+            &insn, pc, &mut current, cp, class_name, &method.name, &method.descriptor, hierarchy,
         )
         .map_err(|e| match e {
             LinkageError::VerifyError {
@@ -471,7 +471,7 @@ fn verify_pre_java7_inference(
         })?;
 
         let result = verify_instruction(
-            &insn, pc, &mut current, cp, class_name, &method.name, hierarchy,
+            &insn, pc, &mut current, cp, class_name, &method.name, &method.descriptor, hierarchy,
         )
         .map_err(|e| match e {
             LinkageError::VerifyError {
@@ -633,7 +633,7 @@ fn bytecode_has_any_branch(bytecode: &[u8]) -> bool {
 /// Returns `true` if any subroutine-related opcode is present. We walk
 /// instruction-by-instruction so that variable-length opcodes
 /// (`tableswitch` / `lookupswitch`) and aligned padding are stepped over
-/// correctly вЂ” otherwise a jump-table byte that happens to be `0xa8`
+/// correctly — otherwise a jump-table byte that happens to be `0xa8`
 /// would be misread as `jsr`.
 fn method_uses_jsr_or_ret(method: &ClassFileMethod) -> bool {
     let code_attr = match method.code() {
@@ -653,13 +653,13 @@ fn method_uses_jsr_or_ret(method: &ClassFileMethod) -> bool {
             return true;
         }
         // Use the canonical decoder to advance. Malformed bytecode here
-        // is harmless вЂ” `verify_method_structural_only` will reject it.
+        // is harmless — `verify_method_structural_only` will reject it.
         let next = match Instruction::decode(bytecode, pc) {
             Ok((_, next_pc)) => next_pc,
             Err(_) => return false,
         };
         if next <= pc {
-            // defensive: zero/negative advance вЂ” stop scanning
+            // defensive: zero/negative advance — stop scanning
             return false;
         }
         pc = next;
@@ -667,20 +667,20 @@ fn method_uses_jsr_or_ret(method: &ClassFileMethod) -> bool {
     false
 }
 
-/// Structural sanity scan for a method's bytecode (JVMS В§4.9.1).
+/// Structural sanity scan for a method's bytecode (JVMS §4.9.1).
 ///
 /// Validates:
 ///   - every byte of `code` decodes into a legal `Instruction`;
 ///   - every branch target lies inside `code`;
 ///   - every entry of the exception table satisfies
-///     `0 в‰¤ start_pc < end_pc в‰¤ code_length` and `handler_pc < code_length`;
+///     `0 ≤ start_pc < end_pc ≤ code_length` and `handler_pc < code_length`;
 ///   - `max_stack` and `max_locals` are well-formed (non-zero code).
 ///
-/// This is JVMS В§4.9.1 "Static Constraints" вЂ” the structural envelope
+/// This is JVMS §4.9.1 "Static Constraints" — the structural envelope
 /// that a class file must satisfy regardless of the type-state pass
-/// (В§4.10). It catches the malformed-bytecode shapes the runtime
+/// (§4.10). It catches the malformed-bytecode shapes the runtime
 /// interpreter cannot defend against (out-of-range jumps, truncated
-/// instructions) without requiring a working type-state model вЂ” which is
+/// instructions) without requiring a working type-state model — which is
 /// what makes it the right fallback for `jsr`/`ret` methods.
 fn verify_method_structural_only(
     class: &Class,
@@ -694,7 +694,7 @@ fn verify_method_structural_only(
     let code_len = bytecode.len();
 
     // Empty bytecode in a non-abstract non-native method is malformed
-    // (JVMS В§4.9.1: "code_length в‰Ґ 1").
+    // (JVMS §4.9.1: "code_length ≥ 1").
     if code_len == 0 {
         return Err(LinkageError::VerifyError {
             class_name: class.name.to_string(),
@@ -716,7 +716,7 @@ fn verify_method_structural_only(
 
         // Enumerate branch targets that this instruction can reach and
         // confirm each one lies inside the code array. We do NOT do
-        // type-state verification here вЂ” we only check that the program
+        // type-state verification here — we only check that the program
         // counter never falls off the edge of the method.
         for target in instruction_branch_targets(&insn, pc) {
             if target as usize > code_len {
@@ -742,7 +742,7 @@ fn verify_method_structural_only(
         pc = next_pc;
     }
 
-    // Validate exception handler ranges (JVMS В§4.9.1).
+    // Validate exception handler ranges (JVMS §4.9.1).
     for entry in &code_attr.exception_table {
         let start = entry.start_pc as usize;
         let end = entry.end_pc as usize;
@@ -787,7 +787,7 @@ fn verify_method_structural_only(
 /// array; the caller checks them against `code.len()`. Includes the
 /// fall-through targets of conditional branches, the default and case
 /// arms of `tableswitch`/`lookupswitch`, and the targets of
-/// `goto`/`goto_w`/`jsr`/`jsr_w`. `ret` is intentionally excluded вЂ” its
+/// `goto`/`goto_w`/`jsr`/`jsr_w`. `ret` is intentionally excluded — its
 /// target is data-flow-dependent and cannot be validated structurally.
 fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
     let pc_i32 = pc as i32;
@@ -845,7 +845,7 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
             }
             v
         }
-        // `ret` jumps to a returnAddress stored in a local вЂ” the target
+        // `ret` jumps to a returnAddress stored in a local — the target
         // is dynamic, not encoded in the instruction. Not checked here.
         _ => Vec::new(),
     }
@@ -854,7 +854,7 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Vec<u16> {
 /// True if `version` predates StackMapTable (Java 6 and earlier).
 ///
 /// Used to gate which class files may legitimately contain `jsr`/`ret`.
-/// Per JVMS В§4.10.1 a class with major version в‰Ґ 51 (Java 7+) MUST NOT
+/// Per JVMS §4.10.1 a class with major version ≥ 51 (Java 7+) MUST NOT
 /// emit `jsr` or `ret`; the standard verifier rejects them on that path.
 #[allow(dead_code)] // referenced by tests below
 fn is_pre_java7(version: &ClassFileVersion) -> bool {
@@ -1080,7 +1080,7 @@ fn verify_abstract_method_implementation(
         current_id = ancestor.superclass;
     }
 
-    // Check interface methods вЂ” concrete classes must implement all
+    // Check interface methods — concrete classes must implement all
     // abstract methods declared in directly implemented interfaces
     // and their super-interfaces.
     verify_interface_methods(class, store)?;
@@ -1605,10 +1605,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // F3 вЂ” JSR/RET subroutine relaxation (Pass 3, JVMS В§4.10.2.5)
+    // F3 — JSR/RET subroutine relaxation (Pass 3, JVMS §4.10.2.5)
     // -----------------------------------------------------------------
 
-    /// Mock hierarchy used by the JSR/RET tests below вЂ” every class is a
+    /// Mock hierarchy used by the JSR/RET tests below — every class is a
     /// subclass of every other, common superclass is always Object,
     /// nothing is an interface. Sufficient because the JSR-relaxation
     /// path does no type-state checking that would consult the
@@ -1640,7 +1640,7 @@ mod tests {
             loader_id: ClassLoaderId::Application,
             name: Arc::from("Hierarchical"),
             source_file: None,
-            // Java 5 (major 49) вЂ” pre-Java-7, no StackMapTable
+            // Java 5 (major 49) — pre-Java-7, no StackMapTable
             // requirement; legitimately may emit jsr/ret.
             version: ClassFileVersion::JAVA_5,
             state: ClassState::Loaded,
@@ -1685,7 +1685,7 @@ mod tests {
 
     /// F3 acceptance: a synthetic method that mirrors the
     /// `TypePool$AbstractBase$Hierarchical.clear` shape from
-    /// ByteBuddy 1.12.12 вЂ” two distinct `jsr` call sites that target
+    /// ByteBuddy 1.12.12 — two distinct `jsr` call sites that target
     /// the same subroutine, where the worklist verifier would merge
     /// `ReturnAddress(3)` and `ReturnAddress(6)` into `Top` and reject
     /// the subroutine's leading `astore_0`. With the JSR-aware
@@ -1693,13 +1693,13 @@ mod tests {
     ///
     /// Bytecode:
     /// ```text
-    ///   0: jsr +9      в†’ push returnAddress(3),  branch to 9
-    ///   3: jsr +6      в†’ push returnAddress(6),  branch to 9
+    ///   0: jsr +9      → push returnAddress(3),  branch to 9
+    ///   3: jsr +6      → push returnAddress(6),  branch to 9
     ///   6: return
     ///   7: nop          (alignment padding)
     ///   8: nop
-    ///   9: astore_0     в†ђ subroutine entry: store the merged returnAddress
-    ///  10: ret 0        в†ђ return via the stored address
+    ///   9: astore_0     ← subroutine entry: store the merged returnAddress
+    ///  10: ret 0        ← return via the stored address
     /// ```
     ///
     /// Without the fix this method would be rejected with
@@ -1732,7 +1732,7 @@ mod tests {
     /// F3 closer match to the real `clear()` shape: jsr inside a
     /// `try-finally` whose `catch` re-jsr's to the same subroutine.
     /// The exception table makes offset 15 (`astore_1`) reachable from
-    /// the protected range as a handler entry вЂ” this mirrors the
+    /// the protected range as a handler entry — this mirrors the
     /// `Exception table: 0 12 15 any; 15 19 15 any` layout from the
     /// ByteBuddy class file.
     ///
@@ -1740,7 +1740,7 @@ mod tests {
     /// ```text
     ///   0: aconst_null  (placeholder for the parent.clear() effect)
     ///   1: pop
-    ///   2: jsr +19      в†’ push returnAddress(5),  branch to 21
+    ///   2: jsr +19      → push returnAddress(5),  branch to 21
     ///   5: goto 28
     ///   8: nop padding
     ///   9: nop
@@ -1749,11 +1749,11 @@ mod tests {
     ///  12: nop
     ///  13: nop
     ///  14: nop
-    ///  15: astore_1     в†ђ handler entry: store the throwable
-    ///  16: jsr +5       в†’ push returnAddress(19),  branch to 21
+    ///  15: astore_1     ← handler entry: store the throwable
+    ///  16: jsr +5       → push returnAddress(19),  branch to 21
     ///  19: aload_1
     ///  20: athrow
-    ///  21: astore_2     в†ђ subroutine entry
+    ///  21: astore_2     ← subroutine entry
     ///  22: aload_0      (filler)
     ///  23: pop
     ///  24: nop
@@ -1771,13 +1771,13 @@ mod tests {
         let code: Vec<u8> = vec![
             0x01,             // 0: aconst_null
             0x57,             // 1: pop
-            0xa8, 0x00, 0x13, // 2: jsr +19  в†’ 21
-            0xa7, 0x00, 0x17, // 5: goto +23 в†’ 28
+            0xa8, 0x00, 0x13, // 2: jsr +19  → 21
+            0xa7, 0x00, 0x17, // 5: goto +23 → 28
             0x00, 0x00, 0x00, // 8..10: nop
             0x00, 0x00, 0x00, // 11..13: nop
             0x00,             // 14: nop
             0x4c,             // 15: astore_1
-            0xa8, 0x00, 0x05, // 16: jsr +5 в†’ 21
+            0xa8, 0x00, 0x05, // 16: jsr +5 → 21
             0x2b,             // 19: aload_1
             0xbf,             // 20: athrow
             0x4d,             // 21: astore_2
@@ -1838,7 +1838,7 @@ mod tests {
 
     /// Sanity: a class whose pre-Java-7 method does NOT use jsr/ret
     /// continues to be type-state-verified. Here the method has a stack
-    /// underflow (`ireturn` on an empty stack) вЂ” the standard verifier
+    /// underflow (`ireturn` on an empty stack) — the standard verifier
     /// must catch it because we never enter the JSR-relaxation branch.
     #[test]
     fn non_jsr_pre_java7_method_still_strictly_verified() {
@@ -1865,7 +1865,7 @@ mod tests {
     /// tolerated, then the non-JSR failure must be re-detected.
     ///
     /// Without per-method iteration, the whole-class verifier surfaces
-    /// only the first error (the JSR one) вЂ” we tolerate it and never
+    /// only the first error (the JSR one) — we tolerate it and never
     /// see the non-JSR one. The retry loop in `verify_class_bytecode`
     /// must re-run after tolerating the JSR method to surface the
     /// non-JSR problem.
@@ -1923,7 +1923,7 @@ mod tests {
             1,
             1,
             vec![
-                0xa8, 0x00, 0x06, // 0: jsr +6 в†’ 6
+                0xa8, 0x00, 0x06, // 0: jsr +6 → 6
                 0xb1,             // 3: return
                 0x00, 0x00,       // 4..5: pad
                 0x4b,             // 6: astore_0
@@ -1932,7 +1932,7 @@ mod tests {
             vec![],
         );
         // Append a non-JSR method with a type-state error (ireturn on
-        // empty stack вЂ” passes structural check but fails type-state).
+        // empty stack — passes structural check but fails type-state).
         class.methods.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("typeStateBug"),
@@ -1966,7 +1966,7 @@ mod tests {
             1,
             1,
             vec![
-                0xa8, 0x00, 0x06, // 0: jsr +6 в†’ 6
+                0xa8, 0x00, 0x06, // 0: jsr +6 → 6
                 0xb1,             // 3: return
                 0x00, 0x00,       // 4..5: pad
                 0x4b,             // 6: astore_0
@@ -1975,7 +1975,7 @@ mod tests {
             vec![],
         );
         // Add a second method that does NOT use jsr/ret but is
-        // structurally malformed (truncated `getstatic` вЂ” opcode 0xb2
+        // structurally malformed (truncated `getstatic` — opcode 0xb2
         // wants 2 operand bytes; we only supply 1).
         class.methods.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -2015,12 +2015,12 @@ mod tests {
         //   4..7: default = 16
         //   8..11: low = 0
         //  12..15: high = 0
-        //  16..19: offset[0] = 12  в†ђ the byte 0x0c, no 0xa8
+        //  16..19: offset[0] = 12  ← the byte 0x0c, no 0xa8
         //  20: ireturn (0xac)
         let mut code: Vec<u8> = Vec::new();
         code.push(0x03); // 0: iconst_0
         code.push(0xaa); // 1: tableswitch
-        // Pad so default starts at offset (1+1+pad) в‰Ў 0 mod 4 в†’ next offset must be 4
+        // Pad so default starts at offset (1+1+pad) ≡ 0 mod 4 → next offset must be 4
         // so we need 2 pad bytes after offset 1
         code.push(0x00);
         code.push(0x00);
@@ -2048,7 +2048,7 @@ mod tests {
                 attributes: vec![],
             }))],
         };
-        // Scanner-level assertion only вЂ” we don't care whether the full
+        // Scanner-level assertion only — we don't care whether the full
         // verifier accepts the synthetic switch.
         assert!(
             !method_uses_jsr_or_ret(&method),

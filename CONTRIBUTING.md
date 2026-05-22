@@ -25,16 +25,16 @@ By participating, you are expected to uphold this code.
 
 ### Before Submitting
 
-All of the following must pass — CI enforces each one:
+All of the following must pass — CI (`.github/workflows/ci.yml`) enforces each one:
 
-1. **Build** — `cargo build --all-targets`
-2. **Lint** — `cargo clippy --all-targets -- -D warnings` (zero warnings required)
+1. **Build** — `cargo build --workspace`
+2. **Lint** — `cargo clippy --workspace`
 3. **Format** — `cargo fmt --all --check`
-4. **Test** — `cargo test --all` (6,000+ tests must pass)
-5. **Coverage** — CI requires 65% line coverage minimum (`cargo llvm-cov`)
-6. **Security audit** — `cargo audit` (no known vulnerabilities)
+4. **Test** — `cargo test --workspace` (6,000+ tests must pass)
 
-On nightly Rust, CI also runs **Miri** (`cargo miri test --all`) to detect undefined behavior.
+CI runs these on `ubuntu-latest` and `windows-latest` for every push and pull
+request. Coverage gating and Miri are planned but not yet enabled (see the
+commented-out jobs in `ci.yml`).
 
 ### Code Style
 
@@ -59,6 +59,7 @@ On nightly Rust, CI also runs **Miri** (`cargo miri test --all`) to detect undef
 | `jit` | x86-64 / AArch64 JIT compiler |
 | `jit-cuda` | Java bytecode -> PTX lowering for GPU offload |
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
+| `craton-gpu` | GPU offload runtime integration |
 | `classloading` | Class loading & bytecode verification |
 | `gc` | Garbage collectors (semi-space, G1, ZGC) |
 | `jfr` | Java Flight Recorder |
@@ -103,7 +104,7 @@ When your PR adds a feature, fixes a bug, or changes behavior:
 
 ### Larger Projects
 
-- ARM64 JIT backend (`vm/src/jit/aarch64.rs`)
+- ARM64 JIT backend (`jit/src/aarch64.rs`)
 - Concurrent garbage collector
 - Full JNI implementation
 - Module system support

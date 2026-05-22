@@ -1,3 +1,10 @@
+//! Class and class-loader identity types.
+//!
+//! Defines [`ClassLoaderId`], which names the class loader (bootstrap,
+//! extension, application, or a user-defined loader) that forms half of a
+//! class's JVM-spec runtime identity — the pair (defining loader, fully
+//! qualified name).
+
 use std::fmt;
 
 /// Identifies which class loader loaded a class.

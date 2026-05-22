@@ -24,9 +24,9 @@ path = "src/main.rs"
 cratonvm-vm = { path = "../vm" }
 cratonvm-native-api = { path = "../native-api" }
 # Direct dep so vm-cli can install the pre-`std::process::exit` hook on
-# `native_system_exit` (see `lang_system::set_pre_exit_hook`) — used to
-# dump the dispatch_trace ring before silent System.exit calls so the
-# last Java method is visible in stderr for diagnosis.
+# `native_system_exit` via `lang_system::set_pre_exit_hook` (installed at the
+# top of `run()`) — dumps the dispatch_trace ring before silent System.exit
+# calls so the last Java method is visible in stderr for diagnosis.
 cratonvm-native-builtins = { path = "../native-builtins" }
 tracing.workspace = true
 tracing-subscriber.workspace = true

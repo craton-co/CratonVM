@@ -1,3 +1,10 @@
+//! VM error types and the two-layer exception model.
+//!
+//! Defines [`MethodCallFailed`] — the result of a failed Java method call,
+//! split into non-catchable internal VM errors and catchable Java exceptions —
+//! along with the [`VmError`] hierarchy ([`ClassFileError`], [`LinkageError`],
+//! [`RuntimeError`]) and the [`MethodCallResult`] alias used throughout the VM.
+
 use std::fmt;
 
 use thiserror::Error;
@@ -36,7 +43,14 @@ pub enum MethodCallFailed {
 impl fmt::Display for MethodCallFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MethodCallFailed::InternalError(err) => write!(f, "internal error: {err}"),
+            // `VmError` is already a self-describing error: every variant's
+            // `Display` carries its own category prefix ("class file error: ",
+            // "linkage error: ", "runtime error: ", "internal error: ").
+            // Prepending another "internal error: " here doubled the prefix
+            // for `VmError::Internal` (yielding "internal error: internal
+            // error: ...") and mislabeled the other variants. Delegate to the
+            // inner error's `Display` so the category appears exactly once.
+            MethodCallFailed::InternalError(err) => write!(f, "{err}"),
             MethodCallFailed::ExceptionThrown(obj_ref) => {
                 write!(f, "exception thrown: ref({:p})", obj_ref.as_ptr())
             }
@@ -677,7 +691,10 @@ mod tests {
         let err = MethodCallFailed::InternalError(VmError::Internal {
             message: "oops".into(),
         });
-        assert_eq!(format!("{err}"), "internal error: internal error: oops");
+        // `MethodCallFailed::InternalError` delegates to the inner `VmError`'s
+        // `Display`, which already supplies the "internal error: " prefix —
+        // so the prefix must appear exactly once, not twice.
+        assert_eq!(format!("{err}"), "internal error: oops");
     }
 
     #[test]

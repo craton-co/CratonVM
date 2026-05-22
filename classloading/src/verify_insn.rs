@@ -27,6 +27,12 @@ pub struct InsnVerifyResult {
 ///
 /// Modifies `frame` in place to reflect the instruction's stack/local effects.
 /// Returns branch targets and whether control falls through.
+///
+/// `method_descriptor` is the descriptor of the method being verified (e.g.
+/// `"(I)Ljava/lang/String;"`). It is required so that `areturn` can check the
+/// returned reference is assignable to the method's declared return type
+/// (JVMS §4.10.1.6 / §6.5 areturn) — without it the verifier would accept any
+/// reference for `areturn`, a soundness hole.
 pub fn verify_instruction(
     insn: &Instruction,
     pc: usize,
@@ -34,6 +40,7 @@ pub fn verify_instruction(
     cp: &ConstantPool,
     _class_name: &str,
     _method_name: &str,
+    method_descriptor: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Result<InsnVerifyResult, LinkageError> {
     let current_class_name = _class_name;
@@ -799,7 +806,37 @@ pub fn verify_instruction(
         }
 
         Instruction::Areturn => {
-            pop_reference(frame, hierarchy)?;
+            // JVMS §4.10.1.6 / §6.5 areturn: the value popped must be a
+            // reference that is assignable to the method's declared
+            // return type. Popping any reference unchecked would let a
+            // method declared to return type `T` actually return an
+            // unrelated reference, breaking type safety for every caller.
+            let value = pop_reference(frame, hierarchy)?;
+            match return_type_from_descriptor(method_descriptor) {
+                Some(declared @ (VType::ObjectRef(_) | VType::ArrayRef(_))) => {
+                    if !value.is_assignable_to(&declared, hierarchy) {
+                        return Err(verify_err(&format!(
+                            "areturn: returned value {value:?} is not assignable to \
+                             the method's declared return type {declared:?}"
+                        )));
+                    }
+                }
+                // Declared return type is a primitive (Int/Long/Float/
+                // Double) — `areturn` is the wrong return instruction.
+                Some(other) => {
+                    return Err(verify_err(&format!(
+                        "areturn: method's declared return type {other:?} is not a \
+                         reference type"
+                    )));
+                }
+                // `None` means the method is declared `void` — `areturn`
+                // must not be used to return from a void method.
+                None => {
+                    return Err(verify_err(
+                        "areturn: method is declared void; cannot return a value",
+                    ));
+                }
+            }
             ok_no_fallthrough()
         }
 
@@ -1039,8 +1076,25 @@ pub fn verify_instruction(
         }
 
         Instruction::Athrow => {
-            // Pop the throwable reference
-            pop_reference(frame, hierarchy)?;
+            // JVMS §4.10.1.6 / §6.5 athrow: the operand must be a
+            // reference assignable to `java/lang/Throwable`. Throwing an
+            // arbitrary non-Throwable reference is a type-safety
+            // violation — the exception-dispatch machinery assumes a
+            // Throwable shape.
+            let value = pop_reference(frame, hierarchy)?;
+            let throwable = VType::ObjectRef(Arc::from("java/lang/Throwable"));
+            // `Null` athrow is legal bytecode: it raises a
+            // NullPointerException at runtime, which is the spec'd
+            // outcome — accept it. `UninitializedThis` / `Uninitialized`
+            // are rejected by the assignability check below (an
+            // uninitialized object is not assignable to Throwable).
+            let ok = matches!(value, VType::Null)
+                || value.is_assignable_to(&throwable, hierarchy);
+            if !ok {
+                return Err(verify_err(&format!(
+                    "athrow: operand {value:?} is not assignable to java/lang/Throwable"
+                )));
+            }
             ok_no_fallthrough()
         }
 
@@ -1548,7 +1602,19 @@ mod tests {
 
     impl ClassHierarchy for MockHierarchy {
         fn is_subclass(&self, child: &str, parent: &str) -> bool {
-            child == parent || parent == "java/lang/Object"
+            if child == parent || parent == "java/lang/Object" {
+                return true;
+            }
+            // Model the JDK exception hierarchy so the `athrow` operand
+            // check (operand must be assignable to java/lang/Throwable)
+            // can be exercised by the tests.
+            matches!(
+                (child, parent),
+                ("java/lang/Exception", "java/lang/Throwable")
+                    | ("java/lang/RuntimeException", "java/lang/Throwable")
+                    | ("java/lang/RuntimeException", "java/lang/Exception")
+                    | ("java/lang/Error", "java/lang/Throwable")
+            )
         }
         fn common_superclass(&self, _a: &str, _b: &str) -> String {
             "java/lang/Object".to_string()
@@ -1610,6 +1676,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1629,7 +1696,7 @@ mod tests {
         frame.push(VType::Int).unwrap();
         frame.push(VType::Int).unwrap();
 
-        verify_instruction(&Instruction::Iadd, 0, &mut frame, &cp, "Test", "test", &h).unwrap();
+        verify_instruction(&Instruction::Iadd, 0, &mut frame, &cp, "Test", "test", "()V", &h).unwrap();
 
         assert_eq!(frame.stack_depth(), 1);
         assert_eq!(frame.pop().unwrap(), VType::Int);
@@ -1645,7 +1712,7 @@ mod tests {
         frame.push(VType::Int).unwrap();
 
         // Second pop expects Int but finds Float
-        let result = verify_instruction(&Instruction::Iadd, 0, &mut frame, &cp, "Test", "test", &h);
+        let result = verify_instruction(&Instruction::Iadd, 0, &mut frame, &cp, "Test", "test", "()V", &h);
         assert!(result.is_err());
     }
 
@@ -1655,7 +1722,7 @@ mod tests {
         let h = MockHierarchy;
         let mut frame = make_frame(1, 4);
 
-        verify_instruction(&Instruction::Ldc(1), 0, &mut frame, &cp, "Test", "test", &h).unwrap();
+        verify_instruction(&Instruction::Ldc(1), 0, &mut frame, &cp, "Test", "test", "()V", &h).unwrap();
 
         assert_eq!(frame.pop().unwrap(), VType::Int);
     }
@@ -1673,6 +1740,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1697,6 +1765,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1717,6 +1786,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1739,6 +1809,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1755,7 +1826,7 @@ mod tests {
         let mut frame = make_frame(1, 4);
 
         let result =
-            verify_instruction(&Instruction::Return, 0, &mut frame, &cp, "Test", "test", &h)
+            verify_instruction(&Instruction::Return, 0, &mut frame, &cp, "Test", "test", "()V", &h)
                 .unwrap();
 
         assert!(!result.falls_through);
@@ -1775,6 +1846,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1795,6 +1867,7 @@ mod tests {
             &cp,
             "Test",
             "test",
+            "()V",
             &h,
         )
         .unwrap();
@@ -1809,7 +1882,7 @@ mod tests {
         let mut frame = make_frame(1, 4);
         frame.push(VType::Int).unwrap();
 
-        verify_instruction(&Instruction::Dup, 0, &mut frame, &cp, "Test", "test", &h).unwrap();
+        verify_instruction(&Instruction::Dup, 0, &mut frame, &cp, "Test", "test", "()V", &h).unwrap();
 
         assert_eq!(frame.stack_depth(), 2);
     }
@@ -1824,9 +1897,102 @@ mod tests {
             .unwrap();
 
         let result =
-            verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", &h)
+            verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", "()V", &h)
                 .unwrap();
 
         assert!(!result.falls_through);
+    }
+
+    // --- RVERIF.3 soundness regressions -----------------------------------
+
+    #[test]
+    fn athrow_rejects_non_throwable() {
+        // A reference that is not assignable to java/lang/Throwable must
+        // be rejected by athrow (JVMS §6.5 athrow).
+        let cp = simple_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame
+            .push(VType::ObjectRef(Arc::from("java/lang/String")))
+            .unwrap();
+
+        let result =
+            verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", "()V", &h);
+        assert!(result.is_err(), "athrow of a non-Throwable must fail");
+    }
+
+    #[test]
+    fn athrow_accepts_null() {
+        // `athrow null` is legal bytecode (raises NPE at runtime).
+        let cp = simple_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+
+        verify_instruction(&Instruction::Athrow, 0, &mut frame, &cp, "Test", "test", "()V", &h)
+            .unwrap();
+    }
+
+    #[test]
+    fn areturn_rejects_unassignable_return() {
+        // Method declared to return java/lang/String must reject an
+        // areturn of an unrelated reference type (JVMS §6.5 areturn).
+        let cp = simple_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame
+            .push(VType::ObjectRef(Arc::from("java/lang/Thread")))
+            .unwrap();
+
+        let result = verify_instruction(
+            &Instruction::Areturn,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()Ljava/lang/String;",
+            &h,
+        );
+        assert!(
+            result.is_err(),
+            "areturn of a type not assignable to the declared return type must fail"
+        );
+    }
+
+    #[test]
+    fn areturn_accepts_assignable_return() {
+        // Returning the declared type itself succeeds.
+        let cp = simple_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame
+            .push(VType::ObjectRef(Arc::from("java/lang/String")))
+            .unwrap();
+
+        verify_instruction(
+            &Instruction::Areturn,
+            0,
+            &mut frame,
+            &cp,
+            "Test",
+            "test",
+            "()Ljava/lang/String;",
+            &h,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn areturn_rejects_void_method() {
+        // areturn must not appear in a method declared void.
+        let cp = simple_cp();
+        let h = MockHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame.push(VType::Null).unwrap();
+
+        let result =
+            verify_instruction(&Instruction::Areturn, 0, &mut frame, &cp, "Test", "test", "()V", &h);
+        assert!(result.is_err(), "areturn in a void method must fail");
     }
 }

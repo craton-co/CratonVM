@@ -2602,11 +2602,39 @@ impl GenerationalHeap {
         promoted_worklist: &mut Vec<*mut u8>,
     ) -> *mut u8 {
         // SAFETY: `old_ptr` points to a live young-gen object; its header is
-        // valid. Read an owned *copy* of the header rather than holding a
+        // valid. Build an owned *copy* of the header rather than holding a
         // shared `&ObjectHeader`: later in this function we install the
         // forwarding pointer through a `&mut`/raw write to the same address,
         // and a live `&` aliasing that write would be undefined behavior.
-        let header: ObjectHeader = unsafe { std::ptr::read(old_ptr as *const ObjectHeader) };
+        //
+        // ATOMIC-UB fix: do NOT `std::ptr::read` the whole `ObjectHeader` by
+        // value. `ObjectHeader` embeds `mark_word: AtomicU64`; a `ptr::read`
+        // of a struct containing an atomic performs a *non-atomic* read of an
+        // atomic location, which is undefined behavior. Instead read each
+        // scalar field individually through field-projected raw pointers, and
+        // read `mark_word` via an explicit `AtomicU64::load`, then reconstruct
+        // an owned header from those values.
+        let header: ObjectHeader = unsafe {
+            let h = old_ptr as *const ObjectHeader;
+            let mut owned = ObjectHeader::new(
+                std::ptr::addr_of!((*h).class_id).read(),
+                std::ptr::addr_of!((*h).kind).read(),
+                std::ptr::addr_of!((*h).element_type).read(),
+                std::ptr::addr_of!((*h).identity_hash_code).read(),
+                std::ptr::addr_of!((*h).array_length).read(),
+                std::ptr::addr_of!((*h).num_slots).read(),
+            );
+            owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
+            owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
+            owned.forwarding_ptr = std::ptr::addr_of!((*h).forwarding_ptr).read();
+            // `mark_word` is an `AtomicU64`: read it through an atomic load so
+            // the access is well-defined under the memory model.
+            owned.mark_word.store(
+                (*h).mark_word.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            owned
+        };
         let header = &header;
 
         // KC16 SIGSEGV audit: sanity-check header before using it. A corrupted
@@ -2707,17 +2735,27 @@ impl GenerationalHeap {
                     match young_to.alloc(total_size, 8) {
                         Some(ptr) => ptr,
                         None => {
-                            // Both old gen and to-space are full — keep the object in from-space.
-                            // This is a best-effort: the object won't be moved but remains reachable.
-                            // A proper OOM should be raised at the next allocation attempt.
-                            tracing::error!(
-                                "GC: both old gen and young to-space out of memory during promotion \
-                                 (tried {} bytes, to-space {}/{})",
+                            // UAF fix: both old gen and to-space are full.
+                            // Previously this returned `old_ptr`, leaving the
+                            // object in from-space. But the caller resets
+                            // young_from immediately after this collection,
+                            // wiping that memory — every still-live reference
+                            // to `old_ptr` would then dangle (use-after-free).
+                            // A copying collector cannot safely "skip" an
+                            // object: there is no valid address to hand back.
+                            // This is an unrecoverable OOM; abort hard, the
+                            // same way `alloc_young` handles young-gen
+                            // exhaustion.
+                            eprintln!(
+                                "FATAL: OutOfMemoryError: GC could not relocate a live object — \
+                                 both old gen and young to-space are full during promotion \
+                                 (tried {} bytes, to-space {}/{} used). Cannot leave the object \
+                                 unmoved without dangling references after from-space reset.",
                                 total_size,
                                 young_to.used(),
                                 young_to.capacity(),
                             );
-                            return old_ptr; // Leave object unmoved
+                            std::process::abort();
                         }
                     }
                 }
@@ -2727,13 +2765,24 @@ impl GenerationalHeap {
             match young_to.alloc(total_size, 8) {
                 Some(ptr) => ptr,
                 None => {
-                    tracing::error!(
-                        "GC: young to-space out of memory: tried {} bytes, to-space has {}/{} used",
+                    // UAF fix: young to-space is full. Previously this
+                    // returned `old_ptr`, leaving the object in from-space —
+                    // but the caller resets young_from right after this
+                    // collection, so every live reference to `old_ptr` would
+                    // dangle (use-after-free). A copying collector has no
+                    // valid address to return for an un-relocated object.
+                    // This is an unrecoverable OOM; abort hard, consistent
+                    // with `alloc_young`'s handling of young-gen exhaustion.
+                    eprintln!(
+                        "FATAL: OutOfMemoryError: GC could not relocate a live object — \
+                         young to-space is full (tried {} bytes, to-space has {}/{} used). \
+                         Cannot leave the object unmoved without dangling references after \
+                         from-space reset.",
                         total_size,
                         young_to.used(),
                         young_to.capacity(),
                     );
-                    return old_ptr; // Leave object unmoved
+                    std::process::abort();
                 }
             }
         };

@@ -1,51 +1,24 @@
 //! Neo4j Community Edition boot-test shims.
 //!
-//! `org.neo4j.server.CommunityEntryPoint.main` throws
-//! `org/neo4j/server/ServerStartupException: Argument --home-dir is required`
-//! because the CLI argument parsing demands a real install layout we don't
-//! provide. We short-circuit `main` and the `<clinit>` so the JVM exits rc=0
-//! for the boot smoke test. `NeoBootstrapper` is registered defensively for
-//! older / alternate entry paths.
+//! **HISTORY**: Previously this module short-circuited Neo4j's entry
+//! points (`org/neo4j/server/CommunityEntryPoint`,
+//! `org/neo4j/server/startup/NeoBootstrapper`) with a fake no-op
+//! `main([Ljava/lang/String;)V` plus a fake no-op `<clinit>`, so the
+//! JVM exited rc=0 without running Neo4j's real server bootstrap
+//! bytecode.
+//!
+//! **CURRENT STATE (real-bytecode audit)**: every short-circuit
+//! registration has been REMOVED per the "no synthetic stubs" policy.
+//! Real Neo4j bytecode now runs. This file is kept so the call site in
+//! `lib.rs::register_essential_natives` continues to compile.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
 
-fn neo4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[neo4j-shim] entry short-circuited (boot-test mode)");
-    Ok(None)
+/// Audit cleanup: no longer registers any natives. Previously short-
+/// circuited the Neo4j `main` / `<clinit>` entry points.
+pub fn register_neo4j_stubs(_registry: &mut NativeMethodRegistry) {
+    // Intentionally empty. Real Neo4j CommunityEntryPoint bytecode runs.
 }
-
-pub fn register_neo4j_stubs(registry: &mut NativeMethodRegistry) {
-    if std::env::var("CRATONVM_NEO4J_REAL").as_deref() == Ok("1") {
-        return;
-    }
-    // Primary boot entry (Neo4j 4.x / 5.x community).
-    registry.register(
-        "org/neo4j/server/CommunityEntryPoint",
-        "main",
-        "([Ljava/lang/String;)V",
-        neo4j_noop,
-    );
-    // Static init may parse system properties / load config schemas.
-    registry.register(
-        "org/neo4j/server/CommunityEntryPoint",
-        "<clinit>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
-    // Defensive: older / alternate entry path used by some distributions.
-    registry.register(
-        "org/neo4j/server/startup/NeoBootstrapper",
-        "main",
-        "([Ljava/lang/String;)V",
-        neo4j_noop,
-    );
-}
-
-// TODO(orchestrator): wire `neo4j_extras::register_neo4j_stubs(registry);`
-// into `register_essential_natives` in lib.rs alongside other real-JDK app
-// shims (e.g., `register_jboss_extras`, `register_es_stubs`).
 
 #[cfg(test)]
 mod tests {

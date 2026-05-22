@@ -1,4 +1,4 @@
-//! The VM orchestrator РІР‚вЂќ ties together all VM subsystems.
+//! The VM orchestrator — ties together all VM subsystems.
 //!
 //! The architecture separates shared (thread-safe) state from per-thread state:
 //!

@@ -105,9 +105,18 @@ fn main() {
         }
     }
 
+    // Re-run when any individual `.java` source changes. The directory
+    // `rerun-if-changed` above is not enough: on many platforms a
+    // directory's mtime does not change when a file *inside* it is
+    // edited, so per-file lines are required to catch edits to
+    // existing annotation sources.
+    for src in &sources {
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
+
     if sources.is_empty() {
         println!(
-            "cargo:warning=javac not found; craton-gpu annotations will not be compiled"
+            "cargo:warning=craton-gpu: no .java source files found; annotations will not be compiled"
         );
         emit_env("", &classes_dir);
         return;

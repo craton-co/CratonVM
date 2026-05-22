@@ -1,5 +1,16 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+
+// Round-7 cross-cutting Fix 2: install mimalloc as the process-wide global
+// allocator. Gated on the `mimalloc` feature (enabled by default) so musl /
+// exotic targets can `--no-default-features` back to the system allocator.
+// Without this `#[global_allocator]` declaration the `mimalloc` dependency
+// would be linked but never actually used, so the documented speedup on the
+// VM's tiny-object workload (Value, ObjectRef, frame locals, Strings) would
+// never take effect.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use cratonvm_vm::error::MethodCallFailed;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::{
@@ -647,6 +658,24 @@ fn run() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Install the pre-`std::process::exit` hook on `native_system_exit` /
+    // `native_runtime_exit`. A silent `System.exit(N)` during real app boot
+    // (e.g. Cassandra NodeTool's airline NPE catch path) otherwise tears the
+    // process down before any downstream observer can print state. The hook
+    // fires immediately before the process exits; when `CRATONVM_DBG_EXIT=1`
+    // is set it dumps the dispatch-trace ring so the last Java method run
+    // before the exit is visible in stderr for diagnosis. First-installer
+    // wins (OnceLock), so installing it once here at the top of `run()` is
+    // sufficient.
+    cratonvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
+        if std::env::var("CRATONVM_DBG_EXIT").ok().as_deref() == Some("1") {
+            eprintln!(
+                "=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ==="
+            );
+            cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
+        }
+    });
 
     // `java`-launcher positional semantics: insert a `--` separator right
     // after the program selector (`-jar <jar>` or the first bare main-class

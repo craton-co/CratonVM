@@ -584,15 +584,6 @@ fn write_header<W: Write>(
 /// the dump is best-effort. The OS will still flush dirty pages on its
 /// own schedule.
 ///
-/// TODO (round-7 CRIT #1, scope: `repository.rs:544-559`):
-///   `SpscEventRing::drop` asserts `consumer_busy == false`. If the owning
-///   `ThreadRingRegistry` is dropped while another thread is mid-drain
-///   (i.e. inside the drainer critical section), the assertion fires and
-///   aborts. Real hazard on VM shutdown when a dump races shutdown. Fix
-///   belongs in `repository.rs` `Drop` impl — either wait for `consumer_busy`
-///   to clear with a short spin-then-park, or downgrade the assertion to
-///   a `debug_assert!` and log a warning at release.
-///
 /// TODO (round-7 MED #6, dump format change):
 ///   Per-event timestamps are written as full 64-bit `start_time_ns` /
 ///   `end_time_ns` values. Within a single chunk, ticks are highly

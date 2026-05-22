@@ -2,7 +2,7 @@
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -84,10 +84,7 @@ impl EventRepository {
                         indices.pop_front();
                     } else if let Some(pos) = indices.iter().position(|&i| i == target) {
                         // Fallback path — preserves correctness if the
-                        // monotonic invariant is ever broken. Logged as a
-                        // TODO so the slow path can be removed once the
-                        // invariant is verified in property tests.
-                        // TODO(round-4-wave-3): assert this path is dead.
+                        // monotonic invariant is ever broken.
                         indices.remove(pos);
                     }
                     indices.is_empty()
@@ -380,6 +377,18 @@ pub struct SpscEventRing {
     /// the events for the holder of the gate to drain. Round-5 CRIT-fix
     /// (2026-05-17) for the multi-consumer UB hazard.
     consumer_busy: AtomicBool,
+    /// Count of events discarded by the drop-newest overflow policy.
+    ///
+    /// Bug 2 fix (silent event loss): a full ring previously dropped the
+    /// incoming event with no record, so a JFR consumer had no way to tell
+    /// the recording was incomplete. Every `push` that hits the full-ring
+    /// path increments this counter; read it via `dropped_events()` (and
+    /// `total_dropped_events()` for the process-wide sum across all shards).
+    ///
+    /// Incremented by the (unique) producer with a Relaxed RMW — it is a
+    /// pure diagnostic statistic and needs no ordering relative to the slot
+    /// stores.
+    dropped: AtomicU64,
 }
 
 // SAFETY: `SpscEventRing` enforces the SPSC discipline at runtime:
@@ -418,6 +427,7 @@ impl SpscEventRing {
             mask: capacity - 1,
             cached_tail: UnsafeCell::new(0),
             consumer_busy: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -425,6 +435,15 @@ impl SpscEventRing {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.mask + 1
+    }
+
+    /// Number of events this ring has discarded under the drop-newest
+    /// overflow policy since creation. Non-zero means this thread's JFR
+    /// event stream is incomplete — a consumer can surface this as a
+    /// "dropped events" diagnostic.
+    #[inline]
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Producer-side push. Returns `Err(ev)` if the ring is full (drop-newest
@@ -472,6 +491,12 @@ impl SpscEventRing {
         // this equals capacity (every slot occupied). `wrapping_sub` keeps
         // the arithmetic correct across `usize` rollover.
         if head.wrapping_sub(tail) >= capacity {
+            // Drop-newest overflow: the ring is full, so this event is
+            // discarded. Bug 2 fix (silent event loss): record the drop so
+            // a JFR consumer can tell the stream is incomplete. Relaxed is
+            // sufficient — this is a diagnostic counter, not a sync point,
+            // and the producer is its only writer.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             return Err(ev);
         }
         let idx = head & self.mask;
@@ -641,36 +666,56 @@ impl Drop for SpscEventRing {
             } else {
                 eprintln!(
                     "WARN: SpscEventRing dropped with consumer still active \
-                     after exhaustive backoff; proceeding with teardown to \
-                     avoid leaking buffered events"
+                     after exhaustive backoff; leaking buffered events to \
+                     avoid a double-drop UB with the wedged consumer"
                 );
                 consumer_wedged = true;
                 break;
             }
             spins += 1;
         }
-        // Bug fix (medium-sev): always drain and drop every initialised but
-        // unconsumed slot, even on a wedged/never-draining consumer.
-        // Previously the "give up" branch returned early, leaking every
-        // buffered `EventInstance` (and its `Arc<str>`s).
+        // SOUNDNESS (Bug 1 — drop UB): only drain-and-drop the buffered
+        // slots when we are *certain* no consumer can still be touching the
+        // slot array. The backoff loop above clears `consumer_busy` to false
+        // before falling through in the normal case; `consumer_wedged` is
+        // set only when we gave up while `consumer_busy` was still observed
+        // true.
         //
-        // Slots in [tail, head) are initialised and not yet consumed (see
-        // `try_pop` / `drain_into`: the consumer advances `tail` only after
-        // `assume_init_read`). `&mut self` guarantees no further producer
-        // entrance; if `consumer_wedged` is true a consumer may still hold
-        // the gate, but it can only be parked between its CAS-acquire and
-        // its Release store, having read at most slot `tail` — and since we
-        // both drop each slot exactly once over [tail, head) there is no
-        // double-drop. (A wedged consumer at shutdown is already UB-prone;
-        // draining here is strictly better than leaking, and matches the
-        // accepted shutdown trade-off.)
-        let _ = consumer_wedged;
+        // If `consumer_wedged` is true a drainer may be parked *inside* its
+        // `try_pop` critical section — between its CAS-acquire of
+        // `consumer_busy` and the matching Release store. Such a consumer
+        // can still `assume_init_read` slot `tail` once it resumes. If we
+        // also `assume_init_drop` slot `tail` here, that slot is read/dropped
+        // twice: a genuine double-read / double-drop (use-after-free of the
+        // `Arc<str>`s inside the `EventInstance`). There is no synchronization
+        // we can add from the `Drop` side to close that window, because the
+        // wedged consumer holds the only thing we could wait on.
+        //
+        // Sound resolution: if a consumer could still be active, SKIP
+        // dropping the buffered slots entirely and let them leak. The slot
+        // storage is tiny (<= capacity * sizeof(EventInstance)) and this only
+        // happens at shutdown on an already-pathological wedged-consumer
+        // path. A bounded leak at shutdown is acceptable; UB is not.
+        if consumer_wedged {
+            // Defensive double-check: even if `consumer_wedged` were somehow
+            // stale, a non-false `consumer_busy` means a consumer is active.
+            // Either way, leak the buffered slots rather than risk UB.
+            return;
+        }
+        // Normal path: `consumer_busy` was observed false (the loop exited
+        // without setting `consumer_wedged`), and `&mut self` guarantees no
+        // producer can enter. No consumer can be mid-`try_pop`: a consumer
+        // would have had to CAS `consumer_busy` to true, which we just saw
+        // as false, and it cannot re-enter while we hold `&mut self`. So we
+        // are the unique accessor of the slot array and can drop each
+        // initialised slot in [tail, head) exactly once.
         let head = *self.head.get_mut();
         let mut tail = *self.tail.get_mut();
         while tail != head {
             let idx = tail & self.mask;
             // SAFETY: slots in [tail, head) are initialised and have not
-            // been consumed, so each is dropped exactly once here.
+            // been consumed, and (per the check above) no consumer can be
+            // racing us, so each is dropped exactly once here.
             unsafe {
                 (*self.slots[idx].get()).assume_init_drop();
             }
@@ -806,6 +851,25 @@ impl ThreadRingRegistry {
         self.rings.read().len()
     }
 
+    /// Process-wide count of events discarded by the drop-newest overflow
+    /// policy, summed across every registered thread shard.
+    ///
+    /// Bug 2 fix (silent event loss): a non-zero result means at least one
+    /// thread's per-thread ring filled up and discarded events, so the JFR
+    /// recording is incomplete. A dumper or operator can surface this as a
+    /// "N events dropped" diagnostic instead of silently losing data.
+    ///
+    /// Takes the registry read lock to snapshot the shard list (concurrent
+    /// drains and counts proceed in parallel); the per-shard loads are
+    /// Relaxed atomics.
+    pub fn total_dropped_events(&self) -> u64 {
+        self.rings
+            .read()
+            .iter()
+            .map(|ring| ring.dropped_events())
+            .sum()
+    }
+
     /// Bounded capacity used when registering new thread shards. (Note: the
     /// actual `SpscEventRing` capacity is rounded up to the next power of
     /// two; this value is the *requested* capacity.)
@@ -847,15 +911,19 @@ pub fn global_ring_registry() -> &'static ThreadRingRegistry {
 ///   - 1 global-registry mutex lock to publish the new shard
 ///
 /// Overflow policy: drop-newest. If the ring is full when `push` is called,
-/// the event is silently discarded. JFR documents this as best-effort.
+/// the event is discarded. JFR documents this as best-effort. The drop is
+/// *not* silent: `SpscEventRing::push` increments a per-shard dropped-event
+/// counter, readable via `SpscEventRing::dropped_events` or the process-wide
+/// `ThreadRingRegistry::total_dropped_events`.
 pub fn push_to_thread_ring(ev: EventInstance) {
     // Fast path: borrow the thread-local shard reference in place and push
     // by value. The closure returns the event back if there is no shard yet
     // so we can install one on the slow path.
     let leftover = THREAD_REGISTERED_RING.with(|cell| {
         if let Some(ring) = cell.borrow().as_ref() {
-            // Push may fail (full); drop the event on the floor in that
-            // case — drop-newest is the documented overflow policy.
+            // Push may fail (full); on overflow the event is dropped
+            // (drop-newest) and `push` bumps the shard's dropped counter so
+            // the loss is observable rather than silent.
             let _ = ring.push(ev);
             None
         } else {

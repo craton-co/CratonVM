@@ -1,3 +1,11 @@
+//! Core JVM runtime value representation.
+//!
+//! Defines [`Value`] — the enum for any value that can live in a local
+//! variable or on the operand stack (the JVM computational types) — and
+//! [`ObjectRef`], the opaque, niche-optimized reference to a heap-allocated
+//! Java object. The `Value` layout is size/alignment-asserted to stay
+//! compatible with the JIT slot layout.
+
 use std::fmt;
 use std::ptr::NonNull;
 
@@ -173,6 +181,26 @@ impl ObjectRef {
 //    Send+Sync bounds trivially sound. When true OS-thread parallelism is
 //    added (threading/jvm_thread.rs), the monitor protocol in (2) provides
 //    the necessary synchronization.
+//
+// !!! KNOWN LATENT RISK — RE-AUDIT BEFORE ENABLING MULTI-THREADED EXECUTION !!!
+//
+// Points (1)-(3) describe protocols that are NOT yet enforced under real
+// preemptive parallelism — today they hold only *because* point (4) keeps
+// every Java thread on one OS thread with cooperative yields. In other words,
+// these `unsafe impl`s are currently sound by accident of the single-threaded
+// scheduler, not by a self-contained argument. `ObjectRef` is a bare,
+// non-atomic, GC-unmanaged raw pointer with no lifetime tracking; once
+// `threading/jvm_thread.rs` spawns Java threads on multiple OS threads, the
+// `Send`/`Sync` claim must be re-derived from first principles. In particular
+// the following must be verified to actually hold concurrently:
+//   - GC roots are scanned at safepoints across ALL OS threads (no thread can
+//     hide an `ObjectRef` from the collector);
+//   - every field access genuinely routes through the monitor/atomic helpers
+//     in (2) — no raw pointer dereference escapes that protocol;
+//   - relocation during compaction is observed atomically by every thread.
+// If any of those cannot be guaranteed, this `unsafe impl` becomes unsound and
+// must be replaced (e.g. with a handle indirection or an explicit `!Send`
+// marker plus per-thread transfer barriers). Do NOT silently rely on it.
 unsafe impl Send for ObjectRef {}
 unsafe impl Sync for ObjectRef {}
 

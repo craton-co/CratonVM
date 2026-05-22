@@ -76,43 +76,76 @@ pub struct DefineClassFull {
 
 /// Compute a fast 128-bit hash key for a native method triple.
 ///
-/// Returns a `(u64, u64)` pair: two independent FNV-1a passes with
-/// different starting basis values. Using two independent 64-bit hashes
-/// gives a 128-bit composite key whose birthday-collision probability
-/// for ~3,100 registrations is on the order of 1e-32 — i.e. for our
-/// purposes zero. This removes the need for a runtime collision check
-/// on the hot registration path.
+/// Returns a `(u64, u64)` pair. The two halves are produced by **two
+/// genuinely different hash functions**, not the same FNV-1a function
+/// re-seeded:
+///
+///  * the first half uses the standard 64-bit FNV-1a prime
+///    (`0x100000001b3`), and
+///  * the second half uses a *different* odd multiplier
+///    (`0x880355f21e6d1965`, the well-known `fasthash`/`xxhash`-family
+///    mixing constant) so the two passes are not just affine variants
+///    of one another.
+///
+/// Both halves then get a splitmix64-style finalization avalanche, so
+/// any residual structural correlation between the two passes is
+/// destroyed before the values are used as a key.
+///
+/// With two effectively-independent 64-bit hashes the composite key is
+/// ~128-bit; the birthday-collision probability for the few thousand
+/// native methods we register is negligibly small (and `register`
+/// still carries a `debug_assert!` collision check as a backstop).
 #[inline]
 fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
+    // FNV prime for the first pass.
+    const FNV_PRIME: u64 = 0x100000001b3;
+    // A distinct odd multiplier for the second pass — different bit
+    // pattern *and* different magnitude, so the second hash is not a
+    // re-seeded copy of the first.
+    const ALT_PRIME: u64 = 0x880355f21e6d1965;
     (
-        fnv1a_hash(class, method, descriptor, 0xcbf29ce484222325),
-        fnv1a_hash(class, method, descriptor, 0x84222325cbf29ce4),
+        fmix64(hash_pass(class, method, descriptor, 0xcbf29ce484222325, FNV_PRIME)),
+        fmix64(hash_pass(class, method, descriptor, 0x9e3779b97f4a7c15, ALT_PRIME)),
     )
 }
 
-/// Single FNV-1a pass over `class . method . descriptor` with a caller-
-/// supplied offset basis. The FNV prime is fixed (0x100000001b3) — only
-/// the basis varies between passes, which is sufficient to make the two
-/// outputs statistically independent for the keyspace we use.
+/// A single FNV-1a-style multiply/xor pass over
+/// `class . method . descriptor` with a caller-supplied offset basis
+/// **and** multiplier. Varying the multiplier (not just the basis) is
+/// what makes two passes statistically independent rather than
+/// correlated affine transforms of the same accumulator.
 #[inline]
-fn fnv1a_hash(class: &str, method: &str, descriptor: &str, basis: u64) -> u64 {
+fn hash_pass(class: &str, method: &str, descriptor: &str, basis: u64, prime: u64) -> u64 {
     let mut h: u64 = basis;
     for b in class.bytes() {
         h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3); // FNV prime
+        h = h.wrapping_mul(prime);
     }
     h ^= b'.' as u64;
-    h = h.wrapping_mul(0x100000001b3);
+    h = h.wrapping_mul(prime);
     for b in method.bytes() {
         h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(prime);
     }
     h ^= b'.' as u64;
-    h = h.wrapping_mul(0x100000001b3);
+    h = h.wrapping_mul(prime);
     for b in descriptor.bytes() {
         h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(prime);
     }
+    h
+}
+
+/// splitmix64 finalizer — an avalanche mix that spreads every input bit
+/// across the whole 64-bit output. Applied to each hash half so the two
+/// halves of the composite key have no shared low-order structure.
+#[inline]
+fn fmix64(mut h: u64) -> u64 {
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d049bb133111eb);
+    h ^= h >> 31;
     h
 }
 
@@ -1897,8 +1930,15 @@ impl NativeMethodRegistry {
         // (method, descriptor) index used by `find_by_method_descriptor`.
         // Reuse `native_method_hash` with an empty class string so the
         // key is independent of the registering class.
+        //
+        // Collision semantics: when two different classes register the
+        // same `(method, descriptor)` pair, the FIRST registration wins
+        // and is kept. `entry().or_insert()` (not `insert()`) guarantees
+        // a later registration never silently overwrites an earlier one,
+        // which is what `find_by_method_descriptor`'s "first match"
+        // contract requires.
         let md_key = native_method_hash("", method_name, descriptor);
-        self.by_method_desc.insert(md_key, callback);
+        self.by_method_desc.entry(md_key).or_insert(callback);
         // Native-call ring buffer: register pointer→name so the
         // watchdog can resolve callback pointers back to human-readable
         // method names.
@@ -2092,9 +2132,17 @@ impl NativeMethodRegistry {
     /// `Object` has no such method — so this scan recovers the
     /// correct callback without needing the CP method-ref class.
     ///
-    /// Returns the first matching callback found. The scan is O(N)
-    /// over the registry; call sites should gate this on the slow
-    /// recovery path (NSME about to be raised), not the hot dispatch.
+    /// Returns the callback of the FIRST class to register this
+    /// `(method_name, descriptor)` pair. The lookup is O(1): it consults
+    /// the `by_method_desc` index built incrementally at registration
+    /// time, not an O(N) scan. The index is populated with
+    /// `entry().or_insert()`, so if several classes register the same
+    /// `(method, descriptor)` the earliest registration is the one kept
+    /// and returned here — the "first match" wording above is therefore
+    /// a real guarantee, not an artifact of iteration order.
+    ///
+    /// Call sites should still gate this on the slow recovery path (NSME
+    /// about to be raised), not the hot dispatch.
     pub fn find_by_method_descriptor(
         &self,
         method_name: &str,
@@ -2103,7 +2151,8 @@ impl NativeMethodRegistry {
         // AUDIT 2026-05-17 (Fix 5): O(1) lookup via the class-agnostic
         // `by_method_desc` index built at registration time. The index
         // is keyed by `native_method_hash("", method, descriptor)` so the
-        // class portion is masked out.
+        // class portion is masked out, and first-registration wins on
+        // key collision (see `register`).
         let key = native_method_hash("", method_name, descriptor);
         self.by_method_desc.get(&key).copied()
     }
@@ -2258,8 +2307,9 @@ mod tests {
 
     #[test]
     fn hash_two_halves_independent() {
-        // The two 64-bit halves use different FNV offset bases, so the
-        // same triple should produce two distinct 64-bit values.
+        // The two 64-bit halves are produced by different hash functions
+        // (different multipliers) plus independent finalization mixes, so
+        // the same triple yields two distinct 64-bit values.
         let (h1, h2) = native_method_hash("java/lang/Object", "hashCode", "()I");
         assert_ne!(h1, h2);
     }

@@ -16,8 +16,12 @@ apps/
 **/*.tar.gz
 apps/**/*.tar.gz
 
+# Compiled Java bytecode — stray probe/repro .class files must not be committed.
 # NOTE: .class files in test_classes/ and demo/ are intentional test fixtures
-# and should remain checked in. Do not add a blanket *.class ignore.
+# and are explicitly kept checked in via the negation patterns below.
+*.class
+!test_classes/**/*.class
+!demo/**/*.class
 
 # JAR files (benchmark dependencies — download separately)
 bench/*.jar
@@ -55,3 +59,9 @@ applogs/
 # Root executables
 *.exe
 !dist/*.exe
+
+# Stray developer probe / build artifacts at the repo root
+/librust_out.rmeta
+/sf-desc.txt
+*.dis
+__pycache__/

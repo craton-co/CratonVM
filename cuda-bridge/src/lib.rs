@@ -125,10 +125,8 @@ impl DeviceContext {
 
     /// Crate-internal accessor used by `stream.rs` / `event.rs` /
     /// `async_memcpy.rs` to reach the backend handle without exposing
-    /// it publicly. PHASE2-CUDA-TODO: today the cuda backend handle is
-    /// an opaque placeholder; once `backend_cuda.rs` is migrated to
-    /// cudarc 0.13 this is where stream/event constructors will pull
-    /// the `Arc<CudaDevice>` from.
+    /// it publicly. Stream/event constructors pull the
+    /// `Arc<CudaDevice>` from here via `DeviceContextInner::device()`.
     #[allow(dead_code)]
     pub(crate) fn inner(&self) -> &backend::DeviceContextInner {
         &self.0
@@ -228,15 +226,25 @@ impl KernelArgs {
         Self::default()
     }
 
-    pub fn push_device_ptr<T>(mut self, buf: &DeviceBuffer<T>) -> Self {
+    pub fn push_device_ptr<T: Send + Sync + 'static>(mut self, buf: &DeviceBuffer<T>) -> Self {
         // AUDIT 2026-05-16 (CRIT-1 fix): plumb the device pointer
         // returned by `CudaSlice::device_ptr` into the `KernelArg`.
         // In cudarc 0.13, SyncRecord was removed; stream ordering is
         // now handled via CudaDevice::wait_for and fork_default_stream.
+        //
+        // AUDIT 2026-05-22 (UAF fix): `device_ptr_arg` now also returns
+        // a type-erased keep-alive handle (a clone of the buffer's
+        // `Arc<CudaSlice<T>>`). It is stored inside the
+        // `KernelArg::DevicePtr` so the device allocation behind `addr`
+        // is kept alive for as long as this `KernelArgs` lives — i.e.
+        // until `launch_raw` consumes it. Previously only the bare
+        // `u64` address was copied in, so dropping the originating
+        // `DeviceBuffer` before the launch left the kernel reading
+        // freed device memory (use-after-free).
         #[cfg(feature = "cuda")]
         {
-            let addr = buf.0.device_ptr_arg();
-            self.raw.push(KernelArg::DevicePtr { addr });
+            let (addr, keep_alive) = buf.0.device_ptr_arg();
+            self.raw.push(KernelArg::DevicePtr { addr, _keep_alive: keep_alive });
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -272,12 +280,24 @@ impl KernelArgs {
 // In cudarc 0.13, SyncRecord was removed; stream ordering is
 // now handled via CudaDevice::wait_for and fork_default_stream.
 //
+// AUDIT 2026-05-22 (UAF fix): the `cuda`-mode variant also carries a
+// type-erased keep-alive handle (`backend::BufferKeepAlive`, an
+// `Arc<dyn Any + Send + Sync>` cloned from the buffer's
+// `Arc<CudaSlice<T>>`). It is never read — its sole job is to keep the
+// device allocation behind `addr` alive for as long as this `KernelArg`
+// (and the owning `KernelArgs`) exists, which spans the kernel launch.
+// This makes "buffer dropped before launch" a compile-checked
+// impossibility instead of a silent use-after-free.
+//
 // In stub mode (no `cuda` feature) the variant degenerates to a bare
 // `u64` since there is no real allocation to guard.
 pub(crate) enum KernelArg {
     #[cfg(feature = "cuda")]
     DevicePtr {
         addr: u64,
+        /// Keep-alive only; not read. See the variant comment above.
+        #[allow(dead_code)]
+        _keep_alive: backend::BufferKeepAlive,
     },
     #[cfg(not(feature = "cuda"))]
     DevicePtr {

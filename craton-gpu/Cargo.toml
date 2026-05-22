@@ -1,7 +1,11 @@
 [package]
 name = "craton-gpu"
-version = "0.2.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Java annotation sources for CratonVM GPU/parallel-compute support, compiled at build time"
 build = "build.rs"
 # Virtual `links` name. No actual native library is linked; this purely
 # enables cargo's `DEP_<NAME>_<KEY>` mechanism so that build scripts of

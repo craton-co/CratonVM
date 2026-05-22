@@ -41,9 +41,6 @@ fn is_latin1(text: &str) -> bool {
 /// - Legacy (pre-JDK 9 / synthetic): `char[] value` (field 0) + `int hash`
 ///   (field 1).
 pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
-    if text == "zqwv9" {
-        eprintln!("[DBG] create_java_string POOLED for 'zqwv9'");
-    }
     // Fast path: check pool
     if let Some(&obj) = shared.string_pool.read().get(text) {
         return obj;

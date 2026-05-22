@@ -1,52 +1,21 @@
 //! Mindustry boot-test shims.
 //!
-//! Mindustry's Main-Class is `mindustry/desktop/DesktopLauncher`. The
-//! real `main` initializes LWJGL / OpenGL native bindings and the
-//! Arc/Mindustry asset pipeline that CratonVM cannot fully drive today.
+//! **HISTORY**: Previously this module short-circuited
+//! `mindustry/desktop/DesktopLauncher.main` with a fake no-op `main`,
+//! plus a fake no-op `<clinit>`, so the JVM exited rc=0 without running
+//! Mindustry's real LWJGL / Arc bootstrap bytecode.
 //!
-//! # Strategy
-//!
-//! Short-circuit `main` and `<clinit>` so the JVM returns rc=0 without
-//! exercising the LWJGL / Arc bootstrap chain.
+//! **CURRENT STATE (real-bytecode audit)**: every short-circuit
+//! registration has been REMOVED per the "no synthetic stubs" policy.
+//! Real Mindustry bytecode now runs. This file is kept so the call site
+//! in `lib.rs::register_essential_natives` continues to compile.
 
-#![allow(clippy::needless_pass_by_value)]
+use cratonvm_native_api::NativeMethodRegistry;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
-
-const CN_DESKTOP_LAUNCHER: &str = "mindustry/desktop/DesktopLauncher";
-
-fn mindustry_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[mindustry-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-fn mindustry_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
-
-/// Install Mindustry boot-test short-circuits.
-pub fn register_mindustry_stubs(registry: &mut NativeMethodRegistry) {
-    // Diagnostic gate: when CRATONVM_MINDUSTRY_REAL=1, skip the
-    // short-circuit so the real DesktopLauncher.main runs (lets us
-    // measure how far CratonVM gets through the LWJGL/Arc boot chain).
-    if std::env::var("CRATONVM_MINDUSTRY_REAL").as_deref() == Ok("1") {
-        tracing::warn!("[mindustry-shim] CRATONVM_MINDUSTRY_REAL=1 — skipping shim registration, running real Mindustry");
-        return;
-    }
-    registry.register(
-        CN_DESKTOP_LAUNCHER,
-        "main",
-        "([Ljava/lang/String;)V",
-        mindustry_main_noop,
-    );
-    registry.register(
-        CN_DESKTOP_LAUNCHER,
-        "<clinit>",
-        "()V",
-        mindustry_clinit_noop,
-    );
+/// Audit cleanup: no longer registers any natives. Previously short-
+/// circuited `DesktopLauncher.main` and `<clinit>`.
+pub fn register_mindustry_stubs(_registry: &mut NativeMethodRegistry) {
+    // Intentionally empty. Real Mindustry DesktopLauncher bytecode runs.
 }
 
 #[cfg(test)]

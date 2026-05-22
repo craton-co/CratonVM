@@ -1,4 +1,4 @@
-//! Bytecode verification РІР‚вЂќ Pass 3 (JVM spec 4.10.1).
+//! Bytecode verification — Pass 3 (JVM spec 4.10.1).
 //!
 //! Type-checking verification for Java 7+ classes using StackMapTable frames.
 //! Each method's bytecode is verified by walking instructions and checking that
@@ -58,7 +58,7 @@ fn verify_bytecode_inner(
     strict_verification: bool,
 ) -> Result<(), LinkageError> {
     for method in &class.methods {
-        // Skip abstract and native methods РІР‚вЂќ they have no Code attribute
+        // Skip abstract and native methods — they have no Code attribute
         if method.is_abstract() || method.is_native() {
             continue;
         }
@@ -102,7 +102,7 @@ fn verify_method(
     let requires_stack_map = version.major >= ClassFileVersion::JAVA_7.major;
 
     if requires_stack_map && stack_map_table.is_none() {
-        // No StackMapTable РІР‚вЂќ only valid if there are no branches/exception handlers.
+        // No StackMapTable — only valid if there are no branches/exception handlers.
         // Check if the method has any branch targets that would require type checking.
         let has_exception_handlers = !code_attr.exception_table.is_empty();
         let has_branches = bytecode_has_branches(bytecode);
@@ -130,7 +130,7 @@ fn verify_method(
                 hierarchy,
             );
         }
-        // No branches and no handlers РІР‚вЂќ fall through to linear walk
+        // No branches and no handlers — fall through to linear walk
     }
 
     // Parse StackMapTable if present
@@ -148,7 +148,7 @@ fn verify_method(
         None => None,
     };
 
-    // Build the declared frames map: bytecode offset РІвЂ вЂ™ VerificationFrame
+    // Build the declared frames map: bytecode offset → VerificationFrame
     // StackMapTable frames are derived from a compact initial frame (method params only,
     // NOT padded to max_locals), per JVM spec 4.7.4.
     let compact_frame = VerificationFrame::compact_initial_frame(
@@ -191,7 +191,7 @@ fn verify_method(
     // Walk the bytecode
     let mut pc = 0usize;
     let mut current_frame = initial_frame;
-    // T1.3.3 РІР‚вЂќ start as `true` because the method entry point (PC=0)
+    // T1.3.3 — start as `true` because the method entry point (PC=0)
     // is always reachable from the caller. The `verified` flag tracks
     // whether control fell through from the *previous* instruction;
     // the first instruction has no previous, so it's unconditionally
@@ -222,7 +222,7 @@ fn verify_method(
         // Check if this PC is an exception handler entry
         if let Some(catch_type) = handler_targets.get(&(pc as u16)) {
             if !verified {
-                // This is an exception handler entry point РІР‚вЂќ start with the handler frame
+                // This is an exception handler entry point — start with the handler frame
                 let mut handler_frame = current_frame.clone();
                 handler_frame.clear_stack();
                 handler_frame
@@ -236,7 +236,7 @@ fn verify_method(
             }
         }
 
-        // T1.3.3 РІР‚вЂќ unreachable code rejection (JVMS Р’В§4.10.1).
+        // T1.3.3 — unreachable code rejection (JVMS §4.10.1).
         //
         // When control does not fall through from the previous
         // instruction (e.g. after an unconditional `goto`, `return`,
@@ -274,7 +274,7 @@ fn verify_method(
             // Lenient: skip to the next declared frame or handler.
             let (_, next_pc) = match Instruction::decode(bytecode, pc) {
                 Ok(r) => r,
-                Err(_) => break, // malformed РІР‚вЂќ stop walking
+                Err(_) => break, // malformed — stop walking
             };
             pc = next_pc;
             continue;
@@ -300,6 +300,7 @@ fn verify_method(
             cp,
             class_name,
             &method.name,
+            &method.descriptor,
             hierarchy,
         )
         .map_err(|e| {
@@ -361,7 +362,7 @@ fn verify_method(
         verified = result.falls_through;
 
         if !result.falls_through && next_pc < bytecode.len() {
-            // Control does not fall through РІР‚вЂќ the next instruction is only reachable
+            // Control does not fall through — the next instruction is only reachable
             // via a branch target or exception handler. Reset verification state.
             // The next instruction must be a declared frame target or handler entry.
             verified = false;
@@ -421,14 +422,14 @@ fn bytecode_has_branches(bytecode: &[u8]) -> bool {
 fn find_stack_map_table(attributes: &[Attribute]) -> Option<&[u8]> {
     for attr in attributes {
         if let Attribute::StackMapTable { entries } = attr {
-            // `entries: &Arc<[u8]>` вЂ” deref to `&[u8]` for the return type.
+            // `entries: &Arc<[u8]>` — deref to `&[u8]` for the return type.
             return Some(&**entries);
         }
     }
     None
 }
 
-/// Build a map of bytecode offset РІвЂ вЂ™ VerificationFrame from a parsed StackMapTable.
+/// Build a map of bytecode offset → VerificationFrame from a parsed StackMapTable.
 fn build_declared_frames(
     table: &StackMapTable,
     initial_frame: &VerificationFrame,
@@ -544,7 +545,7 @@ fn verify_by_inference(
 
         // Verify the instruction's type effects
         let result = verify_instruction(
-            &insn, pc, &mut current, cp, class_name, &method.name, hierarchy,
+            &insn, pc, &mut current, cp, class_name, &method.name, &method.descriptor, hierarchy,
         )
         .map_err(|e| match e {
             LinkageError::VerifyError { class_name: cn, method_name: mn, message } => {
@@ -813,7 +814,7 @@ mod tests {
     fn verify_iadd_requires_two_ints() {
         let h = MockHierarchy;
 
-        // Method body: iconst_0, iadd, ireturn РІР‚вЂќ iadd needs 2 ints but only 1 on stack
+        // Method body: iconst_0, iadd, ireturn — iadd needs 2 ints but only 1 on stack
         let class = make_class(vec![ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad"),
@@ -827,7 +828,7 @@ mod tests {
             }))],
         }]);
 
-        // iadd pops 2 ints, but only 1 is on the stack РІвЂ вЂ™ underflow error
+        // iadd pops 2 ints, but only 1 is on the stack → underflow error
         assert!(verify_bytecode(&class, &h).is_err());
     }
 
@@ -856,7 +857,7 @@ mod tests {
     fn verify_pre_java7_without_stackmap_ok() {
         let h = MockHierarchy;
 
-        // Java 6 class (version 50) РІР‚вЂќ no StackMapTable required
+        // Java 6 class (version 50) — no StackMapTable required
         let mut class = make_class(vec![ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("test"),
@@ -1070,7 +1071,7 @@ mod tests {
     fn verify_isub_requires_two_ints() {
         let h = MockHierarchy;
 
-        // iconst_1, isub (0x64) РІР‚вЂќ only 1 int, needs 2
+        // iconst_1, isub (0x64) — only 1 int, needs 2
         let class = make_class(vec![ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("bad_sub"),
@@ -1186,7 +1187,7 @@ mod tests {
 
     #[test]
     fn bytecode_has_branches_simple_return_no_branches() {
-        // iconst_0, ireturn РІР‚вЂќ no branches
+        // iconst_0, ireturn — no branches
         assert!(!bytecode_has_branches(&[0x03, 0xAC]));
     }
 
@@ -1235,13 +1236,13 @@ mod tests {
     }
 
     // =======================================================================
-    // NEW-9 РІР‚вЂќ Differential error tests
+    // NEW-9 — Differential error tests
     //
     // These tests build a class with deliberately-malformed bytecode and
     // assert that the verifier rejects it with a `VerifyError` whose
     // message is specific enough to diagnose the failure. The messages
-    // below are close to HotSpot's wording (exact match is not a goal РІР‚вЂќ
-    // the JDK's VerifyError text varies by release РІР‚вЂќ but they should be
+    // below are close to HotSpot's wording (exact match is not a goal —
+    // the JDK's VerifyError text varies by release — but they should be
     // grep-stable for test diagnostics and for JCK-style comparisons).
     // =======================================================================
 
@@ -1291,7 +1292,7 @@ mod tests {
 
     #[test]
     fn new9_differential_stack_underflow_on_ireturn() {
-        // ireturn with an empty stack РІР‚вЂќ should fail with an underflow.
+        // ireturn with an empty stack — should fail with an underflow.
         let class = make_pre_java7_method_class(
             "bad",
             "()I",
@@ -1330,7 +1331,7 @@ mod tests {
 
     #[test]
     fn new9_differential_bad_branch_target() {
-        // goto +100 on a 3-byte method РІР‚вЂќ branch past end.
+        // goto +100 on a 3-byte method — branch past end.
         //   0: goto +100  (0xa7, 0x00, 0x64)
         // followed by nothing; the target is bytecode offset 100 which
         // is well past the end of the method.
@@ -1343,7 +1344,7 @@ mod tests {
         );
         let res = verify_pre_java7(&class);
         // The worklist verifier silently ignores out-of-range targets
-        // and the function's fall-through runs off the end of code РІР‚вЂќ
+        // and the function's fall-through runs off the end of code —
         // which triggers a decode error for the unused offset. Either
         // way, the method must not be accepted.
         assert!(
@@ -1354,7 +1355,7 @@ mod tests {
 
     #[test]
     fn new9_differential_bad_local_index() {
-        // iload 250 РІР‚вЂќ reads from a local slot that doesn't exist
+        // iload 250 — reads from a local slot that doesn't exist
         // (max_locals = 2). Must fail with a local-out-of-range error.
         let class = make_pre_java7_method_class(
             "bad",
@@ -1397,7 +1398,7 @@ mod tests {
 
     #[test]
     fn new9_differential_java7_missing_stack_map_table() {
-        // Java 7+ class with branches but no StackMapTable attribute РІР‚вЂќ
+        // Java 7+ class with branches but no StackMapTable attribute —
         // must be rejected per JVMS 4.10.1.
         let mut class = make_class(vec![ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
@@ -1441,7 +1442,7 @@ mod tests {
 
     #[test]
     fn new9_differential_ret_on_empty_local() {
-        // `ret 5` with max_locals=1 РІР‚вЂќ the local index is out of range.
+        // `ret 5` with max_locals=1 — the local index is out of range.
         let class = make_pre_java7_method_class(
             "bad",
             "()V",
@@ -1458,12 +1459,12 @@ mod tests {
         // Proper jsr/ret pair: a subroutine that does nothing then
         // returns. Must PASS the verifier.
         //
-        //   0: jsr +4       (0xa8, 0x00, 0x04)  РІвЂ вЂ™ push returnAddress=3, branch to 3
+        //   0: jsr +4       (0xa8, 0x00, 0x04)  → push returnAddress=3, branch to 3
         //   3: return       (0xb1)
-        //   4: astore_0     (0x4b)              РІвЂ вЂ™ local 0 = returnAddress
-        //   5: ret 0        (0xa9, 0x00)        РІвЂ вЂ™ branch to the stored pc
+        //   4: astore_0     (0x4b)              → local 0 = returnAddress
+        //   5: ret 0        (0xa9, 0x00)        → branch to the stored pc
         //
-        // Wait РІР‚вЂќ offset 3 is return, so the jsr branches past it. Let's
+        // Wait — offset 3 is return, so the jsr branches past it. Let's
         // re-layout so the subroutine body runs before the main return.
         //
         //   0: jsr +5       (0xa8, 0x00, 0x05)  pushes returnAddress=3, branches to 5
@@ -1516,7 +1517,7 @@ mod tests {
     }
 
     // =======================================================================
-    // T1.3.8 РІР‚вЂќ handcrafted negative tests covering JVMS Р’В§4.9 constraints.
+    // T1.3.8 — handcrafted negative tests covering JVMS §4.9 constraints.
     //
     // Each test feeds a malformed bytecode sequence that violates exactly
     // one constraint and asserts the verifier rejects it. Named after the
@@ -1525,7 +1526,7 @@ mod tests {
 
     #[test]
     fn t1_3_8_dup_on_empty_stack() {
-        // dup with empty stack РІвЂ вЂ™ Р’В§4.9.2 Pass 3 underflow.
+        // dup with empty stack → §4.9.2 Pass 3 underflow.
         let class = make_pre_java7_method_class(
             "bad",
             "()V",
@@ -1575,13 +1576,13 @@ mod tests {
 
     #[test]
     fn t1_3_8_freturn_type_mismatch() {
-        // freturn with an int on the stack РІР‚вЂќ Р’В§4.9.2 return type.
+        // freturn with an int on the stack — §4.9.2 return type.
         let class = make_pre_java7_method_class(
             "bad",
             "()F",
             1,
             0,
-            vec![0x03, 0xAE], // iconst_0; freturn (intРІвЂ вЂ™F mismatch)
+            vec![0x03, 0xAE], // iconst_0; freturn (int→F mismatch)
         );
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
@@ -1601,7 +1602,7 @@ mod tests {
 
     #[test]
     fn t1_3_8_iadd_on_long_stack() {
-        // iadd applied to long values РІвЂ вЂ™ category-2 type mismatch.
+        // iadd applied to long values → category-2 type mismatch.
         let class = make_pre_java7_method_class(
             "bad",
             "()J",
@@ -1627,7 +1628,7 @@ mod tests {
 
     #[test]
     fn t1_3_8_aastore_on_int_array() {
-        // aastore applied to an int[] РІР‚вЂќ Р’В§4.9.2 array element type.
+        // aastore applied to an int[] — §4.9.2 array element type.
         //
         // Stack before aastore: [intarr, index, value]
         // We build: newarray int; iconst_0 (index); aconst_null (value); aastore; return
@@ -1652,7 +1653,7 @@ mod tests {
     #[test]
     fn t1_3_8_lshl_on_int_stack() {
         // lshl (long shift left) requires a long on the stack, not
-        // an int РІР‚вЂќ Р’В§4.9.2 operand type check.
+        // an int — §4.9.2 operand type check.
         let class = make_pre_java7_method_class(
             "bad",
             "()J",
@@ -1660,7 +1661,7 @@ mod tests {
             0,
             vec![
                 0x03, 0x03, // iconst_0, iconst_0 (two ints)
-                0x79,       // lshl РІР‚вЂќ expects long, int
+                0x79,       // lshl — expects long, int
                 0xAD,       // lreturn
             ],
         );
@@ -1671,7 +1672,7 @@ mod tests {
     }
 
     // =======================================================================
-    // T1.3.8 РІР‚вЂќ comprehensive JVMS Р’В§4.9 verifier test suite.
+    // T1.3.8 — comprehensive JVMS §4.9 verifier test suite.
     //
     // Each test targets a specific JVMS rule. Together with the 10
     // t1_3_8_* tests above and the 28 existing verify_* tests, this
@@ -1679,7 +1680,7 @@ mod tests {
     // verification constraint.
     // =======================================================================
 
-    /// Р’В§4.9.1 РІР‚вЂќ max_stack: pushing past max_stack must be rejected.
+    /// §4.9.1 — max_stack: pushing past max_stack must be rejected.
     #[test]
     fn jvms_4_9_max_stack_overflow() {
         // max_stack=1 but we push 2 values.
@@ -1698,8 +1699,8 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ dreturn on a method returning int must reject (type
-    /// mismatch on the operand stack РІР‚вЂќ dreturn needs a double).
+    /// §4.9.2 — dreturn on a method returning int must reject (type
+    /// mismatch on the operand stack — dreturn needs a double).
     #[test]
     fn jvms_4_9_dreturn_type_mismatch() {
         // Method returns I but code pushes an int and tries dreturn.
@@ -1718,7 +1719,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ pop2 on a single category-1 value: underflow.
+    /// §4.9.2 — pop2 on a single category-1 value: underflow.
     #[test]
     fn jvms_4_9_pop2_underflow_on_single_cat1() {
         // Only one int on stack; pop2 needs 2 cat-1 or 1 cat-2.
@@ -1732,7 +1733,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ local variable read from uninitialized slot.
+    /// §4.9.2 — local variable read from uninitialized slot.
     #[test]
     fn jvms_4_9_iload_uninitialized_local() {
         // 2 locals (0 = param, 1 = uninitialized), try to iload 1.
@@ -1748,7 +1749,7 @@ mod tests {
         let _ = verify_bytecode(&class, &MockHierarchy);
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ dadd requires two doubles.
+    /// §4.9.2 — dadd requires two doubles.
     #[test]
     fn jvms_4_9_dadd_requires_two_doubles() {
         let class = make_pre_java7_method_class(
@@ -1761,7 +1762,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ istore on an empty stack.
+    /// §4.9.2 — istore on an empty stack.
     #[test]
     fn jvms_4_9_istore_empty_stack() {
         let class = make_pre_java7_method_class(
@@ -1774,7 +1775,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ ladd requires two longs.
+    /// §4.9.2 — ladd requires two longs.
     #[test]
     fn jvms_4_9_ladd_requires_two_longs() {
         let class = make_pre_java7_method_class(
@@ -1787,7 +1788,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ fadd requires two floats.
+    /// §4.9.2 — fadd requires two floats.
     #[test]
     fn jvms_4_9_fadd_requires_two_floats() {
         let class = make_pre_java7_method_class(
@@ -1800,7 +1801,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.2 РІР‚вЂќ dup on a category-2 value (long).
+    /// §4.9.2 — dup on a category-2 value (long).
     #[test]
     fn jvms_4_9_dup_category2_rejected() {
         let class = make_pre_java7_method_class(
@@ -1813,10 +1814,10 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_err());
     }
 
-    /// Р’В§4.9.1 РІР‚вЂќ positive: valid linear method passes.
+    /// §4.9.1 — positive: valid linear method passes.
     #[test]
     fn jvms_4_9_valid_linear_method_passes() {
-        // iconst_1; iconst_2; iadd; ireturn РІР‚вЂќ valid method.
+        // iconst_1; iconst_2; iadd; ireturn — valid method.
         let class = make_class(vec![ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
             name: Arc::from("ok"),
@@ -1832,7 +1833,7 @@ mod tests {
         assert!(verify_bytecode(&class, &MockHierarchy).is_ok());
     }
 
-    /// Р’В§4.9.1 РІР‚вЂќ positive: void method with just return passes.
+    /// §4.9.1 — positive: void method with just return passes.
     #[test]
     fn jvms_4_9_void_return_passes() {
         let class = make_class(vec![ClassFileMethod {
@@ -1855,7 +1856,7 @@ mod tests {
     /// a single entry rather than the two-slot `[value, Top]` form that the
     /// rest of the verifier uses. This caused a "frame mismatch" error when
     /// two control-flow paths both arrived at a frame target with `[long]`
-    /// on the stack РІР‚вЂќ as in `org/jboss/modules/Metrics.getCurrentCPUTime()J`.
+    /// on the stack — as in `org/jboss/modules/Metrics.getCurrentCPUTime()J`.
     ///
     /// Bytecode (static long m(int p)):
     ///   0: iload_0

@@ -352,9 +352,36 @@ fn try_forward_object(
         return Ok(unsafe { (*old_header_ptr).forwarding_address() });
     }
 
-    // SAFETY: read a copy of the header so `object_total_size` operates on an
+    // Build an owned copy of the header so `object_total_size` operates on an
     // owned value rather than a borrow that would alias the later `&mut`.
-    let header_copy = unsafe { std::ptr::read(old_header_ptr) };
+    //
+    // ATOMIC-UB fix: do NOT `std::ptr::read` the whole `ObjectHeader` by
+    // value. `ObjectHeader` embeds `mark_word: AtomicU64`; a `ptr::read` of a
+    // struct containing an atomic performs a *non-atomic* read of an atomic
+    // location, which is undefined behavior. Read each scalar field
+    // individually through field-projected raw pointers, and read `mark_word`
+    // via an explicit `AtomicU64::load`, then reconstruct an owned header.
+    // SAFETY: `old_header_ptr` points at a valid, fully initialized header.
+    let header_copy: ObjectHeader = unsafe {
+        let h = old_header_ptr;
+        let mut owned = ObjectHeader::new(
+            std::ptr::addr_of!((*h).class_id).read(),
+            std::ptr::addr_of!((*h).kind).read(),
+            std::ptr::addr_of!((*h).element_type).read(),
+            std::ptr::addr_of!((*h).identity_hash_code).read(),
+            std::ptr::addr_of!((*h).array_length).read(),
+            std::ptr::addr_of!((*h).num_slots).read(),
+        );
+        owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
+        owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
+        owned.forwarding_ptr = std::ptr::addr_of!((*h).forwarding_ptr).read();
+        // `mark_word` is an `AtomicU64`: read it through an atomic load.
+        owned.mark_word.store(
+            (*h).mark_word.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        owned
+    };
     let total_size = object_total_size(&header_copy);
 
     // Sanity: a corrupt header (stale num_slots / array_length) can inflate

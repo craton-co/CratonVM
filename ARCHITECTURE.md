@@ -5,6 +5,8 @@ If you want to contribute, this is the place to start.
 
 ## Crate Layout
 
+The workspace has 17 member crates:
+
 ```
 cratonvm/
   reader/              cratonvm-reader              .class file parser
@@ -13,8 +15,12 @@ cratonvm/
   native-builtins/     cratonvm-native-builtins     java.lang.* native methods
   native-collections/  cratonvm-native-collections  java.util.* native methods
   native-io/           cratonvm-native-io           java.io/nio native methods
+  native-awt/          cratonvm-native-awt          AWT/Swing/Java2D native peers
   jit-api/             cratonvm-jit-api             JIT compiler API types
   jit/                 cratonvm-jit                 x86-64 / AArch64 JIT compiler
+  jit-cuda/            cratonvm-jit-cuda            Java bytecode -> PTX lowering for GPU offload
+  cuda-bridge/         cuda-bridge                  Thin CUDA Driver API bridge for GPU offload
+  craton-gpu/          craton-gpu                   GPU offload runtime integration
   classloading/        cratonvm-classloading        Class loading & bytecode verification
   gc/                  cratonvm-gc                  Garbage collectors (semi-space, G1, ZGC)
   jfr/                 cratonvm-jfr                 Java Flight Recorder
@@ -24,8 +30,10 @@ cratonvm/
 
 **Dependency flow:**
 ```
-vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections, native-io, jfr}
-                 -> {reader, types, native-api, jit-api}
+vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections,
+                 native-io, native-awt, jfr}
+                 -> {reader, types, native-api, jit-api, jit-cuda,
+                     cuda-bridge, craton-gpu}
 ```
 
 ## reader — Class File Parser
@@ -51,7 +59,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~323,000+ LoC across 16 crates). It contains six
+The VM is the core of the project (~323,000+ LoC across 17 crates). It contains six
 major subsystems (several now extracted into their own crates):
 
 ### Runtime (`vm/src/runtime/`)
@@ -108,8 +116,9 @@ Arrays use compact element sizes (1/2/4/8 bytes per element depending on type).
 Custom x86-64 / AArch64 JIT compiler (~7,200 LoC). Extracted into the `cratonvm-jit`
 crate, with shared API types in `cratonvm-jit-api`.
 
-- **`mod.rs`** — JIT infrastructure: compiled code cache, OSR entry points.
+- **`lib.rs`** — JIT infrastructure: compiled code cache, OSR entry points.
 - **`x64.rs`** — x86-64 machine code emitter with 26 optimization rounds.
+- **`aarch64.rs`** — AArch64 machine code backend (partial coverage).
 
 **Compilation pipeline:** Bytecode -> x86-64 native code (no IR).
 
@@ -197,4 +206,5 @@ Thin wrapper (~200 LoC) using `clap` for argument parsing. Constructs a
   the full VM pipeline.
 - **Java test classes** in `test_classes/` and `vm/tests/resources/` are
   compiled by `build.rs` if `javac` is available.
-- **CI** runs clippy, fmt, tests, 65% coverage floor, Miri, and cargo-audit.
+- **CI** (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo build`,
+  `cargo clippy`, and `cargo test` across the workspace on Linux and Windows.

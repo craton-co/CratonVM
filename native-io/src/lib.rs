@@ -2,6 +2,22 @@
 //!
 //! Contains native method implementations for java.io and java.nio I/O classes.
 //! The FileDescriptorTable is provided by cratonvm-native-api.
+//!
+//! # SECURITY
+//!
+//! This crate gives running Java code access to the host filesystem,
+//! processes, and network. **It is NOT a sandbox by default.** Path
+//! validation (see [`validate_path`]) rejects `..` traversal segments and
+//! null bytes, but does **not** confine resolved paths to any directory —
+//! absolute paths and symlink escapes are accepted.
+//!
+//! Embedders running **untrusted bytecode or hosting multiple tenants**
+//! MUST, at startup, call [`set_path_confine_to_cwd`]`(true)` to enable
+//! CWD confinement and register any extra trusted directories with
+//! [`add_sandbox_root`]. The zip/jar natives additionally cap the size of a
+//! single inflated entry to guard against decompression bombs; see
+//! `zip_real_jar::DEFAULT_MAX_ENTRY_BYTES` and the
+//! `CRATONVM_ZIP_MAX_ENTRY_BYTES` environment variable.
 
 use std::collections::HashMap;
 use std::fs;
@@ -154,14 +170,28 @@ pub fn is_path_confine_to_cwd() -> bool {
 ///     filenames such as `foo..bar.txt` (which contain `..` as a literal
 ///     substring but no `..` segment) are accepted. We reject only paths
 ///     containing a `ParentDir` component (`..` as a path segment).
-///   * SCOPE LIMITATION: this crate has no configured sandbox root, so the
-///     canonicalized path is NOT confined to any directory — `canonicalize`
-///     output is returned as-is. The `..`-segment rejection above stops
-///     traversal expressed in the path string, but an absolute path or a
-///     symlink that resolves outside an intended root is still accepted.
-///     Confining to a root would require a sandbox-root concept that does
-///     not exist here; that is a deployment decision, intentionally not
-///     made in this function.
+///
+/// # SECURITY — confinement is OFF by default
+///
+/// **By default this function does NOT confine the resolved path to any
+/// directory.** The `..`-segment rejection stops traversal expressed *in the
+/// path string*, but it does **not** stop:
+///   * an absolute path (`/etc/passwd`, `C:\Windows\...`) supplied directly
+///     by the running program, or
+///   * a *symlink* inside an otherwise-permitted directory that resolves to
+///     a target outside it.
+///
+/// For a single-tenant `java -jar app.jar` launch this is the correct,
+/// JVM-faithful behavior (see [`PATH_CONFINE_TO_CWD`] for why an
+/// unconditional CWD check breaks real apps).
+///
+/// **MULTI-TENANT / HOSTED / UNTRUSTED-CODE DEPLOYMENTS MUST opt in to
+/// confinement** by calling [`set_path_confine_to_cwd`]`(true)` at startup
+/// (and registering any legitimately-needed extra roots via
+/// [`add_sandbox_root`]). Without that call, untrusted guest bytecode can
+/// read or write anywhere the host process has permission, including via
+/// symlink escape. Do not assume `validate_path` sandboxes you — it does not
+/// unless you turn confinement on.
 fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // Reject null bytes (security check — runs even when validation
     // is otherwise disabled, since a NUL truncates the path at the

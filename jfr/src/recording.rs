@@ -1,6 +1,5 @@
 // AUDIT 2026-05-16: std HashMap/HashSet are unused (replaced by FxHashMap/FxHashSet).
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -85,55 +84,6 @@ impl Recording {
         self.state = RecordingState::Closed;
     }
 
-    /// Record an event if the recording is running and the event is enabled.
-    /// Accepts `Arc<EventInstance>` so the caller can share the event across
-    /// multiple recordings without re-allocating between callees.
-    ///
-    /// Round-5 HIGH-fix (Bug 3, 2026-05-17): we previously called
-    /// `Arc::try_unwrap` first, falling back to a deep clone on `Err`. In
-    /// the multi-recording fan-out path (`drain_per_thread_into_repository`,
-    /// `M > 1`) the caller deliberately keeps an Arc clone live across the
-    /// loop body so every recording receives a sharing reference — that
-    /// means `try_unwrap` *always* fails. We were paying for an atomic CAS
-    /// (the failed unwrap) on top of the deep clone for every event for
-    /// every recording. The CAS was pure waste.
-    ///
-    /// Now: try `Arc::into_inner` (single atomic, succeeds when this caller
-    /// holds the unique Arc — common in tests and in the final iteration
-    /// after the producer drops its own ref). Fall back to cloning the
-    /// inner directly — strictly necessary because the repository stores
-    /// owned values and other recordings still hold the Arc.
-    ///
-    /// Skip-event fast paths (state, enabled, threshold) happen *before*
-    /// the unwrap/clone, so disabled recordings pay only an Arc deref +
-    /// a refcount decrement on return.
-    pub fn record_event_arc(&mut self, event: Arc<EventInstance>) {
-        if self.state != RecordingState::Running {
-            return;
-        }
-        if !self.is_event_enabled(event.type_id) {
-            return;
-        }
-        // Check threshold: if the event type has a threshold, the event duration must meet it.
-        if let Some(&threshold) = self.settings.event_thresholds.get(&event.type_id) {
-            let duration_ns = event.end_time.saturating_sub(event.start_time);
-            if duration_ns < threshold.as_nanos() as u64 {
-                return;
-            }
-        }
-        // Take ownership of the inner value without a TOCTOU race.
-        // `Arc::unwrap_or_clone` performs a single atomic ownership check:
-        // it moves the inner value out when this caller holds the unique
-        // Arc (the no-clone fast path), and otherwise clones the inner
-        // directly. The old code probed `strong_count` first and then
-        // `into_inner(...).expect(...)` — but another thread could clone
-        // the Arc between the check and `into_inner`, making `into_inner`
-        // return `None` and panicking on the `.expect`. `unwrap_or_clone`
-        // decides atomically, so there is no window for that race.
-        let owned: EventInstance = Arc::unwrap_or_clone(event);
-        self.repository.push(owned);
-    }
-
     /// Record an event (owned). Convenience for single-recording use.
     pub fn record_event(&mut self, event: EventInstance) {
         if self.state != RecordingState::Running {
@@ -164,7 +114,7 @@ impl Recording {
     /// Round-9 CRIT-3 helper: full filter check (state + enabled + threshold)
     /// used by `drain_per_thread_into_repository` to decide whether to clone
     /// an event for this recording. Mirrors the inline checks at the top of
-    /// `record_event` / `record_event_arc`.
+    /// `record_event`.
     pub fn passes_filter(&self, event: &EventInstance) -> bool {
         if self.state != RecordingState::Running {
             return false;
@@ -335,8 +285,8 @@ impl FlightRecorder {
             // Round-9 CRIT-3 fix (2026-05-17): route events per-recording
             // with the per-recording filter applied *during* the drain pass.
             // Previously the fan-out Arc-cloned every event for every
-            // recording, then each recording's `record_event_arc` filtered
-            // and dropped — wasting Arc clones for events that no recording
+            // recording, then each recording filtered and dropped — wasting
+            // Arc clones for events that no recording
             // wanted, and (more importantly) making it impossible to give
             // ownership of a uniquely-routed event to its sole recipient
             // without an extra clone.
@@ -710,16 +660,6 @@ mod tests {
         let events = rec.get_events();
         assert_eq!(events[0].fields.len(), 2);
         assert_eq!(events[0].thread_id, 42);
-    }
-
-    #[test]
-    fn test_recording_record_event_arc() {
-        let mut rec = Recording::new(1, RecordingSettings::new("r"));
-        rec.start();
-        let evt = Arc::new(make_event(EventTypeId(1), 100, 200));
-        rec.record_event_arc(Arc::clone(&evt));
-        rec.record_event_arc(evt);
-        assert_eq!(rec.event_count(), 2);
     }
 
     // --- FlightRecorder ---

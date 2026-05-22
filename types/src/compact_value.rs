@@ -724,12 +724,16 @@ impl CompactValue {
             },
             b'L' | b'[' => match sub {
                 SUB_OBJECT | SUB_NULL => self.to_value(),
-                // A primitive landing in a reference slot becomes null — the
-                // JVM verifier would have caught this pre-runtime, so this
-                // is a defensive fallback.
-                SUB_INT | SUB_FLOAT | SUB_LONG_LO | SUB_LONG_HI => {
-                    Value::Object(None)
-                }
+                // A non-reference value landing in a reference slot becomes
+                // null — the JVM verifier would have caught this pre-runtime,
+                // so this is a defensive fallback. `SUB_RETADDR` and
+                // `SUB_UNINIT` are included alongside the numeric primitives:
+                // a `ReturnAddress` or `Uninitialized` is not a valid object
+                // reference either, and routing them through `to_value()`
+                // would leak `Value::ReturnAddress` / `Value::Uninitialized`
+                // into a reference slot — inconsistent with the numeric arms.
+                SUB_INT | SUB_FLOAT | SUB_LONG_LO | SUB_LONG_HI
+                | SUB_RETADDR | SUB_UNINIT => Value::Object(None),
                 _ => self.to_value(),
             },
             // Unknown descriptor: keep legacy behavior.

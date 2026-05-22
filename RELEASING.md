@@ -28,9 +28,9 @@ This document describes how to cut a new release of CratonVM.
        `[Unreleased]: https://github.com/craton-co/cratonvm/compare/vX.Y.Z...HEAD`.
      - Add `[X.Y.Z]: https://github.com/craton-co/cratonvm/compare/vPREV...vX.Y.Z`.
 
-2. **Wait for CI green** on the PR. `.github/.wf/ci.yml` runs
-   build, clippy, tests, coverage (gate ≥ 65%), miri, and `cargo audit`
-   across Linux/macOS/Windows. All checks must pass.
+2. **Wait for CI green** on the PR. `.github/workflows/ci.yml` runs
+   `cargo fmt --check`, `cargo build`, `cargo clippy`, and `cargo test`
+   across the workspace on Linux and Windows. All checks must pass.
 
 3. **Merge the PR** into `main` (squash or merge — match repo policy).
 
@@ -43,11 +43,13 @@ This document describes how to cut a new release of CratonVM.
    git push origin vX.Y.Z
    ```
 
-5. **Release workflow runs automatically.** `.github/.wf/release.yml`
-   triggers on `push` of tags matching `v*` and:
-   - Builds `cratonvm-cli` for `x86_64-unknown-linux-gnu`,
+5. **Build and publish the release artifacts.** A release-workflow
+   template lives at `.github/.wf/release.yml` (not yet activated — move it
+   into `.github/workflows/` to enable automatic tag-triggered releases).
+   Until then, build and upload the artifacts manually:
+   - Build `cratonvm-cli` for `x86_64-unknown-linux-gnu`,
      `x86_64-pc-windows-msvc`, and `aarch64-apple-darwin`.
-   - Uploads the artifacts to a new GitHub Release for the tag.
+   - Attach the artifacts to a new GitHub Release for the tag.
 
 ## 3. Publishing to crates.io (when ready)
 

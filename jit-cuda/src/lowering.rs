@@ -21,7 +21,7 @@
 use crate::analyzer::ParamKind;
 use crate::emitter::{LoweringError, PtxKernel, PtxModule, PtxParam, PtxParamKind, RegDecl, RegKind};
 use crate::signature::KernelSignature;
-use rustjvm_reader::method::ClassFileMethod;
+use cratonvm_reader::method::ClassFileMethod;
 
 mod emit;
 mod loop_recog;
@@ -306,6 +306,7 @@ mod tests {
             return_kind: ParamKind::I32Array,
             estimated_work: 1 << 20,
             needs_d2h_sync: false,
+            this_field_cps: vec![],
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
@@ -326,6 +327,7 @@ mod tests {
             return_kind: ParamKind::I64,
             estimated_work: 1 << 20,
             needs_d2h_sync: false,
+            this_field_cps: vec![],
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6

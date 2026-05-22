@@ -1557,7 +1557,12 @@ fn register_font_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/FontMetrics", "stringWidth", "(Ljava/lang/String;)I", |ctx, args| {
         let text = read_string(ctx, args, 1).unwrap_or_default();
         let size = font_metrics_size(ctx, args);
-        int_ok((text.len() as f32 * size * 0.55).round() as i32)
+        // Use the character count, not `String::len()` (the UTF-8 byte
+        // length). Byte length grossly over-measures CJK / multibyte text
+        // where a single glyph is 2-4 bytes. The width is still an
+        // approximate heuristic, but at least char-count-correct.
+        let char_count = text.chars().count();
+        int_ok((char_count as f32 * size * 0.55).round() as i32)
     });
     registry.register("java/awt/FontMetrics", "charWidth", "(C)I", |ctx, args| {
         int_ok((font_metrics_size(ctx, args) * 0.55).round() as i32)
@@ -1638,6 +1643,11 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
         bool_ok(v)
     });
 
+    // Headless behaviour: there is no display for the user to pick a file
+    // in, so the open/save choosers return `JFileChooser.CANCEL_OPTION`
+    // (the int `1`) without blocking — i.e. "the user dismissed the
+    // dialog". No file is selected. This is a fixed no-interaction result,
+    // not a real prompt.
     registry.register("javax/swing/JFileChooser", "showOpenDialog", "(Ljava/awt/Component;)I", |_ctx, _args| int_ok(1));
     registry.register("javax/swing/JFileChooser", "showSaveDialog", "(Ljava/awt/Component;)I", |_ctx, _args| int_ok(1));
 
@@ -1648,8 +1658,15 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
         tracing::info!("[JOptionPane] {title}: {msg}");
         void_ok()
     });
+    // Headless behaviour: there is no display for the user to respond in,
+    // so the confirm dialog returns `JOptionPane.YES_OPTION` / `OK_OPTION`
+    // (the int `0`) without blocking. This is a fixed no-interaction
+    // result, not a real prompt.
     registry.register("javax/swing/JOptionPane", "showConfirmDialog",
         "(Ljava/awt/Component;Ljava/lang/Object;Ljava/lang/String;I)I", |_ctx, _args| int_ok(0));
+    // Headless behaviour: with no display to type into, the input dialog
+    // returns an empty string without blocking. This is a fixed
+    // no-interaction result, not a real prompt.
     registry.register("javax/swing/JOptionPane", "showInputDialog",
         "(Ljava/awt/Component;Ljava/lang/Object;)Ljava/lang/Object;",
         |ctx, _args| obj_ok(ctx.create_string("")));
@@ -1691,12 +1708,58 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_clipboard_natives(registry: &mut NativeMethodRegistry) {
+    use crate::clipboard::{get_clipboard, ClipboardKind};
+
     registry.register("java/awt/datatransfer/Clipboard", "getName", "()Ljava/lang/String;",
         |ctx, _args| obj_ok(ctx.create_string("System")));
+
+    // `getContents` is wired to the in-process clipboard backend
+    // (`clipboard.rs`). When the system clipboard holds text, it is
+    // returned as a real `java.awt.datatransfer.StringSelection`, which
+    // implements `Transferable` — so callers get genuine clipboard text
+    // rather than an unconditional `null`. Non-text flavors (image / file
+    // list / raw) are not yet representable as a `Transferable` here and
+    // still yield `null`.
     registry.register("java/awt/datatransfer/Clipboard", "getContents",
-        "(Ljava/lang/Object;)Ljava/awt/datatransfer/Transferable;", |_ctx, _args| null_ok());
+        "(Ljava/lang/Object;)Ljava/awt/datatransfer/Transferable;", |ctx, _args| {
+        let text = {
+            let mgr = get_clipboard().lock();
+            mgr.get_text(ClipboardKind::System).map(|s| s.to_string())
+        };
+        let Some(text) = text else { return null_ok(); };
+        // Build a `StringSelection(String)` — it implements `Transferable`.
+        let sel = ctx.new_object("java/awt/datatransfer/StringSelection")?;
+        if let Some(Value::Object(Some(obj))) = &sel {
+            let s = ctx.create_string(&text);
+            ctx.invoke(
+                "java/awt/datatransfer/StringSelection",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(*obj)), Value::Object(Some(s))],
+            )?;
+        }
+        Ok(sel)
+    });
+
+    // `setContents` stores the transferable's text into the `clipboard.rs`
+    // backend so a subsequent `getContents` reflects it. Text is extracted
+    // by reading the `StringSelection.data` field (the standard text
+    // `Transferable`); transferables that carry no readable string field
+    // are accepted as a no-op.
     registry.register("java/awt/datatransfer/Clipboard", "setContents",
-        "(Ljava/awt/datatransfer/Transferable;Ljava/awt/datatransfer/ClipboardOwner;)V", |_ctx, _args| void_ok());
+        "(Ljava/awt/datatransfer/Transferable;Ljava/awt/datatransfer/ClipboardOwner;)V", |ctx, args| {
+        if let Some(transferable) = get_obj(args, 1) {
+            // `StringSelection` keeps the payload in a `data` field.
+            if let Value::Object(Some(data)) = ctx.get_field_by_name(transferable, "data") {
+                if let Some(text) = ctx.read_string(data) {
+                    get_clipboard()
+                        .lock()
+                        .set_text(ClipboardKind::System, text, None);
+                }
+            }
+        }
+        void_ok()
+    });
 }
 
 #[cfg(test)]

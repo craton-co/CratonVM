@@ -12,6 +12,61 @@
 //! - `CompiledMethod`: holds executable memory, entry point, and `needs_context` flag
 //! - `compile_method`: analyzes bytecode, emits x64 code, patches self-calls
 //! - `ExecutableBuffer`: platform-specific executable memory (VirtualAlloc on Windows)
+//!
+//! ## Internal JIT calling convention (NOT the platform ABI)
+//!
+//! JIT-compiled methods do **not** follow the SysV (System V AMD64) or
+//! Win64 ABI for argument passing. They use a private convention that is
+//! only valid between two CratonVM-JIT-compiled functions:
+//!
+//! - **All** Java arguments — including `float` and `double` — are passed
+//!   through the general-purpose argument registers (`ARG_REGS`). Floating
+//!   point arguments are transmitted as their raw 64-bit IEEE-754 bit
+//!   pattern in a GPR, *not* in an XMM register as the platform ABI
+//!   requires. The callee prologue moves each FP parameter from its GPR
+//!   into an XMM register via `movq` (see `x64.rs`, `emit_movq_xmm_from_rax`
+//!   in the prologue). Stack-passed arguments (when the register file is
+//!   exhausted) are likewise raw 64-bit slots.
+//! - "context" methods additionally receive a hidden `SharedVm` pointer in
+//!   `ARG_REGS[0]`, shifting all Java args by one register.
+//!
+//! WARNING: because of this, a function pointer obtained from any source
+//! other than CratonVM's own JIT (a libc symbol, a C-compiled callback, a
+//! function produced by another compiler) **must never** be entered with
+//! this convention, and conversely a CratonVM JIT entry point must never
+//! be handed to external code expecting the platform ABI. The argument
+//! registers, FP-in-GPR encoding, and stack layout are all incompatible.
+//! Cross-ABI calls must go through an explicit thunk that re-marshals
+//! arguments.
+//!
+//! ## SAFETY INVARIANT: GC must conservatively re-sweep every JIT frame
+//!
+//! The JIT register allocator may keep a Java local (including an object
+//! reference) **exclusively in a callee-saved GPR** between bytecode
+//! aload/astore opcodes — the value need not be present in the frame's
+//! local slot at any given native PC. The precise oop map
+//! (`OopMapEntry`) describes only *frame-slot* oops; it has **no
+//! register-oop bitmap**. Therefore a register-resident oop is invisible
+//! to any GC scan that walks frame memory alone.
+//!
+//! Correctness depends on two cooperating mechanisms, and **both must be
+//! kept**:
+//!
+//! 1. Before every safepoint-causing call, the code generator spills every
+//!    register-resident local back to its canonical frame slot
+//!    `[rbp - (idx+1)*8]` (see `x64.rs::emit_pre_safepoint_spill`).
+//! 2. `conservative_roots::scan_one_frame_precise` performs a *full
+//!    conservative sweep* of the entire JIT frame region (validating each
+//!    qword via `heap.is_object_address`), in addition to consulting the
+//!    precise oop map.
+//!
+//! The precise oop map is a pure optimization layered on top of the
+//! conservative sweep. **Do not** remove or weaken the conservative
+//! frame sweep, and **do not** remove the pre-safepoint spill, unless a
+//! genuine register-oop map is added to `OopMapEntry` *and* consumed by
+//! the GC scanner. Removing either one in isolation would let
+//! register-resident oops escape GC root scanning, causing live objects
+//! to be reclaimed and the heap to corrupt.
 
 pub mod aarch64;
 pub mod aarch64_backend;
