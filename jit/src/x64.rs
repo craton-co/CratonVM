@@ -1408,6 +1408,11 @@ pub fn is_jit_compatible(code: &[u8], code_len: usize, descriptor: &str) -> bool
 struct LoopHoist {
     /// Bytecode PC of the loop header (back-edge target).
     loop_header: usize,
+    /// First PC strictly after the back-edge instruction (`loop_end`).
+    /// All PCs `p` with `loop_header <= p < loop_end` are part of the loop
+    /// body. Tracked here so the OSR entry path can detect when a PC lives
+    /// inside a hoisted loop without re-running `detect_loops`.
+    loop_end: usize,
     /// First bytecode PC of the invariant sequence (the aload instruction).
     seq_start: usize,
     /// Bytecode PC after the invariant sequence (past the aaload).
@@ -2391,6 +2396,7 @@ fn find_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]) -> V
                 if seq_end <= loop_end {
                     hoists.push(LoopHoist {
                         loop_header: header,
+                        loop_end,
                         seq_start: pc,
                         seq_end,
                         array_local,
@@ -2457,6 +2463,11 @@ enum ArithStep {
 struct ArithLoopHoist {
     /// Bytecode PC of the loop header (back-edge target).
     loop_header: usize,
+    /// First PC strictly after the back-edge instruction (`loop_end`).
+    /// Mirrors `LoopHoist::loop_end` — see that doc for the OSR-soundness
+    /// rationale (an OSR entry inside this loop's body must not skip the
+    /// preheader, or the in-loop sequence loads a stale cached value).
+    loop_end: usize,
     /// First bytecode PC of the invariant run.
     seq_start: usize,
     /// Bytecode PC just past the invariant run.
@@ -2645,6 +2656,7 @@ fn find_arith_loop_hoists(code: &[u8], code_len: usize, loops: &[(usize, usize)]
                     }
                     hoists.push(ArithLoopHoist {
                         loop_header: header,
+                        loop_end,
                         seq_start: pc,
                         seq_end,
                         steps,
@@ -9533,8 +9545,33 @@ impl Compiler {
             // but an OSR entry has cold slots, so it MUST run the preheader.
             // `pc_to_native[pc]` (set after the preheader) stays the back-edge
             // target; `osr_entry_native[pc]` points here, before the preheader.
+            //
+            // LICM-OSR soundness for nested loops: if this PC lives strictly
+            // inside the body of a *hoisted* loop (header `H` with hoists, and
+            // `H < pc < loop_end(H)`), an OSR entry that lands here would skip
+            // `H`'s preheader and read uninitialised hoist spill slots — which
+            // for an `aaload`-hoisted row pointer means a garbage pointer fed
+            // straight into the in-loop array access (SIGSEGV) or, at best, a
+            // silently wrong result. Mark such PCs as OSR-ineligible (-1) so
+            // the runtime rejects the entry and the interpreter keeps running
+            // until it next reaches `H` (or any PC outside every hoisted loop),
+            // at which point OSR fires correctly with warm slots.
+            //
+            // We only test header PCs of hoists, not every loop — uncontained
+            // loops (no LICM hoisting) are unaffected. The check is O(num_hoists),
+            // and `num_hoists` is bounded by the static analysis upstream.
             if !dead && pc < self.osr_entry_native.len() {
-                self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                let inside_aaload_hoisted = self.hoist_info.iter().any(|h| {
+                    h.loop_header < pc && pc < h.loop_end
+                });
+                let inside_arith_hoisted = self.arith_hoist_info.iter().any(|h| {
+                    h.loop_header < pc && pc < h.loop_end
+                });
+                if inside_aaload_hoisted || inside_arith_hoisted {
+                    self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
+                } else {
+                    self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
             // Hoisted code runs BEFORE pc_to_native is set, so back-edges
