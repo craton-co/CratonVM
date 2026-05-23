@@ -1968,7 +1968,6 @@ fn ccpp_process_config_bean_definitions(
     let registry = match args.get(1).cloned() {
         Some(Value::Object(Some(o))) => o,
         _ => {
-            eprintln!("[CCPP-DBG] processConfigBeanDefinitions: no registry arg → no-op");
             return Ok(None);
         }
     };

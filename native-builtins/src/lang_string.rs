@@ -1475,7 +1475,6 @@ pub(crate) fn native_sb_append_charsequence_off_len(
 }
 
 pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    eprintln!("[DBG] native_sb_to_string ENTERED");
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),

@@ -12213,8 +12213,6 @@ fn spring_class_utils_for_name_impl(ctx: &mut dyn NativeContext, args: &[Value])
 // it creates AnnotationConfigServletWebServerApplicationContext directly for
 // SERVLET type applications.
 fn spring_default_app_ctx_factory_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    eprintln!("[DACF-DBG] DefaultApplicationContextFactory.create called");
-
     // args[1] = WebApplicationType enum instance
     let web_type_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let is_servlet = match web_type_val {
@@ -12225,16 +12223,12 @@ fn spring_default_app_ctx_factory_create(ctx: &mut dyn NativeContext, args: &[Va
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            eprintln!("[DACF-DBG] WebApplicationType field[0]={}", name_from_field);
             // Also check read_string on the enum itself
             let enum_str = ctx.read_string(wt).unwrap_or_default();
-            eprintln!("[DACF-DBG] WebApplicationType read_string={}", enum_str);
             name_from_field.contains("SERVLET") || enum_str.contains("SERVLET")
         }
         _ => false,
     };
-
-    eprintln!("[DACF-DBG] is_servlet={}", is_servlet);
 
     // Attempt to create the right context class
     let ctx_class = if is_servlet {
@@ -12248,25 +12242,20 @@ fn spring_default_app_ctx_factory_create(ctx: &mut dyn NativeContext, args: &[Va
     let obj_val = match ctx.new_object(ctx_class) {
         Ok(Some(v)) => v,
         Ok(None) => {
-            eprintln!("[DACF-DBG] new_object returned None");
             return Ok(Some(Value::Object(None)));
         }
         Err(e) => {
-            eprintln!("[DACF-DBG] new_object failed: {:?}", e);
             return Err(e);
         }
     };
 
     // Step 2: run the no-arg constructor explicitly via invoke_special
     // invoke_special args[0] = this
-    eprintln!("[DACF-DBG] allocated {:?}, running constructor...", obj_val);
     match ctx.invoke_special(ctx_class, "<init>", "()V", &[obj_val]) {
         Ok(_) => {
-            eprintln!("[DACF-DBG] constructor OK, returning context");
             Ok(Some(obj_val))
         }
         Err(e) => {
-            eprintln!("[DACF-DBG] constructor failed: {:?}", e);
             Err(e)
         }
     }
@@ -17542,6 +17531,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     });
     r.register(cb, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        eprintln!("[DBG] CharBuffer.toString() native called, class_id_of_object={:?}", ctx.class_id_of_object(this));
         let pos = match ctx.get_field(this, CB_FIELD_POS) {
             Value::Int(v) => v as usize,
             _ => 0,
@@ -17550,9 +17540,11 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v as usize,
             _ => 0,
         };
+        eprintln!("[DBG] pos={} lim={}", pos, lim);
         let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {
             Value::Object(Some(a)) => a,
-            _ => {
+            other => {
+                eprintln!("[DBG] field0 not Object: {:?}, returning empty", other);
                 let s = ctx.create_string("");
                 return Ok(Some(Value::Object(Some(s))));
             }
@@ -31276,13 +31268,11 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
 
     // StreamSupport
     let ss = "java/util/stream/StreamSupport";
-    eprintln!("[STREAM-SUPPORT-DBG] registering StreamSupport.stream");
     r.register(
         ss,
         "stream",
         "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;",
         |ctx, args| {
-            eprintln!("[STREAM-SUPPORT-DBG] StreamSupport.stream native fired");
             // Convert spliterator to stream (1-field synthetic with backing array).
             //
             // Two cases:

@@ -1538,7 +1538,6 @@ impl BigUint {
     /// Returns (quotient, remainder).
     pub fn div_rem(&self, divisor: &BigUint) -> (BigUint, BigUint) {
         if divisor.is_zero() {
-            eprintln!("[WARN] BigUint::div_rem called with zero divisor, returning (zero, zero)");
             return (Self::zero(), Self::zero());
         }
         if self.cmp(divisor) == std::cmp::Ordering::Less {

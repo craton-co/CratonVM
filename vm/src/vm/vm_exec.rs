@@ -7333,6 +7333,18 @@ fn invoke_on_class_shared_inner(
                         // management interface` and the fork dies before tests
                         // start. Force the synthetic-bean natives in `jmx.rs`
                         // to win.
+                        //
+                        // KAFKA-MBEAN: `getPlatformMBeanServer` is deliberately
+                        // omitted here. A synthetic-stub native for it (whose
+                        // returned object's class was the *interface*
+                        // `javax/management/MBeanServer`) caused
+                        // `AbstractMethodError: registerMBean has no Code attribute`
+                        // when Kafka's `CoreUtils.registerMBean` dispatched
+                        // through `invokeinterface MBeanServer.registerMBean`.
+                        // The real JDK bytecode returns a concrete
+                        // `com.sun.jmx.mbeanserver.JmxMBeanServer` whose
+                        // `registerMBean` has a Code attribute, satisfying
+                        // interface dispatch.
                         || (class_name == "java/lang/management/ManagementFactory"
                             && matches!(
                                 method_name,
@@ -7343,7 +7355,6 @@ fn invoke_on_class_shared_inner(
                                 | "getOperatingSystemMXBean"
                                 | "getCompilationMXBean"
                                 | "getGarbageCollectorMXBeans"
-                                | "getPlatformMBeanServer"
                             ))
                         // Surefire bootstrap: force PropertiesWrapper fallbacks
                         // to win over bytecode. The raw bytecode methods call

@@ -554,6 +554,28 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
     let (data_slot, size_slot, _) = al_slots(ctx);
+    // Undersized-receiver guard: the ArrayList natives are registered
+    // (defensively) on `java/util/AbstractCollection` too — see
+    // `register_arraylist_natives` for the `toArray([T)` mirror — which
+    // means the native-dispatch hierarchy walk can land on a non-ArrayList
+    // receiver whose declared layout has fewer slots than ArrayList's
+    // (data=0, size=1). Examples observed in real-JDK boots:
+    // `java.util.concurrent.ConcurrentSkipListSet` (1 slot — `m`),
+    // `com.google.common.collect.RegularImmutableList` (1 slot — `array`),
+    // `java.util.IdentityHashMap$Values` (1 slot — `this$0`),
+    // `java.util.Collections$EmptyList` (1 slot — `serialVersionUID` pad).
+    // Reading slot 1 (or higher) on those receivers fires the
+    // `gen_heap::get_field: out-of-bounds field read dropped (undersized
+    // object layout)` diagnostic and silently mangles every caller. The
+    // safe answer for *all* of these is "I'm not an ArrayList — fall
+    // through to iterator-based collection access" (the existing
+    // `data = None` short-circuit + `collection_elements_generic`
+    // fallback). Compute it cheaply by checking the receiver's allocated
+    // slot count up-front.
+    let n_fields = ctx.object_num_fields(this);
+    if size_slot >= n_fields || data_slot >= n_fields {
+        return (None, 0);
+    }
     let data = match ctx.get_field(this, data_slot) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
         _ => None,
@@ -20343,7 +20365,6 @@ fn native_stpe_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 const CSLM_FIELD_KEYS: usize = 0;
 const CSLM_FIELD_VALUES: usize = 1;
 const CSLM_FIELD_SIZE: usize = 2;
-#[allow(dead_code)] // used for documentation; allocations go through constructors
 const CSLM_NUM_FIELDS: usize = 3;
 const CSLM_DEFAULT_CAPACITY: usize = 16;
 
@@ -20445,6 +20466,19 @@ fn cslm_ensure_capacity(
 }
 
 fn cslm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, Option<ObjectRef>, i32) {
+    // Undersized-receiver guard — mirrors `al_state`'s. The CSLM natives
+    // are registered on the concrete `ConcurrentSkipListMap` class, but a
+    // misdispatch (e.g. through the AbstractCollection hierarchy walk, or
+    // a Map-shaped wrapper around a non-CSLM receiver) can still land
+    // here with a receiver whose declared layout has fewer than 3 slots
+    // (CSLM uses slots 0/1/2 for keys/values/size). Without the guard,
+    // reading slot 1 or 2 on e.g. `ConcurrentSkipListSet` (1 slot) trips
+    // the "undersized object layout" diagnostic and silently mangles the
+    // caller. Reporting an empty state lets the caller surface a normal
+    // empty-collection result instead.
+    if ctx.object_num_fields(this) < CSLM_NUM_FIELDS {
+        return (None, None, 0);
+    }
     let keys = match ctx.get_field(this, CSLM_FIELD_KEYS) {
         Value::Object(Some(r)) => Some(r),
         _ => None,

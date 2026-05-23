@@ -1979,9 +1979,7 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    let is_spring_legacy_probe = resource_name == "META-INF/spring.factories"
-        || resource_name.contains("META-INF/spring/");
-    if dbg_all || is_spring_legacy_probe {
+    if dbg_all {
         eprintln!("[GRES-DBG] getResources({}) -> {} URLs", resource_name, urls.len());
         for u in &urls {
             eprintln!("[GRES-DBG]   url: {}", u);

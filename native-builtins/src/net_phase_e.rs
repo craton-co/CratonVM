@@ -1776,14 +1776,12 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        eprintln!("[w3a2] ServerSocket <init>(I)V port={port}");
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
 
     r.register(ss, "getLocalPort", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = ss_get(this).port;
-        eprintln!("[w3a2] ServerSocket.getLocalPort -> {p}");
         Ok(Some(Value::Int(p)))
     });
 
@@ -1802,9 +1800,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(ia))) => inet_addr_field_string_or(ctx, *ia, IA_ADDR, "0.0.0.0"),
             _ => "0.0.0.0".to_string(),
         };
-        eprintln!("[w3a2] ServerSocket <init>(IILjava/net/InetAddress;)V port={port} backlog={backlog} host={host}");
         let r = re2_bind_listener(ctx, this, &host, port, backlog);
-        eprintln!("[w3a2]   ss_get(this).port = {}", ss_get(this).port);
         r
     });
 
@@ -2902,7 +2898,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 s
             };
             // S111r23-DBG: log openConnection calls for spring.factories
-            if ext.contains("spring.factories") {
+            if ext.contains("spring.factories") && spring_dbg_enabled() {
                 eprintln!("[CONN-DBG] URL.openConnection: {}", ext);
             }
             // For `jar:` URLs, return a `java/net/JarURLConnection`-typed
@@ -3268,7 +3264,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "afterPropertiesSet",
         "()V",
         |_ctx, _args| {
-            eprintln!("[REDIS-DBG] RedisAccessor.afterPropertiesSet -> no-op (skip connection-factory assert)");
             Ok(None)
         },
     );
@@ -3286,7 +3281,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |_ctx, _args| {
             // Swallow the assert.notNull; field stays uninitialized but that is
             // acceptable for bootstrap advancement.
-            eprintln!("[REDIS-DBG] RedisOperationsSessionRepository.setApplicationEventPublisher -> no-op");
             Ok(None)
         },
     );
@@ -3300,7 +3294,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "setConnectionFactory",
         "(Lorg/springframework/data/redis/connection/RedisConnectionFactory;)V",
         |_ctx, _args| {
-            eprintln!("[REDIS-DBG] RedisMessageListenerContainer.setConnectionFactory -> no-op (swallow null assert)");
             Ok(None)
         },
     );
@@ -3315,7 +3308,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "afterPropertiesSet",
         "()V",
         |_ctx, _args| {
-            eprintln!("[REDIS-DBG] EnableRedisKeyspaceNotificationsInitializer.afterPropertiesSet -> no-op");
             Ok(None)
         },
     );
@@ -3347,7 +3339,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "cleanupExpiredSessions",
         "()V",
         |_ctx, _args| {
-            eprintln!("[REDIS-DBG] RedisOperationsSessionRepository.cleanupExpiredSessions -> no-op");
             Ok(None)
         },
     );
@@ -3373,7 +3364,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "scheduleCronTask",
         "(Lorg/springframework/scheduling/config/CronTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
         |_ctx, _args| {
-            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleCronTask -> no-op (null)");
             Ok(Some(Value::Object(None)))
         },
     );
@@ -3382,7 +3372,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "scheduleFixedRateTask",
         "(Lorg/springframework/scheduling/config/FixedRateTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
         |_ctx, _args| {
-            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleFixedRateTask -> no-op (null)");
             Ok(Some(Value::Object(None)))
         },
     );
@@ -3391,7 +3380,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "scheduleFixedDelayTask",
         "(Lorg/springframework/scheduling/config/FixedDelayTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
         |_ctx, _args| {
-            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleFixedDelayTask -> no-op (null)");
             Ok(Some(Value::Object(None)))
         },
     );
@@ -3400,7 +3388,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "scheduleTriggerTask",
         "(Lorg/springframework/scheduling/config/TriggerTask;)Lorg/springframework/scheduling/config/ScheduledTask;",
         |_ctx, _args| {
-            eprintln!("[SCHED-DBG] ScheduledTaskRegistrar.scheduleTriggerTask -> no-op (null)");
             Ok(Some(Value::Object(None)))
         },
     );
@@ -3457,7 +3444,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // SpringFactoriesLoader to read META-INF/spring.factories from nested JARs
         // when it goes through url.openConnection().getInputStream().
         let url_str = huc_url_string(ctx, this);
-        eprintln!("[HUC-DBG] HttpURLConnection.getInputStream url={}", url_str);
         if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
             // Non-HTTP: delegate to URL.openStream() on the stored URL object.
             let url_obj = match ctx.get_field(this, HUC_URL) {
@@ -3592,7 +3578,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "useCachesIfNecessary",
         "(Ljava/net/URLConnection;)V",
         |_ctx, _args| {
-            eprintln!("[SPRING-DBG] ResourceUtils.useCachesIfNecessary intercepted (no-op)");
             Ok(None)
         },
     );
@@ -3977,7 +3962,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "customizeConnection",
         "(Ljava/net/URLConnection;)V",
         |_ctx, _args| {
-            eprintln!("[SPRING-DBG] AbstractFileResolvingResource.customizeConnection(UC) intercepted (no-op)");
             Ok(None)
         },
     );
@@ -3988,7 +3972,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "customizeConnection",
         "(Ljava/net/HttpURLConnection;)V",
         |_ctx, _args| {
-            eprintln!("[SPRING-DBG] AbstractFileResolvingResource.customizeConnection(HUC) intercepted (no-op)");
             Ok(None)
         },
     );

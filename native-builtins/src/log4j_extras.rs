@@ -713,6 +713,75 @@ fn register_simple_logger_methods(registry: &mut NativeMethodRegistry) {
             "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;)Z",
             native_log_is_enabled,
         );
+        // 3+ arg isEnabled overloads. The slf4j bridge
+        // (`org/apache/logging/slf4j/Log4jLogger.isDebugEnabled` etc.)
+        // dispatches `invokeinterface ExtendedLogger.isEnabled(Level,
+        // Marker, String)Z` on the wrapped log4j-core Logger. When that
+        // wrapped Logger is the synthetic instance our `getLogger` shim
+        // hands out, its `privateConfig` instance field is null (the
+        // synthetic alloc bypasses the real ctor that publishes it), so
+        // letting the real bytecode of `core.Logger.isEnabled` run
+        // tripped `NullPointerException: Cannot invoke filter on null`
+        // at log4j-core `Logger.java:177` — the canonical Solr-CLI boot
+        // failure. Register the full overload surface as no-op `false`
+        // so dispatch lands on the native ahead of the field-reading
+        // bytecode, mirroring the 1-/2-arg coverage above. Same
+        // rationale applies to the `Object[]` /
+        // `Object{,Object{,Object...}}` overloads used by parameterised
+        // `info/warn/error` call sites.
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;)Z",
+            native_log_is_enabled,
+        );
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)Z",
+            native_log_is_enabled,
+        );
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/CharSequence;Ljava/lang/Throwable;)Z",
+            native_log_is_enabled,
+        );
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/Object;Ljava/lang/Throwable;)Z",
+            native_log_is_enabled,
+        );
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Lorg/apache/logging/log4j/message/Message;Ljava/lang/Throwable;)Z",
+            native_log_is_enabled,
+        );
+        registry.register(
+            cls,
+            "isEnabled",
+            "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;[Ljava/lang/Object;)Z",
+            native_log_is_enabled,
+        );
+        // Object-tail overloads: (Level, Marker, String, Object) through
+        // (Level, Marker, String, Object x10). Each accepts a fixed
+        // number of `java/lang/Object` parameters before the trailing
+        // `)Z`. Generated with a small helper to keep the registration
+        // surface compact while covering every overload `core.Logger`
+        // ships. The registry hashes class/method/descriptor at
+        // registration time, so the `&str` borrow is short-lived.
+        for n_obj in 1..=10 {
+            let mut desc = String::from(
+                "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;",
+            );
+            for _ in 0..n_obj {
+                desc.push_str("Ljava/lang/Object;");
+            }
+            desc.push_str(")Z");
+            registry.register(cls, "isEnabled", &desc, native_log_is_enabled);
+        }
 
         // The full Logger interface surface is huge (hundreds of
         // overloads of info/warn/error/debug/trace/fatal/log). Register
@@ -785,5 +854,72 @@ mod tests {
             r.find(CN_SIMPLE_LOGGER, "isInfoEnabled", "()Z").is_some(),
             "SimpleLogger.isInfoEnabled() must be registered"
         );
+    }
+
+    /// Regression: the slf4j → log4j bridge's `Log4jLogger.isDebugEnabled`
+    /// dispatches `invokeinterface ExtendedLogger.isEnabled(Level, Marker,
+    /// String)Z` on the wrapped `core.Logger`. Without the no-op native
+    /// override the real bytecode of `core.Logger.isEnabled` ran on our
+    /// synthetic instance and tripped `NullPointerException: Cannot invoke
+    /// filter on null` (`Logger.java:177`) — the canonical Solr-CLI boot
+    /// failure. Confirm the 3-arg overload AND the parameterised
+    /// `Object`-tail variants are all registered on every concrete logger
+    /// receiver class our `getLogger` shim hands out.
+    #[test]
+    fn register_log4j_stubs_covers_three_arg_is_enabled() {
+        let mut r = NativeMethodRegistry::new();
+        register_log4j_stubs(&mut r);
+        for cls in [CN_SIMPLE_LOGGER, CN_CORE_LOGGER, CN_ABSTRACT_LOGGER] {
+            // 3-arg slf4j-bridge dispatch site.
+            assert!(
+                r.find(
+                    cls,
+                    "isEnabled",
+                    "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;)Z",
+                )
+                .is_some(),
+                "{cls}.isEnabled(Level, Marker, String)Z must be registered"
+            );
+            // Throwable-tail.
+            assert!(
+                r.find(
+                    cls,
+                    "isEnabled",
+                    "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)Z",
+                )
+                .is_some(),
+                "{cls}.isEnabled(Level, Marker, String, Throwable)Z must be registered"
+            );
+            // Varargs Object[].
+            assert!(
+                r.find(
+                    cls,
+                    "isEnabled",
+                    "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;[Ljava/lang/Object;)Z",
+                )
+                .is_some(),
+                "{cls}.isEnabled(Level, Marker, String, Object[])Z must be registered"
+            );
+            // Single-Object tail (the first generated overload).
+            assert!(
+                r.find(
+                    cls,
+                    "isEnabled",
+                    "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;Ljava/lang/Object;)Z",
+                )
+                .is_some(),
+                "{cls}.isEnabled(Level, Marker, String, Object)Z must be registered"
+            );
+            // Ten-Object tail (the last generated overload).
+            assert!(
+                r.find(
+                    cls,
+                    "isEnabled",
+                    "(Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/Marker;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Z",
+                )
+                .is_some(),
+                "{cls}.isEnabled(Level, Marker, String, Object x10)Z must be registered"
+            );
+        }
     }
 }

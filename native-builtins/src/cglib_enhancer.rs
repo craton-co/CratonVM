@@ -360,7 +360,6 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let super_class_id = match crate::lang_class::mirror_class_id(ctx, cls_mirror) {
         Some(cid) => cid,
         None => {
-            eprintln!("[CCE] enhance: mirror has no ClassId — fallback to identity");
             return Ok(Some(Value::Object(Some(cls_mirror))));
         }
     };
@@ -368,7 +367,6 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let super_name = match ctx.class_name_of_id(super_class_id) {
         Some(n) => n,
         None => {
-            eprintln!("[CCE] enhance: ClassId has no name — fallback to identity");
             return Ok(Some(Value::Object(Some(cls_mirror))));
         }
     };

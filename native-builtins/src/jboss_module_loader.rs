@@ -742,15 +742,6 @@ pub(crate) fn native_loader_load_module(
         }
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
-    // KC17 Task A — unconditional entry-point trace.  Without this we
-    // cannot distinguish "brute-force walk didn't fire" from "loadModule
-    // wasn't called at all" when keycloak-16 still raises
-    // `NoSuchMethodException: org/jboss/as/server/Main.main`.
-    eprintln!(
-        "[kc17-bf] native_loader_load_module ENTRY: name={:?} brute_force_trigger={}",
-        name,
-        is_brute_force_trigger(&name)
-    );
     if let Err(e) = validate_module_name(&name) {
         return Err(e.into());
     }
@@ -873,7 +864,6 @@ pub(crate) fn native_loader_load_module(
     // The walk runs at most ONCE per `(root, module_name)` pair (tracked in
     // `BRUTE_FORCED_ROOTS`) and is capped at `MAX_BRUTE_FORCE_JARS` so a
     // pathological deep tree cannot stall startup.
-    let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
     if is_brute_force_trigger(&name) {
         // WF32-fix: the brute-force layered-jar walk is now DISABLED by
         // default (opt back in with `CRATONVM_JBOSS_BRUTE_FORCE_JARS=1`).
@@ -915,24 +905,7 @@ pub(crate) fn native_loader_load_module(
         } else {
             Vec::new()
         };
-        eprintln!(
-            "[jboss-bf] module={} | roots={:?} | jars_found={} | brute_force_enabled={}",
-            name,
-            roots,
-            brute_jars.len(),
-            brute_force_enabled
-        );
-        if dbg_wf {
-            for j in brute_jars.iter().take(32) {
-                eprintln!("[wildfly-brute-force]   jar: {}", j.display());
-            }
-        }
         if !brute_jars.is_empty() {
-            // Task A — also log every jar we register so a misconfigured
-            // module-path is diagnosable from CI output.
-            for j in &brute_jars {
-                eprintln!("[jboss-bf]   register jar: {}", j.display());
-            }
             register_resource_roots(ctx, &brute_jars);
         }
 
@@ -978,33 +951,12 @@ pub(crate) fn native_loader_load_module(
                 entry_candidates.push((*fallback).to_string());
             }
         }
-        eprintln!(
-            "[kc17-bf] entry_candidates for module {}: {:?}",
-            name, entry_candidates
-        );
         for candidate in &entry_candidates {
-            match ctx.ensure_class_initialized(candidate) {
-                Ok(_) => {
-                    // RKC19/WF39 Task B — always-on eprintln so the
-                    // pre-warm result is observable in CI output without
-                    // env-var setup.
-                    eprintln!(
-                        "[jboss-bf] ensure_class_initialized OK: {}",
-                        candidate
-                    );
-                }
-                Err(e) => {
-                    // Best-effort pre-warm: a miss here is fully recoverable.
-                    // `Module.run` only ever consults the ONE class recorded
-                    // in `mainClassName`; the other candidates are speculative
-                    // pre-warms for varying WildFly versions. Mark the line
-                    // non-fatal so it is not mistaken for the real boot error.
-                    eprintln!(
-                        "[jboss-bf] ensure_class_initialized miss (non-fatal pre-warm): {} ({:?})",
-                        candidate, e
-                    );
-                }
-            }
+            // Best-effort pre-warm: a miss here is fully recoverable.
+            // `Module.run` only ever consults the ONE class recorded
+            // in `mainClassName`; the other candidates are speculative
+            // pre-warms for varying WildFly versions.
+            let _ = ctx.ensure_class_initialized(candidate);
         }
 
         // Real-bytecode audit: the RKC19/WF39 Task C "synthetic class
@@ -1031,16 +983,9 @@ pub(crate) fn native_loader_load_module(
             let _ = build_synthetic_class_with_main;
         }
         if allow_synth_bytecode { for synth_name in &entry_candidates {
-            // KC17 Task A — surface BOTH facts (class loaded? main present?)
-            // so the keycloak-16 boot trace shows whether the synth path
-            // even runs.
             let cid_pre = ctx.class_id_by_name(synth_name);
             let main_exists_pre =
                 ctx.method_exists(synth_name, "main", "([Ljava/lang/String;)V");
-            eprintln!(
-                "[kc17-bf] pre-synth check {}: class_id={:?} main_exists={}",
-                synth_name, cid_pre, main_exists_pre
-            );
             // KC17 — critical fix.  Previously this guard only checked
             // `class_id_by_name(...).is_some()` and skipped the synth when a
             // class was loaded.  But `ensure_class_initialized` above can
@@ -1053,10 +998,6 @@ pub(crate) fn native_loader_load_module(
             // loaded AND already exposes a `main([Ljava/lang/String;)V`
             // method.  Otherwise re-define so the reflective lookup resolves.
             if cid_pre.is_some() && main_exists_pre {
-                eprintln!(
-                    "[kc17-bf] class already has main(String[]), skip synth: {}",
-                    synth_name
-                );
                 continue;
             }
             let bytecode = build_synthetic_class_with_main(synth_name);
@@ -1074,64 +1015,13 @@ pub(crate) fn native_loader_load_module(
                 allow_redefine: true,
                 ..Default::default()
             };
-            eprintln!(
-                "[wf8] define_class_full(redefine=true, '{}') bytecode_len={} cid_pre={:?} main_pre={}",
-                synth_name,
-                bytecode.len(),
-                cid_pre,
-                main_exists_pre
-            );
-            match ctx.define_class_full(synth_name, &bytecode, 0, force_opts) {
-                Ok(cid) => {
-                    let main_exists_post = ctx
-                        .method_exists(synth_name, "main", "([Ljava/lang/String;)V");
-                    eprintln!(
-                        "[wf8] define_class_full(redefine) OK {} -> cid={:?} main_exists_post={}",
-                        synth_name, cid, main_exists_post
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[wf8] define_class_full(redefine) FAILED for {}: {} — falling back to define_class_from_bytes",
-                        synth_name, e
-                    );
-                    // Last-ditch fallback: try the legacy strict define
-                    // entry point.  Only useful when the class is NOT
-                    // already loaded (cid_pre.is_none()); otherwise the
-                    // strict define will also return None.
-                    match ctx.define_class_from_bytes(synth_name, &bytecode) {
-                        Some(cid) => {
-                            let main_exists_post = ctx.method_exists(
-                                synth_name,
-                                "main",
-                                "([Ljava/lang/String;)V",
-                            );
-                            eprintln!(
-                                "[wf8] define_class_from_bytes OK {} -> cid={:?} main_exists_post={}",
-                                synth_name, cid, main_exists_post
-                            );
-                        }
-                        None => {
-                            eprintln!(
-                                "[wf8] define_class_from_bytes ALSO FAILED for {} — entry class will remain without main()",
-                                synth_name
-                            );
-                        }
-                    }
-                }
+            if let Err(_e) = ctx.define_class_full(synth_name, &bytecode, 0, force_opts) {
+                // Last-ditch fallback: try the legacy strict define
+                // entry point.  Only useful when the class is NOT
+                // already loaded (cid_pre.is_none()); otherwise the
+                // strict define will also return None.
+                let _ = ctx.define_class_from_bytes(synth_name, &bytecode);
             }
-            // KC17 Task D — diagnostic after the (re)definition so the
-            // final state of `org/jboss/as/server/Main` is visible from
-            // CI output.  Logs the class_id AND whether `main` is now
-            // discoverable via the same `method_exists` query that
-            // reflective lookup will use.
-            let cid_post = ctx.class_id_by_name(synth_name);
-            let main_exists_post =
-                ctx.method_exists(synth_name, "main", "([Ljava/lang/String;)V");
-            eprintln!(
-                "[kc17-bf] post-synth state {}: class_id={:?} main_exists={}",
-                synth_name, cid_post, main_exists_post
-            );
         } } // close `for synth_name` and `if allow_synth_bytecode`
     }
 
@@ -1162,24 +1052,8 @@ fn register_resource_roots(ctx: &mut dyn NativeContext, paths: &[PathBuf]) {
             }
         }
     }
-    // RKC19/WF39 Task D — Unconditional eprintln so the brute-force walk's
-    // jar registration is observable in CI output without env-var setup.
-    // On Windows, path normalisation differences (backslash vs forward
-    // slash) can cause `to_string_lossy` to produce a value that
-    // `register_dynamic_classpath` later fails to find — surfacing those
-    // strings here lets us diagnose path mismatches from the test log.
     if !to_register.is_empty() {
-        eprintln!(
-            "[jboss-bf] register_resource_roots: registering {} new path(s): {:?}",
-            to_register.len(),
-            to_register
-        );
         ctx.register_dynamic_classpath(&to_register);
-    } else if !paths.is_empty() {
-        eprintln!(
-            "[jboss-bf] register_resource_roots: {} path(s) already registered (deduped)",
-            paths.len()
-        );
     }
 }
 
@@ -2614,11 +2488,6 @@ fn native_wildfly_main_noop(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    if std::env::var_os("CRATONVM_DBG_WF").is_some() {
-        eprintln!(
-            "[wildfly-main-noop] synthetic main invoked — WildFly boot short-circuited (rc=0)"
-        );
-    }
     Ok(None)
 }
 

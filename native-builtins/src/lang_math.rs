@@ -2249,14 +2249,12 @@ pub(crate) fn alloc_wrapper(ctx: &mut dyn NativeContext, class_name: &str) -> cr
             }
             return ctx.alloc_object(class_id, 1);
         }
-        eprintln!("[alloc_wrapper] Failed to init {}", class_name);
         return ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
     }
     // Non-cached class name (caller used a non-wrapper name).
     match ctx.ensure_class_initialized(class_name) {
         Ok(class_id) => ctx.alloc_object(class_id, 1),
-        Err(e) => {
-            eprintln!("[alloc_wrapper] Failed to init {}: {:?}", class_name, e);
+        Err(_) => {
             ctx.alloc_object(cratonvm_types::ClassId::new(0), 1)
         }
     }

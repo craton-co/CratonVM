@@ -1903,7 +1903,45 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 }
             }
         }
-        1 | 3 => {
+        1 => {
+            // invokespecial: dispatch must NOT virtually re-target onto the
+            // receiver's runtime class. `invoke_or_native` -> `invoke_on_class_shared`
+            // applies the iface/abstract -> receiver-class retarget that
+            // `invokevirtual` semantics require, which for invokespecial turns
+            // a super-call into a self-call and produces unbounded recursion
+            // (e.g. `RunLast.execute` invokespecial-calls `AbstractParseResultHandler.execute`;
+            // APRH is abstract, so the retarget bounces back to `RunLast.execute`
+            // and we recurse forever — surfaced as `StackOverflowError` inside the
+            // picocli `execute` chain on neo4j / keycloak). The `<init>` and
+            // `<clinit>` carve-outs that protect that path in
+            // `invoke_on_class_shared_inner` do NOT cover ordinary super-calls,
+            // so we have to take an invokespecial-aware dispatch path here.
+            //
+            // `invoke_special_shared` matches the interpreter's invokespecial
+            // semantics: walk the hierarchy from the CP-resolved class to the
+            // declaring class for the requested method, then invoke through
+            // `invoke_on_class_shared_no_retarget` so the virtual retarget never
+            // fires. Native-override priority is preserved (same as
+            // `invoke_or_native`).
+            let r = crate::vm::invoke_special_shared(
+                vm,
+                thread,
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+                &values,
+            );
+            match r {
+                Ok(v) => v,
+                Err(e) => {
+                    return handle_jit_dispatch_error(vm, thread, e, info);
+                }
+            }
+        }
+        3 => {
+            // invokestatic: no receiver, no retarget concern. The historical
+            // `invoke_or_native` path is correct here (static method lookup
+            // by class name with native-override priority and superclass walk).
             let r = crate::vm::invoke_or_native(
                 vm,
                 thread,

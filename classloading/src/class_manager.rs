@@ -7071,6 +7071,127 @@ mod tests {
         assert_eq!(total, 5); // 3 inherited + 2 own
     }
 
+    /// Regression: multi-level hierarchy (`grandparent → parent → child`)
+    /// must accumulate inherited instance fields at every level. A subclass's
+    /// `num_total_fields` is **always** `super.num_total_fields + own_instance`
+    /// — not just `own_instance` — so the absolute slot index of a freshly
+    /// declared field stays past the end of every ancestor's layout.
+    ///
+    /// This protects against a regression class observed in the `applogs/
+    /// orchestrator-r1` run, where the `gen_heap::get_field: undersized
+    /// object layout` diagnostic fires for real-JDK classes (e.g.
+    /// `ConcurrentSkipListSet`, `RegularImmutableList`,
+    /// `IdentityHashMap$Values`) — confirming via this test that
+    /// `compute_field_layout` is NOT the source of those diagnostics
+    /// (the corresponding fix lives in the native-dispatch / native-state
+    /// guards, see `al_state` / `cslm_state` in `native-collections`).
+    #[test]
+    fn compute_field_layout_multilevel_hierarchy() {
+        let mut store = ClassStore::new();
+
+        // Grandparent: 2 instance fields.
+        let gp_id = store.next_id();
+        store.add(Class {
+            id: gp_id,
+            loader_id: ClassLoaderId::Application,
+            name: cratonvm_types::intern_arc("Grandparent"),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_constant_pool(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            superclass: None,
+            interfaces: vec![],
+            fields: vec![make_field("gp1", false), make_field("gp2", false)],
+            methods: vec![],
+            first_field_index: 0,
+            num_total_fields: 2,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: false,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        });
+
+        // Parent: 1 own instance field + the 2 inherited from Grandparent.
+        let parent_id = store.next_id();
+        store.add(Class {
+            id: parent_id,
+            loader_id: ClassLoaderId::Application,
+            name: cratonvm_types::intern_arc("Parent"),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_constant_pool(),
+            access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+            superclass: Some(gp_id),
+            interfaces: vec![],
+            fields: vec![make_field("p1", false)],
+            methods: vec![],
+            // 2 (grandparent) + 1 (own) = 3.
+            first_field_index: 2,
+            num_total_fields: 3,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: false,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        });
+
+        // Child: 2 own instance fields. Expect `num_total_fields = 3 + 2 = 5`,
+        // first slot for child's own = 3 (immediately after Parent's layout).
+        let child_fields = vec![make_field("c1", false), make_field("c2", false)];
+        let (first, total) = compute_field_layout(&child_fields, Some(parent_id), &store);
+        assert_eq!(
+            first, 3,
+            "child's first slot must equal Parent.num_total_fields"
+        );
+        assert_eq!(
+            total, 5,
+            "child must accumulate Grandparent (2) + Parent own (1) + own (2)"
+        );
+
+        // Static fields on the child are stored separately and MUST NOT
+        // perturb the instance-slot accounting — verifies the
+        // `!STATIC` filter inside `compute_field_layout`.
+        let mixed_child_fields = vec![
+            make_field("c1", false),       // instance
+            make_field("STATIC_FOO", true), // static — must be ignored
+            make_field("c2", false),       // instance
+        ];
+        let (first2, total2) =
+            compute_field_layout(&mixed_child_fields, Some(parent_id), &store);
+        assert_eq!(first2, 3);
+        assert_eq!(
+            total2, 5,
+            "static fields must not be counted in instance num_total_fields"
+        );
+    }
+
     #[test]
     fn class_manager_empty_classpath() {
         let mut mgr = ClassManager::new(&[], &[], &[]);

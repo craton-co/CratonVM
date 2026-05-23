@@ -272,33 +272,36 @@ pub fn throw_runtime_error(
                         .unwrap_or_default();
                 }
             }
-            // C29 trace: dump caller stack for isInterface NPE
-            if let RuntimeError::NullPointerException { message: Some(m) } = &error {
-                if m.contains("isInterface") {
-                    for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
-                        let cn = shared.class_manager.read()
-                            .get_class(f.class_id)
-                            .map(|c| c.name.clone())
-                            .unwrap_or_default();
-                        eprintln!("C29-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+            // C29 / SUREFIRE NPE traces — opt-in via CRATONVM_DBG_NPE_TRACE.
+            if std::env::var_os("CRATONVM_DBG_NPE_TRACE").is_some() {
+                if let RuntimeError::NullPointerException { message: Some(m) } = &error {
+                    if m.contains("isInterface") {
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
+                            let cn = shared.class_manager.read()
+                                .get_class(f.class_id)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            eprintln!("C29-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
                     }
-                }
-                if m.contains("Name is null") {
-                    eprintln!("SUREFIRE-NPE-TRACE msg={m}");
-                    for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
-                        let cn = shared.class_manager.read()
-                            .get_class(f.class_id)
-                            .map(|c| c.name.clone())
-                            .unwrap_or_default();
-                        eprintln!("SUREFIRE-NPE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                    if m.contains("Name is null") {
+                        eprintln!("SUREFIRE-NPE-TRACE msg={m}");
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                            let cn = shared.class_manager.read()
+                                .get_class(f.class_id)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            eprintln!("SUREFIRE-NPE-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+                        }
                     }
                 }
             }
             // R15 (WildFly): trace NPE origins inside log4j SimpleLoggerContext
             // / PropertiesUtil chain so we can pinpoint which native /
             // bytecode op produces the bare-NPE that bubbles up as the
-            // ExceptionInInitializerError that crashes WildFly boot.
-            {
+            // ExceptionInInitializerError that crashes WildFly boot. Opt-in
+            // via CRATONVM_DBG_WF_NPE to avoid stderr spam during boot.
+            if std::env::var_os("CRATONVM_DBG_WF_NPE").is_some() {
                 let in_log4j_init = thread.frames.iter().any(|f| {
                     let cn = shared.class_manager.read()
                         .get_class(f.class_id)

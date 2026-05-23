@@ -794,21 +794,24 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
     let cls = "java/lang/management/ManagementFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
-    // getPlatformMBeanServer()
-    r.register(
-        cls,
-        "getPlatformMBeanServer",
-        "()Ljavax/management/MBeanServer;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", 2);
-            // field 0 = defaultDomain
-            let domain = ctx.create_string("DefaultDomain");
-            ctx.set_field(obj, 0, Value::Object(Some(domain)));
-            // field 1 = mbeanCount
-            ctx.set_field(obj, 1, Value::Int(9));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
+    // KAFKA-MBEAN: do NOT register a native for
+    // `ManagementFactory.getPlatformMBeanServer()`. The previous synthetic
+    // here allocated `alloc_concurrent_synthetic("javax/management/MBeanServer", 2)`,
+    // whose Class metadata is the *interface* `javax/management/MBeanServer`.
+    // Any subsequent `invokeinterface MBeanServer.registerMBean(...)`
+    // (e.g. Kafka's `kafka.utils.CoreUtils$.registerMBean` at
+    // `CoreUtils.scala:125`) walks the interface as the receiver class,
+    // finds the abstract `registerMBean` declaration with no Code attribute,
+    // and throws `AbstractMethodError: ... has no Code attribute` —
+    // exactly the failure the no-synthetic-stubs policy
+    // (`docs/jvm-no-synthetic-stubs.md`) forbids.
+    //
+    // The real JDK bytecode for `getPlatformMBeanServer()` calls
+    // `MBeanServerFactory.createMBeanServer()` which constructs a real
+    // `com.sun.jmx.mbeanserver.JmxMBeanServer`. That concrete class declares
+    // `registerMBean` with a Code attribute, so the interface dispatch
+    // resolves correctly. Leaving this method unregistered lets the real
+    // JDK code path run end-to-end.
 
     // getRuntimeMXBean()
     r.register(
@@ -1621,9 +1624,15 @@ mod jmx_tests {
         register_jmx_natives(&mut r);
         let cls = "java/lang/management/ManagementFactory";
         assert!(r.find(cls, "<init>", "()V").is_some());
+        // `getPlatformMBeanServer` is intentionally NOT registered (see
+        // KAFKA-MBEAN note in `register_management_factory`): the real JDK
+        // bytecode constructs a concrete `JmxMBeanServer`, which is what
+        // `invokeinterface MBeanServer.registerMBean` requires for correct
+        // dispatch.
         assert!(
             r.find(cls, "getPlatformMBeanServer", "()Ljavax/management/MBeanServer;")
-                .is_some()
+                .is_none(),
+            "getPlatformMBeanServer must not be a synthetic-stub native"
         );
         assert!(
             r.find(cls, "getRuntimeMXBean", "()Ljava/lang/management/RuntimeMXBean;")
@@ -1838,8 +1847,11 @@ mod jmx_tests {
         let mut r = NativeMethodRegistry::new();
         register_jmx_natives(&mut r);
         let cls = "java/lang/management/ManagementFactory";
+        // `getPlatformMBeanServer` is intentionally NOT in this list — the
+        // real JDK bytecode supplies a concrete `JmxMBeanServer`, and a
+        // synthetic-stub native here would break interface dispatch on the
+        // returned receiver (see KAFKA-MBEAN note above).
         let factory_methods = [
-            "getPlatformMBeanServer",
             "getRuntimeMXBean",
             "getMemoryMXBean",
             "getThreadMXBean",
@@ -1851,12 +1863,11 @@ mod jmx_tests {
         for method in &factory_methods {
             // Just check the method name is registered (any descriptor)
             // We already checked specific descriptors above; this ensures
-            // all eight factory methods exist.
+            // all seven factory methods exist.
             let found = r.find(
                 cls,
                 method,
                 match *method {
-                    "getPlatformMBeanServer" => "()Ljavax/management/MBeanServer;",
                     "getRuntimeMXBean" => "()Ljava/lang/management/RuntimeMXBean;",
                     "getMemoryMXBean" => "()Ljava/lang/management/MemoryMXBean;",
                     "getThreadMXBean" => "()Ljava/lang/management/ThreadMXBean;",

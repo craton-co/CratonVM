@@ -10595,6 +10595,11 @@ fn native_object_equals(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         (Value::Object(None), Value::Object(None)) => true,
         _ => false,
     };
+    if std::env::var_os("CRATONVM_DBG_OBJ_EQUALS").is_some() {
+        let aid = match this { Value::Object(Some(o)) => o.as_ptr() as usize, _ => 0 };
+        let bid = match other { Value::Object(Some(o)) => o.as_ptr() as usize, _ => 0 };
+        eprintln!("[obj-eq] a={aid:x} b={bid:x} -> {equal}");
+    }
     Ok(Some(Value::Int(if equal { 1 } else { 0 })))
 }
 

@@ -1599,10 +1599,46 @@ pub fn execute(
         // Spring's `BeanPropertyName.toDashedForm` (`bannerMode` →
         // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
         // `InvalidConfigurationPropertyNameException` during SportMe boot.
-        let native_skip = shared
+        //
+        // bytebuddy_probe — also walk the parent chain so a method whose
+        // *inherited* identity (`Object.equals`/`hashCode`/`toString`) is
+        // serviced by a Rust native cannot be JIT-compiled here. Mirrors the
+        // walk in `try_jit_compile_callee`. Without the parent walk,
+        // `LazyProjection.equals` (ByteBuddy's hierarchy walker, which itself
+        // declares no `equals` native but inherits the identity native
+        // registered on `java/lang/Object`) was JIT-compiled at this site;
+        // the resulting machine code mis-dispatched the inner `invokevirtual
+        // Object.equals` to a constant `false`, breaking ByteBuddy's
+        // `MethodGraph$Compiler$Default.compile` superclass-resolve lookup
+        // (`Failed to resolve super class class java.lang.Object from
+        // [class java.lang.Object]`).
+        let native_skip = if shared
             .native_methods
             .find(&class_name_str, method_name, method_descriptor)
-            .is_some();
+            .is_some()
+        {
+            true
+        } else {
+            let cm = shared.class_manager.read();
+            let mut found = false;
+            if let Some(start_cid) = cm.find_class_by_name(&class_name_str) {
+                let mut cid = start_cid;
+                while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+                    if let Some(parent) = cm.get_class(parent_id) {
+                        if shared
+                            .native_methods
+                            .find(&parent.name, method_name, method_descriptor)
+                            .is_some()
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    cid = parent_id;
+                }
+            }
+            found
+        };
         // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
@@ -8793,6 +8829,66 @@ fn execute_invoke_kind(
                                     &*method_class_name,
                                 );
                             }
+                            // T-DBG: opt-in deep diagnostic. Dump the Java call
+                            // stack and the per-frame locals/operand slots that
+                            // reference this stale address so we can see HOW
+                            // the bad pointer arrived in the receiver slot.
+                            if std::env::var_os("CRATONVM_DBG_STALE_RECV").is_some() {
+                                let stale_addr = obj_ref.as_ptr() as usize;
+                                eprintln!(
+                                    "[stale-recv] ptr=0x{:x} method={}.{}{} — Java frames:",
+                                    stale_addr,
+                                    &*method_class_name,
+                                    &*method_name,
+                                    &*method_descriptor,
+                                );
+                                for (fi, f) in thread.frames.iter().enumerate().rev().take(30) {
+                                    eprintln!(
+                                        "  [{}] {}.{}{} pc={}",
+                                        fi,
+                                        f.class_name(),
+                                        f.method_name(),
+                                        f.method_descriptor(),
+                                        f.pc,
+                                    );
+                                    for li in 0..f.locals_len() {
+                                        let v = f.get_local(li as u16);
+                                        if let Value::Object(Some(o)) = v {
+                                            let addr = o.as_ptr() as usize;
+                                            let marker =
+                                                if addr == stale_addr { "STALE" } else { "" };
+                                            // Probe the header of every Object
+                                            // local: a non-zero hash means it
+                                            // looks live, all-zero means it
+                                            // shares the stale fate.
+                                            let bytes: [u8; 16] = unsafe {
+                                                std::ptr::read(addr as *const [u8; 16])
+                                            };
+                                            let all_zero = bytes == [0u8; 16];
+                                            eprintln!(
+                                                "      LOCAL[{}] -> 0x{:x} all_zero_header={} {}",
+                                                li, addr, all_zero, marker,
+                                            );
+                                        }
+                                    }
+                                    for si in 0..f.stack.len() {
+                                        let v = f.stack.get_value(si);
+                                        if let Value::Object(Some(o)) = v {
+                                            let addr = o.as_ptr() as usize;
+                                            let marker =
+                                                if addr == stale_addr { "STALE" } else { "" };
+                                            let bytes: [u8; 16] = unsafe {
+                                                std::ptr::read(addr as *const [u8; 16])
+                                            };
+                                            let all_zero = bytes == [0u8; 16];
+                                            eprintln!(
+                                                "      STACK[{}] -> 0x{:x} all_zero_header={} {}",
+                                                si, addr, all_zero, marker,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             method_class_name.clone()
                         } else {
                             // S111r8: cid=0 with non-zero header means a
@@ -12155,6 +12251,19 @@ fn try_jit_upgrade_with_gate(
     // `BeanPropertyName.toDashedForm` (`bannerMode` →
     // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0`) and tripping
     // `InvalidConfigurationPropertyNameException` during SportMe boot.
+    //
+    // bytebuddy_probe — also walk the parent chain so a method whose
+    // *inherited* identity (`Object.equals`/`hashCode`/`toString`) is
+    // serviced by a Rust native cannot be JIT-compiled via this upgrade
+    // path either. Mirrors the walk in `try_jit_compile_callee`. Without
+    // it, `LazyProjection.equals` (ByteBuddy's hierarchy walker, which
+    // itself has no `equals` native but inherits the identity native
+    // registered on `java/lang/Object`) was JIT-compiled here, and the
+    // resulting machine code mis-dispatched the inner `invokevirtual
+    // Object.equals` to a constant `false`, breaking ByteBuddy's
+    // `MethodGraph$Compiler$Default.compile` superclass-resolve lookup
+    // (`Failed to resolve super class class java.lang.Object from
+    // [class java.lang.Object]`).
     {
         if shared
             .native_methods
@@ -12162,6 +12271,22 @@ fn try_jit_upgrade_with_gate(
             .is_some()
         {
             return None;
+        }
+        let cm = shared.class_manager.read();
+        if let Some(start_cid) = cm.find_class_by_name(&cached.class_name) {
+            let mut cid = start_cid;
+            while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+                if let Some(parent) = cm.get_class(parent_id) {
+                    if shared
+                        .native_methods
+                        .find(&parent.name, &cached.method_name, &cached.method_descriptor)
+                        .is_some()
+                    {
+                        return None;
+                    }
+                }
+                cid = parent_id;
+            }
         }
     }
     // W2-CHM: honor the JIT skip list on this caller-method-counter
