@@ -213,6 +213,16 @@ pub trait NativeContext {
     /// calls `runtime::offload::device_cache::release(handle)`.
     fn gpu_release_array_cache(&mut self, _handle: u64) {}
 
+    /// Phase 10 #1 — wipe the explicit-submit input-residency cache.
+    /// Called by `Native.releaseExecutor` so the device buffers
+    /// cached by plain `int[]` / `long[]` / `float[]` / `double[]`
+    /// args to `submitMethod` are freed when the Java
+    /// `GpuExecutor` is closed.
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override
+    /// calls `runtime::offload::input_cache::clear_all()`.
+    fn gpu_clear_input_cache(&mut self) {}
+
     /// Phase 9 #1 — materialise the device-side buffer's contents
     /// into host bytes if (and only if) the cache entry is dirty
     /// from a prior kernel's writes. Returns

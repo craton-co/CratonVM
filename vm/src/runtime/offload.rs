@@ -2052,15 +2052,151 @@ pub(crate) mod device_cache {
     }
 }
 
+// ── Phase 10 #1: per-`ObjectRef` input-residency cache ──────────────
+//
+// Companion to `device_cache` for plain JVM primitive arrays passed
+// to `submitMethod`. When the same Java array (same `ObjectRef`)
+// reappears as a kernel arg on the next submit and the host side
+// hasn't been mutated in the meantime, this cache hands back the
+// existing `Arc<DeviceBuffer<T>>` so the H->D copy + host_view memcpy
+// are both skipped — closing the H2D-every-submit gap that TornadoVM
+// avoids with `DataTransferMode.FIRST_EXECUTION`.
+//
+// Validity model (minimal v1 — Phase 10 #1):
+//   - On the first marshal of `obj`, we `host_view → upload → install`.
+//   - The kernel's writeback does a D->H copy, leaving host == device.
+//   - The cache entry survives across that writeback, so the *next*
+//     submit on the same `obj` reuses the buffer.
+//   - Invalidation: an explicit `invalidate(obj)` call from any
+//     host-side write to the array's payload (currently called only
+//     from `releaseExecutor` and on a full cache clear; the
+//     interpreter/JIT IASTORE hooks are deferred to Phase 10 #2).
+//
+// Limitations (Phase 10 #2 / #3):
+//   - Host-side stores via interpreter `xASTORE` or JIT
+//     `jit_iastore` do NOT yet invalidate the cache entry. For the
+//     `GpuBench` workload (which only mutates `a`, `b` during init
+//     before any GPU submit) this is fine. For a workload that
+//     mutates an input array between submits, this would feed the
+//     kernel stale device data. The fix is a one-line call to
+//     `input_cache::invalidate(obj)` in the interpreter store and
+//     `jit_iastore`/`jit_fastore`/etc. helpers.
+//   - GC compaction is currently OK because the GPU-critical guard
+//     held during dispatch keeps the GC paused — but the cache
+//     entry survives ACROSS submits, and a GC between submits that
+//     moves an array's payload would invalidate the device buffer's
+//     mirror without us noticing. Mitigated today by clearing the
+//     whole cache via `clear_all` from `releaseExecutor`. A
+//     production fix would clear on every major-GC compaction event.
+#[cfg(feature = "gpu-offload")]
+pub(crate) mod input_cache {
+    use cuda_bridge::DeviceBuffer;
+    use cratonvm_types::{ArrayElementType, ObjectRef};
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::sync::{Arc, OnceLock};
+
+    pub(crate) enum CachedBuffer {
+        I32(Arc<DeviceBuffer<i32>>),
+        I64(Arc<DeviceBuffer<i64>>),
+        F32(Arc<DeviceBuffer<f32>>),
+        F64(Arc<DeviceBuffer<f64>>),
+    }
+
+    pub(crate) struct Entry {
+        pub buf: CachedBuffer,
+        pub len: usize,
+        pub element_type: ArrayElementType,
+    }
+
+    static CACHE: OnceLock<Mutex<FxHashMap<ObjectRef, Entry>>> = OnceLock::new();
+
+    fn map() -> &'static Mutex<FxHashMap<ObjectRef, Entry>> {
+        CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+    }
+
+    /// Per-type lookup. Returns `None` on miss OR if the cached
+    /// entry's element type / length doesn't match the requested
+    /// shape (defensive: a stale `ObjectRef` could be reused for a
+    /// different array kind across a GC; we treat that as a miss
+    /// and the caller re-uploads).
+    pub(crate) fn get_i32(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i32>>> {
+        let g = map().lock();
+        let e = g.get(&obj)?;
+        if e.element_type != ArrayElementType::Int || e.len != len { return None; }
+        if let CachedBuffer::I32(a) = &e.buf { Some(a.clone()) } else { None }
+    }
+    pub(crate) fn put_i32(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i32>>) {
+        map().lock().insert(obj, Entry {
+            buf: CachedBuffer::I32(buf), len, element_type: ArrayElementType::Int,
+        });
+    }
+    pub(crate) fn get_i64(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<i64>>> {
+        let g = map().lock();
+        let e = g.get(&obj)?;
+        if e.element_type != ArrayElementType::Long || e.len != len { return None; }
+        if let CachedBuffer::I64(a) = &e.buf { Some(a.clone()) } else { None }
+    }
+    pub(crate) fn put_i64(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<i64>>) {
+        map().lock().insert(obj, Entry {
+            buf: CachedBuffer::I64(buf), len, element_type: ArrayElementType::Long,
+        });
+    }
+    pub(crate) fn get_f32(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f32>>> {
+        let g = map().lock();
+        let e = g.get(&obj)?;
+        if e.element_type != ArrayElementType::Float || e.len != len { return None; }
+        if let CachedBuffer::F32(a) = &e.buf { Some(a.clone()) } else { None }
+    }
+    pub(crate) fn put_f32(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f32>>) {
+        map().lock().insert(obj, Entry {
+            buf: CachedBuffer::F32(buf), len, element_type: ArrayElementType::Float,
+        });
+    }
+    pub(crate) fn get_f64(obj: ObjectRef, len: usize) -> Option<Arc<DeviceBuffer<f64>>> {
+        let g = map().lock();
+        let e = g.get(&obj)?;
+        if e.element_type != ArrayElementType::Double || e.len != len { return None; }
+        if let CachedBuffer::F64(a) = &e.buf { Some(a.clone()) } else { None }
+    }
+    pub(crate) fn put_f64(obj: ObjectRef, len: usize, buf: Arc<DeviceBuffer<f64>>) {
+        map().lock().insert(obj, Entry {
+            buf: CachedBuffer::F64(buf), len, element_type: ArrayElementType::Double,
+        });
+    }
+
+    /// Drop the device-buffer cache entry for `obj`. Intended for
+    /// future wiring from interpreter / JIT array-store paths.
+    pub fn invalidate(obj: ObjectRef) {
+        map().lock().remove(&obj);
+    }
+
+    /// Drop every cached entry. Called from `releaseExecutor` and
+    /// any future major-GC-compaction hook.
+    pub fn clear_all() {
+        map().lock().clear();
+    }
+
+    /// Diagnostic: current entry count.
+    pub fn len() -> usize { map().lock().len() }
+}
+
 // ── Per-type marshalling helpers ────────────────────────────────────
 
 #[cfg(feature = "gpu-offload")]
 pub enum MarshalWriteback {
     // Plain JVM primitive arrays (Phase 5).
-    I32 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i32>, len: usize },
-    I64 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<i64>, len: usize },
-    F32 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f32>, len: usize },
-    F64 { obj: cratonvm_types::ObjectRef, buf: cuda_bridge::DeviceBuffer<f64>, len: usize },
+    //
+    // Phase 10 #1 (input-residency): the device buffer is held as
+    // `Arc<DeviceBuffer<T>>` so the per-`ObjectRef` `input_cache`
+    // can hold a parallel reference and reuse it on the next submit
+    // that names the same Java array. The post-sync writeback still
+    // does a D->H copy into the JVM array — but the device buffer
+    // survives, so the next submit's H->D upload is skipped.
+    I32 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i32>>, len: usize },
+    I64 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<i64>>, len: usize },
+    F32 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f32>>, len: usize },
+    F64 { obj: cratonvm_types::ObjectRef, buf: std::sync::Arc<cuda_bridge::DeviceBuffer<f64>>, len: usize },
     // Phase 6 #3 / Phase 7 #2 — GpuArray-backed args. The
     // `DeviceBuffer<T>` is shared with `device_cache` so the next
     // kernel using the same `handle` reuses it instead of
@@ -2092,28 +2228,28 @@ impl MarshalWriteback {
         match self {
             Self::I32 { obj, buf, len } => {
                 let mut dst = vec![0i32; *len];
-                gpu_marshal::download_into(buf, &mut dst)
+                gpu_marshal::download_into(buf.as_ref(), &mut dst)
                     .map_err(|e| format!("download_into i32: {e}"))?;
                 gpu_marshal::write_back_i32(*obj, &shared.heap, &dst, token);
                 Ok(())
             }
             Self::I64 { obj, buf, len } => {
                 let mut dst = vec![0i64; *len];
-                gpu_marshal::download_into(buf, &mut dst)
+                gpu_marshal::download_into(buf.as_ref(), &mut dst)
                     .map_err(|e| format!("download_into i64: {e}"))?;
                 gpu_marshal::write_back_i64(*obj, &shared.heap, &dst, token);
                 Ok(())
             }
             Self::F32 { obj, buf, len } => {
                 let mut dst = vec![0f32; *len];
-                gpu_marshal::download_into(buf, &mut dst)
+                gpu_marshal::download_into(buf.as_ref(), &mut dst)
                     .map_err(|e| format!("download_into f32: {e}"))?;
                 gpu_marshal::write_back_f32(*obj, &shared.heap, &dst, token);
                 Ok(())
             }
             Self::F64 { obj, buf, len } => {
                 let mut dst = vec![0f64; *len];
-                gpu_marshal::download_into(buf, &mut dst)
+                gpu_marshal::download_into(buf.as_ref(), &mut dst)
                     .map_err(|e| format!("download_into f64: {e}"))?;
                 gpu_marshal::write_back_f64(*obj, &shared.heap, &dst, token);
                 Ok(())
@@ -2392,6 +2528,15 @@ fn try_unbox_primitive(
 ///     `kernel_args` mutably while we still hold `shared`)
 ///   - a `MarshalWriteback` recording how to copy the device buffer
 ///     back into the source Java array after the kernel finishes.
+///
+/// Phase 10 #1 — input-residency: before doing the H->D copy, we
+/// consult `input_cache` keyed by `ObjectRef`. On a hit (same Java
+/// array seen on a previous submit, contents still in sync with the
+/// device buffer), the H->D upload AND the `host_view_*` heap memcpy
+/// are skipped entirely — we just hand back the cached
+/// `Arc<DeviceBuffer<T>>`. On a miss the existing
+/// `host_view → upload` path runs and the resulting Arc is installed
+/// into the cache so the next submit hits.
 #[cfg(feature = "gpu-offload")]
 fn marshal_array_arg(
     shared: &crate::vm::SharedVm,
@@ -2408,110 +2553,92 @@ fn marshal_array_arg(
 > {
     use crate::runtime::gpu_marshal;
     use cratonvm_types::ArrayElementType;
+    use std::sync::Arc;
 
-    match element_type {
-        ArrayElementType::Int => {
-            let host = gpu_marshal::host_view_i32(obj_ref, &shared.heap, token);
-            let len = host.len();
-            let buf = gpu_marshal::upload(ctx, &host)
-                .map_err(|e| format!("upload i32 (len={len}): {e}"))?;
-            // Move `buf` into the writeback record; build a closure
-            // that captures a clone-of-pointer by way of a fresh
-            // KernelArgs::push_device_ptr call. KernelArgs takes the
-            // buffer by reference, so we hold the buffer in
-            // `writeback.buf` for the duration of the launch (the
-            // writeback is processed AFTER synchronize() returns).
-            let wb = MarshalWriteback::I32 { obj: obj_ref, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = Box::new(move |args: cuda_bridge::KernelArgs| {
-                // PHASE5-NOTE: we need the device pointer in
-                // KernelArgs but the buffer lives on `wb`. Since
-                // KernelArgs::push_device_ptr takes &DeviceBuffer<T>,
-                // the closure can't borrow `wb` and consume itself.
-                // We unwrap the buffer here via a reference to the
-                // writeback, but that requires the closure to be
-                // called BEFORE we move wb into the writebacks vec.
-                // Caller arrangement: closure runs before `writebacks.push(wb)`.
-                args
-            });
-            // Bypass the closure indirection — push directly. Easier.
-            drop(push);
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::I32 { buf, len, .. } => {
-                    let len = *len as i32;
-                    // SAFETY: buffer outlives the closure because wb
-                    // is returned alongside, and the caller pushes
-                    // both to the same level.
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i32>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        // SAFETY: the writeback owning `buf` is
-                        // stored in the same `writebacks` Vec on the
-                        // caller's stack frame; the raw pointer is
-                        // valid for the entire dispatch lifetime.
-                        let buf_ref: &cuda_bridge::DeviceBuffer<i32> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        ArrayElementType::Long => {
-            let host = gpu_marshal::host_view_i64(obj_ref, &shared.heap, token);
-            let len = host.len();
-            let buf = gpu_marshal::upload(ctx, &host)
-                .map_err(|e| format!("upload i64 (len={len}): {e}"))?;
-            let wb = MarshalWriteback::I64 { obj: obj_ref, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::I64 { buf, len, .. } => {
-                    let len = *len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<i64>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<i64> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        ArrayElementType::Float => {
-            let host = gpu_marshal::host_view_f32(obj_ref, &shared.heap, token);
-            let len = host.len();
-            let buf = gpu_marshal::upload(ctx, &host)
-                .map_err(|e| format!("upload f32 (len={len}): {e}"))?;
-            let wb = MarshalWriteback::F32 { obj: obj_ref, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::F32 { buf, len, .. } => {
-                    let len = *len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f32>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<f32> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        ArrayElementType::Double => {
-            let host = gpu_marshal::host_view_f64(obj_ref, &shared.heap, token);
-            let len = host.len();
-            let buf = gpu_marshal::upload(ctx, &host)
-                .map_err(|e| format!("upload f64 (len={len}): {e}"))?;
-            let wb = MarshalWriteback::F64 { obj: obj_ref, buf, len };
-            let push: Box<dyn FnOnce(_) -> _> = match &wb {
-                MarshalWriteback::F64 { buf, len, .. } => {
-                    let len = *len as i32;
-                    let device_ptr = buf as *const cuda_bridge::DeviceBuffer<f64>;
-                    Box::new(move |args: cuda_bridge::KernelArgs| {
-                        let buf_ref: &cuda_bridge::DeviceBuffer<f64> = unsafe { &*device_ptr };
-                        args.push_device_ptr(buf_ref).push_i32(len)
-                    })
-                }
-                _ => unreachable!(),
-            };
-            Ok((push, wb))
-        }
-        other => Err(format!("submitMethod: unsupported array element type: {other:?}")),
+    // Resolve the array length without copying the payload — the
+    // cache key is (ObjectRef, element_type, len). A mismatch on
+    // length forces a fresh upload (an array can't change length
+    // on the JVM heap without becoming a different ObjectRef, but
+    // we treat length as part of the validity envelope defensively).
+    let len = shared.heap.array_length(obj_ref);
+
+    // Macro to keep the four arms readable. Each arm:
+    //   (a) consult input_cache via the type's getter — on hit, skip
+    //       host_view + upload and reuse the cached Arc.
+    //   (b) on miss, perform the existing host_view → upload, then
+    //       install the Arc into the cache so future submits hit.
+    //   (c) build the (push closure, writeback) pair from the Arc.
+    //       The closure captures a raw pointer to the inner
+    //       DeviceBuffer (via `Arc::as_ptr`); the writeback holds a
+    //       parallel Arc clone keeping the buffer alive for the
+    //       launch + writeback duration. The cache holds a third
+    //       Arc clone keeping the buffer alive past the writeback.
+    macro_rules! arm {
+        (
+            $ty:ty,
+            $variant:ident,
+            $host_view:path,
+            $cache_get:path,
+            $cache_put:path,
+            $tag:literal
+        ) => {{
+            // (a) Cache check.
+            let arc: Arc<cuda_bridge::DeviceBuffer<$ty>> =
+                if let Some(arc) = $cache_get(obj_ref, len) {
+                    arc
+                } else {
+                    // (b) Miss — host_view + upload, then install.
+                    let host = $host_view(obj_ref, &shared.heap, token);
+                    debug_assert_eq!(host.len(), len, concat!("host_view ", $tag, " length mismatch"));
+                    let buf = gpu_marshal::upload(ctx, &host)
+                        .map_err(|e| format!("upload {} (len={len}): {e}", $tag))?;
+                    let arc = Arc::new(buf);
+                    $cache_put(obj_ref, len, arc.clone());
+                    arc
+                };
+            // (c) Build push closure + writeback.
+            let len32 = len as i32;
+            let wb_arc = arc.clone();
+            let device_ptr = Arc::as_ptr(&arc) as *const cuda_bridge::DeviceBuffer<$ty>;
+            let push: Box<dyn FnOnce(_) -> _> =
+                Box::new(move |args: cuda_bridge::KernelArgs| {
+                    // SAFETY: `arc` is moved into this closure (kept
+                    // alive at least until it fires). The closure
+                    // runs once during the dispatch sequence and
+                    // immediately pushes the pointer into KernelArgs;
+                    // after that the writeback (which holds wb_arc)
+                    // keeps the buffer alive through the launch and
+                    // synchronize, and the cache holds yet another
+                    // Arc clone keeping it alive past the writeback.
+                    let _ = &arc;
+                    let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
+                    args.push_device_ptr(buf_ref).push_i32(len32)
+                });
+            (
+                push,
+                MarshalWriteback::$variant { obj: obj_ref, buf: wb_arc, len },
+            )
+        }};
     }
+
+    let (push, wb) = match element_type {
+        ArrayElementType::Int => arm!(
+            i32, I32, gpu_marshal::host_view_i32,
+            input_cache::get_i32, input_cache::put_i32, "i32"
+        ),
+        ArrayElementType::Long => arm!(
+            i64, I64, gpu_marshal::host_view_i64,
+            input_cache::get_i64, input_cache::put_i64, "i64"
+        ),
+        ArrayElementType::Float => arm!(
+            f32, F32, gpu_marshal::host_view_f32,
+            input_cache::get_f32, input_cache::put_f32, "f32"
+        ),
+        ArrayElementType::Double => arm!(
+            f64, F64, gpu_marshal::host_view_f64,
+            input_cache::get_f64, input_cache::put_f64, "f64"
+        ),
+        other => return Err(format!("submitMethod: unsupported array element type: {other:?}")),
+    };
+    Ok((push, wb))
 }

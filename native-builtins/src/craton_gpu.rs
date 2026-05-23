@@ -410,15 +410,23 @@ fn builtin_open_executor(
 }
 
 /// `Native.releaseExecutor(long handle)`
+///
+/// Phase 10 #1: also flushes the explicit-submit input-residency
+/// cache so device buffers cached for plain JVM primitive arrays
+/// are freed when the Java `GpuExecutor` is closed. (Stricter than
+/// strictly needed — multiple executors share the same global
+/// cache, so closing one wipes residency for the others too — but
+/// `GpuExecutor.close()` is rare and idempotent eviction is safe.)
 #[cfg(feature = "gpu-offload")]
 fn builtin_release_executor(
-    _ctx: &mut dyn cratonvm_native_api::NativeContext,
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let handle = arg_long(args, 0) as u64;
     state::with(|s| {
         s.executors.remove(&handle);
     });
+    ctx.gpu_clear_input_cache();
     Ok(None)
 }
 

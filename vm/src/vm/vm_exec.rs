@@ -1070,6 +1070,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    /// Phase 10 #1: wipe the explicit-submit input-residency
+    /// cache. Called from `Native.releaseExecutor` so device
+    /// buffers cached for plain JVM primitive arrays are freed when
+    /// the Java `GpuExecutor` is closed.
+    fn gpu_clear_input_cache(&mut self) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::input_cache::clear_all();
+        }
+    }
+
     /// Phase 9 #1: materialise dirty device-side bytes into a
     /// host buffer. The caller (the `Native.arrayToHost` shim)
     /// stamps the returned bytes into the resident store before
