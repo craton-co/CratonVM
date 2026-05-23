@@ -734,27 +734,70 @@ impl GenerationalHeap {
             return Value::Object(None);
         }
         if index >= num_slots {
-            // Layout mismatch — return null/zero instead of reading past
-            // the object. Resolve the class name + real declared field
-            // count so the orchestrator can spot undersized-layout bugs
-            // (see the matching `set_field` diagnostic below).
+            // Out-of-bounds field read. Resolve the class name + real
+            // declared field count so the orchestrator can spot which of
+            // two distinct bug classes this is:
+            //
+            //   (A) `real_field_count > num_slots` — TRUE undersized layout.
+            //       The class declares more instance fields than the
+            //       allocation site asked for, so even an own-class
+            //       `getfield` can read past the object. This is the real
+            //       allocator-side bug (the `PrintStream` 1-field-stub fix
+            //       in commit cf1b478 was this case).
+            //
+            //   (B) `real_field_count <= num_slots` (typically equal) —
+            //       CALLER-SIDE wrong-slot dispatch. The class layout is
+            //       correct, but the caller used a slot index past the
+            //       receiver's layout. The canonical pattern is a
+            //       speculative collection-layout probe in
+            //       `collect_collection_elements` / `read_java_string`
+            //       reading slot 1 or 2 on a 1-slot object (e.g.
+            //       `TypeList$Generic$Empty`, `RegularImmutableList`,
+            //       `IdentityHashMap$Values`, `Collections$EmptyList`)
+            //       or slot 0 on a 0-slot object (e.g. cglib's
+            //       `MethodInterceptorGenerator`).
+            //
+            // Both cases return `Value::Object(None)` here so the caller
+            // sees a benign null read instead of a SIGSEGV. The two cases
+            // are distinguished by log level (error vs. warn) and message
+            // text so the orchestrator's `grep undersized` continues to
+            // flag (A) while (B) is triageable as a separate workstream.
             let (class_name, real_fields) =
                 match crate::gc::resolve_class_info(header.class_id.as_u32()) {
                     Some((name, n)) => (name, Some(n)),
                     None => ("<unresolved>".to_string(), None),
                 };
-            tracing::error!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj_ref.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                class_name = %class_name,
-                real_field_count = ?real_fields,
-                "gen_heap::get_field: out-of-bounds field read dropped \
-                 (undersized object layout — class declares more fields \
-                 than the object was allocated with)",
-            );
+            let is_true_undersized = real_fields.is_some_and(|n| n > num_slots);
+            if is_true_undersized {
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    obj = ?obj_ref.as_ptr(),
+                    index,
+                    num_slots,
+                    class_id = ?header.class_id,
+                    class_name = %class_name,
+                    real_field_count = ?real_fields,
+                    "gen_heap::get_field: out-of-bounds field read dropped \
+                     (undersized object layout — class declares more fields \
+                     than the object was allocated with)",
+                );
+            } else {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    obj = ?obj_ref.as_ptr(),
+                    index,
+                    num_slots,
+                    class_id = ?header.class_id,
+                    class_name = %class_name,
+                    real_field_count = ?real_fields,
+                    "gen_heap::get_field: out-of-bounds field read dropped \
+                     (caller used slot index past receiver's layout — \
+                     class layout is correct; the bug is in the caller's \
+                     slot computation, typically a speculative \
+                     collection-layout probe dispatched on a non-matching \
+                     receiver type)",
+                );
+            }
             if std::env::var("CRATONVM_DBG_OOBFIELD").is_ok() {
                 eprintln!(
                     "[OOBFIELD-READ] class={class_name} index={index} num_slots={num_slots}\n{}",
@@ -805,34 +848,60 @@ impl GenerationalHeap {
         }
         if index >= num_slots {
             // Out-of-bounds writes are dropped rather than corrupting the
-            // neighboring object, but log first — silently swallowing this
-            // masks real layout-mismatch bugs in the caller.
+            // neighboring object. The diagnostic distinguishes between two
+            // distinct bug classes (matches the same split in `get_field`
+            // above):
             //
-            // Triage diagnostic: resolve the raw `ClassId` to the class
-            // NAME and its REAL declared field count via the VM-installed
-            // hook. `real_field_count > num_slots` is the smoking gun for
-            // an undersized synthetic-stub allocation: the object was
-            // allocated with `num_slots` slots but the class actually
-            // declares more — the same bug class as the `PrintStream`
-            // 1-field-stub fix (commit cf1b478).
+            //   (A) `real_field_count > num_slots` — TRUE undersized layout.
+            //       The class declares more instance fields than the
+            //       allocation site asked for. This is the original smoking-
+            //       gun case (PrintStream 1-field stub, commit cf1b478) and
+            //       is still logged at `error!` level.
+            //
+            //   (B) `real_field_count <= num_slots` — CALLER-SIDE wrong slot.
+            //       The class layout is correct; a writer used a slot index
+            //       past the receiver's layout. Canonical instance: a
+            //       JIT/interpreter path writes Class-mirror slots 96/97 on
+            //       a 19-slot Class (`ignite.err`). Logged at `warn!` so the
+            //       orchestrator's `grep -E "undersized"` still surfaces (A) —
+            //       the real allocator bugs — while (B) is a separate triage
+            //       workstream.
             let (class_name, real_fields) =
                 match crate::gc::resolve_class_info(header.class_id.as_u32()) {
                     Some((name, n)) => (name, Some(n)),
                     None => ("<unresolved>".to_string(), None),
                 };
-            tracing::error!(
-                target: "cratonvm::gc::guard",
-                obj = ?obj_ref.as_ptr(),
-                index,
-                num_slots,
-                class_id = ?header.class_id,
-                class_name = %class_name,
-                real_field_count = ?real_fields,
-                value = ?value,
-                "gen_heap::set_field: out-of-bounds field write dropped \
-                 (undersized object layout — class declares more fields \
-                 than the object was allocated with)",
-            );
+            let is_true_undersized = real_fields.is_some_and(|n| n > num_slots);
+            if is_true_undersized {
+                tracing::error!(
+                    target: "cratonvm::gc::guard",
+                    obj = ?obj_ref.as_ptr(),
+                    index,
+                    num_slots,
+                    class_id = ?header.class_id,
+                    class_name = %class_name,
+                    real_field_count = ?real_fields,
+                    value = ?value,
+                    "gen_heap::set_field: out-of-bounds field write dropped \
+                     (undersized object layout — class declares more fields \
+                     than the object was allocated with)",
+                );
+            } else {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    obj = ?obj_ref.as_ptr(),
+                    index,
+                    num_slots,
+                    class_id = ?header.class_id,
+                    class_name = %class_name,
+                    real_field_count = ?real_fields,
+                    value = ?value,
+                    "gen_heap::set_field: out-of-bounds field write dropped \
+                     (caller used slot index past receiver's layout — \
+                     class layout is correct; the bug is in the caller's \
+                     slot computation)",
+                );
+            }
             return;
         }
         debug_assert!(index < self.get_header(obj_ref).num_slots as usize);

@@ -245,6 +245,20 @@ pub fn read_java_string(heap: &VmHeap, obj_ref: ObjectRef) -> Option<String> {
 /// When `compact_override` is true, reads compact layout; when false, tries
 /// to auto-detect by examining the array element type.
 fn read_java_string_inner(heap: &VmHeap, obj_ref: ObjectRef, _compact_override: bool) -> Option<String> {
+    // Undersized-receiver guard. This function is invoked speculatively by
+    // hash-key / equality / toString helpers (`map_hash_key`,
+    // `obj_to_display_string`, etc.) that don't know whether the receiver
+    // is actually a `java/lang/String`. When called with a non-String
+    // 0-slot or 1-slot object — e.g. a static-only class such as
+    // `net/sf/cglib/proxy/MethodInterceptorGenerator` (0 instance fields)
+    // used as a HashMap key — the unguarded `get_field(obj, 0)` and
+    // `get_field(obj, 1)` reads below fired the `gen_heap::get_field`
+    // out-of-bounds-read diagnostic for every probe. A String always has
+    // at least 2 slots (value + coder), so anything smaller cannot be a
+    // String and the right answer is `None`.
+    if heap.num_fields(obj_ref) < 2 {
+        return None;
+    }
     // Read field 0 (the value array)
     let value_array = match heap.get_field(obj_ref, 0) {
         Value::Object(Some(arr)) => arr,

@@ -3925,6 +3925,17 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(keys.len() as i32));
+    // Back-reference to the source HashSet so `remove()` can mutate it.
+    // Without this, `Iterator.remove()` falls through to the JDK default
+    // method on `java.util.Iterator`, which throws
+    // `UnsupportedOperationException("remove")` and breaks JDK code paths
+    // that legitimately need iterator-based removal — most notably
+    // `com.sun.jmx.mbeanserver.MXBeanSupport.findMXBeanInterface`, which
+    // does `it.remove()` inside its set-reduction loop. WildFly / Keycloak
+    // hit this when registering `sun.management.GarbageCollectorImpl` as
+    // an MXBean.
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_SOURCE, Value::Object(Some(this)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -4010,7 +4021,18 @@ fn al_itr_last_ret_slot(ctx: &dyn NativeContext) -> usize {
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
-const MAP_KEY_ITR_NUM_FIELDS: usize = 3;
+/// Optional back-reference to the source collection. When set, the
+/// iterator's `remove()` delegates to the source's `remove(Object)` so the
+/// underlying state stays in sync. Older iterator-allocation sites that
+/// pre-date this field leave it null; on those instances `remove()`
+/// behaves like the JDK default (throws `UnsupportedOperationException`).
+const MAP_KEY_ITR_FIELD_SOURCE: usize = 3;
+/// Index of the last key returned by `next()`. `-1` (default for unset
+/// iterators) means `next()` hasn't been called yet or `remove()` was
+/// already invoked once — `remove()` then throws `IllegalStateException`,
+/// matching `java.util.HashMap$HashIterator.remove()`.
+const MAP_KEY_ITR_FIELD_LAST_RET: usize = 4;
+const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     // ArrayList$Itr
@@ -4046,6 +4068,89 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_map_key_itr_next,
     );
+    // `remove()` delegates to the source collection's `remove(Object)`.
+    // Required for JDK code paths that iterate a set with the intent of
+    // removing entries — e.g. `MXBeanSupport.findMXBeanInterface`'s
+    // candidate-reduction loop (`it.remove()` on a `HashSet<Class<?>>`).
+    // Without this override, the JDK's default `Iterator.remove()` throws
+    // `UnsupportedOperationException("remove")` and the MXBean
+    // introspection path tears down with `NotCompliantMBeanException`
+    // (observed booting WildFly 39 / Keycloak 16 in real-JDK mode).
+    r.register(
+        "java/util/HashMap$KeyItr",
+        "remove",
+        "()V",
+        native_map_key_itr_remove,
+    );
+
+    // Belt-and-braces: register at the interface CP class too so the
+    // dispatch path that resolves to the `java.util.Iterator.remove()V`
+    // default method (which throws `UnsupportedOperationException("remove")`)
+    // is intercepted regardless of how the receiver class's vtable / native
+    // tables look up the override. The dispatcher inspects the receiver's
+    // actual class and routes:
+    //
+    // * `HashMap$KeyItr` — our snapshot-based set iterator: delegate to
+    //   `native_map_key_itr_remove` (mutates the source HashSet).
+    // * `ArrayList$Itr` — JDK class with a working `remove()V` natively
+    //   registered: delegate to `native_al_itr_remove`.
+    // * anything else — preserve the JDK default semantics by throwing
+    //   `UnsupportedOperationException("remove")` so callers that catch
+    //   that specific exception type keep working unchanged. Paired with
+    //   the `force_native_over_real_jdk_bytecode` entry in
+    //   `vm/src/runtime/interpreter.rs`, this guarantees the dispatcher
+    //   is consulted on every interface-typed `it.remove()` call site.
+    r.register(
+        "java/util/Iterator",
+        "remove",
+        "()V",
+        native_iterator_remove_dispatcher,
+    );
+}
+
+/// Dispatcher for `java/util/Iterator.remove()V` registered as a native
+/// override so interface-typed invokes route through our receiver-class-
+/// specific iterator natives instead of the JDK's default
+/// `Iterator.remove()` bytecode (which throws `UnsupportedOperationException`).
+///
+/// The synthetic `HashMap$KeyItr` class our `native_hs_iterator` returns
+/// has no class-file methods and no declared interfaces, so the standard
+/// receiver-class native lookup misses the registration on
+/// `HashMap$KeyItr.remove()V` and the dispatch falls through to the
+/// interface's default method body — which is exactly the wrong outcome
+/// for callers that legitimately need iterator-based set removal
+/// (`MXBeanSupport.findMXBeanInterface`, `Collection.removeIf`, etc.).
+fn native_iterator_remove_dispatcher(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(iter_remove_unsupported()),
+    };
+    let cid = ctx.class_id_of_object(this);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    match name.as_str() {
+        "java/util/HashMap$KeyItr" => native_map_key_itr_remove(ctx, args),
+        "java/util/ArrayList$Itr" => native_al_itr_remove(ctx, args),
+        _ => {
+            // No class-specific override exists; preserve the JDK default
+            // semantics by throwing `UnsupportedOperationException("remove")`.
+            // Matching the exact message keeps caller-introspection code
+            // (e.g. `Throwable.getMessage` checks) working unchanged.
+            Err(iter_remove_unsupported())
+        }
+    }
+}
+
+/// Build the JDK-default `UnsupportedOperationException("remove")` that
+/// `java.util.Iterator.remove()V` throws when no override is registered for
+/// the receiver iterator's class.
+fn iter_remove_unsupported() -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: "remove".to_string(),
+    }
+    .into()
 }
 
 fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4177,7 +4282,60 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let val = ctx.get_array_element(keys, cursor as usize);
     ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    // Record the index we just returned so `remove()` (if registered for
+    // this iterator's class) can locate the element in the snapshot.
+    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
     Ok(Some(val))
+}
+
+/// `HashMap$KeyItr.remove()` — remove the last element returned by `next()`
+/// from the iterator's source collection.
+///
+/// Honours the `java.util.Iterator` contract:
+/// * If `next()` has not been called (or `remove()` has already been
+///   invoked since the last `next()`), throw `IllegalStateException`.
+/// * Otherwise, delete the recorded key from the backing collection via
+///   `native_hs_remove` (which routes through `hs_backing_map` for both
+///   `HashSet` and its mirrored subclasses).
+///
+/// If the iterator was allocated without a source back-reference (legacy
+/// `make_iterator_from_array` callers), report `UnsupportedOperationException`
+/// to match the JDK default-method semantics that those callers were
+/// previously relying on.
+fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Err(iter_remove_unsupported()),
+    };
+    let last_ret = match ctx.get_field(this, MAP_KEY_ITR_FIELD_LAST_RET) {
+        Value::Int(v) => v,
+        _ => -1,
+    };
+    if last_ret < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let source = match ctx.get_field(this, MAP_KEY_ITR_FIELD_SOURCE) {
+        Value::Object(Some(s)) => s,
+        // Iterator created by a legacy snapshot path that doesn't carry a
+        // source reference. The JDK default-method behaviour for such an
+        // iterator is to throw `UnsupportedOperationException("remove")`.
+        _ => return Err(iter_remove_unsupported()),
+    };
+    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Err(iter_remove_unsupported()),
+    };
+    let key = ctx.get_array_element(keys, last_ret as usize);
+    // Delegate to the HashSet `remove(Object)` native; this keeps backing-
+    // map bookkeeping (size, bucket chains) in one place.
+    let _ = native_hs_remove(ctx, &[Value::Object(Some(source)), key])?;
+    // Mark consumed so a second `remove()` without an intervening `next()`
+    // raises `IllegalStateException` per the iterator contract.
+    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    Ok(None)
 }
 
 // ===========================================================================
@@ -13241,6 +13399,24 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
+    // Undersized-receiver gate. The speculative layout-probing below
+    // (ArrayList → Arrays$ArrayList → LinkedList → HashSet) reads slots
+    // 0/1/2 directly off the receiver. When called with a non-collection
+    // receiver whose declared layout is smaller than those slots — e.g.
+    // `net/bytebuddy/description/type/TypeList$Generic$Empty` (1 slot,
+    // inherits `modCount` from AbstractList), `RegularImmutableList`
+    // (1 slot, `array`), `IdentityHashMap$Values` (1 slot, `this$0`),
+    // `Collections$EmptyList` (1 slot, `serialVersionUID` pad) — these
+    // reads trip `gen_heap::get_field`'s out-of-bounds guard and fire
+    // the diagnostic for every probe attempt.
+    //
+    // The right behaviour for those receivers is "I don't recognize this
+    // layout — fall through to iterator-based access" (the existing
+    // `iterator()` walk via `collection_elements_generic` at the end of
+    // this function). Compute the receiver's slot count once and skip
+    // every layout-specific probe whose highest-slot read would land
+    // past it.
+    let coll_n_fields = ctx.object_num_fields(coll);
     // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
     // field-index resolver so we honour the real-JDK layout
     // (`modCount`/`elementData`/`size` slots from AbstractList/ArrayList) —
@@ -13251,24 +13427,36 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // and surfaces as the `@AliasFor ... is not meta-present` chain.
     {
         let (data_slot, size_slot, _) = al_slots(ctx);
-        let f_data = ctx.get_field(coll, data_slot);
-        let f_size = ctx.get_field(coll, size_slot);
-        if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
-            if ctx.heap_kind_of(arr) == ObjectKind::Array {
-                let len = ctx.array_length(arr);
-                if size >= 0 && len >= size as usize {
-                    let mut elems = Vec::with_capacity(size as usize);
-                    for i in 0..(size as usize) {
-                        elems.push(ctx.get_array_element(arr, i));
+        if data_slot < coll_n_fields && size_slot < coll_n_fields {
+            let f_data = ctx.get_field(coll, data_slot);
+            let f_size = ctx.get_field(coll, size_slot);
+            if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    if size >= 0 && len >= size as usize {
+                        let mut elems = Vec::with_capacity(size as usize);
+                        for i in 0..(size as usize) {
+                            elems.push(ctx.get_array_element(arr, i));
+                        }
+                        return elems;
                     }
-                    return elems;
                 }
             }
         }
     }
-    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size)
-    let f0 = ctx.get_field(coll, 0);
-    let f1 = ctx.get_field(coll, 1);
+    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size).
+    // Skip if the receiver has fewer than 2 slots — otherwise the probe
+    // would OOB-read on a 0- or 1-slot foreign type.
+    let f0 = if coll_n_fields > 0 {
+        ctx.get_field(coll, 0)
+    } else {
+        Value::Object(None)
+    };
+    let f1 = if coll_n_fields > 1 {
+        ctx.get_field(coll, 1)
+    } else {
+        Value::Object(None)
+    };
     if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
         if ctx.heap_kind_of(arr) == ObjectKind::Array {
             let len = ctx.array_length(arr);
@@ -13297,20 +13485,28 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             return elems;
         }
     }
-    // Try LinkedList layout (field 0 = head Node, field 2 = Int size)
-    if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
-        if size > 0 {
-            let mut elems = Vec::with_capacity(size as usize);
-            let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
-            while let Value::Object(Some(node)) = cur {
-                elems.push(ctx.get_field(node, LL_NODE_ELEM));
-                cur = ctx.get_field(node, LL_NODE_NEXT);
+    // Try LinkedList layout (field 0 = head Node, field 2 = Int size).
+    // Skip if the receiver doesn't have a slot at LL_FIELD_SIZE (=2).
+    if LL_FIELD_SIZE < coll_n_fields {
+        if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
+            if size > 0 && LL_FIELD_HEAD < coll_n_fields {
+                let mut elems = Vec::with_capacity(size as usize);
+                let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
+                while let Value::Object(Some(node)) = cur {
+                    elems.push(ctx.get_field(node, LL_NODE_ELEM));
+                    cur = ctx.get_field(node, LL_NODE_NEXT);
+                }
+                return elems;
             }
-            return elems;
         }
     }
     // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
-    // Walk the backing map's bucket nodes and collect keys.
+    // Walk the backing map's bucket nodes and collect keys. Skip if the
+    // receiver has no slot 0 (e.g. cglib's `MethodInterceptorGenerator`
+    // has 0 instance fields) — fall through to the iterator walk.
+    if HS_FIELD_MAP >= coll_n_fields {
+        return collection_elements_generic(ctx, coll);
+    }
     if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
         // Verify it actually is a HashMap-like (slot 0 = bucket array).
         let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);

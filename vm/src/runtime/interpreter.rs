@@ -10351,6 +10351,21 @@ fn force_native_over_real_jdk_bytecode(
                 "setURLStreamHandlerFactory",
                 "(Ljava/net/URLStreamHandlerFactory;)V"
             )
+            // `Iterator.remove()V` is a default method that throws
+            // `UnsupportedOperationException("remove")`. Several of our
+            // synthetic iterator classes (`HashMap$KeyItr` built from
+            // `HashSet.iterator()`) are pure synthetic stubs that don't
+            // declare `java.util.Iterator` as an interface, so the
+            // class-hierarchy-walk fallbacks in `invoke_on_class_shared_inner`
+            // / `try_stackless_invoke` resolve through the CP-class default
+            // method and execute that throwing body before the receiver-
+            // class native lookup gets a chance. Forcing the registered
+            // dispatcher in `native-collections` (which routes by receiver
+            // class) here moves the receiver-class probe to the front of
+            // every dispatch path — required for WildFly 39 / Keycloak 16's
+            // `MXBeanSupport.findMXBeanInterface` `it.remove()` reduction
+            // loop to succeed.
+            | ("java/util/Iterator", "remove", "()V")
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(
