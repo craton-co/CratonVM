@@ -10366,6 +10366,32 @@ fn force_native_over_real_jdk_bytecode(
             // `MXBeanSupport.findMXBeanInterface` `it.remove()` reduction
             // loop to succeed.
             | ("java/util/Iterator", "remove", "()V")
+            // `ConstantCallSite.getTarget`. On JDK 25 the body is no
+            // longer a plain `getfield target` — it first reads
+            // `private boolean isFrozen` and throws
+            // `IllegalStateException` when it's still false. Our
+            // `LambdaMetafactory.metafactory` / `altMetafactory`
+            // synthesise `ConstantCallSite` instances via
+            // `alloc_concurrent_synthetic`, which bypasses the JDK
+            // `<init>` body that flips `isFrozen=true`. Without the
+            // force-native here, every callsite materialised by an
+            // invokedynamic bootstrap throws ISE on first `getTarget`
+            // — observed in `org.apache.logging.log4j`'s
+            // `ServiceLoaderUtil.callServiceLoader` chain on
+            // Elasticsearch and Spark log4j boot. The registered
+            // native in `native-builtins/src/lang_invoke.rs` just
+            // returns field 0 (the target MH) — the correct
+            // behaviour for an effectively-frozen ConstantCallSite.
+            | (
+                "java/lang/invoke/ConstantCallSite",
+                "getTarget",
+                "()Ljava/lang/invoke/MethodHandle;",
+            )
+            | (
+                "java/lang/invoke/ConstantCallSite",
+                "dynamicInvoker",
+                "()Ljava/lang/invoke/MethodHandle;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(
