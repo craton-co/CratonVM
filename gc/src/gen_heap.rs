@@ -319,14 +319,46 @@ impl GenerationalHeap {
     }
 
     /// Create a generational heap with a total capacity split proportionally.
-    /// Young gen gets 25% (split into two semi-spaces), old gen gets 75%.
-    /// This is used for compatibility with tests that use `Heap::with_capacity`.
+    ///
+    /// HotSpot-equivalent sizing: young gen takes ~50% of the total heap
+    /// (the from+to semi-space pair together), split across two
+    /// semi-spaces. So each semi-space is ~25% of -Xmx. HotSpot's default
+    /// is closer to NewRatio=2 (young = 1/3 of heap) but our copying
+    /// collector trades old-gen room for young-gen room more aggressively
+    /// because (a) the non-moving sweep that runs while JIT frames are
+    /// active cannot promote, and so depends on the young semi being big
+    /// enough to hold the entire transient working set; and (b) Cheney
+    /// copy cost scales with *survivors*, not capacity, so a larger
+    /// young semi is essentially free unless the working set actually
+    /// grows to fill it.
+    ///
+    /// For the common ranges:
+    ///   - 64 KiB heap (test):   young_semi = 16 KiB
+    ///   - 256 MiB heap (def.):  young_semi = 64 MiB
+    ///   - 1 GiB heap:           young_semi = 256 MiB
+    ///   - 4 GiB heap (-Xmx4g):  young_semi = 1 GiB
+    ///   - 16 GiB heap:          young_semi = 4 GiB
+    ///
+    /// The young semi-space can still *grow* up to
+    /// `young_semi * MAX_HEAP_EXPANSION_FACTOR` after a low-reclamation
+    /// minor GC (see the expansion logic in `collect_garbage_inner`).
     pub fn with_capacity(total_bytes: usize) -> Self {
         let total = total_bytes.max(4096);
-        let young_total = total / 4; // 25% for young gen
-        let young_semi = young_total / 2; // split into two semi-spaces
-        let old_size = total - young_total; // 75% for old gen
-        Self::with_sizes(young_semi.max(512), old_size.max(512))
+        // Young takes 1/2 of total, split across from+to semi-spaces (so
+        // each semi gets 1/4 of total). The other half goes to old gen.
+        let young_semi_raw = total / 4;
+        // Clamp: floor at 512 bytes (the smallest test heap) so very
+        // tiny test heaps still produce a non-trivial arena. No ceiling —
+        // the user passed -Xmx N to get N bytes of heap, not "N capped
+        // at some arbitrary internal constant".
+        const YOUNG_SEMI_MIN: usize = 512;
+        let young_semi = young_semi_raw.max(YOUNG_SEMI_MIN);
+        // Old gen gets whatever's left after the young (from+to). Use
+        // `saturating_sub` so a tiny `total` (`max(4096)`) doesn't
+        // underflow when the clamped young is larger than half of it.
+        let young_pair = young_semi.saturating_mul(2);
+        let old_size = total.saturating_sub(young_pair).max(512);
+        Self::with_sizes(young_semi, old_size)
     }
 
     // ----- Allocation --------------------------------------------------------
