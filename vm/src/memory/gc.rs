@@ -246,6 +246,13 @@ fn verify_no_stale_refs(
     pointer_map: &HashMap<usize, usize>,
 ) {
     use crate::types::Value;
+    use cratonvm_types::ObjectHeader;
+
+    // Allow opt-in heavy diagnostic that walks every Object slot and checks
+    // for a zeroed header (class_id=0 && identity_hash_code=0 && num_slots=0).
+    // Such a slot is the in-memory signature of the heavy-trees bug: a
+    // pointer at an address inside the just-reset young-from semispace.
+    let heavy = std::env::var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1");
 
     for (fi, frame) in thread.frames.iter().enumerate() {
         let cname = frame.class_name();
@@ -263,6 +270,24 @@ fn verify_no_stale_refs(
                         addr, pointer_map[&addr],
                     );
                 }
+                if heavy && addr != 0 {
+                    // SAFETY: read-only probe of an aligned address; if the
+                    // slot is corrupt we'll see it in the diagnostic. This is
+                    // an opt-in debug path.
+                    let h = unsafe { &*(addr as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0
+                        && h.identity_hash_code == 0
+                        && h.num_slots == 0
+                        && h.array_length == 0
+                    {
+                        tracing::error!(
+                            "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
+                            fi, cname, mname, li, frame.pc,
+                            addr, h.kind, h.gc_flags,
+                        );
+                    }
+                }
             }
         }
         // Check stack
@@ -277,6 +302,22 @@ fn verify_no_stale_refs(
                         fi, cname, mname, si,
                         addr, pointer_map[&addr],
                     );
+                }
+                if heavy && addr != 0 {
+                    // SAFETY: see locals comment above.
+                    let h = unsafe { &*(addr as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0
+                        && h.identity_hash_code == 0
+                        && h.num_slots == 0
+                        && h.array_length == 0
+                    {
+                        tracing::error!(
+                            "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
+                            fi, cname, mname, si, frame.pc,
+                            addr, h.kind, h.gc_flags,
+                        );
+                    }
                 }
             }
         }
