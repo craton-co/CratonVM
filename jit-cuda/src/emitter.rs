@@ -26,6 +26,17 @@ pub struct PtxModule {
     pub sm_major: u32,
     pub sm_minor: u32,
     pub kernels: Vec<PtxKernel>,
+    /// Phase 10 #2 — bit-set of parameter indices written by the
+    /// (single-kernel) module, populated by `lower_method` from the
+    /// emitter's per-store tracking. Mirrors what will land on the
+    /// `KernelSignature` once the module is wrapped in a
+    /// `CompiledKernel`. Defaults to `0` (all params read-only) for
+    /// hand-constructed unit-test modules — production code paths
+    /// override it via the lowering pass.
+    ///
+    /// See `KernelSignature::writes_param_mask` for the consumer
+    /// (the marshaller in `vm::runtime::offload`).
+    pub writes_param_mask: u64,
 }
 
 impl PtxModule {
@@ -165,6 +176,7 @@ mod tests {
             sm_major: 7,
             sm_minor: 5,
             kernels: vec![],
+            writes_param_mask: 0,
         };
         let s = m.render();
         assert!(s.contains(".version 7.5"));

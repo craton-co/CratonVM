@@ -105,6 +105,13 @@ pub fn lower_method(
 
     emitter.finalize_epilogue();
 
+    // Phase 10 #2 — snapshot the per-`*astore` param mask before
+    // moving the body out of the emitter. The marshaller in
+    // `vm::runtime::offload` reads this to suppress the post-launch
+    // D→H copy for read-only array inputs (closing the residual
+    // perf gap to TornadoVM left by the Phase 10 #1 residency cache).
+    let writes_param_mask = emitter.writes_param_mask;
+
     let reg_decls = emitter.emit_reg_decls();
     let body = emitter.into_body();
 
@@ -118,6 +125,7 @@ pub fn lower_method(
         sm_major,
         sm_minor,
         kernels: vec![kernel],
+        writes_param_mask,
     })
 }
 
@@ -307,6 +315,7 @@ mod tests {
             estimated_work: 1 << 20,
             needs_d2h_sync: false,
             this_field_cps: vec![],
+            writes_param_mask: 0,
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
@@ -328,6 +337,7 @@ mod tests {
             estimated_work: 1 << 20,
             needs_d2h_sync: false,
             this_field_cps: vec![],
+            writes_param_mask: 0,
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6

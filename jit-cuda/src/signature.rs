@@ -41,4 +41,29 @@ pub struct KernelSignature {
     /// optimisation. The simplest implementation passes each access
     /// as a distinct kernel arg.
     pub this_field_cps: Vec<u16>,
+    /// Phase 10 #2 — bit-set of array-parameter indices that the
+    /// kernel body writes to (via `iastore`/`lastore`/`fastore`/
+    /// `dastore`/`bastore`/`castore`/`sastore`). Bit `i` (LSB-first)
+    /// corresponds to `param_kinds[i]`; clear bits are read-only.
+    ///
+    /// The marshaller uses this to suppress the post-launch D→H
+    /// copy + heap write-back for read-only array inputs — closing
+    /// the residual TornadoVM performance gap left by the input
+    /// residency cache (Phase 10 #1). Before this signal, every
+    /// array param was conservatively treated as `inout`, paying a
+    /// full D→H copy on every submit even when the kernel never
+    /// touched the array (e.g. `a`, `b` in `vectorAdd(a, b, out)`).
+    ///
+    /// Populated by `lower_method` from the emitter's per-store
+    /// `array_param_of` tracking, which already knows precisely
+    /// which parameter index each `*astore` targets. The default
+    /// (`0` — no params written) is what unit tests construct;
+    /// real lowering populates it before the kernel is cached.
+    ///
+    /// Width: `u64`. Methods with more than 64 array params are
+    /// hypothetical; the analyzer caps acceptance well below that.
+    /// If a future kernel shape ever exceeds 64 params, callers
+    /// should default `writes_param_mask` to "all bits set" so the
+    /// conservative writeback behaviour is preserved.
+    pub writes_param_mask: u64,
 }

@@ -3313,6 +3313,80 @@ mod tests {
         GenerationalHeap::with_sizes(4 * 1024, 8 * 1024)
     }
 
+    /// Regression: `with_capacity` MUST scale the young semi-space linearly
+    /// with the total heap requested — no hidden internal cap.
+    ///
+    /// Commit a98a375 moved the split from 25/75 (young_semi = 12.5% of
+    /// total) to 50/50 (young_semi = 25% of total). This test pins the
+    /// post-commit ratios so a future edit cannot silently regress to an
+    /// arbitrary internal ceiling (the original bug had a 32 MiB cap
+    /// regardless of -Xmx; the fix has *no* ceiling other than the user-
+    /// supplied total).
+    ///
+    /// We test the same -Xmx values the orchestrator uses to validate
+    /// QuickBenchLong's binary-trees-d18 kernel:
+    ///   - 256 MiB heap → young_semi = 64 MiB
+    ///   - 1 GiB heap   → young_semi = 256 MiB
+    ///   - 4 GiB heap   → young_semi = 1 GiB
+    ///
+    /// Each semi must be exactly `total / 4`; the lower bound (>= the
+    /// orchestrator's "≥256 MiB at -Xmx 1g" criterion) is also asserted
+    /// explicitly so the test fails loudly if someone reinstates a clamp.
+    #[test]
+    fn with_capacity_scales_young_semi_with_xmx() {
+        // -Xmx 256m → 64 MiB young semi (4× larger than the buggy 32 MiB cap)
+        let h_256m = GenerationalHeap::with_capacity(256 * 1024 * 1024);
+        assert_eq!(
+            h_256m.young_semi_capacity(),
+            64 * 1024 * 1024,
+            "with_capacity(256m) must give a 64 MiB young semi (25% of total)",
+        );
+        assert_eq!(
+            h_256m.old_gen_capacity(),
+            128 * 1024 * 1024,
+            "with_capacity(256m) old gen must be 128 MiB (the remaining 50%)",
+        );
+
+        // -Xmx 1g → 256 MiB young semi. This is the orchestrator's
+        // explicit lower-bound check: "≥256 MiB at -Xmx 1g".
+        let h_1g = GenerationalHeap::with_capacity(1024 * 1024 * 1024);
+        assert_eq!(
+            h_1g.young_semi_capacity(),
+            256 * 1024 * 1024,
+            "with_capacity(1g) must give a 256 MiB young semi",
+        );
+        assert!(
+            h_1g.young_semi_capacity() >= 256 * 1024 * 1024,
+            "with_capacity(1g) young semi must be >= 256 MiB (orchestrator floor)",
+        );
+
+        // -Xmx 4g → 1 GiB young semi.
+        let h_4g = GenerationalHeap::with_capacity(4_usize * 1024 * 1024 * 1024);
+        assert_eq!(
+            h_4g.young_semi_capacity(),
+            1024 * 1024 * 1024,
+            "with_capacity(4g) must give a 1 GiB young semi",
+        );
+
+        // Tiny test heap (64 KiB): the floor (512 B) does not engage
+        // because 64 KiB / 4 = 16 KiB is well above it.
+        let h_64k = GenerationalHeap::with_capacity(64 * 1024);
+        assert_eq!(
+            h_64k.young_semi_capacity(),
+            16 * 1024,
+            "with_capacity(64k) must give a 16 KiB young semi",
+        );
+
+        // Floor: a 1 KiB heap (well below the 4 KiB total floor) goes
+        // through the `total.max(4096)` path, then `4096 / 4 = 1024`
+        // which is above the 512-byte minimum.
+        let h_1k = GenerationalHeap::with_capacity(1024);
+        assert!(
+            h_1k.young_semi_capacity() >= 1024,
+            "tiny heap must still produce a non-trivial arena (>= 1 KiB)",
+        );
+    }
+
     #[test]
     fn alloc_object_in_young() {
         let heap = small_gen_heap();

@@ -287,6 +287,12 @@ pub fn analyze_with_annotations(
         // launch); the launch site flips it to `true` when a host
         // read-back will follow.
         needs_d2h_sync: false,
+        // Phase 10 #2 — populated by `lower_method` once the emitter's
+        // per-`*astore` `array_param_of` tracking has run. The analyzer
+        // doesn't simulate the operand stack, so it can't compute the
+        // mask precisely here. Leave `0` and let lowering fill it in
+        // before `CompiledKernel` caches the signature.
+        writes_param_mask: 0,
     })
 }
 

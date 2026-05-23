@@ -248,7 +248,7 @@ impl OffloadCache {
                 &verdict
             );
         }
-        let sig = match verdict {
+        let mut sig = match verdict {
             OffloadVerdict::Eligible(s) => s,
             OffloadVerdict::Rejected(_) => {
                 self.blacklist.write().insert(key);
@@ -277,6 +277,13 @@ impl OffloadCache {
             .first()
             .map(|k| k.name.clone())
             .unwrap_or_default();
+        // Phase 10 #2 — copy the per-param-write mask the lowering pass
+        // computed by tracking `*astore` opcodes into the cached
+        // signature. The marshaller in `marshal_array_arg` consults
+        // this on every submit to decide whether the array arg needs
+        // a post-launch D→H writeback (kernel-written) or not
+        // (read-only input — same bytes as already on the device).
+        sig.writes_param_mask = ptx_module.writes_param_mask;
         let ptx_text = ptx_module.render();
         let ctx = self
             .ctx
@@ -1291,11 +1298,18 @@ pub fn dispatch_method_from_native(
     //    `this_field_cps` into an ordered list of `(cp_index,
     //    field_name)` pairs the marshaller can resolve against the
     //    receiver without holding any class-manager locks afterward.
-    let (class_id, method_index, is_static, this_field_names): (
+    //
+    // Phase 10 #2 — also extract `writes_param_mask` from the compiled
+    // kernel's signature so each `marshal_array_arg` call site can
+    // decide whether to record a post-launch D→H writeback for that
+    // arg or skip it (the read-only-input optimisation that closes
+    // the residual gap to TornadoVM's `FIRST_EXECUTION`).
+    let (class_id, method_index, is_static, this_field_names, writes_param_mask): (
         crate::classloading::ClassId,
         u16,
         bool,
         Vec<String>,
+        u64,
     ) = {
         // Phase 9 #1 fix — load the class on demand. The class name
         // arrives as a string from `Native.submitMethod`; the user has
@@ -1395,7 +1409,7 @@ pub fn dispatch_method_from_native(
                     };
                     names.push(nm.to_string());
                 }
-                (class_id, mi, is_static_local, names)
+                (class_id, mi, is_static_local, names, compiled.signature.writes_param_mask)
             }
             LookupOutcome::Skip => {
                 return record_failed_submission(
@@ -1458,9 +1472,23 @@ pub fn dispatch_method_from_native(
     //    `max_array_len` tracks the largest array length we marshal —
     //    passed below as `runtime_work` so the launch grid covers
     //    every output index. See `dispatch_async`'s comment.
+    //
+    // Phase 10 #2 — `h2d_bytes` accumulates per-arg upload byte counts
+    // for the `CRATONVM_GPU_TRACE_BYTES` instrumentation. The cache
+    // path returns 0 for the upload (no copy happened), so the counter
+    // measures real PCIe traffic; subsequent submits on the same arrays
+    // should accumulate 0 bytes once the residency cache is warm.
     let mut kernel_args = KernelArgs::new();
     let mut writebacks: Vec<MarshalWriteback> = Vec::new();
     let mut max_array_len: usize = 0;
+    let mut h2d_bytes: usize = 0;
+    // Param-index counter for the writes-mask lookup. The non-static
+    // `pthis_*` arms come first and consume slots ahead of the
+    // declared params; we still want declared params to start at
+    // index 0 in the analyzer's mask (the analyzer never sees
+    // `pthis_*` — those are a runtime-only marshalling concept), so
+    // we track declared-param consumption with a separate counter
+    // (`declared_param_idx`) once the non-static prelude finishes.
 
     // Phase 9 #2 push 2 — non-static path: marshal `this.<field>`
     // arrays first (matching the kernel's `pthis_<i>_*` param prefix
@@ -1570,13 +1598,22 @@ pub fn dispatch_method_from_native(
                     ),
                 );
             };
-            match marshal_array_arg(shared, ctx, field_obj, etype, &token) {
-                Ok((args_after, wb)) => {
+            // Phase 10 #2 — `pthis_*` (receiver-field) params are not
+            // represented in `KernelSignature::param_kinds` (the
+            // analyzer treats them as a marshaller-only concept), so
+            // the `writes_param_mask` has no corresponding bit. Be
+            // conservative and treat each as kernel-written, which
+            // preserves the pre-Phase-10 #2 behaviour (always D→H
+            // copy back) for this less-common code path.
+            let pthis_len = shared.heap.array_length(field_obj);
+            match marshal_array_arg(shared, ctx, field_obj, etype, true, &token) {
+                Ok((args_after, wb_opt, bytes)) => {
                     kernel_args = args_after(kernel_args);
-                    if let Some(l) = wb.array_len() {
-                        if l > max_array_len { max_array_len = l; }
+                    h2d_bytes = h2d_bytes.saturating_add(bytes);
+                    if pthis_len > max_array_len { max_array_len = pthis_len; }
+                    if let Some(wb) = wb_opt {
+                        writebacks.push(wb);
                     }
-                    writebacks.push(wb);
                 }
                 Err(msg) => {
                     drop(token);
@@ -1600,13 +1637,26 @@ pub fn dispatch_method_from_native(
             Value::Object(Some(obj_ref)) => {
                 // First: is it a primitive array?
                 if let Some(element_type) = shared.heap.array_element_type(*obj_ref) {
-                    match marshal_array_arg(shared, ctx, *obj_ref, element_type, &token) {
-                        Ok((args_after, wb)) => {
+                    // Phase 10 #2 — `i` is the index inside
+                    // `java_args_to_marshal`, which lines up 1:1 with
+                    // the analyzer's `param_kinds[i]` for static
+                    // methods (the only path where `writes_param_mask`
+                    // is precisely populated today). Consult the mask
+                    // — a clear bit means the kernel never `*astore`s
+                    // into this param, so we can safely skip the
+                    // post-launch D→H copy.
+                    let is_written = (writes_param_mask >> i) & 1 == 1;
+                    let arr_len = shared.heap.array_length(*obj_ref);
+                    match marshal_array_arg(
+                        shared, ctx, *obj_ref, element_type, is_written, &token,
+                    ) {
+                        Ok((args_after, wb_opt, bytes)) => {
                             kernel_args = args_after(kernel_args);
-                            if let Some(l) = wb.array_len() {
-                                if l > max_array_len { max_array_len = l; }
+                            h2d_bytes = h2d_bytes.saturating_add(bytes);
+                            if arr_len > max_array_len { max_array_len = arr_len; }
+                            if let Some(wb) = wb_opt {
+                                writebacks.push(wb);
                             }
-                            writebacks.push(wb);
                         }
                         Err(msg) => {
                             drop(token);
@@ -1724,6 +1774,24 @@ pub fn dispatch_method_from_native(
     //    truncated 2^31-1 (array bigger than u32::MAX is impossible
     //    in JVM but defensive) when needed; `dispatch_async` takes
     //    the max of `runtime_work` and `estimated_work`.
+    //
+    // Phase 10 #2 — flush the per-dispatch H2D byte total into the
+    // process-wide trace counter; emit a per-submit log line when
+    // `CRATONVM_GPU_TRACE_BYTES` is on. With both the residency
+    // cache (Phase 10 #1) and the read-only-input suppression
+    // (Phase 10 #2) live, post-warmup submits report 0 bytes
+    // uploaded — the smoking-gun signal we expected to see.
+    h2d_trace::add(h2d_bytes);
+    if h2d_trace::enabled() {
+        tracing::info!(
+            "gpu offload: submit H2D={} bytes ({}.{}{}) — cumulative {} bytes",
+            h2d_bytes,
+            class_name,
+            method_name,
+            descriptor,
+            h2d_trace::total(),
+        );
+    }
     let runtime_work: u32 = u32::try_from(max_array_len).unwrap_or(u32::MAX);
     let submission = cache.dispatch_async(
         stream.clone(),
@@ -2049,6 +2117,52 @@ pub(crate) mod device_cache {
     /// implicitly forfeited.
     pub fn release(handle: u64) {
         map().lock().remove(&handle);
+    }
+}
+
+// ── Phase 10 #2: cumulative H2D byte counter (optional trace) ───────
+//
+// Set `CRATONVM_GPU_TRACE_BYTES=1` to dump the accumulated host→device
+// transfer total after every dispatch. With the Phase 10 #2 read-only
+// suppression (this commit) plus the Phase 10 #1 residency cache, a
+// 1000-iteration vectorAdd benchmark should show O(3 × array_size)
+// total bytes — one initial upload of `a`, `b`, `out` — not
+// O(3000 × array_size). The counter wraps around at `usize::MAX`;
+// for the workloads it targets (single-process, single-benchmark) that
+// is plenty.
+#[cfg(feature = "gpu-offload")]
+pub(crate) mod h2d_trace {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    static TOTAL: AtomicUsize = AtomicUsize::new(0);
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    /// True if `CRATONVM_GPU_TRACE_BYTES=1`. The probe is cached.
+    pub(crate) fn enabled() -> bool {
+        *ENABLED.get_or_init(|| {
+            std::env::var("CRATONVM_GPU_TRACE_BYTES")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Add `bytes` to the cumulative counter (only when trace is on,
+    /// to avoid the atomic op on the hot path).
+    pub(crate) fn add(bytes: usize) {
+        if enabled() {
+            TOTAL.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot the counter. Public for tests and external probes.
+    pub fn total() -> usize {
+        TOTAL.load(Ordering::Relaxed)
+    }
+
+    /// Reset to zero. Public for tests.
+    pub fn reset() {
+        TOTAL.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2537,17 +2651,29 @@ fn try_unbox_primitive(
 /// `Arc<DeviceBuffer<T>>`. On a miss the existing
 /// `host_view → upload` path runs and the resulting Arc is installed
 /// into the cache so the next submit hits.
+///
+/// Phase 10 #2 — `is_kernel_written` tells us whether the kernel
+/// body actually `*astore`s into this parameter slot. When it does
+/// not (read-only input, e.g. `a` and `b` in `vectorAdd(a, b, out)`),
+/// we return `None` for the writeback — the post-launch D→H copy
+/// (256MB for a 2^26-int input at vectorAdd scale) is pure waste
+/// because the device contents already match the host. Returning
+/// `None` saves the matching `wb_arc` clone the cache-only path
+/// would have produced; the Arc inside `input_cache` keeps the
+/// buffer alive across submits.
 #[cfg(feature = "gpu-offload")]
 fn marshal_array_arg(
     shared: &crate::vm::SharedVm,
     ctx: &cuda_bridge::DeviceContext,
     obj_ref: cratonvm_types::ObjectRef,
     element_type: cratonvm_types::ArrayElementType,
+    is_kernel_written: bool,
     token: &cratonvm_gc::safepoint::SafepointToken<'_>,
 ) -> Result<
     (
         Box<dyn FnOnce(cuda_bridge::KernelArgs) -> cuda_bridge::KernelArgs>,
-        MarshalWriteback,
+        Option<MarshalWriteback>,
+        usize,
     ),
     String,
 > {
@@ -2567,12 +2693,14 @@ fn marshal_array_arg(
     //       host_view + upload and reuse the cached Arc.
     //   (b) on miss, perform the existing host_view → upload, then
     //       install the Arc into the cache so future submits hit.
-    //   (c) build the (push closure, writeback) pair from the Arc.
-    //       The closure captures a raw pointer to the inner
-    //       DeviceBuffer (via `Arc::as_ptr`); the writeback holds a
-    //       parallel Arc clone keeping the buffer alive for the
-    //       launch + writeback duration. The cache holds a third
-    //       Arc clone keeping the buffer alive past the writeback.
+    //   (c) build the (push closure, optional-writeback) pair from
+    //       the Arc. The closure captures a raw pointer to the inner
+    //       DeviceBuffer (via `Arc::as_ptr`). For kernel-written
+    //       params, the writeback holds a parallel Arc clone keeping
+    //       the buffer alive for the launch + writeback duration;
+    //       for read-only inputs we skip the writeback entirely and
+    //       rely on the closure's owned Arc + the `input_cache` Arc
+    //       to keep the buffer alive across the launch.
     macro_rules! arm {
         (
             $ty:ty,
@@ -2580,12 +2708,13 @@ fn marshal_array_arg(
             $host_view:path,
             $cache_get:path,
             $cache_put:path,
-            $tag:literal
+            $tag:literal,
+            $elem_size:expr
         ) => {{
             // (a) Cache check.
-            let arc: Arc<cuda_bridge::DeviceBuffer<$ty>> =
+            let (arc, uploaded): (Arc<cuda_bridge::DeviceBuffer<$ty>>, bool) =
                 if let Some(arc) = $cache_get(obj_ref, len) {
-                    arc
+                    (arc, false)
                 } else {
                     // (b) Miss — host_view + upload, then install.
                     let host = $host_view(obj_ref, &shared.heap, token);
@@ -2594,11 +2723,21 @@ fn marshal_array_arg(
                         .map_err(|e| format!("upload {} (len={len}): {e}", $tag))?;
                     let arc = Arc::new(buf);
                     $cache_put(obj_ref, len, arc.clone());
-                    arc
+                    (arc, true)
                 };
-            // (c) Build push closure + writeback.
+            // (c) Build push closure + optional writeback. Read-only
+            //     params skip the writeback (no D→H copy on the
+            //     finalize path).
             let len32 = len as i32;
-            let wb_arc = arc.clone();
+            let wb_opt = if is_kernel_written {
+                Some(MarshalWriteback::$variant {
+                    obj: obj_ref,
+                    buf: arc.clone(),
+                    len,
+                })
+            } else {
+                None
+            };
             let device_ptr = Arc::as_ptr(&arc) as *const cuda_bridge::DeviceBuffer<$ty>;
             let push: Box<dyn FnOnce(_) -> _> =
                 Box::new(move |args: cuda_bridge::KernelArgs| {
@@ -2606,39 +2745,36 @@ fn marshal_array_arg(
                     // alive at least until it fires). The closure
                     // runs once during the dispatch sequence and
                     // immediately pushes the pointer into KernelArgs;
-                    // after that the writeback (which holds wb_arc)
-                    // keeps the buffer alive through the launch and
-                    // synchronize, and the cache holds yet another
-                    // Arc clone keeping it alive past the writeback.
+                    // after that the writeback (when present) and/or
+                    // the `input_cache` Arc keep the buffer alive
+                    // through the launch and synchronize.
                     let _ = &arc;
                     let buf_ref: &cuda_bridge::DeviceBuffer<$ty> = unsafe { &*device_ptr };
                     args.push_device_ptr(buf_ref).push_i32(len32)
                 });
-            (
-                push,
-                MarshalWriteback::$variant { obj: obj_ref, buf: wb_arc, len },
-            )
+            let bytes_uploaded = if uploaded { len * $elem_size } else { 0 };
+            (push, wb_opt, bytes_uploaded)
         }};
     }
 
-    let (push, wb) = match element_type {
+    let (push, wb, bytes_uploaded) = match element_type {
         ArrayElementType::Int => arm!(
             i32, I32, gpu_marshal::host_view_i32,
-            input_cache::get_i32, input_cache::put_i32, "i32"
+            input_cache::get_i32, input_cache::put_i32, "i32", 4
         ),
         ArrayElementType::Long => arm!(
             i64, I64, gpu_marshal::host_view_i64,
-            input_cache::get_i64, input_cache::put_i64, "i64"
+            input_cache::get_i64, input_cache::put_i64, "i64", 8
         ),
         ArrayElementType::Float => arm!(
             f32, F32, gpu_marshal::host_view_f32,
-            input_cache::get_f32, input_cache::put_f32, "f32"
+            input_cache::get_f32, input_cache::put_f32, "f32", 4
         ),
         ArrayElementType::Double => arm!(
             f64, F64, gpu_marshal::host_view_f64,
-            input_cache::get_f64, input_cache::put_f64, "f64"
+            input_cache::get_f64, input_cache::put_f64, "f64", 8
         ),
         other => return Err(format!("submitMethod: unsupported array element type: {other:?}")),
     };
-    Ok((push, wb))
+    Ok((push, wb, bytes_uploaded))
 }

@@ -146,6 +146,15 @@ pub(crate) struct Emitter<'a> {
     /// Local slot used for the kernel result return (scalar return only).
     /// Populated by the post-loop walker when it sees the matching `*return`.
     pub ret_value_reg: Option<Reg>,
+    /// Phase 10 #2 — bit-set of parameter indices the body writes to
+    /// via `*astore`. Each `array_store*` arm in the opcode dispatch
+    /// resolves the array reference back to its parameter via
+    /// `array_param_of` and sets the matching bit. `lower_method`
+    /// reads this after the walk and stamps it into the returned
+    /// `PtxKernel` (and from there into `KernelSignature`) so the
+    /// marshaller can skip the post-launch D→H copy for read-only
+    /// array inputs — see `KernelSignature::writes_param_mask`.
+    pub writes_param_mask: u64,
 }
 
 impl<'a> Emitter<'a> {
@@ -165,6 +174,7 @@ impl<'a> Emitter<'a> {
             used_bounds_label: false,
             hit_back_branch: false,
             ret_value_reg: None,
+            writes_param_mask: 0,
         }
     }
 
@@ -1278,6 +1288,18 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        // Phase 10 #2 — mark this param as written so the marshaller
+        // can skip the post-launch D→H copy for read-only inputs. The
+        // mask is a 64-bit field; if a (purely hypothetical) kernel
+        // ever exceeds 64 params, conservatively flip every bit so
+        // the marshaller treats all params as written and runs the
+        // pre-Phase-10 #2 D→H-everywhere path. Setting all bits is
+        // the safe direction: correctness over performance.
+        self.writes_param_mask |= if param_idx < 64 {
+            1u64 << param_idx
+        } else {
+            u64::MAX
+        };
         let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let offset = self.regs.fresh_reg(RegKind::U64);
@@ -1315,6 +1337,12 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        // Phase 10 #2 — see `array_store` for rationale.
+        self.writes_param_mask |= if param_idx < 64 {
+            1u64 << param_idx
+        } else {
+            u64::MAX
+        };
         let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
@@ -1346,6 +1374,12 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
+        // Phase 10 #2 — see `array_store` for rationale.
+        self.writes_param_mask |= if param_idx < 64 {
+            1u64 << param_idx
+        } else {
+            u64::MAX
+        };
         let len_param = format!("p{param_idx}_len");
         self.emit_bounds_check(&index, &len_param);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
