@@ -312,27 +312,51 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
 ///
 /// If `monitor_exit` itself panics during unwind the process aborts —
 /// preferable to silently leaking the monitor.
-struct ChmMonitorGuard {
+///
+/// MED fix: a `PhantomData<&'a mut dyn NativeContext>` field carries a
+/// lifetime parameter `'a` at the type level, so any struct that tries to
+/// store the guard must also name `'a` (which a function-local borrow
+/// cannot project to a caller scope). The transmute remains for runtime
+/// storage — without it the guard would conflict with the body's reuse of
+/// `ctx` — but the lifetime parameter prevents the previous
+/// silently-`'static` escape hatch that would have let a refactor stash
+/// the guard into a long-lived struct and miscompile catastrophically.
+struct ChmMonitorGuard<'a> {
     ctx: *mut (dyn NativeContext + 'static),
     seg: ObjectRef,
+    /// Phantom borrow tying the guard's lifetime parameter `'a` to a
+    /// surrounding scope at the type level. Using
+    /// `fn() -> &'a mut dyn NativeContext` rather than `&'a mut …` directly
+    /// means no actual mutable borrow is held at runtime (so the body
+    /// inside the guarded section can keep using `ctx` via reborrows, as
+    /// before), but `'a` is still part of the guard's type and propagates
+    /// into any container that tries to store the guard.
+    _borrow: std::marker::PhantomData<fn() -> &'a mut dyn NativeContext>,
 }
 
-impl ChmMonitorGuard {
+impl<'a> ChmMonitorGuard<'a> {
     fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
         ctx.monitor_enter(seg);
         // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
         // borrow ends. We transmute away the lifetime so the guard doesn't
         // hold the &mut borrow for its scope — call sites still use ctx
         // mutably between acquire and drop, which is sound as long as no
-        // code outlives the original &mut borrow.
+        // code outlives the original &mut borrow. The `PhantomData<fn() ->
+        // &'a mut …>` field pins `'a` to a surrounding scope at the type
+        // level without retaining the borrow at runtime, so attempts to
+        // escape the guard into a longer-lived container fail to type-check.
         let ctx_ptr: *mut dyn NativeContext = ctx;
         let ctx_ptr_static: *mut (dyn NativeContext + 'static) =
             unsafe { core::mem::transmute(ctx_ptr) };
-        ChmMonitorGuard { ctx: ctx_ptr_static, seg }
+        ChmMonitorGuard {
+            ctx: ctx_ptr_static,
+            seg,
+            _borrow: std::marker::PhantomData,
+        }
     }
 }
 
-impl Drop for ChmMonitorGuard {
+impl<'a> Drop for ChmMonitorGuard<'a> {
     fn drop(&mut self) {
         // SAFETY: the guard is always a local whose lifetime is bounded
         // by the `&mut dyn NativeContext` borrow used in `acquire`. No
@@ -1624,7 +1648,19 @@ fn enum_key_identity(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String,
 }
 
 /// Compute hash for a key.
-fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
+///
+/// MED fix: when the user-supplied `hashCode()` throws (i.e. `invoke_virtual`
+/// returns `Err(MethodCallFailed)`), the previous implementation silently
+/// fell back to `identity_hash_code`, breaking the equals/hashCode contract
+/// in a way that made subsequent `get` calls miss every key (and combined
+/// with the matching swallow in `map_keys_equal`, `put` succeeded but `get`
+/// always returned null). Real JDK propagates the exception out of
+/// `HashMap.put`/`get` — this implementation now does the same by returning
+/// `Result<i32, MethodCallFailed>` and surfacing the original error to the
+/// caller. Non-exceptional contract violations (e.g. the user returned a
+/// non-Int from hashCode) still fall back to identity since those are not
+/// exceptional control flow.
+fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, MethodCallFailed> {
     // Try to read as string for better distribution (the common case, so it
     // is checked first).
     // Must match Java's String.hashCode (UTF-16 code units, i32 wrapping mul+add),
@@ -1636,7 +1672,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
             h = h.wrapping_mul(31).wrapping_add(cu as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
-        return h ^ (h >> 16);
+        return Ok(h ^ (h >> 16));
     }
     // Enum constants: hash by (declaring class name, constant name) — the
     // JLS-canonical identity of an enum constant — so an enum-keyed map's
@@ -1653,7 +1689,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
         for b in const_name.bytes() {
             h = h.wrapping_mul(31).wrapping_add(b as i32);
         }
-        return h ^ (h >> 16);
+        return Ok(h ^ (h >> 16));
     }
     if let Some(prim) = unbox_wrapper(ctx, key) {
         // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
@@ -1667,7 +1703,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
             }
             _ => ctx.identity_hash_code(key),
         };
-        return h ^ (h >> 16);
+        return Ok(h ^ (h >> 16));
     }
     // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
     // MUST call their `hashCode()` so HashMap honours the equals/hashCode
@@ -1675,11 +1711,15 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
     // but equal keys (Spring's `AnnotationTypeMapping.aliasedBy` keyed by
     // `java.lang.reflect.Method` is the canonical victim, surfacing as the
     // `@AliasFor ... is not meta-present` chain on Spring Boot startup).
-    let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[]) {
-        Ok(Some(Value::Int(v))) => v,
+    //
+    // MED fix: a thrown exception from `hashCode()` propagates via `?` —
+    // previously it was swallowed and substituted with `identity_hash_code`,
+    // silently breaking the equals/hashCode contract.
+    let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[])? {
+        Some(Value::Int(v)) => v,
         _ => ctx.identity_hash_code(key),
     };
-    h ^ (h >> 16)
+    Ok(h ^ (h >> 16))
 }
 
 /// Compute the *raw* Java `hashCode()` of an element `Value` — i.e. the value
@@ -1725,13 +1765,28 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
 }
 
 /// Check if two keys are equal.
-fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+///
+/// MED fix: when the user-supplied `equals(Object)` throws (i.e.
+/// `invoke_virtual` returns `Err(MethodCallFailed)`), the previous
+/// implementation silently treated it as `false`, breaking the
+/// equals/hashCode contract — combined with the matching `map_hash_key`
+/// swallowing this meant `put` succeeded but `get` always returned null.
+/// Real JDK propagates the exception out of `HashMap.put`/`get` — this
+/// implementation now does the same by returning
+/// `Result<bool, MethodCallFailed>` and surfacing the original error to
+/// the caller. Non-exceptional contract violations (e.g. the user returned
+/// a non-Int from equals) still fall through as `false`.
+fn map_keys_equal(
+    ctx: &mut dyn NativeContext,
+    a: ObjectRef,
+    b: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
-        return true;
+        return Ok(true);
     }
     // String value equality (the common case, checked first).
     if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-        return sa == sb;
+        return Ok(sa == sb);
     }
     // Enum constants: compare by (declaring class, ordinal). `Enum.equals` is
     // `final` identity, so a correct VM never reaches here for two non-equal
@@ -1740,11 +1795,11 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
     // JLS-canonical identity and cannot collide across distinct constants.
     // See `enum_key_identity`.
     if let (Some(ia), Some(ib)) = (enum_key_identity(ctx, a), enum_key_identity(ctx, b)) {
-        return ia == ib;
+        return Ok(ia == ib);
     }
     // Wrapper type equality: unbox and compare primitives
     if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
-        return match (pa, pb) {
+        return Ok(match (pa, pb) {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Long(x), Value::Long(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => x == y,
@@ -1752,19 +1807,24 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
             (Value::Int(x), Value::Long(y)) => (x as i64) == y,
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
-        };
+        });
     }
     // S111r-bug-fix (peaceful-sammet): fall back to the user-defined
     // `equals(Object)` so HashMap honours the equals/hashCode contract for
     // arbitrary key types. See `map_hash_key` for the matching contract
     // commentary and the Spring `AnnotationTypeMapping.aliasedBy` symptom.
+    //
+    // MED fix: thrown exceptions from `equals(Object)` propagate via `?` —
+    // previously they were silently mapped to `false`, which combined with
+    // the matching swallow in `map_hash_key` meant `put` succeeded but
+    // `get` always returned null.
     let res = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))]);
     if dbg_hm_trace() {
         eprintln!("[HM-EQ] invoke_virtual(equals) -> {:?}", res);
     }
-    match res {
-        Ok(Some(Value::Int(v))) => v != 0,
-        _ => false,
+    match res? {
+        Some(Value::Int(v)) => Ok(v != 0),
+        _ => Ok(false),
     }
 }
 
@@ -2707,7 +2767,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     // Handle null key: hash=0, bucket=0, key field stores null
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
@@ -2737,8 +2797,16 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Safety: cap the chain walk to detect pathological cases (cycles or
     // O(n^2) blowup from massive single-bucket pile-ups). Real chains
     // should be O(log n) even with poor hashes; anything past 4096 is a
-    // strong signal of a cycle/corruption — break and let the insert
-    // proceed as if not found.
+    // strong signal of a cycle/corruption.
+    //
+    // MED fix: tripping the cap previously continued silently with a head
+    // insert, producing duplicate keys in the chain and breaking the map's
+    // basic key-uniqueness invariant. An attacker who can force >4096
+    // colliding keys (hash-collision DoS) thus turned each subsequent
+    // `put` into a degenerate O(n) duplicate-insert with no error path.
+    // We now throw `IllegalStateException` instead, signalling the
+    // attack/corruption to the caller rather than silently producing
+    // wrong data.
     let mut walk_count: usize = 0;
     const CHAIN_WALK_LIMIT: usize = 4096;
     while let Value::Object(Some(node)) = node_val {
@@ -2748,7 +2816,11 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
                 walk_count, this, idx, cap
             );
-            break;
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "hashmap chain exceeded safety cap; possible hash-collision DoS"
+                    .to_string(),
+            }
+            .into());
         }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
@@ -2763,7 +2835,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(old_value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
                 let old_value = get_node_value(ctx, node);
                 match ctx.get_field(node, 0) {
                     Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
@@ -2822,7 +2894,7 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -2847,7 +2919,7 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
                 let value = get_node_value(ctx, node);
                 return Ok(Some(value));
             }
@@ -2900,7 +2972,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -2914,26 +2986,31 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let idx = map_bucket_index(hash, cap);
     let head_val = ctx.get_array_element(buckets, idx);
 
-    // Helper closure: check if node matches our key (S111r27: layout-aware)
+    // Helper closure: check if node matches our key (S111r27: layout-aware).
+    // Returns Result so a thrown `equals` from the user-supplied key class
+    // propagates instead of being silently treated as "not equal".
     fn node_matches_inner(
         ctx: &mut dyn NativeContext,
         node: ObjectRef,
         is_null_key: bool,
         key_ref: Option<ObjectRef>,
-    ) -> bool {
+    ) -> Result<bool, MethodCallFailed> {
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
-            matches!(node_key_field, Value::Object(None))
+            Ok(matches!(node_key_field, Value::Object(None)))
         } else if let Value::Object(Some(nk)) = node_key_field {
-            key_ref.is_some_and(|k| map_keys_equal(ctx, nk, k))
+            match key_ref {
+                Some(k) => map_keys_equal(ctx, nk, k),
+                None => Ok(false),
+            }
         } else {
-            false
+            Ok(false)
         }
     }
 
     // Check if the head node is the target
     if let Value::Object(Some(head)) = head_val {
-        if node_matches_inner(ctx, head, is_null_key, key_ref) {
+        if node_matches_inner(ctx, head, is_null_key, key_ref)? {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
             set_map_size(ctx, this, size - 1);
@@ -2946,7 +3023,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
 
         while let Value::Object(Some(curr)) = curr_val {
-            if node_matches_inner(ctx, curr, is_null_key, key_ref) {
+            if node_matches_inner(ctx, curr, is_null_key, key_ref)? {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
                 set_map_size(ctx, this, size - 1);
@@ -2983,7 +3060,7 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -3004,7 +3081,7 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 return Ok(Some(Value::Int(1)));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
                 return Ok(Some(Value::Int(1)));
             }
         }
@@ -3104,7 +3181,7 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Add each key
     for key in &keys {
         if let Value::Object(Some(k)) = key {
-            let hash = map_hash_key(ctx, *k);
+            let hash = map_hash_key(ctx, *k)?;
             let (b, size, c) = map_state(ctx, backing_map);
             let b = b.unwrap();
             let idx = map_bucket_index(hash, c);
@@ -3303,20 +3380,26 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if size_a != size_b {
         return Ok(Some(Value::Int(0)));
     }
-    // Check all entries in this map exist in other
+    // Check all entries in this map exist in other.
+    //
+    // MED fix: previously the `if let Value::Object(Some(k))` guard
+    // silently skipped null-keyed entries entirely, so two maps that
+    // differed only on the value mapped to `null` would compare equal —
+    // a Map.equals contract violation. We now include null-keyed entries
+    // by dispatching the lookup with a `null` key (HashMap permits this
+    // and `native_map_get` handles it), and also include non-`Object`
+    // primitive-keyed entries for completeness.
     let entries = map_collect_entries(ctx, this);
     for (key, value) in &entries {
-        if let Value::Object(Some(k)) = key {
-            let get_args = [Value::Object(Some(other)), Value::Object(Some(*k))];
-            let other_val = native_map_get(ctx, &get_args)?;
-            match other_val {
-                Some(ref ov) => {
-                    if !values_equal(ctx, value, ov) {
-                        return Ok(Some(Value::Int(0)));
-                    }
+        let get_args = [Value::Object(Some(other)), *key];
+        let other_val = native_map_get(ctx, &get_args)?;
+        match other_val {
+            Some(ref ov) => {
+                if !values_equal(ctx, value, ov) {
+                    return Ok(Some(Value::Int(0)));
                 }
-                None => return Ok(Some(Value::Int(0))),
             }
+            None => return Ok(Some(Value::Int(0))),
         }
     }
     Ok(Some(Value::Int(1)))
@@ -3448,7 +3531,14 @@ pub fn make_hashset_with_elements(
                 Value::Object(Some(obj)) => *obj,
                 _ => continue, // skip nulls / primitives we can't hash
             };
-            let raw_hash = map_hash_key(ctx, key_obj);
+            // `make_hashset_with_elements` cannot propagate exceptions
+            // (returns `ObjectRef`, not `MethodCallResult`). If a user
+            // `hashCode()` throws here we fall back to identity to keep
+            // construction infallible — this matches the legacy behaviour
+            // and is acceptable for `Set.of(...)` constants which only
+            // hold JDK-internal types (String, wrappers, enum constants).
+            let raw_hash = map_hash_key(ctx, key_obj)
+                .unwrap_or_else(|_| ctx.identity_hash_code(key_obj));
             // map_hash_key already applies the (h ^ h>>>16) spread; the
             // bucket index uses raw_hash as-is for power-of-two cap.
             let idx = ((cap as u32 - 1) & raw_hash as u32) as usize;
@@ -3460,7 +3550,10 @@ pub fn make_hashset_with_elements(
             while let Value::Object(Some(probe_obj)) = probe {
                 let probe_key = ctx.get_field(probe_obj, n_key);
                 if let Value::Object(Some(pk)) = probe_key {
-                    if map_keys_equal(ctx, pk, key_obj) {
+                    // Swallowing a thrown equals here mirrors the hashCode
+                    // fallback above; legitimate `Set.of(...)` keys do not
+                    // throw equals/hashCode.
+                    if map_keys_equal(ctx, pk, key_obj).unwrap_or(false) {
                         dup = true;
                         break;
                     }
@@ -4568,22 +4661,146 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     }
     let len = ctx.array_length(arr);
-    // Read all elements with their string representation for sorting
-    let mut items: Vec<(String, Value)> = Vec::with_capacity(len);
+
+    // MED fix: real JDK `Arrays.sort(Object[])` orders elements by
+    // natural comparison (`Comparable.compareTo`), and throws
+    // `ClassCastException` for elements that don't implement Comparable.
+    // The previous implementation sorted by `read_string()` representation,
+    // which silently produced wrong order for any type whose toString does
+    // not match its natural ordering (Integer, Date, custom types) and
+    // happily sorted non-Comparable objects without complaint.
+    //
+    // We now:
+    //   1. Snapshot the array into a Vec<Value>.
+    //   2. Verify every non-null element is Comparable; throw
+    //      ClassCastException on the first non-Comparable element.
+    //   3. Sort via insertion sort, dispatching through
+    //      `Comparable.compareTo(Object)` for every pair-wise comparison.
+    //      Insertion sort is O(n^2) but works correctly with a fallible
+    //      comparator (a thrown compareTo propagates out cleanly) and is
+    //      acceptable for the synthetic-stub path — real JDK code uses
+    //      a TimSort that we can't replicate while propagating exceptions
+    //      from Rust's stable `sort_by`.
+    //
+    // Null elements are permitted (JDK sorts them as if smaller than any
+    // non-null element when the comparator is null, but throws NPE when
+    // comparing null via compareTo). To match JDK behaviour we propagate
+    // the NPE that compareTo would naturally throw if a null sneaks in.
+
+    let mut items: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        let val = ctx.get_array_element(arr, i);
-        let key = match &val {
-            Value::Object(Some(obj)) => ctx.read_string(*obj).unwrap_or_default(),
-            Value::Object(None) => String::new(),
-            _ => String::new(),
-        };
-        items.push((key, val));
+        items.push(ctx.get_array_element(arr, i));
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    for (i, (_, val)) in items.iter().enumerate() {
+
+    // Verify Comparable on every non-null element.
+    for v in &items {
+        if let Value::Object(Some(obj)) = v {
+            if !implements_comparable(ctx, *obj) {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(*obj))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                    message: format!(
+                        "element of class {} does not implement java.lang.Comparable",
+                        cname
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+
+    // Insertion sort with fallible comparator.
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 {
+            let cmp = compare_via_compare_to(ctx, &items[j - 1], &items[j])?;
+            if cmp <= 0 {
+                break;
+            }
+            items.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+
+    for (i, val) in items.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
     Ok(None)
+}
+
+/// Walk `obj`'s class hierarchy (including superclasses) and return true if
+/// any class implements `java/lang/Comparable` directly or transitively
+/// via a super-interface. Used by `native_arrays_sort_objects` to throw
+/// `ClassCastException` before invoking `compareTo` on a non-Comparable.
+fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let mut cid = ctx.class_id_of_object(obj);
+    for _ in 0..64 {
+        for iface in ctx.class_interfaces(cid) {
+            if iface_extends_comparable(ctx, iface) {
+                return true;
+            }
+        }
+        match ctx.superclass_of(cid) {
+            Some(p) => cid = p,
+            None => break,
+        }
+    }
+    false
+}
+
+/// True iff `iface` IS `java/lang/Comparable` or transitively extends it.
+fn iface_extends_comparable(ctx: &dyn NativeContext, iface: ClassId) -> bool {
+    // BFS with a depth cap (interface graphs in real-world JDKs are shallow).
+    let mut stack: Vec<ClassId> = vec![iface];
+    let mut budget = 64usize;
+    while let Some(c) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        if let Some(name) = ctx.class_name_of_id(c) {
+            if name == "java/lang/Comparable" {
+                return true;
+            }
+        }
+        for super_iface in ctx.class_interfaces(c) {
+            stack.push(super_iface);
+        }
+    }
+    false
+}
+
+/// Dispatch through `Comparable.compareTo(Object)`. Treats `null` as
+/// less than any non-null element (matching how the JDK's natural-order
+/// comparator handles the corner case for `Arrays.sort(Object[])`).
+fn compare_via_compare_to(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<i32, MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => Ok(0),
+        (Value::Object(None), _) => Ok(-1),
+        (_, Value::Object(None)) => Ok(1),
+        (Value::Object(Some(ao)), Value::Object(Some(bo))) => {
+            let r = ctx.invoke_virtual(
+                *ao,
+                "compareTo",
+                "(Ljava/lang/Object;)I",
+                &[Value::Object(Some(*bo))],
+            )?;
+            match r {
+                Some(Value::Int(v)) => Ok(v),
+                _ => Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                    message: "compareTo did not return an int".to_string(),
+                }
+                .into()),
+            }
+        }
+        // Non-object slots are unreachable in an Object[]; defensive fallback.
+        _ => Ok(0),
+    }
 }
 
 fn native_arrays_fill_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11281,13 +11498,20 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
 }
 
-fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
+fn lhm_find_node(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let (buckets, _, cap) = lhm_state(ctx, this);
-    let buckets = buckets?;
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(None),
+    };
     let (hash, is_null) = match key {
-        Value::Object(Some(k)) => (map_hash_key(ctx, *k), false),
+        Value::Object(Some(k)) => (map_hash_key(ctx, *k)?, false),
         Value::Object(None) => (0, true),
-        _ => return None,
+        _ => return Ok(None),
     };
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
@@ -11295,16 +11519,16 @@ fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> O
         let node_key = ctx.get_field(node, LHM_NODE_KEY);
         if is_null {
             if matches!(node_key, Value::Object(None)) {
-                return Some(node);
+                return Ok(Some(node));
             }
         } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key) {
-            if map_keys_equal(ctx, nk, *k) {
-                return Some(node);
+            if map_keys_equal(ctx, nk, *k)? {
+                return Ok(Some(node));
             }
         }
         node_val = ctx.get_field(node, LHM_NODE_NEXT);
     }
-    None
+    Ok(None)
 }
 
 fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
@@ -11589,7 +11813,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
     let hash = match key_val {
-        Value::Object(Some(k)) => map_hash_key(ctx, k),
+        Value::Object(Some(k)) => map_hash_key(ctx, k)?,
         Value::Object(None) => 0,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -11609,7 +11833,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
 
     // Check for existing key
-    if let Some(node) = lhm_find_node(ctx, this, &key_val) {
+    if let Some(node) = lhm_find_node(ctx, this, &key_val)? {
         let old = ctx.get_field(node, LHM_NODE_VALUE);
         ctx.set_field(node, LHM_NODE_VALUE, value);
         return Ok(Some(old));
@@ -11645,7 +11869,7 @@ fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key) {
+    if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let value = ctx.get_field(node, LHM_NODE_VALUE);
         // Round-9 HIGH: access-order semantics. When the LHM was
         // constructed with `(IFZ)V` accessOrder=true, `get` must move
@@ -11708,7 +11932,7 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (hash, is_null) = match key_val {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -11728,7 +11952,7 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let found = if is_null {
             matches!(node_key, Value::Object(None))
         } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key_val) {
-            map_keys_equal(ctx, nk, k)
+            map_keys_equal(ctx, nk, k)?
         } else {
             false
         };
@@ -11764,7 +11988,7 @@ fn native_lhm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     Ok(Some(Value::Int(
-        if lhm_find_node(ctx, this, &key).is_some() {
+        if lhm_find_node(ctx, this, &key)?.is_some() {
             1
         } else {
             0
@@ -11886,7 +12110,7 @@ fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key) {
+    if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let value = ctx.get_field(node, LHM_NODE_VALUE);
         // Round-9 HIGH: `getOrDefault` is also an access for access-order
         // semantics — same reorder as `get`. The JDK's `LinkedHashMap`
@@ -11906,7 +12130,7 @@ fn native_lhm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key) {
+    if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let existing = ctx.get_field(node, LHM_NODE_VALUE);
         Ok(Some(existing))
     } else {
@@ -16167,10 +16391,13 @@ const CHM_DEFAULT_SEGMENTS: usize = 16;
 const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
 
 /// Compute hash for a key value (reuses map_hash_key for object keys).
-fn chm_key_hash(ctx: &mut dyn NativeContext, key: &Value) -> i32 {
+///
+/// Propagates any exception thrown by a user-supplied `hashCode()` via the
+/// underlying `map_hash_key` (MED fix).
+fn chm_key_hash(ctx: &mut dyn NativeContext, key: &Value) -> Result<i32, MethodCallFailed> {
     match key {
         Value::Object(Some(k)) => map_hash_key(ctx, *k),
-        _ => 0,
+        _ => Ok(0),
     }
 }
 
@@ -16648,7 +16875,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let src_entries = map_collect_entries(ctx, source);
     let _resize_flag = ChmResizeLockGuard::enter();
     for (key, value) in src_entries {
-        let hash = chm_key_hash(ctx, &key);
+        let hash = chm_key_hash(ctx, &key)?;
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
@@ -16674,11 +16901,11 @@ fn chm_seg_get(
     ctx: &mut dyn NativeContext,
     seg: ObjectRef,
     key_val: Value,
-) -> Option<Value> {
+) -> Result<Option<Value>, MethodCallFailed> {
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
-        _ => return None,
+        _ => return Ok(None),
     };
     // Bug 1+2 (CRIT) round-10 fix: take a read-lock against any
     // in-progress concurrent `map_resize_concurrent` on this segment.
@@ -16701,14 +16928,14 @@ fn chm_seg_get(
     let buckets_val = ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS);
     let buckets = match buckets_val {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
-        _ => return None,
+        _ => return Ok(None),
     };
     let cap = match ctx.get_field(seg, MAP_FIELD_CAPACITY) {
         Value::Int(c) => c,
-        _ => return None,
+        _ => return Ok(None),
     };
     if cap <= 0 {
-        return None;
+        return Ok(None);
     }
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
@@ -16716,11 +16943,11 @@ fn chm_seg_get(
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
-                return Some(get_node_value(ctx, node));
+                return Ok(Some(get_node_value(ctx, node)));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
-                return Some(get_node_value(ctx, node));
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+                return Ok(Some(get_node_value(ctx, node)));
             }
         }
         // Acquire-load the NEXT pointer. Pairs with the writer's
@@ -16731,7 +16958,7 @@ fn chm_seg_get(
         // writes (happens-before via Release/Acquire).
         node_val = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
     }
-    None
+    Ok(None)
 }
 
 fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16740,9 +16967,9 @@ fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => Ok(Some(chm_seg_get(ctx, seg, key).unwrap_or(Value::Object(None)))),
+        Some(seg) => Ok(Some(chm_seg_get(ctx, seg, key)?.unwrap_or(Value::Object(None)))),
         None => Ok(Some(Value::Object(None))),
     }
 }
@@ -16753,14 +16980,14 @@ fn native_chm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             // Volatile-read path: a present mapping is detected by a
             // non-null Value::Object payload OR by walking the chain
             // and finding a key match (which `chm_seg_get` does). A
             // miss returns None here.
-            match chm_seg_get(ctx, seg, key) {
+            match chm_seg_get(ctx, seg, key)? {
                 Some(_) => Ok(Some(Value::Int(1))),
                 None => Ok(Some(Value::Int(0))),
             }
@@ -16776,9 +17003,9 @@ fn native_chm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => match chm_seg_get(ctx, seg, key) {
+        Some(seg) => match chm_seg_get(ctx, seg, key)? {
             Some(v) => Ok(Some(v)),
             None => Ok(Some(default)),
         },
@@ -16811,7 +17038,7 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -16828,7 +17055,7 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -16846,7 +17073,7 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -16864,7 +17091,7 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -16882,7 +17109,7 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -16901,7 +17128,7 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let func = args.get(3).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -16961,7 +17188,7 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let _resize_flag = ChmResizeLockGuard::enter();
     let entries = map_collect_entries(ctx, source);
     for (key, value) in entries {
-        let hash = chm_key_hash(ctx, &key);
+        let hash = chm_key_hash(ctx, &key)?;
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
@@ -17161,7 +17388,7 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17186,7 +17413,7 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17213,7 +17440,7 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17703,27 +17930,34 @@ fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Otherwise try to read it as a string field
     let text = props_read_input(ctx, stream);
 
-    // Parse key=value lines
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            continue;
-        }
-        // Handle continuation lines (trailing \) — simplified: ignore
-        // Find separator: = or :
-        let (key, value) = if let Some(eq_pos) = line.find('=') {
-            (line[..eq_pos].trim(), line[eq_pos + 1..].trim())
-        } else if let Some(colon_pos) = line.find(':') {
-            (line[..colon_pos].trim(), line[colon_pos + 1..].trim())
-        } else {
-            // Key with no value
-            (line, "")
-        };
+    // MED fix: implement the JDK `Properties.load` spec (close to it,
+    // anyway):
+    //   - lines starting with `#` or `!` (after leading whitespace) are
+    //     comments and skipped entirely;
+    //   - blank lines (whitespace only) are skipped;
+    //   - leading whitespace before a key is trimmed;
+    //   - a line that ends with an *unescaped* trailing `\` continues
+    //     onto the next line (the `\` is dropped and leading whitespace
+    //     on the continuation line is trimmed);
+    //   - the key terminates at the first unescaped whitespace, `=`, or
+    //     `:`; subsequent whitespace and one optional `=`/`:` are then
+    //     consumed; the rest of the logical line is the value;
+    //   - inside both key and value the JDK escapes are honoured:
+    //       \t \n \r \f \\ \" \'  → the corresponding ASCII char,
+    //       \= \: \space          → the literal char (allows them in keys),
+    //       \uXXXX               → the BMP codepoint XXXX,
+    //       \<anything else>      → the trailing char itself (per JDK).
+    //
+    // This is intentionally implemented in pure Rust against the in-memory
+    // text rather than dispatching back to JDK Properties for parity —
+    // the previous implementation silently truncated/corrupted any
+    // real-world `.properties` file with escapes or continuations.
+    for (key, value) in props_parse_logical_lines(&text) {
         if key.is_empty() {
             continue;
         }
-        let key_obj = ctx.create_string(key);
-        let val_obj = ctx.create_string(value);
+        let key_obj = ctx.create_string(&key);
+        let val_obj = ctx.create_string(&value);
         native_map_put(
             ctx,
             &[
@@ -17734,6 +17968,184 @@ fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         )?;
     }
     Ok(None)
+}
+
+/// Parse a `.properties` text into `(key, value)` pairs per the JDK
+/// `Properties.load` spec — handles comments, blank lines, leading-
+/// whitespace trim, trailing-backslash continuations, the
+/// `\t\n\r\f\\\"\'\=\:` and `\uXXXX` escape sequences in both keys and
+/// values, and the natural key/value separator (the first unescaped
+/// whitespace, `=`, or `:`).
+fn props_parse_logical_lines(text: &str) -> Vec<(String, String)> {
+    let raw_lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < raw_lines.len() {
+        // Strip a trailing `\r` (CRLF inputs) without losing escapes.
+        let mut line = raw_lines[i].trim_end_matches('\r').to_string();
+        // Trim leading whitespace per spec.
+        let trimmed_start = line.trim_start();
+        let leading_skipped = line.len() - trimmed_start.len();
+        // Comment / blank — skipped entirely (continuations do not apply
+        // to comment lines).
+        if trimmed_start.is_empty()
+            || trimmed_start.starts_with('#')
+            || trimmed_start.starts_with('!')
+        {
+            i += 1;
+            continue;
+        }
+        line.drain(..leading_skipped);
+
+        // Apply continuation: if the line ends with an *odd* number of
+        // trailing backslashes, the last `\` is a continuation marker
+        // and the following physical line is appended (after trimming
+        // its leading whitespace).
+        while ends_with_unescaped_backslash(&line) {
+            line.pop(); // remove the trailing backslash
+            i += 1;
+            if i >= raw_lines.len() {
+                break;
+            }
+            let next = raw_lines[i].trim_end_matches('\r');
+            line.push_str(next.trim_start());
+        }
+        i += 1;
+
+        // Walk the logical line to find the key/value boundary. The key
+        // ends at the first unescaped whitespace, `=`, or `:`.
+        let bytes = line.as_bytes();
+        let mut idx = 0;
+        let mut key_buf = String::new();
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if b == b'\\' {
+                // Pull one escape into the key.
+                let (decoded, consumed) = decode_escape(&bytes[idx..]);
+                key_buf.push_str(&decoded);
+                idx += consumed;
+                continue;
+            }
+            if b == b' ' || b == b'\t' || b == b'\x0c' || b == b'=' || b == b':' {
+                break;
+            }
+            // Multi-byte UTF-8: copy through.
+            let ch_end = utf8_char_end(bytes, idx);
+            key_buf.push_str(std::str::from_utf8(&bytes[idx..ch_end]).unwrap_or(""));
+            idx = ch_end;
+        }
+
+        // Skip whitespace, then at most one `=` or `:`, then more whitespace.
+        while idx < bytes.len() && matches!(bytes[idx], b' ' | b'\t' | b'\x0c') {
+            idx += 1;
+        }
+        if idx < bytes.len() && (bytes[idx] == b'=' || bytes[idx] == b':') {
+            idx += 1;
+            while idx < bytes.len() && matches!(bytes[idx], b' ' | b'\t' | b'\x0c') {
+                idx += 1;
+            }
+        }
+
+        // Remainder is the value (with escapes decoded).
+        let mut val_buf = String::new();
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if b == b'\\' {
+                let (decoded, consumed) = decode_escape(&bytes[idx..]);
+                val_buf.push_str(&decoded);
+                idx += consumed;
+                continue;
+            }
+            let ch_end = utf8_char_end(bytes, idx);
+            val_buf.push_str(std::str::from_utf8(&bytes[idx..ch_end]).unwrap_or(""));
+            idx = ch_end;
+        }
+
+        out.push((key_buf, val_buf));
+    }
+    out
+}
+
+/// True when the line ends with a backslash that is *not* itself
+/// escaped (i.e. odd run of trailing backslashes).
+fn ends_with_unescaped_backslash(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut n = 0usize;
+    for &b in bytes.iter().rev() {
+        if b == b'\\' {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n % 2 == 1
+}
+
+/// Decode a single backslash-escape starting at `bytes[0] == b'\\'`.
+/// Returns `(decoded_string, bytes_consumed_including_backslash)`.
+/// Falls back to the literal trailing char for unknown escapes (matches
+/// JDK behaviour: `\q` parses as `q`).
+fn decode_escape(bytes: &[u8]) -> (String, usize) {
+    debug_assert_eq!(bytes[0], b'\\');
+    if bytes.len() < 2 {
+        return (String::new(), 1);
+    }
+    match bytes[1] {
+        b't' => ("\t".to_string(), 2),
+        b'n' => ("\n".to_string(), 2),
+        b'r' => ("\r".to_string(), 2),
+        b'f' => ("\x0c".to_string(), 2),
+        b'\\' => ("\\".to_string(), 2),
+        b'"' => ("\"".to_string(), 2),
+        b'\'' => ("'".to_string(), 2),
+        b'u' => {
+            // \uXXXX (exactly 4 hex digits per JDK spec).
+            if bytes.len() < 6 {
+                return ((bytes[1] as char).to_string(), 2);
+            }
+            let hex = std::str::from_utf8(&bytes[2..6]).unwrap_or("");
+            match u32::from_str_radix(hex, 16) {
+                Ok(cp) => match char::from_u32(cp) {
+                    Some(ch) => (ch.to_string(), 6),
+                    // Surrogate halves and other invalid code points: fall
+                    // through to literal 'u' so we never lose data.
+                    None => ("u".to_string(), 2),
+                },
+                Err(_) => ("u".to_string(), 2),
+            }
+        }
+        // Per spec: any other char after `\` (including space, `=`, `:`,
+        // and unknown letters) becomes itself, allowing them inside keys.
+        other => {
+            // Multi-byte UTF-8 starting at byte index 1.
+            let end = utf8_char_end(bytes, 1);
+            let s = std::str::from_utf8(&bytes[1..end])
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| (other as char).to_string());
+            (s, end)
+        }
+    }
+}
+
+/// Return the byte-index just past the UTF-8 char that begins at `start`,
+/// or `start + 1` for invalid sequences (safe fallback).
+fn utf8_char_end(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() {
+        return start;
+    }
+    let b = bytes[start];
+    let len = if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        1 // continuation byte — should not start a char; treat as 1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    };
+    (start + len).min(bytes.len())
 }
 
 /// Helper: read all text from a stream or reader object.
@@ -17794,13 +18206,36 @@ fn native_props_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
-    // Write to output stream (simplified: store as string in the stream)
-    // For BAOS: write bytes directly
+    // Write to output stream.
+    //
+    // MED fix: the previous implementation issued one `write(I)V` virtual
+    // dispatch per byte — for a Properties with ~1000 entries this meant
+    // ~50 000 virtual calls. Build a single `byte[]` once and call
+    // `write([B)V` exactly once per line, which most OutputStream
+    // implementations override to do a single bulk copy. We dispatch
+    // line-by-line rather than the entire buffer in one go so a
+    // pathological output stream (e.g. one that requires a flush between
+    // lines) still gets reasonable behaviour, and so each line's bytes
+    // fit easily into a single allocation.
     if let Value::Object(Some(ostream)) = args[1] {
-        let bytes = output.as_bytes();
-        for &b in bytes {
-            // Call write(I)V on the output stream
-            let _ = ctx.invoke_virtual(ostream, "write", "(I)V", &[Value::Int(b as i32)]);
+        for line in output.split_inclusive('\n') {
+            let bytes = line.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                // Byte array slots hold sign-extended Int per the VM's
+                // primitive-array value model.
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            // Prefer the bulk `write([B)V` overload. If a stream does
+            // not implement it, the JDK default (AbstractOutputStream)
+            // falls back to per-byte `write(I)V`, so we keep behaviour
+            // even on minimal stream impls.
+            let _ = ctx.invoke_virtual(
+                ostream,
+                "write",
+                "([B)V",
+                &[Value::Object(Some(arr))],
+            );
         }
     }
     Ok(None)
@@ -20349,10 +20784,23 @@ const CSLM_DEFAULT_CAPACITY: usize = 16;
 
 const CSLM_LOCK_STRIPES: usize = 256;
 
-fn cslm_stripe_for(ctx: &mut dyn NativeContext, this: ObjectRef) -> &'static std::sync::RwLock<()> {
-    static STRIPES: std::sync::OnceLock<Vec<std::sync::RwLock<()>>> = std::sync::OnceLock::new();
+fn cslm_stripe_for(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> &'static parking_lot::RwLock<()> {
+    // MED fix: switched from `std::sync::RwLock` to `parking_lot::RwLock`
+    // for consistency with the CHM-segment striped locks earlier in this
+    // file (see `seg_locks`). parking_lot's `read()`/`write()` are
+    // infallible — no `PoisonError` handling at every call site — and
+    // their unpoisoning semantics match the CHM stripes which expect
+    // a panicking writer to leave the lock usable for subsequent
+    // segments rather than poisoning the whole stripe.
+    static STRIPES: std::sync::OnceLock<Vec<parking_lot::RwLock<()>>> =
+        std::sync::OnceLock::new();
     let stripes = STRIPES.get_or_init(|| {
-        (0..CSLM_LOCK_STRIPES).map(|_| std::sync::RwLock::new(())).collect()
+        (0..CSLM_LOCK_STRIPES)
+            .map(|_| parking_lot::RwLock::new(()))
+            .collect()
     });
     let key = ctx.identity_hash_code(this) as u32;
     // Mix bits so sequentially-allocated objects spread across stripes.
@@ -20481,7 +20929,7 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // Bug 1: serialise mutating ops on this map's lock stripe.
-    let _guard = cslm_stripe_for(ctx, this).write().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -20532,7 +20980,7 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Bug 1: shared read lock — concurrent reads OK, blocks during writes.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -20555,7 +21003,7 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Bug 1: serialise mutating ops on this map's lock stripe.
-    let _guard = cslm_stripe_for(ctx, this).write().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -20590,7 +21038,7 @@ fn native_cslm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Int(0))),
     };
     // Bug 1: read lock so size cannot tear vs an in-flight put/remove.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -20604,7 +21052,7 @@ fn native_cslm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Int(1))),
     };
     // Bug 1: read lock for consistent size observation.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -20619,7 +21067,7 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Bug 1: shared read lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -20640,7 +21088,7 @@ fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
     // Bug 1: shared read lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
         return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
@@ -20663,7 +21111,7 @@ fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
     // Bug 1: shared read lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
         return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
@@ -20681,7 +21129,7 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     // Bug 1: shared read lock — snapshot the keys array under the lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     // Return a TreeSet with natural ordering containing all keys
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
