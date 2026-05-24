@@ -61,7 +61,22 @@ impl NativeMemoryTable {
         let id = self.next_id;
         self.next_id = match self.next_id.checked_add(1) {
             Some(next) => next,
-            None => return None, // ID space exhausted
+            None => {
+                // ID space exhausted — free the block we just allocated
+                // rather than leaking it. Without this `dealloc` the
+                // `alloc_zeroed` above would orphan `size` bytes on every
+                // failed call (rare in practice — `i64` exhaustion would
+                // take billions of years — but a leak nonetheless, and
+                // valgrind/miri/asan will flag it).
+                //
+                // Safety: `ptr` was just produced by `alloc::alloc_zeroed`
+                // with `layout` and has not been handed out or stored
+                // anywhere, so we are the unique owner.
+                unsafe { alloc::dealloc(ptr, layout) };
+                #[cfg(test)]
+                test_hooks::EXHAUSTION_DEALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
         };
         self.allocations
             .insert(id, NativeAllocation { ptr, layout });
@@ -114,6 +129,16 @@ impl NativeMemoryTable {
     pub fn live_bytes(&self) -> usize {
         self.live_bytes
     }
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::atomic::AtomicUsize;
+    /// Incremented by `NativeMemoryTable::allocate` every time the
+    /// ID-exhaustion path deallocates the just-allocated block before
+    /// returning `None`. Reset by tests that want to observe a single
+    /// failure in isolation.
+    pub(super) static EXHAUSTION_DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 }
 
 impl Default for NativeMemoryTable {
@@ -359,6 +384,38 @@ mod tests {
         // align=0 should be rounded up to 1
         let result = table.allocate(16, 0);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn allocate_does_not_leak_on_id_exhaustion() {
+        // Regression: previously, when `next_id.checked_add(1)`
+        // overflowed, `allocate` returned `None` without freeing the
+        // block it had just acquired via `alloc::alloc_zeroed`. Force
+        // the overflow by seeding `next_id` at `i64::MAX` and verify:
+        //   1. the function returns `None`,
+        //   2. the allocation table stays empty (the failed allocation
+        //      was *not* stashed under any id), and
+        //   3. the running `live_bytes` total is unchanged, and
+        //   4. the dedicated free-on-exhaustion path actually ran,
+        //      witnessed via the `EXHAUSTION_DEALLOCS` test counter.
+        let before = test_hooks::EXHAUSTION_DEALLOCS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut table = NativeMemoryTable::new();
+        table.next_id = i64::MAX;
+        let result = table.allocate(4096, 8);
+        assert!(result.is_none(), "expected None on id exhaustion");
+        assert!(
+            table.allocations.is_empty(),
+            "leaked block was inserted into table"
+        );
+        assert_eq!(table.live_bytes, 0, "live_bytes drifted on failure");
+        let after = test_hooks::EXHAUSTION_DEALLOCS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            1,
+            "exhaustion path did not call the matching dealloc"
+        );
     }
 
     #[test]
