@@ -1318,6 +1318,7 @@ fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, RuntimeError> {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
+    use cratonvm_native_api::NativeContext;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
