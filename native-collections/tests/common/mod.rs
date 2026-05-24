@@ -1,564 +1,749 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company.
-
-//! Minimal `NativeContext` mock for the GC-relocation overlay tests.
+//
+//! Shared test fixtures for native-collections integration tests.
 //!
-//! Adapted from `native-io/src/test_support.rs` — same heap-entry
-//! design, but with a key extra: `identity_hash_code` reads from a
-//! per-ObjectRef hash map so the test can simulate a moving GC by
-//! creating two distinct `ObjectRef` values that share the same
-//! identity-hash word (the exact contract a real moving GC preserves
-//! during compaction).
-//!
-//! The mock implements every `NativeContext` method that the trait
-//! requires. Methods the overlay shims don't call return cheap
-//! defaults so the file stays under 300 LOC without losing
-//! type-soundness.
+//! Provides a heap-backed `MockCtx` that implements `NativeContext`
+//! richly enough to drive HashMap / ArrayList / LinkedHashMap / TreeMap
+//! natives end-to-end. The bundled `cratonvm-native-api`
+//! `test-mock::MockNativeContext` is intentionally minimal (it exists
+//! to exercise *trait default impls*); collection natives, by contrast,
+//! depend on real heap-backed arrays and field storage, so this module
+//! grows the mock to a usable size.
 
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code)]
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use cratonvm_native_api::{
-    AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, NativeContext,
-    StackTraceEntry,
+    AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata,
+    NativeContext, NativeMethodRegistry, StackTraceEntry,
+    ffi::UpcallEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
+/// One heap entry — either a plain object (fields) or an array (elements).
 enum HeapEntry {
-    Object { fields: Vec<Value> },
+    Object { class_id: ClassId, fields: Vec<Value> },
     Array { elements: Vec<Value> },
 }
 
-/// Deterministic pointer-to-i32 hash with a per-MockCtx namespace
-/// offset. Same `(ptr, namespace)` always yields the same `i32` so
-/// the contract `identity_hash_code(x) == identity_hash_code(x)` holds.
-/// Crucially, the namespace is mixed in via XOR after the multiplier
-/// step so two MockCtx instances allocate hashes from disjoint
-/// 32-bit subranges — preventing process-global overlay collisions
-/// when Cargo runs integration tests in parallel.
-fn derive_hash(ptr: usize, namespace: i32) -> i32 {
-    let mixed = ptr.wrapping_mul(0x9E37_79B9_usize) ^ 0xCAFE_BABE_usize;
-    let h = (mixed as i32) ^ namespace;
-    if h == 0 { 0x1000_0001 } else { h }
-}
-
+/// A heap-backed mock NativeContext.
+///
+/// Single-threaded by contract: uses `UnsafeCell` to satisfy the trait
+/// methods that take `&self` but need interior mutation (`set_field`,
+/// `set_array_element`).
 pub struct MockCtx {
     heap: UnsafeCell<Vec<HeapEntry>>,
-    // raw `as_ptr() as usize` -> heap-entry index
+    /// raw-pointer → heap-index map for `ObjectRef` resolution.
     ptr_to_index: UnsafeCell<HashMap<usize, usize>>,
-    // raw `as_ptr() as usize` -> stable identity-hash word
-    //
-    // A real moving GC copies the identity-hash word along with the
-    // object header during compaction. The mock mirrors that by
-    // keeping the i32 hash in a side map: when `relocate_object`
-    // creates a fresh `ObjectRef` for a relocated object, it inserts
-    // the same hash under the new pointer, so
-    // `identity_hash_code(old) == identity_hash_code(new)`.
-    ptr_to_hash: UnsafeCell<HashMap<usize, i32>>,
-    // Per-MockCtx hash-namespace offset. Cargo runs integration tests
-    // in parallel by default; without a per-instance offset every
-    // test's first object hashes to the same value, polluting the
-    // process-global LHM/LL/TM/TS overlay statics across tests.
-    // `CTX_COUNTER` advances by a 64-bit prime so two MockCtx
-    // instances can never collide on derived hashes.
-    hash_namespace: i32,
+    /// class_id → name and reverse.
+    class_names: HashMap<u32, String>,
+    name_to_id: HashMap<String, u32>,
+    next_class_id: u32,
     next_ptr: usize,
+    /// Stable identity hashes — assigned on first probe and remembered.
+    identity_hashes: UnsafeCell<HashMap<usize, i32>>,
+    next_identity: UnsafeCell<i32>,
+    /// Programmable single-shot result for `invoke_virtual`.
+    invoke_virtual_result: UnsafeCell<Option<MethodCallResult>>,
+    /// Append-only log of every `invoke_virtual` call made on this
+    /// context. Tests that need to observe per-entry callbacks (e.g.
+    /// `forEach`) consult this to recover the visit order without
+    /// re-implementing the callable receiver. Each entry is
+    /// `(receiver_ptr, method_name, descriptor, args)`.
+    invoke_virtual_log: UnsafeCell<Vec<(usize, String, String, Vec<Value>)>>,
 }
 
 impl Default for MockCtx {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
+
+/// Process-wide pointer-namespace counter.
+///
+/// The `native-collections` crate stashes its LinkedList / LinkedHashMap
+/// / TreeMap / TreeSet side-table state in `static OnceLock<Mutex<...>>`
+/// maps that outlive any single test. To stop two tests in the same
+/// integration binary from clobbering each other's overlay entries, each
+/// `MockCtx` claims a fresh, non-overlapping address window. The window
+/// is 2^32 bytes wide and starts above `1 << 40` to keep the addresses
+/// numerically distinct from any plausible real pointer (we never
+/// dereference them — `ObjectRef` is only ever compared and indexed
+/// through our local map).
+static NEXT_NAMESPACE: AtomicUsize = AtomicUsize::new(1);
+/// Per-process identity-hash base. C21's overlay keys are identity-hash
+/// codes (i32); without a per-MockCtx base, two contexts both start at
+/// 1 and would alias overlay entries.
+static NEXT_HASH_BASE: AtomicI32 = AtomicI32::new(1);
 
 impl MockCtx {
     pub fn new() -> Self {
-        use std::sync::atomic::{AtomicI32, Ordering};
-        static CTX_COUNTER: AtomicI32 = AtomicI32::new(1);
-        let id = CTX_COUNTER.fetch_add(1, Ordering::Relaxed);
-        // Multiplier is a large 31-bit prime — gives every MockCtx a
-        // disjoint hash range from the others.
-        let hash_namespace = id.wrapping_mul(0x7FFF_FFFF_u32 as i32);
+        // Carve out a fresh 4 GiB address window for this context.
+        // 1 << 40 (1 TiB) base is comfortably above anything a real
+        // allocator hands out in a test process, and the +1 << 32
+        // stride per ctx guarantees no two windows overlap.
+        let ns = NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
+        let ptr_base = (1usize << 40).wrapping_add(ns << 32);
+        // Identity-hash base: claim 1 << 24 codes per ctx so tests that
+        // allocate hundreds of objects cannot wrap into another ctx's
+        // range (an i32 has ~127 million such windows before exhausting).
+        let hash_base = NEXT_HASH_BASE.fetch_add(1 << 24, Ordering::Relaxed);
         Self {
             heap: UnsafeCell::new(Vec::new()),
             ptr_to_index: UnsafeCell::new(HashMap::new()),
-            ptr_to_hash: UnsafeCell::new(HashMap::new()),
-            hash_namespace,
-            next_ptr: 8,
+            class_names: HashMap::new(),
+            name_to_id: HashMap::new(),
+            next_class_id: 1,
+            next_ptr: ptr_base,
+            identity_hashes: UnsafeCell::new(HashMap::new()),
+            next_identity: UnsafeCell::new(hash_base),
+            invoke_virtual_result: UnsafeCell::new(None),
+            invoke_virtual_log: UnsafeCell::new(Vec::new()),
         }
     }
 
+    /// Snapshot the `invoke_virtual` call log. Returned in invocation order.
+    pub fn invoke_virtual_log(&self) -> Vec<(usize, String, String, Vec<Value>)> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.invoke_virtual_log.get()).clone() }
+    }
+
+    /// Clear the `invoke_virtual` call log.
+    pub fn clear_invoke_virtual_log(&self) {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.invoke_virtual_log.get()).clear() }
+    }
+
+    pub fn set_invoke_virtual_result(&self, r: MethodCallResult) {
+        // SAFETY: single-threaded test code.
+        unsafe { *self.invoke_virtual_result.get() = Some(r); }
+    }
+
     fn heap_mut(&self) -> &mut Vec<HeapEntry> {
+        // SAFETY: single-threaded test code.
         unsafe { &mut *self.heap.get() }
     }
     fn heap_ref(&self) -> &Vec<HeapEntry> {
+        // SAFETY: single-threaded test code.
         unsafe { &*self.heap.get() }
     }
     fn ptr_map_mut(&self) -> &mut HashMap<usize, usize> {
+        // SAFETY: single-threaded test code.
         unsafe { &mut *self.ptr_to_index.get() }
     }
     fn ptr_map_ref(&self) -> &HashMap<usize, usize> {
+        // SAFETY: single-threaded test code.
         unsafe { &*self.ptr_to_index.get() }
-    }
-    fn hash_map_mut(&self) -> &mut HashMap<usize, i32> {
-        unsafe { &mut *self.ptr_to_hash.get() }
-    }
-    fn hash_map_ref(&self) -> &HashMap<usize, i32> {
-        unsafe { &*self.ptr_to_hash.get() }
     }
 
     fn alloc_entry(&mut self, entry: HeapEntry) -> ObjectRef {
-        let idx = self.heap_mut().len();
-        self.heap_mut().push(entry);
-        let ptr = self.next_ptr;
+        let heap = self.heap_mut();
+        let idx = heap.len();
+        heap.push(entry);
+        let ptr_val = self.next_ptr;
         self.next_ptr += 8;
-        self.ptr_map_mut().insert(ptr, idx);
-        unsafe { ObjectRef::from_raw(ptr as *mut u8) }
+        self.ptr_map_mut().insert(ptr_val, idx);
+        // SAFETY: ptr_val >= 8 and 8-byte aligned.
+        unsafe { ObjectRef::from_raw(ptr_val as *mut u8) }
     }
 
     fn entry_index(&self, obj: ObjectRef) -> Option<usize> {
         self.ptr_map_ref().get(&(obj.as_ptr() as usize)).copied()
     }
 
-    /// Allocate a regular object (no class binding) with `num_fields` slots.
-    pub fn alloc_object_simple(&mut self, num_fields: usize) -> ObjectRef {
-        self.alloc_entry(HeapEntry::Object {
-            fields: vec![Value::Object(None); num_fields],
-        })
+    /// Forge a fresh ObjectRef at a synthetic address, bypassing the
+    /// heap-index map. Used by the GC-relocation harness to fabricate a
+    /// "post-GC" pointer with the same numeric value as a previously-
+    /// allocated object, simulating relocation aliasing.
+    pub fn forge_object_ref(&self, ptr_val: usize) -> ObjectRef {
+        debug_assert!(ptr_val % 8 == 0 && ptr_val >= 8);
+        // SAFETY: caller picks a non-null, 8-aligned value.
+        unsafe { ObjectRef::from_raw(ptr_val as *mut u8) }
     }
 
-    /// Simulate a moving-GC compaction: hands back a fresh `ObjectRef`
-    /// pointing to a brand-new pointer address, while preserving the
-    /// original object's identity-hash word (which a real GC copies
-    /// from the source header into the destination header during
-    /// `forward_object`). The new ObjectRef *also* aliases the same
-    /// heap-entry index so loads/stores through it still hit the
-    /// original fields — modelling the post-move "logical identity"
-    /// the JVM presents to bytecode.
-    pub fn relocate_object(&mut self, src: ObjectRef) -> ObjectRef {
-        let src_ptr = src.as_ptr() as usize;
-        let entry_idx = self
-            .ptr_map_ref()
-            .get(&src_ptr)
-            .copied()
-            .expect("relocate_object: source ObjectRef not in heap");
-        // Lazily seed the source hash if it was never observed, so
-        // `relocate_object` is callable on an object that the test
-        // never read the identity hash of (e.g. a fresh alloc).
-        if !self.hash_map_ref().contains_key(&src_ptr) {
-            // Reuse the same derivation as `identity_hash_code` so
-            // the seeded value matches what `identity_hash_code(src)`
-            // would have returned. Without this, calling
-            // `identity_hash_code(src)` *after* `relocate_object`
-            // would compute a different hash than what we just
-            // stored, breaking the post-move equality check.
-            let derived = derive_hash(src_ptr, self.hash_namespace);
-            self.hash_map_mut().insert(src_ptr, derived);
-        }
-        let src_hash = *self.hash_map_ref().get(&src_ptr).unwrap();
-        // Allocate a new pointer address. Do NOT push a new heap
-        // entry — point at the existing one so reads/writes through
-        // the new ObjectRef still observe the relocated object's
-        // state. (A real GC moves the bytes; we keep them in place
-        // and just re-route the address.)
-        let new_ptr = self.next_ptr;
+    /// Reuse the next allocation address so the next `alloc_*` call
+    /// lands at `ptr_val`. Used by the GC-relocation harness.
+    pub fn set_next_ptr(&mut self, ptr_val: usize) {
+        assert!(ptr_val % 8 == 0 && ptr_val >= 8);
+        self.next_ptr = ptr_val;
+    }
+
+    /// Snapshot the next pointer the mock will hand out. Useful for
+    /// the GC-relocation test to capture an address before allocating
+    /// a fresh object on top of it.
+    pub fn peek_next_ptr(&self) -> usize { self.next_ptr }
+
+    /// Convenience wrapper around `NativeContext::alloc_object` for tests
+    /// that don't care about field count. Used by the GC-relocation
+    /// harness (task #13) where the harness just needs distinct
+    /// `ObjectRef`s on which to exercise identity-hash stability.
+    pub fn alloc_object_simple(&mut self, class_id: u32) -> ObjectRef {
+        <Self as NativeContext>::alloc_object(self, ClassId::new(class_id), 0)
+    }
+
+    /// Move `old` to a fresh address while preserving its identity-hash
+    /// mapping. Returns the new `ObjectRef`.
+    ///
+    /// Models a moving / compacting GC: the heap entry stays the same
+    /// (so field/array reads still find the right backing storage), but
+    /// the object's pointer value changes. The identity-hash table is
+    /// updated so the *same* identity hash code that `old` produced is
+    /// also produced for the new ObjectRef — that is the contract a
+    /// real moving GC honors by copying the hash word with the object
+    /// header. This lets the test prove that overlay tables keyed by
+    /// `identity_hash_code` (C21) survive relocation, while overlays
+    /// keyed by raw pointer would lose state.
+    pub fn relocate_object(&mut self, old: ObjectRef) -> ObjectRef {
+        let old_key = old.as_ptr() as usize;
+        let entry_idx = *self.ptr_map_ref().get(&old_key)
+            .expect("relocate_object: stale ObjectRef");
+        // Mint a fresh slot.
+        let new_ptr_val = self.next_ptr;
         self.next_ptr += 8;
-        self.ptr_map_mut().insert(new_ptr, entry_idx);
-        self.hash_map_mut().insert(new_ptr, src_hash);
-        unsafe { ObjectRef::from_raw(new_ptr as *mut u8) }
+        // Repoint the heap-index map and remove the old binding so
+        // subsequent reads against `old` cleanly fail.
+        self.ptr_map_mut().insert(new_ptr_val, entry_idx);
+        self.ptr_map_mut().remove(&old_key);
+        // Copy the identity hash so the new ObjectRef yields the same
+        // hash code as the relocated one did.
+        // SAFETY: single-threaded test code.
+        let hash_map = unsafe { &mut *self.identity_hashes.get() };
+        let existing = hash_map.get(&old_key).copied();
+        if let Some(h) = existing {
+            hash_map.insert(new_ptr_val, h);
+            hash_map.remove(&old_key);
+        }
+        // SAFETY: new_ptr_val is non-null (>= 8) and 8-aligned.
+        unsafe { ObjectRef::from_raw(new_ptr_val as *mut u8) }
     }
 }
 
 impl NativeContext for MockCtx {
+    // ------------------------------------------------------------------
+    // Class loading / dispatch — synthetic class registry only.
+    // ------------------------------------------------------------------
+
+    fn load_class(&mut self, _name: &str) -> MethodCallResult { Ok(None) }
+
+    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
+        let cid = self.ensure_class_initialized(class_name)?;
+        let obj = self.alloc_entry(HeapEntry::Object {
+            class_id: cid,
+            fields: vec![Value::Object(None); 4],
+        });
+        Ok(Some(Value::Object(Some(obj))))
+    }
+
+    fn invoke(&mut self, class: &str, method: &str, _d: &str, a: &[Value]) -> MethodCallResult {
+        // Just enough of the JDK static boxers for the natives that
+        // round-trip primitives through `Integer.valueOf` / `Long.valueOf`
+        // (e.g. TreeMap's `firstKey` returns a boxed primitive built via
+        // `ctx.invoke`). The boxed object's slot 0 carries the wrapped
+        // primitive, matching the layout that `tree_key_from_value` (and
+        // its peers) probe for.
+        match (class, method) {
+            ("java/lang/Integer", "valueOf") => {
+                if let Some(Value::Int(v)) = a.first().copied() {
+                    let cid = self.ensure_class_initialized("java/lang/Integer")?;
+                    let obj = self.alloc_object(cid, 1);
+                    self.set_field(obj, 0, Value::Int(v));
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
+            ("java/lang/Long", "valueOf") => {
+                if let Some(Value::Long(v)) = a.first().copied() {
+                    let cid = self.ensure_class_initialized("java/lang/Long")?;
+                    let obj = self.alloc_object(cid, 1);
+                    self.set_field(obj, 0, Value::Long(v));
+                    return Ok(Some(Value::Object(Some(obj))));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        let k = obj.as_ptr() as usize;
+        // SAFETY: single-threaded test code.
+        let map = unsafe { &mut *self.identity_hashes.get() };
+        if let Some(&h) = map.get(&k) {
+            return h;
+        }
+        let counter = unsafe { &mut *self.next_identity.get() };
+        let h = *counter;
+        *counter = counter.wrapping_add(1);
+        map.insert(k, h);
+        h
+    }
+
+    fn record_printed_value(&mut self, _v: Value) {}
+
+    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
+        self.class_names.get(&class_id.as_u32()).cloned()
+    }
+
+    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
+        match self.entry_index(obj) {
+            Some(idx) => match &self.heap_ref()[idx] {
+                HeapEntry::Object { class_id, .. } => *class_id,
+                HeapEntry::Array { .. } => ClassId::new(0),
+            },
+            None => ClassId::new(0),
+        }
+    }
+
+    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> { Vec::new() }
+    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> { None }
+
+    // ------------------------------------------------------------------
+    // Field access — real heap-backed.
+    // ------------------------------------------------------------------
+
+    fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        let idx = match self.entry_index(obj) {
+            Some(i) => i,
+            None => return Value::Object(None),
+        };
+        match &self.heap_ref()[idx] {
+            HeapEntry::Object { fields, .. } => {
+                fields.get(index).copied().unwrap_or(Value::Object(None))
+            }
+            _ => Value::Object(None),
+        }
+    }
+
+    fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        let idx = match self.entry_index(obj) {
+            Some(i) => i,
+            None => return,
+        };
+        if let HeapEntry::Object { fields, .. } = &mut self.heap_mut()[idx] {
+            if index >= fields.len() {
+                fields.resize(index + 1, Value::Object(None));
+            }
+            fields[index] = value;
+        }
+    }
+
+    fn get_field_by_name(&self, obj: ObjectRef, _f: &str) -> Value {
+        // The collections code only writes through real slots in the
+        // synthetic layout; `*_by_name` is mostly a write-through for
+        // alternative real-JDK slot names. Default-read to null so the
+        // synthetic path's `lhm_is_access_order` etc. fall back to the
+        // overlay value instead of being shadowed by a false `Int(1)`.
+        let _ = obj;
+        Value::Object(None)
+    }
+    fn set_field_by_name(&self, _o: ObjectRef, _f: &str, _v: Value) {}
+
+    /// Hand back slot indices that align with the real-JDK
+    /// `java.util.ArrayList` / `ArrayList$Itr` layout so the natives'
+    /// "real-JDK path" runs end-to-end instead of falling through to
+    /// their synthetic fallback. The fallback collapses `cursor` and
+    /// `lastRet` onto the same slot, which infinite-loops the
+    /// iterator: every `next()` writes `lastRet = cursor` AFTER writing
+    /// `cursor += 1`, so the next `hasNext()` sees the stale cursor and
+    /// returns true forever.
+    ///
+    /// The slot indices below are the JDK-25 layouts. Other classes
+    /// not enumerated here continue to receive `None` (the synthetic
+    /// fallback), which is correct for HashMap / LHM / TreeMap natives
+    /// that read named state through their side-table overlays anyway.
+    fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
+        match (class_name, field_name) {
+            // Real-JDK ArrayList: modCount, elementData, size.
+            ("java/util/ArrayList", "elementData") => Some(1),
+            ("java/util/ArrayList", "size") => Some(2),
+            // Real-JDK ArrayList$Itr: cursor, lastRet, expectedModCount, this$0.
+            ("java/util/ArrayList$Itr", "cursor") => Some(0),
+            ("java/util/ArrayList$Itr", "lastRet") => Some(1),
+            ("java/util/ArrayList$Itr", "this$0") => Some(3),
+            _ => None,
+        }
+    }
+    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool { false }
+
+    // ------------------------------------------------------------------
+    // Arrays — real heap-backed.
+    // ------------------------------------------------------------------
+
     fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
+        self.alloc_entry(HeapEntry::Array { elements: vec![Value::Int(0); length] })
+    }
+
+    fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {
-            elements: vec![Value::Int(0); length],
+            elements: vec![Value::Object(None); length],
         })
     }
+
     fn array_length(&self, obj: ObjectRef) -> usize {
         match self.entry_index(obj) {
-            Some(i) => match &self.heap_ref()[i] {
+            Some(idx) => match &self.heap_ref()[idx] {
                 HeapEntry::Array { elements } => elements.len(),
                 _ => 0,
             },
             None => 0,
         }
     }
+
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
-        match self.entry_index(obj) {
-            Some(i) => match &self.heap_ref()[i] {
-                HeapEntry::Array { elements } => {
-                    elements.get(index).copied().unwrap_or(Value::Int(0))
-                }
-                _ => Value::Int(0),
-            },
-            None => Value::Int(0),
+        let idx = match self.entry_index(obj) {
+            Some(i) => i,
+            None => return Value::Object(None),
+        };
+        match &self.heap_ref()[idx] {
+            HeapEntry::Array { elements } => {
+                elements.get(index).copied().unwrap_or(Value::Object(None))
+            }
+            _ => Value::Object(None),
         }
     }
+
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
-        if let Some(i) = self.entry_index(obj) {
-            if let HeapEntry::Array { elements } = &mut self.heap_mut()[i] {
-                if index < elements.len() {
-                    elements[index] = value;
-                }
+        let idx = match self.entry_index(obj) {
+            Some(i) => i,
+            None => return,
+        };
+        if let HeapEntry::Array { elements } = &mut self.heap_mut()[idx] {
+            if index < elements.len() {
+                elements[index] = value;
             }
         }
     }
-    fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+
+    fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind {
         match self.entry_index(obj) {
-            Some(i) => match &self.heap_ref()[i] {
-                HeapEntry::Object { fields } => {
-                    fields.get(index).copied().unwrap_or(Value::Object(None))
-                }
-                _ => Value::Object(None),
+            Some(idx) => match &self.heap_ref()[idx] {
+                HeapEntry::Object { .. } => ObjectKind::Object,
+                HeapEntry::Array { .. } => ObjectKind::Array,
             },
-            None => Value::Object(None),
-        }
-    }
-    fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-        if let Some(i) = self.entry_index(obj) {
-            if let HeapEntry::Object { fields } = &mut self.heap_mut()[i] {
-                if index >= fields.len() {
-                    fields.resize(index + 1, Value::Object(None));
-                }
-                fields[index] = value;
-            }
+            None => ObjectKind::Object,
         }
     }
 
-    fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let ptr = obj.as_ptr() as usize;
-        if let Some(h) = self.hash_map_ref().get(&ptr).copied() {
-            return h;
-        }
-        // First call for this pointer — derive a fresh hash from the
-        // pointer plus this MockCtx's namespace, and stash it.
-        // Subsequent calls return the same value (the "seed-on-
-        // first-call" contract `identity_hash_code` follows in the
-        // real GC heap).
-        let h = derive_hash(ptr, self.hash_namespace);
-        self.hash_map_mut().insert(ptr, h);
-        h
-    }
-
-    // -- everything else: stubs (unused by the relocation harness) --
-
-    fn load_class(&mut self, _n: &str) -> MethodCallResult {
-        Ok(None)
-    }
-    fn new_object(&mut self, _c: &str) -> MethodCallResult {
-        Ok(None)
-    }
-    fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
-    fn record_printed_value(&mut self, _v: Value) {}
-    fn class_name_of_id(&self, _c: ClassId) -> Option<String> {
-        None
-    }
-    fn class_id_of_object(&self, _o: ObjectRef) -> ClassId {
-        ClassId::new(0)
-    }
-    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
-        Vec::new()
-    }
-    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
-        None
-    }
-    fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
-        Value::Object(None)
-    }
-    fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-        None
-    }
-    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
-        false
-    }
-    fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
-        self.alloc_entry(HeapEntry::Array {
-            elements: vec![Value::Object(None); length],
-        })
-    }
-    fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind {
-        ObjectKind::Object
-    }
     fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
         ArrayElementType::Reference
     }
-    fn create_string(&mut self, _t: &str) -> ObjectRef {
-        self.alloc_object_simple(0)
+
+    // ------------------------------------------------------------------
+    // Strings — char[] backed.
+    // ------------------------------------------------------------------
+
+    fn create_string(&mut self, text: &str) -> ObjectRef {
+        let chars: Vec<u16> = text.encode_utf16().collect();
+        let arr = self.alloc_entry(HeapEntry::Array {
+            elements: chars.iter().map(|&c| Value::Int(c as i32)).collect(),
+        });
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![Value::Object(Some(arr)), Value::Int(0)],
+        })
     }
-    fn read_string(&self, _o: ObjectRef) -> Option<String> {
-        None
+
+    fn read_string(&self, obj: ObjectRef) -> Option<String> {
+        let arr_ref = match self.get_field(obj, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return None,
+        };
+        let len = self.array_length(arr_ref);
+        let mut chars = Vec::with_capacity(len);
+        for i in 0..len {
+            match self.get_array_element(arr_ref, i) {
+                Value::Int(v) => chars.push(v as u16),
+                _ => chars.push(0),
+            }
+        }
+        String::from_utf16(&chars).ok()
     }
-    fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
-        self.alloc_object_simple(0)
+
+    fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
+        let name = self.class_names.get(&class_id.as_u32()).cloned()
+            .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
+        let name_obj = self.create_string(&name);
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![Value::Int(class_id.as_u32() as i32), Value::Object(Some(name_obj))],
+        })
     }
+
     fn record_printed_line(&mut self, _t: String) {}
-    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
-        None
+    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> { None }
+    fn get_system_property(&self, _k: &str) -> Option<String> { None }
+    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> { None }
+
+    fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        self.alloc_entry(HeapEntry::Object {
+            class_id,
+            fields: vec![Value::Object(None); num_fields],
+        })
     }
-    fn get_system_property(&self, _k: &str) -> Option<String> {
-        None
+
+    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        if let Some(&id) = self.name_to_id.get(name) {
+            return Ok(ClassId::new(id));
+        }
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        self.class_names.insert(id, name.to_string());
+        self.name_to_id.insert(name.to_string(), id);
+        Ok(ClassId::new(id))
     }
-    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
-        None
+
+    fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
+        self.ensure_class_initialized(name).unwrap_or(ClassId::new(0))
     }
-    fn alloc_object(&mut self, _c: ClassId, num_fields: usize) -> ObjectRef {
-        self.alloc_object_simple(num_fields)
+
+    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool { c == p }
+    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> { None }
+    fn is_interface_class(&self, _c: ClassId) -> bool { false }
+    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
+        self.name_to_id.get(name).copied().map(ClassId::new)
     }
-    fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
-        Ok(ClassId::new(0))
-    }
-    fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
-        false
-    }
-    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
-        None
-    }
-    fn is_interface_class(&self, _c: ClassId) -> bool {
-        false
-    }
-    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> {
-        None
-    }
-    fn loader_id_of_class(&self, _c: ClassId) -> i32 {
-        2
-    }
-    fn is_record_class(&self, _c: ClassId) -> bool {
-        false
-    }
-    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
-        Vec::new()
-    }
-    fn is_sealed_class(&self, _c: ClassId) -> bool {
-        false
-    }
-    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
-        Vec::new()
-    }
+    fn loader_id_of_class(&self, _c: ClassId) -> i32 { 2 }
+    fn is_record_class(&self, _c: ClassId) -> bool { false }
+    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> { Vec::new() }
+    fn is_sealed_class(&self, _c: ClassId) -> bool { false }
+    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> { Vec::new() }
+
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
         match self.entry_index(obj) {
-            Some(i) => match &self.heap_ref()[i] {
-                HeapEntry::Object { fields } => fields.len(),
+            Some(idx) => match &self.heap_ref()[idx] {
+                HeapEntry::Object { fields, .. } => fields.len(),
                 _ => 0,
             },
             None => 0,
         }
     }
-    fn thread_id(&self) -> u64 {
-        1
-    }
+
+    // ------------------------------------------------------------------
+    // Threading — single-threaded stubs.
+    // ------------------------------------------------------------------
+
+    fn thread_id(&self) -> u64 { 1 }
     fn monitor_enter(&mut self, _o: ObjectRef) {}
     fn monitor_exit(&mut self, _o: ObjectRef) {}
-    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult {
-        Ok(None)
-    }
-    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-    fn thread_is_alive(&self, _o: ObjectRef) -> bool {
-        false
-    }
+    fn monitor_wait(&mut self, _o: ObjectRef, _t: Option<u64>) -> MethodCallResult { Ok(None) }
+    fn monitor_notify(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
+    fn monitor_notify_all(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
+    fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
+    fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
+    fn thread_is_alive(&self, _o: ObjectRef) -> bool { false }
     fn current_thread_object(&mut self) -> ObjectRef {
-        self.alloc_object_simple(0)
+        self.alloc_object(ClassId::new(0), 2)
     }
     fn thread_interrupt(&mut self, _o: ObjectRef) {}
-    fn is_interrupted(&self, _c: bool) -> bool {
-        false
-    }
-    fn active_thread_count(&self) -> i32 {
-        1
-    }
-    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> {
-        Vec::new()
-    }
-    fn heap_allocated_bytes(&self) -> usize {
-        0
-    }
-    fn loaded_class_count(&self) -> usize {
-        0
-    }
-    fn gc_collection_count(&self) -> u64 {
-        0
-    }
+    fn is_interrupted(&self, _c: bool) -> bool { false }
+    fn active_thread_count(&self) -> i32 { 1 }
+    fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> { Vec::new() }
+
+    fn heap_allocated_bytes(&self) -> usize { 0 }
+    fn loaded_class_count(&self) -> usize { 0 }
+    fn gc_collection_count(&self) -> u64 { 0 }
     fn force_gc(&mut self) {}
-    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
-        Vec::new()
-    }
-    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
-        Vec::new()
-    }
-    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
-        Vec::new()
-    }
-    fn class_access_flags(&self, _c: ClassId) -> u16 {
-        0
-    }
-    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
-        Value::Int(0)
-    }
+
+    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> { Vec::new() }
+    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> { Vec::new() }
+    fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> { Vec::new() }
+    fn class_access_flags(&self, _c: ClassId) -> u16 { 0 }
+    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value { Value::Int(0) }
     fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
-    fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
-        self.alloc_object_simple(0)
+    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
+        let name_obj = self.create_string(name);
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![Value::Int(0), Value::Object(Some(name_obj))],
+        })
     }
+
     fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
         use std::sync::OnceLock;
-        static FD: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
-        FD.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
+        static T: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
+        T.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
     }
-    fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value {
-        self.get_field(o, i)
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field(obj, index)
     }
-    fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) {
-        self.set_field(o, i, v)
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value)
     }
     fn compare_and_swap_field(
-        &mut self,
-        _o: ObjectRef,
-        _i: usize,
-        _e: Value,
-        _n: Value,
+        &mut self, obj: ObjectRef, index: usize, expected: Value, new_val: Value,
     ) -> bool {
-        false
+        let current = self.get_field(obj, index);
+        if current == expected {
+            self.set_field(obj, index, new_val);
+            true
+        } else {
+            false
+        }
     }
+
     fn park(&mut self, _t: Option<std::time::Duration>) {}
     fn unpark(&self, _o: ObjectRef) {}
-    fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
-        None
+    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
+        let cid = self.ensure_class_initialized(class_name).ok()?;
+        Some(self.alloc_object(cid, 4))
     }
-    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
-        Vec::new()
-    }
+
+    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> { Vec::new() }
     fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
         Vec::new()
     }
-    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
-        Vec::new()
-    }
+    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> { Vec::new() }
     fn method_parameter_annotations(
-        &self,
-        _c: ClassId,
-        _m: &str,
-        _d: &str,
-    ) -> Vec<Vec<AnnotationData>> {
-        Vec::new()
-    }
-    fn class_signature(&self, _c: ClassId) -> Option<String> {
-        None
-    }
-    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
-        None
-    }
-    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
-        None
-    }
+        &self, _c: ClassId, _m: &str, _d: &str,
+    ) -> Vec<Vec<AnnotationData>> { Vec::new() }
+    fn class_signature(&self, _c: ClassId) -> Option<String> { None }
+    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> { None }
+    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> { None }
     fn method_annotation_default(
-        &self,
-        _c: ClassId,
-        _m: &str,
-        _d: &str,
-    ) -> Option<AnnotationElementValue> {
-        None
-    }
+        &self, _c: ClassId, _m: &str, _d: &str,
+    ) -> Option<AnnotationElementValue> { None }
+
     fn invoke_virtual(
-        &mut self,
-        _r: ObjectRef,
-        _m: &str,
-        _d: &str,
-        _a: &[Value],
+        &mut self, r: ObjectRef, m: &str, d: &str, a: &[Value],
     ) -> MethodCallResult {
-        Ok(None)
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.invoke_virtual_log.get())
+                .push((r.as_ptr() as usize, m.to_string(), d.to_string(), a.to_vec()));
+        }
+        let slot = unsafe { &mut *self.invoke_virtual_result.get() };
+        if let Some(r) = slot.take() {
+            r
+        } else {
+            Ok(None)
+        }
     }
-    fn get_scoped_value(&self, _k: u64) -> Option<Value> {
-        None
-    }
+
+    fn get_scoped_value(&self, _k: u64) -> Option<Value> { None }
     fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
     fn pop_scoped_value(&mut self) {}
-    fn scoped_value_depth(&self) -> usize {
-        0
-    }
-    fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
-        None
-    }
+    fn scoped_value_depth(&self) -> usize { 0 }
+
+    fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> { None }
     fn free_native_memory(&mut self, _a: i64) {}
-    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> {
-        Ok(0)
-    }
-    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> {
-        None
-    }
-    fn register_upcall(&mut self, _e: cratonvm_native_api::ffi::UpcallEntry) -> usize {
-        0
-    }
-    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
-        None
-    }
-    fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
-        None
-    }
-    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
-        None
-    }
-    fn list_application_class_names(&self) -> Vec<String> {
-        Vec::new()
-    }
+    fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> { Ok(0) }
+    fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> { None }
+    fn register_upcall(&mut self, _e: UpcallEntry) -> usize { 0 }
+    fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> { None }
+
+    fn module_name_of_class(&self, _c: ClassId) -> Option<String> { None }
+    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> { None }
+    fn list_application_class_names(&self) -> Vec<String> { Vec::new() }
     fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
-        None
-    }
+    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> { None }
     fn define_class_with_loader(
-        &mut self,
-        _n: &str,
-        _b: &[u8],
-        _l: u32,
-    ) -> Option<ClassId> {
-        None
-    }
-    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
-        None
-    }
-    fn allocate_loader_id(&mut self) -> u32 {
-        0
-    }
+        &mut self, _n: &str, _b: &[u8], _l: u32,
+    ) -> Option<ClassId> { None }
+    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> { None }
+    fn allocate_loader_id(&mut self) -> u32 { 0 }
     fn discover_reference(
-        &mut self,
-        _t: u8,
-        _r: ObjectRef,
-        _f: ObjectRef,
-        _q: Option<ObjectRef>,
-    ) {
-    }
-    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
-        true
-    }
-    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-        true
-    }
-    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
-        true
-    }
-    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-        true
-    }
+        &mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>,
+    ) {}
+
+    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool { true }
+    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
+    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool { true }
+    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
     fn check_deep_reflection_access(
-        &self,
-        _a: ClassId,
-        _t: ClassId,
-    ) -> Result<(), String> {
-        Ok(())
+        &self, _a: ClassId, _t: ClassId,
+    ) -> Result<(), String> { Ok(()) }
+}
+
+// ------------------------------------------------------------------
+// Test helpers — register the natives once per test, then dispatch.
+// ------------------------------------------------------------------
+
+/// Build a registry pre-populated with `register_collections_natives`.
+pub fn build_registry() -> NativeMethodRegistry {
+    let mut r = NativeMethodRegistry::new();
+    cratonvm_native_collections::register_collections_natives(&mut r);
+    r
+}
+
+/// Look up + invoke a native by its (class, method, descriptor) triple.
+///
+/// Panics on a missing native — keeps tests terse; the registration-
+/// completeness suite in `lib.rs` already guards typos.
+pub fn call(
+    reg: &NativeMethodRegistry,
+    ctx: &mut MockCtx,
+    class: &str,
+    method: &str,
+    desc: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    let cb = reg
+        .find(class, method, desc)
+        .unwrap_or_else(|| panic!("native not registered: {class}.{method}{desc}"));
+    cb(ctx, args)
+}
+
+/// Allocate a fresh empty `java/util/ArrayList` and run its native `<init>`.
+pub fn new_arraylist(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let cid = ctx.ensure_class_initialized("java/util/ArrayList").unwrap();
+    let al = ctx.alloc_object(cid, 4);
+    call(reg, ctx, "java/util/ArrayList", "<init>", "()V",
+         &[Value::Object(Some(al))]).unwrap();
+    al
+}
+
+/// Allocate a fresh empty `java/util/HashMap` and run its native `<init>`.
+pub fn new_hashmap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let cid = ctx.ensure_class_initialized("java/util/HashMap").unwrap();
+    let hm = ctx.alloc_object(cid, 6);
+    call(reg, ctx, "java/util/HashMap", "<init>", "()V",
+         &[Value::Object(Some(hm))]).unwrap();
+    hm
+}
+
+/// Allocate a fresh `java/util/LinkedHashMap`. `access_order = true` builds
+/// it via the `(IFZ)V` ctor with capacity 16, load factor 0.75.
+pub fn new_linked_hashmap(
+    reg: &NativeMethodRegistry, ctx: &mut MockCtx, access_order: bool,
+) -> ObjectRef {
+    let cid = ctx.ensure_class_initialized("java/util/LinkedHashMap").unwrap();
+    let lhm = ctx.alloc_object(cid, 8);
+    if access_order {
+        call(reg, ctx, "java/util/LinkedHashMap", "<init>", "(IFZ)V", &[
+            Value::Object(Some(lhm)),
+            Value::Int(16),
+            Value::Float(0.75),
+            Value::Int(1),
+        ]).unwrap();
+    } else {
+        call(reg, ctx, "java/util/LinkedHashMap", "<init>", "()V",
+             &[Value::Object(Some(lhm))]).unwrap();
     }
+    lhm
+}
+
+/// Allocate a fresh empty `java/util/TreeMap`.
+pub fn new_treemap(reg: &NativeMethodRegistry, ctx: &mut MockCtx) -> ObjectRef {
+    let cid = ctx.ensure_class_initialized("java/util/TreeMap").unwrap();
+    let tm = ctx.alloc_object(cid, 4);
+    call(reg, ctx, "java/util/TreeMap", "<init>", "()V",
+         &[Value::Object(Some(tm))]).unwrap();
+    tm
+}
+
+/// Box an i32 as a synthetic `java.lang.Integer` so the keys behave as
+/// objects in the put/get dispatch path. Field layout: slot 0 = Int(v).
+///
+/// Uses `alloc_object` + `set_field`, which the trait exposes — the heap
+/// entry's class_id carries the Integer name so `unbox_wrapper` in the
+/// production code can route through `obj_to_display_string`'s wrapper
+/// branch.
+pub fn boxed_int(ctx: &mut MockCtx, v: i32) -> Value {
+    let cid = ctx.ensure_class_initialized("java/lang/Integer").unwrap();
+    let obj = ctx.alloc_object(cid, 1);
+    ctx.set_field(obj, 0, Value::Int(v));
+    Value::Object(Some(obj))
 }

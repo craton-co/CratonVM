@@ -110,7 +110,8 @@ fn gc_soak_5min_no_leak() {
         if batch_idx % GC_EVERY_N_BATCHES == 0 {
             // Pass `perma_roots` as the only roots — every allocated
             // batch object is unreachable and must be collected.
-            let _ = heap.collect_garbage(&mut perma_roots, &NoMonitors);
+            let stw = cratonvm_gc::collector::StopTheWorldToken::new_unchecked();
+            let _ = heap.collect_garbage(&stw, &mut perma_roots, &NoMonitors);
 
             // Verify permanent root payloads are intact (no
             // corruption across the cycle).
