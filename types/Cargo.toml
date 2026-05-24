@@ -19,5 +19,12 @@ thiserror.workspace = true
 parking_lot.workspace = true
 rustc-hash.workspace = true
 
+[dev-dependencies]
+# Property-based testing for round-trip invariants of the Value /
+# CompactValue codecs (`encode_value` ↔ `decode_value`, `from_value` ↔
+# `to_value`). Lightweight, no proc-macro deps; pinned to a recent 1.x
+# release for stability.
+proptest = "1"
+
 [lints]
 workspace = true
