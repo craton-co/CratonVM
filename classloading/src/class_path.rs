@@ -1445,17 +1445,19 @@ impl ClassPath {
     }
 
     /// Find the code source for a given class: returns the containing JAR /
-    /// directory URL and the set of signer "certificate" blobs extracted
-    /// from `META-INF/*.RSA|.DSA|.EC` signature blocks (if any).
+    /// directory URL and the DER-encoded X.509 certificates extracted from
+    /// every **verified** signer in the JAR's `META-INF/*.RSA|.DSA|.EC`
+    /// signature blocks (if any).
     ///
     /// The returned URL uses `file:` form for directories and JAR paths,
     /// matching HotSpot's `CodeSource.getLocation()`. The certificate
-    /// vector holds one entry per PKCS#7 signature block found in the JAR.
-    /// Because parsing PKCS#7 would pull in a full X.509/ASN.1 stack,
-    /// we expose the *raw* signature-block bytes here — callers are
-    /// expected to treat them as opaque identifiers (e.g. SHA-256 for
-    /// signer matching). A real production implementation would decode
-    /// the PKCS#7 and yield the embedded X.509 certificate chain.
+    /// vector holds the leaf X.509 cert DER for each PKCS#7 signer
+    /// whose `messageDigest` authenticated attribute matched the
+    /// corresponding `.SF` file's SHA-X digest — see
+    /// [`crate::jar_signer::verify_signer_block`].  Signer blocks that
+    /// fail verification contribute **no certificates** (so
+    /// `Class.getCodeSource().getCertificates()` returns empty rather
+    /// than opaque attacker bytes).
     ///
     /// Returns `None` if the class isn't on this classpath or lives in a
     /// JMOD/jimage module (JDK internals have no user-visible code source).
@@ -1537,15 +1539,45 @@ impl ClassPath {
     }
 
     /// Walk a JAR archive for every `META-INF/*.RSA`, `META-INF/*.DSA`,
-    /// and `META-INF/*.EC` signature block.  Returns their raw contents
-    /// (one `Vec<u8>` per signer).  An empty result means the JAR is
-    /// unsigned.
+    /// and `META-INF/*.EC` signature block, parse each as PKCS#7
+    /// SignedData, and return the DER bytes of every **verified** leaf
+    /// X.509 certificate.  Verification is performed by
+    /// [`crate::jar_signer::verify_signer_block`] — it parses the
+    /// SignedData container, extracts the embedded cert chain, and
+    /// confirms that the signer's `messageDigest` authenticated
+    /// attribute equals the SHA-X digest of the matching `*.SF` file.
+    ///
+    /// **Security note.**  Until this commit, the function returned the
+    /// raw signer-block bytes verbatim and the call chain stored them as
+    /// `CodeSource.certificates`.  PKCS#7 SignedData blobs are not
+    /// X.509 certificates — `Class.getCodeSource().getCertificates()`
+    /// was therefore handing attacker-controlled opaque bytes back to
+    /// callers (e.g. policy `signedBy` filters) and treating them as
+    /// trusted signer identities.  We now decode the structure and
+    /// return only the real cert DER on successful integrity check.
+    ///
+    /// An empty result means either:
+    ///   * the JAR is unsigned, or
+    ///   * every signer block failed verification (parse error, missing
+    ///     `.SF` companion, digest mismatch, ...). In that case
+    ///     `Class.getCodeSource().getCertificates()` will be empty /
+    ///     null — **never garbage** — which matches what HotSpot does
+    ///     for a JAR that fails `jarsigner -verify`.
+    ///
+    /// # TODO(post-orchestrator)
+    ///
+    /// Pub-key signature verification over the authenticated-attributes
+    /// blob, and trust-store chaining, are tracked in
+    /// `jar_signer.rs` module docs.  Once `crypto_impl::Rsa::verify_*`
+    /// is hoisted out of `cratonvm-native-builtins` we plug it in here.
     fn extract_jar_signer_blocks(
         archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
     ) -> Vec<Vec<u8>> {
         let mut guard = archive.lock();
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let names: Vec<String> = (0..guard.len())
+        // Collect every safe META-INF entry name once; we need both the
+        // `*.SF` companions (to feed into the integrity check) and the
+        // `*.RSA|.DSA|.EC` signer blocks.
+        let all_names: Vec<String> = (0..guard.len())
             .filter_map(|i| guard.by_index_raw(i).ok().map(|e| e.name().to_string()))
             .filter(|n| {
                 // Audit-fix #3 (zip-slip): refuse to treat traversal /
@@ -1553,22 +1585,75 @@ impl ClassPath {
                 // malicious JAR could otherwise smuggle a signature
                 // block under `../META-INF/key.RSA` that gets attached
                 // to the wrong CodeSource.
-                if !is_safe_entry_name(n) {
-                    return false;
-                }
-                let upper = n.to_ascii_uppercase();
-                upper.starts_with("META-INF/")
-                    && (upper.ends_with(".RSA")
-                        || upper.ends_with(".DSA")
-                        || upper.ends_with(".EC"))
+                is_safe_entry_name(n)
             })
             .collect();
-        for name in names {
-            if let Ok(mut entry) = guard.by_name(&name) {
-                // Audit-fix #2: clamp zip-bomb declared size.
-                let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
-                if entry.read_to_end(&mut data).is_ok() && !data.is_empty() {
-                    out.push(data);
+
+        // Partition into signer blocks and a lookup map for `.SF` companions.
+        let mut signer_block_names: Vec<String> = Vec::new();
+        // Map from uppercase stem (e.g. "META-INF/FOO") to original
+        // `.SF` entry name. This lets us pair `META-INF/foo.RSA` with
+        // `META-INF/FOO.SF` regardless of letter case.
+        let mut sf_by_stem: HashMap<String, String> = HashMap::new();
+        for n in &all_names {
+            let upper = n.to_ascii_uppercase();
+            if !upper.starts_with("META-INF/") {
+                continue;
+            }
+            if upper.ends_with(".RSA") || upper.ends_with(".DSA") || upper.ends_with(".EC") {
+                signer_block_names.push(n.clone());
+            } else if let Some(stem) = upper.strip_suffix(".SF") {
+                sf_by_stem.insert(stem.to_string(), n.clone());
+            }
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for name in signer_block_names {
+            // Read signer block bytes (clamped against zip-bomb sizes).
+            let block = match guard.by_name(&name).and_then(|mut e| {
+                let mut data = Vec::with_capacity(safe_with_capacity(e.size()));
+                e.read_to_end(&mut data)?;
+                Ok(data)
+            }) {
+                Ok(d) if !d.is_empty() => d,
+                _ => continue,
+            };
+
+            // Locate the matching `.SF`. The stem is everything before
+            // the final `.` of the entry name; we look it up case-
+            // insensitively to be compatible with archivers that
+            // produce mixed-case filenames.
+            let upper = name.to_ascii_uppercase();
+            let stem_upper = match upper.rsplit_once('.') {
+                Some((stem, _ext)) => stem.to_string(),
+                None => continue,
+            };
+            let sf_name = match sf_by_stem.get(&stem_upper) {
+                Some(n) => n.clone(),
+                None => {
+                    debug!(
+                        "jar signer: signer block {} has no matching .SF — skipping",
+                        name
+                    );
+                    continue;
+                }
+            };
+            let sf_bytes = match guard.by_name(&sf_name).and_then(|mut e| {
+                let mut data = Vec::with_capacity(safe_with_capacity(e.size()));
+                e.read_to_end(&mut data)?;
+                Ok(data)
+            }) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Verify self-consistency. On success, push every cert in
+            // the chain — leaf first. On failure we silently drop the
+            // block; the JAR ends up reported as unsigned for that
+            // signer (matching the HotSpot "fails verify" behaviour).
+            if let Some(vs) = crate::jar_signer::verify_signer_block(&block, &sf_bytes) {
+                for cert in vs.chain {
+                    out.push(cert);
                 }
             }
         }
