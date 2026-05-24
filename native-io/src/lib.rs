@@ -9874,14 +9874,26 @@ fn os_lock_handles() -> &'static Mutex<HashMap<i64, OsLockHandle>> {
 /// on success or Err on conflict / OS error.
 ///
 /// On Unix uses `fcntl(F_SETLK, &flock)` (non-blocking, matches JDK
-/// `tryLock`). On Windows uses `LockFileEx` with LOCKFILE_FAIL_IMMEDIATELY.
+/// `tryLock`) or `fcntl(F_SETLKW, &flock)` when `blocking == true`
+/// (matches JDK `lock`). On Windows uses `LockFileEx` with
+/// LOCKFILE_FAIL_IMMEDIATELY when `blocking == false`, omitting that
+/// flag when `blocking == true` so the call waits until the OS grants
+/// the region (round-8 C28 fix).
 #[cfg(target_family = "unix")]
-fn os_acquire_lock(file: &std::fs::File, pos: i64, size: i64, shared: bool) -> io::Result<()> {
+fn os_acquire_lock(
+    file: &std::fs::File,
+    pos: i64,
+    size: i64,
+    shared: bool,
+    blocking: bool,
+) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let raw_fd = file.as_raw_fd();
     let len = if size == i64::MAX { 0 } else { size };
     // SAFETY: flock is a POD struct; we initialise every field. fcntl
-    // F_SETLK is the standard non-blocking advisory-lock interface.
+    // F_SETLK is the standard non-blocking advisory-lock interface;
+    // F_SETLKW is the blocking variant (round-8 C28) used by JDK
+    // `FileChannel.lock()` to wait until the region becomes available.
     let flock = libc::flock {
         l_type: if shared { libc::F_RDLCK } else { libc::F_WRLCK } as _,
         l_whence: libc::SEEK_SET as _,
@@ -9891,7 +9903,8 @@ fn os_acquire_lock(file: &std::fs::File, pos: i64, size: i64, shared: bool) -> i
         #[cfg(target_os = "freebsd")]
         l_sysid: 0,
     };
-    let r = unsafe { libc::fcntl(raw_fd, libc::F_SETLK, &flock) };
+    let cmd = if blocking { libc::F_SETLKW } else { libc::F_SETLK };
+    let r = unsafe { libc::fcntl(raw_fd, cmd, &flock) };
     if r < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -9964,7 +9977,13 @@ mod win_lock {
 }
 
 #[cfg(target_family = "windows")]
-fn os_acquire_lock(file: &std::fs::File, pos: i64, size: i64, shared: bool) -> io::Result<()> {
+fn os_acquire_lock(
+    file: &std::fs::File,
+    pos: i64,
+    size: i64,
+    shared: bool,
+    blocking: bool,
+) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use win_lock::*;
 
@@ -9980,7 +9999,11 @@ fn os_acquire_lock(file: &std::fs::File, pos: i64, size: i64, shared: bool) -> i
         offset_high: ((pos as u64 >> 32) & 0xFFFF_FFFF) as Dword,
         h_event: std::ptr::null_mut(),
     };
-    let mut flags = LOCKFILE_FAIL_IMMEDIATELY;
+    // Round-8 C28: when `blocking` is true, omit LOCKFILE_FAIL_IMMEDIATELY
+    // so LockFileEx waits until the OS grants the region — matching the
+    // JDK `FileChannel.lock()` contract. When false, retain the fast-fail
+    // bit so callers get `tryLock` semantics.
+    let mut flags: Dword = if blocking { 0 } else { LOCKFILE_FAIL_IMMEDIATELY };
     if !shared {
         flags |= LOCKFILE_EXCLUSIVE_LOCK;
     }
@@ -10022,7 +10045,13 @@ fn os_release_lock(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> 
 
 // Other platforms: no-op OS lock (process-local registry still applies).
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]
-fn os_acquire_lock(_file: &std::fs::File, _pos: i64, _size: i64, _shared: bool) -> io::Result<()> {
+fn os_acquire_lock(
+    _file: &std::fs::File,
+    _pos: i64,
+    _size: i64,
+    _shared: bool,
+    _blocking: bool,
+) -> io::Result<()> {
     Ok(())
 }
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -10086,6 +10115,23 @@ fn try_acquire_file_lock(
     shared: bool,
     os_file: Option<std::fs::File>,
 ) -> Option<i64> {
+    try_acquire_file_lock_inner(fd_id, position, size, shared, os_file, false)
+}
+
+/// Internal: registers a region in `FILE_LOCKS` and (optionally) asks the
+/// OS for an advisory lock. When `blocking == true` the OS-level call uses
+/// `F_SETLKW` / `LockFileEx` without `LOCKFILE_FAIL_IMMEDIATELY` and waits
+/// until the OS grants the region. The in-process registry check remains
+/// non-blocking — call `acquire_file_lock_blocking` instead if you need
+/// blocking semantics across both layers.
+fn try_acquire_file_lock_inner(
+    fd_id: i64,
+    position: i64,
+    size: i64,
+    shared: bool,
+    os_file: Option<std::fs::File>,
+    blocking: bool,
+) -> Option<i64> {
     let mut map = file_locks().lock();
     let regions = map.entry(fd_id).or_default();
     for existing in regions.iter() {
@@ -10109,7 +10155,7 @@ fn try_acquire_file_lock(
     // Failure rolls back the in-process registration so callers see the
     // same `None` they would for an in-process conflict.
     if let Some(file) = os_file {
-        match os_acquire_lock(&file, position, size, shared) {
+        match os_acquire_lock(&file, position, size, shared, blocking) {
             Ok(()) => {
                 os_lock_handles().lock().insert(
                     token,
@@ -10134,6 +10180,80 @@ fn try_acquire_file_lock(
     }
 
     Some(token)
+}
+
+/// Round-8 C28: blocking acquisition of a file lock. Matches the JDK
+/// `FileChannel.lock()` contract: wait until the region becomes
+/// available, then return its token.
+///
+/// Implementation strategy: cross-process waits use the OS blocking
+/// variant (`F_SETLKW` / `LockFileEx` without `LOCKFILE_FAIL_IMMEDIATELY`)
+/// so they sleep in the kernel rather than spinning. In-process
+/// contention can't easily block on the same condition variable that
+/// guards `file_locks()` (a holder thread releasing would have to wake
+/// up specific waiters), so we poll with a short capped backoff up to
+/// 50ms. Result is caller-visible blocking semantics for both layers;
+/// intra-process wake-up latency is at most ~50ms which is acceptable
+/// for `FileChannel.lock()` (the operation is itself a slow path).
+///
+/// The OS-blocking call only runs once we've cleared the in-process
+/// registry, so the cloned `os_file` is only consumed on the iteration
+/// that actually performs the kernel-blocking acquire. If the OS lock
+/// fails (rare — EBADF / signal-interrupted), we roll back and the next
+/// loop iteration tries again with a fresh OS-blocking call (but
+/// without `os_file`, since it was consumed by the failed attempt).
+/// The caller still sees blocking semantics; cross-process coordination
+/// degrades to process-local on hard OS errors.
+fn acquire_file_lock_blocking(
+    fd_id: i64,
+    position: i64,
+    size: i64,
+    shared: bool,
+    mut os_file: Option<std::fs::File>,
+) -> Option<i64> {
+    // Bounded exponential backoff for in-process contention. Cap at 50ms
+    // so a releasing holder is detected within one wakeup interval.
+    let mut delay_us: u64 = 1_000;
+    loop {
+        // Probe the in-process registry first without committing to an
+        // OS-level acquire. This way `os_file` is only consumed on the
+        // iteration that has a real chance of succeeding (no in-process
+        // conflict), and we never waste the cloned descriptor on a doomed
+        // attempt that will roll back anyway.
+        let in_process_conflict = {
+            let map = file_locks().lock();
+            match map.get(&fd_id) {
+                Some(regions) => regions.iter().any(|existing| {
+                    let want_exclusive = !shared || !existing.shared;
+                    want_exclusive
+                        && regions_overlap(position, size, existing.position, existing.size)
+                }),
+                None => false,
+            }
+        };
+        if in_process_conflict {
+            std::thread::sleep(std::time::Duration::from_micros(delay_us));
+            delay_us = (delay_us * 2).min(50_000);
+            continue;
+        }
+        // No in-process conflict observed — commit. The OS-level call
+        // uses the blocking variant so cross-process waits block in the
+        // kernel without burning CPU. If a sibling thread in *this*
+        // process slipped in between the probe and the commit,
+        // `try_acquire_file_lock_inner` returns `None`; back off and
+        // retry. We pass `os_file` only once we expect to succeed; if
+        // the OS call errors we lose it for subsequent iterations, but
+        // the loop still honours blocking semantics from the caller's
+        // perspective (intra-process retry, OS-blocking elsewhere).
+        let take = os_file.take();
+        match try_acquire_file_lock_inner(fd_id, position, size, shared, take, true) {
+            Some(token) => return Some(token),
+            None => {
+                std::thread::sleep(std::time::Duration::from_micros(delay_us));
+                delay_us = (delay_us * 2).min(50_000);
+            }
+        }
+    }
 }
 
 fn release_file_lock(token: i64) {
@@ -10519,10 +10639,11 @@ fn native_fc_unmap0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// the lock in the in-process FILE_LOCKS map so sibling threads /
 /// channels on the same fd see the conflict.
 ///
-/// TODO(round-8): real OS-level blocking via `fcntl(F_SETLKW)` /
-/// `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`. The current implementation
-/// is correct within a single process but does not coordinate with
-/// other processes opening the same path.
+/// Round-8 C28 fix: real blocking semantics via
+/// `acquire_file_lock_blocking`. The OS-level call uses `F_SETLKW`
+/// (Unix) / `LockFileEx` without `LOCKFILE_FAIL_IMMEDIATELY` (Windows)
+/// so cross-process waits block in the kernel. In-process contention is
+/// resolved by a short capped backoff (≤ 50ms wake-up latency).
 fn native_fc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -10530,13 +10651,16 @@ fn native_fc_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let fd_id = fd_from_file_channel(ctx, this);
     let token = if fd_id > 0 {
-        // Round-9 HIGH: the OS lock layer added in `try_acquire_file_lock`
-        // gives us cross-process coordination. Non-blocking semantics
-        // (matching `tryLock`) — true blocking via F_SETLKW is still a
-        // separate work item because it requires interrupt-safe waits.
+        // Round-8 C28: blocking variant. The OS lock layer waits in the
+        // kernel (F_SETLKW / LockFileEx without FAIL_IMMEDIATELY) for
+        // cross-process callers; the in-process registry contends via a
+        // short capped-backoff poll inside `acquire_file_lock_blocking`.
         let os_file = ctx.fd_table().clone_file(fd_id as FdId).ok();
-        match try_acquire_file_lock(fd_id, 0, i64::MAX, false, os_file) {
+        match acquire_file_lock_blocking(fd_id, 0, i64::MAX, false, os_file) {
             Some(t) => t,
+            // Blocking acquire only returns `None` if the loop is broken
+            // by something genuinely unrecoverable; mirror tryLock's
+            // null-return behaviour rather than throwing.
             None => return Ok(Some(Value::Object(None))),
         }
     } else {
