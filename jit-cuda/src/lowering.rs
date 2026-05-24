@@ -307,6 +307,7 @@ mod tests {
             estimated_work: 1 << 20,
             needs_d2h_sync: false,
             this_field_cps: vec![],
+            is_reduction: false,
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, ret_len, failure_flag) = 7
@@ -328,6 +329,7 @@ mod tests {
             estimated_work: 1 << 20,
             needs_d2h_sync: false,
             this_field_cps: vec![],
+            is_reduction: false,
         };
         let params = build_param_list(&sig);
         // (a_ptr, a_len, b_ptr, b_len, ret_ptr, failure_flag) = 6
@@ -407,11 +409,49 @@ mod tests {
         // 64-bit multiply + add somewhere.
         assert!(text.contains("mul.lo.s64"));
         assert!(text.contains("add.s64"));
-        // Scalar return → ret_ptr store of an s64.
+        // Scalar return path references `ret_ptr`.
         assert!(text.contains("[ret_ptr]"));
-        assert!(text.contains("st.global.s64"));
         // Bounds-fail block present.
         assert!(text.contains("L_bounds_fail:"));
+    }
+
+    /// AUDIT 2026-05-24 (C31): dot-product is a reduction shape (counted
+    /// loop, array load, arithmetic `*add`, scalar return). Each CUDA
+    /// thread accumulates one iteration's partial term; a plain
+    /// `st.global.s64 [ret_ptr], value` would race-overwrite the single
+    /// output slot with every thread's per-element product → silently
+    /// wrong sums. The lowering must emit `atom.global.add.u64` against
+    /// `ret_ptr` so the partial contributions accumulate atomically.
+    /// (PTX integer atomics use the unsigned-width suffix — the bit
+    /// pattern is identical to the signed s64 we'd otherwise store, and
+    /// two's-complement add wraps the same way either way.)
+    ///
+    /// The host marshaller must pre-zero `*ret_ptr` before launch; this
+    /// matches the Java `long sum = 0L` initialiser semantically.
+    /// Numerical correctness cannot be checked here without a real GPU —
+    /// see the ptxas round-trip / oracle items in the review doc — but
+    /// the PTX-shape assertion catches a regression on the atomic
+    /// emission path.
+    #[test]
+    fn dot_product_reduction_emits_atomic_add() {
+        let m = lower_fixture("EligibleDotProduct", "dot", "([I[I)J");
+        let text = m.render();
+        // The fix: atomic add into the shared accumulator slot.
+        assert!(
+            text.contains("atom.global.add.u64"),
+            "reduction lowering must emit `atom.global.add.u64` against ret_ptr — \
+             plain `st.global.s64` races between threads.\nPTX:\n{text}"
+        );
+        // And the racing plain store must NOT appear on the return path.
+        assert!(
+            !text.contains("st.global.s64 [%"),
+            "reduction lowering must not emit a plain `st.global.s64 [%…], …` to \
+             the scalar return slot; that is the racing pre-C31 path.\nPTX:\n{text}"
+        );
+        // Sanity: the atomic targets `ret_ptr`, not some other pointer.
+        // The exact register name floats with allocation order, so just
+        // assert the ret_ptr param is referenced and the atomic appears.
+        assert!(text.contains("[ret_ptr]"));
     }
 
     #[test]

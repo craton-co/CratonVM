@@ -69,6 +69,26 @@ impl RegPool {
             wide,
         }
     }
+
+    /// Like [`fresh_reg`] but lets the caller force the JVM
+    /// category-2 (wide) flag.
+    ///
+    /// AUDIT 2026-05-24 (C31): array references live in `RegKind::U64`
+    /// PTX registers (64-bit device pointer width), but on the JVM
+    /// operand stack they are category-1 — `pop2`, `dup2_x1`, etc. must
+    /// treat them as a single slot, not two. The default `fresh_reg`
+    /// infers wideness from `RegKind` alone (U64/S64/F64 → `wide=true`),
+    /// which is correct for `long`/`double` JVM values but wrong for
+    /// array refs. Use this constructor at array-ref binding sites
+    /// (`bind_param_locals`) so `pop2` of two stacked array refs pops
+    /// two slots instead of one.
+    pub fn fresh_reg_with_wide(&mut self, kind: RegKind, wide: bool) -> Reg {
+        Reg {
+            kind,
+            name: self.fresh(kind),
+            wide,
+        }
+    }
 }
 
 /// Simulated JVM operand stack of typed registers.
@@ -207,7 +227,15 @@ impl<'a> Emitter<'a> {
                 | ParamKind::F64Array
                 | ParamKind::I16Array
                 | ParamKind::I8Array => {
-                    let r = self.regs.fresh_reg(RegKind::U64);
+                    // AUDIT 2026-05-24 (C31): array references are JVM
+                    // category-1 (one operand-stack slot each), but they
+                    // live in a `RegKind::U64` PTX register because the
+                    // pointer is 64-bit on device. The default
+                    // `fresh_reg` would tag them `wide=true` from the
+                    // U64 kind alone, which would break `pop2` of two
+                    // stacked array refs (it would pop one slot instead
+                    // of two). Force `wide=false` here.
+                    let r = self.regs.fresh_reg_with_wide(RegKind::U64, false);
                     writeln!(self.body, "    ld.param.u64 {}, [p{i}_ptr];", r.name).unwrap();
                     self.param_ptr_reg[i] = r.name.clone();
                     self.locals.set(slot, r);
@@ -393,7 +421,11 @@ impl<'a> Emitter<'a> {
             0x01 => {
                 // aconst_null — push a u64 zero. We never expect to use
                 // it, but the analyzer permits the opcode.
-                let r = self.regs.fresh_reg(RegKind::U64);
+                //
+                // AUDIT 2026-05-24 (C31): `null` is a reference, which
+                // is JVM category-1 — `pop2` of (any, null) must pop two
+                // slots, not one. Override the U64-implies-wide default.
+                let r = self.regs.fresh_reg_with_wide(RegKind::U64, false);
                 writeln!(self.body, "    mov.u64 {}, 0;", r.name).unwrap();
                 self.stack.push(r);
             }
@@ -1392,12 +1424,8 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn scalar_return(&mut self, _kind: RegKind, suffix: &str) -> Result<(), LoweringError> {
+    fn scalar_return(&mut self, kind: RegKind, suffix: &str) -> Result<(), LoweringError> {
         let value = self.stack.pop()?;
-        // Write the value through ret_ptr. Each thread writes the same
-        // location — for a single-thread scalar return that's the
-        // intent; for a per-thread "result" it overwrites. Marshalling
-        // pre-allocates a one-element output buffer.
         let ret_ptr = self.regs.fresh_reg(RegKind::U64);
         writeln!(
             self.body,
@@ -1405,12 +1433,53 @@ impl<'a> Emitter<'a> {
             ret_ptr.name
         )
         .unwrap();
-        writeln!(
-            self.body,
-            "    st.global{} [{}], {};",
-            suffix, ret_ptr.name, value.name
-        )
-        .unwrap();
+        if self.sig.is_reduction {
+            // AUDIT 2026-05-24 (C31): dot-product / sum reduction shape.
+            // The element-wise lowering substitutes `iload iv → tid` so
+            // each CUDA thread carries one iteration's partial term in
+            // `value`. A plain `st.global.<suffix>` would have every
+            // thread race-overwrite the single `*ret_ptr` slot — silently
+            // wrong sums. Emit `atom.global.add.<atomic_suffix>` so each
+            // thread's partial contribution accumulates correctly.
+            //
+            // PTX atomic-add type suffixes are NOT identical to the
+            // load/store suffixes: integer atomics use unsigned widths
+            // (`atom.add.u32` / `atom.add.u64`) — they operate on the raw
+            // bit pattern, which matches Java two's-complement semantics
+            // for signed accumulation. Float atomics use `atom.add.f32`
+            // (sm_20+) / `atom.add.f64` (sm_60+).
+            //
+            // The host marshaller MUST pre-zero `*ret_ptr` before launch;
+            // `KernelSignature::is_reduction` documents this contract.
+            let atomic_suffix = match kind {
+                RegKind::S32 => ".u32",
+                RegKind::S64 => ".u64",
+                RegKind::F32 => ".f32",
+                RegKind::F64 => ".f64",
+                _ => {
+                    return Err(LoweringError::UnsupportedNode(format!(
+                        "reduction atomic-add for register kind {kind:?} (suffix `{suffix}`) is not supported",
+                    )));
+                }
+            };
+            writeln!(
+                self.body,
+                "    atom.global.add{} [{}], {};",
+                atomic_suffix, ret_ptr.name, value.name
+            )
+            .unwrap();
+        } else {
+            // Non-reduction scalar return. For a single-thread / straight-line
+            // shape, every thread writes the same value to `*ret_ptr` so
+            // racing on the store is benign. Marshalling pre-allocates a
+            // one-element output buffer.
+            writeln!(
+                self.body,
+                "    st.global{} [{}], {};",
+                suffix, ret_ptr.name, value.name
+            )
+            .unwrap();
+        }
         self.ret_value_reg = Some(value);
         writeln!(self.body, "    bra L_done;").unwrap();
         Ok(())

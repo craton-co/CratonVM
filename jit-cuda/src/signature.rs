@@ -41,4 +41,19 @@ pub struct KernelSignature {
     /// optimisation. The simplest implementation passes each access
     /// as a distinct kernel arg.
     pub this_field_cps: Vec<u16>,
+
+    /// AUDIT 2026-05-24 (C31): the analyzer recognised this method as a
+    /// dot-product / sum reduction (counted loop, array load, arithmetic
+    /// `*add`, scalar return). The lowering layer turns the per-thread
+    /// `*return` into an `atom.global.add.<suffix>` against `ret_ptr`
+    /// instead of a racing plain `st.global.<suffix>`, so every thread's
+    /// partial contribution accumulates correctly into the single output
+    /// slot. The host marshaller MUST pre-zero `*ret_ptr` before launch
+    /// for the atomic accumulation to land on the correct identity
+    /// (`0` for sum/dot — matches Java initialiser of the accumulator).
+    ///
+    /// `false` for non-reduction shapes (element-wise stores into output
+    /// arrays, void returns, straight-line scalar returns where every
+    /// thread computes the same value and racing on `ret_ptr` is benign).
+    pub is_reduction: bool,
 }
