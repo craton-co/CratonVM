@@ -23061,6 +23061,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn concurrent_linked_queue_registered() {
         let r = build_registry();
         let clq = "java/util/concurrent/ConcurrentLinkedQueue";
@@ -23074,6 +23075,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn concurrent_linked_deque_registered() {
         let r = build_registry();
         let cld = "java/util/concurrent/ConcurrentLinkedDeque";
@@ -23086,6 +23088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn linked_blocking_queue_registered() {
         let r = build_registry();
         let lbq = "java/util/concurrent/LinkedBlockingQueue";
@@ -23101,6 +23104,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn array_blocking_queue_registered() {
         let r = build_registry();
         let abq = "java/util/concurrent/ArrayBlockingQueue";
@@ -23237,6 +23241,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "synthetic-jdk")]
     fn blocking_queue_interface_registered() {
         let r = build_registry();
         let bq = "java/util/concurrent/BlockingQueue";
