@@ -182,11 +182,33 @@ pub trait GarbageCollector: Send + Sync {
     /// Run a garbage collection cycle.
     fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult;
 
-    /// Write barrier -- called after every reference store into a heap object.
+    /// Write barrier -- called **after** every reference store into a heap
+    /// object.
     ///
     /// For the simple heap this is a no-op. The generational heap marks
     /// the card table entry dirty when an old-gen object stores a reference
-    /// to a young-gen object.
+    /// to a young-gen object. G1 records the cross-region edge in the
+    /// destination region's remembered set.
+    ///
+    /// # SATB pre-barrier precondition
+    ///
+    /// This trait method is a **post-store** hook: the new reference value
+    /// is already in the slot by the time it fires. Concurrent collectors
+    /// that use Snapshot-At-The-Beginning (SATB) marking (currently G1) also
+    /// require the *old* slot value to be logged **before** the store —
+    /// otherwise objects reachable only through the overwritten reference
+    /// at the start of the marking cycle can be lost (lost-object bug,
+    /// downstream UAF on the next collection).
+    ///
+    /// When the underlying collector advertises `is_marking_active()` (see
+    /// `VmHeap::g1_is_marking_active`), callers MUST invoke
+    /// `VmHeap::satb_barrier(old_value)` **before** the store whose
+    /// completion is being signalled here. The trait shape cannot deliver
+    /// the old value after the fact, so this two-stage protocol is a caller
+    /// contract — there is no way for the GC alone to recover a missed
+    /// pre-barrier. G1 ships a best-effort `debug_assert!` that fires when
+    /// `write_barrier` is invoked while marking is active without any
+    /// matching pre-call on the same thread; release builds skip the check.
     fn write_barrier(&self, obj: ObjectRef, stored_value: Value);
 
     /// Total bytes currently allocated.

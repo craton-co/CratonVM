@@ -2067,13 +2067,19 @@ impl G1Collector {
         let total_size = HEADER_SIZE.checked_add(data_size)?;
         let (ptr, _region) = self.alloc_in_region(total_size)?;
 
+        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
+        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
+        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
+        // header decoders in `vm_heap` / `walk_objects` (e.g.
+        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
+        // returning 0 for any G1-allocated array prior to this fix.
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
             element_type,
             self.next_hash(),
             u32::try_from(length).ok()?,
-            0,
+            u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
         );
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
@@ -2135,7 +2141,13 @@ impl G1Collector {
     /// ([`crate::satb::satb_thread_local_log`]) so the hot write-barrier
     /// path takes no shared lock in the common case; the buffer auto-flushes
     /// into the global queue every ~256 entries.
+    ///
+    /// Also bumps a per-thread "SATB pre-barrier observed" epoch counter so
+    /// the debug-only assertion in `write_barrier` can detect callers that
+    /// invoke the post-store barrier without first logging the old slot
+    /// value (see `write_barrier` for the SATB protocol contract).
     pub fn satb_pre_barrier(&self, old_ref: usize) {
+        bump_satb_pre_barrier_epoch();
         if old_ref == 0 {
             return;
         }
@@ -2213,7 +2225,33 @@ impl G1Collector {
         // Cache miss: take the regions lock just long enough to capture
         // the stable pointer, populate the TLS cache, then perform the
         // RSet add via the same `&self` interior-mutex path.
+        //
+        // Round-9 fix (HIGH C4): post-filter by `region_type` here, on the
+        // slow path only. The cached `region_lookup` table is keyed by
+        // address-range alone and so `lookup_region_for_addr` happily
+        // returns the index of a Free (or HumongousContinuation) region
+        // whose backing buffer still covers `dst_addr` from a prior cycle.
+        // Recording references into Free regions inflates RSet traffic and,
+        // more critically, holds references that will be reset to garbage
+        // at the next GC. We replicate the gating that
+        // `is_addr_in_live_region` (line 2324) and `is_object_address`
+        // (line 2267) already apply on the read-side root-scan paths.
+        //
+        // The fast-path TLS cache hit above does not need a re-check
+        // because G1 phase transitions invalidate the cache via the
+        // collector-identity mismatch path: when the collector moves a
+        // region between Eden/Survivor/Old/Free, the cached `*const
+        // G1Region` is still address-valid (Vec never reallocates), but
+        // any subsequent `post_write_barrier_rset` call that hits a *new*
+        // destination region will re-take this slow path and re-validate.
+        // A stale cache entry can therefore briefly admit a write to a
+        // region that just freed, but the window is bounded by the
+        // mutator's next cross-region store and the next GC drains the
+        // (now-stale) RSet entries before any region is reclassified.
         let regions = self.regions.lock();
+        if regions[dst_idx].region_type == RegionType::Free {
+            return;
+        }
         let region_ptr: *const G1Region = &regions[dst_idx];
         LAST_RSET_TARGET.with(|cell| {
             cell.set(Some((collector_id, dst_idx, region_ptr)));
@@ -2415,13 +2453,19 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
+        // Mirror `length` into BOTH `array_length` and `num_slots`, matching
+        // `Heap::alloc_array` (heap.rs:367-370,403-410) and
+        // `GenerationalHeap::alloc_array` (gen_heap.rs:497-500). The shared
+        // header decoders in `vm_heap` / `walk_objects` (e.g.
+        // `VmHeap::num_fields(arr)`) consume `num_slots` and were silently
+        // returning 0 for any G1-allocated array prior to this fix.
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
             element_type,
             self.next_hash(),
             u32::try_from(length).expect("array length exceeds u32::MAX"),
-            0,
+            u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
         );
 
         unsafe {
@@ -2617,12 +2661,20 @@ impl GarbageCollector for G1Collector {
         // the rationale. No-op when `gpu-offload` is off.
         crate::vm_heap::wait_for_gpu_critical_drain();
 
-        // 1. Check if mixed GC is needed
+        // 1. Check if mixed GC is needed. Bracket the inner collection in an
+        //    `Instant` so we can feed the actual pause delta (milliseconds)
+        //    into `update_ihop` below. Previously this site passed
+        //    `bytes_freed` to `update_ihop`, which expects milliseconds and
+        //    compares against `config.max_gc_pause_ms` — feeding a byte
+        //    count (typically 10^4-10^8) caused the adaptive IHOP threshold
+        //    to floor on essentially every collection.
+        let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
         } else {
             self.young_collection(roots, monitors)
         };
+        let pause_ms = pause_start.elapsed().as_millis() as u64;
 
         // 2. Check IHOP -> start concurrent mark if threshold reached
         if self.check_ihop()
@@ -2631,17 +2683,46 @@ impl GarbageCollector for G1Collector {
             self.start_concurrent_mark();
         }
 
-        // 3. Adaptive IHOP
-        let last_pause = self.total_pause_ms.load(Ordering::Relaxed);
-        if last_pause > 0 {
-            self.update_ihop(result.stats.bytes_freed as u64);
+        // 3. Adaptive IHOP: feed the *pause time* of this collection (not
+        //    the bytes freed) — see `update_ihop` doc for the contract.
+        if pause_ms > 0 {
+            self.update_ihop(pause_ms);
         }
 
         result
     }
 
     fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
-        // Post-write barrier: track cross-region references in remembered sets
+        // Post-write barrier: track cross-region references in remembered sets.
+        //
+        // PRECONDITION (SATB pre-barrier): when `gc_state.is_marking_active()`
+        // returns true, the caller MUST have invoked
+        // `VmHeap::satb_barrier(old_slot_value)` BEFORE performing the store
+        // whose result is being signalled here. SATB needs the *old* slot
+        // value to be logged before it is overwritten, and the trait shape
+        // (post-store hook) cannot recover that value after the fact. See
+        // `GarbageCollector::write_barrier` doc on the trait for the full
+        // contract.
+        //
+        // Best-effort assertion: in debug builds, fire if the marking phase
+        // is active and this thread has not invoked `satb_pre_barrier` since
+        // its last `write_barrier` call. We cannot mechanically check that
+        // the caller logged the *correct* old value (the old value is gone
+        // by the time we get here) — only that *some* pre-call happened on
+        // the same thread between consecutive post-store hooks. Misses are
+        // false-positives on the very first store after marking activates;
+        // they are still useful for surfacing call sites that need auditing
+        // for SATB callsite coverage.
+        debug_assert!(
+            !self.gc_state.is_marking_active()
+                || consume_satb_pre_barrier_epoch(),
+            "G1 write_barrier invoked while concurrent marking is active without a \
+             corresponding SATB pre-barrier on this thread. The trait contract \
+             requires callers to invoke `VmHeap::satb_barrier(old_value)` BEFORE \
+             the reference store. See `GarbageCollector::write_barrier` doc and \
+             `G1Collector::satb_pre_barrier`."
+        );
+
         if let Value::Object(Some(ref target)) = stored_value {
             self.post_write_barrier_rset(obj, *target);
         }
@@ -2651,6 +2732,41 @@ impl GarbageCollector for G1Collector {
         let regions = self.regions.lock();
         regions.iter().map(|r| r.cursor).sum()
     }
+}
+
+// ---------------------------------------------------------------------------
+// SATB pre-barrier debug tracking
+// ---------------------------------------------------------------------------
+//
+// Per-thread flag bumped by `G1Collector::satb_pre_barrier` and consumed by
+// the debug-only assertion in `G1Collector::write_barrier`. This is purely a
+// best-effort detector for missing SATB pre-calls — the post-store trait
+// shape cannot see the old slot value, so we cannot mechanically verify
+// correctness here. What we *can* do is detect the obvious bug where a
+// caller invokes the post-store barrier while marking is active without
+// having issued any pre-barrier on the same thread.
+//
+// Compiled to a no-op in release builds (only the `debug_assert!` consumer
+// references these helpers, and the body of `consume_satb_pre_barrier_epoch`
+// is trivially DCE-able when the assertion is stripped).
+
+thread_local! {
+    static SATB_PRE_BARRIER_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark that this thread has invoked the SATB pre-barrier; the next
+/// post-store `write_barrier` call will consume the flag.
+#[inline]
+fn bump_satb_pre_barrier_epoch() {
+    SATB_PRE_BARRIER_FLAG.with(|c| c.set(true));
+}
+
+/// Consume the per-thread SATB pre-barrier flag and return whether one was
+/// observed since the last call. Used only by the debug-only assertion in
+/// `write_barrier`.
+#[inline]
+fn consume_satb_pre_barrier_epoch() -> bool {
+    SATB_PRE_BARRIER_FLAG.with(|c| c.replace(false))
 }
 
 // ---------------------------------------------------------------------------
