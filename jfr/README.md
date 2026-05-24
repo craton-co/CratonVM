@@ -33,6 +33,75 @@ if is_enabled() {
 }
 ```
 
+## JMC Compatibility
+
+The `.jfr` files this crate writes are **JFR v2.0 inspired**, not
+byte-for-byte identical to the format OpenJDK's Flight Recorder
+emits. JDK Mission Control (JMC) opens and renders them, but two
+writer conventions diverge from stock JFR and one chunk-level
+ordering pass was added in round 9 (2026-05-24) to keep the JMC
+timeline view monotonic.
+
+### Wire-format divergences from stock JFR
+
+- **`JFR_VERSION_MINOR = 1` — delta-encoded event timestamps.**
+  Each event's on-wire `start_time` field is the delta from the
+  chunk header's `start_time_ns`, not the absolute nanos-since-epoch
+  that stock JFR (`minor = 0`) writes. Within a single chunk (≤ ~1
+  second of wall time) deltas fit in 1–3 varint bytes instead of
+  6–9, shrinking the event region by ~30–40 %. Readers detect the
+  encoding from the header's `minor` field and re-add
+  `chunk_start_time` when decoding; see `read_events` in
+  `src/dump.rs`. Files written by pre-round-5 (`minor = 0`)
+  writers still decode correctly via the
+  `JFR_VERSION_MINOR_ABSOLUTE_TS` legacy path.
+- **`STRING_POOL_TYPE_ID = 2` — single per-chunk string constant
+  pool.** A custom checkpoint section type ID interns every
+  string-typed field payload once and references it by compressed
+  index from the event records. Stock JFR uses its own (more
+  elaborate) constant-pool taxonomy. See
+  `write_checkpoint_section` / `parse_checkpoint_pool` in
+  `src/dump.rs` for the encoding and the matching decoder.
+- **Simplified metadata section.** Event-type descriptors are
+  written as a compact binary record list rather than the binary
+  XML form OpenJDK ships. Field types, descriptions, and the
+  `has_thread` / `has_stacktrace` flags round-trip; the rest of
+  OpenJDK's metadata schema (annotations, content types, settings)
+  is currently omitted. See `write_metadata_section` in
+  `src/dump.rs`.
+
+### Cross-shard timestamp sort on dump (round-9 HIGH-4 fix)
+
+Hot-path event emission goes through a per-thread `SpscEventRing`
+shard for lock-free producer cost. At dump time the writer now
+**merge-sorts the recording's repository events and any
+caller-supplied `extra_events` by absolute `start_time` and
+writes them as one globally-monotonic stream within the chunk**.
+This is O(N log N) on a cold path; without it, JMC's timeline view
+sees per-event timestamps that go backwards mid-chunk wherever two
+shards' insertion orders interleave (and the delta-timestamp
+encoding above makes that worse on JMC versions that decode
+deltas relative to the previous event's tick rather than
+`chunk_start_time`). See the `Round-9 HIGH-4 fix` comment in
+`dump_to_file` (`src/dump.rs`) for the implementation and
+rationale, and
+`test_dump_merges_repository_and_extra_events_by_start_time` for
+the verifying test.
+
+### Caveats
+
+- The metadata section omits OpenJDK's annotation / content-type
+  payload, so JMC's "settings" pane and content-type-based
+  visualisations may show a reduced view.
+- Periodic-event scheduling and the `EventStream` chunk-rotation
+  semantics are partial: only the on-disk format guarantees apply.
+- Diagnostic counters for event loss (per-thread ring overflow
+  via `ThreadRingRegistry::total_dropped_events`, per-recording
+  filter rejections via `Recording::stats().events_filtered_out`
+  added by round-9 CRIT-3) are exposed on the Rust API but are
+  NOT yet surfaced inside the written `.jfr` file as an
+  event-loss record.
+
 ## Status
 
 Pre-1.0. API stability is best-effort. Tied to the
