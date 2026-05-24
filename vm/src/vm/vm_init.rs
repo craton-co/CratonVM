@@ -3730,12 +3730,13 @@ mod ranked_locks {
 
         fn level_from_u8(v: u8) -> LockLevel {
             match v {
-                0 => LockLevel::HeapLock,
-                1 => LockLevel::ClassLoader,
-                2 => LockLevel::MonitorPool,
-                3 => LockLevel::ThreadList,
-                4 => LockLevel::JitCache,
-                5 => LockLevel::Safepoint,
+                0 => LockLevel::ClassManager,    // L10 — highest
+                1 => LockLevel::NativeMethods,   // L9
+                2 => LockLevel::RefProcessor,    // L7
+                3 => LockLevel::Monitors,        // L6
+                4 => LockLevel::ThreadRegistry,  // L5
+                5 => LockLevel::FlightRecorder,  // L4
+                6 => LockLevel::NativeMemory,    // L2
                 _ => unreachable!("level discriminant out of range: {v}"),
             }
         }
@@ -3795,13 +3796,13 @@ mod ranked_locks {
 
     // ----- Per-lock level mapping -----------------------------------
 
-    pub(super) const CLASS_MANAGER: LockLevel = LockLevel::HeapLock;
-    pub(super) const NATIVE_METHOD_CACHE: LockLevel = LockLevel::ClassLoader;
-    pub(super) const REF_PROCESSOR: LockLevel = LockLevel::MonitorPool;
-    pub(super) const MONITORS: LockLevel = LockLevel::ThreadList;
-    pub(super) const THREAD_REGISTRY: LockLevel = LockLevel::JitCache;
-    pub(super) const FLIGHT_RECORDER: LockLevel = LockLevel::Safepoint;
-    pub(super) const NATIVE_MEMORY: LockLevel = LockLevel::Safepoint;
+    pub(super) const CLASS_MANAGER: LockLevel = LockLevel::ClassManager;     // L10
+    pub(super) const NATIVE_METHOD_CACHE: LockLevel = LockLevel::NativeMethods; // L9
+    pub(super) const REF_PROCESSOR: LockLevel = LockLevel::RefProcessor;     // L7
+    pub(super) const MONITORS: LockLevel = LockLevel::Monitors;              // L6
+    pub(super) const THREAD_REGISTRY: LockLevel = LockLevel::ThreadRegistry; // L5
+    pub(super) const FLIGHT_RECORDER: LockLevel = LockLevel::FlightRecorder; // L4
+    pub(super) const NATIVE_MEMORY: LockLevel = LockLevel::NativeMemory;     // L2
 }
 
 pub use ranked_locks::RankScope;

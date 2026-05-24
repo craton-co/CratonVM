@@ -21530,7 +21530,7 @@ mod tests {
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[0]) };
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[0]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -21584,7 +21584,7 @@ mod tests {
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[0]) };
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[0]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -21653,9 +21653,9 @@ mod tests {
         // In-bounds access should work
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 0]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 0]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 10);
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 4]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 4]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 50);
     }
 
@@ -21719,7 +21719,7 @@ mod tests {
         // In-bounds store should work
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42]) }; // Cast: address arithmetic
+        unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42]).expect("test JIT call") }; // Cast: address arithmetic
         let val = shared.heap.get_array_element(arr, 0).unwrap();
         assert_eq!(val.as_int(), Some(42));
     }
@@ -21922,7 +21922,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 5]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 5]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 15); // 1+2+3+4+5
     }
 
@@ -23044,7 +23044,7 @@ mod tests {
         let arr1_ptr = arr1.as_ptr();
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result1 = unsafe { compiled.call_with_context(vm_ptr, &[arr1_ptr as i64, 0]) }; // Cast: JIT ABI convention
+        let result1 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr1_ptr as i64, 0]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result1, 0, "empty array sum should be 0");
 
         // Test 2: array of 3 elements (0 SIMD chunks, all scalar cleanup)
@@ -23058,7 +23058,7 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result2 = unsafe { compiled.call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64]) }; // Cast: JIT ABI convention
+        let result2 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result2, 300, "3 elements of 100 should sum to 300");
 
         // Test 3: array of exactly 8 elements (exactly 1 SIMD chunk, no cleanup)
@@ -23072,7 +23072,7 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result3 = unsafe { compiled.call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64]) }; // Cast: JIT ABI convention
+        let result3 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result3, 80, "8 elements of 10 should sum to 80");
 
         // Test 4: array of 20 elements (exercises both SIMD chunks and scalar cleanup)
@@ -23089,7 +23089,7 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result4 = unsafe { compiled.call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64]) }; // Cast: JIT ABI convention
+        let result4 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result4, 210, "sum of 1..=20 should be 210");
 
         // Test 5: large array (256 elements) to really exercise SIMD
@@ -23104,7 +23104,7 @@ mod tests {
         // sum of 0..255 = 255*256/2 = 32640
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result5 = unsafe { compiled.call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64]) }; // Cast: JIT ABI convention
+        let result5 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result5, 32640, "sum of 0..=255 should be 32640");
     }
 
@@ -23292,7 +23292,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with a sentinel VM pointer.
         // The fake_new_object stub does not touch the pointer.
-        let result = unsafe { compiled.call_with_context(0xCAFE_F00D, &[]) };
+        let result = unsafe { compiled.try_call_with_context(0xCAFE_F00D, &[]).expect("test JIT call") };
         assert_eq!(
             result, 0xDEAD_BEEFi64,
             "inline TLAB cascade must fall through to slow-path fake_new_object \
@@ -23354,7 +23354,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call_with_context(vm_ptr, &[]) };
+        let result = unsafe { compiled.unwrap().try_call_with_context(vm_ptr, &[]).expect("test JIT call") };
         // Result should be a non-zero pointer to the allocated object
         assert_ne!(result, 0, "jit_new_object should return a valid object pointer");
     }
@@ -23412,7 +23412,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call_with_context(vm_ptr, &[]) };
+        let result = unsafe { compiled.unwrap().try_call_with_context(vm_ptr, &[]).expect("test JIT call") };
         // Result should be non-zero (valid array pointer)
         assert_ne!(result, 0, "jit_anewarray_object should return a valid array pointer");
     }
