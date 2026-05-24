@@ -13104,11 +13104,28 @@ pub(crate) fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]
 /// the field's value tag and crashing later reads with "expected object
 /// reference, got double(...)".
 ///
-/// Heuristic guard: pointers in our heap arenas are 8-byte aligned and fit
-/// in 48 bits (canonical x86-64 user-space).  A `Value::Double` that fails
-/// either constraint cannot be a live ObjectRef and is mapped to null —
-/// matching the verifier's "primitive in reference slot" recovery for
-/// `Int(0)`/`Long(0)`.
+/// C20 — heap-membership filter on Java-controlled `ObjectRef::from_raw`
+/// reconstruction. Mirrors the `vm::interpreter::pop_object_ref_ctx_with`
+/// C7 fix: alignment + 48-bit-range alone are NOT sufficient to prove a
+/// Double slot holds a smuggled `ObjectRef`. An honest `f64` whose
+/// `to_bits()` value satisfies the predicate (e.g. denormals like
+/// `f64::from_bits(0x800)`) would be coerced into a wild `ObjectRef`
+/// and dereferenced by the next heap access. The interpreter fix uses
+/// `heap.is_heap_addr(bits) -> Option<ObjectRef>` as the gating
+/// primitive, but `NativeContext` (the only handle into the runtime
+/// from native-builtins) does not currently expose that probe and the
+/// function's call sites span both `lib.rs` and `unsafe_natives.rs` so
+/// the signature is fixed.
+///
+/// Conservative resolution until the heap probe is plumbed through:
+/// disable the smuggled-pointer reconstruction and return `Object(None)`
+/// for the Double-bits arm. This matches the existing miss-idiom (line
+/// just below for misaligned bits, and for `Int(0)`/`Long(0)`), and
+/// matches `recover_class_mirror_from_slot`'s heap-membership-gated
+/// behavior in `lang_invoke.rs`. The AQS smuggle path will instead hit
+/// the "expected object reference, got double(...)" error rather than
+/// silently feeding a wild pointer to downstream heap accesses — a
+/// loud failure is strictly safer than the soundness footgun.
 pub(crate) fn recover_object_arg(value: Value) -> Value {
     match value {
         Value::Object(_) => value,
@@ -13116,15 +13133,17 @@ pub(crate) fn recover_object_arg(value: Value) -> Value {
             let bits = d.to_bits();
             if bits == 0 {
                 Value::Object(None)
-            } else if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                // SAFETY: same untagged pointer pattern as written by the
-                // sibling thread; ObjectRef::from_raw is a typed wrapper
-                // and does not dereference the address until a later heap
-                // access validates it.
-                Value::Object(Some(unsafe {
-                    cratonvm_types::ObjectRef::from_raw(bits as usize as *mut u8)
-                }))
             } else {
+                // C20: previously this fell through to
+                // `ObjectRef::from_raw(bits as *mut u8)` after an
+                // alignment+48-bit-range check. Without an
+                // `is_heap_addr`-style heap-membership probe on
+                // `NativeContext`, we cannot distinguish a legitimate
+                // smuggled pointer from an honest scalar that happens to
+                // satisfy the predicate. Refuse to fabricate the
+                // `ObjectRef`; let the caller observe an explicit
+                // null/error rather than silently dereferencing arbitrary
+                // Java-controlled bits.
                 Value::Object(None)
             }
         }
