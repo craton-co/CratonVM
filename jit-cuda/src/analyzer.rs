@@ -132,6 +132,19 @@ pub enum Reason {
     /// (e.g. `(II)I` that loops) slips through. Reject it here until a
     /// guarded single-writer or block-reduction lowering exists.
     CountedLoopScalarReturn,
+    /// AUDIT 2026-05-24 (C31): `ldc` (0x12) / `ldc_w` (0x13) /
+    /// `ldc2_w` (0x14) load a constant from the constant pool. The
+    /// analyzer cannot, without resolving the CP entry, tell whether
+    /// the target is a numeric primitive (which a GPU lowering could
+    /// in principle materialise as an immediate) or a `String` /
+    /// `Class` / `MethodType` / `MethodHandle` / dynamic constant
+    /// (which have no GPU representation). The lowering layer has no
+    /// dispatch arm for these opcodes either, so admitting them at
+    /// the analyzer wastes the analyze→lower round-trip and pollutes
+    /// the per-method blacklist with would-be-eligible methods.
+    /// Reject upstream until the analyzer learns to resolve the CP
+    /// entry or the emitter grows a numeric-only `ldc` arm.
+    LoadConstant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +309,11 @@ pub fn analyze_with_annotations(
         // mask precisely here. Leave `0` and let lowering fill it in
         // before `CompiledKernel` caches the signature.
         writes_param_mask: 0,
+        // AUDIT 2026-05-24 (C31): propagate the dot-product reduction
+        // flag so the lowering layer emits `atom.global.add.<suffix>`
+        // instead of a racing plain `st.global.<suffix>` for the scalar
+        // return. See `KernelSignature::is_reduction` for the contract.
+        is_reduction: is_dot_reduction,
     })
 }
 
@@ -436,6 +454,13 @@ fn classify(op: u8, hint: AdmissionHint, prev_op: Option<u8>) -> OpClass {
         0xA5 | 0xA6 => OpClass::Reject(Reason::TypeCheck),     // if_acmpeq, if_acmpne
         0xA8 | 0xA9 | 0xC9 => OpClass::Reject(Reason::JsrRet), // jsr, ret, jsr_w
         0xAA | 0xAB => OpClass::Reject(Reason::Switch),
+        // AUDIT 2026-05-24 (C31): `ldc` / `ldc_w` / `ldc2_w` were
+        // silently admitted by the permitted band below (0x00..=0x31)
+        // even though the emitter has no dispatch arm for them — every
+        // such method was analyzed-eligible and then lowering-rejected,
+        // wasting work. Reject upstream with the precise reason; see
+        // `Reason::LoadConstant`.
+        0x12 | 0x13 | 0x14 => OpClass::Reject(Reason::LoadConstant),
         0xB2..=0xB5 => OpClass::Reject(Reason::FieldAccess),
         // Invokes: the AllowIntrinsicCalls hint loosens `invokestatic`
         // (0xB8) so that the lowering layer can recognise the small set
