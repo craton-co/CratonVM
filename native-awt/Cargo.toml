@@ -47,7 +47,7 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = "0.2"
-objc2-app-kit = { version = "0.2", features = ["NSWindow", "NSView", "NSEvent", "NSGraphicsContext", "NSImage", "NSPasteboard", "NSApplication", "NSFont", "NSColor", "NSTextField", "NSButton", "NSMenu"] }
+objc2-app-kit = { version = "0.2", features = ["NSWindow", "NSView", "NSEvent", "NSGraphicsContext", "NSImage", "NSPasteboard", "NSApplication", "NSFont", "NSColor", "NSTextField", "NSButton", "NSMenu", "NSAttributedString"] }
 
 [dev-dependencies]
 
