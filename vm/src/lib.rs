@@ -19,6 +19,13 @@
 //! - [`native`] — Native method registry and implementations
 //! - [`threading`] — Thread management, monitors, virtual thread scheduler
 //! - [`types`] — JVM value representation with SoA layout
+//!
+//! # Embedding
+//!
+//! For a worked example of embedding CratonVM as a library in a Rust
+//! application, see [`docs/embedding.md`](https://github.com/craton-co/cratonvm/blob/main/docs/embedding.md)
+//! in the workspace root. The first-party `vm-cli` binary is the
+//! reference embedder.
 
 pub mod classloading;
 pub mod config;

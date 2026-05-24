@@ -11,6 +11,13 @@
 //! - [`collector::MonitorCleanup`] -- trait for GC-time monitor remapping
 //! - [`card_table::CardTable`] -- card table for old->young reference tracking
 //! - [`old_gen::OldGen`] -- free-list allocator for old generation
+//!
+//! # Tuning
+//!
+//! For choosing a backend (Generational vs G1 vs ZGC), sizing the heap,
+//! interpreting JFR GC events, and diagnosing common pause / allocation
+//! symptoms, see [`docs/gc-tuning.md`](https://github.com/craton-co/cratonvm/blob/main/docs/gc-tuning.md)
+//! in the workspace root.
 
 pub mod arena;
 pub mod card_table;
