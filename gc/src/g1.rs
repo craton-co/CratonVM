@@ -4536,6 +4536,7 @@ mod tests {
             }
             fn collect_garbage(
                 &self,
+                _: &crate::collector::StopTheWorldToken,
                 _: &mut [ObjectRef],
                 _: &dyn MonitorCleanup,
             ) -> GcResult {
