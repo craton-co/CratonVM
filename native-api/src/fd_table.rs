@@ -1215,19 +1215,44 @@ impl FileDescriptorTable {
     }
 
     /// Estimate available bytes on a TCP stream using peek.
+    ///
+    /// Mirrors the rewrite documented at `fd_table.rs:1001` for
+    /// `poll_ready`: the previous implementation flipped the socket
+    /// to non-blocking, called `peek`, then flipped it back. That
+    /// pattern (a) races against a concurrent blocking `tcp_read` on
+    /// the same fd into a spurious `WouldBlock`, and (b) clobbers the
+    /// blocking flag the caller had deliberately set — every
+    /// `tcp_available` call would silently undo `set_nonblocking(true)`.
+    ///
+    /// New strategy: do a non-destructive readiness probe first. If
+    /// the kernel reports the socket as not-readable, return 0 without
+    /// touching the socket. If it is readable, the kernel already has
+    /// buffered data and a `peek` is guaranteed not to block — no
+    /// flag-toggling required.
     pub fn tcp_available(&self, fd: FdId) -> Result<usize, io::Error> {
         let entry = self.get_entry(fd).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp"))?;
         match &*entry {
             FileEntry::TcpStream(s) => {
                 let stream = s.lock();
-                let _ = stream.set_nonblocking(true);
+                let (readable, _) = poll_socket_readiness(&*stream);
+                if !readable {
+                    // Nothing buffered in the kernel — no bytes
+                    // available. Crucially, the socket's blocking flag
+                    // is left exactly as the caller configured it.
+                    return Ok(0);
+                }
+                // Readable per poll(); peek without flag toggling. On
+                // a blocking stream that the kernel says has data this
+                // returns immediately with the buffered byte count.
                 let mut buf = [0u8; 8192];
                 let avail = match stream.peek(&mut buf) {
                     Ok(n) => n,
+                    // POLLIN with WouldBlock means readiness raced
+                    // away (a concurrent reader drained the buffer).
+                    // That's a snapshot estimate, return 0.
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
                     Err(_) => 0,
                 };
-                let _ = stream.set_nonblocking(false);
                 Ok(avail)
             }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for tcp")),
@@ -1962,5 +1987,131 @@ mod tests {
         assert_eq!(table.read_line(fd).unwrap(), None);
         table.close(fd).unwrap();
         let _ = fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // tcp_available — the previous implementation toggled the socket's
+    // non-blocking flag (set true / peek / set false), which silently
+    // clobbered a non-blocking flag the caller had deliberately set.
+    // See the comment at `fd_table.rs:1001` for the analogous rewrite of
+    // `poll_ready` that this fix mirrors.
+    // -----------------------------------------------------------------------
+
+    /// Helper: spin up a localhost loopback TcpStream pair and return
+    /// the client side (so the test owns one end and can probe it).
+    /// The server-side accepted socket is kept alive in the returned
+    /// guard so the connection doesn't reset under the test.
+    fn loopback_pair() -> (std::net::TcpStream, std::net::TcpListener, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, listener, server)
+    }
+
+    /// Differentiates a non-blocking socket from a blocking one by
+    /// timing: read on an empty buffer returns `WouldBlock` on *both*
+    /// paths (set_read_timeout also surfaces a timeout as WouldBlock
+    /// on Linux), so we time how long the read took. A truly non-
+    /// blocking read returns essentially immediately; a blocking read
+    /// gated by a 200ms timeout returns after ~200ms.
+    fn is_still_nonblocking_via_timing(stream: &std::net::TcpStream) -> bool {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        // We expect this to fail (empty buffer); we only care about
+        // *how long* it took to fail. `impl Read for &TcpStream`
+        // lets us read through a shared reference.
+        let mut reader: &std::net::TcpStream = stream;
+        let _ = reader.read(&mut buf);
+        let elapsed = start.elapsed();
+        // Clear the timeout so we don't perturb later reads in the
+        // same test.
+        stream.set_read_timeout(None).unwrap();
+        // Non-blocking: well under 50ms. Blocking-with-timeout: ~200ms.
+        // 100ms is a comfortable midpoint.
+        elapsed < Duration::from_millis(100)
+    }
+
+    #[test]
+    fn tcp_available_preserves_nonblocking_flag_no_data() {
+        // Regression: pre-fix `tcp_available` did
+        //   set_nonblocking(true); peek(); set_nonblocking(false);
+        // which silently clobbered an intentionally non-blocking
+        // socket. The new code uses `poll_socket_readiness` first and
+        // peeks only when the kernel says there's data — leaving the
+        // blocking flag untouched. See `fd_table.rs:1001` for the
+        // analogous fix that `poll_ready` already received.
+        let (client, _listener, _server) = loopback_pair();
+        let table = FileDescriptorTable::new();
+        let fd = table.insert_tcp_stream(client);
+
+        // Caller persistently sets non-blocking.
+        table.tcp_set_nonblocking(fd, true).unwrap();
+
+        // Probe — there is no data on the wire so this returns Ok(0).
+        let avail = table.tcp_available(fd).unwrap();
+        assert_eq!(avail, 0, "no data was sent, available should be 0");
+
+        // The persistent non-blocking flag must still be in effect.
+        let entry = table.get_entry(fd).unwrap();
+        match &*entry {
+            FileEntry::TcpStream(s) => {
+                let stream = s.lock();
+                assert!(
+                    is_still_nonblocking_via_timing(&*stream),
+                    "tcp_available clobbered the persistent non-blocking flag"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tcp_available_preserves_nonblocking_flag_with_data() {
+        // Same regression check but with bytes already buffered: the
+        // poll path reports "readable" and we hit the peek branch. The
+        // non-blocking flag must still survive intact.
+        let (client, _listener, mut server) = loopback_pair();
+        // Push some bytes from the server end so the client's recv
+        // buffer has data ready.
+        server.write_all(b"hello world").unwrap();
+        server.flush().unwrap();
+
+        let table = FileDescriptorTable::new();
+        let fd = table.insert_tcp_stream(client);
+        table.tcp_set_nonblocking(fd, true).unwrap();
+
+        // Give the kernel a brief moment to deliver the bytes to the
+        // client's recv buffer so `poll` reports readable.
+        let mut avail = 0;
+        for _ in 0..50 {
+            avail = table.tcp_available(fd).unwrap();
+            if avail > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(avail > 0, "expected buffered bytes, got {avail}");
+
+        // Persistent non-blocking flag must still be set. Drain the
+        // buffered bytes first so the timing check sees an empty
+        // recv buffer.
+        let entry = table.get_entry(fd).unwrap();
+        match &*entry {
+            FileEntry::TcpStream(s) => {
+                let mut stream = s.lock();
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf).unwrap();
+                assert!(
+                    is_still_nonblocking_via_timing(&*stream),
+                    "tcp_available clobbered the persistent non-blocking flag \
+                     after the data-present (peek) path"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }

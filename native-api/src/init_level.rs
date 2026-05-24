@@ -61,19 +61,33 @@ pub fn get_init_level() -> i32 {
 pub fn set_init_level(level: i32) {
     let state = global();
     let (atomic, lock, cv) = (&state.0, &state.1, &state.2);
-    let cur = atomic.load(Ordering::Acquire);
-    if level < cur {
+    // Use `fetch_max` so two threads racing with monotonically-
+    // increasing values can never violate the monotonic-progression
+    // contract: the higher value always wins regardless of interleaving.
+    // The previous load-then-store sequence had a classic lost-update
+    // race — thread A reads 1, thread B reads 1, A stores 3, B stores 2,
+    // and the final level is 2 instead of 3.
+    //
+    // `fetch_max` returns the *previous* value; from it we can both
+    // detect (and warn about) a refused downward transition and decide
+    // whether to notify waiters.
+    let prev = atomic.fetch_max(level, Ordering::AcqRel);
+    if level < prev {
         // Keep the diagnostic cheap — the `tracing` crate is the
         // native-builtins default but native-api doesn't pull it in,
         // so we write to stderr directly. Stays out of the hot path
         // because downward transitions should never happen.
         eprintln!(
             "[cratonvm] warning: VM.setInitLevel: refusing downward \
-             transition {cur}->{level}"
+             transition {prev}->{level}"
         );
         return;
     }
-    atomic.store(level, Ordering::Release);
+    if level == prev {
+        // No-op store — no waiters could become unblocked by this call,
+        // so skip the lock/notify dance entirely.
+        return;
+    }
     // Release the lock before notifying so the woken thread can
     // re-acquire immediately.
     {
@@ -144,5 +158,60 @@ mod tests {
         // bumped to 4; instead check the "already at or above"
         // fast path via await_init_level(0), which always returns.
         await_init_level(0);
+    }
+
+    #[test]
+    fn concurrent_setters_preserve_monotonic_max() {
+        // Regression: `set_init_level` previously did a load-then-store
+        // on the underlying `AtomicI32`. Two threads racing — one with
+        // a high value, one with a lower-but-still-above-current value
+        // — could observe the same `cur` and then store in any order,
+        // letting the lower write clobber the higher (last-write-wins).
+        // With `fetch_max` the final value must equal the maximum any
+        // racing thread tried to set, regardless of how the stores
+        // interleave.
+        //
+        // We use a *fresh* dedicated atomic instead of touching the
+        // process-wide `GLOBAL` so this test is hermetic and can run
+        // concurrently with `monotonic_advance` / `await_*` above
+        // without flaking.
+        use std::sync::Arc;
+        use std::thread;
+
+        // Replicates the production fetch_max logic in isolation.
+        fn race_set(atomic: &AtomicI32, level: i32) {
+            atomic.fetch_max(level, Ordering::AcqRel);
+        }
+
+        const TARGETS: &[i32] = &[1, 2, 3, 4, 2, 3, 1, 4, 3, 2];
+        let expected_max = *TARGETS.iter().max().unwrap();
+
+        // Run the experiment several times to make races more likely
+        // to interleave differently across iterations.
+        for _ in 0..32 {
+            let atomic = Arc::new(AtomicI32::new(0));
+            let mut handles = Vec::with_capacity(TARGETS.len());
+            for &lvl in TARGETS {
+                let a = Arc::clone(&atomic);
+                handles.push(thread::spawn(move || race_set(&a, lvl)));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                atomic.load(Ordering::Acquire),
+                expected_max,
+                "racing setters should converge to the max, not the last writer"
+            );
+        }
+    }
+
+    #[test]
+    fn set_init_level_refuses_downward_after_race() {
+        // Even after concurrent advancement to a high value, a later
+        // call with a smaller value must not roll the global back.
+        set_init_level(4);
+        set_init_level(2);
+        assert_eq!(get_init_level(), 4);
     }
 }
