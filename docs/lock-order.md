@@ -5,6 +5,13 @@ mutex and rwlock in `cratonvm-vm` and its dependencies. Acquiring locks
 out of order is a deadlock waiting to happen and *will* be caught by
 the lock-order regression tests in `vm/tests/lock_order_tests.rs`.
 
+The runtime enforcement counterpart lives in
+[`vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs):
+`LockLevel`, `OrderedMutex`, and `OrderedRwLock`. The numeric
+discriminants of `LockLevel` mirror the L0–L10 column in the table
+below exactly — if you change one, change the other in the same
+commit.
+
 ## Why this matters
 
 A JVM has many subsystems that occasionally need to coordinate:
