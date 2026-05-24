@@ -10626,9 +10626,10 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             }
             // KC26 LinkedHashMap.clone fix: LHM (and subclasses like
             // AnnotationAttributes) keeps most of its state in a side-table
-            // overlay keyed by ObjectRef pointer, not in the heap fields the
-            // loop above copies. Without this, the cloned LHM has all state
-            // missing (size, table, head/tail) and a subsequent
+            // overlay keyed by the receiver's identity hash code (C21:
+            // GC-stable across moving collections), not in the heap fields
+            // the loop above copies. Without this, the cloned LHM has all
+            // state missing (size, table, head/tail) and a subsequent
             // `HashMap.clone()` → `reinitialize()` → `putMapEntries()` chain
             // walks an empty receiver, producing OOM via division-by-zero
             // load-factor or silent data loss.  Detect LHM ancestry on the
@@ -10637,7 +10638,7 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             loop {
                 match ctx.class_name_of_id(cur) {
                     Some(n) if n == "java/util/LinkedHashMap" => {
-                        cratonvm_native_collections::clone_lhm_overlay(this, clone_ref);
+                        cratonvm_native_collections::clone_lhm_overlay(ctx, this, clone_ref);
                         break;
                     }
                     Some(n) if n == "java/lang/Object" => break,

@@ -10139,25 +10139,37 @@ fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // kept slot-based because `LinkedList$Node` is purely synthetic in our VM
 // (we never load the real class, since Node is private/inner and bytecode
 // doesn't `getfield` it directly).
-fn ll_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>> {
-    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>>> =
+//
+// GC-stability invariant (C21 fix): the overlay is keyed by
+// `ctx.identity_hash_code(this)` (i32), NOT by `this.as_ptr() as usize`.
+// CratonVM ships a moving GC; a raw heap-pointer key is stale after a
+// compaction, and a fresh object allocated at the old address silently
+// inherits the previous LinkedList's head/tail/size. The identity hash is
+// stable across GC moves — the GC copies the hash word along with the
+// object header — so the overlay entry continues to map to the correct
+// list across collections. Mirrors the CHM resize-stripe fix at the top
+// of this file.
+fn ll_overlay() -> &'static Mutex<StdHashMap<i32, StdHashMap<&'static str, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<i32, StdHashMap<&'static str, Value>>>> =
         std::sync::OnceLock::new();
     OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
-fn ll_get(this: ObjectRef, name: &'static str) -> Value {
+fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
+    let key = ctx.identity_hash_code(this);
     ll_overlay()
         .lock()
         .unwrap()
-        .get(&(this.as_ptr() as usize))
+        .get(&key)
         .and_then(|m| m.get(name))
         .copied()
         .unwrap_or(Value::Object(None))
 }
-fn ll_set(this: ObjectRef, name: &'static str, v: Value) {
+fn ll_set(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str, v: Value) {
+    let key = ctx.identity_hash_code(this);
     ll_overlay()
         .lock()
         .unwrap()
-        .entry(this.as_ptr() as usize)
+        .entry(key)
         .or_default()
         .insert(name, v);
 }
@@ -10178,7 +10190,7 @@ fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
 }
 
 fn ll_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ll_get(this, "size") {
+    match ll_get(ctx, this, "size") {
         Value::Int(n) => n,
         _ => 0,
     }
@@ -10285,7 +10297,7 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     let size = ll_size(ctx, this) as usize;
     let arr = alloc_ref_array(ctx, size);
-    let mut cur = match ll_get(this, "head") {
+    let mut cur = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -10493,39 +10505,39 @@ fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ll_set(this, "head", Value::Object(None));
-    ll_set(this, "tail", Value::Object(None));
-    ll_set(this, "size", Value::Int(0));
+    ll_set(ctx, this, "head", Value::Object(None));
+    ll_set(ctx, this, "tail", Value::Object(None));
+    ll_set(ctx, this, "size", Value::Int(0));
     Ok(None)
 }
 
 fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(tail)) = ll_get(this, "tail") {
+    if let Value::Object(Some(tail)) = ll_get(ctx, this, "tail") {
         ctx.set_field(tail, LL_NODE_NEXT, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_PREV, Value::Object(Some(tail)));
-        ll_set(this, "tail", Value::Object(Some(node)));
+        ll_set(ctx, this, "tail", Value::Object(Some(node)));
     } else {
         // Empty list
-        ll_set(this, "head", Value::Object(Some(node)));
-        ll_set(this, "tail", Value::Object(Some(node)));
+        ll_set(ctx, this, "head", Value::Object(Some(node)));
+        ll_set(ctx, this, "tail", Value::Object(Some(node)));
     }
-    ll_set(this, "size", Value::Int(size + 1));
+    ll_set(ctx, this, "size", Value::Int(size + 1));
 }
 
 fn ll_link_first(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(head)) = ll_get(this, "head") {
+    if let Value::Object(Some(head)) = ll_get(ctx, this, "head") {
         ctx.set_field(head, LL_NODE_PREV, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(head)));
-        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(ctx, this, "head", Value::Object(Some(node)));
     } else {
-        ll_set(this, "head", Value::Object(Some(node)));
-        ll_set(this, "tail", Value::Object(Some(node)));
+        ll_set(ctx, this, "head", Value::Object(Some(node)));
+        ll_set(ctx, this, "tail", Value::Object(Some(node)));
     }
-    ll_set(this, "size", Value::Int(size + 1));
+    ll_set(ctx, this, "size", Value::Int(size + 1));
 }
 
 fn native_ll_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10574,11 +10586,11 @@ fn ll_link_before(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value, 
         }
         _ => {
             // succ was the head — node becomes the new head.
-            ll_set(this, "head", Value::Object(Some(node)));
+            ll_set(ctx, this, "head", Value::Object(Some(node)));
         }
     }
     let size = ll_size(ctx, this);
-    ll_set(this, "size", Value::Int(size + 1));
+    ll_set(ctx, this, "size", Value::Int(size + 1));
 }
 
 /// Unlink a live node, returning its element. Mirrors `LinkedList.unlink`.
@@ -10592,7 +10604,7 @@ fn ll_unlink_node(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef)
         }
         _ => {
             // node was the head.
-            ll_set(this, "head", next);
+            ll_set(ctx, this, "head", next);
         }
     }
     match next {
@@ -10601,11 +10613,11 @@ fn ll_unlink_node(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef)
         }
         _ => {
             // node was the tail.
-            ll_set(this, "tail", prev);
+            ll_set(ctx, this, "tail", prev);
         }
     }
     let size = ll_size(ctx, this);
-    ll_set(this, "size", Value::Int((size - 1).max(0)));
+    ll_set(ctx, this, "size", Value::Int((size - 1).max(0)));
     element
 }
 
@@ -10669,7 +10681,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
     }
     if index < size / 2 {
         // Traverse from head
-        let mut cur = match ll_get(this, "head") {
+        let mut cur = match ll_get(ctx, this, "head") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -10682,7 +10694,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
         Some(cur)
     } else {
         // Traverse from tail
-        let mut cur = match ll_get(this, "tail") {
+        let mut cur = match ll_get(ctx, this, "tail") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -10721,7 +10733,7 @@ fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
-    match ll_get(this, "head") {
+    match ll_get(ctx, this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -10740,7 +10752,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    match ll_get(this, "tail") {
+    match ll_get(ctx, this, "tail") {
         Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, LL_NODE_ELEM))),
         _ => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -10750,7 +10762,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let head = match ll_get(this, "head") {
+    let head = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -10760,19 +10772,19 @@ fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match next {
         Value::Object(Some(next_node)) => {
             ctx.set_field(next_node, LL_NODE_PREV, Value::Object(None));
-            ll_set(this, "head", Value::Object(Some(next_node)));
+            ll_set(ctx, this, "head", Value::Object(Some(next_node)));
         }
         _ => {
-            ll_set(this, "head", Value::Object(None));
-            ll_set(this, "tail", Value::Object(None));
+            ll_set(ctx, this, "head", Value::Object(None));
+            ll_set(ctx, this, "tail", Value::Object(None));
         }
     }
-    ll_set(this, "size", Value::Int(size - 1));
+    ll_set(ctx, this, "size", Value::Int(size - 1));
     element
 }
 
 fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let tail = match ll_get(this, "tail") {
+    let tail = match ll_get(ctx, this, "tail") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -10782,14 +10794,14 @@ fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match prev {
         Value::Object(Some(prev_node)) => {
             ctx.set_field(prev_node, LL_NODE_NEXT, Value::Object(None));
-            ll_set(this, "tail", Value::Object(Some(prev_node)));
+            ll_set(ctx, this, "tail", Value::Object(Some(prev_node)));
         }
         _ => {
-            ll_set(this, "head", Value::Object(None));
-            ll_set(this, "tail", Value::Object(None));
+            ll_set(ctx, this, "head", Value::Object(None));
+            ll_set(ctx, this, "tail", Value::Object(None));
         }
     }
-    ll_set(this, "size", Value::Int(size - 1));
+    ll_set(ctx, this, "size", Value::Int(size - 1));
     element
 }
 
@@ -10857,7 +10869,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ll_get(this, "head") {
+    let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -10879,9 +10891,9 @@ fn native_ll_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ll_set(this, "head", Value::Object(None));
-    ll_set(this, "tail", Value::Object(None));
-    ll_set(this, "size", Value::Int(0));
+    ll_set(ctx, this, "head", Value::Object(None));
+    ll_set(ctx, this, "tail", Value::Object(None));
+    ll_set(ctx, this, "size", Value::Int(0));
     Ok(None)
 }
 
@@ -10890,7 +10902,7 @@ fn native_ll_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    match ll_get(this, "head") {
+    match ll_get(ctx, this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Ok(Some(Value::Object(None))),
     }
@@ -10917,7 +10929,7 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let size = ll_size(ctx, this) as usize;
     let arr = alloc_ref_array(ctx, size);
-    let mut cur_opt = match ll_get(this, "head") {
+    let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -10960,7 +10972,7 @@ fn native_ll_to_array_typed(
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
         _ => alloc_ref_array(ctx, size),
     };
-    let mut cur_opt = match ll_get(this, "head") {
+    let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -10996,7 +11008,7 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this) as usize;
     let mut parts = Vec::with_capacity(size);
-    let mut cur_opt = match ll_get(this, "head") {
+    let mut cur_opt = match ll_get(ctx, this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -11019,7 +11031,7 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let head = ll_get(this, "head");
+    let head = ll_get(ctx, this, "head");
     let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3);
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
@@ -11140,26 +11152,38 @@ const LHM_FIELD_TAIL: usize = 4;
 //
 // IMPORTANT: this is a per-object overlay; iteration helpers continue to walk
 // the synthetic linked-list pointers, which now live in the side-table too.
+//
+// GC-stability invariant (C21 fix): the overlay is keyed by
+// `ctx.identity_hash_code(this)` (i32), NOT by `this.as_ptr() as usize`.
+// CratonVM's moving GC relocates objects during compaction, so a raw heap
+// pointer is unstable across collections — and a fresh allocation at the
+// old address would silently inherit the previous LinkedHashMap's
+// buckets/head/tail/size. The identity hash word is preserved across GC
+// moves (copied along with the object header), so the overlay key remains
+// valid for the lifetime of the object. Mirrors the CHM resize-stripe fix
+// at the top of this file.
 use std::sync::Mutex;
 use std::collections::HashMap as StdHashMap;
-fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>> {
-    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<String, Value>>>> =
+fn lhm_overlay() -> &'static Mutex<StdHashMap<i32, StdHashMap<String, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<i32, StdHashMap<String, Value>>>> =
         std::sync::OnceLock::new();
     OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
-fn lhm_overlay_key(this: ObjectRef) -> usize {
-    this.as_ptr() as usize
+fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
 }
-fn lhm_get(_ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
+fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
+    let key = lhm_overlay_key(ctx, this);
     let m = lhm_overlay().lock().unwrap();
-    m.get(&lhm_overlay_key(this))
+    m.get(&key)
         .and_then(|inner| inner.get(name))
         .copied()
         .unwrap_or(Value::Object(None))
 }
-fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
+fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
+    let key = lhm_overlay_key(ctx, this);
     let mut m = lhm_overlay().lock().unwrap();
-    m.entry(lhm_overlay_key(this))
+    m.entry(key)
         .or_default()
         .insert(name.to_string(), v);
 }
@@ -11170,11 +11194,19 @@ fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback:
 /// fields. Without this, `lhm.clone()` returns an LHM with all state
 /// missing and downstream `HashMap.clone()` bytecode walks an empty
 /// receiver.
-pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
+///
+/// GC-stability invariant (C21 fix): `src` and `dst` are translated into
+/// the overlay key space via `ctx.identity_hash_code`, NOT raw pointer
+/// casts. The identity hash word is preserved by the moving GC during
+/// compaction, so this remains correct across collections even if the
+/// clone is taken straight before a major GC fires.
+pub fn clone_lhm_overlay(ctx: &dyn NativeContext, src: ObjectRef, dst: ObjectRef) {
+    let src_key = ctx.identity_hash_code(src);
+    let dst_key = ctx.identity_hash_code(dst);
     let mut m = lhm_overlay().lock().unwrap();
-    let src_state = m.get(&lhm_overlay_key(src)).cloned();
+    let src_state = m.get(&src_key).cloned();
     if let Some(s) = src_state {
-        m.insert(lhm_overlay_key(dst), s);
+        m.insert(dst_key, s);
     }
 }
 
@@ -13714,24 +13746,38 @@ fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
     }
 }
 
-/// Per-TreeMap fast-mode side-table. The outer key is the synthetic
-/// receiver's address; the inner BTreeMap is the authoritative store
-/// for fast-mode maps (mirroring is avoided — when fast mode is active,
-/// the array slot is left empty and we read from the BTreeMap).
-fn tm_fast_table() -> &'static Mutex<StdHashMap<usize, std::collections::BTreeMap<TreeKey, Value>>>
+/// Per-TreeMap fast-mode side-table. The outer key is the receiver's
+/// identity hash code (i32); the inner BTreeMap is the authoritative
+/// store for fast-mode maps (mirroring is avoided — when fast mode is
+/// active, the array slot is left empty and we read from the BTreeMap).
+///
+/// GC-stability invariant (C21 fix): the key is `ctx.identity_hash_code(this)`,
+/// NOT `this.as_ptr() as usize`. CratonVM's moving GC relocates objects
+/// during compaction, so a raw heap-pointer key is stale across
+/// collections and a fresh allocation at the old address would silently
+/// inherit the previous TreeMap's BTreeMap contents. The identity hash
+/// is preserved across GC moves. Mirrors the CHM resize-stripe fix at
+/// the top of this file.
+fn tm_fast_table() -> &'static Mutex<StdHashMap<i32, std::collections::BTreeMap<TreeKey, Value>>>
 {
     static T: std::sync::OnceLock<
-        Mutex<StdHashMap<usize, std::collections::BTreeMap<TreeKey, Value>>>,
+        Mutex<StdHashMap<i32, std::collections::BTreeMap<TreeKey, Value>>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-fn tm_obj_key(this: ObjectRef) -> usize {
-    this.as_ptr() as usize
+/// Derive the side-table key for `this`. C21: returns the identity hash
+/// code rather than the raw heap pointer so the key is stable across GC
+/// compactions. Shared by `tm_fast_table`, `tm_array_table`,
+/// `tm_force_array_set`, and `ts_array_table` (TreeSet reuses
+/// `tm_obj_key` to keep the GC invariant uniform across the Tree*
+/// families).
+fn tm_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
 }
 
-/// Address-keyed TreeMap array-mode state side-table — `(data array, size,
-/// comparator)` keyed by the receiver's address.
+/// Identity-keyed TreeMap array-mode state side-table — `(data array,
+/// size, comparator)` keyed by the receiver's identity hash code.
 ///
 /// Why a side-table instead of object fields: in real-JDK mode `TreeMap`
 /// instances have the *real* JDK field layout (`comparator`, `root`,
@@ -13739,8 +13785,12 @@ fn tm_obj_key(this: ObjectRef) -> usize {
 /// extends TreeMap` add their own fields on top. Writing to the synthetic
 /// slots 0/1/2 lands in unrelated real fields — silently losing the data
 /// array and size, and (worse) writing an `Int` into a reference slot
-/// corrupts the heap for the GC. Keying state by the object's address is
-/// layout-independent and works for arbitrary subclasses.
+/// corrupts the heap for the GC.
+///
+/// GC-stability invariant (C21 fix): the key was previously the raw
+/// `this.as_ptr() as usize`, which a moving GC could invalidate. It is
+/// now the identity hash code (`ctx.identity_hash_code(this)`), which is
+/// preserved by the GC's object header during compaction.
 #[derive(Clone)]
 struct TmArrayState {
     data: Option<ObjectRef>,
@@ -13756,18 +13806,19 @@ impl Default for TmArrayState {
         }
     }
 }
-fn tm_array_table() -> &'static Mutex<StdHashMap<usize, TmArrayState>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TmArrayState>>> =
+fn tm_array_table() -> &'static Mutex<StdHashMap<i32, TmArrayState>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<i32, TmArrayState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
 /// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
-/// address-keyed side-table. Returns layout-independent defaults when no
+/// identity-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet. The object's own fields are never consulted.
-fn tm_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    let key = tm_obj_key(ctx, this);
     let tbl = tm_array_table().lock().unwrap();
-    if let Some(st) = tbl.get(&tm_obj_key(this)) {
+    if let Some(st) = tbl.get(&key) {
         return match slot {
             TM_FIELD_DATA => Value::Object(st.data),
             TM_FIELD_SIZE => Value::Int(st.size),
@@ -13781,12 +13832,13 @@ fn tm_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value 
     }
 }
 
-/// Write a TreeMap "slot" into the address-keyed side-table (creating the
-/// entry on first write). The object's own fields are never touched — the
-/// side-table is the sole authoritative store (see `TmArrayState`).
-fn tm_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+/// Write a TreeMap "slot" into the identity-keyed side-table (creating
+/// the entry on first write). The object's own fields are never touched
+/// — the side-table is the sole authoritative store (see `TmArrayState`).
+fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+    let key = tm_obj_key(ctx, this);
     let mut tbl = tm_array_table().lock().unwrap();
-    let st = tbl.entry(tm_obj_key(this)).or_default();
+    let st = tbl.entry(key).or_default();
     match slot {
         TM_FIELD_DATA => {
             st.data = match v {
@@ -13813,8 +13865,9 @@ fn tm_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Va
 ///
 /// Empty TreeMaps with null comparator are tentatively "fast-eligible" —
 /// the first non-extractable key flips them to array mode.
-fn tm_is_fast_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    tm_fast_table().lock().unwrap().contains_key(&tm_obj_key(this))
+fn tm_is_fast_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = tm_obj_key(ctx, this);
+    tm_fast_table().lock().unwrap().contains_key(&key)
 }
 
 /// True if the comparator slot is null. Custom Comparator forces array mode
@@ -13825,28 +13878,34 @@ fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 
 /// Borrow the fast-mode BTreeMap mutably and call `f`. Creates the entry
 /// if missing. Caller must ensure they only invoke this when fast mode
-/// is applicable (no comparator, etc.).
+/// is applicable (no comparator, etc.). `ctx` is needed to derive the
+/// GC-stable identity-hash key (see `tm_obj_key`).
 fn tm_fast_with<R>(
+    ctx: &dyn NativeContext,
     this: ObjectRef,
     f: impl FnOnce(&mut std::collections::BTreeMap<TreeKey, Value>) -> R,
 ) -> R {
+    let key = tm_obj_key(ctx, this);
     let mut map = tm_fast_table().lock().unwrap();
-    let bt = map.entry(tm_obj_key(this)).or_default();
+    let bt = map.entry(key).or_default();
     f(bt)
 }
 
 /// "Sticky" flag side-table — once a TreeMap is forced to array mode
 /// (e.g. by a non-extractable key) it stays there for its lifetime so
-/// we never split state across both stores.
-fn tm_force_array_set() -> &'static Mutex<StdHashMap<usize, ()>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, ()>>> = std::sync::OnceLock::new();
+/// we never split state across both stores. C21: keyed by identity hash
+/// for GC stability, like the other Tree* side-tables.
+fn tm_force_array_set() -> &'static Mutex<StdHashMap<i32, ()>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<i32, ()>>> = std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
-fn tm_force_array_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    tm_force_array_set().lock().unwrap().contains_key(&tm_obj_key(this))
+fn tm_force_array_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = tm_obj_key(ctx, this);
+    tm_force_array_set().lock().unwrap().contains_key(&key)
 }
-fn tm_set_force_array(_ctx: &dyn NativeContext, this: ObjectRef) {
-    tm_force_array_set().lock().unwrap().insert(tm_obj_key(this), ());
+fn tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
+    let key = tm_obj_key(ctx, this);
+    tm_force_array_set().lock().unwrap().insert(key, ());
 }
 
 /// Migrate any fast-mode entries to the array store, then remove the
@@ -13855,10 +13914,11 @@ fn tm_set_force_array(_ctx: &dyn NativeContext, this: ObjectRef) {
 /// across the mode flip without losing data.
 fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // Snapshot fast-mode entries first, then drop the side-table entry.
-    let entries: Vec<(TreeKey, Value)> = tm_fast_with(this, |bt| {
+    let entries: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
         bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
     });
-    tm_fast_table().lock().unwrap().remove(&tm_obj_key(this));
+    let key = tm_obj_key(ctx, this);
+    tm_fast_table().lock().unwrap().remove(&key);
     if entries.is_empty() {
         return;
     }
@@ -13926,11 +13986,20 @@ const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
 const TS_NUM_FIELDS: usize = 3;
 const TS_DEFAULT_CAPACITY: usize = 16;
 
-/// Address-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
+/// Identity-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
 /// real-JDK mode `java.util.TreeSet` (and any subclass) has the real JDK
 /// field layout, so the synthetic slots 0/1/2 do not exist. All state —
 /// backing data array, size, comparator — lives here, keyed by the
-/// receiver's address, so it is layout-independent.
+/// receiver's identity hash code, so it is both layout-independent and
+/// stable across GC compactions.
+///
+/// GC-stability invariant (C21 fix): the outer key is
+/// `ctx.identity_hash_code(this)` (via `tm_obj_key`), not
+/// `this.as_ptr() as usize`. A moving GC could otherwise invalidate the
+/// raw-pointer key after a compaction, and a fresh allocation at the old
+/// address would silently inherit the previous TreeSet's data array and
+/// size. Reusing `tm_obj_key` keeps the GC invariant uniform across the
+/// Tree* families.
 #[derive(Clone)]
 struct TsArrayState {
     data: Option<ObjectRef>,
@@ -13946,18 +14015,19 @@ impl Default for TsArrayState {
         }
     }
 }
-fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TsArrayState>>> =
+fn ts_array_table() -> &'static Mutex<StdHashMap<i32, TsArrayState>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<i32, TsArrayState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
 /// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
-/// address-keyed side-table. Returns layout-independent defaults when no
+/// identity-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet.
-fn ts_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+fn ts_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    let key = tm_obj_key(ctx, this);
     let tbl = ts_array_table().lock().unwrap();
-    if let Some(st) = tbl.get(&tm_obj_key(this)) {
+    if let Some(st) = tbl.get(&key) {
         return match slot {
             TS_FIELD_DATA => Value::Object(st.data),
             TS_FIELD_SIZE => Value::Int(st.size),
@@ -13971,11 +14041,12 @@ fn ts_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value 
     }
 }
 
-/// Write a TreeSet "slot" into the address-keyed side-table. The object's
-/// own fields are never touched (see `tm_set_slot`).
-fn ts_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+/// Write a TreeSet "slot" into the identity-keyed side-table. The
+/// object's own fields are never touched (see `tm_set_slot`).
+fn ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
+    let key = tm_obj_key(ctx, this);
     let mut tbl = ts_array_table().lock().unwrap();
-    let st = tbl.entry(tm_obj_key(this)).or_default();
+    let st = tbl.entry(key).or_default();
     match slot {
         TS_FIELD_DATA => {
             st.data = match v {
@@ -14235,7 +14306,7 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             let already_in_array = matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
                 && !tm_is_fast_mode(ctx, this);
             if !already_in_array {
-                let (old, new_size) = tm_fast_with(this, |bt| {
+                let (old, new_size) = tm_fast_with(ctx, this, |bt| {
                     let old = bt.insert(tk, value).unwrap_or(Value::Object(None));
                     (old, bt.len() as i32)
                 });
@@ -14288,7 +14359,7 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let v = tm_fast_with(this, |bt| bt.get(&tk).copied().unwrap_or(Value::Object(None)));
+            let v = tm_fast_with(ctx, this, |bt| bt.get(&tk).copied().unwrap_or(Value::Object(None)));
             return Ok(Some(v));
         }
         // Fast-mode map asked for a non-extractable key → not present.
@@ -14313,7 +14384,7 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let (old, new_size) = tm_fast_with(this, |bt| {
+            let (old, new_size) = tm_fast_with(ctx, this, |bt| {
                 let old = bt.remove(&tk).unwrap_or(Value::Object(None));
                 (old, bt.len() as i32)
             });
@@ -14346,7 +14417,7 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let found = tm_fast_with(this, |bt| bt.contains_key(&tk));
+            let found = tm_fast_with(ctx, this, |bt| bt.contains_key(&tk));
             return Ok(Some(Value::Int(i32::from(found))));
         }
         return Ok(Some(Value::Int(0)));
@@ -14367,7 +14438,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
-        let values: Vec<Value> = tm_fast_with(this, |bt| bt.values().copied().collect());
+        let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
         for v in values {
             if values_equal(ctx, &v, &target) {
                 return Ok(Some(Value::Int(1)));
@@ -14420,7 +14491,7 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     // Fast-mode side-table needs clearing too — without this an iter
     // helper would return stale entries from before the clear.
-    tm_fast_with(this, |bt| bt.clear());
+    tm_fast_with(ctx, this, |bt| bt.clear());
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
@@ -14438,7 +14509,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     if tm_is_fast_mode(ctx, this) {
-        let first = tm_fast_with(this, |bt| bt.keys().next().cloned());
+        let first = tm_fast_with(ctx, this, |bt| bt.keys().next().cloned());
         match first {
             Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
             None => {
@@ -14471,7 +14542,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     };
     if tm_is_fast_mode(ctx, this) {
-        let last = tm_fast_with(this, |bt| bt.keys().next_back().cloned());
+        let last = tm_fast_with(ctx, this, |bt| bt.keys().next_back().cloned());
         match last {
             Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
             None => {
@@ -14502,7 +14573,7 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let res = tm_fast_with(this, |bt| bt.range(tk..).next().map(|(k, _)| k.clone()));
+            let res = tm_fast_with(ctx, this, |bt| bt.range(tk..).next().map(|(k, _)| k.clone()));
             return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
         }
         return Ok(Some(Value::Object(None)));
@@ -14533,7 +14604,7 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let res = tm_fast_with(this, |bt| {
+            let res = tm_fast_with(ctx, this, |bt| {
                 bt.range(..=tk).next_back().map(|(k, _)| k.clone())
             });
             return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
@@ -14567,7 +14638,7 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             use std::ops::Bound;
-            let res = tm_fast_with(this, |bt| {
+            let res = tm_fast_with(ctx, this, |bt| {
                 bt.range((Bound::Excluded(tk), Bound::Unbounded))
                     .next()
                     .map(|(k, _)| k.clone())
@@ -14610,7 +14681,7 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             use std::ops::Bound;
-            let res = tm_fast_with(this, |bt| {
+            let res = tm_fast_with(ctx, this, |bt| {
                 bt.range((Bound::Unbounded, Bound::Excluded(tk)))
                     .next_back()
                     .map(|(k, _)| k.clone())
@@ -14655,7 +14726,7 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let first = tm_fast_with(this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
+        let first = tm_fast_with(ctx, this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
         match first {
             Some((tk, v)) => {
                 let k = tree_key_to_value(ctx, &tk);
@@ -14682,7 +14753,7 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let last = tm_fast_with(this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
+        let last = tm_fast_with(ctx, this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
         match last {
             Some((tk, v)) => {
                 let k = tree_key_to_value(ctx, &tk);
@@ -14710,7 +14781,7 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let removed = tm_fast_with(this, |bt| {
+        let removed = tm_fast_with(ctx, this, |bt| {
             let first = bt.iter().next().map(|(k, _)| k.clone())?;
             let v = bt.remove(&first)?;
             Some((first, v, bt.len() as i32))
@@ -14744,7 +14815,7 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let removed = tm_fast_with(this, |bt| {
+        let removed = tm_fast_with(ctx, this, |bt| {
             let last = bt.iter().next_back().map(|(k, _)| k.clone())?;
             let v = bt.remove(&last)?;
             Some((last, v, bt.len() as i32))
@@ -14798,7 +14869,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// releasing the side-table lock (boxing may re-enter the VM).
 fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
     if tm_is_fast_mode(ctx, this) {
-        let raw: Vec<(TreeKey, Value)> = tm_fast_with(this, |bt| {
+        let raw: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
             bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
         });
         raw.into_iter()
@@ -14889,7 +14960,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let v = tm_fast_with(this, |bt| bt.get(&tk).copied());
+            let v = tm_fast_with(ctx, this, |bt| bt.get(&tk).copied());
             return Ok(Some(v.unwrap_or(default)));
         }
         return Ok(Some(default));
@@ -14918,7 +14989,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             let already_in_array = matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
                 && !tm_is_fast_mode(ctx, this);
             if !already_in_array {
-                let (existing, new_size) = tm_fast_with(this, |bt| {
+                let (existing, new_size) = tm_fast_with(ctx, this, |bt| {
                     use std::collections::btree_map::Entry;
                     match bt.entry(tk) {
                         Entry::Occupied(o) => (Some(*o.get()), bt.len() as i32),
