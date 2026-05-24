@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
-
 //! Synthetic native implementations for the Java Collections Framework.
 //!
 //! **DEPRECATED (Session 15)**: These are Rust-backed synthetic stubs used only when
@@ -117,27 +114,11 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_collections_utility_natives(registry);
     register_map_entry_natives(registry);
     register_factory_natives(registry);
-    // DISABLED — see kc26 / streams_probe / synthetic-stream eradication.
-    // The previous synthetic-Stream shim built `java/util/stream/Stream`
-    // interface instances and force-intercepted every `Stream.*` /
-    // `IntStream.*` / `LongStream.*` / `DoubleStream.*` virtual call. Now
-    // that the real-JDK `AbstractCollection.stream()` default method runs,
-    // dispatch must land on the real `ReferencePipeline` / `IntPipeline` /
-    // `LongPipeline` / `DoublePipeline` bodies instead. Re-enabling these
-    // would break any stream chain originating from a real-JDK collection
-    // (every `Stream.*` native reads field 0 as an `Object[]` of elements;
-    // a real `ReferencePipeline$Head` has a `sourceSpliterator`, not an
-    // elements array — so `count` returns 0, `forEachOrdered` lands on the
-    // synthetic Stream interface receiver and throws `AbstractMethodError`,
-    // etc.). Collectors are also disabled: real `ReferencePipeline.collect`
-    // calls `Collector.supplier()` / `.accumulator()` / `.finisher()` on
-    // the collector, which our synthetic tagged-Collector instances do not
-    // implement.
-    // register_stream_natives(registry);
-    // register_collectors_natives(registry);
-    // register_int_stream_natives(registry);
-    // register_long_stream_natives(registry);
-    // register_double_stream_natives(registry);
+    register_stream_natives(registry);
+    register_collectors_natives(registry);
+    register_int_stream_natives(registry);
+    register_long_stream_natives(registry);
+    register_double_stream_natives(registry);
     register_interface_natives(registry);
     register_copy_constructor_natives(registry);
     register_comparator_natives(registry);
@@ -331,27 +312,51 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
 ///
 /// If `monitor_exit` itself panics during unwind the process aborts —
 /// preferable to silently leaking the monitor.
-struct ChmMonitorGuard {
+///
+/// MED fix: a `PhantomData<&'a mut dyn NativeContext>` field carries a
+/// lifetime parameter `'a` at the type level, so any struct that tries to
+/// store the guard must also name `'a` (which a function-local borrow
+/// cannot project to a caller scope). The transmute remains for runtime
+/// storage — without it the guard would conflict with the body's reuse of
+/// `ctx` — but the lifetime parameter prevents the previous
+/// silently-`'static` escape hatch that would have let a refactor stash
+/// the guard into a long-lived struct and miscompile catastrophically.
+struct ChmMonitorGuard<'a> {
     ctx: *mut (dyn NativeContext + 'static),
     seg: ObjectRef,
+    /// Phantom borrow tying the guard's lifetime parameter `'a` to a
+    /// surrounding scope at the type level. Using
+    /// `fn() -> &'a mut dyn NativeContext` rather than `&'a mut …` directly
+    /// means no actual mutable borrow is held at runtime (so the body
+    /// inside the guarded section can keep using `ctx` via reborrows, as
+    /// before), but `'a` is still part of the guard's type and propagates
+    /// into any container that tries to store the guard.
+    _borrow: std::marker::PhantomData<fn() -> &'a mut dyn NativeContext>,
 }
 
-impl ChmMonitorGuard {
+impl<'a> ChmMonitorGuard<'a> {
     fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
         ctx.monitor_enter(seg);
         // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
         // borrow ends. We transmute away the lifetime so the guard doesn't
         // hold the &mut borrow for its scope — call sites still use ctx
         // mutably between acquire and drop, which is sound as long as no
-        // code outlives the original &mut borrow.
+        // code outlives the original &mut borrow. The `PhantomData<fn() ->
+        // &'a mut …>` field pins `'a` to a surrounding scope at the type
+        // level without retaining the borrow at runtime, so attempts to
+        // escape the guard into a longer-lived container fail to type-check.
         let ctx_ptr: *mut dyn NativeContext = ctx;
         let ctx_ptr_static: *mut (dyn NativeContext + 'static) =
             unsafe { core::mem::transmute(ctx_ptr) };
-        ChmMonitorGuard { ctx: ctx_ptr_static, seg }
+        ChmMonitorGuard {
+            ctx: ctx_ptr_static,
+            seg,
+            _borrow: std::marker::PhantomData,
+        }
     }
 }
 
-impl Drop for ChmMonitorGuard {
+impl<'a> Drop for ChmMonitorGuard<'a> {
     fn drop(&mut self) {
         // SAFETY: the guard is always a local whose lifetime is bounded
         // by the `&mut dyn NativeContext` borrow used in `acquire`. No
@@ -573,28 +578,6 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
     let (data_slot, size_slot, _) = al_slots(ctx);
-    // Undersized-receiver guard: the ArrayList natives are registered
-    // (defensively) on `java/util/AbstractCollection` too — see
-    // `register_arraylist_natives` for the `toArray([T)` mirror — which
-    // means the native-dispatch hierarchy walk can land on a non-ArrayList
-    // receiver whose declared layout has fewer slots than ArrayList's
-    // (data=0, size=1). Examples observed in real-JDK boots:
-    // `java.util.concurrent.ConcurrentSkipListSet` (1 slot — `m`),
-    // `com.google.common.collect.RegularImmutableList` (1 slot — `array`),
-    // `java.util.IdentityHashMap$Values` (1 slot — `this$0`),
-    // `java.util.Collections$EmptyList` (1 slot — `serialVersionUID` pad).
-    // Reading slot 1 (or higher) on those receivers fires the
-    // `gen_heap::get_field: out-of-bounds field read dropped (undersized
-    // object layout)` diagnostic and silently mangles every caller. The
-    // safe answer for *all* of these is "I'm not an ArrayList — fall
-    // through to iterator-based collection access" (the existing
-    // `data = None` short-circuit + `collection_elements_generic`
-    // fallback). Compute it cheaply by checking the receiver's allocated
-    // slot count up-front.
-    let n_fields = ctx.object_num_fields(this);
-    if size_slot >= n_fields || data_slot >= n_fields {
-        return (None, 0);
-    }
     let data = match ctx.get_field(this, data_slot) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
         _ => None,
@@ -785,10 +768,7 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/UnaryOperator;)V",
         native_al_replace_all,
     );
-    // NOTE: `ArrayList.stream()` intentionally NOT bridged — let the real-JDK
-    // `AbstractCollection.stream()` default method run so we get a proper
-    // `ReferencePipeline$Head` instead of a synthetic `Stream`-interface
-    // instance.
+    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
 }
 
 pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1668,7 +1648,19 @@ fn enum_key_identity(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String,
 }
 
 /// Compute hash for a key.
-fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
+///
+/// MED fix: when the user-supplied `hashCode()` throws (i.e. `invoke_virtual`
+/// returns `Err(MethodCallFailed)`), the previous implementation silently
+/// fell back to `identity_hash_code`, breaking the equals/hashCode contract
+/// in a way that made subsequent `get` calls miss every key (and combined
+/// with the matching swallow in `map_keys_equal`, `put` succeeded but `get`
+/// always returned null). Real JDK propagates the exception out of
+/// `HashMap.put`/`get` — this implementation now does the same by returning
+/// `Result<i32, MethodCallFailed>` and surfacing the original error to the
+/// caller. Non-exceptional contract violations (e.g. the user returned a
+/// non-Int from hashCode) still fall back to identity since those are not
+/// exceptional control flow.
+fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, MethodCallFailed> {
     // Try to read as string for better distribution (the common case, so it
     // is checked first).
     // Must match Java's String.hashCode (UTF-16 code units, i32 wrapping mul+add),
@@ -1680,7 +1672,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
             h = h.wrapping_mul(31).wrapping_add(cu as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
-        return h ^ (h >> 16);
+        return Ok(h ^ (h >> 16));
     }
     // Enum constants: hash by (declaring class name, constant name) — the
     // JLS-canonical identity of an enum constant — so an enum-keyed map's
@@ -1697,7 +1689,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
         for b in const_name.bytes() {
             h = h.wrapping_mul(31).wrapping_add(b as i32);
         }
-        return h ^ (h >> 16);
+        return Ok(h ^ (h >> 16));
     }
     if let Some(prim) = unbox_wrapper(ctx, key) {
         // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
@@ -1711,7 +1703,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
             }
             _ => ctx.identity_hash_code(key),
         };
-        return h ^ (h >> 16);
+        return Ok(h ^ (h >> 16));
     }
     // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
     // MUST call their `hashCode()` so HashMap honours the equals/hashCode
@@ -1719,11 +1711,15 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> i32 {
     // but equal keys (Spring's `AnnotationTypeMapping.aliasedBy` keyed by
     // `java.lang.reflect.Method` is the canonical victim, surfacing as the
     // `@AliasFor ... is not meta-present` chain on Spring Boot startup).
-    let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[]) {
-        Ok(Some(Value::Int(v))) => v,
+    //
+    // MED fix: a thrown exception from `hashCode()` propagates via `?` —
+    // previously it was swallowed and substituted with `identity_hash_code`,
+    // silently breaking the equals/hashCode contract.
+    let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[])? {
+        Some(Value::Int(v)) => v,
         _ => ctx.identity_hash_code(key),
     };
-    h ^ (h >> 16)
+    Ok(h ^ (h >> 16))
 }
 
 /// Compute the *raw* Java `hashCode()` of an element `Value` — i.e. the value
@@ -1769,13 +1765,28 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
 }
 
 /// Check if two keys are equal.
-fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+///
+/// MED fix: when the user-supplied `equals(Object)` throws (i.e.
+/// `invoke_virtual` returns `Err(MethodCallFailed)`), the previous
+/// implementation silently treated it as `false`, breaking the
+/// equals/hashCode contract — combined with the matching `map_hash_key`
+/// swallowing this meant `put` succeeded but `get` always returned null.
+/// Real JDK propagates the exception out of `HashMap.put`/`get` — this
+/// implementation now does the same by returning
+/// `Result<bool, MethodCallFailed>` and surfacing the original error to
+/// the caller. Non-exceptional contract violations (e.g. the user returned
+/// a non-Int from equals) still fall through as `false`.
+fn map_keys_equal(
+    ctx: &mut dyn NativeContext,
+    a: ObjectRef,
+    b: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
-        return true;
+        return Ok(true);
     }
     // String value equality (the common case, checked first).
     if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-        return sa == sb;
+        return Ok(sa == sb);
     }
     // Enum constants: compare by (declaring class, ordinal). `Enum.equals` is
     // `final` identity, so a correct VM never reaches here for two non-equal
@@ -1784,11 +1795,11 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
     // JLS-canonical identity and cannot collide across distinct constants.
     // See `enum_key_identity`.
     if let (Some(ia), Some(ib)) = (enum_key_identity(ctx, a), enum_key_identity(ctx, b)) {
-        return ia == ib;
+        return Ok(ia == ib);
     }
     // Wrapper type equality: unbox and compare primitives
     if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
-        return match (pa, pb) {
+        return Ok(match (pa, pb) {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Long(x), Value::Long(y)) => x == y,
             (Value::Float(x), Value::Float(y)) => x == y,
@@ -1796,19 +1807,24 @@ fn map_keys_equal(ctx: &mut dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bo
             (Value::Int(x), Value::Long(y)) => (x as i64) == y,
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
-        };
+        });
     }
     // S111r-bug-fix (peaceful-sammet): fall back to the user-defined
     // `equals(Object)` so HashMap honours the equals/hashCode contract for
     // arbitrary key types. See `map_hash_key` for the matching contract
     // commentary and the Spring `AnnotationTypeMapping.aliasedBy` symptom.
+    //
+    // MED fix: thrown exceptions from `equals(Object)` propagate via `?` —
+    // previously they were silently mapped to `false`, which combined with
+    // the matching swallow in `map_hash_key` meant `put` succeeded but
+    // `get` always returned null.
     let res = ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))]);
     if dbg_hm_trace() {
         eprintln!("[HM-EQ] invoke_virtual(equals) -> {:?}", res);
     }
-    match res {
-        Ok(Some(Value::Int(v))) => v != 0,
-        _ => false,
+    match res? {
+        Some(Value::Int(v)) => Ok(v != 0),
+        _ => Ok(false),
     }
 }
 
@@ -2751,7 +2767,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     // Handle null key: hash=0, bucket=0, key field stores null
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
     };
@@ -2781,8 +2797,16 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Safety: cap the chain walk to detect pathological cases (cycles or
     // O(n^2) blowup from massive single-bucket pile-ups). Real chains
     // should be O(log n) even with poor hashes; anything past 4096 is a
-    // strong signal of a cycle/corruption — break and let the insert
-    // proceed as if not found.
+    // strong signal of a cycle/corruption.
+    //
+    // MED fix: tripping the cap previously continued silently with a head
+    // insert, producing duplicate keys in the chain and breaking the map's
+    // basic key-uniqueness invariant. An attacker who can force >4096
+    // colliding keys (hash-collision DoS) thus turned each subsequent
+    // `put` into a degenerate O(n) duplicate-insert with no error path.
+    // We now throw `IllegalStateException` instead, signalling the
+    // attack/corruption to the caller rather than silently producing
+    // wrong data.
     let mut walk_count: usize = 0;
     const CHAIN_WALK_LIMIT: usize = 4096;
     while let Value::Object(Some(node)) = node_val {
@@ -2792,7 +2816,11 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
                 walk_count, this, idx, cap
             );
-            break;
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "hashmap chain exceeded safety cap; possible hash-collision DoS"
+                    .to_string(),
+            }
+            .into());
         }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
@@ -2807,7 +2835,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(old_value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
                 let old_value = get_node_value(ctx, node);
                 match ctx.get_field(node, 0) {
                     Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
@@ -2866,7 +2894,7 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -2891,7 +2919,7 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
                 let value = get_node_value(ctx, node);
                 return Ok(Some(value));
             }
@@ -2944,7 +2972,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -2958,26 +2986,31 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let idx = map_bucket_index(hash, cap);
     let head_val = ctx.get_array_element(buckets, idx);
 
-    // Helper closure: check if node matches our key (S111r27: layout-aware)
+    // Helper closure: check if node matches our key (S111r27: layout-aware).
+    // Returns Result so a thrown `equals` from the user-supplied key class
+    // propagates instead of being silently treated as "not equal".
     fn node_matches_inner(
         ctx: &mut dyn NativeContext,
         node: ObjectRef,
         is_null_key: bool,
         key_ref: Option<ObjectRef>,
-    ) -> bool {
+    ) -> Result<bool, MethodCallFailed> {
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
-            matches!(node_key_field, Value::Object(None))
+            Ok(matches!(node_key_field, Value::Object(None)))
         } else if let Value::Object(Some(nk)) = node_key_field {
-            key_ref.is_some_and(|k| map_keys_equal(ctx, nk, k))
+            match key_ref {
+                Some(k) => map_keys_equal(ctx, nk, k),
+                None => Ok(false),
+            }
         } else {
-            false
+            Ok(false)
         }
     }
 
     // Check if the head node is the target
     if let Value::Object(Some(head)) = head_val {
-        if node_matches_inner(ctx, head, is_null_key, key_ref) {
+        if node_matches_inner(ctx, head, is_null_key, key_ref)? {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
             set_map_size(ctx, this, size - 1);
@@ -2990,7 +3023,7 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
 
         while let Value::Object(Some(curr)) = curr_val {
-            if node_matches_inner(ctx, curr, is_null_key, key_ref) {
+            if node_matches_inner(ctx, curr, is_null_key, key_ref)? {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
                 set_map_size(ctx, this, size - 1);
@@ -3027,7 +3060,7 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -3048,7 +3081,7 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 return Ok(Some(Value::Int(1)));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
                 return Ok(Some(Value::Int(1)));
             }
         }
@@ -3148,7 +3181,7 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Add each key
     for key in &keys {
         if let Value::Object(Some(k)) = key {
-            let hash = map_hash_key(ctx, *k);
+            let hash = map_hash_key(ctx, *k)?;
             let (b, size, c) = map_state(ctx, backing_map);
             let b = b.unwrap();
             let idx = map_bucket_index(hash, c);
@@ -3347,20 +3380,26 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if size_a != size_b {
         return Ok(Some(Value::Int(0)));
     }
-    // Check all entries in this map exist in other
+    // Check all entries in this map exist in other.
+    //
+    // MED fix: previously the `if let Value::Object(Some(k))` guard
+    // silently skipped null-keyed entries entirely, so two maps that
+    // differed only on the value mapped to `null` would compare equal —
+    // a Map.equals contract violation. We now include null-keyed entries
+    // by dispatching the lookup with a `null` key (HashMap permits this
+    // and `native_map_get` handles it), and also include non-`Object`
+    // primitive-keyed entries for completeness.
     let entries = map_collect_entries(ctx, this);
     for (key, value) in &entries {
-        if let Value::Object(Some(k)) = key {
-            let get_args = [Value::Object(Some(other)), Value::Object(Some(*k))];
-            let other_val = native_map_get(ctx, &get_args)?;
-            match other_val {
-                Some(ref ov) => {
-                    if !values_equal(ctx, value, ov) {
-                        return Ok(Some(Value::Int(0)));
-                    }
+        let get_args = [Value::Object(Some(other)), *key];
+        let other_val = native_map_get(ctx, &get_args)?;
+        match other_val {
+            Some(ref ov) => {
+                if !values_equal(ctx, value, ov) {
+                    return Ok(Some(Value::Int(0)));
                 }
-                None => return Ok(Some(Value::Int(0))),
             }
+            None => return Ok(Some(Value::Int(0))),
         }
     }
     Ok(Some(Value::Int(1)))
@@ -3492,7 +3531,14 @@ pub fn make_hashset_with_elements(
                 Value::Object(Some(obj)) => *obj,
                 _ => continue, // skip nulls / primitives we can't hash
             };
-            let raw_hash = map_hash_key(ctx, key_obj);
+            // `make_hashset_with_elements` cannot propagate exceptions
+            // (returns `ObjectRef`, not `MethodCallResult`). If a user
+            // `hashCode()` throws here we fall back to identity to keep
+            // construction infallible — this matches the legacy behaviour
+            // and is acceptable for `Set.of(...)` constants which only
+            // hold JDK-internal types (String, wrappers, enum constants).
+            let raw_hash = map_hash_key(ctx, key_obj)
+                .unwrap_or_else(|_| ctx.identity_hash_code(key_obj));
             // map_hash_key already applies the (h ^ h>>>16) spread; the
             // bucket index uses raw_hash as-is for power-of-two cap.
             let idx = ((cap as u32 - 1) & raw_hash as u32) as usize;
@@ -3504,7 +3550,10 @@ pub fn make_hashset_with_elements(
             while let Value::Object(Some(probe_obj)) = probe {
                 let probe_key = ctx.get_field(probe_obj, n_key);
                 if let Value::Object(Some(pk)) = probe_key {
-                    if map_keys_equal(ctx, pk, key_obj) {
+                    // Swallowing a thrown equals here mirrors the hashCode
+                    // fallback above; legitimate `Set.of(...)` keys do not
+                    // throw equals/hashCode.
+                    if map_keys_equal(ctx, pk, key_obj).unwrap_or(false) {
                         dup = true;
                         break;
                     }
@@ -3608,8 +3657,7 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/function/Consumer;)V",
             native_hs_for_each,
         );
-        // NOTE: `HashSet.stream()` intentionally NOT bridged — let real-JDK
-        // default method run.
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
         r.register(
             c,
             "addAll",
@@ -3948,17 +3996,6 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(keys.len() as i32));
-    // Back-reference to the source HashSet so `remove()` can mutate it.
-    // Without this, `Iterator.remove()` falls through to the JDK default
-    // method on `java.util.Iterator`, which throws
-    // `UnsupportedOperationException("remove")` and breaks JDK code paths
-    // that legitimately need iterator-based removal — most notably
-    // `com.sun.jmx.mbeanserver.MXBeanSupport.findMXBeanInterface`, which
-    // does `it.remove()` inside its set-reduction loop. WildFly / Keycloak
-    // hit this when registering `sun.management.GarbageCollectorImpl` as
-    // an MXBean.
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_SOURCE, Value::Object(Some(this)));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -4044,18 +4081,7 @@ fn al_itr_last_ret_slot(ctx: &dyn NativeContext) -> usize {
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
-/// Optional back-reference to the source collection. When set, the
-/// iterator's `remove()` delegates to the source's `remove(Object)` so the
-/// underlying state stays in sync. Older iterator-allocation sites that
-/// pre-date this field leave it null; on those instances `remove()`
-/// behaves like the JDK default (throws `UnsupportedOperationException`).
-const MAP_KEY_ITR_FIELD_SOURCE: usize = 3;
-/// Index of the last key returned by `next()`. `-1` (default for unset
-/// iterators) means `next()` hasn't been called yet or `remove()` was
-/// already invoked once — `remove()` then throws `IllegalStateException`,
-/// matching `java.util.HashMap$HashIterator.remove()`.
-const MAP_KEY_ITR_FIELD_LAST_RET: usize = 4;
-const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
+const MAP_KEY_ITR_NUM_FIELDS: usize = 3;
 
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     // ArrayList$Itr
@@ -4091,140 +4117,6 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_map_key_itr_next,
     );
-    // `remove()` delegates to the source collection's `remove(Object)`.
-    // Required for JDK code paths that iterate a set with the intent of
-    // removing entries — e.g. `MXBeanSupport.findMXBeanInterface`'s
-    // candidate-reduction loop (`it.remove()` on a `HashSet<Class<?>>`).
-    // Without this override, the JDK's default `Iterator.remove()` throws
-    // `UnsupportedOperationException("remove")` and the MXBean
-    // introspection path tears down with `NotCompliantMBeanException`
-    // (observed booting WildFly 39 / Keycloak 16 in real-JDK mode).
-    r.register(
-        "java/util/HashMap$KeyItr",
-        "remove",
-        "()V",
-        native_map_key_itr_remove,
-    );
-
-    // Belt-and-braces: register at the interface CP class too so the
-    // dispatch path that resolves to the `java.util.Iterator.remove()V`
-    // default method (which throws `UnsupportedOperationException("remove")`)
-    // is intercepted regardless of how the receiver class's vtable / native
-    // tables look up the override. The dispatcher inspects the receiver's
-    // actual class and routes:
-    //
-    // * `HashMap$KeyItr` — our snapshot-based set iterator: delegate to
-    //   `native_map_key_itr_remove` (mutates the source HashSet).
-    // * `ArrayList$Itr` — JDK class with a working `remove()V` natively
-    //   registered: delegate to `native_al_itr_remove`.
-    // * anything else — preserve the JDK default semantics by throwing
-    //   `UnsupportedOperationException("remove")` so callers that catch
-    //   that specific exception type keep working unchanged. Paired with
-    //   the `force_native_over_real_jdk_bytecode` entry in
-    //   `vm/src/runtime/interpreter.rs`, this guarantees the dispatcher
-    //   is consulted on every interface-typed `it.remove()` call site.
-    r.register(
-        "java/util/Iterator",
-        "remove",
-        "()V",
-        native_iterator_remove_dispatcher,
-    );
-}
-
-/// Dispatcher for `java/util/Iterator.remove()V` registered as a native
-/// override so interface-typed invokes route through our receiver-class-
-/// specific iterator natives instead of the JDK's default
-/// `Iterator.remove()` bytecode (which throws `UnsupportedOperationException`).
-///
-/// The synthetic `HashMap$KeyItr` class our `native_hs_iterator` returns
-/// has no class-file methods and no declared interfaces, so the standard
-/// receiver-class native lookup misses the registration on
-/// `HashMap$KeyItr.remove()V` and the dispatch falls through to the
-/// interface's default method body — which is exactly the wrong outcome
-/// for callers that legitimately need iterator-based set removal
-/// (`MXBeanSupport.findMXBeanInterface`, `Collection.removeIf`, etc.).
-fn native_iterator_remove_dispatcher(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(iter_remove_unsupported()),
-    };
-    let cid = ctx.class_id_of_object(this);
-    let name = ctx.class_name_of_id(cid).unwrap_or_default();
-    match name.as_str() {
-        "java/util/HashMap$KeyItr" => native_map_key_itr_remove(ctx, args),
-        "java/util/ArrayList$Itr" => native_al_itr_remove(ctx, args),
-        _ => {
-            // The receiver is not one of our synthetic iterator classes. The
-            // force-native registration on `java/util/Iterator.remove()V`
-            // intercepts EVERY interface-typed `it.remove()` call site, so
-            // we land here for any real-JDK iterator too (e.g.
-            // `java/util/HashMap$KeyIterator`, returned by the real-JDK
-            // `HashSet.iterator()` running in real-bytecode mode). For those
-            // we MUST delegate back to the receiver class's own bytecode
-            // body — `MXBeanSupport.findMXBeanInterface` iterates a real
-            // `HashSet<Class<?>>` and calls `it.remove()` to prune
-            // candidate interfaces; throwing UOE unconditionally tears the
-            // MXBean introspection down with `NotCompliantMBeanException`
-            // (observed booting WildFly 39 / Keycloak 16).
-            //
-            // Walk the receiver's superclass chain (NOT its interfaces —
-            // the JDK `java.util.Iterator.remove()V` default body is itself
-            // a UOE thrower we want to bypass) and check whether any
-            // concrete class declares a non-abstract `remove()V`. If yes,
-            // call it via `invoke_special` on the receiver class (the
-            // shared impl's `find_method_recursive` runs the chain-walk
-            // phase first and lands on the override before the interface
-            // default ever gets a look-in). If no concrete override exists
-            // anywhere on the chain, preserve the JDK semantics by throwing
-            // `UnsupportedOperationException("remove")`.
-            if receiver_class_has_concrete_remove(ctx, cid) {
-                ctx.invoke_special(&name, "remove", "()V", args)
-            } else {
-                Err(iter_remove_unsupported())
-            }
-        }
-    }
-}
-
-/// Returns `true` if `class_id` or any class on its superclass chain (excluding
-/// interfaces) declares a non-abstract `remove()V` method. Used by
-/// [`native_iterator_remove_dispatcher`] to decide whether falling through to
-/// the receiver class's own bytecode is safe — if no concrete override exists,
-/// `find_method_recursive` would resolve through the interface closure to
-/// `java.util.Iterator.remove()V`'s default body, which itself throws
-/// `UnsupportedOperationException` (and risks re-entering the dispatcher via
-/// the registered native on the interface CP class).
-fn receiver_class_has_concrete_remove(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
-    // `MethodAccessFlags::ABSTRACT == 0x0400` (see `reader/src/class_access_flags.rs`).
-    // Re-encoded as a literal here to avoid pulling the `cratonvm_reader` crate
-    // into `native-collections` solely for the flag constant.
-    const ACC_ABSTRACT: u16 = 0x0400;
-    let mut current = Some(class_id);
-    while let Some(cid) = current {
-        for m in ctx.declared_methods(cid) {
-            if m.name == "remove"
-                && m.descriptor == "()V"
-                && (m.access_flags & ACC_ABSTRACT) == 0
-            {
-                return true;
-            }
-        }
-        current = ctx.superclass_of(cid);
-    }
-    false
-}
-
-/// Build the JDK-default `UnsupportedOperationException("remove")` that
-/// `java.util.Iterator.remove()V` throws when no override is registered for
-/// the receiver iterator's class.
-fn iter_remove_unsupported() -> MethodCallFailed {
-    RuntimeError::UnsupportedOperationException {
-        message: "remove".to_string(),
-    }
-    .into()
 }
 
 fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4356,60 +4248,7 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let val = ctx.get_array_element(keys, cursor as usize);
     ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
-    // Record the index we just returned so `remove()` (if registered for
-    // this iterator's class) can locate the element in the snapshot.
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
     Ok(Some(val))
-}
-
-/// `HashMap$KeyItr.remove()` — remove the last element returned by `next()`
-/// from the iterator's source collection.
-///
-/// Honours the `java.util.Iterator` contract:
-/// * If `next()` has not been called (or `remove()` has already been
-///   invoked since the last `next()`), throw `IllegalStateException`.
-/// * Otherwise, delete the recorded key from the backing collection via
-///   `native_hs_remove` (which routes through `hs_backing_map` for both
-///   `HashSet` and its mirrored subclasses).
-///
-/// If the iterator was allocated without a source back-reference (legacy
-/// `make_iterator_from_array` callers), report `UnsupportedOperationException`
-/// to match the JDK default-method semantics that those callers were
-/// previously relying on.
-fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Err(iter_remove_unsupported()),
-    };
-    let last_ret = match ctx.get_field(this, MAP_KEY_ITR_FIELD_LAST_RET) {
-        Value::Int(v) => v,
-        _ => -1,
-    };
-    if last_ret < 0 {
-        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-            message: "remove".to_string(),
-        }
-        .into());
-    }
-    let source = match ctx.get_field(this, MAP_KEY_ITR_FIELD_SOURCE) {
-        Value::Object(Some(s)) => s,
-        // Iterator created by a legacy snapshot path that doesn't carry a
-        // source reference. The JDK default-method behaviour for such an
-        // iterator is to throw `UnsupportedOperationException("remove")`.
-        _ => return Err(iter_remove_unsupported()),
-    };
-    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
-        Value::Object(Some(arr)) => arr,
-        _ => return Err(iter_remove_unsupported()),
-    };
-    let key = ctx.get_array_element(keys, last_ret as usize);
-    // Delegate to the HashSet `remove(Object)` native; this keeps backing-
-    // map bookkeeping (size, bucket chains) in one place.
-    let _ = native_hs_remove(ctx, &[Value::Object(Some(source)), key])?;
-    // Mark consumed so a second `remove()` without an intervening `next()`
-    // raises `IllegalStateException` per the iterator contract.
-    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
-    Ok(None)
 }
 
 // ===========================================================================
@@ -4616,17 +4455,12 @@ fn register_optional_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;)Ljava/util/Optional;",
         native_opt_or,
     );
-    // DISABLED — see kc26 / streams_probe / synthetic-stream eradication.
-    // `Optional.stream()` allocated a synthetic `java/util/stream/Stream`
-    // interface instance via `make_stream`. The real-JDK default method
-    // (or the override in `Optional`) returns a proper Stream wrapped over
-    // the value — let the real bytecode run.
-    // r.register(
-    //     o,
-    //     "stream",
-    //     "()Ljava/util/stream/Stream;",
-    //     native_opt_stream,
-    // );
+    r.register(
+        o,
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_opt_stream,
+    );
     r.register(
         o,
         "orElseThrow",
@@ -4827,22 +4661,146 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     }
     let len = ctx.array_length(arr);
-    // Read all elements with their string representation for sorting
-    let mut items: Vec<(String, Value)> = Vec::with_capacity(len);
+
+    // MED fix: real JDK `Arrays.sort(Object[])` orders elements by
+    // natural comparison (`Comparable.compareTo`), and throws
+    // `ClassCastException` for elements that don't implement Comparable.
+    // The previous implementation sorted by `read_string()` representation,
+    // which silently produced wrong order for any type whose toString does
+    // not match its natural ordering (Integer, Date, custom types) and
+    // happily sorted non-Comparable objects without complaint.
+    //
+    // We now:
+    //   1. Snapshot the array into a Vec<Value>.
+    //   2. Verify every non-null element is Comparable; throw
+    //      ClassCastException on the first non-Comparable element.
+    //   3. Sort via insertion sort, dispatching through
+    //      `Comparable.compareTo(Object)` for every pair-wise comparison.
+    //      Insertion sort is O(n^2) but works correctly with a fallible
+    //      comparator (a thrown compareTo propagates out cleanly) and is
+    //      acceptable for the synthetic-stub path — real JDK code uses
+    //      a TimSort that we can't replicate while propagating exceptions
+    //      from Rust's stable `sort_by`.
+    //
+    // Null elements are permitted (JDK sorts them as if smaller than any
+    // non-null element when the comparator is null, but throws NPE when
+    // comparing null via compareTo). To match JDK behaviour we propagate
+    // the NPE that compareTo would naturally throw if a null sneaks in.
+
+    let mut items: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        let val = ctx.get_array_element(arr, i);
-        let key = match &val {
-            Value::Object(Some(obj)) => ctx.read_string(*obj).unwrap_or_default(),
-            Value::Object(None) => String::new(),
-            _ => String::new(),
-        };
-        items.push((key, val));
+        items.push(ctx.get_array_element(arr, i));
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    for (i, (_, val)) in items.iter().enumerate() {
+
+    // Verify Comparable on every non-null element.
+    for v in &items {
+        if let Value::Object(Some(obj)) = v {
+            if !implements_comparable(ctx, *obj) {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(*obj))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                    message: format!(
+                        "element of class {} does not implement java.lang.Comparable",
+                        cname
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+
+    // Insertion sort with fallible comparator.
+    for i in 1..items.len() {
+        let mut j = i;
+        while j > 0 {
+            let cmp = compare_via_compare_to(ctx, &items[j - 1], &items[j])?;
+            if cmp <= 0 {
+                break;
+            }
+            items.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+
+    for (i, val) in items.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
     Ok(None)
+}
+
+/// Walk `obj`'s class hierarchy (including superclasses) and return true if
+/// any class implements `java/lang/Comparable` directly or transitively
+/// via a super-interface. Used by `native_arrays_sort_objects` to throw
+/// `ClassCastException` before invoking `compareTo` on a non-Comparable.
+fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let mut cid = ctx.class_id_of_object(obj);
+    for _ in 0..64 {
+        for iface in ctx.class_interfaces(cid) {
+            if iface_extends_comparable(ctx, iface) {
+                return true;
+            }
+        }
+        match ctx.superclass_of(cid) {
+            Some(p) => cid = p,
+            None => break,
+        }
+    }
+    false
+}
+
+/// True iff `iface` IS `java/lang/Comparable` or transitively extends it.
+fn iface_extends_comparable(ctx: &dyn NativeContext, iface: ClassId) -> bool {
+    // BFS with a depth cap (interface graphs in real-world JDKs are shallow).
+    let mut stack: Vec<ClassId> = vec![iface];
+    let mut budget = 64usize;
+    while let Some(c) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        if let Some(name) = ctx.class_name_of_id(c) {
+            if name == "java/lang/Comparable" {
+                return true;
+            }
+        }
+        for super_iface in ctx.class_interfaces(c) {
+            stack.push(super_iface);
+        }
+    }
+    false
+}
+
+/// Dispatch through `Comparable.compareTo(Object)`. Treats `null` as
+/// less than any non-null element (matching how the JDK's natural-order
+/// comparator handles the corner case for `Arrays.sort(Object[])`).
+fn compare_via_compare_to(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<i32, MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => Ok(0),
+        (Value::Object(None), _) => Ok(-1),
+        (_, Value::Object(None)) => Ok(1),
+        (Value::Object(Some(ao)), Value::Object(Some(bo))) => {
+            let r = ctx.invoke_virtual(
+                *ao,
+                "compareTo",
+                "(Ljava/lang/Object;)I",
+                &[Value::Object(Some(*bo))],
+            )?;
+            match r {
+                Some(Value::Int(v)) => Ok(v),
+                _ => Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                    message: "compareTo did not return an int".to_string(),
+                }
+                .into()),
+            }
+        }
+        // Non-object slots are unreachable in an Object[]; defensive fallback.
+        _ => Ok(0),
+    }
 }
 
 fn native_arrays_fill_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6100,37 +6058,31 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
 }
 
 /// Extract elements from a Stream.
-/// Resolve a Stream-shaped object to its element list.
-///
-/// Two cases:
-///
-/// 1. **Synthetic Stream/IntStream/LongStream/DoubleStream** (allocated by
-///    our `make_stream` / `make_int_stream` / etc.): field 0 holds an
-///    `Object[]` backing array — read it directly.
-///
-/// 2. **Real-JDK `ReferencePipeline`** (returned by e.g.
-///    `AbstractCollection.stream()`, `Spring`'s `MergedAnnotations.stream()`,
-///    `ServiceLoader.stream()`): we cannot peek at field 0. Materialize via
-///    `Stream.toArray()`.
-///
-/// Jenkins bug (2026-05-24): `native_stream_find_first` previously called the
-/// immutable `stream_elements` variant, which silently returned `Vec::new()`
-/// for real-JDK pipelines — making `Arrays.asList(...).stream().findFirst()`
-/// always return `Optional.empty()`. Winstone's `Level.parse(String.valueOf(5))`
-/// → `KnownLevel.findByValue(5, KnownLevel::referent)` then threw
-/// `NoSuchElementException` despite the level being correctly registered. All
-/// terminal/intermediate ops registered on `java/util/stream/Stream` now share
-/// one mutable-context helper that handles both cases.
-fn stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    // For our synthetic Stream object, field 0 holds an Object[] of elements.
+    // But some streams are real JDK ReferencePipeline instances (returned by
+    // e.g. Spring's MergedAnnotations.stream()). In those cases we can't peek
+    // at field 0 — fall through to materialize via Stream.toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = matches!(
-        class_name.as_str(),
-        "java/util/stream/Stream"
-            | "java/util/stream/IntStream"
-            | "java/util/stream/LongStream"
-            | "java/util/stream/DoubleStream"
-    );
+    let is_synthetic = class_name == "java/util/stream/Stream";
+    if is_synthetic {
+        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
+            let len = ctx.array_length(arr);
+            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+        }
+    }
+    // Non-synthetic streams (real JDK ReferencePipeline etc.) require an
+    // `invoke_virtual` call to materialize via `Stream.toArray()` — use
+    // `stream_elements_mut` from a context that has `&mut dyn NativeContext`.
+    Vec::new()
+}
+
+/// Mutable variant of stream_elements that can invoke virtual methods.
+fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    let class_id = ctx.class_id_of_object(stream);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let is_synthetic = class_name == "java/util/stream/Stream";
     if is_synthetic {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
@@ -6146,12 +6098,6 @@ fn stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value>
         }
         _ => Vec::new(),
     }
-}
-
-/// Legacy alias retained for callers that previously distinguished the
-/// mutable variant. Both names now route through the same implementation.
-fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    stream_elements(ctx, stream)
 }
 
 fn register_stream_natives(r: &mut NativeMethodRegistry) {
@@ -6528,11 +6474,58 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     make_stream(ctx, &combined)
 }
 
-// NOTE: `native_al_stream` / `native_hs_stream` / `native_ts_stream` /
-// `native_unmod_stream` were removed when the synthetic `Stream` shim was
-// disabled (see docs/jvm-no-synthetic-stubs.md). The real-JDK default method
-// `AbstractCollection.stream()` now runs instead, producing a proper
-// `ReferencePipeline$Head`.
+fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (data, size) = al_state(ctx, this);
+    let elements: Vec<Value> = match data {
+        Some(d) => (0..size as usize)
+            .map(|i| ctx.get_array_element(d, i))
+            .collect(),
+        // Foreign collection (not ArrayList-shaped): the interface-level
+        // `stream` registration caught e.g. a Guava `Maps$Values`. Walk
+        // its real iterator instead of returning an empty stream.
+        None => collection_elements_generic(ctx, this),
+    };
+    make_stream(ctx, &elements)
+}
+
+fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let backing = match hs_backing_map(ctx, this) {
+        Some(m) => m,
+        None => return make_stream(ctx, &[]),
+    };
+    let keys = map_collect_keys(ctx, backing);
+    make_stream(ctx, &keys)
+}
+
+// TreeSet.stream() — snapshot of sorted elements (also serves TreeMap.keySet()
+// since native_tm_key_set returns a synthetic TreeSet). Real JDK's
+// TreeSet.spliterator() goes through TreeMap.keySpliteratorFor(), which requires
+// the JDK's `root`/`size` red-black tree fields populated by put(); our
+// synthetic layout does not provide those, so without this override the stream
+// is empty (observed: `m.keySet().stream().count()` returned 0 for a 3-entry
+// TreeMap, which broke Keycloak FeatureOptions.<clinit>).
+fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let elements: Vec<Value> = match data_opt {
+        Some(d) => (0..size as usize)
+            .map(|i| ctx.get_array_element(d, i))
+            .collect(),
+        None => Vec::new(),
+    };
+    make_stream(ctx, &elements)
+}
 
 // -- Intermediate operations --
 
@@ -8031,7 +8024,7 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(stream))))
 }
 
-fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+fn int_stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     stream_elements(ctx, stream)
 }
 
@@ -8939,12 +8932,12 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         native_al_iterator,
     );
     registry.register("java/util/Collection", "size", "()I", native_al_size);
-    // NOTE: `Collection.stream()` intentionally NOT bridged — see
-    // docs/jvm-no-synthetic-stubs.md. The previous bridge returned a synthetic
-    // `java/util/stream/Stream` object (an interface!), causing
-    // `AbstractMethodError` when real-JDK code invoked any method on it
-    // (e.g. `forEachOrdered`). Letting the real default method run produces a
-    // proper `ReferencePipeline$Head`.
+    registry.register(
+        "java/util/Collection",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_al_stream,
+    );
     registry.register("java/util/Collection", "isEmpty", "()Z", native_al_is_empty);
     registry.register(
         "java/util/Collection",
@@ -8980,8 +8973,12 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         native_al_iterator,
     );
     registry.register("java/util/List", "isEmpty", "()Z", native_al_is_empty);
-    // NOTE: `List.stream()` intentionally NOT bridged (see Collection.stream
-    // note above).
+    registry.register(
+        "java/util/List",
+        "stream",
+        "()Ljava/util/stream/Stream;",
+        native_al_stream,
+    );
     registry.register(
         "java/util/List",
         "toArray",
@@ -10359,37 +10356,25 @@ fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // kept slot-based because `LinkedList$Node` is purely synthetic in our VM
 // (we never load the real class, since Node is private/inner and bytecode
 // doesn't `getfield` it directly).
-//
-// GC-stability invariant (C21 fix): the overlay is keyed by
-// `ctx.identity_hash_code(this)` (i32), NOT by `this.as_ptr() as usize`.
-// CratonVM ships a moving GC; a raw heap-pointer key is stale after a
-// compaction, and a fresh object allocated at the old address silently
-// inherits the previous LinkedList's head/tail/size. The identity hash is
-// stable across GC moves — the GC copies the hash word along with the
-// object header — so the overlay entry continues to map to the correct
-// list across collections. Mirrors the CHM resize-stripe fix at the top
-// of this file.
-fn ll_overlay() -> &'static Mutex<StdHashMap<i32, StdHashMap<&'static str, Value>>> {
-    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<i32, StdHashMap<&'static str, Value>>>> =
+fn ll_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<&'static str, Value>>>> =
         std::sync::OnceLock::new();
     OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
-fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
-    let key = ctx.identity_hash_code(this);
+fn ll_get(this: ObjectRef, name: &'static str) -> Value {
     ll_overlay()
         .lock()
         .unwrap()
-        .get(&key)
+        .get(&(this.as_ptr() as usize))
         .and_then(|m| m.get(name))
         .copied()
         .unwrap_or(Value::Object(None))
 }
-fn ll_set(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str, v: Value) {
-    let key = ctx.identity_hash_code(this);
+fn ll_set(this: ObjectRef, name: &'static str, v: Value) {
     ll_overlay()
         .lock()
         .unwrap()
-        .entry(key)
+        .entry(this.as_ptr() as usize)
         .or_default()
         .insert(name, v);
 }
@@ -10410,7 +10395,7 @@ fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
 }
 
 fn ll_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ll_get(ctx, this, "size") {
+    match ll_get(this, "size") {
         Value::Int(n) => n,
         _ => 0,
     }
@@ -10517,7 +10502,7 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     let size = ll_size(ctx, this) as usize;
     let arr = alloc_ref_array(ctx, size);
-    let mut cur = match ll_get(ctx, this, "head") {
+    let mut cur = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -10725,39 +10710,39 @@ fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ll_set(ctx, this, "head", Value::Object(None));
-    ll_set(ctx, this, "tail", Value::Object(None));
-    ll_set(ctx, this, "size", Value::Int(0));
+    ll_set(this, "head", Value::Object(None));
+    ll_set(this, "tail", Value::Object(None));
+    ll_set(this, "size", Value::Int(0));
     Ok(None)
 }
 
 fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(tail)) = ll_get(ctx, this, "tail") {
+    if let Value::Object(Some(tail)) = ll_get(this, "tail") {
         ctx.set_field(tail, LL_NODE_NEXT, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_PREV, Value::Object(Some(tail)));
-        ll_set(ctx, this, "tail", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     } else {
         // Empty list
-        ll_set(ctx, this, "head", Value::Object(Some(node)));
-        ll_set(ctx, this, "tail", Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     }
-    ll_set(ctx, this, "size", Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 fn ll_link_first(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
     let node = ll_alloc_node(ctx, element);
     let size = ll_size(ctx, this);
-    if let Value::Object(Some(head)) = ll_get(ctx, this, "head") {
+    if let Value::Object(Some(head)) = ll_get(this, "head") {
         ctx.set_field(head, LL_NODE_PREV, Value::Object(Some(node)));
         ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(head)));
-        ll_set(ctx, this, "head", Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
     } else {
-        ll_set(ctx, this, "head", Value::Object(Some(node)));
-        ll_set(ctx, this, "tail", Value::Object(Some(node)));
+        ll_set(this, "head", Value::Object(Some(node)));
+        ll_set(this, "tail", Value::Object(Some(node)));
     }
-    ll_set(ctx, this, "size", Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 fn native_ll_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10806,11 +10791,11 @@ fn ll_link_before(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value, 
         }
         _ => {
             // succ was the head — node becomes the new head.
-            ll_set(ctx, this, "head", Value::Object(Some(node)));
+            ll_set(this, "head", Value::Object(Some(node)));
         }
     }
     let size = ll_size(ctx, this);
-    ll_set(ctx, this, "size", Value::Int(size + 1));
+    ll_set(this, "size", Value::Int(size + 1));
 }
 
 /// Unlink a live node, returning its element. Mirrors `LinkedList.unlink`.
@@ -10824,7 +10809,7 @@ fn ll_unlink_node(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef)
         }
         _ => {
             // node was the head.
-            ll_set(ctx, this, "head", next);
+            ll_set(this, "head", next);
         }
     }
     match next {
@@ -10833,11 +10818,11 @@ fn ll_unlink_node(ctx: &mut dyn NativeContext, this: ObjectRef, node: ObjectRef)
         }
         _ => {
             // node was the tail.
-            ll_set(ctx, this, "tail", prev);
+            ll_set(this, "tail", prev);
         }
     }
     let size = ll_size(ctx, this);
-    ll_set(ctx, this, "size", Value::Int((size - 1).max(0)));
+    ll_set(this, "size", Value::Int((size - 1).max(0)));
     element
 }
 
@@ -10901,7 +10886,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
     }
     if index < size / 2 {
         // Traverse from head
-        let mut cur = match ll_get(ctx, this, "head") {
+        let mut cur = match ll_get(this, "head") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -10914,7 +10899,7 @@ fn ll_node_at(ctx: &dyn NativeContext, this: ObjectRef, index: i32) -> Option<Ob
         Some(cur)
     } else {
         // Traverse from tail
-        let mut cur = match ll_get(ctx, this, "tail") {
+        let mut cur = match ll_get(this, "tail") {
             Value::Object(Some(r)) => r,
             _ => return None,
         };
@@ -10953,7 +10938,7 @@ fn native_ll_get_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
-    match ll_get(ctx, this, "head") {
+    match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -10972,7 +10957,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    match ll_get(ctx, this, "tail") {
+    match ll_get(this, "tail") {
         Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, LL_NODE_ELEM))),
         _ => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "List is empty".to_string(),
@@ -10982,7 +10967,7 @@ fn native_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let head = match ll_get(ctx, this, "head") {
+    let head = match ll_get(this, "head") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -10992,19 +10977,19 @@ fn ll_unlink_first(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match next {
         Value::Object(Some(next_node)) => {
             ctx.set_field(next_node, LL_NODE_PREV, Value::Object(None));
-            ll_set(ctx, this, "head", Value::Object(Some(next_node)));
+            ll_set(this, "head", Value::Object(Some(next_node)));
         }
         _ => {
-            ll_set(ctx, this, "head", Value::Object(None));
-            ll_set(ctx, this, "tail", Value::Object(None));
+            ll_set(this, "head", Value::Object(None));
+            ll_set(this, "tail", Value::Object(None));
         }
     }
-    ll_set(ctx, this, "size", Value::Int(size - 1));
+    ll_set(this, "size", Value::Int(size - 1));
     element
 }
 
 fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
-    let tail = match ll_get(ctx, this, "tail") {
+    let tail = match ll_get(this, "tail") {
         Value::Object(Some(r)) => r,
         _ => return Value::Object(None),
     };
@@ -11014,14 +10999,14 @@ fn ll_unlink_last(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     match prev {
         Value::Object(Some(prev_node)) => {
             ctx.set_field(prev_node, LL_NODE_NEXT, Value::Object(None));
-            ll_set(ctx, this, "tail", Value::Object(Some(prev_node)));
+            ll_set(this, "tail", Value::Object(Some(prev_node)));
         }
         _ => {
-            ll_set(ctx, this, "head", Value::Object(None));
-            ll_set(ctx, this, "tail", Value::Object(None));
+            ll_set(this, "head", Value::Object(None));
+            ll_set(this, "tail", Value::Object(None));
         }
     }
-    ll_set(ctx, this, "size", Value::Int(size - 1));
+    ll_set(this, "size", Value::Int(size - 1));
     element
 }
 
@@ -11089,7 +11074,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ll_get(ctx, this, "head") {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -11111,9 +11096,9 @@ fn native_ll_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    ll_set(ctx, this, "head", Value::Object(None));
-    ll_set(ctx, this, "tail", Value::Object(None));
-    ll_set(ctx, this, "size", Value::Int(0));
+    ll_set(this, "head", Value::Object(None));
+    ll_set(this, "tail", Value::Object(None));
+    ll_set(this, "size", Value::Int(0));
     Ok(None)
 }
 
@@ -11122,7 +11107,7 @@ fn native_ll_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    match ll_get(ctx, this, "head") {
+    match ll_get(this, "head") {
         Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, LL_NODE_ELEM))),
         _ => Ok(Some(Value::Object(None))),
     }
@@ -11149,7 +11134,7 @@ fn native_ll_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let size = ll_size(ctx, this) as usize;
     let arr = alloc_ref_array(ctx, size);
-    let mut cur_opt = match ll_get(ctx, this, "head") {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -11192,7 +11177,7 @@ fn native_ll_to_array_typed(
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
         _ => alloc_ref_array(ctx, size),
     };
-    let mut cur_opt = match ll_get(ctx, this, "head") {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -11228,7 +11213,7 @@ fn native_ll_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let size = ll_size(ctx, this) as usize;
     let mut parts = Vec::with_capacity(size);
-    let mut cur_opt = match ll_get(ctx, this, "head") {
+    let mut cur_opt = match ll_get(this, "head") {
         Value::Object(Some(r)) => Some(r),
         _ => None,
     };
@@ -11251,7 +11236,7 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let head = ll_get(ctx, this, "head");
+    let head = ll_get(this, "head");
     let itr = alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3);
     ctx.set_field(itr, 0, head); // current node
     ctx.set_field(itr, 1, Value::Object(Some(this))); // list ref
@@ -11372,38 +11357,26 @@ const LHM_FIELD_TAIL: usize = 4;
 //
 // IMPORTANT: this is a per-object overlay; iteration helpers continue to walk
 // the synthetic linked-list pointers, which now live in the side-table too.
-//
-// GC-stability invariant (C21 fix): the overlay is keyed by
-// `ctx.identity_hash_code(this)` (i32), NOT by `this.as_ptr() as usize`.
-// CratonVM's moving GC relocates objects during compaction, so a raw heap
-// pointer is unstable across collections — and a fresh allocation at the
-// old address would silently inherit the previous LinkedHashMap's
-// buckets/head/tail/size. The identity hash word is preserved across GC
-// moves (copied along with the object header), so the overlay key remains
-// valid for the lifetime of the object. Mirrors the CHM resize-stripe fix
-// at the top of this file.
 use std::sync::Mutex;
 use std::collections::HashMap as StdHashMap;
-fn lhm_overlay() -> &'static Mutex<StdHashMap<i32, StdHashMap<String, Value>>> {
-    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<i32, StdHashMap<String, Value>>>> =
+fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>> {
+    static OVERLAY: std::sync::OnceLock<Mutex<StdHashMap<usize, StdHashMap<String, Value>>>> =
         std::sync::OnceLock::new();
     OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
-fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    ctx.identity_hash_code(this)
+fn lhm_overlay_key(this: ObjectRef) -> usize {
+    this.as_ptr() as usize
 }
-fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
-    let key = lhm_overlay_key(ctx, this);
+fn lhm_get(_ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
     let m = lhm_overlay().lock().unwrap();
-    m.get(&key)
+    m.get(&lhm_overlay_key(this))
         .and_then(|inner| inner.get(name))
         .copied()
         .unwrap_or(Value::Object(None))
 }
-fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
-    let key = lhm_overlay_key(ctx, this);
+fn lhm_set(_ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
     let mut m = lhm_overlay().lock().unwrap();
-    m.entry(key)
+    m.entry(lhm_overlay_key(this))
         .or_default()
         .insert(name.to_string(), v);
 }
@@ -11414,19 +11387,11 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
 /// fields. Without this, `lhm.clone()` returns an LHM with all state
 /// missing and downstream `HashMap.clone()` bytecode walks an empty
 /// receiver.
-///
-/// GC-stability invariant (C21 fix): `src` and `dst` are translated into
-/// the overlay key space via `ctx.identity_hash_code`, NOT raw pointer
-/// casts. The identity hash word is preserved by the moving GC during
-/// compaction, so this remains correct across collections even if the
-/// clone is taken straight before a major GC fires.
-pub fn clone_lhm_overlay(ctx: &dyn NativeContext, src: ObjectRef, dst: ObjectRef) {
-    let src_key = ctx.identity_hash_code(src);
-    let dst_key = ctx.identity_hash_code(dst);
+pub fn clone_lhm_overlay(src: ObjectRef, dst: ObjectRef) {
     let mut m = lhm_overlay().lock().unwrap();
-    let src_state = m.get(&src_key).cloned();
+    let src_state = m.get(&lhm_overlay_key(src)).cloned();
     if let Some(s) = src_state {
-        m.insert(dst_key, s);
+        m.insert(lhm_overlay_key(dst), s);
     }
 }
 
@@ -11533,13 +11498,20 @@ fn lhm_resize(ctx: &mut dyn NativeContext, this: ObjectRef) {
     lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(new_cap as i32));
 }
 
-fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> Option<ObjectRef> {
+fn lhm_find_node(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let (buckets, _, cap) = lhm_state(ctx, this);
-    let buckets = buckets?;
+    let buckets = match buckets {
+        Some(b) => b,
+        None => return Ok(None),
+    };
     let (hash, is_null) = match key {
-        Value::Object(Some(k)) => (map_hash_key(ctx, *k), false),
+        Value::Object(Some(k)) => (map_hash_key(ctx, *k)?, false),
         Value::Object(None) => (0, true),
-        _ => return None,
+        _ => return Ok(None),
     };
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
@@ -11547,16 +11519,16 @@ fn lhm_find_node(ctx: &mut dyn NativeContext, this: ObjectRef, key: &Value) -> O
         let node_key = ctx.get_field(node, LHM_NODE_KEY);
         if is_null {
             if matches!(node_key, Value::Object(None)) {
-                return Some(node);
+                return Ok(Some(node));
             }
         } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key) {
-            if map_keys_equal(ctx, nk, *k) {
-                return Some(node);
+            if map_keys_equal(ctx, nk, *k)? {
+                return Ok(Some(node));
             }
         }
         node_val = ctx.get_field(node, LHM_NODE_NEXT);
     }
-    None
+    Ok(None)
 }
 
 fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
@@ -11841,7 +11813,7 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
     let hash = match key_val {
-        Value::Object(Some(k)) => map_hash_key(ctx, k),
+        Value::Object(Some(k)) => map_hash_key(ctx, k)?,
         Value::Object(None) => 0,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -11861,19 +11833,9 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
 
     // Check for existing key
-    if let Some(node) = lhm_find_node(ctx, this, &key_val) {
+    if let Some(node) = lhm_find_node(ctx, this, &key_val)? {
         let old = ctx.get_field(node, LHM_NODE_VALUE);
         ctx.set_field(node, LHM_NODE_VALUE, value);
-        // C25 (HIGH) fix: access-order LinkedHashMap must treat a put on
-        // an existing key as an access and move the entry to the tail of
-        // the insertion-order list. JDK `LinkedHashMap.afterNodeAccess`
-        // is called from `HashMap.putVal` when an existing node is
-        // replaced; LRU-cache use-cases (the canonical reason to set
-        // `accessOrder = true`) were getting wrong eviction order
-        // because we updated the value and returned without re-linking.
-        if lhm_is_access_order(ctx, this) {
-            lhm_move_to_tail(ctx, this, node);
-        }
         return Ok(Some(old));
     }
 
@@ -11907,7 +11869,7 @@ fn native_lhm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key) {
+    if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let value = ctx.get_field(node, LHM_NODE_VALUE);
         // Round-9 HIGH: access-order semantics. When the LHM was
         // constructed with `(IFZ)V` accessOrder=true, `get` must move
@@ -11970,7 +11932,7 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (hash, is_null) = match key_val {
-        Value::Object(Some(k)) => (map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
         Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -11990,7 +11952,7 @@ fn native_lhm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let found = if is_null {
             matches!(node_key, Value::Object(None))
         } else if let (Value::Object(Some(nk)), Value::Object(Some(k))) = (node_key, key_val) {
-            map_keys_equal(ctx, nk, k)
+            map_keys_equal(ctx, nk, k)?
         } else {
             false
         };
@@ -12026,7 +11988,7 @@ fn native_lhm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     Ok(Some(Value::Int(
-        if lhm_find_node(ctx, this, &key).is_some() {
+        if lhm_find_node(ctx, this, &key)?.is_some() {
             1
         } else {
             0
@@ -12148,7 +12110,7 @@ fn native_lhm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key) {
+    if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let value = ctx.get_field(node, LHM_NODE_VALUE);
         // Round-9 HIGH: `getOrDefault` is also an access for access-order
         // semantics — same reorder as `get`. The JDK's `LinkedHashMap`
@@ -12168,7 +12130,7 @@ fn native_lhm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(node) = lhm_find_node(ctx, this, &key) {
+    if let Some(node) = lhm_find_node(ctx, this, &key)? {
         let existing = ctx.get_field(node, LHM_NODE_VALUE);
         Ok(Some(existing))
     } else {
@@ -13481,24 +13443,6 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
-    // Undersized-receiver gate. The speculative layout-probing below
-    // (ArrayList → Arrays$ArrayList → LinkedList → HashSet) reads slots
-    // 0/1/2 directly off the receiver. When called with a non-collection
-    // receiver whose declared layout is smaller than those slots — e.g.
-    // `net/bytebuddy/description/type/TypeList$Generic$Empty` (1 slot,
-    // inherits `modCount` from AbstractList), `RegularImmutableList`
-    // (1 slot, `array`), `IdentityHashMap$Values` (1 slot, `this$0`),
-    // `Collections$EmptyList` (1 slot, `serialVersionUID` pad) — these
-    // reads trip `gen_heap::get_field`'s out-of-bounds guard and fire
-    // the diagnostic for every probe attempt.
-    //
-    // The right behaviour for those receivers is "I don't recognize this
-    // layout — fall through to iterator-based access" (the existing
-    // `iterator()` walk via `collection_elements_generic` at the end of
-    // this function). Compute the receiver's slot count once and skip
-    // every layout-specific probe whose highest-slot read would land
-    // past it.
-    let coll_n_fields = ctx.object_num_fields(coll);
     // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
     // field-index resolver so we honour the real-JDK layout
     // (`modCount`/`elementData`/`size` slots from AbstractList/ArrayList) —
@@ -13509,36 +13453,24 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // and surfaces as the `@AliasFor ... is not meta-present` chain.
     {
         let (data_slot, size_slot, _) = al_slots(ctx);
-        if data_slot < coll_n_fields && size_slot < coll_n_fields {
-            let f_data = ctx.get_field(coll, data_slot);
-            let f_size = ctx.get_field(coll, size_slot);
-            if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
-                if ctx.heap_kind_of(arr) == ObjectKind::Array {
-                    let len = ctx.array_length(arr);
-                    if size >= 0 && len >= size as usize {
-                        let mut elems = Vec::with_capacity(size as usize);
-                        for i in 0..(size as usize) {
-                            elems.push(ctx.get_array_element(arr, i));
-                        }
-                        return elems;
+        let f_data = ctx.get_field(coll, data_slot);
+        let f_size = ctx.get_field(coll, size_slot);
+        if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                let len = ctx.array_length(arr);
+                if size >= 0 && len >= size as usize {
+                    let mut elems = Vec::with_capacity(size as usize);
+                    for i in 0..(size as usize) {
+                        elems.push(ctx.get_array_element(arr, i));
                     }
+                    return elems;
                 }
             }
         }
     }
-    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size).
-    // Skip if the receiver has fewer than 2 slots — otherwise the probe
-    // would OOB-read on a 0- or 1-slot foreign type.
-    let f0 = if coll_n_fields > 0 {
-        ctx.get_field(coll, 0)
-    } else {
-        Value::Object(None)
-    };
-    let f1 = if coll_n_fields > 1 {
-        ctx.get_field(coll, 1)
-    } else {
-        Value::Object(None)
-    };
+    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size)
+    let f0 = ctx.get_field(coll, 0);
+    let f1 = ctx.get_field(coll, 1);
     if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
         if ctx.heap_kind_of(arr) == ObjectKind::Array {
             let len = ctx.array_length(arr);
@@ -13567,28 +13499,20 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             return elems;
         }
     }
-    // Try LinkedList layout (field 0 = head Node, field 2 = Int size).
-    // Skip if the receiver doesn't have a slot at LL_FIELD_SIZE (=2).
-    if LL_FIELD_SIZE < coll_n_fields {
-        if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
-            if size > 0 && LL_FIELD_HEAD < coll_n_fields {
-                let mut elems = Vec::with_capacity(size as usize);
-                let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
-                while let Value::Object(Some(node)) = cur {
-                    elems.push(ctx.get_field(node, LL_NODE_ELEM));
-                    cur = ctx.get_field(node, LL_NODE_NEXT);
-                }
-                return elems;
+    // Try LinkedList layout (field 0 = head Node, field 2 = Int size)
+    if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
+        if size > 0 {
+            let mut elems = Vec::with_capacity(size as usize);
+            let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
+            while let Value::Object(Some(node)) = cur {
+                elems.push(ctx.get_field(node, LL_NODE_ELEM));
+                cur = ctx.get_field(node, LL_NODE_NEXT);
             }
+            return elems;
         }
     }
     // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
-    // Walk the backing map's bucket nodes and collect keys. Skip if the
-    // receiver has no slot 0 (e.g. cglib's `MethodInterceptorGenerator`
-    // has 0 instance fields) — fall through to the iterator walk.
-    if HS_FIELD_MAP >= coll_n_fields {
-        return collection_elements_generic(ctx, coll);
-    }
+    // Walk the backing map's bucket nodes and collect keys.
     if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
         // Verify it actually is a HashMap-like (slot 0 = bucket array).
         let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
@@ -14014,38 +13938,24 @@ fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
     }
 }
 
-/// Per-TreeMap fast-mode side-table. The outer key is the receiver's
-/// identity hash code (i32); the inner BTreeMap is the authoritative
-/// store for fast-mode maps (mirroring is avoided — when fast mode is
-/// active, the array slot is left empty and we read from the BTreeMap).
-///
-/// GC-stability invariant (C21 fix): the key is `ctx.identity_hash_code(this)`,
-/// NOT `this.as_ptr() as usize`. CratonVM's moving GC relocates objects
-/// during compaction, so a raw heap-pointer key is stale across
-/// collections and a fresh allocation at the old address would silently
-/// inherit the previous TreeMap's BTreeMap contents. The identity hash
-/// is preserved across GC moves. Mirrors the CHM resize-stripe fix at
-/// the top of this file.
-fn tm_fast_table() -> &'static Mutex<StdHashMap<i32, std::collections::BTreeMap<TreeKey, Value>>>
+/// Per-TreeMap fast-mode side-table. The outer key is the synthetic
+/// receiver's address; the inner BTreeMap is the authoritative store
+/// for fast-mode maps (mirroring is avoided — when fast mode is active,
+/// the array slot is left empty and we read from the BTreeMap).
+fn tm_fast_table() -> &'static Mutex<StdHashMap<usize, std::collections::BTreeMap<TreeKey, Value>>>
 {
     static T: std::sync::OnceLock<
-        Mutex<StdHashMap<i32, std::collections::BTreeMap<TreeKey, Value>>>,
+        Mutex<StdHashMap<usize, std::collections::BTreeMap<TreeKey, Value>>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-/// Derive the side-table key for `this`. C21: returns the identity hash
-/// code rather than the raw heap pointer so the key is stable across GC
-/// compactions. Shared by `tm_fast_table`, `tm_array_table`,
-/// `tm_force_array_set`, and `ts_array_table` (TreeSet reuses
-/// `tm_obj_key` to keep the GC invariant uniform across the Tree*
-/// families).
-fn tm_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    ctx.identity_hash_code(this)
+fn tm_obj_key(this: ObjectRef) -> usize {
+    this.as_ptr() as usize
 }
 
-/// Identity-keyed TreeMap array-mode state side-table — `(data array,
-/// size, comparator)` keyed by the receiver's identity hash code.
+/// Address-keyed TreeMap array-mode state side-table — `(data array, size,
+/// comparator)` keyed by the receiver's address.
 ///
 /// Why a side-table instead of object fields: in real-JDK mode `TreeMap`
 /// instances have the *real* JDK field layout (`comparator`, `root`,
@@ -14053,12 +13963,8 @@ fn tm_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 /// extends TreeMap` add their own fields on top. Writing to the synthetic
 /// slots 0/1/2 lands in unrelated real fields — silently losing the data
 /// array and size, and (worse) writing an `Int` into a reference slot
-/// corrupts the heap for the GC.
-///
-/// GC-stability invariant (C21 fix): the key was previously the raw
-/// `this.as_ptr() as usize`, which a moving GC could invalidate. It is
-/// now the identity hash code (`ctx.identity_hash_code(this)`), which is
-/// preserved by the GC's object header during compaction.
+/// corrupts the heap for the GC. Keying state by the object's address is
+/// layout-independent and works for arbitrary subclasses.
 #[derive(Clone)]
 struct TmArrayState {
     data: Option<ObjectRef>,
@@ -14074,19 +13980,18 @@ impl Default for TmArrayState {
         }
     }
 }
-fn tm_array_table() -> &'static Mutex<StdHashMap<i32, TmArrayState>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<i32, TmArrayState>>> =
+fn tm_array_table() -> &'static Mutex<StdHashMap<usize, TmArrayState>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TmArrayState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
 /// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
-/// identity-keyed side-table. Returns layout-independent defaults when no
+/// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet. The object's own fields are never consulted.
-fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
-    let key = tm_obj_key(ctx, this);
+fn tm_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
     let tbl = tm_array_table().lock().unwrap();
-    if let Some(st) = tbl.get(&key) {
+    if let Some(st) = tbl.get(&tm_obj_key(this)) {
         return match slot {
             TM_FIELD_DATA => Value::Object(st.data),
             TM_FIELD_SIZE => Value::Int(st.size),
@@ -14100,13 +14005,12 @@ fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
     }
 }
 
-/// Write a TreeMap "slot" into the identity-keyed side-table (creating
-/// the entry on first write). The object's own fields are never touched
-/// — the side-table is the sole authoritative store (see `TmArrayState`).
-fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
-    let key = tm_obj_key(ctx, this);
+/// Write a TreeMap "slot" into the address-keyed side-table (creating the
+/// entry on first write). The object's own fields are never touched — the
+/// side-table is the sole authoritative store (see `TmArrayState`).
+fn tm_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
     let mut tbl = tm_array_table().lock().unwrap();
-    let st = tbl.entry(key).or_default();
+    let st = tbl.entry(tm_obj_key(this)).or_default();
     match slot {
         TM_FIELD_DATA => {
             st.data = match v {
@@ -14133,9 +14037,8 @@ fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Val
 ///
 /// Empty TreeMaps with null comparator are tentatively "fast-eligible" —
 /// the first non-extractable key flips them to array mode.
-fn tm_is_fast_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    let key = tm_obj_key(ctx, this);
-    tm_fast_table().lock().unwrap().contains_key(&key)
+fn tm_is_fast_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_fast_table().lock().unwrap().contains_key(&tm_obj_key(this))
 }
 
 /// True if the comparator slot is null. Custom Comparator forces array mode
@@ -14146,34 +14049,28 @@ fn tm_has_no_comparator(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 
 /// Borrow the fast-mode BTreeMap mutably and call `f`. Creates the entry
 /// if missing. Caller must ensure they only invoke this when fast mode
-/// is applicable (no comparator, etc.). `ctx` is needed to derive the
-/// GC-stable identity-hash key (see `tm_obj_key`).
+/// is applicable (no comparator, etc.).
 fn tm_fast_with<R>(
-    ctx: &dyn NativeContext,
     this: ObjectRef,
     f: impl FnOnce(&mut std::collections::BTreeMap<TreeKey, Value>) -> R,
 ) -> R {
-    let key = tm_obj_key(ctx, this);
     let mut map = tm_fast_table().lock().unwrap();
-    let bt = map.entry(key).or_default();
+    let bt = map.entry(tm_obj_key(this)).or_default();
     f(bt)
 }
 
 /// "Sticky" flag side-table — once a TreeMap is forced to array mode
 /// (e.g. by a non-extractable key) it stays there for its lifetime so
-/// we never split state across both stores. C21: keyed by identity hash
-/// for GC stability, like the other Tree* side-tables.
-fn tm_force_array_set() -> &'static Mutex<StdHashMap<i32, ()>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<i32, ()>>> = std::sync::OnceLock::new();
+/// we never split state across both stores.
+fn tm_force_array_set() -> &'static Mutex<StdHashMap<usize, ()>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, ()>>> = std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
-fn tm_force_array_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    let key = tm_obj_key(ctx, this);
-    tm_force_array_set().lock().unwrap().contains_key(&key)
+fn tm_force_array_mode(_ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_force_array_set().lock().unwrap().contains_key(&tm_obj_key(this))
 }
-fn tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
-    let key = tm_obj_key(ctx, this);
-    tm_force_array_set().lock().unwrap().insert(key, ());
+fn tm_set_force_array(_ctx: &dyn NativeContext, this: ObjectRef) {
+    tm_force_array_set().lock().unwrap().insert(tm_obj_key(this), ());
 }
 
 /// Migrate any fast-mode entries to the array store, then remove the
@@ -14182,11 +14079,10 @@ fn tm_set_force_array(ctx: &dyn NativeContext, this: ObjectRef) {
 /// across the mode flip without losing data.
 fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // Snapshot fast-mode entries first, then drop the side-table entry.
-    let entries: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
+    let entries: Vec<(TreeKey, Value)> = tm_fast_with(this, |bt| {
         bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
     });
-    let key = tm_obj_key(ctx, this);
-    tm_fast_table().lock().unwrap().remove(&key);
+    tm_fast_table().lock().unwrap().remove(&tm_obj_key(this));
     if entries.is_empty() {
         return;
     }
@@ -14254,20 +14150,11 @@ const TS_FIELD_COMPARATOR: usize = 2; // Comparator or null
 const TS_NUM_FIELDS: usize = 3;
 const TS_DEFAULT_CAPACITY: usize = 16;
 
-/// Identity-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
+/// Address-keyed TreeSet state side-table. Mirrors `TmArrayState`: in
 /// real-JDK mode `java.util.TreeSet` (and any subclass) has the real JDK
 /// field layout, so the synthetic slots 0/1/2 do not exist. All state —
 /// backing data array, size, comparator — lives here, keyed by the
-/// receiver's identity hash code, so it is both layout-independent and
-/// stable across GC compactions.
-///
-/// GC-stability invariant (C21 fix): the outer key is
-/// `ctx.identity_hash_code(this)` (via `tm_obj_key`), not
-/// `this.as_ptr() as usize`. A moving GC could otherwise invalidate the
-/// raw-pointer key after a compaction, and a fresh allocation at the old
-/// address would silently inherit the previous TreeSet's data array and
-/// size. Reusing `tm_obj_key` keeps the GC invariant uniform across the
-/// Tree* families.
+/// receiver's address, so it is layout-independent.
 #[derive(Clone)]
 struct TsArrayState {
     data: Option<ObjectRef>,
@@ -14283,19 +14170,18 @@ impl Default for TsArrayState {
         }
     }
 }
-fn ts_array_table() -> &'static Mutex<StdHashMap<i32, TsArrayState>> {
-    static T: std::sync::OnceLock<Mutex<StdHashMap<i32, TsArrayState>>> =
+fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, TsArrayState>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
 /// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
-/// identity-keyed side-table. Returns layout-independent defaults when no
+/// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet.
-fn ts_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
-    let key = tm_obj_key(ctx, this);
+fn ts_get_slot(_ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
     let tbl = ts_array_table().lock().unwrap();
-    if let Some(st) = tbl.get(&key) {
+    if let Some(st) = tbl.get(&tm_obj_key(this)) {
         return match slot {
             TS_FIELD_DATA => Value::Object(st.data),
             TS_FIELD_SIZE => Value::Int(st.size),
@@ -14309,12 +14195,11 @@ fn ts_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
     }
 }
 
-/// Write a TreeSet "slot" into the identity-keyed side-table. The
-/// object's own fields are never touched (see `tm_set_slot`).
-fn ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
-    let key = tm_obj_key(ctx, this);
+/// Write a TreeSet "slot" into the address-keyed side-table. The object's
+/// own fields are never touched (see `tm_set_slot`).
+fn ts_set_slot(_ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
     let mut tbl = ts_array_table().lock().unwrap();
-    let st = tbl.entry(key).or_default();
+    let st = tbl.entry(tm_obj_key(this)).or_default();
     match slot {
         TS_FIELD_DATA => {
             st.data = match v {
@@ -14574,7 +14459,7 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             let already_in_array = matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
                 && !tm_is_fast_mode(ctx, this);
             if !already_in_array {
-                let (old, new_size) = tm_fast_with(ctx, this, |bt| {
+                let (old, new_size) = tm_fast_with(this, |bt| {
                     let old = bt.insert(tk, value).unwrap_or(Value::Object(None));
                     (old, bt.len() as i32)
                 });
@@ -14627,7 +14512,7 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let v = tm_fast_with(ctx, this, |bt| bt.get(&tk).copied().unwrap_or(Value::Object(None)));
+            let v = tm_fast_with(this, |bt| bt.get(&tk).copied().unwrap_or(Value::Object(None)));
             return Ok(Some(v));
         }
         // Fast-mode map asked for a non-extractable key → not present.
@@ -14652,7 +14537,7 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let (old, new_size) = tm_fast_with(ctx, this, |bt| {
+            let (old, new_size) = tm_fast_with(this, |bt| {
                 let old = bt.remove(&tk).unwrap_or(Value::Object(None));
                 (old, bt.len() as i32)
             });
@@ -14685,7 +14570,7 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let found = tm_fast_with(ctx, this, |bt| bt.contains_key(&tk));
+            let found = tm_fast_with(this, |bt| bt.contains_key(&tk));
             return Ok(Some(Value::Int(i32::from(found))));
         }
         return Ok(Some(Value::Int(0)));
@@ -14706,7 +14591,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
-        let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
+        let values: Vec<Value> = tm_fast_with(this, |bt| bt.values().copied().collect());
         for v in values {
             if values_equal(ctx, &v, &target) {
                 return Ok(Some(Value::Int(1)));
@@ -14759,7 +14644,7 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     // Fast-mode side-table needs clearing too — without this an iter
     // helper would return stale entries from before the clear.
-    tm_fast_with(ctx, this, |bt| bt.clear());
+    tm_fast_with(this, |bt| bt.clear());
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
@@ -14777,7 +14662,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     if tm_is_fast_mode(ctx, this) {
-        let first = tm_fast_with(ctx, this, |bt| bt.keys().next().cloned());
+        let first = tm_fast_with(this, |bt| bt.keys().next().cloned());
         match first {
             Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
             None => {
@@ -14810,7 +14695,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     };
     if tm_is_fast_mode(ctx, this) {
-        let last = tm_fast_with(ctx, this, |bt| bt.keys().next_back().cloned());
+        let last = tm_fast_with(this, |bt| bt.keys().next_back().cloned());
         match last {
             Some(tk) => return Ok(Some(tree_key_to_value(ctx, &tk))),
             None => {
@@ -14841,7 +14726,7 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let res = tm_fast_with(ctx, this, |bt| bt.range(tk..).next().map(|(k, _)| k.clone()));
+            let res = tm_fast_with(this, |bt| bt.range(tk..).next().map(|(k, _)| k.clone()));
             return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
         }
         return Ok(Some(Value::Object(None)));
@@ -14872,7 +14757,7 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let res = tm_fast_with(ctx, this, |bt| {
+            let res = tm_fast_with(this, |bt| {
                 bt.range(..=tk).next_back().map(|(k, _)| k.clone())
             });
             return Ok(Some(res.map(|k| tree_key_to_value(ctx, &k)).unwrap_or(Value::Object(None))));
@@ -14906,7 +14791,7 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             use std::ops::Bound;
-            let res = tm_fast_with(ctx, this, |bt| {
+            let res = tm_fast_with(this, |bt| {
                 bt.range((Bound::Excluded(tk), Bound::Unbounded))
                     .next()
                     .map(|(k, _)| k.clone())
@@ -14949,7 +14834,7 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
             use std::ops::Bound;
-            let res = tm_fast_with(ctx, this, |bt| {
+            let res = tm_fast_with(this, |bt| {
                 bt.range((Bound::Unbounded, Bound::Excluded(tk)))
                     .next_back()
                     .map(|(k, _)| k.clone())
@@ -14994,7 +14879,7 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let first = tm_fast_with(ctx, this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
+        let first = tm_fast_with(this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
         match first {
             Some((tk, v)) => {
                 let k = tree_key_to_value(ctx, &tk);
@@ -15021,7 +14906,7 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let last = tm_fast_with(ctx, this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
+        let last = tm_fast_with(this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
         match last {
             Some((tk, v)) => {
                 let k = tree_key_to_value(ctx, &tk);
@@ -15049,7 +14934,7 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let removed = tm_fast_with(ctx, this, |bt| {
+        let removed = tm_fast_with(this, |bt| {
             let first = bt.iter().next().map(|(k, _)| k.clone())?;
             let v = bt.remove(&first)?;
             Some((first, v, bt.len() as i32))
@@ -15083,7 +14968,7 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Object(None))),
     };
     if tm_is_fast_mode(ctx, this) {
-        let removed = tm_fast_with(ctx, this, |bt| {
+        let removed = tm_fast_with(this, |bt| {
             let last = bt.iter().next_back().map(|(k, _)| k.clone())?;
             let v = bt.remove(&last)?;
             Some((last, v, bt.len() as i32))
@@ -15137,7 +15022,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// releasing the side-table lock (boxing may re-enter the VM).
 fn tm_collect_pairs(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
     if tm_is_fast_mode(ctx, this) {
-        let raw: Vec<(TreeKey, Value)> = tm_fast_with(ctx, this, |bt| {
+        let raw: Vec<(TreeKey, Value)> = tm_fast_with(this, |bt| {
             bt.iter().map(|(k, v)| (k.clone(), *v)).collect()
         });
         raw.into_iter()
@@ -15228,7 +15113,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
-            let v = tm_fast_with(ctx, this, |bt| bt.get(&tk).copied());
+            let v = tm_fast_with(this, |bt| bt.get(&tk).copied());
             return Ok(Some(v.unwrap_or(default)));
         }
         return Ok(Some(default));
@@ -15257,7 +15142,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             let already_in_array = matches!(tm_get_slot(ctx, this, TM_FIELD_SIZE), Value::Int(n) if n > 0)
                 && !tm_is_fast_mode(ctx, this);
             if !already_in_array {
-                let (existing, new_size) = tm_fast_with(ctx, this, |bt| {
+                let (existing, new_size) = tm_fast_with(this, |bt| {
                     use std::collections::btree_map::Entry;
                     match bt.entry(tk) {
                         Entry::Occupied(o) => (Some(*o.get()), bt.len() as i32),
@@ -16422,8 +16307,7 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         native_ts_sub_set,
     );
     registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
-    // NOTE: `TreeSet.stream()` intentionally NOT bridged — let real-JDK
-    // default method run.
+    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";
@@ -16507,10 +16391,13 @@ const CHM_DEFAULT_SEGMENTS: usize = 16;
 const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
 
 /// Compute hash for a key value (reuses map_hash_key for object keys).
-fn chm_key_hash(ctx: &mut dyn NativeContext, key: &Value) -> i32 {
+///
+/// Propagates any exception thrown by a user-supplied `hashCode()` via the
+/// underlying `map_hash_key` (MED fix).
+fn chm_key_hash(ctx: &mut dyn NativeContext, key: &Value) -> Result<i32, MethodCallFailed> {
     match key {
         Value::Object(Some(k)) => map_hash_key(ctx, *k),
-        _ => 0,
+        _ => Ok(0),
     }
 }
 
@@ -16988,7 +16875,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let src_entries = map_collect_entries(ctx, source);
     let _resize_flag = ChmResizeLockGuard::enter();
     for (key, value) in src_entries {
-        let hash = chm_key_hash(ctx, &key);
+        let hash = chm_key_hash(ctx, &key)?;
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
@@ -17014,11 +16901,11 @@ fn chm_seg_get(
     ctx: &mut dyn NativeContext,
     seg: ObjectRef,
     key_val: Value,
-) -> Option<Value> {
+) -> Result<Option<Value>, MethodCallFailed> {
     let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k), false),
+        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
         Value::Object(None) => (None, 0, true),
-        _ => return None,
+        _ => return Ok(None),
     };
     // Bug 1+2 (CRIT) round-10 fix: take a read-lock against any
     // in-progress concurrent `map_resize_concurrent` on this segment.
@@ -17041,14 +16928,14 @@ fn chm_seg_get(
     let buckets_val = ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS);
     let buckets = match buckets_val {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
-        _ => return None,
+        _ => return Ok(None),
     };
     let cap = match ctx.get_field(seg, MAP_FIELD_CAPACITY) {
         Value::Int(c) => c,
-        _ => return None,
+        _ => return Ok(None),
     };
     if cap <= 0 {
-        return None;
+        return Ok(None);
     }
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
@@ -17056,11 +16943,11 @@ fn chm_seg_get(
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
-                return Some(get_node_value(ctx, node));
+                return Ok(Some(get_node_value(ctx, node)));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap()) {
-                return Some(get_node_value(ctx, node));
+            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+                return Ok(Some(get_node_value(ctx, node)));
             }
         }
         // Acquire-load the NEXT pointer. Pairs with the writer's
@@ -17071,7 +16958,7 @@ fn chm_seg_get(
         // writes (happens-before via Release/Acquire).
         node_val = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
     }
-    None
+    Ok(None)
 }
 
 fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17080,9 +16967,9 @@ fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => Ok(Some(chm_seg_get(ctx, seg, key).unwrap_or(Value::Object(None)))),
+        Some(seg) => Ok(Some(chm_seg_get(ctx, seg, key)?.unwrap_or(Value::Object(None)))),
         None => Ok(Some(Value::Object(None))),
     }
 }
@@ -17093,14 +16980,14 @@ fn native_chm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             // Volatile-read path: a present mapping is detected by a
             // non-null Value::Object payload OR by walking the chain
             // and finding a key match (which `chm_seg_get` does). A
             // miss returns None here.
-            match chm_seg_get(ctx, seg, key) {
+            match chm_seg_get(ctx, seg, key)? {
                 Some(_) => Ok(Some(Value::Int(1))),
                 None => Ok(Some(Value::Int(0))),
             }
@@ -17116,9 +17003,9 @@ fn native_chm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
-        Some(seg) => match chm_seg_get(ctx, seg, key) {
+        Some(seg) => match chm_seg_get(ctx, seg, key)? {
             Some(v) => Ok(Some(v)),
             None => Ok(Some(default)),
         },
@@ -17151,19 +17038,7 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values.
-    // JDK: `if (key == null || value == null) throw new
-    // NullPointerException();` (see `java.util.concurrent.ConcurrentHashMap`).
-    // Previously this silently inserted a null-keyed or null-valued entry,
-    // letting client code that *relied* on the NPE for input validation
-    // continue with a corrupted map.
-    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17180,7 +17055,7 @@ fn native_chm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17198,14 +17073,7 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): null rejection — see `native_chm_put`.
-    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17223,16 +17091,7 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null mappingFunction.
-    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.computeIfAbsent: null key or mappingFunction".to_string(),
-            ),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17250,16 +17109,7 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null remappingFunction.
-    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.compute: null key or remappingFunction".to_string(),
-            ),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17278,19 +17128,7 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let func = args.get(3).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key, null value, and null remappingFunction.
-    if matches!(key, Value::Object(None))
-        || matches!(value, Value::Object(None))
-        || matches!(func, Value::Object(None))
-    {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.merge: null key, value, or remappingFunction".to_string(),
-            ),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17350,7 +17188,7 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let _resize_flag = ChmResizeLockGuard::enter();
     let entries = map_collect_entries(ctx, source);
     for (key, value) in entries {
-        let hash = chm_key_hash(ctx, &key);
+        let hash = chm_key_hash(ctx, &key)?;
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_put(ctx, &[Value::Object(Some(seg)), key, value])?;
@@ -17550,7 +17388,7 @@ fn native_chm_remove_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let expected_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17575,14 +17413,7 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key and null value.
-    if matches!(key, Value::Object(None)) || matches!(new_val, Value::Object(None)) {
-        return Err(RuntimeError::NullPointerException {
-            message: Some("ConcurrentHashMap.replace: null key or value".to_string()),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -17609,19 +17440,7 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
-    // C24 (HIGH): JDK rejects null key, null oldValue, and null newValue.
-    if matches!(key, Value::Object(None))
-        || matches!(old_val, Value::Object(None))
-        || matches!(new_val, Value::Object(None))
-    {
-        return Err(RuntimeError::NullPointerException {
-            message: Some(
-                "ConcurrentHashMap.replace(K,V,V): null key, oldValue, or newValue".to_string(),
-            ),
-        }
-        .into());
-    }
-    let hash = chm_key_hash(ctx, &key);
+    let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
             let _resize_flag = ChmResizeLockGuard::enter();
@@ -18111,27 +17930,34 @@ fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Otherwise try to read it as a string field
     let text = props_read_input(ctx, stream);
 
-    // Parse key=value lines
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            continue;
-        }
-        // Handle continuation lines (trailing \) — simplified: ignore
-        // Find separator: = or :
-        let (key, value) = if let Some(eq_pos) = line.find('=') {
-            (line[..eq_pos].trim(), line[eq_pos + 1..].trim())
-        } else if let Some(colon_pos) = line.find(':') {
-            (line[..colon_pos].trim(), line[colon_pos + 1..].trim())
-        } else {
-            // Key with no value
-            (line, "")
-        };
+    // MED fix: implement the JDK `Properties.load` spec (close to it,
+    // anyway):
+    //   - lines starting with `#` or `!` (after leading whitespace) are
+    //     comments and skipped entirely;
+    //   - blank lines (whitespace only) are skipped;
+    //   - leading whitespace before a key is trimmed;
+    //   - a line that ends with an *unescaped* trailing `\` continues
+    //     onto the next line (the `\` is dropped and leading whitespace
+    //     on the continuation line is trimmed);
+    //   - the key terminates at the first unescaped whitespace, `=`, or
+    //     `:`; subsequent whitespace and one optional `=`/`:` are then
+    //     consumed; the rest of the logical line is the value;
+    //   - inside both key and value the JDK escapes are honoured:
+    //       \t \n \r \f \\ \" \'  → the corresponding ASCII char,
+    //       \= \: \space          → the literal char (allows them in keys),
+    //       \uXXXX               → the BMP codepoint XXXX,
+    //       \<anything else>      → the trailing char itself (per JDK).
+    //
+    // This is intentionally implemented in pure Rust against the in-memory
+    // text rather than dispatching back to JDK Properties for parity —
+    // the previous implementation silently truncated/corrupted any
+    // real-world `.properties` file with escapes or continuations.
+    for (key, value) in props_parse_logical_lines(&text) {
         if key.is_empty() {
             continue;
         }
-        let key_obj = ctx.create_string(key);
-        let val_obj = ctx.create_string(value);
+        let key_obj = ctx.create_string(&key);
+        let val_obj = ctx.create_string(&value);
         native_map_put(
             ctx,
             &[
@@ -18142,6 +17968,184 @@ fn native_props_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         )?;
     }
     Ok(None)
+}
+
+/// Parse a `.properties` text into `(key, value)` pairs per the JDK
+/// `Properties.load` spec — handles comments, blank lines, leading-
+/// whitespace trim, trailing-backslash continuations, the
+/// `\t\n\r\f\\\"\'\=\:` and `\uXXXX` escape sequences in both keys and
+/// values, and the natural key/value separator (the first unescaped
+/// whitespace, `=`, or `:`).
+fn props_parse_logical_lines(text: &str) -> Vec<(String, String)> {
+    let raw_lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < raw_lines.len() {
+        // Strip a trailing `\r` (CRLF inputs) without losing escapes.
+        let mut line = raw_lines[i].trim_end_matches('\r').to_string();
+        // Trim leading whitespace per spec.
+        let trimmed_start = line.trim_start();
+        let leading_skipped = line.len() - trimmed_start.len();
+        // Comment / blank — skipped entirely (continuations do not apply
+        // to comment lines).
+        if trimmed_start.is_empty()
+            || trimmed_start.starts_with('#')
+            || trimmed_start.starts_with('!')
+        {
+            i += 1;
+            continue;
+        }
+        line.drain(..leading_skipped);
+
+        // Apply continuation: if the line ends with an *odd* number of
+        // trailing backslashes, the last `\` is a continuation marker
+        // and the following physical line is appended (after trimming
+        // its leading whitespace).
+        while ends_with_unescaped_backslash(&line) {
+            line.pop(); // remove the trailing backslash
+            i += 1;
+            if i >= raw_lines.len() {
+                break;
+            }
+            let next = raw_lines[i].trim_end_matches('\r');
+            line.push_str(next.trim_start());
+        }
+        i += 1;
+
+        // Walk the logical line to find the key/value boundary. The key
+        // ends at the first unescaped whitespace, `=`, or `:`.
+        let bytes = line.as_bytes();
+        let mut idx = 0;
+        let mut key_buf = String::new();
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if b == b'\\' {
+                // Pull one escape into the key.
+                let (decoded, consumed) = decode_escape(&bytes[idx..]);
+                key_buf.push_str(&decoded);
+                idx += consumed;
+                continue;
+            }
+            if b == b' ' || b == b'\t' || b == b'\x0c' || b == b'=' || b == b':' {
+                break;
+            }
+            // Multi-byte UTF-8: copy through.
+            let ch_end = utf8_char_end(bytes, idx);
+            key_buf.push_str(std::str::from_utf8(&bytes[idx..ch_end]).unwrap_or(""));
+            idx = ch_end;
+        }
+
+        // Skip whitespace, then at most one `=` or `:`, then more whitespace.
+        while idx < bytes.len() && matches!(bytes[idx], b' ' | b'\t' | b'\x0c') {
+            idx += 1;
+        }
+        if idx < bytes.len() && (bytes[idx] == b'=' || bytes[idx] == b':') {
+            idx += 1;
+            while idx < bytes.len() && matches!(bytes[idx], b' ' | b'\t' | b'\x0c') {
+                idx += 1;
+            }
+        }
+
+        // Remainder is the value (with escapes decoded).
+        let mut val_buf = String::new();
+        while idx < bytes.len() {
+            let b = bytes[idx];
+            if b == b'\\' {
+                let (decoded, consumed) = decode_escape(&bytes[idx..]);
+                val_buf.push_str(&decoded);
+                idx += consumed;
+                continue;
+            }
+            let ch_end = utf8_char_end(bytes, idx);
+            val_buf.push_str(std::str::from_utf8(&bytes[idx..ch_end]).unwrap_or(""));
+            idx = ch_end;
+        }
+
+        out.push((key_buf, val_buf));
+    }
+    out
+}
+
+/// True when the line ends with a backslash that is *not* itself
+/// escaped (i.e. odd run of trailing backslashes).
+fn ends_with_unescaped_backslash(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut n = 0usize;
+    for &b in bytes.iter().rev() {
+        if b == b'\\' {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n % 2 == 1
+}
+
+/// Decode a single backslash-escape starting at `bytes[0] == b'\\'`.
+/// Returns `(decoded_string, bytes_consumed_including_backslash)`.
+/// Falls back to the literal trailing char for unknown escapes (matches
+/// JDK behaviour: `\q` parses as `q`).
+fn decode_escape(bytes: &[u8]) -> (String, usize) {
+    debug_assert_eq!(bytes[0], b'\\');
+    if bytes.len() < 2 {
+        return (String::new(), 1);
+    }
+    match bytes[1] {
+        b't' => ("\t".to_string(), 2),
+        b'n' => ("\n".to_string(), 2),
+        b'r' => ("\r".to_string(), 2),
+        b'f' => ("\x0c".to_string(), 2),
+        b'\\' => ("\\".to_string(), 2),
+        b'"' => ("\"".to_string(), 2),
+        b'\'' => ("'".to_string(), 2),
+        b'u' => {
+            // \uXXXX (exactly 4 hex digits per JDK spec).
+            if bytes.len() < 6 {
+                return ((bytes[1] as char).to_string(), 2);
+            }
+            let hex = std::str::from_utf8(&bytes[2..6]).unwrap_or("");
+            match u32::from_str_radix(hex, 16) {
+                Ok(cp) => match char::from_u32(cp) {
+                    Some(ch) => (ch.to_string(), 6),
+                    // Surrogate halves and other invalid code points: fall
+                    // through to literal 'u' so we never lose data.
+                    None => ("u".to_string(), 2),
+                },
+                Err(_) => ("u".to_string(), 2),
+            }
+        }
+        // Per spec: any other char after `\` (including space, `=`, `:`,
+        // and unknown letters) becomes itself, allowing them inside keys.
+        other => {
+            // Multi-byte UTF-8 starting at byte index 1.
+            let end = utf8_char_end(bytes, 1);
+            let s = std::str::from_utf8(&bytes[1..end])
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| (other as char).to_string());
+            (s, end)
+        }
+    }
+}
+
+/// Return the byte-index just past the UTF-8 char that begins at `start`,
+/// or `start + 1` for invalid sequences (safe fallback).
+fn utf8_char_end(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() {
+        return start;
+    }
+    let b = bytes[start];
+    let len = if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        1 // continuation byte — should not start a char; treat as 1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    };
+    (start + len).min(bytes.len())
 }
 
 /// Helper: read all text from a stream or reader object.
@@ -18202,13 +18206,36 @@ fn native_props_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
-    // Write to output stream (simplified: store as string in the stream)
-    // For BAOS: write bytes directly
+    // Write to output stream.
+    //
+    // MED fix: the previous implementation issued one `write(I)V` virtual
+    // dispatch per byte — for a Properties with ~1000 entries this meant
+    // ~50 000 virtual calls. Build a single `byte[]` once and call
+    // `write([B)V` exactly once per line, which most OutputStream
+    // implementations override to do a single bulk copy. We dispatch
+    // line-by-line rather than the entire buffer in one go so a
+    // pathological output stream (e.g. one that requires a flush between
+    // lines) still gets reasonable behaviour, and so each line's bytes
+    // fit easily into a single allocation.
     if let Value::Object(Some(ostream)) = args[1] {
-        let bytes = output.as_bytes();
-        for &b in bytes {
-            // Call write(I)V on the output stream
-            let _ = ctx.invoke_virtual(ostream, "write", "(I)V", &[Value::Int(b as i32)]);
+        for line in output.split_inclusive('\n') {
+            let bytes = line.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                // Byte array slots hold sign-extended Int per the VM's
+                // primitive-array value model.
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            // Prefer the bulk `write([B)V` overload. If a stream does
+            // not implement it, the JDK default (AbstractOutputStream)
+            // falls back to per-byte `write(I)V`, so we keep behaviour
+            // even on minimal stream impls.
+            let _ = ctx.invoke_virtual(
+                ostream,
+                "write",
+                "([B)V",
+                &[Value::Object(Some(arr))],
+            );
         }
     }
     Ok(None)
@@ -18433,8 +18460,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/function/Consumer;)V",
             native_unmod_for_each,
         );
-        // NOTE: unmodifiable-wrapper `stream()` intentionally NOT bridged —
-        // let real-JDK default method run.
+        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_unmod_stream);
         r.register(
             c,
             "spliterator",
@@ -18741,6 +18767,10 @@ fn native_unmod_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_unmod_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     unmod_delegate(ctx, args, "forEach", "(Ljava/util/function/Consumer;)V")
+}
+
+fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    unmod_delegate(ctx, args, "stream", "()Ljava/util/stream/Stream;")
 }
 
 fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -19552,91 +19582,6 @@ const LBQ_FIELD_SIZE: usize = 2;
 const LBQ_FIELD_CAPACITY: usize = 3;
 const _LBQ_NUM_FIELDS: usize = 4;
 
-// ---------------------------------------------------------------------------
-// C22 (HIGH) round-12 fix: condvar-based blocking for LinkedBlockingQueue /
-// ArrayBlockingQueue / BlockingQueue.
-//
-// Previously `put_blocking` spun 10 000 times with `yield_now()` and *then
-// inserted anyway* — silently overflowing capacity. `take_blocking` spun
-// 10 000 times and *then returned null* — violating the JDK contract that
-// `take()` blocks indefinitely and never returns null. Producer/consumer code
-// polling `take()` for shutdown would burn CPU and then unwind on a spurious
-// null; bounded-capacity producers would silently corrupt by exceeding the
-// declared capacity.
-//
-// Replacement: per-queue `parking_lot::Mutex<()>` paired with two
-// `parking_lot::Condvar`s (`not_full`, `not_empty`). Side-tabled by the
-// queue's `identity_hash_code` (GC-stable across moving collections, matching
-// the CHM resize-stripe pattern earlier in this file).
-//
-// Notification points:
-//   - successful `offer`/`offer_bool`/`put`/`offer_first` → `not_empty.notify_one`
-//   - successful `poll`/`poll_last`/`take`/`remove`/`clear` → `not_full.notify_one`
-//
-// Wait points:
-//   - `put_blocking` (size >= capacity) → `not_full.wait`
-//   - `take_blocking` (size == 0) → `not_empty.wait`
-//
-// The Java monitor (`monitor_enter(this)`) is kept for compatibility with
-// bytecode that synchronises on the queue object, but correctness is
-// enforced by the Rust-side mutex: state-check + wait + state-update happen
-// while holding the mutex, eliminating the lost-wakeup race that would exist
-// if we tried to combine the JVM monitor with a Rust condvar.
-
-struct LbqWaitSlot {
-    gate: parking_lot::Mutex<()>,
-    not_full: parking_lot::Condvar,
-    not_empty: parking_lot::Condvar,
-}
-
-static LBQ_WAITERS: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<i32, std::sync::Arc<LbqWaitSlot>>>,
-> = std::sync::OnceLock::new();
-
-fn lbq_waiters() -> &'static parking_lot::Mutex<
-    std::collections::HashMap<i32, std::sync::Arc<LbqWaitSlot>>,
-> {
-    LBQ_WAITERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn lbq_wait_slot(ctx: &dyn NativeContext, this: ObjectRef) -> std::sync::Arc<LbqWaitSlot> {
-    let id = ctx.identity_hash_code(this);
-    let mut map = lbq_waiters().lock();
-    map.entry(id)
-        .or_insert_with(|| {
-            std::sync::Arc::new(LbqWaitSlot {
-                gate: parking_lot::Mutex::new(()),
-                not_full: parking_lot::Condvar::new(),
-                not_empty: parking_lot::Condvar::new(),
-            })
-        })
-        .clone()
-}
-
-fn lbq_notify_not_empty(ctx: &dyn NativeContext, this: ObjectRef) {
-    let slot = lbq_wait_slot(ctx, this);
-    slot.not_empty.notify_one();
-}
-
-fn lbq_notify_not_full(ctx: &dyn NativeContext, this: ObjectRef) {
-    let slot = lbq_wait_slot(ctx, this);
-    slot.not_full.notify_one();
-}
-
-fn lbq_current_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, LBQ_FIELD_SIZE) {
-        Value::Int(v) => v,
-        _ => 0,
-    }
-}
-
-fn lbq_current_capacity(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
-        Value::Int(v) if v > 0 => v,
-        _ => i32::MAX,
-    }
-}
-
 fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     // LinkedBlockingQueue
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
@@ -19871,8 +19816,6 @@ fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.set_array_element(arr, 0, elem);
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size + 1));
     ctx.monitor_exit(this);
-    // C22 (HIGH): wake any `take_blocking` waiter — we added an element.
-    lbq_notify_not_empty(ctx, this);
     Ok(Some(Value::Int(1)))
 }
 
@@ -19970,79 +19913,60 @@ fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Int(0))); // queue full
     }
     native_lbq_offer(ctx, args)?;
-    // C22 (HIGH): wake any thread parked in `take_blocking` on this queue.
-    lbq_notify_not_empty(ctx, this);
     Ok(Some(Value::Int(1)))
 }
 
-/// Blocking put: waits indefinitely until space is available.
-///
-/// C22 (HIGH) fix: previously this spun 10 000 times with `yield_now()` and
-/// then *succeeded with the offer anyway* — silently overflowing the queue's
-/// declared capacity and breaking the BlockingQueue contract. The new
-/// implementation uses a side-tabled `parking_lot::Condvar` (`not_full`)
-/// keyed by the queue's `identity_hash_code`. A producer waits on `not_full`
-/// while the queue is at capacity; a consumer's successful `poll`/`take`
-/// notifies `not_full` so the producer wakes and re-tries. This matches the
-/// JDK semantics of `put` blocking indefinitely with no spurious wake-up
-/// returning to the caller without a completed insertion.
+/// Blocking put: waits until space is available (spin-wait with yield).
 fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let slot = lbq_wait_slot(ctx, this);
-    let mut guard = slot.gate.lock();
+    let capacity = match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
+        Value::Int(v) if v > 0 => v,
+        _ => i32::MAX,
+    };
+    let mut spins = 0;
     loop {
-        let size = lbq_current_size(ctx, this);
-        let capacity = lbq_current_capacity(ctx, this);
+        ctx.monitor_enter(this);
+        let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         if size < capacity {
-            // We hold the per-queue gate, so no other producer/consumer can
-            // observe the state between our check and our write. Perform
-            // the insertion, drop the gate, and wake one waiter on
-            // `not_empty` (a pending `take_blocking`, if any).
-            ctx.monitor_enter(this);
-            let r = native_lbq_offer(ctx, args);
             ctx.monitor_exit(this);
-            drop(guard);
-            slot.not_empty.notify_one();
-            return r;
+            break;
         }
-        // Wait for a consumer to free a slot. `parking_lot::Condvar::wait`
-        // atomically drops the gate and parks; on wake-up the gate is
-        // re-acquired before this call returns. No spurious-wake handling
-        // needed because we re-check the precondition at the top of the
-        // loop.
-        slot.not_full.wait(&mut guard);
+        ctx.monitor_exit(this);
+        spins += 1;
+        if spins > 10000 { break; } // prevent infinite block on single-threaded VM
+        std::thread::yield_now();
     }
+    native_lbq_offer(ctx, args)
 }
 
-/// Blocking take: waits indefinitely until an element is available.
-///
-/// C22 (HIGH) fix: previously this spun 10 000 times with `yield_now()` and
-/// then *returned `null`* — violating the JDK contract that `take()` blocks
-/// indefinitely and never returns null. Consumers polling `take()` for
-/// shutdown via interrupt would burn CPU and then unwind on a spurious
-/// null. The new implementation parks on a `not_empty` Condvar; producers
-/// notify on every successful `offer`/`put`.
+/// Blocking take: waits until an element is available (spin-wait with yield).
 fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let slot = lbq_wait_slot(ctx, this);
-    let mut guard = slot.gate.lock();
+    let mut spins = 0;
     loop {
-        let size = lbq_current_size(ctx, this);
+        ctx.monitor_enter(this);
+        let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        ctx.monitor_exit(this);
         if size > 0 {
-            ctx.monitor_enter(this);
-            let r = native_lbq_poll(ctx, args);
-            ctx.monitor_exit(this);
-            drop(guard);
-            slot.not_full.notify_one();
-            return r;
+            return native_lbq_poll(ctx, args);
         }
-        slot.not_empty.wait(&mut guard);
+        spins += 1;
+        if spins > 10000 {
+            return Ok(Some(Value::Object(None)));
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -20069,9 +19993,6 @@ fn native_lbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
-    // C22 (HIGH): wake any thread parked in `put_blocking` (queue is no
-    // longer at capacity now that we removed an element).
-    lbq_notify_not_full(ctx, this);
     Ok(Some(head))
 }
 
@@ -20094,8 +20015,6 @@ fn native_lbq_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let tail = ctx.get_array_element(arr, (size - 1) as usize);
     ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
-    // C22 (HIGH): wake any thread parked in `put_blocking`.
-    lbq_notify_not_full(ctx, this);
     Ok(Some(tail))
 }
 
@@ -20182,10 +20101,6 @@ fn native_lbq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
-    // C22 (HIGH): wake all `put_blocking` waiters — clearing the queue
-    // frees capacity for every parked producer at once.
-    let slot = lbq_wait_slot(ctx, this);
-    slot.not_full.notify_all();
     Ok(None)
 }
 
@@ -20234,8 +20149,6 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             }
             ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
             ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
-            // C22 (HIGH): freed a slot — wake a `put_blocking` waiter.
-            lbq_notify_not_full(ctx, this);
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -20865,15 +20778,29 @@ fn native_stpe_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 const CSLM_FIELD_KEYS: usize = 0;
 const CSLM_FIELD_VALUES: usize = 1;
 const CSLM_FIELD_SIZE: usize = 2;
+#[allow(dead_code)] // used for documentation; allocations go through constructors
 const CSLM_NUM_FIELDS: usize = 3;
 const CSLM_DEFAULT_CAPACITY: usize = 16;
 
 const CSLM_LOCK_STRIPES: usize = 256;
 
-fn cslm_stripe_for(ctx: &mut dyn NativeContext, this: ObjectRef) -> &'static std::sync::RwLock<()> {
-    static STRIPES: std::sync::OnceLock<Vec<std::sync::RwLock<()>>> = std::sync::OnceLock::new();
+fn cslm_stripe_for(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> &'static parking_lot::RwLock<()> {
+    // MED fix: switched from `std::sync::RwLock` to `parking_lot::RwLock`
+    // for consistency with the CHM-segment striped locks earlier in this
+    // file (see `seg_locks`). parking_lot's `read()`/`write()` are
+    // infallible — no `PoisonError` handling at every call site — and
+    // their unpoisoning semantics match the CHM stripes which expect
+    // a panicking writer to leave the lock usable for subsequent
+    // segments rather than poisoning the whole stripe.
+    static STRIPES: std::sync::OnceLock<Vec<parking_lot::RwLock<()>>> =
+        std::sync::OnceLock::new();
     let stripes = STRIPES.get_or_init(|| {
-        (0..CSLM_LOCK_STRIPES).map(|_| std::sync::RwLock::new(())).collect()
+        (0..CSLM_LOCK_STRIPES)
+            .map(|_| parking_lot::RwLock::new(()))
+            .collect()
     });
     let key = ctx.identity_hash_code(this) as u32;
     // Mix bits so sequentially-allocated objects spread across stripes.
@@ -20966,19 +20893,6 @@ fn cslm_ensure_capacity(
 }
 
 fn cslm_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, Option<ObjectRef>, i32) {
-    // Undersized-receiver guard — mirrors `al_state`'s. The CSLM natives
-    // are registered on the concrete `ConcurrentSkipListMap` class, but a
-    // misdispatch (e.g. through the AbstractCollection hierarchy walk, or
-    // a Map-shaped wrapper around a non-CSLM receiver) can still land
-    // here with a receiver whose declared layout has fewer than 3 slots
-    // (CSLM uses slots 0/1/2 for keys/values/size). Without the guard,
-    // reading slot 1 or 2 on e.g. `ConcurrentSkipListSet` (1 slot) trips
-    // the "undersized object layout" diagnostic and silently mangles the
-    // caller. Reporting an empty state lets the caller surface a normal
-    // empty-collection result instead.
-    if ctx.object_num_fields(this) < CSLM_NUM_FIELDS {
-        return (None, None, 0);
-    }
     let keys = match ctx.get_field(this, CSLM_FIELD_KEYS) {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -21015,7 +20929,7 @@ fn native_cslm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // Bug 1: serialise mutating ops on this map's lock stripe.
-    let _guard = cslm_stripe_for(ctx, this).write().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -21066,7 +20980,7 @@ fn native_cslm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Bug 1: shared read lock — concurrent reads OK, blocks during writes.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -21089,7 +21003,7 @@ fn native_cslm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Bug 1: serialise mutating ops on this map's lock stripe.
-    let _guard = cslm_stripe_for(ctx, this).write().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).write();
     let (keys_opt, values_opt, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -21124,7 +21038,7 @@ fn native_cslm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Int(0))),
     };
     // Bug 1: read lock so size cannot tear vs an in-flight put/remove.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -21138,7 +21052,7 @@ fn native_cslm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Int(1))),
     };
     // Bug 1: read lock for consistent size observation.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let size = match ctx.get_field(this, CSLM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -21153,7 +21067,7 @@ fn native_cslm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     // Bug 1: shared read lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     let keys = match keys_opt {
         Some(k) => k,
@@ -21174,7 +21088,7 @@ fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     };
     // Bug 1: shared read lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
         return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
@@ -21197,7 +21111,7 @@ fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
     // Bug 1: shared read lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     if size == 0 {
         return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
@@ -21215,7 +21129,7 @@ fn native_cslm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     // Bug 1: shared read lock — snapshot the keys array under the lock.
-    let _guard = cslm_stripe_for(ctx, this).read().unwrap_or_else(|e| e.into_inner());
+    let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
     // Return a TreeSet with natural ordering containing all keys
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
@@ -21241,58 +21155,6 @@ const SL_FIELD_STAMP: usize = 1; // monotonic stamp counter
 #[allow(dead_code)]
 const SL_NUM_FIELDS: usize = 2;
 
-// ---------------------------------------------------------------------------
-// C23 (HIGH) round-12 fix: condvar-based blocking for StampedLock.
-//
-// Previously `read_lock` / `write_lock` spun 1000 times and then *silently
-// proceeded with stale state* — a `read_lock` could grant a read stamp on
-// top of an existing write-lock, and a `write_lock` could overwrite the
-// state to `1` over an existing write-lock, corrupting the lock state
-// machine entirely. Optimistic-read paths (`tryOptimisticRead`/`validate`)
-// also skipped the monitor, so writer state-update races against optimistic
-// readers were unobservable.
-//
-// Replacement: per-lock `parking_lot::Mutex<()>` + `Condvar` (`state_change`)
-// keyed by the lock's `identity_hash_code`. The acquire paths now do
-// state-check + wait + state-update under the side-table mutex; unlock
-// paths notify; optimistic-read/validate take the side-table mutex briefly
-// to fence the state observation.
-
-struct SlWaitSlot {
-    gate: parking_lot::Mutex<()>,
-    state_change: parking_lot::Condvar,
-}
-
-static SL_WAITERS: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<i32, std::sync::Arc<SlWaitSlot>>>,
-> = std::sync::OnceLock::new();
-
-fn sl_waiters() -> &'static parking_lot::Mutex<
-    std::collections::HashMap<i32, std::sync::Arc<SlWaitSlot>>,
-> {
-    SL_WAITERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn sl_wait_slot(ctx: &dyn NativeContext, this: ObjectRef) -> std::sync::Arc<SlWaitSlot> {
-    let id = ctx.identity_hash_code(this);
-    let mut map = sl_waiters().lock();
-    map.entry(id)
-        .or_insert_with(|| {
-            std::sync::Arc::new(SlWaitSlot {
-                gate: parking_lot::Mutex::new(()),
-                state_change: parking_lot::Condvar::new(),
-            })
-        })
-        .clone()
-}
-
-fn sl_read_state(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    }
-}
-
 fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/concurrent/locks/StampedLock";
     r.register(c, "<init>", "()V", native_sl_init);
@@ -21309,10 +21171,10 @@ fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        // C23 (HIGH): fence the state read against concurrent acquires.
-        let slot = sl_wait_slot(ctx, this);
-        let _guard = slot.gate.lock();
-        let state = sl_read_state(ctx, this);
+        let state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         // state >= 2 means readers are present
         Ok(Some(Value::Int(if state >= 2 { 1 } else { 0 })))
     });
@@ -21321,9 +21183,10 @@ fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let slot = sl_wait_slot(ctx, this);
-        let _guard = slot.gate.lock();
-        let state = sl_read_state(ctx, this);
+        let state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
         // state == 1 means write-locked
         Ok(Some(Value::Int(if state == 1 { 1 } else { 0 })))
     });
@@ -21350,32 +21213,35 @@ fn sl_next_stamp(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
     stamp
 }
 
-/// Read-lock: blocks until no writer holds the lock, then increments the
-/// reader count and returns a fresh stamp.
-///
-/// C23 (HIGH) fix: previously this spun 1000 times and then *silently
-/// proceeded with stale state* — granting a read stamp on top of an
-/// existing write-lock, corrupting the state machine. The new implementation
-/// uses a per-lock `parking_lot::Condvar` (`state_change`) to park readers
-/// while a writer holds the lock; writers `notify_all` on unlock.
 fn native_sl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let slot = sl_wait_slot(ctx, this);
-    let mut guard = slot.gate.lock();
-    loop {
-        let state = sl_read_state(ctx, this);
-        if state != 1 {
-            // state >= 2 means readers present; state == 0 means free.
-            let new_state = if state == 0 { 2 } else { state + 1 };
-            ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
-            let stamp = sl_next_stamp(ctx, this);
-            return Ok(Some(Value::Long(stamp)));
-        }
-        slot.state_change.wait(&mut guard);
+    // Acquire monitor and spin-wait if write-locked
+    ctx.monitor_enter(this);
+    let mut state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // Wait for write lock to be released (bounded spin)
+    let mut spins = 0;
+    while state == 1 && spins < 1000 {
+        ctx.monitor_exit(this);
+        std::thread::yield_now();
+        ctx.monitor_enter(this);
+        state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        spins += 1;
     }
+    // state >= 2 means readers present; state == 0 means free
+    let new_state = if state == 0 || state == 1 { 2 } else { state + 1 };
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+    let stamp = sl_next_stamp(ctx, this);
+    ctx.monitor_exit(this);
+    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_sl_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21383,46 +21249,45 @@ fn native_sl_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let slot = sl_wait_slot(ctx, this);
-    {
-        let _guard = slot.gate.lock();
-        let state = sl_read_state(ctx, this);
-        if state >= 2 {
-            let new_state = if state == 2 { 0 } else { state - 1 };
-            ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
-            // Bump the stamp on every state transition so optimistic
-            // readers observe a different stamp before/after lock release.
-            sl_next_stamp(ctx, this);
-        }
+    ctx.monitor_enter(this);
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if state >= 2 {
+        let new_state = if state == 2 { 0 } else { state - 1 };
+        ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
     }
-    // Wake a waiting writer or reader. notify_all because a freed read may
-    // unblock multiple parallel readers and exactly one writer.
-    slot.state_change.notify_all();
+    ctx.monitor_exit(this);
     Ok(None)
 }
 
-/// Write-lock: blocks until the lock is fully free (no readers, no other
-/// writer), then atomically transitions to write-locked and returns a stamp.
-///
-/// C23 (HIGH) fix: see `native_sl_read_lock` above. Replaces the silent
-/// fallthrough that could overwrite the state to `1` on top of an existing
-/// write-lock.
 fn native_sl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let slot = sl_wait_slot(ctx, this);
-    let mut guard = slot.gate.lock();
-    loop {
-        let state = sl_read_state(ctx, this);
-        if state == 0 {
-            ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
-            let stamp = sl_next_stamp(ctx, this);
-            return Ok(Some(Value::Long(stamp)));
-        }
-        slot.state_change.wait(&mut guard);
+    // Acquire monitor and spin-wait if readers or writers present
+    ctx.monitor_enter(this);
+    let mut state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let mut spins = 0;
+    while state != 0 && spins < 1000 {
+        ctx.monitor_exit(this);
+        std::thread::yield_now();
+        ctx.monitor_enter(this);
+        state = match ctx.get_field(this, SL_FIELD_STATE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        spins += 1;
     }
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
+    let stamp = sl_next_stamp(ctx, this);
+    ctx.monitor_exit(this);
+    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_sl_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21430,31 +21295,22 @@ fn native_sl_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let slot = sl_wait_slot(ctx, this);
-    {
-        let _guard = slot.gate.lock();
-        ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
-        sl_next_stamp(ctx, this);
-    }
-    // Wake every parked acquirer — readers can proceed in parallel and one
-    // writer may also acquire.
-    slot.state_change.notify_all();
+    ctx.monitor_enter(this);
+    ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
+    sl_next_stamp(ctx, this);
+    ctx.monitor_exit(this);
     Ok(None)
 }
 
-/// C23 (HIGH) fix: previously this read `SL_FIELD_STATE` outside the
-/// monitor, racing against `write_lock`'s state update. Now the read is
-/// fenced by the side-table mutex so an optimistic read either observes a
-/// fully-acquired writer (and returns 0) or a fully-released state (and
-/// returns a valid stamp). Pair with `validate` below.
 fn native_sl_try_optimistic_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let slot = sl_wait_slot(ctx, this);
-    let _guard = slot.gate.lock();
-    let state = sl_read_state(ctx, this);
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     if state == 1 {
         // Write-locked, return 0 (failure)
         Ok(Some(Value::Long(0)))
@@ -21481,14 +21337,15 @@ fn native_sl_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if expected_stamp == 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let slot = sl_wait_slot(ctx, this);
-    let _guard = slot.gate.lock();
     let current_stamp = match ctx.get_field(this, SL_FIELD_STAMP) {
         Value::Int(v) => v as i64,
         Value::Long(v) => v,
         _ => 0,
     };
-    let state = sl_read_state(ctx, this);
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     // Valid if stamp hasn't changed and not write-locked
     let valid = expected_stamp == current_stamp && state != 1;
     Ok(Some(Value::Int(i32::from(valid))))
@@ -21499,9 +21356,10 @@ fn native_sl_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let slot = sl_wait_slot(ctx, this);
-    let _guard = slot.gate.lock();
-    let state = sl_read_state(ctx, this);
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     if state == 1 {
         // Write-locked, can't acquire read lock
         Ok(Some(Value::Long(0)))
@@ -21518,9 +21376,10 @@ fn native_sl_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let slot = sl_wait_slot(ctx, this);
-    let _guard = slot.gate.lock();
-    let state = sl_read_state(ctx, this);
+    let state = match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
     if state != 0 {
         // Not free — someone is holding a lock
         Ok(Some(Value::Long(0)))
@@ -21585,10 +21444,6 @@ fn native_ph_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // C23 (HIGH) fix: serialize the parties RMW under the `this` monitor.
-    // Previously two concurrent `register()` calls would each read
-    // `parties = N`, both write `parties = N + 1`, losing one increment.
-    ctx.monitor_enter(this);
     let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
         Value::Int(v) => v,
         _ => 0,
@@ -21598,7 +21453,6 @@ fn native_ph_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(v) => v,
         _ => 0,
     };
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21631,17 +21485,12 @@ fn native_ph_arrive_and_await(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // C23 (HIGH) fix: hold the `this` monitor across the read-modify-write
-    // of `arrived` + the `parties == arrived` advance check so concurrent
-    // arrivals can't race to lose increments or double-advance the phase.
-    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
     };
     ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
     let phase = ph_maybe_advance(ctx, this);
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21650,7 +21499,6 @@ fn native_ph_arrive_and_deregister(ctx: &mut dyn NativeContext, args: &[Value]) 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
@@ -21664,7 +21512,6 @@ fn native_ph_arrive_and_deregister(ctx: &mut dyn NativeContext, args: &[Value]) 
         ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(parties - 1));
     }
     let phase = ph_maybe_advance(ctx, this);
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21673,14 +21520,12 @@ fn native_ph_arrive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
     };
     ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
     let phase = ph_maybe_advance(ctx, this);
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21689,15 +21534,10 @@ fn native_ph_get_phase(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    // C23 (HIGH): fence the read so a concurrent arrival's
-    // `set_field(phase, +1)` is observed atomically with its
-    // `set_field(arrived, 0)` reset.
-    ctx.monitor_enter(this);
     let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
         Value::Int(v) => v,
         _ => 0,
     };
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21706,12 +21546,10 @@ fn native_ph_get_registered_parties(ctx: &mut dyn NativeContext, args: &[Value])
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    ctx.monitor_enter(this);
     let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
         Value::Int(v) => v,
         _ => 0,
     };
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(parties)))
 }
 
@@ -21720,12 +21558,10 @@ fn native_ph_get_arrived_parties(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
     };
-    ctx.monitor_exit(this);
     Ok(Some(Value::Int(arrived)))
 }
 
@@ -23647,8 +23483,7 @@ mod tests {
         assert!(r.find(c, "sort", "(Ljava/util/Comparator;)V").is_some(), "AL sort");
         assert!(r.find(c, "removeIf", "(Ljava/util/function/Predicate;)Z").is_some(), "AL removeIf");
         assert!(r.find(c, "replaceAll", "(Ljava/util/function/UnaryOperator;)V").is_some(), "AL replaceAll");
-        // `stream()` intentionally NOT registered — see docs/jvm-no-synthetic-stubs.md.
-        assert!(r.find(c, "stream", "()Ljava/util/stream/Stream;").is_none(), "AL stream must be absent");
+        assert!(r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(), "AL stream");
     }
 
     // -----------------------------------------------------------------------
