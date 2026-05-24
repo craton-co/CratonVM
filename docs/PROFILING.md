@@ -73,7 +73,7 @@ cargo bench
 - **Ratio = 1.0x**: Performance parity with HotSpot
 - **Ratio > 1.0x**: CratonVM is slower by that factor
 
-Current performance: ~1.41x overall vs HotSpot JDK 25 C2 (Round 26).
+Current performance: ~1.50x overall vs HotSpot JDK 25 C2 (Round 26).
 Fibonacci is within 7% of C2.
 
 ## Tips for Reproducible Results

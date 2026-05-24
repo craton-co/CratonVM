@@ -62,7 +62,8 @@ implementations:
   and native method bridge).
 - **Class library strategy:** Native Rust implementations of `java.base` module
   classes, registered through the VM's native method registry.
-- **Test infrastructure:** The `.github/workflows/jck.yml` CI workflow and
+- **Test infrastructure:** The `.github/_disabled-workflows/jck.yml`
+  CI workflow (currently disabled — see RELEASING.md §2) and
   `bench/javatest_config.jti` harness configuration are prepared and ready to
   execute once JCK access is granted.
 - **Failure tracking:** The `vm/tests/jck_harness.rs` test captures per-test
@@ -71,7 +72,7 @@ implementations:
   pre-defined in the JSON schema.
 - **Differential testing:** The `vm/tests/differential.rs` harness runs
   methods under both CratonVM and HotSpot to detect behavioral divergences.
-  Known divergences are tracked in `docs/divergence-log.md`.
+  Known divergences are tracked in `docs/internal/divergence-log.md`.
 
 ## Current Status
 
@@ -80,12 +81,12 @@ implementations:
 | License path          | OCTLA or TCK Community License |
 | Application           | **Pending application** |
 | JCK version target    | JCK 25 (Java SE 25) |
-| CI runner prepared    | Yes (`.github/workflows/jck.yml`) |
+| CI runner prepared    | Yes (`.github/_disabled-workflows/jck.yml`, currently disabled — see RELEASING.md §2) |
 | Harness configuration | Yes (`bench/javatest_config.jti`) |
 | Test harness          | Yes (`vm/tests/jck_harness.rs`) |
 | Failure capture       | Yes (`bench/jck-failures.json`) |
 | Differential testing  | Yes (`vm/tests/differential.rs`) |
-| Divergence log        | Yes (`docs/divergence-log.md`) |
+| Divergence log        | Yes (`docs/internal/divergence-log.md`) |
 
 The JCK license application has not yet been submitted. All CI and harness
 infrastructure is in place and will activate automatically once `JCK_HOME` is

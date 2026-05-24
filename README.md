@@ -221,3 +221,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+See [TRADEMARKS.md](TRADEMARKS.md) for trademark attributions and notices.

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-24
+
 ### Added
 - JIT XMM register allocation for float/double locals (callee-saved XMM8-XMM15 on Windows x64), eliminating frame spills for FP-heavy methods.
 - JIT `Math.sqrt` intrinsic inlined as `SQRTSD` instead of going through interpreter dispatch.
@@ -23,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Security hardening: checked arithmetic throughout GC and JIT.
 
 ### Changed
-- Updated benchmark numbers against JDK 25.0.1 C2: QuickBench 1.41x, Fannkuch 1.57x, N-Body 20x (down from 464x interpreter-only).
+- Updated benchmark numbers against JDK 25.0.1 C2: QuickBench 1.50x, Fannkuch 1.57x, N-Body 20x (down from 464x interpreter-only).
 - Added Binary Trees (CLBG) benchmark, exposing a GC allocation bottleneck (23.3x ratio).
 - N-Body and Fannkuch-Redux benchmarks now run to completion with correct results.
 - Rewrote roadmap with an honest production-readiness evaluation distinguishing real working features from Rust-side stubs.
@@ -119,6 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Command-line launcher with classpath and heap size configuration
 - CI pipeline with cross-platform testing, coverage, and Miri
 
-[Unreleased]: https://github.com/craton-co/cratonvm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/craton-co/cratonvm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/craton-co/cratonvm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/craton-co/cratonvm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/craton-co/cratonvm/releases/tag/v0.1.0
