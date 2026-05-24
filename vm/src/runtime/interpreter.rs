@@ -1,4 +1,4 @@
-//! Bytecode interpreter — the heart of the VM.
+﻿//! Bytecode interpreter — the heart of the VM.
 //!
 //! Executes JVM bytecode instructions in a loop, handling:
 //! - Local variable loads/stores
@@ -906,7 +906,7 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
 
         // Apply pointer map to this thread's frames
         if !pointer_map.is_empty() {
-            apply_pointer_map_to_thread(thread, &pointer_map);
+            apply_pointer_map_to_thread(thread, &pointer_map, &shared.heap);
         }
     }
     // T1.5.1 — pick up any async exception posted by another thread
@@ -946,10 +946,11 @@ pub fn check_pending_async_exception(
 pub(crate) fn apply_pointer_map_to_thread(
     thread: &mut JvmThread,
     pointer_map: &std::collections::HashMap<usize, usize>,
+    heap: &crate::memory::VmHeap,
 ) {
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map);
-        frame.stack.update_object_refs(pointer_map);
+        frame.stack.update_object_refs(pointer_map, heap);
     }
     // Also update printed values and java_thread_obj
     for val in &mut thread.printed {
@@ -2445,7 +2446,21 @@ pub fn pop_and_recycle_frame_with_reason(
             eprintln!("[FRAME_POP] depth={} {}.{}{}", thread.frames.len(), f.class_name(), f.method_name(), f.method_descriptor());
         }
         if let Some(obj) = f.monitor_on_exit {
-            let _ = shared.monitors.exit(obj, thread.thread_id);
+            // B8: implicit monitorexit on synchronized-method frame pop.
+            // We can't propagate the error (the frame MUST be recycled here),
+            // but silently swallowing loses diagnostics on monitor-state
+            // corruption (e.g. user code that manually `monitorexit`ed past
+            // the sync method's own counter). Log via tracing for visibility.
+            if let Err(e) = shared.monitors.exit(obj, thread.thread_id) {
+                tracing::warn!(
+                    class = %f.class_name(),
+                    method = %f.method_name(),
+                    descriptor = %f.method_descriptor(),
+                    thread_id = ?thread.thread_id,
+                    error = ?e,
+                    "implicit monitorexit on synchronized-method-frame-pop failed"
+                );
+            }
         }
         thread.recycle_frame_with_shared(
             f,
@@ -5249,19 +5264,19 @@ fn execute_instruction(
         // -- Loads (T10.9.D direct CompactValue path) --
         Instruction::Iload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact(cv);
+            thread.frames[frame_idx].stack.push_compact_checked(cv)?;
         }
         Instruction::Lload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact(cv);
+            thread.frames[frame_idx].stack.push_compact_checked(cv)?;
         }
         Instruction::Fload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact(cv);
+            thread.frames[frame_idx].stack.push_compact_checked(cv)?;
         }
         Instruction::Dload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact(cv);
+            thread.frames[frame_idx].stack.push_compact_checked(cv)?;
         }
         Instruction::Aload(idx) => {
             // Mirror `Instruction::Astore` / fast-path `aload`: JNI may leave a
@@ -5303,7 +5318,7 @@ fn execute_instruction(
         Instruction::Istore(idx) | Instruction::Fstore(idx) => {
             // Direct compact round-trip — tag on the stack slot is preserved
             // through compact_to_local_slot.
-            let cv = thread.frames[frame_idx].stack.pop_compact();
+            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
             thread.frames[frame_idx].set_local_compact(*idx, cv);
         }
         // `astore` must NOT use the raw compact round-trip: JNI / invoke
@@ -5404,103 +5419,103 @@ fn execute_instruction(
 
         // -- Stack manipulation (T10.9.D direct CompactValue path) --
         Instruction::Pop => {
-            thread.frames[frame_idx].stack.pop_compact();
+            thread.frames[frame_idx].stack.pop_compact_checked()?;
         }
         Instruction::Pop2 => {
-            let val = thread.frames[frame_idx].stack.pop_compact();
+            let val = thread.frames[frame_idx].stack.pop_compact_checked()?;
             if !val.is_category2() {
-                thread.frames[frame_idx].stack.pop_compact();
+                thread.frames[frame_idx].stack.pop_compact_checked()?;
             }
         }
         Instruction::Dup => {
-            let val = thread.frames[frame_idx].stack.peek_compact();
-            thread.frames[frame_idx].stack.push_compact(val);
+            let val = thread.frames[frame_idx].stack.peek_compact_checked()?;
+            thread.frames[frame_idx].stack.push_compact_checked(val)?;
         }
         Instruction::DupX1 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact();
-            let val2 = thread.frames[frame_idx].stack.pop_compact();
-            thread.frames[frame_idx].stack.push_compact(val1);
-            thread.frames[frame_idx].stack.push_compact(val2);
-            thread.frames[frame_idx].stack.push_compact(val1);
+            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
         }
         Instruction::DupX2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact();
-            let val2 = thread.frames[frame_idx].stack.pop_compact();
+            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
             if val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact();
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val3);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             }
         }
         Instruction::Dup2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact();
+            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
             if val1.is_category2() {
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             } else {
-                let val2 = thread.frames[frame_idx].stack.pop_compact();
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             }
         }
         Instruction::Dup2X1 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact();
-            let val2 = thread.frames[frame_idx].stack.pop_compact();
+            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
             if val1.is_category2() {
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact();
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val3);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             }
         }
         Instruction::Dup2X2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact();
-            let val2 = thread.frames[frame_idx].stack.pop_compact();
+            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
             if val1.is_category2() && val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             } else if val1.is_category2() {
-                let val3 = thread.frames[frame_idx].stack.pop_compact();
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val3);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             } else if val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact();
-                let val4 = thread.frames[frame_idx].stack.pop_compact();
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
-                thread.frames[frame_idx].stack.push_compact(val4);
-                thread.frames[frame_idx].stack.push_compact(val3);
-                thread.frames[frame_idx].stack.push_compact(val2);
-                thread.frames[frame_idx].stack.push_compact(val1);
+                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                let val4 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val4)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
             }
         }
         Instruction::Swap => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact();
-            let val2 = thread.frames[frame_idx].stack.pop_compact();
-            thread.frames[frame_idx].stack.push_compact(val1);
-            thread.frames[frame_idx].stack.push_compact(val2);
+            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            thread.frames[frame_idx].stack.push_compact_checked(val2)?;
         }
 
         // -- Integer arithmetic --
@@ -6235,7 +6250,7 @@ fn execute_instruction(
                 };
                 thread.frames[frame_idx]
                     .stack
-                    .push_compact(CompactValue::long(bits));
+                    .push_compact_checked(CompactValue::long(bits))?;
             } else if matches!(desc_byte, Some(b'D')) {
                 let d: f64 = match value {
                     Value::Double(x) => x,
@@ -6250,7 +6265,7 @@ fn execute_instruction(
                 };
                 thread.frames[frame_idx]
                     .stack
-                    .push_compact(CompactValue::double(d));
+                    .push_compact_checked(CompactValue::double(d))?;
             } else {
                 // T12/T14: Coerce zero-initialized heap slots for reference fields.
                 // The GC heap zeroes memory on allocation; for reference-typed
@@ -6306,7 +6321,7 @@ fn execute_instruction(
             let value: Value = match desc_byte {
                 Some(b'J') => {
                     use crate::types::CompactTag;
-                    let cv = thread.frames[frame_idx].stack.pop_compact();
+                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
                     let lv = match cv.tag() {
                         // Unambiguously a long (explicit VTAG_LONG).
                         CompactTag::Long => cv.as_long_unchecked(),
@@ -6336,7 +6351,7 @@ fn execute_instruction(
                 }
                 Some(b'D') => {
                     use crate::types::CompactTag;
-                    let cv = thread.frames[frame_idx].stack.pop_compact();
+                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
                     let dv = match cv.tag() {
                         CompactTag::Double => f64::from_bits(cv.raw_bits()),
                         CompactTag::Long => f64::from_bits(cv.as_long_unchecked() as u64),

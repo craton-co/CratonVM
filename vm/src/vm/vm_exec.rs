@@ -722,7 +722,7 @@ impl<'a> NativeContextImpl<'a> {
             if !pointer_map.is_empty() {
                 for frame in &mut self.thread.frames {
                     frame.update_local_refs(&pointer_map);
-                    frame.stack.update_object_refs(&pointer_map);
+                    frame.stack.update_object_refs(&pointer_map, &self.shared.heap);
                 }
                 for val in &mut self.thread.printed {
                     update_value_ref(val, &pointer_map);
@@ -8793,7 +8793,12 @@ fn invoke_on_class_shared_inner(
     }
 
     // --- ACC_SYNCHRONIZED: acquire monitor before execution ---
-    let monitor_obj: Option<ObjectRef> = if is_synchronized {
+    // B9: scope the monitor release as an RAII guard so it runs on BOTH the
+    // normal-return path AND a panic unwind through the interpreter call.
+    // The previous `let _ = shared.monitors.exit(...)` after `result` (a)
+    // leaked the monitor entirely if `result` panicked (the line never
+    // executed), and (b) silently swallowed the error on the normal path.
+    let _sync_guard = if is_synchronized {
         let obj = if is_static {
             // Static synchronized: use a per-class synthetic lock object
             shared.get_class_lock_object(declaring_class_id)
@@ -8810,7 +8815,11 @@ fn invoke_on_class_shared_inner(
             }
         };
         shared.monitors.enter(obj, thread.thread_id);
-        Some(obj)
+        Some(SynchronizedMethodGuard {
+            monitor_pool: &shared.monitors,
+            obj,
+            thread_id: thread.thread_id,
+        })
     } else {
         None
     };
@@ -8998,15 +9007,36 @@ fn invoke_on_class_shared_inner(
         }
     };
 
-    // --- ACC_SYNCHRONIZED: release monitor after execution ---
-    // Release the monitor regardless of success or failure (including exceptions).
-    if let Some(obj) = monitor_obj {
-        // We ignore exit errors here вЂ” the monitor should always be owned
-        // by this thread at this point.
-        let _ = shared.monitors.exit(obj, thread.thread_id);
-    }
+    // --- ACC_SYNCHRONIZED: monitor released by `_sync_guard` Drop ---
+    // The RAII guard's `Drop` impl runs after this point on the normal-return
+    // path AND on a panic unwind through the `result` expression above, fixing
+    // the unwind-safety hole from the previous manual release pattern.
+    drop(_sync_guard);
 
     result
+}
+
+/// B9: RAII guard for ACC_SYNCHRONIZED method release. Constructed after the
+/// monitor has been entered; its `Drop` impl releases the monitor and logs
+/// any exit error via tracing so a diagnostic is preserved on the panic-unwind
+/// path (where the previous manual `let _ = shared.monitors.exit(...)` after
+/// the call leaked the monitor entirely because the line never executed).
+struct SynchronizedMethodGuard<'a> {
+    monitor_pool: &'a crate::threading::monitor::MonitorTable,
+    obj: ObjectRef,
+    thread_id: ThreadId,
+}
+
+impl Drop for SynchronizedMethodGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.monitor_pool.exit(self.obj, self.thread_id) {
+            tracing::warn!(
+                thread_id = ?self.thread_id,
+                error = ?e,
+                "implicit monitorexit on synchronized-method exit failed"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

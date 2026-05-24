@@ -30,7 +30,7 @@ pub fn update_all_roots(
     // 1. Thread frames — locals and operand stacks (SoA layout)
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map);
-        frame.stack.update_object_refs(pointer_map);
+        frame.stack.update_object_refs(pointer_map, &shared.heap);
     }
 
     for obj_ref in &mut thread.native_pin_roots {
@@ -432,9 +432,14 @@ mod tests {
 
     #[test]
     fn gc_update_all_roots_integration() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
         use crate::runtime::frame::Frame;
         use crate::threading::jvm_thread::{JvmThread, ThreadId};
 
+        // B10: `update_object_refs` requires a `&VmHeap` for the heap-
+        // membership filter; construct one alongside the legacy semi-space
+        // `Heap` used by the older standalone GC tests.
+        let vm_heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let heap = small_heap();
         let monitor_table = crate::threading::monitor::MonitorTable::new();
 
@@ -467,7 +472,7 @@ mod tests {
         thread.frames[0].update_local_refs(&result.pointer_map);
         thread.frames[0]
             .stack
-            .update_object_refs(&result.pointer_map);
+            .update_object_refs(&result.pointer_map, &vm_heap);
         for val in &mut thread.printed {
             update_value_ref(val, &result.pointer_map);
         }

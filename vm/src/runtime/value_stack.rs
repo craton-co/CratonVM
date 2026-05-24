@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 
 use crate::error::RuntimeError;
 use crate::memory::VmHeap;
@@ -215,9 +215,24 @@ impl ValueStack {
     /// should never trigger this.
     #[inline(always)]
     pub fn push_unchecked(&mut self, value: Value) {
-        assert!(self.len < self.max_size, "stack overflow in push_unchecked");
+        debug_assert!(self.len < self.max_size, "stack overflow in push_unchecked");
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
+    }
+
+    /// B12: checked sibling of [`Self::push_unchecked`] for callers that
+    /// can't rely on a verifier guarantee (slow-path / JIT-deopt entry).
+    /// Returns `Err(IllegalStateException)` on overflow rather than panicking.
+    #[inline(always)]
+    pub fn push_checked(&mut self, value: Value) -> Result<(), RuntimeError> {
+        if self.len >= self.max_size {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack overflow".to_string(),
+            });
+        }
+        self.slots[self.len] = CompactValue::from_value(value);
+        self.len += 1;
+        Ok(())
     }
 
     /// Push a pre-encoded `CompactValue` directly — zero-cost over writing
@@ -228,9 +243,23 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_compact(&mut self, cv: CompactValue) {
-        assert!(self.len < self.max_size, "stack overflow in push_compact");
+        debug_assert!(self.len < self.max_size, "stack overflow in push_compact");
         self.slots[self.len] = cv;
         self.len += 1;
+    }
+
+    /// B12: checked sibling of [`Self::push_compact`]. Returns
+    /// `Err(IllegalStateException)` on overflow instead of debug-aborting.
+    #[inline(always)]
+    pub fn push_compact_checked(&mut self, cv: CompactValue) -> Result<(), RuntimeError> {
+        if self.len >= self.max_size {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack overflow".to_string(),
+            });
+        }
+        self.slots[self.len] = cv;
+        self.len += 1;
+        Ok(())
     }
 
     /// Push an int directly as a CompactValue (T10.9.D hot-path).
@@ -317,9 +346,22 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn pop_unchecked(&mut self) -> Value {
-        assert!(self.len > 0, "stack underflow in pop_unchecked");
+        debug_assert!(self.len > 0, "stack underflow in pop_unchecked");
         self.len -= 1;
         self.slots[self.len].to_value()
+    }
+
+    /// B12: checked sibling of [`Self::pop_unchecked`]. Returns
+    /// `Err(IllegalStateException)` on underflow.
+    #[inline(always)]
+    pub fn pop_checked(&mut self) -> Result<Value, RuntimeError> {
+        if self.len == 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack underflow".to_string(),
+            });
+        }
+        self.len -= 1;
+        Ok(self.slots[self.len].to_value())
     }
 
     /// Pop a raw `CompactValue` slot without decoding to `Value`.
@@ -329,9 +371,22 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn pop_compact(&mut self) -> CompactValue {
-        assert!(self.len > 0, "stack underflow in pop_compact");
+        debug_assert!(self.len > 0, "stack underflow in pop_compact");
         self.len -= 1;
         self.slots[self.len]
+    }
+
+    /// B12: checked sibling of [`Self::pop_compact`]. Returns
+    /// `Err(IllegalStateException)` on underflow.
+    #[inline(always)]
+    pub fn pop_compact_checked(&mut self) -> Result<CompactValue, RuntimeError> {
+        if self.len == 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack underflow".to_string(),
+            });
+        }
+        self.len -= 1;
+        Ok(self.slots[self.len])
     }
 
     // ── AUDIT CRIT-4: int-specialised push/pop (no Value enum round-trip) ──
@@ -352,7 +407,7 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_int_unchecked(&mut self, v: i32) {
-        assert!(self.len < self.max_size, "stack overflow in push_int_unchecked");
+        debug_assert!(self.len < self.max_size, "stack overflow in push_int_unchecked");
         self.slots[self.len] = CompactValue::int(v);
         self.len += 1;
     }
@@ -369,7 +424,7 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn pop_int_unchecked(&mut self) -> i32 {
-        assert!(self.len > 0, "stack underflow in pop_int_unchecked");
+        debug_assert!(self.len > 0, "stack underflow in pop_int_unchecked");
         self.len -= 1;
         // CompactValue exposes `as_int() -> Option<i32>` (None when the slot
         // is not an Int tag).  Verified bytecode is Int-typed at this site,
@@ -385,7 +440,7 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_float_unchecked(&mut self, v: f32) {
-        assert!(self.len < self.max_size, "stack overflow in push_float_unchecked");
+        debug_assert!(self.len < self.max_size, "stack overflow in push_float_unchecked");
         self.slots[self.len] = CompactValue::float(v);
         self.len += 1;
     }
@@ -396,7 +451,7 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn pop_float_unchecked(&mut self) -> f32 {
-        assert!(self.len > 0, "stack underflow in pop_float_unchecked");
+        debug_assert!(self.len > 0, "stack underflow in pop_float_unchecked");
         self.len -= 1;
         self.slots[self.len].as_float().unwrap_or(0.0)
     }
@@ -410,7 +465,7 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_double_unchecked(&mut self, v: f64) {
-        assert!(self.len < self.max_size, "stack overflow in push_double_unchecked");
+        debug_assert!(self.len < self.max_size, "stack overflow in push_double_unchecked");
         self.slots[self.len] = CompactValue::double(v);
         self.len += 1;
     }
@@ -426,7 +481,7 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn pop_double_unchecked(&mut self) -> f64 {
-        assert!(self.len > 0, "stack underflow in pop_double_unchecked");
+        debug_assert!(self.len > 0, "stack underflow in pop_double_unchecked");
         self.len -= 1;
         // CompactValue::double(v) stores `v.to_bits()` verbatim (or canonical
         // NaN on collision), and there is no separate Double sub-tag — the
@@ -444,7 +499,7 @@ impl ValueStack {
     /// Panics if the stack is full.
     #[inline(always)]
     pub fn push_long_unchecked(&mut self, v: i64) {
-        assert!(self.len < self.max_size, "stack overflow in push_long_unchecked");
+        debug_assert!(self.len < self.max_size, "stack overflow in push_long_unchecked");
         self.slots[self.len] = CompactValue::long(v);
         self.len += 1;
     }
@@ -460,7 +515,7 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn pop_long_unchecked(&mut self) -> i64 {
-        assert!(self.len > 0, "stack underflow in pop_long_unchecked");
+        debug_assert!(self.len > 0, "stack underflow in pop_long_unchecked");
         self.len -= 1;
         // Both CompactTag::Long (NaN-tag collision) and CompactTag::Double
         // (untagged) store the raw i64 bits directly in self.0 — see
@@ -475,7 +530,7 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn peek_int_unchecked(&self) -> i32 {
-        assert!(self.len > 0, "stack underflow in peek_int_unchecked");
+        debug_assert!(self.len > 0, "stack underflow in peek_int_unchecked");
         self.slots[self.len - 1].as_int().unwrap_or(0)
     }
 
@@ -483,7 +538,7 @@ impl ValueStack {
     /// Used by JIT dispatch to avoid decode/re-encode overhead.
     #[inline(always)]
     pub fn pop_raw(&mut self) -> u64 {
-        assert!(self.len > 0, "stack underflow in pop_raw");
+        debug_assert!(self.len > 0, "stack underflow in pop_raw");
         self.len -= 1;
         self.slots[self.len].to_bits()
     }
@@ -503,7 +558,7 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn peek(&self) -> Value {
-        assert!(self.len > 0, "stack underflow in peek");
+        debug_assert!(self.len > 0, "stack underflow in peek");
         self.slots[self.len - 1].to_value()
     }
 
@@ -513,8 +568,20 @@ impl ValueStack {
     /// Panics if the stack is empty.
     #[inline(always)]
     pub fn peek_compact(&self) -> CompactValue {
-        assert!(self.len > 0, "stack underflow in peek_compact");
+        debug_assert!(self.len > 0, "stack underflow in peek_compact");
         self.slots[self.len - 1]
+    }
+
+    /// B12: checked sibling of [`Self::peek_compact`]. Returns
+    /// `Err(IllegalStateException)` on empty stack.
+    #[inline(always)]
+    pub fn peek_compact_checked(&self) -> Result<CompactValue, RuntimeError> {
+        if self.len == 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack underflow".to_string(),
+            });
+        }
+        Ok(self.slots[self.len - 1])
     }
 
     /// Peek at a value at `offset` positions from the top (0 = top, 1 = second from top, etc.).
@@ -524,7 +591,7 @@ impl ValueStack {
     /// Panics if `offset_from_top >= self.len`.
     #[inline(always)]
     pub fn peek_at(&self, offset_from_top: usize) -> Value {
-        assert!(offset_from_top < self.len, "stack underflow in peek_at");
+        debug_assert!(offset_from_top < self.len, "stack underflow in peek_at");
         self.slots[self.len - 1 - offset_from_top].to_value()
     }
 
@@ -731,7 +798,7 @@ impl ValueStack {
     /// contain an entry for it. Untagged `Double` slots that happen to encode a
     /// jlong-shaped pointer were rooted (filtered through `heap.is_object_address`)
     /// and ARE remapped here so the post-GC slot points at the moved object.
-    pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>, heap: &VmHeap) {
         for i in 0..self.len {
             let cv = self.slots[i];
             if cv.is_object() {
@@ -744,10 +811,24 @@ impl ValueStack {
                 let bits = cv.to_bits();
                 if let Some(old_ptr) = jlong_bits_as_aligned_object_ptr(bits) {
                     if let Some(&new_addr) = pointer_map.get(&old_ptr) {
-                        // Preserve the Double tag (untagged raw bits) so the slot's
-                        // type doesn't change across GC — interpreter dispatch on
-                        // this slot expects the same tag it had pre-GC.
-                        self.slots[i] = CompactValue::from_bits(new_addr as u64);
+                        // B10: distinguish the legitimate JNI long-as-jobject
+                        // smuggle path from a coincidental bit-pattern match.
+                        // `scan_object_refs` rooted this slot ONLY when
+                        // `heap.is_heap_addr(old_ptr)` succeeded — so the
+                        // pointer_map entry is only authoritative for slots
+                        // that pass the same heap-membership check. A plain
+                        // double whose bit pattern happens to fall in the
+                        // address range and also collides with a moved
+                        // object's old address must NOT be rewritten: doing
+                        // so corrupts a perfectly valid f64. Mirrors C7 in
+                        // interpreter.rs.
+                        if heap.is_heap_addr(old_ptr).is_some() {
+                            // Preserve the Double tag (untagged raw bits) so
+                            // the slot's type doesn't change across GC — the
+                            // interpreter dispatch on this slot expects the
+                            // same tag it had pre-GC.
+                            self.slots[i] = CompactValue::from_bits(new_addr as u64);
+                        }
                     }
                 }
             }
@@ -948,6 +1029,10 @@ mod tests {
         assert_eq!(stack.peek_at(1).as_int(), Some(42));
     }
 
+    // B12: `*_unchecked` guards are now `debug_assert!`, so the panic only
+    // fires in debug builds. Gate the `#[should_panic]` coverage on
+    // `debug_assertions` so release-mode test runs don't fail these.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stack overflow")]
     fn push_unchecked_panics_on_overflow() {
@@ -956,6 +1041,7 @@ mod tests {
         stack.push_unchecked(Value::Int(2)); // should panic
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stack underflow")]
     fn pop_unchecked_panics_on_underflow() {
@@ -963,6 +1049,7 @@ mod tests {
         stack.pop_unchecked(); // should panic
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stack underflow")]
     fn peek_panics_on_empty() {
@@ -970,6 +1057,7 @@ mod tests {
         let _ = stack.peek(); // should panic
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stack underflow")]
     fn peek_at_panics_out_of_range() {
@@ -1090,6 +1178,7 @@ mod tests {
         assert!(stack.push(Value::Int(2)).is_err());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stack overflow")]
     fn push_unchecked_panics_on_full_size_zero() {
@@ -1097,6 +1186,7 @@ mod tests {
         stack.push_unchecked(Value::Int(1));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "stack underflow")]
     fn peek_at_panics_on_empty_stack() {
@@ -1106,10 +1196,12 @@ mod tests {
 
     #[test]
     fn gc_update_object_refs_empty_map() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let mut stack = ValueStack::new(5);
         stack.push(Value::Int(42)).unwrap();
         let empty_map = HashMap::new();
-        stack.update_object_refs(&empty_map);
+        stack.update_object_refs(&empty_map, &heap);
         // Stack should be unchanged
         assert_eq!(stack.pop_int().unwrap(), 42);
     }
@@ -1454,6 +1546,8 @@ mod tests {
 
     #[test]
     fn t10_gc_update_object_refs_rewrites_pointer() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let mut stack = ValueStack::new(4);
         let old_ptr = 0x0000_1000_u64;
         let new_ptr = 0x0000_2000_u64;
@@ -1462,7 +1556,7 @@ mod tests {
 
         let mut map = HashMap::new();
         map.insert(old_ptr as usize, new_ptr as usize);
-        stack.update_object_refs(&map);
+        stack.update_object_refs(&map, &heap);
 
         let popped = stack.pop().unwrap();
         match popped {
@@ -1542,6 +1636,8 @@ mod tests {
     /// `Long`-tagged slot.
     #[test]
     fn t10_gc_update_object_refs_preserves_long_slot() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let mut stack = ValueStack::new(4);
         // NANBOX_BITS | SUB_LONG_HI (7 << 47) | aligned low bits (0x1000).
         let long_bits: u64 = 0xFFFC_0000_0000_0000 | (7u64 << 47) | 0x1000;
@@ -1556,7 +1652,7 @@ mod tests {
         map.insert(0x1000_usize, new_ptr);
         // Also map the raw long_bits itself (defensive — neither key should fire).
         map.insert(long_bits as usize, new_ptr);
-        stack.update_object_refs(&map);
+        stack.update_object_refs(&map, &heap);
 
         // Bits unchanged: primitive long is left strictly alone.
         assert_eq!(stack.get_compact(0).unwrap().to_bits(), long_bits);
@@ -1564,19 +1660,51 @@ mod tests {
 
     /// Untagged raw `Double` slot carrying an aligned, mapped pointer IS
     /// remapped (these are the only ambiguous slots `scan_object_refs` rooted).
+    /// B10: the old_ptr MUST be a real heap address — `update_object_refs`
+    /// now mirrors `scan_object_refs`'s `heap.is_heap_addr` filter to avoid
+    /// rewriting honest doubles whose bits coincidentally collide with a
+    /// pointer_map key.
     #[test]
     fn t10_gc_update_object_refs_rewrites_untagged_pointer_shaped_slot() {
+        use crate::classloading::ClassId;
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let old_ptr = obj.as_ptr() as usize;
+        let new_ptr: usize = old_ptr + 64;
         let mut stack = ValueStack::new(4);
-        let old_ptr: usize = 0x1000;
-        let new_ptr: usize = 0x2000;
         stack.push_compact(CompactValue::from_bits(old_ptr as u64));
 
         let mut map = HashMap::new();
         map.insert(old_ptr, new_ptr);
-        stack.update_object_refs(&map);
+        stack.update_object_refs(&map, &heap);
 
         // Slot now carries the remapped raw bits.
         let cv = stack.get_compact(0).expect("slot present");
         assert_eq!(cv.to_bits(), new_ptr as u64);
+    }
+
+    /// B10: an honest f64 whose bit pattern happens to collide with a
+    /// pointer_map key must NOT be rewritten — the slot is not heap-resident,
+    /// so it cannot have been a rooted reference. The old behaviour would
+    /// silently corrupt the f64.
+    #[test]
+    fn t10_gc_update_object_refs_leaves_non_heap_double_untouched() {
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let mut stack = ValueStack::new(4);
+        // Non-heap aligned pointer-shaped bits — the previous behaviour
+        // would have rewritten this; with the heap-membership check it
+        // stays put.
+        let old_bits: u64 = 0x1000;
+        let new_ptr: usize = 0x2000;
+        stack.push_compact(CompactValue::from_bits(old_bits));
+
+        let mut map = HashMap::new();
+        map.insert(old_bits as usize, new_ptr);
+        stack.update_object_refs(&map, &heap);
+
+        let cv = stack.get_compact(0).expect("slot present");
+        assert_eq!(cv.to_bits(), old_bits, "non-heap Double bits must be preserved");
     }
 }
