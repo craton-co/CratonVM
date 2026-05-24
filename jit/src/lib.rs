@@ -242,6 +242,45 @@ pub fn probe_object_null_template() -> (u64, u64) {
 // Executable memory — delegates to platform module
 // ---------------------------------------------------------------------------
 
+/// Error returned by the fallible patch helpers on [`ExecutableBuffer`]
+/// (C10).
+///
+/// JIT codegen is contractually never allowed to panic in production — a
+/// bad patch site must bail back to the interpreter, not abort the VM.
+/// `PatchError` is the structured signal callers in `x64.rs` /
+/// `ir_lower.rs` propagate up the compile stack when they catch one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchError {
+    /// A patch tried to write past the bytes currently emitted into the
+    /// buffer. `offset .. offset + len` extends beyond `buf_size`
+    /// (= the buffer's `pos()` at the time of the patch). This is
+    /// typically a stale recorded patch site left over from an emit
+    /// shortfall that did not flip the `overflowed` flag.
+    OutOfBounds {
+        /// The requested patch offset (byte position from the start of
+        /// the buffer).
+        offset: usize,
+        /// The number of bytes the patch wanted to write.
+        len: usize,
+        /// The buffer's emit position (`pos()`) when the patch was
+        /// attempted. The patch is valid only when `offset + len <= buf_size`.
+        buf_size: usize,
+    },
+}
+
+impl std::fmt::Display for PatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatchError::OutOfBounds { offset, len, buf_size } => write!(
+                f,
+                "patch out of bounds: offset {offset} + len {len} > buf_size {buf_size}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PatchError {}
+
 /// A buffer of executable machine code allocated via OS-level APIs.
 ///
 /// On platforms with W^X enforcement (macOS ARM64), the buffer starts in writable
@@ -375,32 +414,91 @@ impl ExecutableBuffer {
     }
 
     /// Patch 4 bytes (little-endian i32) at the given offset.
-    pub fn patch_i32(&mut self, offset: usize, value: i32) {
+    ///
+    /// Fallible variant: returns [`PatchError::OutOfBounds`] when
+    /// `offset .. offset+4` falls outside the bytes currently emitted into
+    /// the buffer. The compile driver should treat any error as "bail to
+    /// interpreter" — the partially emitted code is unsafe to execute. C10:
+    /// this is the never-panic path callers should migrate to from the
+    /// deprecated [`Self::patch_i32`] shim.
+    pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), PatchError> {
         // After an emit overflow some recorded patch sites can point past the
-        // truncated buffer; skip them rather than panicking since the result
-        // is going to be discarded anyway.
-        if offset + 4 > self.len {
+        // truncated buffer; skip them rather than erroring since the result
+        // is going to be discarded anyway. `checked_add` defends against the
+        // `offset + 4 > self.len` arithmetic wrapping when `offset` is
+        // adversarially close to `usize::MAX`.
+        if offset.checked_add(4).map_or(true, |end| end > self.len) {
             if self.overflowed {
-                return;
+                return Ok(());
             }
-            panic!("patch out of bounds");
+            return Err(PatchError::OutOfBounds {
+                offset,
+                len: 4,
+                buf_size: self.len,
+            });
         }
         let bytes = value.to_le_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), 4);
         }
+        Ok(())
     }
 
     /// Patch 1 byte at the given offset.
-    pub fn patch_byte(&mut self, offset: usize, value: u8) {
+    ///
+    /// Fallible variant: returns [`PatchError::OutOfBounds`] when `offset`
+    /// lies past the current emit position. C10: never-panic path; see
+    /// [`Self::try_patch_i32`] for the rationale.
+    pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), PatchError> {
         if offset >= self.len {
             if self.overflowed {
-                return;
+                return Ok(());
             }
-            panic!("patch_byte out of bounds");
+            return Err(PatchError::OutOfBounds {
+                offset,
+                len: 1,
+                buf_size: self.len,
+            });
         }
         unsafe {
             *self.ptr.add(offset) = value;
+        }
+        Ok(())
+    }
+
+    /// Patch 4 bytes (little-endian i32) at the given offset.
+    ///
+    /// Panicking shim retained for back-compat with the pre-C10 callers in
+    /// `x64.rs` / `ir_lower.rs`. **Production callers must migrate to
+    /// [`Self::try_patch_i32`]** so a stale recorded patch site (e.g. after
+    /// an emit shortfall that did not flip `overflowed`) bails to the
+    /// interpreter instead of aborting the VM. The body delegates to
+    /// `try_patch_i32` and only panics on the error path, so once every
+    /// caller has migrated this shim can be deleted and the never-panic
+    /// invariant holds crate-wide.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use try_patch_i32 instead; this variant panics on out-of-bounds writes \
+                and violates the 'JIT never panics in production' contract (C10)"
+    )]
+    pub fn patch_i32(&mut self, offset: usize, value: i32) {
+        if let Err(e) = self.try_patch_i32(offset, value) {
+            panic!("patch out of bounds: {e:?}");
+        }
+    }
+
+    /// Patch 1 byte at the given offset.
+    ///
+    /// Panicking shim retained for back-compat; see [`Self::patch_i32`] for
+    /// the migration rationale.
+    #[deprecated(
+        since = "0.2.0",
+        note = "use try_patch_byte instead; this variant panics on out-of-bounds writes \
+                and violates the 'JIT never panics in production' contract (C10)"
+    )]
+    pub fn patch_byte(&mut self, offset: usize, value: u8) {
+        if let Err(e) = self.try_patch_byte(offset, value) {
+            panic!("patch_byte out of bounds: {e:?}");
         }
     }
 
