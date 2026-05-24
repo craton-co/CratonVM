@@ -8,7 +8,7 @@ repository.workspace = true
 keywords = ["jvm", "java", "classfile", "parser", "bytecode"]
 categories = ["parser-implementations", "encoding"]
 description = "Java .class file parser for the CratonVM project"
-readme = "../README.md"
+readme = "README.md"
 
 [dependencies]
 cratonvm-types = { path = "../types" }

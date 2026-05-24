@@ -8,6 +8,7 @@ repository.workspace = true
 keywords = ["gpu", "annotations", "java", "jvm"]
 categories = ["development-tools::build-utils"]
 description = "Java annotation sources for CratonVM GPU/parallel-compute support, compiled at build time"
+readme = "README.md"
 build = "build.rs"
 # Virtual `links` name. No actual native library is linked; this purely
 # enables cargo's `DEP_<NAME>_<KEY>` mechanism so that build scripts of
