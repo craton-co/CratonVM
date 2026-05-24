@@ -582,7 +582,7 @@ mod tests {
         assert!(compiled.is_some());
         let method = compiled.unwrap();
         // Execute the compiled code
-        let result = unsafe { method.call(&[]) };
+        let result = unsafe { method.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 42, "Should return 42");
     }
 
@@ -593,7 +593,7 @@ mod tests {
         let compiled = compile_via_ir(&code, 4, 0, 0);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
-        let result = unsafe { method.call(&[]) };
+        let result = unsafe { method.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 7, "Should return 7 after constant folding");
     }
 
@@ -604,7 +604,7 @@ mod tests {
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
-        let result = unsafe { method.call(&[10, 20]) };
+        let result = unsafe { method.try_call(&[10, 20]).expect("test JIT call") };
         assert_eq!(result, 30, "10 + 20 = 30");
     }
 
@@ -615,7 +615,7 @@ mod tests {
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
-        let result = unsafe { method.call(&[30, 12]) };
+        let result = unsafe { method.try_call(&[30, 12]).expect("test JIT call") };
         assert_eq!(result, 18, "30 - 12 = 18");
     }
 
@@ -626,7 +626,7 @@ mod tests {
         let compiled = compile_via_ir(&code, 4, 2, 2);
         assert!(compiled.is_some());
         let method = compiled.unwrap();
-        let result = unsafe { method.call(&[6, 7]) };
+        let result = unsafe { method.try_call(&[6, 7]).expect("test JIT call") };
         assert_eq!(result, 42, "6 * 7 = 42");
     }
 }

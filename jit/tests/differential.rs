@@ -108,7 +108,7 @@ unsafe fn jit_run_no_args(code: &[u8], descriptor: &str, num_locals: usize) -> i
     .expect("JIT compilation failed");
     // SAFETY: `compiled` was produced by the JIT from valid bytecode and the
     // mmap region is executable.
-    compiled.call(&[])
+    compiled.try_call(&[]).expect("test JIT call")
 }
 
 /// JVM bytecode for the method:

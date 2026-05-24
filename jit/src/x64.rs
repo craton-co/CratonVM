@@ -17163,7 +17163,7 @@ mod tests {
         let method = compiled.unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { method.call(&[42]) };
+        let result = unsafe { method.try_call(&[42]).expect("test JIT call") };
         assert_eq!(result, 42);
     }
 
@@ -17204,7 +17204,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[10, 32]) };
+        let result = unsafe { compiled.try_call(&[10, 32]).expect("test JIT call") };
         assert_eq!(result, 42);
     }
 
@@ -17243,7 +17243,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[10, 3]) };
+        let result = unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") };
         assert_eq!(result, (10 - 3) * 10); // 70
     }
 
@@ -17282,7 +17282,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[]) };
+        let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 5);
     }
 
@@ -17344,13 +17344,13 @@ mod tests {
         // n=0: 0 <= 1, return 0
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[0]) }, 0);
+        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, 0);
         // n=1: 1 <= 1, return 1
-        assert_eq!(unsafe { compiled.call(&[1]) }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[1]).expect("test JIT call") }, 1);
         // n=5: 5 > 1, return 5+1=6
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[5]) }, 6);
+        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 6);
     }
 
     #[test]
@@ -17427,12 +17427,12 @@ mod tests {
         // fib(0) = 0, fib(1) = 1, fib(10) = 55, fib(20) = 6765
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[0]) }, 0);
-        assert_eq!(unsafe { compiled.call(&[1]) }, 1);
-        assert_eq!(unsafe { compiled.call(&[10]) }, 55);
+        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, 0);
+        assert_eq!(unsafe { compiled.try_call(&[1]).expect("test JIT call") }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[10]).expect("test JIT call") }, 55);
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[20]) }, 6765);
+        assert_eq!(unsafe { compiled.try_call(&[20]).expect("test JIT call") }, 6765);
     }
 
     #[test]
@@ -17471,7 +17471,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[100_000_000_000i64, 200_000_000_000i64]) };
+        let result = unsafe { compiled.try_call(&[100_000_000_000i64, 200_000_000_000i64]).expect("test JIT call") };
         assert_eq!(result, 300_000_000_000i64);
     }
 
@@ -17519,8 +17519,8 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[5]) }, 15);
-        assert_eq!(unsafe { compiled.call(&[-3]) }, 7);
+        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 15);
+        assert_eq!(unsafe { compiled.try_call(&[-3]).expect("test JIT call") }, 7);
     }
 
     #[test]
@@ -17565,9 +17565,9 @@ mod tests {
         // 17 / 5 = 3, 17 % 5 = 2, total = 5
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[17, 5]) }, 5);
+        assert_eq!(unsafe { compiled.try_call(&[17, 5]).expect("test JIT call") }, 5);
         // -7 / 2 = -3, -7 % 2 = -1, total = -4
-        assert_eq!(unsafe { compiled.call(&[-7, 2]) }, -4);
+        assert_eq!(unsafe { compiled.try_call(&[-7, 2]).expect("test JIT call") }, -4);
     }
 
     #[test]
@@ -17685,7 +17685,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[]) };
+        let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
         // Result is f32 bit pattern as i64
         assert_eq!(f32::from_bits(result as u32), 1.0f32); // Cast: JIT ABI convention
     }
@@ -17723,7 +17723,7 @@ mod tests {
             .unwrap();
             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-            let result = unsafe { compiled.call(&[]) };
+            let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
             assert_eq!(f32::from_bits(result as u32), expected); // Cast: JIT ABI convention
         }
     }
@@ -17764,7 +17764,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[]) };
+        let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 1.0f64); // Cast: JIT ABI convention
     }
 
@@ -17801,7 +17801,7 @@ mod tests {
             .unwrap();
             // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
             // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-            let result = unsafe { compiled.call(&[]) };
+            let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
             assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
         }
     }
@@ -17843,7 +17843,7 @@ mod tests {
         let input = 3.15f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 3.15f32); // Cast: JIT ABI convention
     }
 
@@ -17884,7 +17884,7 @@ mod tests {
         let input = 2.719f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 2.719f64); // Cast: JIT ABI convention
     }
 
@@ -17925,7 +17925,7 @@ mod tests {
         let input = 42.5f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[0, input]) };
+        let result = unsafe { compiled.try_call(&[0, input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 42.5f32); // Cast: JIT ABI convention
     }
 
@@ -17965,15 +17965,15 @@ mod tests {
         // Positive value within byte range
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[42]) }, 42);
+        assert_eq!(unsafe { compiled.try_call(&[42]).expect("test JIT call") }, 42);
         // Truncation: 0x1FF → (byte) = -1
-        assert_eq!(unsafe { compiled.call(&[0x1FF]) }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[0x1FF]).expect("test JIT call") }, -1);
         // Truncation: 300 → (byte) = 44
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[300]) }, 44);
+        assert_eq!(unsafe { compiled.try_call(&[300]).expect("test JIT call") }, 44);
         // Negative: -128
-        assert_eq!(unsafe { compiled.call(&[-128]) }, -128);
+        assert_eq!(unsafe { compiled.try_call(&[-128]).expect("test JIT call") }, -128);
     }
 
     #[test]
@@ -18012,15 +18012,15 @@ mod tests {
         // Positive value within char range
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[65]) }, 65); // 'A'
+        assert_eq!(unsafe { compiled.try_call(&[65]).expect("test JIT call") }, 65); // 'A'
                                                          // 0xFFFF stays as 65535 (unsigned)
-        assert_eq!(unsafe { compiled.call(&[0xFFFF]) }, 65535);
+        assert_eq!(unsafe { compiled.try_call(&[0xFFFF]).expect("test JIT call") }, 65535);
         // Truncation: 0x10041 → 0x0041 = 65
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[0x10041]) }, 65);
+        assert_eq!(unsafe { compiled.try_call(&[0x10041]).expect("test JIT call") }, 65);
         // Negative: -1 → 0xFFFF = 65535
-        assert_eq!(unsafe { compiled.call(&[-1]) }, 65535);
+        assert_eq!(unsafe { compiled.try_call(&[-1]).expect("test JIT call") }, 65535);
     }
 
     #[test]
@@ -18059,15 +18059,15 @@ mod tests {
         // Positive within short range
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[1000]) }, 1000);
+        assert_eq!(unsafe { compiled.try_call(&[1000]).expect("test JIT call") }, 1000);
         // Truncation: 0x18000 → (short) = -32768
-        assert_eq!(unsafe { compiled.call(&[0x18000]) }, -32768);
+        assert_eq!(unsafe { compiled.try_call(&[0x18000]).expect("test JIT call") }, -32768);
         // 32767 stays
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[32767]) }, 32767);
+        assert_eq!(unsafe { compiled.try_call(&[32767]).expect("test JIT call") }, 32767);
         // -32768 stays
-        assert_eq!(unsafe { compiled.call(&[-32768]) }, -32768);
+        assert_eq!(unsafe { compiled.try_call(&[-32768]).expect("test JIT call") }, -32768);
     }
 
     #[test]
@@ -18107,7 +18107,7 @@ mod tests {
         // Void return — result is undefined, but should not crash
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let _ = unsafe { compiled.call(&[]) };
+        let _ = unsafe { compiled.try_call(&[]).expect("test JIT call") };
     }
 
     #[test]
@@ -18147,7 +18147,7 @@ mod tests {
         let input = (-3.5f32).to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), -3.5f32); // Cast: JIT ABI convention
     }
 
@@ -18170,12 +18170,12 @@ mod tests {
         // f(3, 5) = 2*3 + 2*5 = 16
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[3, 5]) };
+        let result = unsafe { compiled.try_call(&[3, 5]).expect("test JIT call") };
         assert_eq!(result, 16);
         // f(10, 7) = 2*10 + 2*7 = 34
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[10, 7]) };
+        let result = unsafe { compiled.try_call(&[10, 7]).expect("test JIT call") };
         assert_eq!(result, 34);
     }
 
@@ -18222,13 +18222,13 @@ mod tests {
         let input = 4.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 2.0f64); // Cast: JIT ABI convention
         // sqrt(2.0) ≈ 1.4142135623730951
         let input2 = 2.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result2 = unsafe { compiled.call(&[input2]) };
+        let result2 = unsafe { compiled.try_call(&[input2]).expect("test JIT call") };
         assert!((f64::from_bits(result2 as u64) - std::f64::consts::SQRT_2).abs() < 1e-14); // Cast: JIT ABI convention
     }
 
@@ -18272,15 +18272,15 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r1 = unsafe { compiled_min.call(&[3, 5]) };
+        let r1 = unsafe { compiled_min.try_call(&[3, 5]).expect("test JIT call") };
         assert_eq!(r1, 3, "Math.min(3, 5) must be 3 (was {r1})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r2 = unsafe { compiled_min.call(&[5, 3]) };
+        let r2 = unsafe { compiled_min.try_call(&[5, 3]).expect("test JIT call") };
         assert_eq!(r2, 3, "Math.min(5, 3) must be 3 (was {r2})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r3 = unsafe { compiled_min.call(&[-7, 4]) };
+        let r3 = unsafe { compiled_min.try_call(&[-7, 4]).expect("test JIT call") };
         assert_eq!(r3, -7, "Math.min(-7, 4) must be -7 (was {r3})");
 
         // Math.max variant
@@ -18310,15 +18310,15 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m1 = unsafe { compiled_max.call(&[3, 5]) };
+        let m1 = unsafe { compiled_max.try_call(&[3, 5]).expect("test JIT call") };
         assert_eq!(m1, 5, "Math.max(3, 5) must be 5 (was {m1})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m2 = unsafe { compiled_max.call(&[5, 3]) };
+        let m2 = unsafe { compiled_max.try_call(&[5, 3]).expect("test JIT call") };
         assert_eq!(m2, 5, "Math.max(5, 3) must be 5 (was {m2})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m3 = unsafe { compiled_max.call(&[-7, 4]) };
+        let m3 = unsafe { compiled_max.try_call(&[-7, 4]).expect("test JIT call") };
         assert_eq!(m3, 4, "Math.max(-7, 4) must be 4 (was {m3})");
     }
 
@@ -18372,17 +18372,17 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the
         // CompiledMethod was produced by the JIT compiler from valid
         // bytecode and the mmap region is executable.
-        let r1 = unsafe { compiled.call(&[3, 5]) };
+        let r1 = unsafe { compiled.try_call(&[3, 5]).expect("test JIT call") };
         assert_eq!(r1, 3, "user-min(3, 5) must be 3 (was {r1})");
         // SAFETY: same as above
-        let r2 = unsafe { compiled.call(&[5, 3]) };
+        let r2 = unsafe { compiled.try_call(&[5, 3]).expect("test JIT call") };
         assert_eq!(r2, 3, "user-min(5, 3) must be 3 (was {r2})");
         // SAFETY: same as above
-        let r3 = unsafe { compiled.call(&[-7, 4]) };
+        let r3 = unsafe { compiled.try_call(&[-7, 4]).expect("test JIT call") };
         assert_eq!(r3, -7, "user-min(-7, 4) must be -7 (was {r3})");
         // Equal inputs: (a < b) is false → take b == a.
         // SAFETY: same as above
-        let r4 = unsafe { compiled.call(&[42, 42]) };
+        let r4 = unsafe { compiled.try_call(&[42, 42]).expect("test JIT call") };
         assert_eq!(r4, 42, "user-min(42, 42) must be 42 (was {r4})");
     }
 
@@ -18431,15 +18431,15 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r1 = unsafe { compiled_min.call(&[3i64, 5i64]) };
+        let r1 = unsafe { compiled_min.try_call(&[3i64, 5i64]).expect("test JIT call") };
         assert_eq!(r1, 3, "Math.min(3L, 5L) must be 3 (was {r1})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r2 = unsafe { compiled_min.call(&[5i64, 3i64]) };
+        let r2 = unsafe { compiled_min.try_call(&[5i64, 3i64]).expect("test JIT call") };
         assert_eq!(r2, 3, "Math.min(5L, 3L) must be 3 (was {r2})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let r3 = unsafe { compiled_min.call(&[-7i64, 4i64]) };
+        let r3 = unsafe { compiled_min.try_call(&[-7i64, 4i64]).expect("test JIT call") };
         assert_eq!(r3, -7, "Math.min(-7L, 4L) must be -7 (was {r3})");
 
         // Math.max(long, long) variant
@@ -18469,15 +18469,15 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m1 = unsafe { compiled_max.call(&[3i64, 5i64]) };
+        let m1 = unsafe { compiled_max.try_call(&[3i64, 5i64]).expect("test JIT call") };
         assert_eq!(m1, 5, "Math.max(3L, 5L) must be 5 (was {m1})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m2 = unsafe { compiled_max.call(&[5i64, 3i64]) };
+        let m2 = unsafe { compiled_max.try_call(&[5i64, 3i64]).expect("test JIT call") };
         assert_eq!(m2, 5, "Math.max(5L, 3L) must be 5 (was {m2})");
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let m3 = unsafe { compiled_max.call(&[-7i64, 4i64]) };
+        let m3 = unsafe { compiled_max.try_call(&[-7i64, 4i64]).expect("test JIT call") };
         assert_eq!(m3, 4, "Math.max(-7L, 4L) must be 4 (was {m3})");
     }
 
@@ -18518,7 +18518,7 @@ mod tests {
         let input = std::f64::consts::PI.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), std::f64::consts::PI); // Cast: JIT ABI convention
     }
 
@@ -18599,7 +18599,7 @@ mod tests {
         let b = 2.25f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 5.75f32); // Cast: JIT ABI convention
     }
 
@@ -18637,7 +18637,7 @@ mod tests {
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 7.0f32); // Cast: JIT ABI convention
 
         // float fmul(float a, float b) { return a * b; }
@@ -18670,7 +18670,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 30.0f32); // Cast: JIT ABI convention
 
         // float fdiv(float a, float b) { return a / b; }
@@ -18705,7 +18705,7 @@ mod tests {
         let b = 4.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 3.75f32); // Cast: JIT ABI convention
     }
 
@@ -18746,7 +18746,7 @@ mod tests {
         let b = 2.5f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 4.0f64); // Cast: JIT ABI convention
     }
 
@@ -18784,7 +18784,7 @@ mod tests {
         let b = 37.5f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 62.5f64); // Cast: JIT ABI convention
 
         // double dmul
@@ -18819,7 +18819,7 @@ mod tests {
         let b = 7.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 42.0f64); // Cast: JIT ABI convention
 
         // double ddiv
@@ -18854,7 +18854,7 @@ mod tests {
         let b = 7.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         let expected = 22.0f64 / 7.0f64;
         assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
     }
@@ -18893,13 +18893,13 @@ mod tests {
         let input = 3.5f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), -3.5f32); // Cast: JIT ABI convention
         // Negate negative
         let input = (-7.0f32).to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 7.0f32); // Cast: JIT ABI convention
 
         // double dneg(double x) { return -x; }
@@ -18934,7 +18934,7 @@ mod tests {
         let input = 42.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), -42.0f64); // Cast: JIT ABI convention
     }
 
@@ -18970,9 +18970,9 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[42]) };
+        let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 42.0f32); // Cast: JIT ABI convention
-        let result = unsafe { compiled.call(&[-7]) };
+        let result = unsafe { compiled.try_call(&[-7]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), -7.0f32); // Cast: JIT ABI convention
 
         // int → double: iload_0 (0x1a), i2d (0x87), dreturn (0xaf)
@@ -19005,9 +19005,9 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[42]) };
+        let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 42.0f64); // Cast: JIT ABI convention
-        let result = unsafe { compiled.call(&[-100]) };
+        let result = unsafe { compiled.try_call(&[-100]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), -100.0f64); // Cast: JIT ABI convention
     }
 
@@ -19044,12 +19044,12 @@ mod tests {
         let input = 3.7f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 3); // truncate toward zero
         let input = (-3.7f32).to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, -3);
 
         // float → double: fload_0, f2d (0x8d), dreturn
@@ -19083,7 +19083,7 @@ mod tests {
         let input = 1.5f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 1.5f64); // Cast: JIT ABI convention
 
         // double → int: dload_0 (0x26), d2i (0x8e), ireturn (0xac)
@@ -19117,7 +19117,7 @@ mod tests {
         let input = 9.99f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 9);
 
         // double → float: dload_0 (0x26), d2f (0x90), freturn (0xae)
@@ -19151,7 +19151,7 @@ mod tests {
         let input = 1.5f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 1.5f32); // Cast: JIT ABI convention
     }
 
@@ -19187,7 +19187,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[1000000i64]) };
+        let result = unsafe { compiled.try_call(&[1000000i64]).expect("test JIT call") };
         assert_eq!(f32::from_bits(result as u32), 1_000_000.0f32); // Cast: JIT ABI convention
 
         // long → double: lload_0 (0x1e), l2d (0x8a), dreturn (0xaf)
@@ -19220,7 +19220,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[1000000i64]) };
+        let result = unsafe { compiled.try_call(&[1000000i64]).expect("test JIT call") };
         assert_eq!(f64::from_bits(result as u64), 1_000_000.0f64); // Cast: JIT ABI convention
 
         // float → long: fload_0 (0x22), f2l (0x8c), lreturn (0xad)
@@ -19254,7 +19254,7 @@ mod tests {
         let input = 42.9f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 42i64);
 
         // double → long: dload_0 (0x26), d2l (0x8f), lreturn (0xad)
@@ -19288,7 +19288,7 @@ mod tests {
         let input = 99.9f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[input]) };
+        let result = unsafe { compiled.try_call(&[input]).expect("test JIT call") };
         assert_eq!(result, 99i64);
     }
 
@@ -19329,29 +19329,29 @@ mod tests {
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 1);
 
         // a == b → 0
         let a = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, 0);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 0);
 
         // a < b → -1
         let a = 1.0f32.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, -1);
 
         // NaN → -1 (fcmpl)
         let nan = f32::NAN.to_bits() as i64; // Cast: JIT ABI convention
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[nan, b]) }, -1);
-        assert_eq!(unsafe { compiled.call(&[b, nan]) }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") }, -1);
     }
 
     #[test]
@@ -19390,20 +19390,20 @@ mod tests {
         let b = 3.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 1);
 
         // a < b → -1
         let a = 1.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, -1);
 
         // NaN → 1 (fcmpg)
         let nan = f32::NAN.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[nan, b]) }, 1);
-        assert_eq!(unsafe { compiled.call(&[b, nan]) }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") }, 1);
     }
 
     #[test]
@@ -19441,23 +19441,23 @@ mod tests {
         let b = 3.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 1);
 
         let a = 3.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, 0);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, 0);
 
         let a = 1.0f64.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[a, b]) }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[a, b]).expect("test JIT call") }, -1);
 
         // NaN → -1 (dcmpl)
         let nan = f64::NAN.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[nan, b]) }, -1);
+        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, -1);
 
         // dcmpg: NaN → 1
         let dcmpg_code: Vec<u8> = vec![0x26, 0x27, 0x98, 0xac, 0, 0];
@@ -19489,8 +19489,8 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        assert_eq!(unsafe { compiled.call(&[nan, b]) }, 1);
-        assert_eq!(unsafe { compiled.call(&[b, nan]) }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[nan, b]).expect("test JIT call") }, 1);
+        assert_eq!(unsafe { compiled.try_call(&[b, nan]).expect("test JIT call") }, 1);
     }
 
     #[test]
@@ -19530,7 +19530,7 @@ mod tests {
         let b = 2.0f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a, b]) };
+        let result = unsafe { compiled.try_call(&[a, b]).expect("test JIT call") };
         // (3.0 + 2.0) * 3.0 = 15.0
         assert_eq!(f32::from_bits(result as u32), 15.0f32); // Cast: JIT ABI convention
     }
@@ -19579,12 +19579,12 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[10, 20]) };
+        let result = unsafe { compiled.try_call(&[10, 20]).expect("test JIT call") };
         assert_eq!(result, 30);
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[7, -3]) };
+        let result = unsafe { compiled.try_call(&[7, -3]).expect("test JIT call") };
         assert_eq!(result, 4);
     }
 
@@ -19644,14 +19644,14 @@ mod tests {
         // Call the JIT method: pass obj pointer as first arg
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 42);
 
         // Test with negative value
         heap.set_field(obj, 0, Value::Int(-123));
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, -123);
     }
 
@@ -19702,7 +19702,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 9_999_999_999i64);
     }
 
@@ -19752,7 +19752,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         let result_f = f32::from_bits(result as u32); // Cast: JIT ABI convention
         assert!((result_f - 3.5f32).abs() < 0.001);
     }
@@ -19806,7 +19806,7 @@ mod tests {
         // Call: setX(obj, 99)
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.call(&[obj.as_ptr() as i64, 99]) }; // Cast: JIT ABI convention
+        unsafe { compiled.try_call(&[obj.as_ptr() as i64, 99]).expect("test JIT call") }; // Cast: JIT ABI convention
 
         // Verify the field was updated
         let val = heap.get_field(obj, 0);
@@ -19815,7 +19815,7 @@ mod tests {
         // Test with negative value
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.call(&[obj.as_ptr() as i64, -42]) }; // Cast: JIT ABI convention
+        unsafe { compiled.try_call(&[obj.as_ptr() as i64, -42]).expect("test JIT call") }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 0);
         assert_eq!(val, Value::Int(-42));
     }
@@ -19865,7 +19865,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.call(&[obj.as_ptr() as i64, 123_456_789_012i64]) }; // Cast: JIT ABI convention
+        unsafe { compiled.try_call(&[obj.as_ptr() as i64, 123_456_789_012i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 0);
         assert_eq!(val, Value::Long(123_456_789_012i64));
     }
@@ -19999,7 +19999,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 11);
 
         // Verify the field is now 11
@@ -20009,7 +20009,7 @@ mod tests {
         // Call again — should return 12
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 12);
     }
 
@@ -20058,7 +20058,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         let result_d = f64::from_bits(result as u64); // Cast: JIT ABI convention
         assert!((result_d - 2.719).abs() < 0.0001);
     }
@@ -20110,14 +20110,14 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, ref_obj.as_ptr() as i64); // Cast: JIT ABI convention
 
         // Test null reference
         heap.set_field(obj, 0, Value::Object(None));
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 0);
     }
 
@@ -20169,7 +20169,7 @@ mod tests {
         let float_bits = 1.5f32.to_bits() as i64; // Cast: JIT ABI convention
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.call(&[obj.as_ptr() as i64, float_bits]) }; // Cast: JIT ABI convention
+        unsafe { compiled.try_call(&[obj.as_ptr() as i64, float_bits]).expect("test JIT call") }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 1);
         assert_eq!(val, Value::Float(1.5f32));
     }
@@ -20222,7 +20222,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[obj.as_ptr() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 300); // reads field at index 2
     }
 
@@ -20280,11 +20280,11 @@ mod tests {
         // Byte fields live in the cell as Value::Int(sign-extended).
         heap.set_field(obj, 0, Value::Int(-7));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
         assert_eq!(r, -7, "inline byte getfield must sign-extend like the helper");
         heap.set_field(obj, 0, Value::Int(127));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
         assert_eq!(r, 127);
     }
 
@@ -20300,7 +20300,7 @@ mod tests {
         let target = heap.alloc_object(ClassId::new(1), 0);
         heap.set_field(obj, 0, Value::Object(Some(target)));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
         assert_eq!(
             r,
             target.as_ptr() as i64,
@@ -20309,7 +20309,7 @@ mod tests {
         // Null reference field → 0.
         heap.set_field(obj, 0, Value::Object(None));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
         assert_eq!(r, 0, "Object(None) field must read as 0");
     }
 
@@ -20325,7 +20325,7 @@ mod tests {
         let v = 0x7EDC_BA98_7654_3210_i64;
         heap.set_field(obj, 1, Value::Long(v));
         // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-        let r = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+        let r = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
         assert_eq!(r, v, "inline long getfield must load the full 64-bit payload");
     }
 
@@ -20337,17 +20337,17 @@ mod tests {
         // field (32-bit payload path) and a ref field (64-bit path).
         let compiled_int = compile_single_getfield(0xac /* ireturn */, 0, b'I');
         // SAFETY: executing JIT-compiled machine code; null receiver is the case under test.
-        let r = unsafe { compiled_int.call(&[0]) };
+        let r = unsafe { compiled_int.try_call(&[0]).expect("test JIT call") };
         assert_eq!(r, 0, "null-receiver int getfield must return 0, not fault");
 
         let compiled_ref = compile_single_getfield(0xb0 /* areturn */, 0, b'L');
         // SAFETY: executing JIT-compiled machine code; null receiver is the case under test.
-        let r = unsafe { compiled_ref.call(&[0]) };
+        let r = unsafe { compiled_ref.try_call(&[0]).expect("test JIT call") };
         assert_eq!(r, 0, "null-receiver ref getfield must return 0, not fault");
 
         let compiled_long = compile_single_getfield(0xad /* lreturn */, 0, b'J');
         // SAFETY: executing JIT-compiled machine code; null receiver is the case under test.
-        let r = unsafe { compiled_long.call(&[0]) };
+        let r = unsafe { compiled_long.try_call(&[0]).expect("test JIT call") };
         assert_eq!(r, 0, "null-receiver long getfield must return 0, not fault");
     }
 
@@ -20366,7 +20366,7 @@ mod tests {
             // SAFETY: obj is a live heap object with field index 0 in bounds.
             let helper = unsafe { stub_getfield(obj.as_ptr() as i64, 0) };
             // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
-            let inline = unsafe { compiled.call(&[obj.as_ptr() as i64]) };
+            let inline = unsafe { compiled.try_call(&[obj.as_ptr() as i64]).expect("test JIT call") };
             assert_eq!(
                 inline, helper,
                 "inline getfield diverged from helper for value {v}"
@@ -20837,7 +20837,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[]) };
+        let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -20885,12 +20885,12 @@ mod tests {
         // null input → branch taken → returns 1
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[0]) };
+        let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") };
         assert_eq!(result, 1);
         // non-null input → branch not taken → returns 0
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[42]) };
+        let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -20938,12 +20938,12 @@ mod tests {
         // non-null input → branch taken → returns 1
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[42]) };
+        let result = unsafe { compiled.try_call(&[42]).expect("test JIT call") };
         assert_eq!(result, 1);
         // null input → branch not taken → returns 0
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[0]) };
+        let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -20996,17 +20996,17 @@ mod tests {
         // Same ref → branch taken → 1
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[100, 100]) };
+        let result = unsafe { compiled.try_call(&[100, 100]).expect("test JIT call") };
         assert_eq!(result, 1);
         // Different refs → not taken → 0
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[100, 200]) };
+        let result = unsafe { compiled.try_call(&[100, 200]).expect("test JIT call") };
         assert_eq!(result, 0);
         // Both null → taken → 1
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[0, 0]) };
+        let result = unsafe { compiled.try_call(&[0, 0]).expect("test JIT call") };
         assert_eq!(result, 1);
     }
 
@@ -21059,12 +21059,12 @@ mod tests {
         // Different refs → branch taken → 1
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[100, 200]) };
+        let result = unsafe { compiled.try_call(&[100, 200]).expect("test JIT call") };
         assert_eq!(result, 1);
         // Same ref → not taken → 0
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[100, 100]) };
+        let result = unsafe { compiled.try_call(&[100, 100]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -21113,7 +21113,7 @@ mod tests {
         .unwrap();
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[]) };
+        let result = unsafe { compiled.try_call(&[]).expect("test JIT call") };
         assert_eq!(result, 42);
     }
 
@@ -21169,7 +21169,7 @@ mod tests {
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[0]) };
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[0]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -21223,7 +21223,7 @@ mod tests {
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[0]) };
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[0]).expect("test JIT call") };
         assert_eq!(result, 0);
     }
 
@@ -21292,9 +21292,9 @@ mod tests {
         // In-bounds access should work
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 0]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 0]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 10);
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 4]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 4]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 50);
     }
 
@@ -21358,7 +21358,7 @@ mod tests {
         // In-bounds store should work
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42]) }; // Cast: address arithmetic
+        unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 0, 42]).expect("test JIT call") }; // Cast: address arithmetic
         let val = shared.heap.get_array_element(arr, 0).unwrap();
         assert_eq!(val.as_int(), Some(42));
     }
@@ -21561,7 +21561,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, 5]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 5]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 15); // 1+2+3+4+5
     }
 
@@ -21969,7 +21969,7 @@ mod tests {
         // Normal entry: sum(10) = 0+1+...+9 = 45
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[10]) };
+        let result = unsafe { compiled.try_call(&[10]).expect("test JIT call") };
         assert_eq!(result, 45);
 
         // OSR entry: simulate entering at PC=4 with locals [n=10, s=10, i=5]
@@ -22021,7 +22021,7 @@ mod tests {
         .unwrap();
 
         // Normal entry: addOnly(2000) = sum(0..1999) = 1999000
-        let result = unsafe { compiled.call(&[2000]) };
+        let result = unsafe { compiled.try_call(&[2000]).expect("test JIT call") };
         assert_eq!(result, 1999000, "normal entry");
 
         // OSR entry at PC=5 with i=1000, s=499500 (sum 0..999), n=2000.
@@ -22683,7 +22683,7 @@ mod tests {
         let arr1_ptr = arr1.as_ptr();
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result1 = unsafe { compiled.call_with_context(vm_ptr, &[arr1_ptr as i64, 0]) }; // Cast: JIT ABI convention
+        let result1 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr1_ptr as i64, 0]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result1, 0, "empty array sum should be 0");
 
         // Test 2: array of 3 elements (0 SIMD chunks, all scalar cleanup)
@@ -22697,7 +22697,7 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result2 = unsafe { compiled.call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64]) }; // Cast: JIT ABI convention
+        let result2 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr2_ptr as i64, n2 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result2, 300, "3 elements of 100 should sum to 300");
 
         // Test 3: array of exactly 8 elements (exactly 1 SIMD chunk, no cleanup)
@@ -22711,7 +22711,7 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result3 = unsafe { compiled.call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64]) }; // Cast: JIT ABI convention
+        let result3 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr3_ptr as i64, n3 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result3, 80, "8 elements of 10 should sum to 80");
 
         // Test 4: array of 20 elements (exercises both SIMD chunks and scalar cleanup)
@@ -22728,7 +22728,7 @@ mod tests {
         }
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result4 = unsafe { compiled.call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64]) }; // Cast: JIT ABI convention
+        let result4 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr4_ptr as i64, n4 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result4, 210, "sum of 1..=20 should be 210");
 
         // Test 5: large array (256 elements) to really exercise SIMD
@@ -22743,7 +22743,7 @@ mod tests {
         // sum of 0..255 = 255*256/2 = 32640
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result5 = unsafe { compiled.call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64]) }; // Cast: JIT ABI convention
+        let result5 = unsafe { compiled.try_call_with_context(vm_ptr, &[arr5_ptr as i64, n5 as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result5, 32640, "sum of 0..=255 should be 32640");
     }
 
@@ -22931,7 +22931,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with a sentinel VM pointer.
         // The fake_new_object stub does not touch the pointer.
-        let result = unsafe { compiled.call_with_context(0xCAFE_F00D, &[]) };
+        let result = unsafe { compiled.try_call_with_context(0xCAFE_F00D, &[]).expect("test JIT call") };
         assert_eq!(
             result, 0xDEAD_BEEFi64,
             "inline TLAB cascade must fall through to slow-path fake_new_object \
@@ -22993,7 +22993,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call_with_context(vm_ptr, &[]) };
+        let result = unsafe { compiled.unwrap().try_call_with_context(vm_ptr, &[]).expect("test JIT call") };
         // Result should be a non-zero pointer to the allocated object
         assert_ne!(result, 0, "jit_new_object should return a valid object pointer");
     }
@@ -23051,7 +23051,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
         // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call_with_context(vm_ptr, &[]) };
+        let result = unsafe { compiled.unwrap().try_call_with_context(vm_ptr, &[]).expect("test JIT call") };
         // Result should be non-zero (valid array pointer)
         assert_ne!(result, 0, "jit_anewarray_object should return a valid array pointer");
     }
@@ -23110,7 +23110,7 @@ mod tests {
         // Call <init>(this, 42)
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.unwrap().call(&[obj.as_ptr() as i64, 42]) }; // Cast: JIT ABI convention
+        unsafe { compiled.unwrap().try_call(&[obj.as_ptr() as i64, 42]).expect("test JIT call") }; // Cast: JIT ABI convention
         let val = heap.get_field(obj, 0);
         assert_eq!(val, Value::Int(42), "Constructor putfield should set field correctly");
     }
@@ -23171,7 +23171,7 @@ mod tests {
         // Call <init>(this, 10, 20)
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        unsafe { compiled.unwrap().call(&[obj.as_ptr() as i64, 10, 20]) }; // Cast: JIT ABI convention
+        unsafe { compiled.unwrap().try_call(&[obj.as_ptr() as i64, 10, 20]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(heap.get_field(obj, 0), Value::Int(10));
         assert_eq!(heap.get_field(obj, 1), Value::Int(20));
     }
@@ -23218,7 +23218,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call(&[41]) };
+        let result = unsafe { compiled.unwrap().try_call(&[41]).expect("test JIT call") };
         assert_eq!(result, 42, "lambda$main$0(41) should return 42");
     }
 
@@ -23263,7 +23263,7 @@ mod tests {
 
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call(&[17, 25]) };
+        let result = unsafe { compiled.unwrap().try_call(&[17, 25]).expect("test JIT call") };
         assert_eq!(result, 42, "add(17, 25) should return 42");
     }
 
@@ -23320,7 +23320,7 @@ mod tests {
         // Pass null as captured object (0), 99 as idx
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.unwrap().call(&[0, 99]) };
+        let result = unsafe { compiled.unwrap().try_call(&[0, 99]).expect("test JIT call") };
         assert_eq!(result, 99, "Lambda should correctly access second parameter");
     }
 
@@ -23371,7 +23371,7 @@ mod tests {
         let b = 3.0f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a.to_bits() as i64, b.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         let expected = (a + b) * (a - b); // 8.0 * 2.0 = 16.0
         assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
     }
@@ -23407,7 +23407,7 @@ mod tests {
         let b = 3.0f32;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a.to_bits() as i64, b.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         let expected = (a + b) * (a - b);
         assert_eq!(f32::from_bits(result as u32), expected); // Cast: JIT ABI convention
     }
@@ -23456,11 +23456,11 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe {
-            compiled.call(&[
+            compiled.try_call(&[
                 a.to_bits() as i64, // Cast: JIT ABI convention
                 b.to_bits() as i64, // Cast: JIT ABI convention
                 c.to_bits() as i64, // Cast: JIT ABI convention
-            ])
+            ]).expect("test JIT call")
         };
         let expected = a * b + a * c + b * c; // 6 + 8 + 12 = 26
         assert_eq!(f64::from_bits(result as u64), expected); // Cast: JIT ABI convention
@@ -23609,7 +23609,7 @@ mod tests {
         let x = 7.5f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[x.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[x.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(f64::from_bits(result as u64), 15.0); // 7.5 * 2.0 = 15.0 // Cast: JIT ABI convention
     }
 
@@ -23758,7 +23758,7 @@ mod tests {
         let a = std::f64::consts::PI;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[a.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(f64::from_bits(result as u64), a + a + a + a); // Cast: JIT ABI convention
     }
 
@@ -23787,7 +23787,7 @@ mod tests {
         let a = 2.5f32;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[a.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(f32::from_bits(result as u32), a * a * a); // 15.625 // Cast: JIT ABI convention
     }
 
@@ -23818,7 +23818,7 @@ mod tests {
         let b = 5.0f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a.to_bits() as i64, b.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(f64::from_bits(result as u64), (a / b) / b); // 4.0 // Cast: JIT ABI convention
     }
 
@@ -23849,7 +23849,7 @@ mod tests {
         let b = 2.1f64;
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call(&[a.to_bits() as i64, b.to_bits() as i64]) }; // Cast: JIT ABI convention
+        let result = unsafe { compiled.try_call(&[a.to_bits() as i64, b.to_bits() as i64]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, (a + b) as i32 as i64); // 5 // Cast: JIT ABI convention
     }
 
@@ -24117,12 +24117,12 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[0]), 10);
-            assert_eq!(compiled.call(&[1]), 20);
-            assert_eq!(compiled.call(&[2]), 30);
-            assert_eq!(compiled.call(&[-1i32 as i64]), -1i64); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[3]), -1i64);
-            assert_eq!(compiled.call(&[100]), -1i64);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 10);
+            assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), 20);
+            assert_eq!(compiled.try_call(&[2]).expect("test JIT call"), 30);
+            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[3]).expect("test JIT call"), -1i64);
+            assert_eq!(compiled.try_call(&[100]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24136,12 +24136,12 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..10 {
-                assert_eq!(compiled.call(&[i as i64]), ((i + 1) * 100) as i64, // Cast: JIT ABI convention
+                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), ((i + 1) * 100) as i64, // Cast: JIT ABI convention
                     "case {} failed", i);
             }
-            assert_eq!(compiled.call(&[-1i32 as i64]), -999i64); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[10]), -999i64);
-            assert_eq!(compiled.call(&[1000]), -999i64);
+            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), -999i64); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[10]).expect("test JIT call"), -999i64);
+            assert_eq!(compiled.try_call(&[1000]).expect("test JIT call"), -999i64);
         }
     }
 
@@ -24153,13 +24153,13 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[5]), 50);
-            assert_eq!(compiled.call(&[6]), 60);
-            assert_eq!(compiled.call(&[7]), 70);
-            assert_eq!(compiled.call(&[8]), 80);
-            assert_eq!(compiled.call(&[9]), 90);
-            assert_eq!(compiled.call(&[4]), 0);
-            assert_eq!(compiled.call(&[10]), 0);
+            assert_eq!(compiled.try_call(&[5]).expect("test JIT call"), 50);
+            assert_eq!(compiled.try_call(&[6]).expect("test JIT call"), 60);
+            assert_eq!(compiled.try_call(&[7]).expect("test JIT call"), 70);
+            assert_eq!(compiled.try_call(&[8]).expect("test JIT call"), 80);
+            assert_eq!(compiled.try_call(&[9]).expect("test JIT call"), 90);
+            assert_eq!(compiled.try_call(&[4]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[10]).expect("test JIT call"), 0);
         }
     }
 
@@ -24171,13 +24171,13 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[-2i32 as i64]), 200); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[-1i32 as i64]), 201); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[0]), 202);
-            assert_eq!(compiled.call(&[1]), 203);
-            assert_eq!(compiled.call(&[2]), 204);
-            assert_eq!(compiled.call(&[-3i32 as i64]), -1i64); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[3]), -1i64);
+            assert_eq!(compiled.try_call(&[-2i32 as i64]).expect("test JIT call"), 200); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), 201); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 202);
+            assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), 203);
+            assert_eq!(compiled.try_call(&[2]).expect("test JIT call"), 204);
+            assert_eq!(compiled.try_call(&[-3i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[3]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24188,8 +24188,8 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[0]), 42);
-            assert_eq!(compiled.call(&[1]), -1i64);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 42);
+            assert_eq!(compiled.try_call(&[1]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24201,12 +24201,12 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[10]), 100);
-            assert_eq!(compiled.call(&[20]), 200);
-            assert_eq!(compiled.call(&[30]), 300);
-            assert_eq!(compiled.call(&[0]), -1i64);
-            assert_eq!(compiled.call(&[15]), -1i64);
-            assert_eq!(compiled.call(&[99]), -1i64);
+            assert_eq!(compiled.try_call(&[10]).expect("test JIT call"), 100);
+            assert_eq!(compiled.try_call(&[20]).expect("test JIT call"), 200);
+            assert_eq!(compiled.try_call(&[30]).expect("test JIT call"), 300);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), -1i64);
+            assert_eq!(compiled.try_call(&[15]).expect("test JIT call"), -1i64);
+            assert_eq!(compiled.try_call(&[99]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24224,13 +24224,13 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for &(key, val) in &pairs {
-                assert_eq!(compiled.call(&[key as i64]), val as i64, // Cast: JIT ABI convention
+                assert_eq!(compiled.try_call(&[key as i64]).expect("test JIT call"), val as i64, // Cast: JIT ABI convention
                     "key {} should return {}", key, val);
             }
-            assert_eq!(compiled.call(&[0]), -1i64);
-            assert_eq!(compiled.call(&[7]), -1i64);
-            assert_eq!(compiled.call(&[150]), -1i64);
-            assert_eq!(compiled.call(&[99999]), -1i64);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), -1i64);
+            assert_eq!(compiled.try_call(&[7]).expect("test JIT call"), -1i64);
+            assert_eq!(compiled.try_call(&[150]).expect("test JIT call"), -1i64);
+            assert_eq!(compiled.try_call(&[99999]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24246,10 +24246,10 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for &(key, val) in &pairs {
-                assert_eq!(compiled.call(&[key as i64]), val as i64); // Cast: JIT ABI convention
+                assert_eq!(compiled.try_call(&[key as i64]).expect("test JIT call"), val as i64); // Cast: JIT ABI convention
             }
-            assert_eq!(compiled.call(&[-200i32 as i64]), -1i64); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[999]), -1i64);
+            assert_eq!(compiled.try_call(&[-200i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[999]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24261,9 +24261,9 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[42]), 999);
-            assert_eq!(compiled.call(&[0]), 0);
-            assert_eq!(compiled.call(&[43]), 0);
+            assert_eq!(compiled.try_call(&[42]).expect("test JIT call"), 999);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[43]).expect("test JIT call"), 0);
         }
     }
 
@@ -24276,10 +24276,10 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..8 {
-                assert_eq!(compiled.call(&[i as i64]), 77); // Cast: JIT ABI convention
+                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), 77); // Cast: JIT ABI convention
             }
-            assert_eq!(compiled.call(&[-1i32 as i64]), -1i64); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[8]), -1i64);
+            assert_eq!(compiled.try_call(&[-1i32 as i64]).expect("test JIT call"), -1i64); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[8]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24291,9 +24291,9 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[0]), 111);
-            assert_eq!(compiled.call(&[1000]), 222);
-            assert_eq!(compiled.call(&[500]), -1i64);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 111);
+            assert_eq!(compiled.try_call(&[1000]).expect("test JIT call"), 222);
+            assert_eq!(compiled.try_call(&[500]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24306,9 +24306,9 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             for i in 0..20 {
-                assert_eq!(compiled.call(&[i as i64]), (i * 11) as i64); // Cast: JIT ABI convention
+                assert_eq!(compiled.try_call(&[i as i64]).expect("test JIT call"), (i * 11) as i64); // Cast: JIT ABI convention
             }
-            assert_eq!(compiled.call(&[20]), -1i64);
+            assert_eq!(compiled.try_call(&[20]).expect("test JIT call"), -1i64);
         }
     }
 
@@ -24403,9 +24403,9 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[42]), 42);
-            assert_eq!(compiled.call(&[0]), 0);
-            assert_eq!(compiled.call(&[-7i32 as i64]), -7); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[42]).expect("test JIT call"), 42);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[-7i32 as i64]).expect("test JIT call"), -7); // Cast: JIT ABI convention
         }
     }
 
@@ -24439,9 +24439,9 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[3, 4]), 7);
-            assert_eq!(compiled.call(&[100, -50i32 as i64]), 50); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[0, 0]), 0);
+            assert_eq!(compiled.try_call(&[3, 4]).expect("test JIT call"), 7);
+            assert_eq!(compiled.try_call(&[100, -50i32 as i64]).expect("test JIT call"), 50); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[0, 0]).expect("test JIT call"), 0);
         }
     }
 
@@ -24473,7 +24473,7 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[]), 5);
+            assert_eq!(compiled.try_call(&[]).expect("test JIT call"), 5);
         }
     }
 
@@ -24506,7 +24506,7 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[99]), 99);
+            assert_eq!(compiled.try_call(&[99]).expect("test JIT call"), 99);
         }
     }
 
@@ -24550,9 +24550,9 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[5]), 5);
-            assert_eq!(compiled.call(&[-5i32 as i64]), 5); // Cast: JIT ABI convention
-            assert_eq!(compiled.call(&[0]), 0);
+            assert_eq!(compiled.try_call(&[5]).expect("test JIT call"), 5);
+            assert_eq!(compiled.try_call(&[-5i32 as i64]).expect("test JIT call"), 5); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
         }
     }
 
@@ -24583,9 +24583,9 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[7]), 21);
-            assert_eq!(compiled.call(&[0]), 0);
-            assert_eq!(compiled.call(&[-3i32 as i64]), -9); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[7]).expect("test JIT call"), 21);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[-3i32 as i64]).expect("test JIT call"), -9); // Cast: JIT ABI convention
         }
     }
 
@@ -24621,8 +24621,8 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[10]), 15);
-            assert_eq!(compiled.call(&[0]), 5);
+            assert_eq!(compiled.try_call(&[10]).expect("test JIT call"), 15);
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 5);
         }
     }
 
@@ -24663,8 +24663,8 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
             // swap_add(a,b) = a + b regardless of swap, so always sum
-            assert_eq!(compiled.call(&[3, 7]), 10);
-            assert_eq!(compiled.call(&[100, 200]), 300);
+            assert_eq!(compiled.try_call(&[3, 7]).expect("test JIT call"), 10);
+            assert_eq!(compiled.try_call(&[100, 200]).expect("test JIT call"), 300);
         }
     }
 
@@ -24721,8 +24721,8 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[50]), 100);
-            assert_eq!(compiled.call(&[-7i32 as i64]), -14); // Cast: JIT ABI convention
+            assert_eq!(compiled.try_call(&[50]).expect("test JIT call"), 100);
+            assert_eq!(compiled.try_call(&[-7i32 as i64]).expect("test JIT call"), -14); // Cast: JIT ABI convention
         }
     }
 
@@ -24748,7 +24748,7 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[]), 100);
+            assert_eq!(compiled.try_call(&[]).expect("test JIT call"), 100);
         }
     }
 
@@ -24781,8 +24781,8 @@ mod tests {
         // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         unsafe {
-            assert_eq!(compiled.call(&[10]), 12); // 10 + 1 + 1
-            assert_eq!(compiled.call(&[0]), 2);
+            assert_eq!(compiled.try_call(&[10]).expect("test JIT call"), 12); // 10 + 1 + 1
+            assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 2);
         }
     }
 
@@ -24867,7 +24867,7 @@ mod tests {
             max_locals,
             // needs_heap = false: inline array access (length + Xaload) is
             // pure machine code with no hidden VM-context argument, so the
-            // tests call `CompiledMethod::call` directly with just the Java
+            // tests call `CompiledMethod::try_call` directly with just the Java
             // args. The deopt stubs call `bastore`/`throw_aioobe` helpers
             // but those take no context. Mirrors the `test_getfield_*`
             // pattern; see the note in `test_bounds_check_iaload_in_bounds`.
@@ -24916,9 +24916,9 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.call(&[arr0.as_ptr() as i64]), 0);
-            assert_eq!(compiled.call(&[arr5.as_ptr() as i64]), 5);
-            assert_eq!(compiled.call(&[arr257.as_ptr() as i64]), 257);
+            assert_eq!(compiled.try_call(&[arr0.as_ptr() as i64]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[arr5.as_ptr() as i64]).expect("test JIT call"), 5);
+            assert_eq!(compiled.try_call(&[arr257.as_ptr() as i64]).expect("test JIT call"), 257);
         }
     }
 
@@ -24952,7 +24952,7 @@ mod tests {
                 // iaload sign-extends the 32-bit element to the 64-bit
                 // return register, so the expected value is `*v as i64`.
                 assert_eq!(
-                    compiled.call(&[arr.as_ptr() as i64, i as i64]),
+                    compiled.try_call(&[arr.as_ptr() as i64, i as i64]).expect("test JIT call"),
                     *v as i64,
                     "iaload mismatch at index {i}"
                 );
@@ -24987,10 +24987,10 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 0]), 127);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 1]), -1);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 2]), -128);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 3]), 1);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 0]).expect("test JIT call"), 127);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 1]).expect("test JIT call"), -1);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call"), -128);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 3]).expect("test JIT call"), 1);
         }
     }
 
@@ -25019,9 +25019,9 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 0]), 65);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 1]), 65535);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 2]), 32768);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 0]).expect("test JIT call"), 65);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 1]).expect("test JIT call"), 65535);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call"), 32768);
         }
     }
 
@@ -25050,9 +25050,9 @@ mod tests {
 
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
         unsafe {
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 0]), 32767);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 1]), -1);
-            assert_eq!(compiled.call(&[arr.as_ptr() as i64, 2]), -32768);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 0]).expect("test JIT call"), 32767);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 1]).expect("test JIT call"), -1);
+            assert_eq!(compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call"), -32768);
         }
     }
 
@@ -25083,7 +25083,7 @@ mod tests {
         unsafe {
             for (i, v) in vals.iter().enumerate() {
                 assert_eq!(
-                    compiled.call(&[arr.as_ptr() as i64, i as i64]),
+                    compiled.try_call(&[arr.as_ptr() as i64, i as i64]).expect("test JIT call"),
                     *v,
                     "laload mismatch at index {i}"
                 );
@@ -25108,7 +25108,7 @@ mod tests {
 
         TEST_NPE_HIT.with(|c| c.set(false));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.call(&[0]) }; // null array
+        let result = unsafe { compiled.try_call(&[0]).expect("test JIT call") }; // null array
         assert_eq!(result, i64::MIN, "null arraylength must deopt with sentinel");
         assert!(
             TEST_NPE_HIT.with(|c| c.get()),
@@ -25130,7 +25130,7 @@ mod tests {
 
         TEST_NPE_HIT.with(|c| c.set(false));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.call(&[0, 0]) }; // null array
+        let result = unsafe { compiled.try_call(&[0, 0]).expect("test JIT call") }; // null array
         assert_eq!(result, i64::MIN, "null iaload must deopt with sentinel");
         assert!(
             TEST_NPE_HIT.with(|c| c.get()),
@@ -25162,7 +25162,7 @@ mod tests {
         // Index == length (just past the end).
         TEST_AIOOBE_HIT.with(|c| c.set(None));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.call(&[arr.as_ptr() as i64, 3]) };
+        let result = unsafe { compiled.try_call(&[arr.as_ptr() as i64, 3]).expect("test JIT call") };
         assert_eq!(result, i64::MIN, "OOB iaload must deopt with sentinel");
         assert_eq!(
             TEST_AIOOBE_HIT.with(|c| c.get()),
@@ -25173,7 +25173,7 @@ mod tests {
         // Negative index — unsigned compare catches it as huge.
         TEST_AIOOBE_HIT.with(|c| c.set(None));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.call(&[arr.as_ptr() as i64, -1]) };
+        let result = unsafe { compiled.try_call(&[arr.as_ptr() as i64, -1]).expect("test JIT call") };
         assert_eq!(result, i64::MIN, "negative-index iaload must deopt");
         assert!(
             TEST_AIOOBE_HIT.with(|c| c.get()).is_some(),
@@ -25184,7 +25184,7 @@ mod tests {
         heap.set_array_element(arr, 2, Value::Int(99)).unwrap();
         TEST_AIOOBE_HIT.with(|c| c.set(None));
         // SAFETY: JIT-compiled code from valid bytecode; mmap region executable.
-        let result = unsafe { compiled.call(&[arr.as_ptr() as i64, 2]) };
+        let result = unsafe { compiled.try_call(&[arr.as_ptr() as i64, 2]).expect("test JIT call") };
         assert_eq!(result, 99);
         assert_eq!(
             TEST_AIOOBE_HIT.with(|c| c.get()),

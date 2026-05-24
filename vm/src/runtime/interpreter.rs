@@ -2189,13 +2189,17 @@ pub fn execute(
                         let args_slice = &jit_args[..jit_count];
                         let needs_heap = compiled_ref.needs_heap();
                         let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
+                        // task #44: migrated from `call`/`call_with_context` (panicking shims)
+                        // to `try_call`/`try_call_with_context`. A JIT runtime invocation
+                        // failure (invalid code pointer / too-many-args) surfaces as
+                        // `Err(CompileError)` instead of being silently downgraded to 0.
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if needs_heap {
                                 // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                                unsafe { compiled_ref.call_with_context(vm_ptr, args_slice) }
+                                unsafe { compiled_ref.try_call_with_context(vm_ptr, args_slice) }
                             } else {
                                 // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                                unsafe { compiled_ref.call(args_slice) }
+                                unsafe { compiled_ref.try_call(args_slice) }
                             }
                         }))
                     };
@@ -2213,7 +2217,14 @@ pub fn execute(
                         jit_early_exception = Some(exc);
                     } else {
                     let result = match jit_result {
-                        Ok(v) => v,
+                        Ok(Ok(v)) => v,
+                        Ok(Err(jit_err)) => {
+                            // task #44: surface `try_call*` Err as InternalError
+                            // instead of the old silent return-0 fallback.
+                            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                                message: format!("JIT call failed: {jit_err}"),
+                            }));
+                        }
                         Err(panic_payload) => {
                             return Err(jit_panic_to_exception(shared, thread, panic_payload));
                         }
@@ -13581,6 +13592,10 @@ fn execute_jit_call(
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
 
     // Fast path: dispatch-free methods skip catch_unwind + thread-local overhead
+    // task #44: migrated from `call`/`call_with_context` (panicking shims) to
+    // `try_call`/`try_call_with_context`. JIT runtime invocation failures
+    // (invalid code pointer / too-many-args) surface as
+    // `MethodCallFailed::InternalError` instead of silent 0-returns.
     let result = if !compiled.has_dispatch {
         // NEW-1.5 + T1.1.a: even on the fast path, a JIT call may
         // transitively trigger GC via a helper. Push the entry guard
@@ -13589,11 +13604,19 @@ fn execute_jit_call(
         let _jit_root_guard =
             crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-        unsafe {
+        let fast_result: Result<i64, cratonvm_jit::CompileError> = unsafe {
             if needs_heap {
-                compiled.call_with_context(vm_ptr, args_slice)
+                compiled.try_call_with_context(vm_ptr, args_slice)
             } else {
-                compiled.call(args_slice)
+                compiled.try_call(args_slice)
+            }
+        };
+        match fast_result {
+            Ok(v) => v,
+            Err(jit_err) => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JIT call failed: {jit_err}"),
+                }));
             }
         }
     } else {
@@ -13603,10 +13626,10 @@ fn execute_jit_call(
         let jit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if needs_heap {
                 // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                unsafe { compiled.call_with_context(vm_ptr, args_slice) }
+                unsafe { compiled.try_call_with_context(vm_ptr, args_slice) }
             } else {
                 // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; args match the method's JVM descriptor.
-                unsafe { compiled.call(args_slice) }
+                unsafe { compiled.try_call(args_slice) }
             }
         }));
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
@@ -13627,7 +13650,15 @@ fn execute_jit_call(
             );
         }
         match jit_result {
-            Ok(v) => v,
+            Ok(Ok(v)) => v,
+            Ok(Err(jit_err)) => {
+                // task #44: try_call/try_call_with_context surface invalid
+                // code pointer / too-many-args as Err; propagate instead
+                // of silently returning 0.
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JIT call failed: {jit_err}"),
+                }));
+            }
             Err(panic_payload) => {
                 return Err(jit_panic_to_exception(shared, thread, panic_payload));
             }

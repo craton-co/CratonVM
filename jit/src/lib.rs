@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
-
 //! JIT compiler for hot bytecode methods.
 //!
 //! Compiles self-contained JVM bytecode methods to native x86-64 machine code.
@@ -242,47 +239,72 @@ pub fn probe_object_null_template() -> (u64, u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Executable memory — delegates to platform module
+// JIT error type — non-panicking compile/runtime failure signalling
 // ---------------------------------------------------------------------------
 
-/// Error returned by the fallible patch helpers on [`ExecutableBuffer`]
-/// (C10).
+/// Errors surfaced by the JIT instead of panicking.
 ///
-/// JIT codegen is contractually never allowed to panic in production — a
-/// bad patch site must bail back to the interpreter, not abort the VM.
-/// `PatchError` is the structured signal callers in `x64.rs` /
-/// `ir_lower.rs` propagate up the compile stack when they catch one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatchError {
-    /// A patch tried to write past the bytes currently emitted into the
-    /// buffer. `offset .. offset + len` extends beyond `buf_size`
-    /// (= the buffer's `pos()` at the time of the patch). This is
-    /// typically a stale recorded patch site left over from an emit
-    /// shortfall that did not flip the `overflowed` flag.
-    OutOfBounds {
-        /// The requested patch offset (byte position from the start of
-        /// the buffer).
-        offset: usize,
-        /// The number of bytes the patch wanted to write.
-        len: usize,
-        /// The buffer's emit position (`pos()`) when the patch was
-        /// attempted. The patch is valid only when `offset + len <= buf_size`.
-        buf_size: usize,
-    },
+/// The JIT contract is "never panics" — every internal codegen or runtime
+/// invariant violation that previously triggered a `panic!`, `assert!`, or
+/// `expect()` is being migrated to return one of these variants instead.
+/// Most variants short-circuit the surrounding compile by tripping the
+/// containing [`ExecutableBuffer`]'s sticky overflow flag, after which the
+/// existing `if buf.overflowed() { return None; }` bail-outs cause
+/// [`compile`](crate::x64::compile) to return `None` (interpreter fallback).
+///
+/// `try_call`/`try_call_with_context` propagate these directly without
+/// going through `overflowed`, because they describe runtime invocation
+/// failures rather than codegen ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileError {
+    /// A `try_patch_i32`/`try_patch_byte` call pointed past the emitted
+    /// code, signalling either a codegen invariant break or a recovery
+    /// from a prior buffer overflow. `kind` is `"i32"` or `"byte"`;
+    /// `offset` is the patch site as recorded by the caller.
+    PatchFailed { kind: &'static str, offset: usize },
+    /// A rel8/rel32 displacement overflowed its encoding range during a
+    /// branch patch. `kind` is `"rel8"` or `"rel32"`; `displacement` is
+    /// the out-of-range value. Currently produced by the safe-idiv
+    /// guard patches; the surrounding compile bails via `overflowed`.
+    DisplacementOverflow { kind: &'static str, displacement: i64 },
+    /// `CompiledMethod::try_call` / `try_call_with_context` was invoked
+    /// with more arguments than the JIT's hand-rolled call thunks
+    /// support (currently 8 / 7 respectively, excluding the implicit
+    /// context pointer). `n` is the actual number of arguments
+    /// supplied.
+    TooManyArgs(usize),
+    /// `validate_code_ptr` rejected an entry/trampoline pointer before
+    /// transmute to a function pointer. The wrapped string is the
+    /// `validate_code_ptr` reason.
+    InvalidCodePtr(&'static str),
 }
 
-impl std::fmt::Display for PatchError {
+impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PatchError::OutOfBounds { offset, len, buf_size } => write!(
+            CompileError::PatchFailed { kind, offset } => write!(
                 f,
-                "patch out of bounds: offset {offset} + len {len} > buf_size {buf_size}"
+                "JIT patch failed ({kind}) at offset {offset}: site is past emitted len"
             ),
+            CompileError::DisplacementOverflow { kind, displacement } => write!(
+                f,
+                "JIT branch displacement overflowed {kind} encoding (= {displacement})"
+            ),
+            CompileError::TooManyArgs(n) => {
+                write!(f, "JIT call: too many arguments ({n})")
+            }
+            CompileError::InvalidCodePtr(reason) => {
+                write!(f, "JIT invalid code pointer: {reason}")
+            }
         }
     }
 }
 
-impl std::error::Error for PatchError {}
+impl std::error::Error for CompileError {}
+
+// ---------------------------------------------------------------------------
+// Executable memory — delegates to platform module
+// ---------------------------------------------------------------------------
 
 /// A buffer of executable machine code allocated via OS-level APIs.
 ///
@@ -385,6 +407,19 @@ impl ExecutableBuffer {
         self.overflowed
     }
 
+    /// Force the buffer into the [`overflowed`](Self::overflowed) state.
+    ///
+    /// Used by codegen sites that detect a hard codegen invariant break
+    /// (e.g. a branch displacement that does not fit its encoding) and
+    /// cannot return `Result` to their caller. Setting this flag causes
+    /// the surrounding compile driver to discard the half-emitted method
+    /// and fall back to the interpreter via the existing
+    /// `if buf.overflowed() { return None; }` check in `compile`.
+    #[inline]
+    pub fn mark_overflowed(&mut self) {
+        self.overflowed = true;
+    }
+
     /// Current write position (offset from start).
     #[inline]
     pub fn pos(&self) -> usize {
@@ -418,29 +453,23 @@ impl ExecutableBuffer {
 
     /// Patch 4 bytes (little-endian i32) at the given offset.
     ///
-    /// Fallible variant: returns [`PatchError::OutOfBounds`] when
-    /// `offset .. offset+4` falls outside the bytes currently emitted into
-    /// the buffer. The compile driver should treat any error as "bail to
-    /// interpreter" — the partially emitted code is unsafe to execute. C10:
-    /// this is the never-panic path callers should migrate to from the
-    /// deprecated [`Self::patch_i32`] shim.
-    pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), PatchError> {
-        // After an emit overflow some recorded patch sites can point past the
-        // truncated buffer; skip them rather than erroring since the result
-        // is going to be discarded anyway. `checked_add` defends against the
-        // `offset + 4 > self.len` arithmetic wrapping when `offset` is
-        // adversarially close to `usize::MAX`.
+    /// On out-of-bounds offset, marks the buffer
+    /// [`overflowed`](Self::overflowed) and returns
+    /// `Err(CompileError::PatchFailed)` instead of panicking. The surrounding
+    /// compile driver inspects `overflowed()` after codegen and bails to the
+    /// interpreter; the caller may ignore the `Err` and rely on that bail.
+    pub fn try_patch_i32(&mut self, offset: usize, value: i32) -> Result<(), CompileError> {
         if offset.checked_add(4).map_or(true, |end| end > self.len) {
-            if self.overflowed {
-                return Ok(());
-            }
-            return Err(PatchError::OutOfBounds {
-                offset,
-                len: 4,
-                buf_size: self.len,
-            });
+            self.overflowed = true;
+            tracing::warn!(
+                offset = offset,
+                len = self.len,
+                "JIT try_patch_i32: offset out of bounds; marking buffer overflowed"
+            );
+            return Err(CompileError::PatchFailed { kind: "i32", offset });
         }
         let bytes = value.to_le_bytes();
+        // Safety: bounds checked above; ptr is owned and writable.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(offset), 4);
         }
@@ -449,61 +478,32 @@ impl ExecutableBuffer {
 
     /// Patch 1 byte at the given offset.
     ///
-    /// Fallible variant: returns [`PatchError::OutOfBounds`] when `offset`
-    /// lies past the current emit position. C10: never-panic path; see
-    /// [`Self::try_patch_i32`] for the rationale.
-    pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), PatchError> {
+    /// On out-of-bounds offset, marks the buffer
+    /// [`overflowed`](Self::overflowed) and returns
+    /// `Err(CompileError::PatchFailed)` instead of panicking. See
+    /// [`try_patch_i32`](Self::try_patch_i32) for the bail-out contract.
+    pub fn try_patch_byte(&mut self, offset: usize, value: u8) -> Result<(), CompileError> {
         if offset >= self.len {
-            if self.overflowed {
-                return Ok(());
-            }
-            return Err(PatchError::OutOfBounds {
-                offset,
-                len: 1,
-                buf_size: self.len,
-            });
+            self.overflowed = true;
+            tracing::warn!(
+                offset = offset,
+                len = self.len,
+                "JIT try_patch_byte: offset out of bounds; marking buffer overflowed"
+            );
+            return Err(CompileError::PatchFailed { kind: "byte", offset });
         }
+        // Safety: bounds checked above.
         unsafe {
             *self.ptr.add(offset) = value;
         }
         Ok(())
     }
 
-    /// Patch 4 bytes (little-endian i32) at the given offset.
-    ///
-    /// Panicking shim retained for back-compat with the pre-C10 callers in
-    /// `x64.rs` / `ir_lower.rs`. **Production callers must migrate to
-    /// [`Self::try_patch_i32`]** so a stale recorded patch site (e.g. after
-    /// an emit shortfall that did not flip `overflowed`) bails to the
-    /// interpreter instead of aborting the VM. The body delegates to
-    /// `try_patch_i32` and only panics on the error path, so once every
-    /// caller has migrated this shim can be deleted and the never-panic
-    /// invariant holds crate-wide.
-    #[deprecated(
-        since = "0.2.0",
-        note = "use try_patch_i32 instead; this variant panics on out-of-bounds writes \
-                and violates the 'JIT never panics in production' contract (C10)"
-    )]
-    pub fn patch_i32(&mut self, offset: usize, value: i32) {
-        if let Err(e) = self.try_patch_i32(offset, value) {
-            panic!("patch out of bounds: {e:?}");
-        }
-    }
-
-    /// Patch 1 byte at the given offset.
-    ///
-    /// Panicking shim retained for back-compat; see [`Self::patch_i32`] for
-    /// the migration rationale.
-    #[deprecated(
-        since = "0.2.0",
-        note = "use try_patch_byte instead; this variant panics on out-of-bounds writes \
-                and violates the 'JIT never panics in production' contract (C10)"
-    )]
-    pub fn patch_byte(&mut self, offset: usize, value: u8) {
-        if let Err(e) = self.try_patch_byte(offset, value) {
-            panic!("patch_byte out of bounds: {e:?}");
-        }
-    }
+    // task #44: the deprecated panicking `patch_i32` / `patch_byte` shims
+    // have been removed. Every internal codegen site was migrated to the
+    // `try_patch_*` variants in task #20 (commit acd57f2). A workspace grep
+    // confirmed zero remaining callers before deletion; the `try_*`
+    // variants are the only entry points now.
 
     /// Read 4 bytes (little-endian i32) at the given offset.
     pub fn read_i32(&self, offset: usize) -> i32 {
@@ -519,7 +519,7 @@ impl ExecutableBuffer {
     ///
     /// Calls the OS API to switch from RW to RX permissions.
     ///
-    /// After calling `finalize`, writes via `emit`/`emit_byte`/`patch_i32` are
+    /// After calling `finalize`, writes via `emit`/`emit_byte`/`try_patch_i32` are
     /// undefined behavior. Call [`make_writable`](Self::make_writable)
     /// first if you need to patch code after finalization.
     pub fn finalize(&self) {
@@ -846,121 +846,157 @@ impl CompiledMethod {
         self.needs_context
     }
 
-    /// Call a pure compiled method (no VM context interaction).
+    /// Call a pure compiled method, returning `Err` instead of panicking
+    /// on invalid code pointer or unsupported arg count.
+    ///
+    /// task #44: this is the canonical entry point for invoking JIT
+    /// code. The earlier panicking-warn-and-return-0 `call` wrapper has
+    /// been removed; every VM and test caller now goes through
+    /// `try_call` directly.
     ///
     /// # Safety
     /// The compiled code must match the expected signature.
     #[inline]
-    pub unsafe fn call(&self, args: &[i64]) -> i64 {
-        validate_code_ptr(self.entry).expect("JIT: invalid code pointer in call()");
+    pub unsafe fn try_call(&self, args: &[i64]) -> Result<i64, CompileError> {
+        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
                 let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(self.entry);
-                f()
+                Ok(f())
             }
             1 => {
                 let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
-                f(args[0])
+                Ok(f(args[0]))
             }
             2 => {
                 let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
-                f(args[0], args[1])
+                Ok(f(args[0], args[1]))
             }
             3 => {
                 let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
-                f(args[0], args[1], args[2])
+                Ok(f(args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(args[0], args[1], args[2], args[3])
+                Ok(f(args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(args[0], args[1], args[2], args[3], args[4])
+                Ok(f(args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(args[0], args[1], args[2], args[3], args[4], args[5])
+                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6]))
             }
             8 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7])
+                Ok(f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]))
             }
-            _ => {
-                eprintln!("JIT: too many arguments ({}), returning 0", args.len());
-                0
-            }
+            n => Err(CompileError::TooManyArgs(n)),
         }
     }
 
-    /// Call a compiled method that needs VM context (SharedVm pointer).
+    // task #44: the panicking-warn-and-return-0 `CompiledMethod::call`
+    // wrapper has been removed. All workspace callers (vm/, jit/src,
+    // jit/tests) now use `try_call` directly. A JIT runtime invocation
+    // failure (invalid code pointer, too-many-args) surfaces as
+    // `Err(CompileError)` instead of being silently downgraded to a
+    // zero return value.
+
+    /// Call a compiled method that needs VM context, returning `Err`
+    /// instead of panicking on invalid code pointer or unsupported arg
+    /// count.
+    ///
+    /// task #44: this is the canonical entry point for invoking
+    /// context-needing JIT code. The earlier
+    /// panicking-warn-and-return-0 `call_with_context` wrapper has
+    /// been removed; every VM and test caller now goes through
+    /// `try_call_with_context` directly.
     ///
     /// # Safety
-    /// `vm_ptr` must be a valid pointer to a `SharedVm`. Args must match the method signature.
+    /// `vm_ptr` must be a valid pointer to a `SharedVm`. Args must match
+    /// the method signature.
     #[inline]
-    pub unsafe fn call_with_context(&self, vm_ptr: i64, args: &[i64]) -> i64 {
-        validate_code_ptr(self.entry).expect("JIT: invalid code pointer in call_with_context()");
+    pub unsafe fn try_call_with_context(
+        &self,
+        vm_ptr: i64,
+        args: &[i64],
+    ) -> Result<i64, CompileError> {
+        validate_code_ptr(self.entry).map_err(CompileError::InvalidCodePtr)?;
         match args.len() {
             0 => {
                 let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(self.entry);
-                f(vm_ptr)
+                Ok(f(vm_ptr))
             }
             1 => {
                 let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(self.entry);
-                f(vm_ptr, args[0])
+                Ok(f(vm_ptr, args[0]))
             }
             2 => {
                 let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(self.entry);
-                f(vm_ptr, args[0], args[1])
+                Ok(f(vm_ptr, args[0], args[1]))
             }
             3 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(vm_ptr, args[0], args[1], args[2])
+                Ok(f(vm_ptr, args[0], args[1], args[2]))
             }
             4 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(vm_ptr, args[0], args[1], args[2], args[3])
+                Ok(f(vm_ptr, args[0], args[1], args[2], args[3]))
             }
             5 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(vm_ptr, args[0], args[1], args[2], args[3], args[4])
+                Ok(f(vm_ptr, args[0], args[1], args[2], args[3], args[4]))
             }
             6 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5])
+                Ok(f(vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5]))
             }
             7 => {
                 let f: unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
                     std::mem::transmute(self.entry);
-                f(vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+                Ok(f(
+                    vm_ptr, args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                ))
             }
-            _ => {
-                eprintln!("JIT: too many arguments ({}) for context call, returning 0", args.len());
-                0
-            }
+            n => Err(CompileError::TooManyArgs(n)),
         }
     }
 
-    /// Backward-compatible alias for `call_with_context`.
+    // task #44: the panicking-warn-and-return-0 `call_with_context`
+    // wrapper has been removed alongside `call`. All workspace callers
+    // now use `try_call_with_context` directly (or the thin `.expect()`
+    // alias `call_with_heap` below for test-side callers that keep an
+    // `i64` return type).
+
+    /// Backward-compatible test-only alias for `try_call_with_context`.
+    ///
+    /// task #44 removed the panicking `call_with_context` wrapper; this
+    /// alias now delegates to the `try_*` variant and `.expect()`s the
+    /// result so existing tests keep their `i64` return type. New code
+    /// should call [`try_call_with_context`](Self::try_call_with_context)
+    /// directly.
     ///
     /// # Safety
-    /// Same safety requirements as `call_with_context`.
+    /// Same safety requirements as
+    /// [`try_call_with_context`](Self::try_call_with_context).
     #[inline]
     pub unsafe fn call_with_heap(&self, heap_ptr: i64, args: &[i64]) -> i64 {
-        self.call_with_context(heap_ptr, args)
+        self.try_call_with_context(heap_ptr, args)
+            .expect("call_with_heap: invalid JIT entry or arg count (use try_call_with_context for the fallible variant)")
     }
 
     /// OSR entry: enter JIT code at an arbitrary bytecode PC with interpreter locals.
@@ -1268,7 +1304,17 @@ unsafe fn osr_trampoline(
     };
 
     let code_ptr = tramp_arc.as_ptr();
-    validate_code_ptr(code_ptr).expect("JIT: invalid trampoline code pointer");
+    // Non-panicking validation: if the freshly-emitted trampoline pointer
+    // somehow isn't in a registered code region, log and bail rather than
+    // aborting the process. The caller (`osr_enter`) treats `None` as
+    // "skip OSR, fall back to interpreter".
+    if let Err(reason) = validate_code_ptr(code_ptr) {
+        tracing::warn!(
+            reason = reason,
+            "JIT osr_trampoline: invalid code pointer; skipping OSR"
+        );
+        return None;
+    }
 
     // The cached trampoline now takes (locals_ptr, vm_ptr) via the platform C ABI.
     // `vm_ptr` is only read when `needs_context`, but passing it unconditionally
@@ -4277,9 +4323,9 @@ mod tests {
     fn test_executable_buffer_patch_and_read_i32() {
         let mut buf = ExecutableBuffer::new(32).expect("alloc failed");
         buf.emit(&[0; 8]); // 8 zero bytes
-        buf.patch_i32(0, 0x12345678);
+        buf.try_patch_i32(0, 0x12345678).expect("in-bounds patch");
         assert_eq!(buf.read_i32(0), 0x12345678);
-        buf.patch_i32(4, -42);
+        buf.try_patch_i32(4, -42).expect("in-bounds patch");
         assert_eq!(buf.read_i32(4), -42);
     }
 
@@ -4294,6 +4340,141 @@ mod tests {
         assert_eq!(buf.pos(), 0, "overflowing emit must not advance len");
         buf.emit_byte(0xCC);
         assert_eq!(buf.pos(), 0, "overflowing emit_byte must not advance len");
+    }
+
+    #[test]
+    fn test_try_patch_i32_out_of_bounds_returns_err_does_not_panic() {
+        // Task #20: a patch site pointing past `len` must return
+        // `Err(PatchFailed)`, mark the buffer overflowed, and never panic.
+        // The compile driver relies on the overflow flag to bail to the
+        // interpreter when codegen has slipped past its size estimate.
+        let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+        buf.emit(&[0; 8]); // only 8 bytes emitted, so offset 8..=11 is OOB
+        let result = buf.try_patch_i32(8, 0xDEAD_BEEFu32 as i32);
+        assert!(matches!(
+            result,
+            Err(CompileError::PatchFailed { kind: "i32", offset: 8 })
+        ));
+        assert!(
+            buf.overflowed(),
+            "OOB patch must set the sticky overflow flag for the compile driver"
+        );
+
+        // Same contract for try_patch_byte.
+        let mut buf2 = ExecutableBuffer::new(64).expect("alloc failed");
+        buf2.emit(&[0; 2]);
+        let result2 = buf2.try_patch_byte(99, 0xCC);
+        assert!(matches!(
+            result2,
+            Err(CompileError::PatchFailed { kind: "byte", offset: 99 })
+        ));
+        assert!(buf2.overflowed());
+    }
+
+    #[test]
+    fn test_try_call_nine_args_returns_too_many_args_err_no_panic() {
+        // Task #20: invoking a compiled method with more arguments than
+        // the JIT's hand-rolled call thunks support must return
+        // `Err(TooManyArgs)` rather than silently returning 0 or
+        // panicking. Both `try_call` and `try_call_with_context` honor
+        // this contract.
+        let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET — just a valid landing pad
+        let cm = CompiledMethod::new(buf);
+
+        // 9 args exceeds the 8-arg ceiling of `try_call`.
+        let nine = [0i64; 9];
+        let r = unsafe { cm.try_call(&nine) };
+        assert!(
+            matches!(r, Err(CompileError::TooManyArgs(9))),
+            "expected TooManyArgs(9), got {r:?}"
+        );
+
+        // 8 args exceeds the 7-arg ceiling of `try_call_with_context`
+        // (one register is consumed by the implicit vm_ptr).
+        let mut buf2 = ExecutableBuffer::new(64).expect("alloc failed");
+        buf2.emit(&[0xC3]);
+        let cm2 = CompiledMethod::new_with_context(buf2);
+        let eight = [0i64; 8];
+        let r2 = unsafe { cm2.try_call_with_context(0, &eight) };
+        assert!(
+            matches!(r2, Err(CompileError::TooManyArgs(8))),
+            "expected TooManyArgs(8) for context call, got {r2:?}"
+        );
+    }
+
+    #[test]
+    fn test_try_call_returns_ok_for_in_bounds_zero_arg_method() {
+        // Task #44: positive test. After removing the panicking `call`
+        // wrapper, `try_call` is the canonical happy-path entry point.
+        // A minimal compiled method that returns 0 (XOR EAX,EAX; RET)
+        // must produce `Ok(0)` when invoked with no arguments.
+        // Encoded as: 31 C0 (xor eax, eax) C3 (ret).
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0x31, 0xC0, 0xC3]);
+        let cm = CompiledMethod::new(buf);
+        // SAFETY: the emitted code is a well-formed x86-64 leaf (XOR
+        // EAX,EAX; RET) using the platform C ABI for a no-arg
+        // `extern "C" fn() -> i64`. CompiledMethod::new finalized the
+        // buffer, so the page is executable.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let r = unsafe { cm.try_call(&[]) };
+            assert_eq!(r, Ok(0), "try_call({{}}) should return Ok(0)");
+        }
+        // On non-x86_64 targets the emitted bytes are not valid, so
+        // suppress the call but still exercise the type-level
+        // try_call contract (TooManyArgs path) to keep the test
+        // platform-independent.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let big = [0i64; 9];
+            let r = unsafe { cm.try_call(&big) };
+            assert!(matches!(r, Err(CompileError::TooManyArgs(9))));
+        }
+    }
+
+    #[test]
+    fn test_try_call_invalid_code_ptr_returns_err_not_silent_zero() {
+        // Task #44 acceptance criterion 5: demonstrate that a JIT
+        // "compile-failed" / runtime-invalid-pointer result propagates
+        // as `Err(CompileError::InvalidCodePtr(_))` instead of being
+        // silently downgraded to a `0` return value (which is what the
+        // now-removed `call` wrapper did via `tracing::warn!` +
+        // return 0).
+        //
+        // We synthesize the invalid-pointer condition by constructing
+        // a `CompiledMethod` whose `entry` field has been overwritten
+        // with a value outside any known JIT code region. The pointer
+        // is also misaligned (1 byte) so `validate_code_ptr` would
+        // reject it on alignment alone even if the region check ever
+        // changes.
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]);
+        let mut cm = CompiledMethod::new(buf);
+        // Stomp on the entry pointer: misaligned + outside any region.
+        cm.entry = 0x1 as *const u8;
+
+        // SAFETY: the call is gated by `validate_code_ptr` inside
+        // `try_call`, which rejects the synthetic pointer before any
+        // transmute-to-fn-pointer happens. No real code is executed.
+        let r = unsafe { cm.try_call(&[]) };
+        assert!(
+            matches!(r, Err(CompileError::InvalidCodePtr(_))),
+            "expected InvalidCodePtr, got {r:?} (silent-zero would be Ok(0) — that contract is gone)"
+        );
+
+        // Equivalent contract for the context-needing variant: must
+        // also surface InvalidCodePtr rather than swallowing it.
+        let mut buf2 = ExecutableBuffer::new(16).expect("alloc failed");
+        buf2.emit(&[0xC3]);
+        let mut cm2 = CompiledMethod::new_with_context(buf2);
+        cm2.entry = 0x3 as *const u8;
+        let r2 = unsafe { cm2.try_call_with_context(0, &[]) };
+        assert!(
+            matches!(r2, Err(CompileError::InvalidCodePtr(_))),
+            "expected InvalidCodePtr for context call, got {r2:?}"
+        );
     }
 
     #[test]

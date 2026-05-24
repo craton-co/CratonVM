@@ -120,7 +120,7 @@ fn compile_unary(entry: usize) -> impl Fn(i32) -> i32 {
     move |x: i32| {
         // SAFETY: `compiled` was produced by the JIT from valid bytecode and
         // the mmap region is executable.
-        unsafe { compiled.call(&[x as i64]) as i32 }
+        unsafe { compiled.try_call(&[x as i64]).expect("test JIT call") as i32 }
     }
 }
 
@@ -166,7 +166,7 @@ fn compile_binary(entry: usize) -> impl Fn(i32, i32) -> i32 {
     .expect("JIT compilation of binary INT_BITS intrinsic failed");
     move |x: i32, y: i32| {
         // SAFETY: see `compile_unary`.
-        unsafe { compiled.call(&[x as i64, y as i64]) as i32 }
+        unsafe { compiled.try_call(&[x as i64, y as i64]).expect("test JIT call") as i32 }
     }
 }
 

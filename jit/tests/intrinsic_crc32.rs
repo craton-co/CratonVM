@@ -285,7 +285,7 @@ fn compile_update_byte(entry: usize, guard_class_id: u32) -> impl Fn(*mut u8, i3
         // the first C argument is the heap pointer (unused by the intrinsic;
         // 0 is fine — no helper is called).
         unsafe {
-            compiled.call(&[0, recv as i64, b as i64]);
+            compiled.try_call(&[0, recv as i64, b as i64]).expect("test JIT call");
         }
     }
 }
@@ -335,7 +335,7 @@ fn compile_update_bytes(entry: usize, guard_class_id: u32) -> impl Fn(*mut u8, *
     move |recv: *mut u8, arr: *mut u8, off: i32, len: i32| {
         // SAFETY: see `compile_update_byte`.
         unsafe {
-            compiled.call(&[0, recv as i64, arr as i64, off as i64, len as i64]);
+            compiled.try_call(&[0, recv as i64, arr as i64, off as i64, len as i64]).expect("test JIT call");
         }
     }
 }

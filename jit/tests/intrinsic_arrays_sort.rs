@@ -168,7 +168,7 @@ fn compile_sort(entry: usize) -> impl Fn(*mut u8) {
         // the mmap region is executable. `arr` points at a live heap-layout
         // array object owned by the caller for the duration of the call.
         unsafe {
-            compiled.call(&[arr as i64]);
+            compiled.try_call(&[arr as i64]).expect("test JIT call");
         }
     }
 }

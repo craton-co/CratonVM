@@ -136,7 +136,7 @@ unsafe fn run_unary(intrinsic: JitIntrinsic, ret_type: u8, arg: i64) -> i64 {
     )
     .expect("JIT compilation failed");
     // SAFETY: machine code produced by the JIT from valid bytecode.
-    compiled.call(&[arg])
+    compiled.try_call(&[arg]).expect("test JIT call")
 }
 
 /// Compile `static int f(long x, long y) { return Long.OP(x, y); }`.
@@ -185,7 +185,7 @@ unsafe fn run_binary(intrinsic: JitIntrinsic, ret_type: u8, x: i64, y: i64) -> i
     )
     .expect("JIT compilation failed");
     // SAFETY: machine code produced by the JIT from valid bytecode.
-    compiled.call(&[x, y])
+    compiled.try_call(&[x, y]).expect("test JIT call")
 }
 
 #[test]

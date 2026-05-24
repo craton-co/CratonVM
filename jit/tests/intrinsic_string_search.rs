@@ -226,7 +226,7 @@ fn compile_equals() -> impl Fn(i64, i64) -> i64 {
         Some(string_layout()),
     )
     .expect("equals wrapper compilation failed");
-    move |this: i64, other: i64| unsafe { compiled.call(&[this, other]) }
+    move |this: i64, other: i64| unsafe { compiled.try_call(&[this, other]).expect("test JIT call") }
 }
 
 /// Build a String object for `s` plus its backing array; return both so the
@@ -352,7 +352,7 @@ fn compile_obj_arg(name: &str, descriptor: &str) -> impl Fn(i64, i64) -> i64 {
         Some(string_layout()),
     )
     .expect("object-arg wrapper compilation failed");
-    move |this: i64, other: i64| unsafe { compiled.call(&[this, other]) }
+    move |this: i64, other: i64| unsafe { compiled.try_call(&[this, other]).expect("test JIT call") }
 }
 
 /// JIT-compile `int f(String this, int ch)` whose body is
@@ -403,7 +403,7 @@ fn compile_index_of_char() -> impl Fn(i64, i64) -> i64 {
         Some(string_layout()),
     )
     .expect("indexOf(I) wrapper compilation failed");
-    move |this: i64, ch: i64| unsafe { compiled.call(&[this, ch]) }
+    move |this: i64, ch: i64| unsafe { compiled.try_call(&[this, ch]).expect("test JIT call") }
 }
 
 /// Reference `compareTo` — the `native_string_compare_to` oracle.

@@ -235,13 +235,13 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
         // the mmap region is executable. The pointer args reference live
         // `FakeArray` storage owned by the caller for the call's duration.
         unsafe {
-            compiled.call(&[
+            compiled.try_call(&[
                 src,
                 src_pos as i64,
                 dst,
                 dst_pos as i64,
                 len as i64,
-            ]);
+            ]).expect("test JIT call");
         }
     }
 }

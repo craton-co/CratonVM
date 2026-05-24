@@ -253,7 +253,7 @@ fn compile_unary(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
         HashMap::new(),
         Some(string_layout()),
     )?;
-    Some(move |this: i64| unsafe { compiled.call(&[this]) })
+    Some(move |this: i64| unsafe { compiled.try_call(&[this]).expect("test JIT call") })
 }
 
 /// JIT-compile `int f(String this, int idx)` whose body is
@@ -304,7 +304,7 @@ fn compile_char_at() -> impl Fn(i64, i32) -> i64 {
         Some(string_layout()),
     )
     .expect("charAt wrapper compilation failed");
-    move |this: i64, idx: i32| unsafe { compiled.call(&[this, idx as i64]) }
+    move |this: i64, idx: i32| unsafe { compiled.try_call(&[this, idx as i64]).expect("test JIT call") }
 }
 
 // --- matcher integration --------------------------------------------------

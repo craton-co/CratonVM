@@ -66435,7 +66435,7 @@ public class SkippedTest {
                 .find(|&&(k, _)| k == input)
                 .map(|&(_, v)| v as i64)
                 .unwrap_or(default_val as i64);
-            let actual = unsafe { compiled.call(&[input as i64]) };
+            let actual = unsafe { compiled.try_call(&[input as i64]).expect("test JIT call") };
             assert_eq!(actual, expected,
                 "input={}: expected {}, got {}", input, expected, actual);
         }
@@ -66493,10 +66493,10 @@ public class SkippedTest {
 
         unsafe {
             // Extreme out-of-range values should all hit default without crash
-            assert_eq!(compiled.call(&[-1000000i32 as i64]), 0);
-            assert_eq!(compiled.call(&[1000000]), 0);
-            assert_eq!(compiled.call(&[i32::MIN as i64]), 0);
-            assert_eq!(compiled.call(&[i32::MAX as i64]), 0);
+            assert_eq!(compiled.try_call(&[-1000000i32 as i64]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[1000000]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[i32::MIN as i64]).expect("test JIT call"), 0);
+            assert_eq!(compiled.try_call(&[i32::MAX as i64]).expect("test JIT call"), 0);
         }
     }
 

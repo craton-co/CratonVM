@@ -269,7 +269,7 @@ pub fn pop_jit_entry() -> Option<usize> {
 ///
 /// ```ignore
 /// let _guard = JitEntryGuard::enter();
-/// let result = std::panic::catch_unwind(|| unsafe { compiled.call(args) });
+/// let result = std::panic::catch_unwind(|| unsafe { compiled.try_call(args) });
 /// // _guard drops here, popping the entry whether result is Ok or Err
 /// ```
 pub struct JitEntryGuard {
