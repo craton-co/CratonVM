@@ -1636,6 +1636,76 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// JIT-T#51 — loop-unrolling byte-copy safety predicate.
+//
+// The unroller in `compile_op_goto` works by snapshotting the native bytes
+// emitted for the loop body and re-emitting them verbatim at later
+// offsets. That is only correct when every byte the body contains is
+// position-independent **or** is one of the rel32 patch flavours the
+// unroller knows how to re-shift afterwards (`forward_patches`,
+// `bounds_check_stubs`, `null_check_store_stubs`).
+//
+// Naively copying bytes for opcodes that emit RIP-relative call/branch
+// targets (e.g. `emit_call_absolute` for getfield/putfield/invokes/new,
+// `emit_post_invoke_exception_check`'s JE rel32, `deopt_stubs`,
+// `self_call_patches`, `jump_table_patches`) shifted the embedded rel32
+// by `extra_copies * body_len` bytes — the call landed in the middle
+// of unrelated code or jumped to an offset whose stub had not been
+// resolved. That is the exact "corrupt native code" symptom recorded
+// in CHANGELOG against N-Body (the inner advance loop has dload /
+// dmul / dastore for double[] — `dastore` itself is safe, but a
+// neighbouring `getfield` for `Body.x` made the body unsafe).
+//
+// Rather than retrofit every patch-tracking vector with shift-aware
+// duplication, we conservatively restrict unrolling to bodies whose
+// every opcode is on a known-safe allow-list. The allow-list still
+// covers the FP-heavy "for (i=0;i<n;i++) a[i] = expr;" kernel
+// archetype (loads/stores/arithmetic/array-index-store), which is the
+// shape that PGO and the static heuristic actually target.
+fn is_byte_copy_safe_loop_body(code: &[u8], header: usize, back_edge: usize) -> bool {
+    let mut pc = header;
+    while pc < back_edge {
+        let op = code[pc];
+        let safe = matches!(op,
+            // nop / aconst_null / iconst_m1..5 / lconst_0..1 / fconst_0..2 /
+            // dconst_0..1 / bipush / sipush / ldc / ldc_w / ldc2_w
+            0x00..=0x14
+            // iload..aload_3 (locals load family)
+            | 0x15..=0x2d
+            // array loads: iaload (0x2e) ... saload (0x35) — share the
+            // null-check stub list which the unroller now duplicates.
+            | 0x2e..=0x35
+            // istore..astore_3 (locals store family)
+            | 0x36..=0x4e
+            // array stores: iastore (0x4f) ... sastore (0x56) — also
+            // null-check-stub-only.
+            | 0x4f..=0x56
+            // pop/pop2/dup/dup_x*/dup2*/swap
+            | 0x57..=0x5f
+            // numeric ALU (iadd .. dneg, shifts/logic, conversions, cmp)
+            | 0x60..=0x98
+            // ifeq..goto — handled via forward_patches duplication
+            | 0x99..=0xa7
+            // iinc
+            | 0x84
+            // arraylength (length read; no rel32, no helper)
+            | 0xbe
+            // ifnull / ifnonnull — handled via forward_patches
+            | 0xc6 | 0xc7
+        );
+        if !safe {
+            return false;
+        }
+        let n = bytecode_len_at(code, pc);
+        if n == 0 {
+            return false;
+        }
+        pc += n;
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
 // ---------------------------------------------------------------------------
 
@@ -11676,6 +11746,20 @@ impl Compiler {
                                     .filter(|&&po| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
+                                // JIT-T#51 — array load/store null-check stubs share
+                                // the `null_check_store_stubs` vector (see
+                                // `emit_null_check_array_load` / `…_store`). They
+                                // resolve to a single shared out-of-line stub at
+                                // method end; we duplicate the patch offset per
+                                // copy with the shift applied so each unrolled
+                                // iteration's TEST/JZ pair branches to that stub
+                                // instead of a zero-rel32 fall-through.
+                                let orig_null_stubs: Vec<usize> = self
+                                    .null_check_store_stubs
+                                    .iter()
+                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .copied()
+                                    .collect();
 
                                 for _ in 0..extra_copies {
                                     let copy_start = self.buf.pos();
@@ -11712,6 +11796,12 @@ impl Compiler {
                                         .map(|&po| po + shift as usize) // Cast: address arithmetic
                                         .collect();
                                     self.bounds_check_stubs.extend(stubs_to_add);
+                                    // Add shifted null-check stubs for this copy.
+                                    let null_stubs_to_add: Vec<usize> = orig_null_stubs
+                                        .iter()
+                                        .map(|&po| po + shift as usize) // Cast: address arithmetic
+                                        .collect();
+                                    self.null_check_store_stubs.extend(null_stubs_to_add);
                                 }
                             }
                         }
@@ -16546,6 +16636,19 @@ pub fn compile(
     //   Body ≤20 bytecodes  → 4x unroll (3 extra copies)
     //   Body 20-50 bytecodes → 2x unroll (1 extra copy)
     //   Body > 50            → no unroll (unless PGO says otherwise, up to 100 bytes)
+    //
+    // JIT-T#51 — the byte-copy unroller is only correct on a restricted
+    // opcode set; bodies with field/static accesses, invokes, allocs,
+    // throws, instanceof/checkcast, monitor ops, switches, or any other
+    // opcode that emits rel32 references through deopt/exception/MIC/PIC
+    // stub vectors are skipped. `is_byte_copy_safe_loop_body` enforces
+    // that restriction; see its doc comment for the root-cause history.
+    //
+    // The env-var `CRATONVM_UNROLL_UNSAFE_BODIES=1` re-enables the
+    // legacy unguarded behaviour as a debugging escape hatch — do not
+    // use in production; it is preserved only so the previous
+    // miscompile is straightforward to reproduce in a bisection.
+    let unsafe_unroll = std::env::var_os("CRATONVM_UNROLL_UNSAFE_BODIES").is_some();
     let unroll_loops: Vec<(usize, usize, usize)> = if std::env::var_os("CRATONVM_DISABLE_UNROLL").is_some() {
         Vec::new()
     } else { loops
@@ -16557,6 +16660,11 @@ pub fn compile(
             }
             let body_size = back_edge - header;
             if body_size < 5 {
+                return None;
+            }
+
+            // JIT-T#51 — body must be byte-copy safe.
+            if !unsafe_unroll && !is_byte_copy_safe_loop_body(code, header, back_edge) {
                 return None;
             }
 
@@ -21563,6 +21671,262 @@ mod tests {
         // was produced from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call_with_context(vm_ptr, &[arr_ptr as i64, 5]).expect("test JIT call") }; // Cast: JIT ABI convention
         assert_eq!(result, 15); // 1+2+3+4+5
+    }
+
+    // ------------------------------------------------------------------
+    // JIT-T#51 — loop unrolling re-enablement: byte-copy safety tests.
+    //
+    // These pin the regression history that "N-Body segfaulted because
+    // the byte-copy unroller produced corrupt native code" (see
+    // CHANGELOG, dev). Before re-enabling unrolling, we constrain the
+    // duplicator to bodies whose opcodes do not emit rel32 references
+    // that the duplicator cannot re-shift. The tests below exercise
+    // both directions of the predicate plus an end-to-end execute test
+    // that runs a loop whose body would trigger byte-copy (body_size
+    // <= 20 → 4x unroll).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn s51_unroll_safety_accepts_arithmetic_array_store_kernel() {
+        // The N-Body inner-loop archetype the unroller targets:
+        //   for (i = 0; i < n; i++) a[i] = a[i] + 1;
+        //
+        // Bytecode body (header..back_edge):
+        //   4: iload_3  (i)
+        //   5: iload_1  (n)
+        //   6: if_icmpge +18 → 24    (exit branch, forward_patches)
+        //   9: aload_0  (a)
+        //  10: iload_3  (i)
+        //  11: aload_0  (a)
+        //  12: iload_3  (i)
+        //  13: iaload                 (null-check + bounds-check stubs)
+        //  14: iconst_1
+        //  15: iadd
+        //  16: iastore                (null-check + bounds-check stubs)
+        //  17: iinc 3, 1
+        //  20: goto -16 → 4           (back-edge)
+        //
+        // Every opcode is on the allow-list, so the predicate must accept.
+        let code: Vec<u8> = vec![
+            0x1d,                   // 4: iload_3
+            0x1b,                   // 5: iload_1
+            0xa2, 0x00, 0x12,       // 6: if_icmpge +18
+            0x2a,                   // 9: aload_0
+            0x1d,                   // 10: iload_3
+            0x2a,                   // 11: aload_0
+            0x1d,                   // 12: iload_3
+            0x2e,                   // 13: iaload
+            0x04,                   // 14: iconst_1
+            0x60,                   // 15: iadd
+            0x4f,                   // 16: iastore
+            0x84, 0x03, 0x01,       // 17: iinc 3, 1
+            0xa7, 0xff, 0xf0,       // 20: goto -16
+        ];
+        // Loop runs 4..23, back_edge at pc=20 (the goto opcode).
+        // For the predicate we artificially align: header=0, back_edge=20.
+        let mut prefix: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00]; // pad to mirror 0..3 outside loop
+        prefix.extend_from_slice(&code);
+        assert!(is_byte_copy_safe_loop_body(&prefix, 4, 20),
+            "kernel of (a[i] = a[i] + 1) must be byte-copy safe — all opcodes \
+             are arithmetic / load / store / iinc / forward branch / goto");
+    }
+
+    #[test]
+    fn s51_unroll_safety_rejects_field_access_body() {
+        // A loop body that reads/writes a field would emit an
+        // `emit_call_absolute` to the getfield/putfield helper —
+        // duplicating its rel32 verbatim lands the call in garbage.
+        // The predicate must refuse to unroll such a body.
+        //
+        // Body: aload_0; getfield #1; aload_0; iconst_1; putfield #2
+        let code: Vec<u8> = vec![
+            0x2a,                   // aload_0
+            0xb4, 0x00, 0x01,       // getfield #1
+            0x2a,                   // aload_0
+            0x04,                   // iconst_1
+            0xb5, 0x00, 0x02,       // putfield #2
+            0xa7, 0xff, 0xf7,       // goto -9
+        ];
+        // header=0, back_edge=9 (the goto)
+        assert!(!is_byte_copy_safe_loop_body(&code, 0, 9),
+            "field-access bodies must be rejected — getfield/putfield emit \
+             rel32 helper calls that the byte-copy unroller cannot shift");
+    }
+
+    #[test]
+    fn s51_unroll_safety_rejects_invoke_body() {
+        // invokevirtual emits a rel32 dispatch helper call AND populates
+        // mic_slots / pic_slots / invoke_info — none of which are
+        // duplicated by the byte-copy unroller.
+        let code: Vec<u8> = vec![
+            0x2a,                   // aload_0
+            0xb6, 0x00, 0x01,       // invokevirtual #1
+            0xa7, 0xff, 0xfa,       // goto -6
+        ];
+        assert!(!is_byte_copy_safe_loop_body(&code, 0, 4),
+            "invokevirtual bodies must be rejected (mic/pic + helper rel32)");
+    }
+
+    #[test]
+    fn s51_unroll_safety_rejects_new_body() {
+        // `new` emits an emit_call_absolute to the allocator helper and
+        // records new_info; not safe to byte-copy.
+        let code: Vec<u8> = vec![
+            0xbb, 0x00, 0x01,       // new #1
+            0x57,                   // pop
+            0xa7, 0xff, 0xfb,       // goto -5
+        ];
+        assert!(!is_byte_copy_safe_loop_body(&code, 0, 4));
+    }
+
+    #[test]
+    fn s51_unroll_safety_rejects_athrow_body() {
+        let code: Vec<u8> = vec![
+            0x01,                   // aconst_null
+            0xbf,                   // athrow
+            0xa7, 0xff, 0xfd,       // goto -3
+        ];
+        assert!(!is_byte_copy_safe_loop_body(&code, 0, 2));
+    }
+
+    #[test]
+    fn s51_unroll_safety_rejects_lookupswitch_body() {
+        // lookupswitch emits jump_table_patches that are not duplicated.
+        // Synthesize a minimal lookupswitch and confirm rejection.
+        // Bytecode layout (offset 0): lookupswitch
+        // We don't need a fully-aligned form — the predicate dispatches
+        // on the opcode byte before length parsing.
+        let code: Vec<u8> = vec![
+            0xab, 0x00, 0x00,        // lookupswitch (truncated; predicate only checks opcode)
+            // ... predicate rejects on op match before bytecode_len_at runs
+        ];
+        assert!(!is_byte_copy_safe_loop_body(&code, 0, 1));
+    }
+
+    #[test]
+    fn s51_unroll_byte_copy_safe_loop_executes_to_completion() {
+        // Differential pin: run an unrolled-eligible array-store loop
+        // (body_size <= 20 → 4x unroll triggered by the static
+        // heuristic) and verify the result is correct. Before the fix
+        // the duplicated body's null-check JZ pointed at a zero rel32
+        // (fall-through), so on a null receiver the inline TEST/JZ
+        // failed silently instead of branching to the shared stub —
+        // that latent miscompile is what the CHANGELOG calls "corrupt
+        // native code". Here we run the loop with a non-null array
+        // many times so all four copies (1 original + 3 unrolled)
+        // execute, and confirm the sum matches the expected value.
+        //
+        // Method: int loop_inc(int[] arr, int n) {
+        //     int s = 0;
+        //     for (int i = 0; i < n; i++) { arr[i] = arr[i] + 1; s += arr[i]; }
+        //     return s;
+        // }
+        // Bytecode (kept under 50 bytes so static heuristic applies):
+        //   0: iconst_0
+        //   1: istore_2          ; s = 0
+        //   2: iconst_0
+        //   3: istore_3          ; i = 0
+        //   4: iload_3
+        //   5: iload_1
+        //   6: if_icmpge +23 → 29 (exit branch to iload_2)
+        //   9: aload_0
+        //  10: iload_3
+        //  11: aload_0
+        //  12: iload_3
+        //  13: iaload
+        //  14: iconst_1
+        //  15: iadd
+        //  16: iastore
+        //  17: iload_2
+        //  18: aload_0
+        //  19: iload_3
+        //  20: iaload
+        //  21: iadd
+        //  22: istore_2
+        //  23: iinc 3, 1         ; (3 bytes: 0x84 0x03 0x01)
+        //  26: goto -22 → 4
+        //  29: iload_2
+        //  30: ireturn
+        use cratonvm_types::ClassId;
+        use crate::config::VmConfig;
+        use cratonvm_gc::heap::ArrayElementType;
+        use crate::vm::SharedVm;
+        use std::sync::Arc;
+
+        let code: Vec<u8> = vec![
+            0x03,                   // 0: iconst_0
+            0x3d,                   // 1: istore_2
+            0x03,                   // 2: iconst_0
+            0x3e,                   // 3: istore_3
+            0x1d,                   // 4: iload_3
+            0x1b,                   // 5: iload_1
+            0xa2, 0x00, 0x17,       // 6: if_icmpge +23 → 29
+            0x2a,                   // 9: aload_0
+            0x1d,                   // 10: iload_3
+            0x2a,                   // 11: aload_0
+            0x1d,                   // 12: iload_3
+            0x2e,                   // 13: iaload
+            0x04,                   // 14: iconst_1
+            0x60,                   // 15: iadd
+            0x4f,                   // 16: iastore
+            0x1c,                   // 17: iload_2
+            0x2a,                   // 18: aload_0
+            0x1d,                   // 19: iload_3
+            0x2e,                   // 20: iaload
+            0x60,                   // 21: iadd
+            0x3d,                   // 22: istore_2
+            0x84, 0x03, 0x01,       // 23: iinc 3, 1
+            0xa7, 0xff, 0xea,       // 26: goto -22 → 4
+            0x1c,                   // 29: iload_2
+            0xac,                   // 30: ireturn
+            0, 0,
+        ];
+        let code_len = 31;
+
+        // body span: header=4, back_edge=26 → body_size=22 (≤ 50, so 2x unroll).
+        assert!(is_byte_copy_safe_loop_body(&code, 4, 26),
+            "this kernel is the exact byte-copy-safe shape the unroller targets");
+
+        let compiled = compile(
+            &code, code_len,
+            2, 4, true,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(),
+            HashMap::new(), HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        ).unwrap();
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
+
+        // arr = [1,2,3,4,5,6,7,8]; each element incremented once, then summed.
+        // Expected sum = 2+3+4+5+6+7+8+9 = 44.
+        let n: i32 = 8;
+        let arr = shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Int, n as usize); // Cast: address arithmetic
+        for i in 0..n {
+            let _ = shared.heap.set_array_element(arr, i as usize, Value::Int(i + 1)); // Cast: x86-64 immediate encoding
+        }
+        let arr_ptr = arr.as_ptr();
+
+        // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
+        // was produced from valid bytecode and the mmap region is executable.
+        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, n as i64]) }; // Cast: JIT ABI convention
+        assert_eq!(result, 44, "unrolled byte-copy-safe loop must compute the same value as the un-unrolled reference");
+
+        // Each element was incremented exactly once (not 2x/4x as a
+        // mis-unrolled loop would do): confirms that the duplicated
+        // body still respected the iinc-driven loop bound.
+        for i in 0..n {
+            let v = shared.heap.get_array_element(arr, i as usize); // Cast: x86-64 immediate encoding
+            assert_eq!(v, Ok(Value::Int(i + 2)),
+                "element {i} should be incremented exactly once across all unrolled iterations");
+        }
     }
 
     #[test]

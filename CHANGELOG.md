@@ -104,6 +104,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - JIT `ifeq..ifle` now uses `TEST` instead of `CMP reg,reg`, correctly setting flags.
 - JIT `if_icmpXX` codegen optimized to use direct register comparison.
 - N-Body segfault root-caused to loop unrolling producing corrupt native code; N-Body now runs cleanly with unrolling disabled.
+- JIT loop unrolling re-enabled behind a byte-copy-safety predicate. The byte-copy unroller is only correct when every opcode in the body is position-independent (or one of the rel32 patch flavours the duplicator now handles, namely `forward_patches`, `bounds_check_stubs`, and `null_check_store_stubs`). Bodies containing field/static accesses, invokes, allocations, throws, instanceof/checkcast, monitor ops, switches, or any other helper-call opcode are skipped. Set `CRATONVM_UNROLL_UNSAFE_BODIES=1` to re-enter the legacy unguarded path for bisection.
 - Integer truncation in array allocation (security).
 - Unchecked branch offsets in JIT (security).
 - Path traversal in resource loading (security).
@@ -122,7 +123,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - N-Body FP arithmetic improved from 464x to 20x vs JDK 25 C2 via XMM stack slots, `Math.sqrt` intrinsic, and OSR XMM transfer.
 
 ### Known Issues
-- JIT loop unrolling is disabled; the previous byte-copy unrolling produced corrupt native code and needs to be reimplemented before re-enabling.
+- JIT loop unrolling is now gated on a byte-copy safety predicate (above); pure-arithmetic and array-index-store kernels are unrolled, but loops with field accesses or invokes still execute unrolled-by-1 until the duplicator learns to clone deopt/exception/MIC/PIC stubs.
 - BigDecimal/BigInteger arithmetic on post-clinit-populated statics returns 0 (`BigDecimal.ONE.add(BigDecimal.TEN)` yields 0). Boot paths that only reference these values work; numeric workloads (JDBC numeric, Jackson numeric) do not.
 - `ForkJoinPool.invoke(RecursiveTask)` at recursion depth >= 10 returns 0 due to a JIT register clobber in deeply-recursive boxed-`Long` arithmetic. Workaround: disable the JIT for affected workloads.
 - GC throughput is roughly 23x slower than JDK on allocation-heavy workloads (Binary Trees).
