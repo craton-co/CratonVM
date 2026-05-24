@@ -121,6 +121,82 @@ pub enum EventValue {
     Null,
 }
 
+/// Canonical "shape kind" of a field value, used to compare a runtime
+/// [`EventValue`] variant against a registry-declared `type_name`.
+///
+/// Task #30 (HIGH correctness): the JFR writer dispatches on the Rust
+/// [`EventValue`] variant (see `dump::encode_event_value`), but the reader
+/// dispatches on the registry-declared `type_name` (see
+/// `dump::decode_event_value`). A per-emit mismatch (e.g. caller passes
+/// `EventValue::Float(_)` for a field declared `"double"`) silently
+/// desynchronises the entire chunk because the writer emits 4 bytes where
+/// the reader expects 8. `FieldKind` is the abstraction we compare in both
+/// directions to catch the mismatch at emit time.
+///
+/// Both `String` and `Str` collapse to `FieldKind::String` (they share
+/// encoding). `Null` is the wildcard — it is accepted for any field type
+/// because the JFR null-string tag (encoding-type 0) is a valid runtime
+/// value for any nullable field on read-back. (For numeric fields this is
+/// debatable, but matching the existing relaxed write-side semantics is
+/// safer than tightening it here.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Int,
+    Long,
+    Float,
+    Double,
+    Boolean,
+    String,
+    /// Wildcard — `EventValue::Null` matches every declared type.
+    Null,
+}
+
+impl FieldKind {
+    /// Map a registry-declared `type_name` string to a [`FieldKind`].
+    ///
+    /// Returns `None` for unrecognised type strings; callers should treat
+    /// that as a registration-time bug (and the emit-time validator does:
+    /// it rejects the emit rather than silently corrupting the chunk).
+    pub fn from_declared(type_name: &str) -> Option<Self> {
+        match type_name {
+            "int" => Some(FieldKind::Int),
+            "long" => Some(FieldKind::Long),
+            "float" => Some(FieldKind::Float),
+            "double" => Some(FieldKind::Double),
+            "boolean" => Some(FieldKind::Boolean),
+            "string" => Some(FieldKind::String),
+            _ => None,
+        }
+    }
+
+    /// Classify a runtime [`EventValue`] variant.
+    pub fn of_value(value: &EventValue) -> Self {
+        match value {
+            EventValue::Int(_) => FieldKind::Int,
+            EventValue::Long(_) => FieldKind::Long,
+            EventValue::Float(_) => FieldKind::Float,
+            EventValue::Double(_) => FieldKind::Double,
+            EventValue::Boolean(_) => FieldKind::Boolean,
+            EventValue::String(_) | EventValue::Str(_) => FieldKind::String,
+            EventValue::Null => FieldKind::Null,
+        }
+    }
+
+    /// Returns `true` if a runtime value of kind `self` is compatible with
+    /// the declared kind `declared`. `Null` is the wildcard on the runtime
+    /// side — it matches every declared type because it encodes as the
+    /// distinct null-tag on the wire and the reader accepts it for any
+    /// string-typed field. For non-string declared types, `Null` is still
+    /// accepted on write to preserve the existing write-side semantics
+    /// (`dump::encode_event_value` accepts `Null` unconditionally), but
+    /// callers should prefer typed zero values for numeric fields.
+    #[inline]
+    pub fn matches_declared(self, declared: FieldKind) -> bool {
+        if self == FieldKind::Null { return true; }
+        self == declared
+    }
+}
+
 impl EventValue {
     /// Convenience constructor for string values from a `&str`.
     pub fn from_str(s: &str) -> Self {

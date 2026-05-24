@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use smallvec::smallvec;
 
-use crate::event::{EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventTypeRegistry, EventValue};
+use crate::event::{EventField, EventInstance, EventPeriod, EventType, EventTypeId, EventTypeRegistry, EventValue, FieldKind};
 use crate::recording::FlightRecorder;
 
 // ---------------------------------------------------------------------------
@@ -2829,33 +2829,208 @@ pub fn register_custom_event(
     registry.register(event_type)
 }
 
+/// Errors returned by [`emit_custom_event`] when per-emit validation
+/// (task #30) rejects an event before it touches the ring.
+///
+/// In release builds the writer prefers an early `Err` return over
+/// silently corrupting the chunk: a single bad emit would otherwise
+/// desynchronise every later event in the chunk because the reader
+/// decodes off the declared `type_name`, not the runtime variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitError {
+    /// `event_name` is not present in the recorder's `type_registry`.
+    UnknownEventType,
+    /// Number of supplied field values does not match the registry-declared
+    /// field count for this event type.
+    FieldCountMismatch { expected: usize, actual: usize },
+    /// A registry-declared field has a `type_name` that does not map to a
+    /// known [`FieldKind`] (e.g. typo in `register_custom_event`).
+    UnknownDeclaredType { field_index: usize, declared: String },
+    /// The runtime [`EventValue`] variant does not match the declared field
+    /// type for this position.
+    DeclaredTypeMismatch { field_index: usize, declared: FieldKind, actual: FieldKind },
+    /// The runtime variant sequence for a subsequent emit does not match
+    /// the shape locked in on this event type's first emit. See
+    /// [`FlightRecorder::field_shape_lock`].
+    ShapeLockMismatch { field_index: usize, locked: FieldKind, actual: FieldKind },
+}
+
+impl std::fmt::Display for EmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmitError::UnknownEventType => write!(f, "unknown event type"),
+            EmitError::FieldCountMismatch { expected, actual } => {
+                write!(f, "field count mismatch: expected {}, got {}", expected, actual)
+            }
+            EmitError::UnknownDeclaredType { field_index, declared } => {
+                write!(f, "field {}: unknown declared type '{}'", field_index, declared)
+            }
+            EmitError::DeclaredTypeMismatch { field_index, declared, actual } => {
+                write!(
+                    f,
+                    "field {}: declared {:?} but supplied {:?} — would desync the chunk",
+                    field_index, declared, actual
+                )
+            }
+            EmitError::ShapeLockMismatch { field_index, locked, actual } => {
+                write!(
+                    f,
+                    "field {}: first emit locked variant {:?}, this emit supplies {:?}",
+                    field_index, locked, actual
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EmitError {}
+
+/// Validate `field_values` against the registry-declared field types for
+/// `type_id`, AND against the per-event-type shape lock (task #30).
+///
+/// On the very first emit for `type_id`, this also POPULATES the shape lock
+/// with the runtime variant sequence — subsequent emits must match it.
+///
+/// Returns `Ok(())` if the emit is safe; `Err(EmitError)` otherwise. The
+/// caller is responsible for the `debug_assert!`-vs-early-return policy.
+fn validate_and_lock_shape(
+    recorder: &mut FlightRecorder,
+    type_id: EventTypeId,
+    field_values: &[EventValue],
+) -> Result<(), EmitError> {
+    // 1. Declared-type check against the registry. Snapshot the kinds into
+    //    a small stack vector so we drop the immutable borrow before we
+    //    mutate the shape-lock map.
+    let declared_kinds: smallvec::SmallVec<[FieldKind; crate::event::EVENT_FIELD_INLINE]> = {
+        let event_type = recorder.type_registry.get(type_id)
+            .ok_or(EmitError::UnknownEventType)?;
+        if event_type.fields.len() != field_values.len() {
+            return Err(EmitError::FieldCountMismatch {
+                expected: event_type.fields.len(),
+                actual: field_values.len(),
+            });
+        }
+        let mut kinds = smallvec::SmallVec::with_capacity(event_type.fields.len());
+        for (idx, decl) in event_type.fields.iter().enumerate() {
+            let declared = FieldKind::from_declared(&decl.type_name).ok_or_else(|| {
+                EmitError::UnknownDeclaredType {
+                    field_index: idx,
+                    declared: decl.type_name.clone(),
+                }
+            })?;
+            kinds.push(declared);
+        }
+        kinds
+    };
+
+    for (idx, (value, &declared)) in field_values.iter().zip(declared_kinds.iter()).enumerate() {
+        let actual = FieldKind::of_value(value);
+        if !actual.matches_declared(declared) {
+            return Err(EmitError::DeclaredTypeMismatch {
+                field_index: idx,
+                declared,
+                actual,
+            });
+        }
+    }
+
+    // 2. Shape-lock check. The lock is keyed by `EventTypeId` so a single
+    //    bad emit can never silently change the per-chunk wire shape.
+    //    `Null` is the wildcard variant — we do NOT overwrite a locked
+    //    concrete kind with `Null`, and we accept `Null` against any
+    //    locked kind. This avoids spuriously rejecting nullable strings.
+    let actual_kinds: smallvec::SmallVec<[FieldKind; crate::event::EVENT_FIELD_INLINE]> =
+        field_values.iter().map(FieldKind::of_value).collect();
+
+    if let Some(locked) = recorder.field_shape_lock.get(&type_id) {
+        // Length check is redundant (already verified above against the
+        // registry, and the lock was populated under that same registry
+        // count), but defensive: registry mutation between emits would
+        // otherwise be undetected.
+        if locked.len() != actual_kinds.len() {
+            return Err(EmitError::FieldCountMismatch {
+                expected: locked.len(),
+                actual: actual_kinds.len(),
+            });
+        }
+        for (idx, (&l, &a)) in locked.iter().zip(actual_kinds.iter()).enumerate() {
+            if a == FieldKind::Null { continue; }
+            if l == FieldKind::Null { continue; }
+            if l != a {
+                return Err(EmitError::ShapeLockMismatch {
+                    field_index: idx,
+                    locked: l,
+                    actual: a,
+                });
+            }
+        }
+    } else {
+        // First emit for this event type: lock the shape in. We store the
+        // runtime variants (not the declared kinds) because the WRITER
+        // dispatches on those — that is the wire-format truth.
+        recorder.field_shape_lock.insert(type_id, actual_kinds.into_vec());
+    }
+
+    Ok(())
+}
+
 /// Emit a custom user event with the given fields.
 ///
 /// Note: this cannot use a per-site `OnceLock` cache because `event_name` is
 /// dynamic. The `is_enabled()` fast-path still skips the registry probe when
 /// no recordings are active.
+///
+/// Task #30 (HIGH correctness): every emit is validated against (a) the
+/// registry-declared field types AND (b) the per-event-type shape locked
+/// in on the first successful emit. Mismatches are rejected before the
+/// event reaches the ring: in debug builds via `debug_assert!` with a
+/// useful diagnostic, in release builds via an `Err` return. Returns
+/// `Ok(())` on success, `Ok(())` when JFR is disabled (the fast-path
+/// drops the event), or `Err(EmitError)` on validation failure.
 pub fn emit_custom_event(
     recorder: &mut FlightRecorder,
     event_name: &str,
     field_values: Vec<EventValue>,
     time_ns: u64,
     thread_id: u64,
-) {
-    if !crate::is_enabled() { return; }
-    if let Some(type_id) = recorder.type_registry.find_by_name(event_name) {
-        // Round-5 Fix 1: bridge Vec→SmallVec at the public boundary; the
-        // common case (≤ 8 fields) keeps the storage inline despite the
-        // caller-allocated `Vec`. Long fields still spill to the heap once,
-        // matching the prior behaviour.
-        let event = EventInstance {
-            type_id,
-            start_time: time_ns,
-            end_time: time_ns,
-            thread_id,
-            fields: smallvec::SmallVec::from_vec(field_values),
-        };
-        crate::repository::push_to_thread_ring(event);
+) -> Result<(), EmitError> {
+    if !crate::is_enabled() { return Ok(()); }
+    let type_id = match recorder.type_registry.find_by_name(event_name) {
+        Some(id) => id,
+        None => {
+            // Unknown event names are not a wire-format hazard (the event
+            // is simply not emitted), so we preserve the original
+            // "silently skip" semantics for callers that pre-register
+            // events lazily.
+            return Ok(());
+        }
+    };
+    if let Err(e) = validate_and_lock_shape(recorder, type_id, &field_values) {
+        // Debug builds: surface the bug loudly with a useful diagnostic.
+        // Release builds: prefer an early `Err` return over corrupting
+        // the chunk — silently letting a mismatched emit through would
+        // desync every later event in the same chunk because the reader
+        // decodes off the declared `type_name`, not the runtime variant.
+        debug_assert!(
+            false,
+            "JFR emit_custom_event validation failed for '{}': {}",
+            event_name, e
+        );
+        return Err(e);
     }
+    // Round-5 Fix 1: bridge Vec→SmallVec at the public boundary; the
+    // common case (≤ 8 fields) keeps the storage inline despite the
+    // caller-allocated `Vec`. Long fields still spill to the heap once,
+    // matching the prior behaviour.
+    let event = EventInstance {
+        type_id,
+        start_time: time_ns,
+        end_time: time_ns,
+        thread_id,
+        fields: smallvec::SmallVec::from_vec(field_values),
+    };
+    crate::repository::push_to_thread_ring(event);
+    Ok(())
 }
 
 /// JFR configuration profile — corresponds to .jfc files (default.jfc, profile.jfc).
@@ -3883,10 +4058,215 @@ mod tests {
             vec![EventValue::from_str("hello")],
             1000,
             1,
-        );
+        ).expect("emit should succeed");
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
         assert_eq!(rec.event_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task #30 (HIGH correctness): emit_custom_event variant validation
+    // -----------------------------------------------------------------------
+    //
+    // The JFR writer dispatches on the Rust `EventValue` variant; the reader
+    // dispatches on the registry-declared `type_name`. A per-emit mismatch
+    // would silently desync the entire chunk. These tests confirm that:
+    //   1. float-vs-double mismatch is detected and rejected
+    //   2. string-vs-int mismatch is detected and rejected
+    //   3. correctly-shaped emits succeed across many calls
+    // and that the per-event-type shape lock cannot be bypassed by a
+    // subsequent caller swapping variants.
+
+    fn t30_setup_recorder(field_type: &str) -> (FlightRecorder, EventTypeId, u64) {
+        let mut fr = crate::create_flight_recorder();
+        let id = register_custom_event(
+            &mut fr.type_registry,
+            "test.task30.Validate",
+            &["Test"],
+            "task #30 variant validation",
+            &[("value", field_type, "A typed value")],
+            false,
+            false,
+            None,
+        );
+        let rid = fr.new_recording(RecordingSettings::new("task30"));
+        fr.start_recording(rid);
+        (fr, id, rid)
+    }
+
+    // Mismatch tests use `#[cfg_attr(debug_assertions, should_panic)]` because
+    // in debug builds the validator fires a `debug_assert!` with a diagnostic
+    // (acceptance criterion #2). In release builds the same call returns
+    // `Err(...)` (criterion #3) — which we check explicitly below.
+    //
+    // Each pair (debug / release) is split into two named tests so the failure
+    // modes can be inspected independently.
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "validation failed"))]
+    fn t30_float_vs_double_mismatch_rejected() {
+        // Declared "double" + supplied `EventValue::Float(_)`:
+        //   writer would emit 4 bytes, reader expects 8 → chunk desync.
+        let (mut fr, _id, _rid) = t30_setup_recorder("double");
+        let err = emit_custom_event(
+            &mut fr,
+            "test.task30.Validate",
+            vec![EventValue::Float(1.5)],
+            1000,
+            1,
+        );
+        // Release path: the call above returned an Err; assert its shape.
+        // (Debug path: the `debug_assert!` inside the emit panicked, so
+        // execution never reaches this point — `#[should_panic]` covers it.)
+        assert!(matches!(
+            err,
+            Err(EmitError::DeclaredTypeMismatch {
+                field_index: 0,
+                declared: FieldKind::Double,
+                actual: FieldKind::Float,
+            })
+        ), "expected DeclaredTypeMismatch(Double, Float), got {:?}", err);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "validation failed"))]
+    fn t30_double_vs_float_mismatch_rejected() {
+        // Symmetric case: declared "float" + supplied `EventValue::Double(_)`.
+        // Writer would emit 8 bytes, reader would read 4 — same desync hazard.
+        let (mut fr, _id, _rid) = t30_setup_recorder("float");
+        let err = emit_custom_event(
+            &mut fr,
+            "test.task30.Validate",
+            vec![EventValue::Double(1.5)],
+            1000,
+            1,
+        );
+        assert!(matches!(
+            err,
+            Err(EmitError::DeclaredTypeMismatch {
+                field_index: 0,
+                declared: FieldKind::Float,
+                actual: FieldKind::Double,
+            })
+        ), "expected DeclaredTypeMismatch(Float, Double), got {:?}", err);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "validation failed"))]
+    fn t30_string_vs_int_mismatch_rejected() {
+        // Declared "int" + supplied `EventValue::String(_)`.
+        // The reader would try to varint-decode the string's tag/length
+        // prefix as an i32 and then misread every following field.
+        let (mut fr, _id, _rid) = t30_setup_recorder("int");
+        let err = emit_custom_event(
+            &mut fr,
+            "test.task30.Validate",
+            vec![EventValue::from_str("not an int")],
+            1000,
+            1,
+        );
+        assert!(matches!(
+            err,
+            Err(EmitError::DeclaredTypeMismatch {
+                field_index: 0,
+                declared: FieldKind::Int,
+                actual: FieldKind::String,
+            })
+        ), "expected DeclaredTypeMismatch(Int, String), got {:?}", err);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "validation failed"))]
+    fn t30_int_vs_string_mismatch_rejected() {
+        // Symmetric case: declared "string" + supplied `EventValue::Int(_)`.
+        let (mut fr, _id, _rid) = t30_setup_recorder("string");
+        let err = emit_custom_event(
+            &mut fr,
+            "test.task30.Validate",
+            vec![EventValue::Int(42)],
+            1000,
+            1,
+        );
+        assert!(matches!(
+            err,
+            Err(EmitError::DeclaredTypeMismatch {
+                field_index: 0,
+                declared: FieldKind::String,
+                actual: FieldKind::Int,
+            })
+        ), "expected DeclaredTypeMismatch(String, Int), got {:?}", err);
+    }
+
+    #[test]
+    fn t30_correct_shape_succeeds_across_many_calls() {
+        // Declared "double" + always-`Double` emits: every call must succeed,
+        // and the per-event-type shape lock must accept all of them.
+        let (mut fr, _id, _rid) = t30_setup_recorder("double");
+        for i in 0..32u64 {
+            let r = emit_custom_event(
+                &mut fr,
+                "test.task30.Validate",
+                vec![EventValue::Double(i as f64 + 0.5)],
+                1000 + i,
+                1,
+            );
+            assert!(r.is_ok(), "emit #{} should succeed, got {:?}", i, r);
+        }
+    }
+
+    #[test]
+    fn t30_shape_lock_populated_on_first_emit() {
+        // The first emit must populate `field_shape_lock` with the runtime
+        // variant sequence; same-shape subsequent emits then keep working.
+        let (mut fr, type_id, _rid) = t30_setup_recorder("string");
+        emit_custom_event(
+            &mut fr,
+            "test.task30.Validate",
+            vec![EventValue::from_str("v1")],
+            1000,
+            1,
+        ).expect("first emit succeeds");
+        assert_eq!(fr.field_shape_lock.get(&type_id).cloned(), Some(vec![FieldKind::String]));
+        for i in 0..8 {
+            emit_custom_event(
+                &mut fr,
+                "test.task30.Validate",
+                vec![EventValue::from_str(&format!("v{}", i + 2))],
+                1000 + i as u64,
+                1,
+            ).expect("same-shape emit succeeds");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "validation failed"))]
+    fn t30_field_count_mismatch_rejected() {
+        // Declares 2 fields but emit supplies 1 — guards against partial
+        // event payloads silently truncating the chunk.
+        let mut fr = crate::create_flight_recorder();
+        let _id = register_custom_event(
+            &mut fr.type_registry,
+            "test.task30.Count",
+            &["Test"],
+            "count",
+            &[("a", "long", "a"), ("b", "long", "b")],
+            false,
+            false,
+            None,
+        );
+        let rid = fr.new_recording(RecordingSettings::new("count"));
+        fr.start_recording(rid);
+        let err = emit_custom_event(
+            &mut fr,
+            "test.task30.Count",
+            vec![EventValue::Long(1)],
+            1000,
+            1,
+        );
+        assert!(matches!(
+            err,
+            Err(EmitError::FieldCountMismatch { expected: 2, actual: 1 })
+        ), "expected FieldCountMismatch(2,1), got {:?}", err);
     }
 
     // --- JFR profiles ---

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dump::{self, JfrDumpError};
-use crate::event::{EventInstance, EventTypeId, EventTypeRegistry};
+use crate::event::{EventInstance, EventTypeId, EventTypeRegistry, FieldKind};
 use crate::repository::{self, EventRepository};
 
 /// How often (in filtered-out events per recording) the drain path emits a
@@ -268,6 +268,19 @@ pub struct FlightRecorder {
     /// `refresh_running_ids` after each state transition. `Vec::with_capacity(4)`
     /// keeps it allocation-free for typical workloads (1-4 concurrent recordings).
     running_ids: Vec<u64>,
+    /// Task #30 (HIGH correctness): per-event-type "first emit" field-shape
+    /// lock. The first successful emit of a given [`EventTypeId`] records
+    /// the runtime variant sequence of its fields here; every later emit
+    /// of the same type must match that sequence exactly, otherwise it is
+    /// rejected (debug_assert! in debug builds; early `Err` in release).
+    ///
+    /// Without this lock a caller of `emit_custom_event` that passes
+    /// `EventValue::Float(_)` on call N and `EventValue::Double(_)` on call
+    /// N+1 (both declared as e.g. `"double"`) would write 4 bytes on one
+    /// emit and 8 on the next — the reader, which decodes off the declared
+    /// `type_name`, would then desynchronise mid-chunk and corrupt every
+    /// subsequent event. The lock catches this at the producer.
+    pub(crate) field_shape_lock: FxHashMap<EventTypeId, Vec<FieldKind>>,
 }
 
 impl FlightRecorder {
@@ -277,6 +290,7 @@ impl FlightRecorder {
             type_registry: EventTypeRegistry::new(),
             next_recording_id: 1,
             running_ids: Vec::with_capacity(4),
+            field_shape_lock: FxHashMap::default(),
         }
     }
 
