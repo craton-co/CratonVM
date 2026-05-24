@@ -11612,6 +11612,16 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if let Some(node) = lhm_find_node(ctx, this, &key_val) {
         let old = ctx.get_field(node, LHM_NODE_VALUE);
         ctx.set_field(node, LHM_NODE_VALUE, value);
+        // C25 (HIGH) fix: access-order LinkedHashMap must treat a put on
+        // an existing key as an access and move the entry to the tail of
+        // the insertion-order list. JDK `LinkedHashMap.afterNodeAccess`
+        // is called from `HashMap.putVal` when an existing node is
+        // replaced; LRU-cache use-cases (the canonical reason to set
+        // `accessOrder = true`) were getting wrong eviction order
+        // because we updated the value and returned without re-linking.
+        if lhm_is_access_order(ctx, this) {
+            lhm_move_to_tail(ctx, this, node);
+        }
         return Ok(Some(old));
     }
 
@@ -16811,6 +16821,18 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values.
+    // JDK: `if (key == null || value == null) throw new
+    // NullPointerException();` (see `java.util.concurrent.ConcurrentHashMap`).
+    // Previously this silently inserted a null-keyed or null-valued entry,
+    // letting client code that *relied* on the NPE for input validation
+    // continue with a corrupted map.
+    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -16846,6 +16868,13 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): null rejection — see `native_chm_put`.
+    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -16864,6 +16893,15 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key and null mappingFunction.
+    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.computeIfAbsent: null key or mappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -16882,6 +16920,15 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key and null remappingFunction.
+    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.compute: null key or remappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -16901,6 +16948,18 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let func = args.get(3).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key, null value, and null remappingFunction.
+    if matches!(key, Value::Object(None))
+        || matches!(value, Value::Object(None))
+        || matches!(func, Value::Object(None))
+    {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.merge: null key, value, or remappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17186,6 +17245,13 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key and null value.
+    if matches!(key, Value::Object(None)) || matches!(new_val, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap.replace: null key or value".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17213,6 +17279,18 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key, null oldValue, and null newValue.
+    if matches!(key, Value::Object(None))
+        || matches!(old_val, Value::Object(None))
+        || matches!(new_val, Value::Object(None))
+    {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.replace(K,V,V): null key, oldValue, or newValue".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key);
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -19147,6 +19225,91 @@ const LBQ_FIELD_SIZE: usize = 2;
 const LBQ_FIELD_CAPACITY: usize = 3;
 const _LBQ_NUM_FIELDS: usize = 4;
 
+// ---------------------------------------------------------------------------
+// C22 (HIGH) round-12 fix: condvar-based blocking for LinkedBlockingQueue /
+// ArrayBlockingQueue / BlockingQueue.
+//
+// Previously `put_blocking` spun 10 000 times with `yield_now()` and *then
+// inserted anyway* — silently overflowing capacity. `take_blocking` spun
+// 10 000 times and *then returned null* — violating the JDK contract that
+// `take()` blocks indefinitely and never returns null. Producer/consumer code
+// polling `take()` for shutdown would burn CPU and then unwind on a spurious
+// null; bounded-capacity producers would silently corrupt by exceeding the
+// declared capacity.
+//
+// Replacement: per-queue `parking_lot::Mutex<()>` paired with two
+// `parking_lot::Condvar`s (`not_full`, `not_empty`). Side-tabled by the
+// queue's `identity_hash_code` (GC-stable across moving collections, matching
+// the CHM resize-stripe pattern earlier in this file).
+//
+// Notification points:
+//   - successful `offer`/`offer_bool`/`put`/`offer_first` → `not_empty.notify_one`
+//   - successful `poll`/`poll_last`/`take`/`remove`/`clear` → `not_full.notify_one`
+//
+// Wait points:
+//   - `put_blocking` (size >= capacity) → `not_full.wait`
+//   - `take_blocking` (size == 0) → `not_empty.wait`
+//
+// The Java monitor (`monitor_enter(this)`) is kept for compatibility with
+// bytecode that synchronises on the queue object, but correctness is
+// enforced by the Rust-side mutex: state-check + wait + state-update happen
+// while holding the mutex, eliminating the lost-wakeup race that would exist
+// if we tried to combine the JVM monitor with a Rust condvar.
+
+struct LbqWaitSlot {
+    gate: parking_lot::Mutex<()>,
+    not_full: parking_lot::Condvar,
+    not_empty: parking_lot::Condvar,
+}
+
+static LBQ_WAITERS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<i32, std::sync::Arc<LbqWaitSlot>>>,
+> = std::sync::OnceLock::new();
+
+fn lbq_waiters() -> &'static parking_lot::Mutex<
+    std::collections::HashMap<i32, std::sync::Arc<LbqWaitSlot>>,
+> {
+    LBQ_WAITERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lbq_wait_slot(ctx: &dyn NativeContext, this: ObjectRef) -> std::sync::Arc<LbqWaitSlot> {
+    let id = ctx.identity_hash_code(this);
+    let mut map = lbq_waiters().lock();
+    map.entry(id)
+        .or_insert_with(|| {
+            std::sync::Arc::new(LbqWaitSlot {
+                gate: parking_lot::Mutex::new(()),
+                not_full: parking_lot::Condvar::new(),
+                not_empty: parking_lot::Condvar::new(),
+            })
+        })
+        .clone()
+}
+
+fn lbq_notify_not_empty(ctx: &dyn NativeContext, this: ObjectRef) {
+    let slot = lbq_wait_slot(ctx, this);
+    slot.not_empty.notify_one();
+}
+
+fn lbq_notify_not_full(ctx: &dyn NativeContext, this: ObjectRef) {
+    let slot = lbq_wait_slot(ctx, this);
+    slot.not_full.notify_one();
+}
+
+fn lbq_current_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn lbq_current_capacity(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
+        Value::Int(v) if v > 0 => v,
+        _ => i32::MAX,
+    }
+}
+
 fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     // LinkedBlockingQueue
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
@@ -19381,6 +19544,8 @@ fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ctx.set_array_element(arr, 0, elem);
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size + 1));
     ctx.monitor_exit(this);
+    // C22 (HIGH): wake any `take_blocking` waiter — we added an element.
+    lbq_notify_not_empty(ctx, this);
     Ok(Some(Value::Int(1)))
 }
 
@@ -19478,60 +19643,79 @@ fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Int(0))); // queue full
     }
     native_lbq_offer(ctx, args)?;
+    // C22 (HIGH): wake any thread parked in `take_blocking` on this queue.
+    lbq_notify_not_empty(ctx, this);
     Ok(Some(Value::Int(1)))
 }
 
-/// Blocking put: waits until space is available (spin-wait with yield).
+/// Blocking put: waits indefinitely until space is available.
+///
+/// C22 (HIGH) fix: previously this spun 10 000 times with `yield_now()` and
+/// then *succeeded with the offer anyway* — silently overflowing the queue's
+/// declared capacity and breaking the BlockingQueue contract. The new
+/// implementation uses a side-tabled `parking_lot::Condvar` (`not_full`)
+/// keyed by the queue's `identity_hash_code`. A producer waits on `not_full`
+/// while the queue is at capacity; a consumer's successful `poll`/`take`
+/// notifies `not_full` so the producer wakes and re-tries. This matches the
+/// JDK semantics of `put` blocking indefinitely with no spurious wake-up
+/// returning to the caller without a completed insertion.
 fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let capacity = match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
-        Value::Int(v) if v > 0 => v,
-        _ => i32::MAX,
-    };
-    let mut spins = 0;
+    let slot = lbq_wait_slot(ctx, this);
+    let mut guard = slot.gate.lock();
     loop {
-        ctx.monitor_enter(this);
-        let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let size = lbq_current_size(ctx, this);
+        let capacity = lbq_current_capacity(ctx, this);
         if size < capacity {
+            // We hold the per-queue gate, so no other producer/consumer can
+            // observe the state between our check and our write. Perform
+            // the insertion, drop the gate, and wake one waiter on
+            // `not_empty` (a pending `take_blocking`, if any).
+            ctx.monitor_enter(this);
+            let r = native_lbq_offer(ctx, args);
             ctx.monitor_exit(this);
-            break;
+            drop(guard);
+            slot.not_empty.notify_one();
+            return r;
         }
-        ctx.monitor_exit(this);
-        spins += 1;
-        if spins > 10000 { break; } // prevent infinite block on single-threaded VM
-        std::thread::yield_now();
+        // Wait for a consumer to free a slot. `parking_lot::Condvar::wait`
+        // atomically drops the gate and parks; on wake-up the gate is
+        // re-acquired before this call returns. No spurious-wake handling
+        // needed because we re-check the precondition at the top of the
+        // loop.
+        slot.not_full.wait(&mut guard);
     }
-    native_lbq_offer(ctx, args)
 }
 
-/// Blocking take: waits until an element is available (spin-wait with yield).
+/// Blocking take: waits indefinitely until an element is available.
+///
+/// C22 (HIGH) fix: previously this spun 10 000 times with `yield_now()` and
+/// then *returned `null`* — violating the JDK contract that `take()` blocks
+/// indefinitely and never returns null. Consumers polling `take()` for
+/// shutdown via interrupt would burn CPU and then unwind on a spurious
+/// null. The new implementation parks on a `not_empty` Condvar; producers
+/// notify on every successful `offer`/`put`.
 fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut spins = 0;
+    let slot = lbq_wait_slot(ctx, this);
+    let mut guard = slot.gate.lock();
     loop {
-        ctx.monitor_enter(this);
-        let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        ctx.monitor_exit(this);
+        let size = lbq_current_size(ctx, this);
         if size > 0 {
-            return native_lbq_poll(ctx, args);
+            ctx.monitor_enter(this);
+            let r = native_lbq_poll(ctx, args);
+            ctx.monitor_exit(this);
+            drop(guard);
+            slot.not_full.notify_one();
+            return r;
         }
-        spins += 1;
-        if spins > 10000 {
-            return Ok(Some(Value::Object(None)));
-        }
-        std::thread::yield_now();
+        slot.not_empty.wait(&mut guard);
     }
 }
 
@@ -19558,6 +19742,9 @@ fn native_lbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    // C22 (HIGH): wake any thread parked in `put_blocking` (queue is no
+    // longer at capacity now that we removed an element).
+    lbq_notify_not_full(ctx, this);
     Ok(Some(head))
 }
 
@@ -19580,6 +19767,8 @@ fn native_lbq_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let tail = ctx.get_array_element(arr, (size - 1) as usize);
     ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    // C22 (HIGH): wake any thread parked in `put_blocking`.
+    lbq_notify_not_full(ctx, this);
     Ok(Some(tail))
 }
 
@@ -19666,6 +19855,10 @@ fn native_lbq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
+    // C22 (HIGH): wake all `put_blocking` waiters — clearing the queue
+    // frees capacity for every parked producer at once.
+    let slot = lbq_wait_slot(ctx, this);
+    slot.not_full.notify_all();
     Ok(None)
 }
 
@@ -19714,6 +19907,8 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             }
             ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
             ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+            // C22 (HIGH): freed a slot — wake a `put_blocking` waiter.
+            lbq_notify_not_full(ctx, this);
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -20707,6 +20902,58 @@ const SL_FIELD_STAMP: usize = 1; // monotonic stamp counter
 #[allow(dead_code)]
 const SL_NUM_FIELDS: usize = 2;
 
+// ---------------------------------------------------------------------------
+// C23 (HIGH) round-12 fix: condvar-based blocking for StampedLock.
+//
+// Previously `read_lock` / `write_lock` spun 1000 times and then *silently
+// proceeded with stale state* — a `read_lock` could grant a read stamp on
+// top of an existing write-lock, and a `write_lock` could overwrite the
+// state to `1` over an existing write-lock, corrupting the lock state
+// machine entirely. Optimistic-read paths (`tryOptimisticRead`/`validate`)
+// also skipped the monitor, so writer state-update races against optimistic
+// readers were unobservable.
+//
+// Replacement: per-lock `parking_lot::Mutex<()>` + `Condvar` (`state_change`)
+// keyed by the lock's `identity_hash_code`. The acquire paths now do
+// state-check + wait + state-update under the side-table mutex; unlock
+// paths notify; optimistic-read/validate take the side-table mutex briefly
+// to fence the state observation.
+
+struct SlWaitSlot {
+    gate: parking_lot::Mutex<()>,
+    state_change: parking_lot::Condvar,
+}
+
+static SL_WAITERS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<i32, std::sync::Arc<SlWaitSlot>>>,
+> = std::sync::OnceLock::new();
+
+fn sl_waiters() -> &'static parking_lot::Mutex<
+    std::collections::HashMap<i32, std::sync::Arc<SlWaitSlot>>,
+> {
+    SL_WAITERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn sl_wait_slot(ctx: &dyn NativeContext, this: ObjectRef) -> std::sync::Arc<SlWaitSlot> {
+    let id = ctx.identity_hash_code(this);
+    let mut map = sl_waiters().lock();
+    map.entry(id)
+        .or_insert_with(|| {
+            std::sync::Arc::new(SlWaitSlot {
+                gate: parking_lot::Mutex::new(()),
+                state_change: parking_lot::Condvar::new(),
+            })
+        })
+        .clone()
+}
+
+fn sl_read_state(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, SL_FIELD_STATE) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
 fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/concurrent/locks/StampedLock";
     r.register(c, "<init>", "()V", native_sl_init);
@@ -20723,10 +20970,10 @@ fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let state = match ctx.get_field(this, SL_FIELD_STATE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        // C23 (HIGH): fence the state read against concurrent acquires.
+        let slot = sl_wait_slot(ctx, this);
+        let _guard = slot.gate.lock();
+        let state = sl_read_state(ctx, this);
         // state >= 2 means readers are present
         Ok(Some(Value::Int(if state >= 2 { 1 } else { 0 })))
     });
@@ -20735,10 +20982,9 @@ fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let state = match ctx.get_field(this, SL_FIELD_STATE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let slot = sl_wait_slot(ctx, this);
+        let _guard = slot.gate.lock();
+        let state = sl_read_state(ctx, this);
         // state == 1 means write-locked
         Ok(Some(Value::Int(if state == 1 { 1 } else { 0 })))
     });
@@ -20765,35 +21011,32 @@ fn sl_next_stamp(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
     stamp
 }
 
+/// Read-lock: blocks until no writer holds the lock, then increments the
+/// reader count and returns a fresh stamp.
+///
+/// C23 (HIGH) fix: previously this spun 1000 times and then *silently
+/// proceeded with stale state* — granting a read stamp on top of an
+/// existing write-lock, corrupting the state machine. The new implementation
+/// uses a per-lock `parking_lot::Condvar` (`state_change`) to park readers
+/// while a writer holds the lock; writers `notify_all` on unlock.
 fn native_sl_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Acquire monitor and spin-wait if write-locked
-    ctx.monitor_enter(this);
-    let mut state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    // Wait for write lock to be released (bounded spin)
-    let mut spins = 0;
-    while state == 1 && spins < 1000 {
-        ctx.monitor_exit(this);
-        std::thread::yield_now();
-        ctx.monitor_enter(this);
-        state = match ctx.get_field(this, SL_FIELD_STATE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        spins += 1;
+    let slot = sl_wait_slot(ctx, this);
+    let mut guard = slot.gate.lock();
+    loop {
+        let state = sl_read_state(ctx, this);
+        if state != 1 {
+            // state >= 2 means readers present; state == 0 means free.
+            let new_state = if state == 0 { 2 } else { state + 1 };
+            ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+            let stamp = sl_next_stamp(ctx, this);
+            return Ok(Some(Value::Long(stamp)));
+        }
+        slot.state_change.wait(&mut guard);
     }
-    // state >= 2 means readers present; state == 0 means free
-    let new_state = if state == 0 || state == 1 { 2 } else { state + 1 };
-    ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
-    let stamp = sl_next_stamp(ctx, this);
-    ctx.monitor_exit(this);
-    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_sl_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20801,45 +21044,46 @@ fn native_sl_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.monitor_enter(this);
-    let state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if state >= 2 {
-        let new_state = if state == 2 { 0 } else { state - 1 };
-        ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+    let slot = sl_wait_slot(ctx, this);
+    {
+        let _guard = slot.gate.lock();
+        let state = sl_read_state(ctx, this);
+        if state >= 2 {
+            let new_state = if state == 2 { 0 } else { state - 1 };
+            ctx.set_field(this, SL_FIELD_STATE, Value::Int(new_state));
+            // Bump the stamp on every state transition so optimistic
+            // readers observe a different stamp before/after lock release.
+            sl_next_stamp(ctx, this);
+        }
     }
-    ctx.monitor_exit(this);
+    // Wake a waiting writer or reader. notify_all because a freed read may
+    // unblock multiple parallel readers and exactly one writer.
+    slot.state_change.notify_all();
     Ok(None)
 }
 
+/// Write-lock: blocks until the lock is fully free (no readers, no other
+/// writer), then atomically transitions to write-locked and returns a stamp.
+///
+/// C23 (HIGH) fix: see `native_sl_read_lock` above. Replaces the silent
+/// fallthrough that could overwrite the state to `1` on top of an existing
+/// write-lock.
 fn native_sl_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    // Acquire monitor and spin-wait if readers or writers present
-    ctx.monitor_enter(this);
-    let mut state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    let mut spins = 0;
-    while state != 0 && spins < 1000 {
-        ctx.monitor_exit(this);
-        std::thread::yield_now();
-        ctx.monitor_enter(this);
-        state = match ctx.get_field(this, SL_FIELD_STATE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        spins += 1;
+    let slot = sl_wait_slot(ctx, this);
+    let mut guard = slot.gate.lock();
+    loop {
+        let state = sl_read_state(ctx, this);
+        if state == 0 {
+            ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
+            let stamp = sl_next_stamp(ctx, this);
+            return Ok(Some(Value::Long(stamp)));
+        }
+        slot.state_change.wait(&mut guard);
     }
-    ctx.set_field(this, SL_FIELD_STATE, Value::Int(1));
-    let stamp = sl_next_stamp(ctx, this);
-    ctx.monitor_exit(this);
-    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_sl_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20847,22 +21091,31 @@ fn native_sl_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.monitor_enter(this);
-    ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
-    sl_next_stamp(ctx, this);
-    ctx.monitor_exit(this);
+    let slot = sl_wait_slot(ctx, this);
+    {
+        let _guard = slot.gate.lock();
+        ctx.set_field(this, SL_FIELD_STATE, Value::Int(0));
+        sl_next_stamp(ctx, this);
+    }
+    // Wake every parked acquirer — readers can proceed in parallel and one
+    // writer may also acquire.
+    slot.state_change.notify_all();
     Ok(None)
 }
 
+/// C23 (HIGH) fix: previously this read `SL_FIELD_STATE` outside the
+/// monitor, racing against `write_lock`'s state update. Now the read is
+/// fenced by the side-table mutex so an optimistic read either observes a
+/// fully-acquired writer (and returns 0) or a fully-released state (and
+/// returns a valid stamp). Pair with `validate` below.
 fn native_sl_try_optimistic_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let slot = sl_wait_slot(ctx, this);
+    let _guard = slot.gate.lock();
+    let state = sl_read_state(ctx, this);
     if state == 1 {
         // Write-locked, return 0 (failure)
         Ok(Some(Value::Long(0)))
@@ -20889,15 +21142,14 @@ fn native_sl_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if expected_stamp == 0 {
         return Ok(Some(Value::Int(0)));
     }
+    let slot = sl_wait_slot(ctx, this);
+    let _guard = slot.gate.lock();
     let current_stamp = match ctx.get_field(this, SL_FIELD_STAMP) {
         Value::Int(v) => v as i64,
         Value::Long(v) => v,
         _ => 0,
     };
-    let state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let state = sl_read_state(ctx, this);
     // Valid if stamp hasn't changed and not write-locked
     let valid = expected_stamp == current_stamp && state != 1;
     Ok(Some(Value::Int(i32::from(valid))))
@@ -20908,10 +21160,9 @@ fn native_sl_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let slot = sl_wait_slot(ctx, this);
+    let _guard = slot.gate.lock();
+    let state = sl_read_state(ctx, this);
     if state == 1 {
         // Write-locked, can't acquire read lock
         Ok(Some(Value::Long(0)))
@@ -20928,10 +21179,9 @@ fn native_sl_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let state = match ctx.get_field(this, SL_FIELD_STATE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let slot = sl_wait_slot(ctx, this);
+    let _guard = slot.gate.lock();
+    let state = sl_read_state(ctx, this);
     if state != 0 {
         // Not free — someone is holding a lock
         Ok(Some(Value::Long(0)))
@@ -20996,6 +21246,10 @@ fn native_ph_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // C23 (HIGH) fix: serialize the parties RMW under the `this` monitor.
+    // Previously two concurrent `register()` calls would each read
+    // `parties = N`, both write `parties = N + 1`, losing one increment.
+    ctx.monitor_enter(this);
     let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
         Value::Int(v) => v,
         _ => 0,
@@ -21005,6 +21259,7 @@ fn native_ph_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(v) => v,
         _ => 0,
     };
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21037,12 +21292,17 @@ fn native_ph_arrive_and_await(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // C23 (HIGH) fix: hold the `this` monitor across the read-modify-write
+    // of `arrived` + the `parties == arrived` advance check so concurrent
+    // arrivals can't race to lose increments or double-advance the phase.
+    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
     };
     ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
     let phase = ph_maybe_advance(ctx, this);
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21051,6 +21311,7 @@ fn native_ph_arrive_and_deregister(ctx: &mut dyn NativeContext, args: &[Value]) 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
@@ -21064,6 +21325,7 @@ fn native_ph_arrive_and_deregister(ctx: &mut dyn NativeContext, args: &[Value]) 
         ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(parties - 1));
     }
     let phase = ph_maybe_advance(ctx, this);
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21072,12 +21334,14 @@ fn native_ph_arrive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
     };
     ctx.set_field(this, PH_FIELD_ARRIVED, Value::Int(arrived + 1));
     let phase = ph_maybe_advance(ctx, this);
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21086,10 +21350,15 @@ fn native_ph_get_phase(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // C23 (HIGH): fence the read so a concurrent arrival's
+    // `set_field(phase, +1)` is observed atomically with its
+    // `set_field(arrived, 0)` reset.
+    ctx.monitor_enter(this);
     let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
         Value::Int(v) => v,
         _ => 0,
     };
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(phase)))
 }
 
@@ -21098,10 +21367,12 @@ fn native_ph_get_registered_parties(ctx: &mut dyn NativeContext, args: &[Value])
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    ctx.monitor_enter(this);
     let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
         Value::Int(v) => v,
         _ => 0,
     };
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(parties)))
 }
 
@@ -21110,10 +21381,12 @@ fn native_ph_get_arrived_parties(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    ctx.monitor_enter(this);
     let arrived = match ctx.get_field(this, PH_FIELD_ARRIVED) {
         Value::Int(v) => v,
         _ => 0,
     };
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(arrived)))
 }
 
