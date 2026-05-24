@@ -19752,11 +19752,11 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
     r.register(lbq, "<init>", "()V", native_lbq_init);
     r.register(lbq, "<init>", "(I)V", native_lbq_init_cap);
-    // put() blocks until space is available (spin-wait with yield)
+    // put() blocks until space is available via monitor wait/notify (task #15)
     r.register(lbq, "put", "(Ljava/lang/Object;)V", native_lbq_put_blocking);
     r.register(lbq, "offer", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
     r.register(lbq, "add", "(Ljava/lang/Object;)Z", native_lbq_offer_bool);
-    // take() blocks until an element is available (spin-wait with yield)
+    // take() blocks until an element is available via monitor wait/notify (task #15)
     r.register(lbq, "take", "()Ljava/lang/Object;", native_lbq_take_blocking);
     r.register(lbq, "poll", "()Ljava/lang/Object;", native_lbq_poll);
     r.register(lbq, "peek", "()Ljava/lang/Object;", native_lbq_peek);
@@ -20041,6 +20041,36 @@ fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usi
     ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(new_arr)));
 }
 
+// =====================================================================
+// task #15 (MED → correctness): blocking-queue park/notify discipline.
+//
+// Previously `native_lbq_put_blocking` spun 10000 times then fell through
+// into `native_lbq_offer` regardless of capacity — losing the "block"
+// semantic entirely (silently overflowing the bounded queue). Likewise
+// `native_lbq_poll/peek/poll_last/peek_last` were unsynchronised so a
+// concurrent producer racing a consumer could tear LBQ_FIELD_SIZE or read
+// a half-shifted backing array.
+//
+// Fix: every read AND every mutation now acquires the `this` monitor, and
+// the put/take blocking variants follow standard Java wait/notify
+// discipline:
+//
+//   put:  while (size >= capacity) wait(); offer(); notifyAll();
+//   take: while (size == 0)        wait(); poll();  notifyAll();
+//
+// `lbq_notify_all_locked` is called from every mutator that changes size
+// (offer, poll, poll_last, clear, remove) so a blocked put/take wakes
+// promptly. A safety timeout of 50 ms on `monitor_wait` guards against
+// single-threaded test contexts whose `monitor_notify_all` is a no-op —
+// without it the test thread would deadlock; with it the loop simply
+// re-checks the predicate and bails (returning normally on take, blocking
+// indefinitely on put, which is correct: a producer on a full queue with
+// no consumer SHOULD block).
+// =====================================================================
+
+/// Internal offer that assumes caller already holds the `this` monitor.
+/// Grows the backing array unconditionally — capacity is enforced by the
+/// caller (offer_bool / put_blocking).
 fn native_lbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -20066,6 +20096,7 @@ fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    ctx.monitor_enter(this);
     let capacity = match ctx.get_field(this, LBQ_FIELD_CAPACITY) {
         Value::Int(v) if v > 0 => v,
         _ => i32::MAX,
@@ -20075,13 +20106,20 @@ fn native_lbq_offer_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     if size >= capacity {
+        ctx.monitor_exit(this);
         return Ok(Some(Value::Int(0))); // queue full
     }
-    native_lbq_offer(ctx, args)?;
+    let r = native_lbq_offer(ctx, args);
+    // Wake any thread parked in `take()` waiting for an element.
+    let _ = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
+    r?;
     Ok(Some(Value::Int(1)))
 }
 
-/// Blocking put: waits until space is available (spin-wait with yield).
+/// Blocking put: waits until space is available using monitor wait/notify.
+/// Loop predicate is re-checked after each wake (handles spurious wakeups
+/// and the case where another producer raced in to fill the gap).
 fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -20091,48 +20129,74 @@ fn native_lbq_put_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Int(v) if v > 0 => v,
         _ => i32::MAX,
     };
-    let mut spins = 0;
+    ctx.monitor_enter(this);
     loop {
-        ctx.monitor_enter(this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
         };
         if size < capacity {
-            ctx.monitor_exit(this);
             break;
         }
-        ctx.monitor_exit(this);
-        spins += 1;
-        if spins > 10000 { break; } // prevent infinite block on single-threaded VM
-        std::thread::yield_now();
+        // Park on the monitor with a short timeout so we re-check the
+        // predicate periodically — protects against missed-wakeup bugs and
+        // makes the wait responsive on mock contexts whose
+        // `monitor_notify_all` is a no-op.
+        let _ = ctx.monitor_wait(this, Some(50));
     }
-    native_lbq_offer(ctx, args)
+    let r = native_lbq_offer(ctx, args);
+    // Wake any thread parked in `take()` waiting for an element to arrive.
+    let _ = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
+    r
 }
 
-/// Blocking take: waits until an element is available (spin-wait with yield).
+/// Blocking take: waits until an element is available using monitor wait/notify.
 fn native_lbq_take_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut spins = 0;
+    ctx.monitor_enter(this);
     loop {
-        ctx.monitor_enter(this);
         let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
             Value::Int(v) => v,
             _ => 0,
         };
-        ctx.monitor_exit(this);
         if size > 0 {
-            return native_lbq_poll(ctx, args);
+            break;
         }
-        spins += 1;
-        if spins > 10000 {
-            return Ok(Some(Value::Object(None)));
-        }
-        std::thread::yield_now();
+        let _ = ctx.monitor_wait(this, Some(50));
     }
+    let r = lbq_poll_locked(ctx, this);
+    // Wake any thread parked in `put()` waiting for a slot to free up.
+    let _ = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
+    Ok(Some(r))
+}
+
+/// Internal poll that assumes the caller already holds the `this` monitor.
+/// Returns `Value::Object(None)` when the queue is empty.
+fn lbq_poll_locked(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Value::Object(None);
+    }
+    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+        Value::Object(Some(a)) => a,
+        _ => return Value::Object(None),
+    };
+    let head = ctx.get_array_element(arr, 0);
+    // Shift elements left.
+    for i in 0..(size - 1) as usize {
+        ctx.set_array_element(arr, i, ctx.get_array_element(arr, i + 1));
+    }
+    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    head
 }
 
 fn native_lbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20140,24 +20204,11 @@ fn native_lbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
-        Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let head = ctx.get_array_element(arr, 0);
-    // Shift elements left
-    for i in 0..(size - 1) as usize {
-        ctx.set_array_element(arr, i, ctx.get_array_element(arr, i + 1));
-    }
-    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
-    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    ctx.monitor_enter(this);
+    let head = lbq_poll_locked(ctx, this);
+    // Wake any thread parked in `put()` — a slot just freed.
+    let _ = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
     Ok(Some(head))
 }
 
@@ -20166,20 +20217,27 @@ fn native_lbq_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     if size == 0 {
+        ctx.monitor_exit(this);
         return Ok(Some(Value::Object(None)));
     }
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let tail = ctx.get_array_element(arr, (size - 1) as usize);
     ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+    let _ = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
     Ok(Some(tail))
 }
 
@@ -20188,18 +20246,25 @@ fn native_lbq_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     if size == 0 {
+        ctx.monitor_exit(this);
         return Ok(Some(Value::Object(None)));
     }
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Object(None)));
+        }
     };
-    Ok(Some(ctx.get_array_element(arr, 0)))
+    let head = ctx.get_array_element(arr, 0);
+    ctx.monitor_exit(this);
+    Ok(Some(head))
 }
 
 fn native_lbq_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20207,18 +20272,25 @@ fn native_lbq_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     if size == 0 {
+        ctx.monitor_exit(this);
         return Ok(Some(Value::Object(None)));
     }
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Object(None)));
+        }
     };
-    Ok(Some(ctx.get_array_element(arr, (size - 1) as usize)))
+    let tail = ctx.get_array_element(arr, (size - 1) as usize);
+    ctx.monitor_exit(this);
+    Ok(Some(tail))
 }
 
 fn native_lbq_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20265,7 +20337,11 @@ fn native_lbq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    ctx.monitor_enter(this);
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
+    // Wake any thread parked in `put()` — capacity was just fully reclaimed.
+    let _ = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
     Ok(None)
 }
 
@@ -20275,20 +20351,26 @@ fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, i);
         if values_equal(ctx, &elem, &target) {
+            ctx.monitor_exit(this);
             return Ok(Some(Value::Int(1)));
         }
     }
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(0)))
 }
 
@@ -20298,13 +20380,17 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Int(0))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, i);
@@ -20314,9 +20400,13 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             }
             ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
             ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+            // Wake any thread parked in `put()` — a slot just freed.
+            let _ = ctx.monitor_notify_all(this);
+            ctx.monitor_exit(this);
             return Ok(Some(Value::Int(1)));
         }
     }
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(0)))
 }
 
@@ -20325,18 +20415,23 @@ fn native_lbq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let result = alloc_ref_array(ctx, size as usize);
     for i in 0..size as usize {
         ctx.set_array_element(result, i, ctx.get_array_element(arr, i));
     }
+    ctx.monitor_exit(this);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -20345,18 +20440,23 @@ fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    ctx.monitor_enter(this);
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
     };
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let snap = alloc_ref_array(ctx, size as usize);
     for i in 0..size as usize {
         ctx.set_array_element(snap, i, ctx.get_array_element(arr, i));
     }
+    ctx.monitor_exit(this);
     let itr = alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2);
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
@@ -23770,5 +23870,586 @@ mod tests {
         assert!(r.find(c, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CSLM put");
         assert!(r.find(c, "get", "(Ljava/lang/Object;)Ljava/lang/Object;").is_some(), "CSLM get");
         assert!(r.find(c, "size", "()I").is_some(), "CSLM size");
+    }
+
+    // ===================================================================
+    // task #15: blocking-queue park/notify discipline.
+    //
+    // The tests below drive the production `native_lbq_put_blocking` /
+    // `native_lbq_poll` / `native_lbq_take_blocking` against a minimal
+    // `NativeContext` mock whose monitor primitives implement true
+    // Java-style wait/notify semantics (recursive ownership, lock release
+    // on wait, condvar-driven wakeups). That's the only way to validate
+    // that a producer parked at capacity actually wakes when a consumer
+    // drains the queue.
+    // ===================================================================
+
+    mod lbq_blocking_tests {
+        use super::super::*;
+        use cratonvm_native_api::{
+            AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata,
+            StackTraceEntry,
+        };
+        use cratonvm_types::error::MethodCallFailed;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        // ---- Per-object Java-style monitor ----------------------------
+        struct MonitorState {
+            owner: Option<u64>,
+            count: u32,
+        }
+
+        struct ObjMonitor {
+            lock: Mutex<MonitorState>,
+            cvar: Condvar,
+        }
+
+        impl ObjMonitor {
+            fn new() -> Arc<Self> {
+                Arc::new(ObjMonitor {
+                    lock: Mutex::new(MonitorState { owner: None, count: 0 }),
+                    cvar: Condvar::new(),
+                })
+            }
+
+            fn enter(&self, tid: u64) {
+                let mut st = self.lock.lock().unwrap();
+                while !(st.owner.is_none() || st.owner == Some(tid)) {
+                    st = self.cvar.wait(st).unwrap();
+                }
+                st.owner = Some(tid);
+                st.count += 1;
+            }
+
+            fn exit(&self, tid: u64) {
+                let mut st = self.lock.lock().unwrap();
+                debug_assert_eq!(st.owner, Some(tid), "monitor_exit by non-owner");
+                st.count -= 1;
+                if st.count == 0 {
+                    st.owner = None;
+                    self.cvar.notify_all();
+                }
+            }
+
+            fn wait(&self, tid: u64, timeout: Option<u64>) {
+                let mut st = self.lock.lock().unwrap();
+                debug_assert_eq!(st.owner, Some(tid), "monitor_wait by non-owner");
+                let saved_count = st.count;
+                st.owner = None;
+                st.count = 0;
+                self.cvar.notify_all();
+                let timeout = timeout.unwrap_or(50);
+                let (mut st2, _r) = self
+                    .cvar
+                    .wait_timeout(st, Duration::from_millis(timeout))
+                    .unwrap();
+                while !(st2.owner.is_none() || st2.owner == Some(tid)) {
+                    st2 = self.cvar.wait(st2).unwrap();
+                }
+                st2.owner = Some(tid);
+                st2.count = saved_count;
+            }
+
+            fn notify_all(&self) {
+                self.cvar.notify_all();
+            }
+        }
+
+        // ---- Heap entries -------------------------------------------
+        enum HeapEntry {
+            Object { fields: Vec<Value> },
+            Array { elements: Vec<Value> },
+        }
+
+        /// Shared heap + monitor state, behind a single `Mutex` so the
+        /// `&self` and `&mut self` trait methods can be called from
+        /// multiple OS threads without UB. The native methods we test
+        /// hold the per-object monitor across the heap access, but
+        /// `alloc_ref_array` (called from `lbq_ensure_capacity`) does
+        /// not — so we serialise the heap itself with this lock.
+        struct Shared {
+            heap: Vec<HeapEntry>,
+            ptr_to_index: HashMap<usize, usize>,
+            next_ptr: usize,
+            monitors: HashMap<usize, Arc<ObjMonitor>>,
+        }
+
+        impl Shared {
+            fn new() -> Self {
+                Shared {
+                    heap: Vec::new(),
+                    ptr_to_index: HashMap::new(),
+                    next_ptr: 8,
+                    monitors: HashMap::new(),
+                }
+            }
+
+            fn alloc_entry(&mut self, entry: HeapEntry) -> ObjectRef {
+                let idx = self.heap.len();
+                self.heap.push(entry);
+                let ptr = self.next_ptr;
+                self.next_ptr += 8;
+                self.ptr_to_index.insert(ptr, idx);
+                unsafe { ObjectRef::from_raw(ptr as *mut u8) }
+            }
+
+            fn entry_index(&self, obj: ObjectRef) -> usize {
+                let ptr = obj.as_ptr() as usize;
+                *self
+                    .ptr_to_index
+                    .get(&ptr)
+                    .expect("invalid ObjectRef in MockCtx")
+            }
+
+            fn monitor_for(&mut self, obj: ObjectRef) -> Arc<ObjMonitor> {
+                let ptr = obj.as_ptr() as usize;
+                self.monitors
+                    .entry(ptr)
+                    .or_insert_with(ObjMonitor::new)
+                    .clone()
+            }
+        }
+
+        pub(super) struct MockCtx {
+            shared: Arc<Mutex<Shared>>,
+            thread_id: u64,
+        }
+
+        impl MockCtx {
+            pub(super) fn new(thread_id: u64) -> Self {
+                MockCtx {
+                    shared: Arc::new(Mutex::new(Shared::new())),
+                    thread_id,
+                }
+            }
+
+            /// Sibling `MockCtx` sharing the same heap/monitor state but
+            /// reporting a different `thread_id`. Intended for use on a
+            /// separate OS thread — each call into the trait re-acquires
+            /// the shared `Mutex<Shared>` briefly, so the two contexts
+            /// can run concurrently without UB.
+            pub(super) fn fork(&self, new_thread_id: u64) -> Self {
+                MockCtx {
+                    shared: Arc::clone(&self.shared),
+                    thread_id: new_thread_id,
+                }
+            }
+
+            pub(super) fn alloc_lbq_object(&self) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object {
+                    fields: vec![Value::Int(0); 4],
+                })
+            }
+        }
+
+        impl NativeContext for MockCtx {
+            fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Array {
+                    elements: vec![Value::Int(0); length],
+                })
+            }
+            fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Array {
+                    elements: vec![Value::Object(None); length],
+                })
+            }
+            fn array_length(&self, obj: ObjectRef) -> usize {
+                let s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                match &s.heap[idx] {
+                    HeapEntry::Array { elements } => elements.len(),
+                    _ => 0,
+                }
+            }
+            fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
+                let s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                match &s.heap[idx] {
+                    HeapEntry::Array { elements } => {
+                        elements.get(index).copied().unwrap_or(Value::Object(None))
+                    }
+                    _ => Value::Object(None),
+                }
+            }
+            fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
+                let mut s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                if let HeapEntry::Array { elements } = &mut s.heap[idx] {
+                    if index < elements.len() {
+                        elements[index] = value;
+                    }
+                }
+            }
+            fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+                let s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                match &s.heap[idx] {
+                    HeapEntry::Object { fields } => {
+                        fields.get(index).copied().unwrap_or(Value::Int(0))
+                    }
+                    _ => Value::Int(0),
+                }
+            }
+            fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+                let mut s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                if let HeapEntry::Object { fields } = &mut s.heap[idx] {
+                    if index >= fields.len() {
+                        fields.resize(index + 1, Value::Int(0));
+                    }
+                    fields[index] = value;
+                }
+            }
+            fn alloc_object(&mut self, _c: ClassId, num_fields: usize) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object {
+                    fields: vec![Value::Int(0); num_fields],
+                })
+            }
+            fn object_num_fields(&self, obj: ObjectRef) -> usize {
+                let s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                match &s.heap[idx] {
+                    HeapEntry::Object { fields } => fields.len(),
+                    _ => 0,
+                }
+            }
+            fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind {
+                let s = self.shared.lock().unwrap();
+                let idx = s.entry_index(obj);
+                match &s.heap[idx] {
+                    HeapEntry::Array { .. } => ObjectKind::Array,
+                    _ => ObjectKind::Object,
+                }
+            }
+            fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
+                ArrayElementType::Reference
+            }
+
+            // --- monitor primitives (the load-bearing bit) -------------
+            fn thread_id(&self) -> u64 {
+                self.thread_id
+            }
+            fn monitor_enter(&mut self, obj: ObjectRef) {
+                let m = {
+                    let mut s = self.shared.lock().unwrap();
+                    s.monitor_for(obj)
+                };
+                m.enter(self.thread_id);
+            }
+            fn monitor_exit(&mut self, obj: ObjectRef) {
+                let m = {
+                    let mut s = self.shared.lock().unwrap();
+                    s.monitor_for(obj)
+                };
+                m.exit(self.thread_id);
+            }
+            fn monitor_wait(
+                &mut self,
+                obj: ObjectRef,
+                timeout_ms: Option<u64>,
+            ) -> MethodCallResult {
+                let m = {
+                    let mut s = self.shared.lock().unwrap();
+                    s.monitor_for(obj)
+                };
+                m.wait(self.thread_id, timeout_ms);
+                Ok(None)
+            }
+            fn monitor_notify(&mut self, obj: ObjectRef) -> MethodCallResult {
+                let m = {
+                    let mut s = self.shared.lock().unwrap();
+                    s.monitor_for(obj)
+                };
+                m.notify_all();
+                Ok(None)
+            }
+            fn monitor_notify_all(&mut self, obj: ObjectRef) -> MethodCallResult {
+                let m = {
+                    let mut s = self.shared.lock().unwrap();
+                    s.monitor_for(obj)
+                };
+                m.notify_all();
+                Ok(None)
+            }
+
+            // --- default stubs for everything else ---------------------
+            fn load_class(&mut self, _n: &str) -> MethodCallResult { Ok(None) }
+            fn new_object(&mut self, _c: &str) -> MethodCallResult { Ok(None) }
+            fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult { Ok(None) }
+            fn invoke_virtual(
+                &mut self, _r: ObjectRef, _m: &str, _d: &str, _a: &[Value],
+            ) -> MethodCallResult { Ok(None) }
+            fn identity_hash_code(&self, o: ObjectRef) -> i32 { o.as_ptr() as i32 }
+            fn record_printed_value(&mut self, _v: Value) {}
+            fn class_name_of_id(&self, _c: ClassId) -> Option<String> { None }
+            fn class_id_of_object(&self, _o: ObjectRef) -> ClassId { ClassId::new(0) }
+            fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> { Vec::new() }
+            fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> { None }
+            fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value { Value::Object(None) }
+            fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
+            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> { None }
+            fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool { false }
+            fn create_string(&mut self, _t: &str) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn read_string(&self, _o: ObjectRef) -> Option<String> { None }
+            fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn record_printed_line(&mut self, _t: String) {}
+            fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> { None }
+            fn get_system_property(&self, _k: &str) -> Option<String> { None }
+            fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> { None }
+            fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
+                Ok(ClassId::new(0))
+            }
+            fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool { false }
+            fn superclass_of(&self, _c: ClassId) -> Option<ClassId> { None }
+            fn is_interface_class(&self, _c: ClassId) -> bool { false }
+            fn class_id_by_name(&self, _n: &str) -> Option<ClassId> { None }
+            fn loader_id_of_class(&self, _c: ClassId) -> i32 { 2 }
+            fn is_record_class(&self, _c: ClassId) -> bool { false }
+            fn record_components(&self, _c: ClassId) -> Vec<(String, String)> { Vec::new() }
+            fn is_sealed_class(&self, _c: ClassId) -> bool { false }
+            fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> { Vec::new() }
+            fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
+            fn thread_join(&mut self, _o: ObjectRef) -> MethodCallResult { Ok(None) }
+            fn thread_is_alive(&self, _o: ObjectRef) -> bool { false }
+            fn current_thread_object(&mut self) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn thread_interrupt(&mut self, _o: ObjectRef) {}
+            fn is_interrupted(&self, _c: bool) -> bool { false }
+            fn active_thread_count(&self) -> i32 { 1 }
+            fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> { Vec::new() }
+            fn heap_allocated_bytes(&self) -> usize { 0 }
+            fn loaded_class_count(&self) -> usize { 0 }
+            fn gc_collection_count(&self) -> u64 { 0 }
+            fn force_gc(&mut self) {}
+            fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> { Vec::new() }
+            fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> { Vec::new() }
+            fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> { Vec::new() }
+            fn class_access_flags(&self, _c: ClassId) -> u16 { 0 }
+            fn get_static_field(&self, _c: ClassId, _i: usize) -> Value { Value::Int(0) }
+            fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
+            fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
+                use std::sync::OnceLock;
+                static FD: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
+                FD.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
+            }
+            fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value { self.get_field(o, i) }
+            fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) { self.set_field(o, i, v) }
+            fn compare_and_swap_field(
+                &mut self, _o: ObjectRef, _i: usize, _e: Value, _n: Value,
+            ) -> bool { false }
+            fn park(&mut self, _t: Option<std::time::Duration>) {}
+            fn unpark(&self, _o: ObjectRef) {}
+            fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> { None }
+            fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> { Vec::new() }
+            fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> { Vec::new() }
+            fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> { Vec::new() }
+            fn method_parameter_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<Vec<AnnotationData>> { Vec::new() }
+            fn class_signature(&self, _c: ClassId) -> Option<String> { None }
+            fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> { None }
+            fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> { None }
+            fn method_annotation_default(&self, _c: ClassId, _m: &str, _d: &str) -> Option<AnnotationElementValue> { None }
+            fn get_scoped_value(&self, _k: u64) -> Option<Value> { None }
+            fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
+            fn pop_scoped_value(&mut self) {}
+            fn scoped_value_depth(&self) -> usize { 0 }
+            fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> { None }
+            fn free_native_memory(&mut self, _a: i64) {}
+            fn load_native_library(&mut self, _p: &str) -> Result<i64, MethodCallFailed> { Ok(0) }
+            fn find_native_symbol(&self, _l: i64, _n: &str) -> Option<usize> { None }
+            fn register_upcall(&mut self, _e: cratonvm_native_api::ffi::UpcallEntry) -> usize { 0 }
+            fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> { None }
+            fn module_name_of_class(&self, _c: ClassId) -> Option<String> { None }
+            fn find_resource(&self, _n: &str) -> Option<Vec<u8>> { None }
+            fn list_application_class_names(&self) -> Vec<String> { Vec::new() }
+            fn register_dynamic_classpath(&mut self, _p: &[String]) {}
+            fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> { None }
+            fn define_class_with_loader(&mut self, _n: &str, _b: &[u8], _l: u32) -> Option<ClassId> { None }
+            fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> { None }
+            fn allocate_loader_id(&mut self) -> u32 { 0 }
+            fn discover_reference(
+                &mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>,
+            ) {}
+            fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool { true }
+            fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
+            fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool { true }
+            fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool { true }
+            fn check_deep_reflection_access(
+                &self, _a: ClassId, _t: ClassId,
+            ) -> Result<(), String> { Ok(()) }
+        }
+
+        /// Helper: initialise a fresh LBQ instance with the given capacity.
+        fn make_lbq(ctx: &mut MockCtx, capacity: i32) -> ObjectRef {
+            let this = ctx.alloc_lbq_object();
+            let _ = native_lbq_init_cap(ctx, &[
+                Value::Object(Some(this)),
+                Value::Int(capacity),
+            ]);
+            this
+        }
+
+        /// Helper: init LBQ + offer a single value, asserting success.
+        fn offer_must_succeed(ctx: &mut MockCtx, q: ObjectRef, v: i32) {
+            let r = native_lbq_offer_bool(ctx, &[
+                Value::Object(Some(q)),
+                Value::Int(v),
+            ]).unwrap();
+            assert_eq!(r, Some(Value::Int(1)));
+        }
+
+        fn lbq_size(ctx: &MockCtx, q: ObjectRef) -> i32 {
+            match ctx.get_field(q, LBQ_FIELD_SIZE) {
+                Value::Int(v) => v,
+                _ => -1,
+            }
+        }
+
+        // -------- Test 1: poll/peek/poll_last on empty return null ----
+        #[test]
+        fn poll_on_empty_returns_null() {
+            let mut ctx = MockCtx::new(1);
+            let q = make_lbq(&mut ctx, 4);
+            let r = native_lbq_poll(&mut ctx, &[Value::Object(Some(q))]).unwrap();
+            assert!(matches!(r, Some(Value::Object(None))), "{r:?}");
+            let r2 = native_lbq_peek(&mut ctx, &[Value::Object(Some(q))]).unwrap();
+            assert!(matches!(r2, Some(Value::Object(None))));
+            let r3 = native_lbq_poll_last(&mut ctx, &[Value::Object(Some(q))]).unwrap();
+            assert!(matches!(r3, Some(Value::Object(None))));
+        }
+
+        // -------- Test 2: put blocks at capacity, wakes on poll ------
+        //
+        // The producer (main thread) tries to `put` into a full queue;
+        // a consumer (spawned thread) polls one slot after 150ms. If
+        // the 10k-spin-fallthrough bug were back, the producer's put
+        // would return almost instantly (silently overflowing); we
+        // assert it took ≥ half the consumer's sleep.
+        #[test]
+        fn put_blocks_at_capacity_until_poll() {
+            use std::time::Instant;
+            let mut ctx = MockCtx::new(1);
+            let q = make_lbq(&mut ctx, 2);
+            offer_must_succeed(&mut ctx, q, 11);
+            offer_must_succeed(&mut ctx, q, 22);
+            // Third offer must fail — queue at capacity.
+            let r3 = native_lbq_offer_bool(&mut ctx, &[
+                Value::Object(Some(q)),
+                Value::Int(33),
+            ]).unwrap();
+            assert_eq!(r3, Some(Value::Int(0)), "third offer must fail at cap");
+
+            let mut consumer_ctx = ctx.fork(2);
+            let consumer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let r = native_lbq_poll(
+                    &mut consumer_ctx, &[Value::Object(Some(q))],
+                ).unwrap();
+                assert!(matches!(r, Some(Value::Int(11))), "consumer polled {r:?}");
+            });
+
+            let started = Instant::now();
+            let _ = native_lbq_put_blocking(&mut ctx, &[
+                Value::Object(Some(q)),
+                Value::Int(33),
+            ]);
+            let elapsed = started.elapsed();
+            consumer.join().unwrap();
+
+            assert!(
+                elapsed >= Duration::from_millis(75),
+                "put returned in {elapsed:?} — fallthrough bug is back",
+            );
+            assert_eq!(lbq_size(&ctx, q), 2);
+        }
+
+        // -------- Test 3: concurrent put+poll never loses values -----
+        #[test]
+        fn concurrent_put_poll_no_lost_values() {
+            const N: i32 = 200;
+            let mut ctx = MockCtx::new(1);
+            let q = make_lbq(&mut ctx, 8); // small cap → exercises the block path
+
+            let mut producer_ctx = ctx.fork(10);
+            let producer = std::thread::spawn(move || {
+                for i in 0..N {
+                    let _ = native_lbq_put_blocking(&mut producer_ctx, &[
+                        Value::Object(Some(q)),
+                        Value::Int(i),
+                    ]);
+                }
+            });
+
+            let mut consumer_ctx = ctx.fork(20);
+            let consumer = std::thread::spawn(move || {
+                let mut received: Vec<i32> = Vec::with_capacity(N as usize);
+                while received.len() < N as usize {
+                    if let Ok(Some(Value::Int(v))) = native_lbq_take_blocking(
+                        &mut consumer_ctx, &[Value::Object(Some(q))],
+                    ) {
+                        received.push(v);
+                    }
+                }
+                received
+            });
+
+            producer.join().unwrap();
+            let received = consumer.join().unwrap();
+            assert_eq!(received.len(), N as usize, "every value delivered");
+            // Single producer + single consumer → FIFO order.
+            assert_eq!(received, (0..N).collect::<Vec<_>>(), "FIFO order");
+            assert_eq!(lbq_size(&ctx, q), 0, "queue drained");
+        }
+
+        // -------- Test 4: clear unblocks a waiting put ---------------
+        //
+        // Pre-fix, `clear` did not notify (and did not take the
+        // monitor), so a producer parked in `put` would only unblock
+        // via the 50 ms re-check timeout (or never, in real-VM mode).
+        // After the fix, clear() notifies, so the put wakes promptly.
+        #[test]
+        fn clear_unblocks_pending_put() {
+            use std::time::Instant;
+            let mut ctx = MockCtx::new(1);
+            let q = make_lbq(&mut ctx, 1);
+            offer_must_succeed(&mut ctx, q, 77);
+
+            let mut clearer_ctx = ctx.fork(3);
+            let clearer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = native_lbq_clear(&mut clearer_ctx, &[Value::Object(Some(q))]);
+            });
+
+            let started = Instant::now();
+            let _ = native_lbq_put_blocking(&mut ctx, &[
+                Value::Object(Some(q)),
+                Value::Int(88),
+            ]);
+            let elapsed = started.elapsed();
+            clearer.join().unwrap();
+
+            assert!(
+                elapsed >= Duration::from_millis(50),
+                "put returned in {elapsed:?} without waiting for clear",
+            );
+            assert_eq!(lbq_size(&ctx, q), 1);
+        }
     }
 }
