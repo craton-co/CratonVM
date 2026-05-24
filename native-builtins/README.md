@@ -39,6 +39,13 @@ cratonvm_native_builtins::register_builtins(&mut reg);
 Pre-1.0. API stability is best-effort. Tied to the
 [CratonVM](https://github.com/craton-co/cratonvm) workspace version.
 
+## JDK coverage
+
+For an auto-generated catalog of every `r.register("<class>", "<method>",
+"<desc>", ...)` call site across this crate (and the sibling
+`native-collections`, `native-io`, `native-awt` crates), see
+[`docs/JDK_COVERAGE.md`](../docs/JDK_COVERAGE.md) at the workspace root.
+
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE` at the workspace root.
