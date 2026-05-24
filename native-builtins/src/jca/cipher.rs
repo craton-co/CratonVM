@@ -86,23 +86,32 @@ use crate::crypto_impl::{Aes, AesGcm};
 use crate::phases_early::CIPHER_IV;
 
 // ---------------------------------------------------------------------------
-// Cipher state — kept in a process-wide side-table keyed on the heap
-// `ObjectRef` of the Cipher synthetic.  We CANNOT reuse the synthetic
-// field-index pattern from `phases_early.rs::register_phase53_crypto`
+// Cipher state — kept in a process-wide side-table keyed on the
+// `identity_hash_code` of the Cipher synthetic.  We CANNOT reuse the
+// synthetic field-index pattern from `phases_early.rs::register_phase53_crypto`
 // in real-JDK mode: when `javax.crypto.Cipher` is loaded as a real
 // class, instance-field 5 maps to `initialized:Z` (a primitive
 // boolean), so storing `Value::Object(Some(byte_arr))` there throws
 // `expected object reference, got double` on read-back.  The
 // side-table keeps the storage independent of the real-JDK class
 // layout — it works in both modes and is cheap (single
-// `RwLock<FxHashMap<usize, CipherState>>` lookup; no allocation per
+// `RwLock<FxHashMap<i32, CipherState>>` lookup; no allocation per
 // call).
 //
-// Memory note: the table grows monotonically until VM shutdown.
-// Entries are addressed by raw heap pointer, so a Cipher whose ref
-// is gc'd will leave a dangling entry until the next VM exit — fine
-// for finite-lived JVM processes; not suitable for a long-running
-// daemon doing millions of Cipher instances per minute.
+// Round-13 C13 fix: keys are GC-stable identity hash codes (see
+// `gc/src/compact_header.rs::HashCodeTable::update_after_gc`), not raw
+// heap pointers.  Previously this table was keyed by `obj.as_ptr() as
+// usize` — when the GC relocated a live Cipher during compaction, the
+// stored `mode`/`key_bytes`/`iv_bytes`/`accumulated`/`aad` became
+// orphaned and the next `cipher_do_final` saw `mode == 0` and silently
+// returned a NULL ciphertext (apparent "success" producing wrong data).
+// Routing every read/write through `NativeContext::identity_hash_code`
+// means GC compaction no longer corrupts the table.
+//
+// Memory note: the table still grows monotonically until VM shutdown
+// (no weak-ref machinery hooked up yet) — fine for finite-lived JVM
+// processes; not suitable for a long-running daemon doing millions of
+// Cipher instances per minute.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Default)]
@@ -125,9 +134,9 @@ struct CipherState {
     aad: Vec<u8>,
 }
 
-static CIPHER_TABLE: RwLock<Option<FxHashMap<usize, CipherState>>> = RwLock::new(None);
+static CIPHER_TABLE: RwLock<Option<FxHashMap<i32, CipherState>>> = RwLock::new(None);
 
-fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, CipherState>) -> R) -> R {
+fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, CipherState>) -> R) -> R {
     // Round-9 MED-2: parking_lot — no poison handling.
     let mut g = CIPHER_TABLE.write();
     if g.is_none() {
@@ -136,7 +145,7 @@ fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, CipherState>) -> R) 
     f(g.as_mut().expect("table just initialised"))
 }
 
-fn with_table_read<R>(f: impl FnOnce(&FxHashMap<usize, CipherState>) -> R) -> R {
+fn with_table_read<R>(f: impl FnOnce(&FxHashMap<i32, CipherState>) -> R) -> R {
     // Round-9 MED-2: parking_lot — no poison handling.
     let g = CIPHER_TABLE.read();
     match g.as_ref() {
@@ -145,8 +154,13 @@ fn with_table_read<R>(f: impl FnOnce(&FxHashMap<usize, CipherState>) -> R) -> R 
     }
 }
 
-fn obj_key(obj: ObjectRef) -> usize {
-    obj.as_ptr() as usize
+/// GC-stable key for the side-table.  Routes through
+/// `NativeContext::identity_hash_code` so the entry survives moving-GC
+/// compaction; the underlying `HashCodeTable::update_after_gc` remaps
+/// codes whenever objects are relocated.  See the module-level Round-13
+/// C13 note for why this matters.
+fn obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
+    ctx.identity_hash_code(obj)
 }
 
 /// `<clinit>` no-op — used to mark a real-JDK class as initialized
@@ -206,9 +220,12 @@ fn read_bytes(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
 fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6);
     let algo_str = ctx.read_string(algo).unwrap_or_default();
+    // Compute key outside the closure — `obj_key` borrows `ctx` and the
+    // table write-guard must not depend on the ctx borrow.
+    let key = obj_key(ctx, obj);
     with_table_write(|t| {
         t.insert(
-            obj_key(obj),
+            key,
             CipherState {
                 algorithm: algo_str,
                 ..Default::default()
@@ -280,13 +297,29 @@ fn parse_transformation(algo: &str) -> (String, String, bool) {
 /// and return an `IllegalStateException` describing the requested
 /// transformation rather than silently producing wrong bytes.
 fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
-    let state = with_table_read(|t| t.get(&obj_key(this)).cloned()).unwrap_or_default();
+    let key = obj_key(ctx, this);
+    let state = with_table_read(|t| t.get(&key).cloned());
+
+    // Round-13 C13: missing-state used to silently return
+    // `Ok(Some(Value::Object(None)))` — apparent "success" producing a
+    // NULL ciphertext.  With the GC-stable identity-hash key in place,
+    // a missing entry now means the caller never invoked `init` (or a
+    // future regression has re-introduced a key-instability bug); fail
+    // loudly so the symptom surfaces at the first wrong call instead of
+    // propagating silent NULLs through the user's pipeline.
+    let Some(state) = state else {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Cipher state missing (init never called or stale post-GC)".into(),
+        }
+        .into());
+    };
 
     let mode = state.mode;
     if mode == 0 {
-        // Uninitialized — match the synthetic-mode "passthrough" test
-        // assertion in phases_early.rs which expects null.
-        return Ok(Some(Value::Object(None)));
+        return Err(RuntimeError::IllegalStateException {
+            message: "Cipher state missing (init never called or stale post-GC)".into(),
+        }
+        .into());
     }
 
     let algo = state.algorithm.clone();
@@ -406,7 +439,7 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             // resets the cipher to the state it was in after the last
             // call to init".
             with_table_write(|t| {
-                if let Some(s) = t.get_mut(&obj_key(this)) {
+                if let Some(s) = t.get_mut(&key) {
                     s.accumulated.clear();
                     s.aad.clear();
                 }
@@ -632,8 +665,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let mode = args[1].as_int().unwrap_or(0);
         let key = obj_arg(args, 2)?;
         let key_bytes = extract_key_bytes(ctx, key);
+        let tkey = obj_key(ctx, this);
         with_table_write(|t| {
-            let s = t.entry(obj_key(this)).or_default();
+            let s = t.entry(tkey).or_default();
             s.mode = mode;
             s.key_bytes = key_bytes;
             s.accumulated.clear();
@@ -655,8 +689,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(spec))) => extract_iv_bytes(ctx, *spec),
                 _ => Vec::new(),
             };
+            let tkey = obj_key(ctx, this);
             with_table_write(|t| {
-                let s = t.entry(obj_key(this)).or_default();
+                let s = t.entry(tkey).or_default();
                 s.mode = mode;
                 s.key_bytes = key_bytes;
                 s.iv_bytes = iv_bytes;
@@ -680,8 +715,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(spec))) => extract_iv_bytes(ctx, *spec),
                 _ => Vec::new(),
             };
+            let tkey = obj_key(ctx, this);
             with_table_write(|t| {
-                let s = t.entry(obj_key(this)).or_default();
+                let s = t.entry(tkey).or_default();
                 s.mode = mode;
                 s.key_bytes = key_bytes;
                 s.iv_bytes = iv_bytes;
@@ -701,8 +737,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
             let key_bytes = extract_key_bytes(ctx, key);
+            let tkey = obj_key(ctx, this);
             with_table_write(|t| {
-                let s = t.entry(obj_key(this)).or_default();
+                let s = t.entry(tkey).or_default();
                 s.mode = mode;
                 s.key_bytes = key_bytes;
                 s.accumulated.clear();
@@ -716,8 +753,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(input))) = args.get(1) {
             let bytes = read_bytes(ctx, *input);
+            let tkey = obj_key(ctx, this);
             with_table_write(|t| {
-                if let Some(s) = t.get_mut(&obj_key(this)) {
+                if let Some(s) = t.get_mut(&tkey) {
                     s.accumulated.extend_from_slice(&bytes);
                 }
             });
@@ -730,8 +768,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(aad_input))) = args.get(1) {
             let bytes = read_bytes(ctx, *aad_input);
+            let tkey = obj_key(ctx, this);
             with_table_write(|t| {
-                if let Some(s) = t.get_mut(&obj_key(this)) {
+                if let Some(s) = t.get_mut(&tkey) {
                     s.aad.extend_from_slice(&bytes);
                 }
             });
@@ -743,8 +782,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(input))) = args.get(1) {
             let bytes = read_bytes(ctx, *input);
+            let tkey = obj_key(ctx, this);
             with_table_write(|t| {
-                if let Some(s) = t.get_mut(&obj_key(this)) {
+                if let Some(s) = t.get_mut(&tkey) {
                     s.accumulated.extend_from_slice(&bytes);
                 }
             });
@@ -763,8 +803,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            let tkey = obj_key(ctx, this);
             let algo = with_table_read(|t| {
-                t.get(&obj_key(this)).map(|s| s.algorithm.clone()).unwrap_or_default()
+                t.get(&tkey).map(|s| s.algorithm.clone()).unwrap_or_default()
             });
             let s = ctx.create_string(&algo);
             Ok(Some(Value::Object(Some(s))))
@@ -775,11 +816,12 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(16)))
     });
 
-    r.register(cipher, "getOutputSize", "(I)I", |_ctx, args| {
+    r.register(cipher, "getOutputSize", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let input_len = args[1].as_int().unwrap_or(0);
+        let tkey = obj_key(ctx, this);
         let (algo, mode) = with_table_read(|t| {
-            t.get(&obj_key(this))
+            t.get(&tkey)
                 .map(|s| (s.algorithm.clone(), s.mode))
                 .unwrap_or_default()
         });
@@ -798,8 +840,9 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
 
     r.register(cipher, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let tkey = obj_key(ctx, this);
         let iv_bytes = with_table_read(|t| {
-            t.get(&obj_key(this)).map(|s| s.iv_bytes.clone()).unwrap_or_default()
+            t.get(&tkey).map(|s| s.iv_bytes.clone()).unwrap_or_default()
         });
         if iv_bytes.is_empty() {
             return Ok(Some(Value::Object(None)));
