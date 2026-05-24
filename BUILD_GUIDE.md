@@ -45,6 +45,26 @@ cargo build --release --all-targets
 target/release/cratonvm    # or target/debug/cratonvm
 ```
 
+### Optional `java` binary alias
+
+By default, only the `cratonvm` binary is produced. To additionally
+build a `java[.exe]` launcher (same code, alias name — required by
+Maven Surefire's `-Djvm=...` path validation), enable the
+`java-bin-alias` feature on `cratonvm-cli`:
+
+```bash
+cargo build --release -p cratonvm-cli --features java-bin-alias
+# Produces both:
+#   target/release/cratonvm[.exe]
+#   target/release/java[.exe]
+```
+
+The alias is **off by default** so that `cargo install cratonvm-cli`
+does not drop a `java` binary into `~/.cargo/bin/` that would shadow
+the system JDK on the user's PATH. The helper scripts
+`scripts/sync-maven-java-shim.ps1` and `tools/sync-cratonvm-maven-jdk.ps1`
+both require this feature.
+
 **Build times:**
 - Clean build: ~60-120 seconds
 - Incremental: ~5-15 seconds

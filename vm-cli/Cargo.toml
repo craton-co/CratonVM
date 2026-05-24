@@ -14,11 +14,21 @@ readme = "README.md"
 name = "cratonvm"
 path = "src/main.rs"
 
-# Same launcher as `cratonvm`; built as `java.exe` so Maven Surefire's
-# `<jvm>` / `-Djvm=` validation (path must end with `java` / `java.exe`) accepts it.
+# Optional second bin built as `java[.exe]`, gated behind the
+# `java-bin-alias` cargo feature. Off by default so `cargo install
+# cratonvm-cli` does NOT drop a `java` binary into `~/.cargo/bin/`
+# that would shadow the system JDK launcher — a hard blocker for safe
+# crates.io distribution. Opt in with:
+#
+#     cargo build --release -p cratonvm-cli --features java-bin-alias
+#
+# Same launcher as `cratonvm`; the `java[.exe]` name is required by
+# Maven Surefire's `<jvm>` / `-Djvm=` validation (path must end with
+# `java` / `java.exe`), which is why the alias exists at all.
 [[bin]]
 name = "java"
 path = "src/main.rs"
+required-features = ["java-bin-alias"]
 
 [dependencies]
 cratonvm-vm = { path = "../vm" }
@@ -55,6 +65,12 @@ default = ["mimalloc"]
 # or macOS, but kept as a feature so musl / exotic targets can disable it
 # with `--no-default-features`.
 mimalloc = ["dep:mimalloc"]
+# Opt-in second binary named `java[.exe]` (same source as `cratonvm`).
+# Off by default to avoid shadowing the system JDK launcher when users
+# run `cargo install cratonvm-cli`. Enable when you need Maven Surefire
+# `-Djvm=...` compatibility (see the `[[bin]] name = "java"` block above
+# and `scripts/sync-maven-java-shim.ps1`).
+java-bin-alias = []
 # Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
 synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
 # Expose --gpu* flags and link cuda-bridge in stub mode. Probing the

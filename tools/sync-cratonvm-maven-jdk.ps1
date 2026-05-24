@@ -4,7 +4,9 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Src = Join-Path $Root 'target\release\java.exe'
 if (-not (Test-Path $Src)) {
-    Write-Error "Missing $Src - run: cargo build --release -p cratonvm-cli"
+    Write-Error ("Missing $Src - the `java.exe` alias is opt-in since the " +
+        "binary rename for crates.io safety. Build it with: " +
+        "cargo build --release -p cratonvm-cli --features java-bin-alias")
 }
 $Bin = Join-Path $Root 'target\cratonvm-mavenjdk\bin'
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null

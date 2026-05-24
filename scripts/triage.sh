@@ -3,7 +3,7 @@
 set +e
 ROOT="C:/craton/CratonVM"
 APPS="$ROOT/apps"
-J="$ROOT/target/release/java.exe"
+J="$ROOT/target/release/cratonvm.exe"
 TS=$(date +%H%M%S)
 LOG="$ROOT/applogs/triage-$TS"
 mkdir -p "$LOG"

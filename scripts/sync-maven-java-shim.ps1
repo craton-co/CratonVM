@@ -8,7 +8,9 @@ param(
 $ErrorActionPreference = "Stop"
 $src = Join-Path $WorkspaceRoot "target\$Profile\java.exe"
 if (-not (Test-Path $src)) {
-    throw "Missing '$src'. Build first: cargo build --$Profile -p cratonvm-cli"
+    throw "Missing '$src'. The `java.exe` binary is opt-in since the binary " +
+          "rename for crates.io safety. Build with the alias feature: " +
+          "cargo build --$Profile -p cratonvm-cli --features java-bin-alias"
 }
 $dstDir = Join-Path $WorkspaceRoot "target\cratonvm-maven-shim\bin"
 $dst = Join-Path $dstDir "java.exe"

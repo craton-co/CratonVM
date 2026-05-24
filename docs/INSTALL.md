@@ -45,6 +45,20 @@ cargo build --release -p cratonvm-cli
 The package is `cratonvm-cli` but the binary it produces is `cratonvm`, so the
 executable lands at `target/release/cratonvm` (or `cratonvm.exe` on Windows).
 
+### Optional `java` binary alias
+
+CratonVM intentionally does **not** install a `java` binary by default —
+that would shadow the system JDK launcher (`~/.cargo/bin/java` on the
+PATH is a footgun, and `cargo install cratonvm-cli` would silently
+replace your real `java`). If you need a `java[.exe]` launcher (e.g.
+for Maven Surefire's `-Djvm=...` validation which requires the binary
+basename to be `java`), opt in with the `java-bin-alias` feature:
+
+```bash
+cargo build --release -p cratonvm-cli --features java-bin-alias
+# now both target/release/cratonvm and target/release/java exist
+```
+
 See [BUILD_GUIDE.md](../BUILD_GUIDE.md) for detailed build instructions, testing, and benchmarking.
 
 ## Running Your First Program
