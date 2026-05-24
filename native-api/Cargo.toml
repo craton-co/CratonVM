@@ -10,6 +10,12 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# When enabled, exposes `test_mock::MockNativeContext` to downstream crates so
+# they can drive `NativeContext` trait default impls without standing up a
+# full VM. Auto-enabled inside this crate under `#[cfg(test)]`.
+test-mock = []
+
 [dependencies]
 cratonvm-types = { path = "../types" }
 parking_lot.workspace = true

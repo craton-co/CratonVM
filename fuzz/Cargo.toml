@@ -16,3 +16,9 @@ name = "fuzz_classfile"
 path = "fuzz_targets/fuzz_classfile.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "read_class"
+path = "fuzz_targets/read_class.rs"
+test = false
+doc = false
