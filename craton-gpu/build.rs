@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Build script for craton-gpu.
 //!
 //! Compiles the Java annotation source files under `src/main/java/`

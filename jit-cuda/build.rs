@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Compile GPU-offload Java fixtures with `javac` if it's on PATH.
 //!
 //! Mirrors `vm/build.rs`. Sources live in `../test_classes/gpu/`;
