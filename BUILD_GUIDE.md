@@ -6,7 +6,7 @@ CratonVM is a Java Virtual Machine written entirely in Rust with a custom x86-64
 
 **Project stats:**
 - **~323,000+ lines** of Rust across ~200+ files
-- 18 Cargo.toml files (17 workspace member crates + a `fuzz` libfuzzer harness): `reader`, `types`, `native-api`, `native-collections`, `native-io`, `native-builtins`, `native-awt`, `jit-api`, `jit`, `jit-cuda`, `cuda-bridge`, `craton-gpu`, `classloading`, `gc`, `vm`, `vm-cli`, `jfr` (plus the out-of-workspace `fuzz` harness)
+- 18 workspace member crates: `reader`, `types`, `native-api`, `native-collections`, `native-io`, `native-builtins`, `native-awt`, `jit-api`, `jit`, `jit-cuda`, `cuda-bridge`, `craton-gpu`, `classloading`, `gc`, `vm`, `vm-cli`, `jfr`, plus the `fuzz` libfuzzer harness
 - **6,000+ tests** passing, **0** clippy warnings
 - **~3,100+ native method** registrations
 - **~7,200 lines** of JIT compiler code (custom x86-64)
@@ -178,6 +178,7 @@ cratonvm/
       threading/
         jvm_thread.rs    # Per-thread state
   vm-cli/              # CLI entry point
+  fuzz/                # libfuzzer harness (nightly-only)
   bench/               # QuickBench.java and compiled .class
   test_classes/        # Test Java source + compiled .class
   demo/                # Demo programs

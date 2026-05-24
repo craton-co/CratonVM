@@ -197,7 +197,7 @@ cratonvm/
   jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
-  fuzz/                - libfuzzer harness (out-of-workspace, nightly-only)
+  fuzz/                - libfuzzer harness (workspace member, nightly-only)
 ```
 
 - **Bytecode interpreter** — fast-path dispatch with 140+ opcodes

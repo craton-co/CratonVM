@@ -95,5 +95,3 @@ mod tests {
         register_hbase_stubs(&mut r);
     }
 }
-
-// TODO(orchestrator): wire register_hbase_stubs() into lib.rs

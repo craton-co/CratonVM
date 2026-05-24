@@ -42,5 +42,3 @@ pub fn register_activemq_stubs(registry: &mut NativeMethodRegistry) {
     // failure surfaced, then dispatches follow-up fix agents.
     let _ = registry;
 }
-
-// TODO(orchestrator): wire register_activemq_stubs() in native-builtins/src/lib.rs

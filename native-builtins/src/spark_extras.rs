@@ -88,5 +88,3 @@ mod tests {
         register_spark_stubs(&mut r);
     }
 }
-
-// TODO(orchestrator): wire register_spark_stubs() into lib.rs

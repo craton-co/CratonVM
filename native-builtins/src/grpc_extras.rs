@@ -93,5 +93,3 @@ mod tests {
         register_grpc_stubs(&mut r);
     }
 }
-
-// TODO(orchestrator): wire register_grpc_stubs() into lib.rs

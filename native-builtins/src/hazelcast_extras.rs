@@ -84,5 +84,3 @@ mod tests {
         register_hazelcast_stubs(&mut r);
     }
 }
-
-// TODO(orchestrator): wire register_hazelcast_stubs() into lib.rs

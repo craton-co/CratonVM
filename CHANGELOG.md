@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Unreleased (post-review-orchestrator)
+
+A cross-crate review-driven fix orchestrator landed 50+ commits across security, soundness, correctness, and OSS-distribution hygiene. Highlights:
+
+#### Security
+- JEP-290 `ObjectInputFilter` honored with `maxdepth`/`maxrefs`/`maxbytes`/`maxarray` caps (`native-builtins/src/object_input_filter.rs`).
+- JAR signer chain verified against the JCE/JDK trust store before classes load (`classloading/src/jar_signer.rs`).
+- Panama / FFI host calls gated behind `--enable-native-access`; unauthorized callers throw `IllegalCallerException` (`native-builtins/src/panama_*.rs`).
+- `ProcessBuilder.start` and Panama host calls now consult `SecurityManager.checkExec` (`native-builtins/src/process.rs`).
+- Test-only TLS certs and keys moved behind `cfg(test)` so they cannot ship in release artifacts (`native-builtins/src/tls_test_certs.rs`).
+- Outbound network calls (HTTP/Socket/URL) run through an SSRF policy hook with a per-connect timeout (`native-io/src/net.rs`).
+- `RandomAccessFile`, `WatchService`, and `ProcessBuilder` now route paths through `validate_path` before opening (`native-io/src/*`, `native-builtins/src/process.rs`).
+- New libfuzzer targets cover classfile reader, JImage parser, PKCS#12 keystore, and JAR signer (`fuzz/fuzz_targets/`).
+- `vm` identity-validates resolution-cache keys so a forged class identity cannot poison lookups (`vm/src/runtime/resolution_cache.rs`).
+- `vm` verifier-skip path is now gated on the bootstrap classloader identity, not just the loader pointer (`vm/src/runtime/verifier_gate.rs`).
+
+#### Soundness
+- SATB pre-barrier wired at remaining `aastore`/`putfield` sites plus a real stop-the-world for `newarray` (`vm/src/runtime/interpreter.rs`, `jit/src/runtime_helpers.rs`).
+- `gc` mutating heap entry points now require a `StopTheWorldToken` witness (`gc/src/lib.rs`).
+- Async-signal-safe SIGSEGV handler installed on Unix (no allocations, no locks) (`vm/src/runtime/signals.rs`).
+- AArch64 icache flush on Linux and FreeBSD after JIT code emission (`jit/src/aarch64/mod.rs`).
+- `vm` hot locks reordered through `OrderedMutex` matching `docs/lock-order.md` (`vm/src/lock_order.rs`).
+- JIT switch-target offsets are now overflow-checked; `try_patch` replaces panicking `patch_i32`/`patch_byte` (`jit/src/buffer.rs`).
+- `reader::ByteView::try_new` returns `Result` on overflow / misalignment instead of UB (`reader/src/byte_view.rs`).
+- `gc` bitmap clears use `AcqRel` ordering; the `SATB` write barrier is now part of the trait surface (`gc/src/g1.rs`).
+- `jfr::SpscEventRing::Drop` performs a bounded shutdown and releases pending payloads (`jfr/src/ring.rs`).
+
+#### Correctness
+- JFR field emit validates variant against declared type per event (`jfr/src/event.rs`).
+- Native collections rekey GC overlays on `identity_hash_code` so post-GC pointer remap keeps maps consistent (`native-collections/src/*`).
+- Blocking queue park / notify discipline cleaned up with read-locks instead of unsynchronized shared state (`native-collections/src/blocking_queue.rs`).
+- CUDA H2D → kernel → D2H now sequenced on the same stream; previous code raced (`cuda-bridge/src/stream.rs`).
+- `jit-api` exposes a `validate()` loop, `repr(C)` golden offsets, and a fixed `NUM_FIELDS` constant for ABI lock-in (`jit-api/src/lib.rs`).
+- `types::CompactValue::update_object_ptr` returns `Result`, and `as_long_unchecked` documents its lazy-decode invariant (`types/src/compact_value.rs`).
+- `native-builtins` `--enable-native-access` audit; Panama host calls check the caller module against the allow-list.
+- `reader` attribute shape validation propagates the signature depth-guard "sticky" flag (`reader/src/attribute.rs`).
+- `native-builtins` JCA crypto routes AES / AES-GCM through `aes` / `aes-gcm` RustCrypto (constant-time).
+- `vm-cli` rebuilt for HotSpot `-Xmx` / `-XX` parsing, `--nojit`, `String[] args` (`vm-cli/src/main.rs`).
+- `native-api::allocate` no longer leaks on the error path; `init_level` is monotonic; `tcp_available` no longer clobbers state (`native-api/src/lib.rs`).
+
+#### OSS / Distribution
+- `vm-cli` produces the `cratonvm` binary by default; the `java[.exe]` alias is opt-in via `--features java-bin-alias` so `cargo install` does not shadow a real JDK (`vm-cli/Cargo.toml`).
+- Added `SUPPORT.md`, `GOVERNANCE.md`, `MAINTAINERS.md`, `THIRD_PARTY_NOTICES.md`, `CITATION.cff`, and a GitHub issue-template config (top-level + `.github/`).
+- SPDX `Apache-2.0` headers on every Rust source file across the workspace.
+- MSRV bumped to 1.77 and synchronized across `README.md`, `BUILD_GUIDE.md`, `CONTRIBUTING.md`, and `docs/INSTALL.md`.
+- Workspace version raised to `0.3.0`; every inter-crate `path = "../<crate>"` declaration now carries `version = "0.3.0"` so `cargo publish --dry-run` accepts the manifest.
+- Per-crate `README.md` added for crates.io rendering (17 crates).
+- `fuzz/` is now a workspace member (still nightly-only; `publish = false`).
+- Workspace crate-count references aligned to 17 workspace members plus `fuzz` (18 total) in `README.md`, `ARCHITECTURE.md`, `BUILD_GUIDE.md`.
+- CI parked workflows reactivated with `clippy -D warnings` as a hard gate (`.github/workflows/ci.yml`).
+
+#### Known follow-ups
+- Re-enable JIT loop unrolling — previous byte-copy unrolling produced corrupt native code and was disabled (`jit/src/x64/unroll.rs`).
+- `zip` crate version drift: `native-io` is on `zip 2.x`, `native-builtins` still on `0.6` pending `SimpleFileOptions` migration (`Cargo.toml`, workspace `zip.workspace`).
+- Real-JDK boot via `java.base` JMOD remains opt-in; synthetic stubs cover the default path.
+- Concurrent GC marking is still serialized under STW; G1 / ZGC remain experimental.
+
 ## [0.3.0] - 2026-05-24
 
 ### Added

@@ -88,5 +88,3 @@ mod tests {
         register_flink_stubs(&mut r);
     }
 }
-
-// TODO(orchestrator): wire register_flink_stubs() into lib.rs

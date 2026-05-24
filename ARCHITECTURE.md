@@ -26,7 +26,7 @@ cratonvm/
   jfr/                 cratonvm-jfr                 Java Flight Recorder
   vm/                  cratonvm-vm                  VM runtime engine
   vm-cli/              cratonvm-cli                 CLI entry point
-  fuzz/                cratonvm-fuzz                libfuzzer harness (out-of-workspace, nightly-only)
+  fuzz/                cratonvm-fuzz                libfuzzer harness (workspace member, nightly-only)
 ```
 
 **Dependency flow:**

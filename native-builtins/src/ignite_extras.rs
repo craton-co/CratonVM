@@ -88,5 +88,3 @@ mod tests {
         register_ignite_stubs(&mut r);
     }
 }
-
-// TODO(orchestrator): wire register_ignite_stubs() into lib.rs

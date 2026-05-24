@@ -46,5 +46,3 @@ pub fn register_felix_stubs(registry: &mut NativeMethodRegistry) {
     // follow-up fix agents — not boot-test rc=0 short-circuits.
     let _ = registry;
 }
-
-// TODO(orchestrator): wire register_felix_stubs() in native-builtins/src/lib.rs
