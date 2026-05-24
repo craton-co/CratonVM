@@ -34,9 +34,22 @@
 //! the seed directly in field 0.  In real-JDK mode, however, `Random.seed`
 //! is a private `AtomicLong` and field 0 is its boxed reference — writing
 //! a `Long` into that slot would corrupt the object.  The side-table side-
-//! steps the question entirely: it keys on the object's pointer identity,
-//! works in both modes, and is cheap (single `RwLock<FxHashMap<usize,
-//! u64>>` lookup; no allocation per call).
+//! steps the question entirely: it keys on the object's identity hash code
+//! (GC-stable across compaction — see `gc/src/compact_header.rs`'s
+//! `HashCodeTable::update_after_gc`), works in both modes, and is cheap
+//! (single `RwLock<FxHashMap<i32, u64>>` lookup; no allocation per call).
+//!
+//! Bug C12 (Round-9): previously this table was keyed on
+//! `ObjectRef::as_ptr() as usize`, which silently corrupted any `Random`
+//! that survived a GC compaction — the relocated object's pointer no
+//! longer matched the stored row, so `lcg_next` fell into the
+//! "no stored seed → install OS entropy" lazy-init branch and returned a
+//! totally different deterministic stream even though `setSeed()` was
+//! never called.  That broke the JDK contract
+//! (`new Random(s).nextLong()` must replay identically for the same `s`).
+//! Switching to `NativeContext::identity_hash_code(obj)` makes the key
+//! GC-stable; the same pattern is used by `VH_META_TABLE` in
+//! `lang_invoke.rs`.
 //!
 //! Memory note: the side-table grows monotonically until VM shutdown.
 //! Random instances are usually long-lived (or small in count) so this is
@@ -161,25 +174,33 @@ fn scramble_seed(user_seed: i64) -> u64 {
     (user_seed as u64 ^ LCG_MULTIPLIER) & LCG_MASK
 }
 
-/// Process-wide map from object identity → 48-bit LCG seed.  We use
-/// the object's pointer (cast to `usize`) as the key because:
+/// Process-wide map from object identity → 48-bit LCG seed.  We key on
+/// the object's **identity hash code** rather than its raw heap pointer
+/// because:
 ///
-/// 1. `ObjectRef` is `Copy` and stable for the lifetime of the
-///    underlying object on our heap (the GC does not relocate
-///    in-place; it would tombstone+reallocate, and a tombstoned
-///    Random would be unreachable from Java anyway).
-/// 2. Using a hash on the pointer (rather than embedding state in the
-///    object's field 0) keeps the side-table independent of class
-///    layout, which differs between synthetic-jdk and real-JDK modes.
+/// 1. `NativeContext::identity_hash_code(obj)` is GC-stable: the GC's
+///    `HashCodeTable` (see `gc/src/compact_header.rs::HashCodeTable::
+///    update_after_gc`) is remapped during compaction, so the same
+///    `ObjectRef` keeps producing the same `i32` hash across all GC
+///    phases.  Using the raw pointer — what this code did before the
+///    Round-9 C12 fix — silently broke `new Random(seed).nextLong()`
+///    after any compaction because the post-move pointer no longer hit
+///    the seeded row.
+/// 2. Using the side-table at all (rather than embedding state in the
+///    object's field 0) keeps the layout independent of class layout,
+///    which differs between synthetic-jdk and real-JDK modes.
 ///
 /// The lock is a parking-lot `RwLock` so that concurrent reads (the
 /// common case — many threads each holding their own Random) do not
 /// serialize on the table; mutations only happen on
 /// `<init>` / `setSeed` / inside `lcg_next`, which all need exclusive
 /// access for the read-modify-write step.
-static SEED_TABLE: RwLock<Option<FxHashMap<usize, u64>>> = RwLock::new(None);
+///
+/// See `native-builtins/src/lang_invoke.rs::VH_META_TABLE` for the
+/// canonical example of this pattern.
+static SEED_TABLE: RwLock<Option<FxHashMap<i32, u64>>> = RwLock::new(None);
 
-fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, u64>) -> R) -> R {
+fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<i32, u64>) -> R) -> R {
     // Round-9 MED-3: parking_lot — no poison handling.
     let mut g = SEED_TABLE.write();
     if g.is_none() {
@@ -188,16 +209,26 @@ fn with_table_write<R>(f: impl FnOnce(&mut FxHashMap<usize, u64>) -> R) -> R {
     f(g.as_mut().expect("table just initialized"))
 }
 
-fn obj_key(obj: ObjectRef) -> usize {
-    obj.as_ptr() as usize
+/// GC-stable key for a `Random` instance.  Round-9 C12 fix: was
+/// `obj.as_ptr() as usize`, which broke after the GC relocated the
+/// `Random`.  `identity_hash_code` is preserved across compaction by
+/// `HashCodeTable::update_after_gc`.
+///
+/// Takes `&mut dyn NativeContext` to match the `VH_META_TABLE` pattern
+/// in `lang_invoke.rs` (and to satisfy callers that hold a mutable
+/// reference — the `&mut` reborrows to `&self` at the trait-method call
+/// site, but exposing `&mut` here avoids reborrow churn at every site).
+fn obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
+    ctx.identity_hash_code(obj)
 }
 
 /// Install the user's seed for this object.  Used by both the seeded
 /// constructor and `setSeed`.
-fn set_seed(obj: ObjectRef, user_seed: i64) {
+fn set_seed(ctx: &mut dyn NativeContext, obj: ObjectRef, user_seed: i64) {
     let scrambled = scramble_seed(user_seed);
+    let key = obj_key(ctx, obj);
     with_table_write(|t| {
-        t.insert(obj_key(obj), scrambled);
+        t.insert(key, scrambled);
     });
 }
 
@@ -205,7 +236,7 @@ fn set_seed(obj: ObjectRef, user_seed: i64) {
 /// no-arg constructor.  We use an OS entropy draw (or a system-time
 /// fallback) so each unseeded `new Random()` produces a distinct
 /// sequence, just like the JDK.
-fn set_entropy_seed(obj: ObjectRef) {
+fn set_entropy_seed(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     let user_seed = os_random_u64()
         .map(|u| u as i64)
         .unwrap_or_else(|| {
@@ -220,7 +251,7 @@ fn set_entropy_seed(obj: ObjectRef) {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             nanos.wrapping_mul(0x9E3779B97F4A7C15u64 as i64).wrapping_add(counter as i64)
         });
-    set_seed(obj, user_seed);
+    set_seed(ctx, obj, user_seed);
 }
 
 static ENTROPY_FALLBACK_COUNTER: std::sync::atomic::AtomicI64 =
@@ -238,8 +269,8 @@ static ENTROPY_FALLBACK_COUNTER: std::sync::atomic::AtomicI64 =
 /// the contract.  If the object has no stored seed yet (e.g. the
 /// constructor was missed), we lazily install an entropy seed so we
 /// never return zero/predictable output.
-fn lcg_next(obj: ObjectRef, bits: u32) -> i32 {
-    let key = obj_key(obj);
+fn lcg_next(ctx: &mut dyn NativeContext, obj: ObjectRef, bits: u32) -> i32 {
+    let key = obj_key(ctx, obj);
     let new_seed = with_table_write(|t| {
         let old = match t.get(&key) {
             Some(s) => *s,
@@ -274,17 +305,17 @@ fn lcg_next(obj: ObjectRef, bits: u32) -> i32 {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn native_random_init_noseed(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
-        set_entropy_seed(*this);
+        set_entropy_seed(ctx, *this);
     }
     Ok(None)
 }
 
 pub(crate) fn native_random_init_seed(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -295,12 +326,12 @@ pub(crate) fn native_random_init_seed(
         Some(Value::Long(s)) => *s,
         _ => 0,
     };
-    set_seed(this, seed);
+    set_seed(ctx, this, seed);
     Ok(None)
 }
 
 pub(crate) fn native_random_set_seed(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -311,23 +342,23 @@ pub(crate) fn native_random_set_seed(
         Some(Value::Long(s)) => *s,
         _ => 0,
     };
-    set_seed(this, seed);
+    set_seed(ctx, this, seed);
     Ok(None)
 }
 
 pub(crate) fn native_random_next_int(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(lcg_next(this, 32))))
+    Ok(Some(Value::Int(lcg_next(ctx, this, 32))))
 }
 
 pub(crate) fn native_random_next_int_bound(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -345,7 +376,7 @@ pub(crate) fn native_random_next_int_bound(
         .into());
     }
     let m = bound - 1;
-    let mut r = lcg_next(this, 31);
+    let mut r = lcg_next(ctx, this, 31);
     if (bound & m) == 0 {
         // Power-of-two fast path — JDK formula.
         r = ((bound as i64).wrapping_mul(r as i64) >> 31) as i32;
@@ -359,14 +390,14 @@ pub(crate) fn native_random_next_int_bound(
                 r = candidate;
                 break;
             }
-            r = lcg_next(this, 31);
+            r = lcg_next(ctx, this, 31);
         }
     }
     Ok(Some(Value::Int(r)))
 }
 
 pub(crate) fn native_random_next_long(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -376,13 +407,13 @@ pub(crate) fn native_random_next_long(
     // JDK's nextLong is `((long)next(32) << 32) + next(32)`.  We
     // sign-extend each i32 to i64 first to keep the high half wider
     // than 32 bits, exactly matching the JDK output bit-for-bit.
-    let hi = lcg_next(this, 32) as i64;
-    let lo = lcg_next(this, 32) as i64;
+    let hi = lcg_next(ctx, this, 32) as i64;
+    let lo = lcg_next(ctx, this, 32) as i64;
     Ok(Some(Value::Long((hi << 32).wrapping_add(lo))))
 }
 
 pub(crate) fn native_random_next_double(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -390,14 +421,14 @@ pub(crate) fn native_random_next_double(
         _ => return Ok(Some(Value::Double(0.0))),
     };
     // JDK formula: `(((long)next(26) << 27) + next(27)) / (double)(1L << 53)`.
-    let hi = (lcg_next(this, 26) as i64) << 27;
-    let lo = lcg_next(this, 27) as i64;
+    let hi = (lcg_next(ctx, this, 26) as i64) << 27;
+    let lo = lcg_next(ctx, this, 27) as i64;
     let v = (hi + lo) as f64 / ((1i64 << 53) as f64);
     Ok(Some(Value::Double(v)))
 }
 
 pub(crate) fn native_random_next_float(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -405,23 +436,23 @@ pub(crate) fn native_random_next_float(
         _ => return Ok(Some(Value::Float(0.0))),
     };
     // JDK: `next(24) / (float)(1 << 24)`.
-    let v = lcg_next(this, 24) as f32 / ((1i32 << 24) as f32);
+    let v = lcg_next(ctx, this, 24) as f32 / ((1i32 << 24) as f32);
     Ok(Some(Value::Float(v)))
 }
 
 pub(crate) fn native_random_next_boolean(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(lcg_next(this, 1))))
+    Ok(Some(Value::Int(lcg_next(ctx, this, 1))))
 }
 
 pub(crate) fn native_random_next_bytes(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -432,18 +463,18 @@ pub(crate) fn native_random_next_bytes(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let len = _ctx.array_length(arr);
+    let len = ctx.array_length(arr);
     // JDK fills 4 bytes per LCG draw; we replicate that exactly so the
     // produced byte sequence matches `new Random(seed).nextBytes(buf)`.
     let mut i = 0usize;
     while i < len {
-        let mut rnd = lcg_next(this, 32) as i32;
+        let mut rnd = lcg_next(ctx, this, 32) as i32;
         let n = std::cmp::min(len - i, 4);
         for _ in 0..n {
             // Sign-extend low 8 bits to i32 so the array stores the
             // canonical Java byte (signed 8-bit).
             let b = (rnd & 0xFF) as i8 as i32;
-            _ctx.set_array_element(arr, i, Value::Int(b));
+            ctx.set_array_element(arr, i, Value::Int(b));
             rnd >>= 8;
             i += 1;
         }
@@ -452,7 +483,7 @@ pub(crate) fn native_random_next_bytes(
 }
 
 pub(crate) fn native_random_next_gaussian(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
@@ -469,11 +500,11 @@ pub(crate) fn native_random_next_gaussian(
     // P(reject) per pair ≈ 1 - π/4 ≈ 0.215, so 64 retries is well
     // under 2^-32 failure probability.
     for _ in 0..64 {
-        let h1 = (lcg_next(this, 26) as i64) << 27;
-        let l1 = lcg_next(this, 27) as i64;
+        let h1 = (lcg_next(ctx, this, 26) as i64) << 27;
+        let l1 = lcg_next(ctx, this, 27) as i64;
         let v1 = 2.0 * ((h1 + l1) as f64 / ((1i64 << 53) as f64)) - 1.0;
-        let h2 = (lcg_next(this, 26) as i64) << 27;
-        let l2 = lcg_next(this, 27) as i64;
+        let h2 = (lcg_next(ctx, this, 26) as i64) << 27;
+        let l2 = lcg_next(ctx, this, 27) as i64;
         let v2 = 2.0 * ((h2 + l2) as f64 / ((1i64 << 53) as f64)) - 1.0;
         let s = v1 * v1 + v2 * v2;
         if s < 1.0 && s != 0.0 {
@@ -848,19 +879,22 @@ mod tests {
     #[test]
     fn test_seed_table_distinct_keys() {
         // Two keys → two independent seed streams.  We model the keys
-        // as raw usize values to avoid needing a real ObjectRef.
+        // as raw `i32` values (the GC-stable identity hash code type)
+        // to avoid needing a real ObjectRef + NativeContext.
+        const KEY_A: i32 = 0x4A4A_4A4A; // distinct, unlikely to collide
+        const KEY_B: i32 = 0x4B4B_4B4B;
         with_table_write(|t| {
-            t.insert(0xAAAA, scramble_seed(1));
-            t.insert(0xBBBB, scramble_seed(2));
+            t.insert(KEY_A, scramble_seed(1));
+            t.insert(KEY_B, scramble_seed(2));
         });
         // Read them back.
         with_table_write(|t| {
-            assert_eq!(t.get(&0xAAAA), Some(&scramble_seed(1)));
-            assert_eq!(t.get(&0xBBBB), Some(&scramble_seed(2)));
-            assert_ne!(t.get(&0xAAAA), t.get(&0xBBBB));
+            assert_eq!(t.get(&KEY_A), Some(&scramble_seed(1)));
+            assert_eq!(t.get(&KEY_B), Some(&scramble_seed(2)));
+            assert_ne!(t.get(&KEY_A), t.get(&KEY_B));
             // Cleanup so other tests aren't polluted.
-            t.remove(&0xAAAA);
-            t.remove(&0xBBBB);
+            t.remove(&KEY_A);
+            t.remove(&KEY_B);
         });
     }
 }
