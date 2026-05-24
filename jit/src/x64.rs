@@ -4460,14 +4460,22 @@ impl Compiler {
 
             // .nan: XOR EAX, EAX
             let nan_off = self.buf.pos();
-            self.buf.patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JP rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
             self.buf.emit(&[0x31, 0xC0]);
 
             // .done:
             let done_off = self.buf.pos();
-            self.buf.patch_byte(jne_patch, (done_off - jne_patch - 1) as u8); // Cast: x86-64 immediate encoding
-            self.buf.patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8); // Cast: x86-64 immediate encoding
-            self.buf.patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JNE rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JBE rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JMP rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
         } else {
             // 64-bit: CMP RAX with 0x8000000000000000
             // MOV RCX, 0x8000000000000000
@@ -4513,14 +4521,22 @@ impl Compiler {
 
             // .nan: XOR RAX, RAX (48 31 C0)
             let nan_off = self.buf.pos();
-            self.buf.patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JP rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
             self.buf.emit(&[0x48, 0x31, 0xC0]);
 
             // .done:
             let done_off = self.buf.pos();
-            self.buf.patch_byte(jne_patch, (done_off - jne_patch - 1) as u8); // Cast: x86-64 immediate encoding
-            self.buf.patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8); // Cast: x86-64 immediate encoding
-            self.buf.patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JNE rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JBE rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
+            self.buf
+                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
+                .expect("emit_fp_to_int_nan_fixup: JMP rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
         }
     }
 
@@ -5945,7 +5961,9 @@ impl Compiler {
         let after_simd = self.buf.pos();
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         let pos = simd_skip_patch;
-        self.buf.patch_i32(pos, skip_rel);
+        self.buf
+            .try_patch_i32(pos, skip_rel)
+            .expect("emit_simd_int_array_sum: SIMD skip rel32 patch");
 
         // Now set up for scalar cleanup:
         // R10D needs to be updated to: old_i + num_simd_elements
@@ -5996,7 +6014,9 @@ impl Compiler {
         // Patch scalar end
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(scalar_end_patch, end_rel);
+        self.buf
+            .try_patch_i32(scalar_end_patch, end_rel)
+            .expect("emit_simd_int_array_sum: scalar-end rel32 patch");
     }
 
     /// Emit a vectorized double-array sum loop using AVX2 VADDPD.
@@ -6098,7 +6118,9 @@ impl Compiler {
         // Patch the skip jump target
         let after_simd = self.buf.pos();
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(simd_skip_patch, skip_rel);
+        self.buf
+            .try_patch_i32(simd_skip_patch, skip_rel)
+            .expect("emit_simd_fp_array_sum: SIMD skip rel32 patch");
 
         // --- Scalar cleanup loop ---
         let scalar_loop_start = self.buf.pos();
@@ -6132,7 +6154,9 @@ impl Compiler {
         // Patch scalar end
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(scalar_end_patch, end_rel);
+        self.buf
+            .try_patch_i32(scalar_end_patch, end_rel)
+            .expect("emit_simd_fp_array_sum: scalar-end rel32 patch");
     }
 
     // -----------------------------------------------------------------------
@@ -6455,7 +6479,9 @@ impl Compiler {
         // Patch skip-to-scalar target — when R8D == 0, jump here.
         let after_simd = self.buf.pos();
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(simd_skip_patch, skip_rel);
+        self.buf
+            .try_patch_i32(simd_skip_patch, skip_rel)
+            .expect("emit_simd_int_array_element_wise: SIMD skip rel32 patch");
 
         // --- Scalar remainder ---
         //
@@ -6511,7 +6537,9 @@ impl Compiler {
         // Patch scalar end.
         let scalar_end = self.buf.pos();
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(scalar_end_patch, end_rel);
+        self.buf
+            .try_patch_i32(scalar_end_patch, end_rel)
+            .expect("emit_simd_int_array_element_wise: scalar-end rel32 patch");
     }
 
     fn emit_prologue(&mut self) {
@@ -7087,7 +7115,9 @@ impl Compiler {
     /// current buffer position.
     fn patch_rel32_to_here(&mut self, patch: usize) {
         let rel = (self.buf.pos() as i32) - (patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(patch, rel);
+        self.buf
+            .try_patch_i32(patch, rel)
+            .expect("patch_rel32_to_here: rel32 patch out of bounds");
     }
 
     /// Emit the inline TLAB bump-pointer fast path for the `new` opcode
@@ -8341,10 +8371,14 @@ impl Compiler {
                 // Target not yet emitted (shouldn't happen for forward branches after full emission)
                 // Fall back: point to current position
                 let rel32 = (self.buf.pos() as i32) - (*patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf.patch_i32(*patch_off, rel32);
+                self.buf
+                    .try_patch_i32(*patch_off, rel32)
+                    .expect("try_emit_inline_body: forward branch rel32 patch (fallback)");
             } else {
                 let rel32 = (target_native as i32) - (*patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf.patch_i32(*patch_off, rel32);
+                self.buf
+                    .try_patch_i32(*patch_off, rel32)
+                    .expect("try_emit_inline_body: forward branch rel32 patch");
             }
         }
 
@@ -8434,7 +8468,9 @@ impl Compiler {
         // Patch JL to point here (start of left subtree)
         let left_start = self.buf.pos();
         let jl_rel = left_start as i32 - (jl_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-        self.buf.patch_i32(jl_patch, jl_rel);
+        self.buf
+            .try_patch_i32(jl_patch, jl_rel)
+            .expect("emit_binary_search_lookup: JL rel32 patch");
 
         // Left subtree
         self.emit_binary_search_lookup(left, default_target);
@@ -9021,8 +9057,12 @@ impl Compiler {
             (-128..=127).contains(&rel2),
             "emit_safe_idiv: JNE2 rel8 displacement {rel2} out of i8 range",
         );
-        self.buf.patch_byte(jne1_patch, rel1 as u8);
-        self.buf.patch_byte(jne2_patch, rel2 as u8);
+        self.buf
+            .try_patch_byte(jne1_patch, rel1 as u8)
+            .expect("emit_safe_idiv: JNE1 rel8 patch");
+        self.buf
+            .try_patch_byte(jne2_patch, rel2 as u8)
+            .expect("emit_safe_idiv: JNE2 rel8 patch");
 
         // Sign-extend RAX → RDX:RAX (or EAX → EDX:EAX), then IDIV.
         if is_64bit {
@@ -9061,7 +9101,9 @@ impl Compiler {
             (-128..=127).contains(&rel_jmp),
             "emit_safe_idiv: JMP rel8 displacement {rel_jmp} out of i8 range",
         );
-        self.buf.patch_byte(jmp_after_patch, rel_jmp as u8);
+        self.buf
+            .try_patch_byte(jmp_after_patch, rel_jmp as u8)
+            .expect("emit_safe_idiv: JMP after-div rel8 patch");
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
@@ -9112,7 +9154,9 @@ impl Compiler {
         // Patch all JAE branches to point to the shared stub
         for &patch_off in &self.bounds_check_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf.patch_i32(patch_off, rel32);
+            self.buf
+                .try_patch_i32(patch_off, rel32)
+                .expect("emit_bounds_check_stubs: JAE stub rel32 patch");
         }
     }
 
@@ -9182,7 +9226,9 @@ impl Compiler {
         // Patch every recorded JZ branch to point to the shared stub.
         for &patch_off in &self.null_check_store_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf.patch_i32(patch_off, rel32);
+            self.buf
+                .try_patch_i32(patch_off, rel32)
+                .expect("emit_null_check_store_stubs: JZ stub rel32 patch");
         }
     }
 
@@ -9247,7 +9293,9 @@ impl Compiler {
         // Patch every recorded JE branch to point to the shared stub.
         for &patch_off in &self.exception_check_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf.patch_i32(patch_off, rel32);
+            self.buf
+                .try_patch_i32(patch_off, rel32)
+                .expect("emit_exception_check_stub: JE stub rel32 patch");
         }
     }
 
@@ -9273,7 +9321,9 @@ impl Compiler {
             if let Some(&stub_off) = stub_offsets.get(&key) {
                 // Reuse existing stub
                 let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf.patch_i32(patch_off, rel32);
+                self.buf
+                    .try_patch_i32(patch_off, rel32)
+                    .expect("emit_deopt_stubs: reused stub rel32 patch");
                 continue;
             }
 
@@ -9325,7 +9375,9 @@ impl Compiler {
 
             // Patch the branch to point here
             let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf.patch_i32(patch_off, rel32);
+            self.buf
+                .try_patch_i32(patch_off, rel32)
+                .expect("emit_deopt_stubs: new stub rel32 patch");
         }
     }
 
@@ -11720,7 +11772,9 @@ impl Compiler {
                                                 let shifted_target = orig_target + shift;
                                                 let rel = shifted_target
                                                     - (shifted_po as i32 + 4); // Cast: x86-64 immediate encoding
-                                                self.buf.patch_i32(shifted_po, rel);
+                                                self.buf
+                                                    .try_patch_i32(shifted_po, rel)
+                                                    .expect("rel32 patch in unroll duplicator");
                                             }
                                         } else {
                                             // External: defer to normal resolution
@@ -12045,7 +12099,9 @@ impl Compiler {
                         // Patch LEA: disp32 = table_start - (lea_patch + 4)
                         let table_start = self.buf.pos();
                         let lea_rel = table_start as i32 - (lea_patch as i32 + 4); // Cast: x86-64 rel32 displacement
-                        self.buf.patch_i32(lea_patch, lea_rel);
+                        self.buf
+                            .try_patch_i32(lea_patch, lea_rel)
+                            .expect("tableswitch: LEA rel32 patch");
 
                         // Emit jump table: count entries, each i32 offset from table_start
                         for &target in &targets {
@@ -13598,7 +13654,9 @@ impl Compiler {
                                     (-128..=127).contains(&rel),
                                     "Arrays.equals intrinsic rel8 out of range: {rel}"
                                 );
-                                self.buf.patch_byte(patch, rel as u8);
+                                self.buf
+                                    .try_patch_byte(patch, rel as u8)
+                                    .expect("Arrays.equals intrinsic: rel8 patch");
                             }
 
                             // boolean result in RAX → operand stack.
@@ -14074,7 +14132,9 @@ impl Compiler {
                             // Patch: target = body_entry_offset
                             let rel = self.body_entry_offset as i32 - (jmp_offset as i32 + 4); // Cast: x86-64 rel32 displacement
                             let pos = self.buf.pos();
-                            self.buf.patch_i32(jmp_offset, rel);
+                            self.buf
+                                .try_patch_i32(jmp_offset, rel)
+                                .expect("self-recursion tail JMP rel32 patch");
                             let _ = pos;
 
                             // Skip the following xreturn — we already jumped
@@ -14333,7 +14393,9 @@ impl Compiler {
                                     let back = self.emit_jmp_rel32_patch();
                                     let rel = loop_top as i32
                                         - (back as i32 + 4);
-                                    self.buf.patch_i32(back, rel);
+                                    self.buf
+                                        .try_patch_i32(back, rel)
+                                        .expect("String.hashCode intrinsic: loop back-edge rel32 patch");
                                     self.patch_rel32_to_here(loop_done);
                                     self.patch_rel32_to_here(cached_done);
                                     // Result (EAX) is sign-extended on push.
@@ -14701,7 +14763,9 @@ impl Compiler {
                             self.buf.emit(&[0x41, 0xFF, 0xC0]);
                             let back = self.emit_jmp_rel32_patch();
                             let rel = loop_top as i32 - (back as i32 + 4);
-                            self.buf.patch_i32(back, rel);
+                            self.buf
+                                .try_patch_i32(back, rel)
+                                .expect("String.compareTo intrinsic: loop back-edge rel32 patch");
                             // loop_done: result = len1 - len2.
                             self.patch_rel32_to_here(loop_done);
                             self.emit_alu_r32_r32(0x89, RAX, R14); // MOV EAX,R14D
@@ -14796,7 +14860,9 @@ impl Compiler {
                             self.buf.emit(&[0xFF, 0xC2]);
                             let back = self.emit_jmp_rel32_patch();
                             let rel = loop_top as i32 - (back as i32 + 4);
-                            self.buf.patch_i32(back, rel);
+                            self.buf
+                                .try_patch_i32(back, rel)
+                                .expect("String.indexOf(char) intrinsic: loop back-edge rel32 patch");
                             // found: result = i.
                             self.patch_rel32_to_here(found);
                             self.emit_alu_r32_r32(0x89, RAX, RDX); // MOV EAX,EDX
@@ -14945,14 +15011,18 @@ impl Compiler {
                             let inner_back = self.emit_jmp_rel32_patch();
                             let rel =
                                 inner_top as i32 - (inner_back as i32 + 4);
-                            self.buf.patch_i32(inner_back, rel);
+                            self.buf
+                                .try_patch_i32(inner_back, rel)
+                                .expect("String.indexOf(String) intrinsic: inner-loop back-edge rel32 patch");
                             // inner_break: INC R8D ; JMP outer_top.
                             self.patch_rel32_to_here(inner_break);
                             self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D
                             let outer_back = self.emit_jmp_rel32_patch();
                             let rel =
                                 outer_top as i32 - (outer_back as i32 + 4);
-                            self.buf.patch_i32(outer_back, rel);
+                            self.buf
+                                .try_patch_i32(outer_back, rel)
+                                .expect("String.indexOf(String) intrinsic: outer-loop back-edge rel32 patch");
                             // match_found: result = i (R8D).
                             self.patch_rel32_to_here(match_found);
                             self.emit_alu_r32_r32(0x89, RAX, R8); // MOV EAX,R8D
@@ -15764,7 +15834,9 @@ impl Compiler {
                                         "inline PIC inter-slot jne overflowed rel8 ({} bytes)",
                                         rel
                                     );
-                                    self.buf.patch_byte(*jne_patch, rel as u8); // Cast: rel8 displacement
+                                    self.buf
+                                        .try_patch_byte(*jne_patch, rel as u8)
+                                        .expect("inline PIC: inter-slot JNE rel8 patch"); // Cast: rel8 displacement
                                 }
 
                                 // .miss: patch all `je needs_ctx → .miss`
@@ -15783,7 +15855,9 @@ impl Compiler {
                                         "inline PIC miss branch overflowed rel32 ({} bytes)",
                                         rel
                                     );
-                                    self.buf.patch_i32(*patch, rel as i32); // Cast: rel32 displacement
+                                    self.buf
+                                        .try_patch_i32(*patch, rel as i32)
+                                        .expect("inline PIC: miss-branch rel32 patch"); // Cast: rel32 displacement
                                 }
                                 // `miss_patches` (the legacy rel8 vector)
                                 // remains in scope for the MIC arm below;
@@ -15864,7 +15938,9 @@ impl Compiler {
                                         "inline MIC miss branch overflowed rel8 ({} bytes)",
                                         rel
                                     );
-                                    self.buf.patch_byte(*patch, rel as u8); // Cast: rel8 displacement
+                                    self.buf
+                                        .try_patch_byte(*patch, rel as u8)
+                                        .expect("inline MIC: miss-branch rel8 patch"); // Cast: rel8 displacement
                                 }
                             }
 
@@ -15944,7 +16020,9 @@ impl Compiler {
                                     "inline MIC done jump overflowed rel8 ({} bytes)",
                                     rel
                                 );
-                                self.buf.patch_byte(patch, rel as u8); // Cast: rel8 displacement
+                                self.buf
+                                    .try_patch_byte(patch, rel as u8)
+                                    .expect("inline MIC: done-jump rel8 patch"); // Cast: rel8 displacement
                             }
                             for patch in &done_patches32 {
                                 // `patch` points at the start of the rel32
@@ -15958,7 +16036,9 @@ impl Compiler {
                                     "inline PIC done jump overflowed rel32 ({} bytes)",
                                     rel
                                 );
-                                self.buf.patch_i32(*patch, rel as i32); // Cast: rel32 displacement
+                                self.buf
+                                    .try_patch_i32(*patch, rel as i32)
+                                    .expect("inline PIC: done-jump rel32 patch"); // Cast: rel32 displacement
                             }
                             // T1.1.2 — every virtual/interface dispatch is
                             // a full safepoint: the callee may allocate,
@@ -16529,7 +16609,9 @@ impl Compiler {
             if target_native >= 0 {
                 // rel32 = target - (patch_offset + 4)
                 let rel = target_native - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf.patch_i32(patch_offset, rel);
+                self.buf
+                    .try_patch_i32(patch_offset, rel)
+                    .expect("patch_branches: forward-branch rel32 patch");
             }
         }
         // Patch jump table entries: each entry is an i32 offset from table_base to target
@@ -16541,7 +16623,9 @@ impl Compiler {
             };
             if target_native >= 0 {
                 let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
-                self.buf.patch_i32(entry_offset, rel);
+                self.buf
+                    .try_patch_i32(entry_offset, rel)
+                    .expect("patch_branches: jump-table entry rel32 patch");
             }
         }
     }
@@ -16550,7 +16634,9 @@ impl Compiler {
         for &patch_offset in &self.self_call_patches {
             // rel32 = entry - (patch_offset + 4)
             let rel = entry_offset as i32 - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf.patch_i32(patch_offset, rel);
+            self.buf
+                .try_patch_i32(patch_offset, rel)
+                .expect("patch_self_calls: self-call rel32 patch");
         }
     }
 }
