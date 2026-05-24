@@ -5391,7 +5391,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             // SATB barrier: log old array element before overwriting
             // Widening: index conversion
             if let Ok(old_elem) = shared.heap.get_array_element(array_ref, index as usize) {
@@ -5415,7 +5415,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
@@ -5432,7 +5432,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Long(v))
@@ -5444,7 +5444,7 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, || format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -6207,6 +6207,7 @@ fn execute_instruction(
             let field_name = resolve_field_name(shared, current_class_id, *index);
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
+                &shared.heap,
                 || format!(
                     "Cannot read field '{}' because the object is null",
                     field_name.as_deref().unwrap_or("?")
@@ -6418,6 +6419,7 @@ fn execute_instruction(
             let field_name = resolve_field_name(shared, current_class_id, *index);
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
+                &shared.heap,
                 || format!(
                     "Cannot write field '{}' because the object is null",
                     field_name.as_deref().unwrap_or("?")
@@ -6614,6 +6616,7 @@ fn execute_instruction(
             // S111r14 diag: print full Java stack trace on arraylength failure
             let arr_ref = match pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
+                &shared.heap,
                 || format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})"),
             ) {
                 Ok(r) => r,
@@ -7140,7 +7143,7 @@ fn execute_instruction(
                 let cls_ptr = cls as *const str;
                 let mth_ptr = mth as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
-                pop_object_ref_ctx_with(stack, || {
+                pop_object_ref_ctx_with(stack, &shared.heap, || {
                     // SAFETY: cls/mth originate from `frame_ref.inner`,
                     // which is not mutated by stack ops; the pointers are
                     // valid for the duration of the closure call.
@@ -7203,7 +7206,7 @@ fn execute_instruction(
                 let cls_ptr = frame_ref.class_name() as *const str;
                 let mth_ptr = frame_ref.method_name() as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
-                pop_object_ref_ctx_with(stack, || {
+                pop_object_ref_ctx_with(stack, &shared.heap, || {
                     // SAFETY: see Monitorenter — frame metadata is stable
                     // across the stack pop performed by `pop_object_ref_ctx_with`.
                     let cls = unsafe { &*cls_ptr };
@@ -15029,8 +15032,18 @@ fn pop_object_ref(stack: &mut crate::runtime::ValueStack) -> Result<ObjectRef, M
 /// that need a `format!`-built message — previously they paid the
 /// per-pop formatting cost on every reference-touching opcode even
 /// when the pop succeeded.
+///
+/// `heap` is required because Double/Long slots can carry smuggled
+/// `jobject` bit patterns (the JNI "long-as-jobject" pattern used by
+/// e.g. WildFly's jboss-modules bootloader). Without a heap-membership
+/// check, an honest `Value::Double` whose `to_bits()` value happens to
+/// satisfy the 8-aligned + <2^48 predicate would be coerced into a
+/// wild `ObjectRef` and dereferenced by the next GC scan or field
+/// access (C7). Mirrors the validation used by
+/// `value_stack::scan_object_refs` for the same smuggle path.
 fn pop_object_ref_ctx_with<F>(
     stack: &mut crate::runtime::ValueStack,
+    heap: &crate::memory::vm_heap::VmHeap,
     make_context: F,
 ) -> Result<ObjectRef, MethodCallFailed>
 where
@@ -15058,7 +15071,30 @@ where
                 }
                 .into())
             } else if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                Ok(unsafe { ObjectRef::from_raw(bits as usize as *mut u8) })
+                // C7 fix: alignment + 48-bit-range alone are NOT sufficient
+                // to prove a Double slot holds a smuggled jobject — an honest
+                // f64 (e.g. `f64::from_bits(0x800)`) can satisfy them too. Use
+                // `is_heap_addr` (the same loose arena+alignment check that
+                // `value_stack::scan_object_refs` uses for the JNI long-as-
+                // jobject smuggle pattern) to confirm the bits actually point
+                // into the managed heap before fabricating an `ObjectRef`.
+                if let Some(obj_ref) = heap.is_heap_addr(bits as usize) {
+                    // SAFETY: `is_heap_addr` returned `Some(ObjectRef)`,
+                    // meaning the address is within one of the GC's managed
+                    // arenas and 8-byte aligned. The returned `ObjectRef`
+                    // was constructed by the heap layer itself (not by us);
+                    // we forward it unchanged. The GC's MAX_SANE_OBJECT_SIZE
+                    // sanity guard in `forward_object` handles any residual
+                    // bogus root gracefully (over-retention only).
+                    Ok(obj_ref)
+                } else {
+                    Err(VmError::Internal {
+                        message: format!(
+                            "expected object reference, got double({d}) with non-heap bit pattern"
+                        ),
+                    }
+                    .into())
+                }
             } else {
                 Err(VmError::Internal {
                     message: format!("expected object reference, got double({d})"),
@@ -15069,7 +15105,27 @@ where
         Value::Long(l) => {
             let bits = l as u64;
             if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                Ok(unsafe { ObjectRef::from_raw(bits as usize as *mut u8) })
+                // C7 fix: see Double-arm comment above. The JNI long-as-
+                // jobject smuggle (WildFly jboss-modules bootloader) is
+                // preserved, but we now require the bits to land inside a
+                // managed-heap arena before we trust them as an `ObjectRef`.
+                if let Some(obj_ref) = heap.is_heap_addr(bits as usize) {
+                    // SAFETY: `is_heap_addr` returned `Some(ObjectRef)`,
+                    // meaning the address is within one of the GC's managed
+                    // arenas and 8-byte aligned. The returned `ObjectRef`
+                    // was constructed by the heap layer itself; we forward
+                    // it unchanged. The GC's MAX_SANE_OBJECT_SIZE sanity
+                    // guard in `forward_object` handles any residual bogus
+                    // root gracefully (over-retention only).
+                    Ok(obj_ref)
+                } else {
+                    Err(VmError::Internal {
+                        message: format!(
+                            "expected object reference, got long({l}) with non-heap bit pattern"
+                        ),
+                    }
+                    .into())
+                }
             } else {
                 Err(VmError::Internal {
                     message: format!("expected object reference, got long({l})"),
