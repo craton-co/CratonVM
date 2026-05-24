@@ -1,22 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JIT kill-switch end-to-end check.
 //!
-//! There is currently NO `--nojit` CLI flag on the cratonvm launcher
-//! (see `.claude/review-2026-05-24/vm-cli.md` §3 — "README inaccuracy"
-//! row: the README's "Command-Line Reference" table lists `--nojit` but
-//! `grep nojit vm-cli/src/main.rs` returns 0 hits). The interpreter
-//! does read the `CRATONVM_DISABLE_JIT` environment variable
-//! (`vm/src/runtime/env_cache.rs::disable_jit`), so this test verifies
-//! end-to-end that:
+//! The cratonvm launcher exposes a `--nojit` boolean flag (see
+//! `vm-cli/src/main.rs` — `Args.nojit` and the post-parse block that
+//! sets `CRATONVM_DISABLE_JIT=1` so the existing kill-switch in
+//! `vm/src/runtime/env_cache.rs::disable_jit` observes it on first
+//! read). This test verifies end-to-end that:
 //!
 //!   1. Setting `CRATONVM_DISABLE_JIT=1` on the spawned process is
-//!      honoured (HelloWorld still runs to a clean exit) — proving the
-//!      env-var path that the eventual `--nojit` flag will rewrite to.
-//!   2. The CURRENTLY-MISSING `--nojit` CLI flag is rejected by clap
-//!      with the expected `unexpected argument` error. This is a
-//!      regression marker: the day someone wires up `--nojit` to set
-//!      `CRATONVM_DISABLE_JIT=1`, the second test starts failing and
-//!      the first test should be extended to also assert behaviour via
-//!      the new flag.
+//!      honoured (HelloWorld still runs to a clean exit) — the env-var
+//!      path the `--nojit` flag itself rewrites to.
+//!   2. The `--nojit` CLI flag is accepted by clap and produces the
+//!      same end-to-end behaviour as the env var (HelloWorld runs to a
+//!      clean exit). This guards the post-parse `set_var` wiring in
+//!      `run()` from regression.
 
 mod common;
 
@@ -55,19 +54,22 @@ fn cratonvm_disable_jit_env_var_runs_helloworld() {
     );
 }
 
-/// Regression marker for the missing `--nojit` CLI flag. Today this
-/// test passes because clap rejects the flag; once `--nojit` is added
-/// to `Args` (mapped to `env::set_var("CRATONVM_DISABLE_JIT", "1")` at
-/// the top of `run()`), this test will start failing — that's the
-/// signal to extend `cratonvm_disable_jit_env_var_runs_helloworld`
-/// above to cover the flag path too, then delete this test.
+/// The `--nojit` CLI flag is accepted by clap and rewrites to the
+/// `CRATONVM_DISABLE_JIT=1` env var inside `run()` before any
+/// interpreter / JIT dispatcher reads `env_cache::disable_jit()`. End
+/// to end, an invocation with `--nojit` runs HelloWorld to a clean
+/// exit just like the env-var path above, and clap must not emit any
+/// "unexpected argument" diagnostic for the flag.
 #[test]
-fn nojit_cli_flag_currently_absent() {
+fn nojit_cli_flag_runs_helloworld() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     common::stage_class(tmp.path(), "HelloWorld");
 
     let mut cmd = common::cratonvm_cmd();
-    cmd.arg("--nojit")
+    // Scrub any ambient CRATONVM_DISABLE_JIT so this test only exercises
+    // the `--nojit` -> set_var path inside run(), not an inherited env.
+    cmd.env_remove("CRATONVM_DISABLE_JIT")
+        .arg("--nojit")
         .arg("--classpath")
         .arg(tmp.path())
         .arg("HelloWorld")
@@ -75,7 +77,14 @@ fn nojit_cli_flag_currently_absent() {
         .stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn cratonvm");
+    let mut stdout = String::new();
     let mut stderr = String::new();
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
     child
         .stderr
         .as_mut()
@@ -84,14 +93,17 @@ fn nojit_cli_flag_currently_absent() {
         .unwrap();
     let status = child.wait().expect("wait for cratonvm");
 
-    if status.success() {
-        panic!(
-            "`--nojit` is now accepted by clap; wire `cratonvm_disable_jit_env_var_runs_helloworld` \
-             to also assert via the flag and delete this regression-marker test."
-        );
-    }
     assert!(
-        stderr.contains("unexpected argument") || stderr.contains("--nojit"),
-        "expected clap to reject `--nojit`; stderr was {stderr:?}"
+        status.success(),
+        "cratonvm --nojit should be accepted and run to a clean exit; \
+         status={status:?}, stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should accept --nojit; stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("Hello, World!"),
+        "expected 'Hello, World!' in stdout, got {stdout:?}"
     );
 }
