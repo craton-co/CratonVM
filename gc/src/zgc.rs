@@ -654,6 +654,17 @@ impl ZgcCollector {
     }
 
     /// Concurrent tri-color mark: drain the mark stack.
+    ///
+    /// TODO(task #54, ZGC): unlike G1 (see `g1_concurrent.rs`), ZGC's
+    /// `concurrent_mark` currently runs synchronously on the caller's
+    /// thread. The G1 controller pattern (background `std::thread::spawn`
+    /// + `parking_lot::Condvar` shutdown) is intentionally narrow and
+    /// can be reused here once ZGC moves off the simulation to real
+    /// backing pages — at that point the mark_stack-drain loop below
+    /// belongs in a worker thread launched between `pause_mark_start`
+    /// (STW) and `pause_mark_end` (STW), with the load-barrier good-color
+    /// set serving the role G1's SATB queue plays as the mutator-side
+    /// concurrent-mark invariant.
     pub fn concurrent_mark(&mut self) {
         self.phase = ZgcPhase::ConcurrentMark;
         // In a real JVM we'd traverse the object graph here.

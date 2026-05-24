@@ -31,6 +31,7 @@ pub mod compact_header;
 pub mod compressed_oops;
 pub mod concurrent_mark;
 pub mod g1;
+pub mod g1_concurrent;
 pub mod gc;
 pub mod gen_heap;
 pub mod heap;
@@ -62,6 +63,7 @@ pub use compact_header::{CompactAllocator, CompactHeader, CompactHeaderSavingsRe
 pub use compressed_oops::{CompressedOop, CompressedOops, CompressedOopsMode, NarrowKlass};
 pub use concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState, ConcurrentMarker};
 pub use g1::{G1Collector, G1CollectionType, G1CollectorConfig};
+pub use g1_concurrent::{ConcurrentMarkController, ConcurrentMarkState};
 pub use gen_heap::{GenerationalHeap, HeapStats, HeapStatsSnapshot};
 pub use heap::{ArrayElementType, Heap, ObjectHeader, ObjectKind};
 pub use mark_bitmap::MarkBitmap;
