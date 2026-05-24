@@ -34,5 +34,12 @@ hashbrown = "0.14"
 # bytes feed straight into `ZipArchive::new(Cursor::new(bytes))`.
 memmap2 = "0.9"
 
+[dev-dependencies]
+# Used by `tests/wp_security_robustness.rs` to materialise synthetic JARs
+# and `.class` fixtures into a tempdir for the classloading hardening
+# tests (zip-slip, zip-bomb, bad magic, two-loader isolation, circular
+# hierarchy, redefine rollback).
+tempfile = "3"
+
 [lints]
 workspace = true
