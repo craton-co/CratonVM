@@ -409,10 +409,17 @@ impl Monitor {
         let mut state = self.state.lock();
         match state.owner {
             Some(owner) if owner == thread_id => {
-                // Defense-in-depth: a frame-unwind release racing a manual
-                // `monitorexit` could otherwise decrement an already-zero
-                // count, panicking in debug or wrapping to u32::MAX in
-                // release (permanently corrupting the monitor).
+                // B6: JVMS §6.5 monitorexit contract — if the entry count is
+                // already zero at the moment of the exit attempt, the calling
+                // thread does NOT logically own the monitor and must observe
+                // `IllegalMonitorStateException`. Check BEFORE the decrement
+                // so the failure mode is the spec-defined IMSE rather than a
+                // silent saturating wrap. The saturating-sub below becomes
+                // defense-in-depth against the same race (frame-unwind release
+                // racing a manual `monitorexit`) but no longer hides the bug.
+                if state.entry_count == 0 {
+                    return Err(MonitorError::NotOwner);
+                }
                 state.entry_count = state.entry_count.saturating_sub(1);
                 if state.entry_count == 0 {
                     state.owner = None;
