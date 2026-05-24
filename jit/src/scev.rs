@@ -245,6 +245,10 @@ pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
         0xA7 => 3,
         0xA8 => 3,
         0xA9 => 2,
+        // HIGH security fix: bound switch table size against adversarial
+        // overflow (see `x64::checked_tableswitch_count`). On overflow / cap
+        // exceeded we return 1 — a safe PC advance; the JIT entry point
+        // re-validates and bails the whole compile.
         0xAA => {
             let pad = (4 - ((pc + 1) % 4)) % 4;
             let table = pc + 1 + pad;
@@ -257,18 +261,34 @@ pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
                 code[table + 8], code[table + 9],
                 code[table + 10], code[table + 11],
             ]);
-            let n = (high as i64 - low as i64 + 1).max(0) as usize;
-            1 + pad + 12 + n * 4
+            let n = match crate::x64::checked_tableswitch_count(low, high) {
+                Some(c) => c,
+                None => return 1,
+            };
+            match n.checked_mul(4).and_then(|x| x.checked_add(1 + pad + 12)) {
+                Some(len) => len,
+                None => 1,
+            }
         }
         0xAB => {
             let pad = (4 - ((pc + 1) % 4)) % 4;
             let table = pc + 1 + pad;
             if table + 8 > code_len { return 1; }
-            let npairs = u32::from_be_bytes([
+            // Read as i32 first to detect negative values explicitly; the
+            // historical `u32` cast silently accepted huge "negative"
+            // npairs and let them propagate into address arithmetic.
+            let npairs_raw = i32::from_be_bytes([
                 code[table + 4], code[table + 5],
                 code[table + 6], code[table + 7],
-            ]) as usize;
-            1 + pad + 8 + npairs * 8
+            ]);
+            let npairs = match crate::x64::checked_lookupswitch_npairs(npairs_raw) {
+                Some(n) => n,
+                None => return 1,
+            };
+            match npairs.checked_mul(8).and_then(|x| x.checked_add(1 + pad + 8)) {
+                Some(len) => len,
+                None => 1,
+            }
         }
         0xAC..=0xB1 => 1,
         0xB2..=0xB8 => 3,

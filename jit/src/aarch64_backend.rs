@@ -1536,6 +1536,11 @@ impl Arm64Backend {
                 }
 
                 // -- tableswitch (0xaa) --
+                //
+                // HIGH security fix: same `checked_tableswitch_count` audit
+                // as the x64 path — reject adversarial overflow / oversize
+                // tables. Bail out by setting `success = false` so the
+                // ARM64 backend falls back to the interpreter.
                 0xaa => {
                     let index = self.pop_operand();
                     // Align to 4-byte boundary
@@ -1545,7 +1550,10 @@ impl Arm64Backend {
                     let low = i32::from_be_bytes([bytecode[pc+4], bytecode[pc+5], bytecode[pc+6], bytecode[pc+7]]);
                     let high = i32::from_be_bytes([bytecode[pc+8], bytecode[pc+9], bytecode[pc+10], bytecode[pc+11]]);
                     pc += 12;
-                    let count = (high - low + 1).max(0) as usize;
+                    let count = match super::x64::checked_tableswitch_count(low, high) {
+                        Some(n) => n,
+                        None => { success = false; break; }
+                    };
 
                     // Range check: if index < low || index > high → default
                     let default_target = (start_pc as i32 + default_off) as usize;
@@ -1583,12 +1591,19 @@ impl Arm64Backend {
                 }
 
                 // -- lookupswitch (0xab) --
+                //
+                // HIGH security fix: validate `npairs` via
+                // `checked_lookupswitch_npairs` (reject negative / oversize).
                 0xab => {
                     let key = self.pop_operand();
                     while pc % 4 != 0 { pc += 1; }
                     if pc + 8 > bytecode.len() { success = false; break; }
                     let default_off = i32::from_be_bytes([bytecode[pc], bytecode[pc+1], bytecode[pc+2], bytecode[pc+3]]);
-                    let npairs = i32::from_be_bytes([bytecode[pc+4], bytecode[pc+5], bytecode[pc+6], bytecode[pc+7]]) as usize;
+                    let npairs_raw = i32::from_be_bytes([bytecode[pc+4], bytecode[pc+5], bytecode[pc+6], bytecode[pc+7]]);
+                    let npairs = match super::x64::checked_lookupswitch_npairs(npairs_raw) {
+                        Some(n) => n,
+                        None => { success = false; break; }
+                    };
                     pc += 8;
 
                     let default_target = (start_pc as i32 + default_off) as usize;

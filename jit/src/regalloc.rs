@@ -23,6 +23,26 @@
 
 use super::x64::{LOCAL_REGS, LOCAL_XMMS};
 
+/// Conservative cap on `tableswitch` table size used by [`bc_len`].
+///
+/// JVM method code is at most 65535 bytes, which by itself caps a real
+/// `tableswitch` payload at ~16383 entries. We keep an explicit cap two
+/// orders of magnitude above that (consistent with `x64::MAX_TABLESWITCH_ENTRIES`)
+/// so that adversarial or truncated bytecode cannot trick `(high - low + 1)`
+/// into wrapping when cast to `usize`. On overflow / cap exceeded `bc_len`
+/// falls back to length 1, which is always safe: any further validation is
+/// the caller's responsibility (`jit_scan` / `compile_bytecode` reject the
+/// method outright at the same opcode).
+const MAX_TABLESWITCH_ENTRIES: usize = 1 << 24;
+
+/// Conservative cap on `lookupswitch` `npairs` used by [`bc_len`].
+///
+/// Same rationale as [`MAX_TABLESWITCH_ENTRIES`]. The JVM spec stores
+/// `npairs` as a signed `i32`; any negative value is rejected outright
+/// rather than reinterpreted as a huge `usize` (which previously caused
+/// out-of-bounds reads in liveness scanning).
+const MAX_LOOKUPSWITCH_NPAIRS: usize = 1 << 20;
+
 /// ARM64 callee-saved GPR registers for locals: X19-X28 (10 registers).
 pub const ARM64_LOCAL_GPRS: [u8; 10] = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
 
@@ -64,23 +84,53 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         0xbb => 3,
         0xc5 => 4,
         0xb9 => 5,
-        // tableswitch — variable length
+        // tableswitch — variable length.
+        //
+        // HIGH security fix: adversarial bytecode can craft `high < low - 1`
+        // such that `(high - low + 1)` either wraps (signed-overflow UB in
+        // debug, two's-complement wrap in release) or, after `.max(0) as usize`,
+        // becomes an enormous value that overflows subsequent address
+        // arithmetic. We compute the count with `checked_sub`/`checked_add`,
+        // clamp against `MAX_TABLESWITCH_ENTRIES`, and fall back to length 1
+        // on overflow — the caller (`jit_scan` / `compile_bytecode`) re-checks
+        // and bails the method out of JIT compilation.
         0xaa => {
             let mut p = pc + 1;
             while p % 4 != 0 { p += 1; }
             if p + 12 > code.len() { return 1; }
             let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
             let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            let count = (high - low + 1).max(0) as usize;
-            (p + 12 + count * 4) - pc
+            let count = match (high as i64).checked_sub(low as i64).and_then(|d| d.checked_add(1)) {
+                Some(n) if n >= 0 && (n as u64) <= MAX_TABLESWITCH_ENTRIES as u64 => n as usize,
+                _ => return 1, // overflow or cap exceeded — bail (caller will reject method)
+            };
+            // Saturate the address arithmetic too: a pathological but in-cap
+            // count multiplied by 4 still fits in u64, but using checked_*
+            // documents intent and protects future cap raises.
+            match count.checked_mul(4).and_then(|x| x.checked_add(p + 12)).and_then(|x| x.checked_sub(pc)) {
+                Some(len) => len,
+                None => 1,
+            }
         }
-        // lookupswitch — variable length
+        // lookupswitch — variable length.
+        //
+        // HIGH security fix: previously `npairs` was cast from `i32` directly
+        // to `usize`, so a negative `npairs` (e.g. `i32::MIN`) became a huge
+        // `usize` and the subsequent multiply/add produced wildly OOB
+        // pointers. Reject negative `npairs` and clamp positive values against
+        // `MAX_LOOKUPSWITCH_NPAIRS`; fall back to length 1 on violation.
         0xab => {
             let mut p = pc + 1;
             while p % 4 != 0 { p += 1; }
             if p + 8 > code.len() { return 1; }
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]) as usize;
-            (p + 8 + npairs * 8) - pc
+            let npairs_raw = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
+            if npairs_raw < 0 { return 1; }
+            let npairs = npairs_raw as usize;
+            if npairs > MAX_LOOKUPSWITCH_NPAIRS { return 1; }
+            match npairs.checked_mul(8).and_then(|x| x.checked_add(p + 8)).and_then(|x| x.checked_sub(pc)) {
+                Some(len) => len,
+                None => 1,
+            }
         }
         _ => 1,
     }
@@ -133,6 +183,10 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
     while p % 4 != 0 { p += 1; }
 
     match op {
+        // HIGH security fix: same overflow audit as `bc_len` above. The
+        // inner per-target loop already has a `code_len` bound, but if
+        // `count` is allowed to be `i32::MAX` (or wrap via signed overflow)
+        // we still spin billions of iterations, which is a DoS in itself.
         0xaa => {
             // tableswitch
             if p + 12 > code_len { return targets; }
@@ -144,7 +198,10 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
             }
             let low = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
             let high = i32::from_be_bytes([code[p+8], code[p+9], code[p+10], code[p+11]]);
-            let count = (high - low + 1).max(0) as usize;
+            let count = match (high as i64).checked_sub(low as i64).and_then(|d| d.checked_add(1)) {
+                Some(n) if n >= 0 && (n as u64) <= MAX_TABLESWITCH_ENTRIES as u64 => n as usize,
+                _ => return targets, // overflow / cap exceeded → no targets harvested
+            };
             p += 12;
             for _ in 0..count {
                 if p + 4 > code_len { break; }
@@ -162,7 +219,10 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
             if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
                 if t < code_len { targets.push(t); }
             }
-            let npairs = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]) as usize;
+            let npairs_raw = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
+            if npairs_raw < 0 { return targets; }
+            let npairs = npairs_raw as usize;
+            if npairs > MAX_LOOKUPSWITCH_NPAIRS { return targets; }
             p += 8;
             for _ in 0..npairs {
                 if p + 8 > code_len { break; }

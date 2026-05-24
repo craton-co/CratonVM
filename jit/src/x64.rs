@@ -115,6 +115,91 @@ const ARG_REGS: [u8; 4] = [RCX, RDX, R8, R9];
 const ARG_REGS: [u8; 6] = [RDI, RSI, RDX, RCX, R8, R9];
 
 // ---------------------------------------------------------------------------
+// Switch-lowering safety caps (HIGH security fix)
+// ---------------------------------------------------------------------------
+//
+// `tableswitch` / `lookupswitch` are the only bytecodes whose payload length
+// is determined by attacker-controlled integer fields (`low`, `high`,
+// `npairs`). Without explicit bounding, an adversarial classfile can craft:
+//
+//   * tableswitch with `high - low + 1` overflowing `i32` (e.g. `low = i32::MIN`,
+//     `high = i32::MAX`) — the previous `(high - low + 1).max(0) as usize`
+//     wrapped through signed overflow and, on release builds, produced a
+//     small positive `usize` that disagreed with the actual payload size,
+//     so subsequent PC advances stepped into unrelated bytecode and could
+//     also feed into address arithmetic during JIT lowering.
+//   * lookupswitch with negative `npairs` (e.g. `i32::MIN`) — the previous
+//     `i32 as usize` cast produced a huge value (~2^31) whose
+//     `* 8 + base` walked far past `code.len()`, causing out-of-bounds
+//     reads when the codegen tried to materialise the (key, target) pairs.
+//
+// Both inputs are rejected with explicit checked arithmetic and bounded
+// against the caps below. The caps are deliberately conservative — well
+// above any value seen in practice (the JVM method-size limit of 65535 bytes
+// already caps a real `tableswitch` payload at ~16383 entries) — but small
+// enough that no realistic bytecode is rejected.
+//
+// On overflow OR cap exceeded the JIT bails the method out of compilation
+// (`jit_scan` → `None`, `compile_bytecode` → `false`, `compile` → `None`).
+// The interpreter then runs the method untouched; no panic, no OOB read.
+
+/// Maximum number of `tableswitch` jump-table entries the JIT will lower.
+///
+/// The JVM spec limits a single method's `Code` attribute to 65535 bytes, so
+/// a real `tableswitch` payload cannot exceed ~16383 entries. The cap of
+/// 2^24 is two orders of magnitude above that — far enough that no honest
+/// bytecode triggers it, low enough that the resulting jump table
+/// (`count * 4` bytes) never overflows `usize` arithmetic on any supported
+/// platform.
+pub(crate) const MAX_TABLESWITCH_ENTRIES: usize = 1 << 24;
+
+/// Maximum number of `lookupswitch` `(match, offset)` pairs the JIT will lower.
+///
+/// Lower than `MAX_TABLESWITCH_ENTRIES` because each lookupswitch pair is
+/// 8 bytes (vs 4 for tableswitch) and the binary-search lowering visits each
+/// pair, so the practical realistic upper bound is much tighter.
+pub(crate) const MAX_LOOKUPSWITCH_NPAIRS: usize = 1 << 20;
+
+/// Compute the number of `tableswitch` jump-table entries from the raw
+/// `low`/`high` fields, with overflow and cap checks.
+///
+/// Returns `None` if the spec-required `high >= low - 1` invariant is
+/// violated, if `(high - low + 1)` overflows, or if the result exceeds
+/// [`MAX_TABLESWITCH_ENTRIES`]. Callers that hit `None` MUST refuse to
+/// JIT-compile the method (return `None` from `jit_scan`, `false` from
+/// `compile_bytecode`); falling back to the interpreter is always safe.
+#[inline]
+pub(crate) fn checked_tableswitch_count(low: i32, high: i32) -> Option<usize> {
+    let diff = (high as i64).checked_sub(low as i64)?;
+    let count = diff.checked_add(1)?;
+    if count < 0 {
+        return None;
+    }
+    let count = count as u64;
+    if count > MAX_TABLESWITCH_ENTRIES as u64 {
+        return None;
+    }
+    Some(count as usize)
+}
+
+/// Compute the validated `npairs` count for a `lookupswitch`, rejecting
+/// negative values (`i32::MIN` etc.) and any positive value above
+/// [`MAX_LOOKUPSWITCH_NPAIRS`].
+///
+/// Returns `None` on violation; callers MUST then refuse to JIT-compile.
+#[inline]
+pub(crate) fn checked_lookupswitch_npairs(npairs_raw: i32) -> Option<usize> {
+    if npairs_raw < 0 {
+        return None;
+    }
+    let npairs = npairs_raw as usize;
+    if npairs > MAX_LOOKUPSWITCH_NPAIRS {
+        return None;
+    }
+    Some(npairs)
+}
+
+// ---------------------------------------------------------------------------
 // AVX2 runtime detection via CPUID
 // ---------------------------------------------------------------------------
 
@@ -1221,7 +1306,13 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 needs_heap = true;
                 pc += 5;
             }
-            // tableswitch — accept in scanner, emit CMP chain in compiler
+            // tableswitch — accept in scanner, emit CMP chain in compiler.
+            //
+            // HIGH security fix: reject methods whose `(high - low + 1)`
+            // overflows `i32` or exceeds [`MAX_TABLESWITCH_ENTRIES`]. See the
+            // module-level commentary near `checked_tableswitch_count` for the
+            // full attack scenario. Returning `None` here lets the caller
+            // fall back to the interpreter — the JIT must NOT compile.
             0xaa => {
                 pc += 1;
                 while pc % 4 != 0 && pc < code_len {
@@ -1234,10 +1325,19 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                     i32::from_be_bytes([code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7]]);
                 let high =
                     i32::from_be_bytes([code[pc + 8], code[pc + 9], code[pc + 10], code[pc + 11]]);
-                let num_offsets = (high - low + 1).max(0) as usize; // Cast: address arithmetic
-                pc += 12 + num_offsets * 4;
+                let num_offsets = checked_tableswitch_count(low, high)?;
+                // checked_add on the PC advance: even with a capped count the
+                // sum must not overflow `usize` on 32-bit-pointer hosts.
+                let advance = 12usize
+                    .checked_add(num_offsets.checked_mul(4)?)?;
+                pc = pc.checked_add(advance)?;
             }
-            // lookupswitch — accept in scanner, emit CMP chain in compiler
+            // lookupswitch — accept in scanner, emit CMP chain in compiler.
+            //
+            // HIGH security fix: reject negative `npairs` (e.g. `i32::MIN`,
+            // which previously became a ~2^31 `usize` and walked the PC far
+            // past `code_len`) and any value above
+            // [`MAX_LOOKUPSWITCH_NPAIRS`]. See module-level commentary.
             0xab => {
                 pc += 1;
                 while pc % 4 != 0 && pc < code_len {
@@ -1248,11 +1348,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 }
                 let npairs_raw =
                     i32::from_be_bytes([code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7]]);
-                if npairs_raw < 0 {
-                    return None;
-                }
-                let npairs = npairs_raw as usize; // Cast: address arithmetic
-                pc += 8 + npairs * 8;
+                let npairs = checked_lookupswitch_npairs(npairs_raw)?;
+                let advance = 8usize.checked_add(npairs.checked_mul(8)?)?;
+                pc = pc.checked_add(advance)?;
             }
             // ldc — load int/float/string constant from CP (1-byte index)
             0x12 => {
@@ -1486,21 +1584,52 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         0xbb => 3, // new
         0xc5 => 4,
         0xb9 => 5, // invokeinterface: opcode, cp_hi, cp_lo, count, 0
-        // tableswitch — variable length
+        // tableswitch — variable length.
+        //
+        // HIGH security fix: use `checked_tableswitch_count` to reject
+        // adversarial `(high - low + 1)` overflow. On violation we return 1
+        // — the safe fallback that walks PC forward harmlessly; the caller
+        // (`compile_bytecode` / `jit_scan`) re-validates at the same opcode
+        // and aborts the JIT compile.
         0xaa => {
             let mut p = pc + 1;
             while p % 4 != 0 { p += 1; }
+            if p + 12 > code.len() { return 1; }
             let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
             let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            let count = (high - low + 1).max(0) as usize; // Cast: address arithmetic
-            (p + 12 + count * 4) - pc
+            let count = match checked_tableswitch_count(low, high) {
+                Some(n) => n,
+                None => return 1,
+            };
+            match count.checked_mul(4)
+                .and_then(|x| x.checked_add(p + 12))
+                .and_then(|x| x.checked_sub(pc))
+            {
+                Some(len) => len,
+                None => 1,
+            }
         }
-        // lookupswitch — variable length
+        // lookupswitch — variable length.
+        //
+        // HIGH security fix: previously cast `i32` to `usize` directly, so
+        // a negative `npairs` became a huge `usize`. Now validated via
+        // `checked_lookupswitch_npairs`; on violation return 1.
         0xab => {
             let mut p = pc + 1;
             while p % 4 != 0 { p += 1; }
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]) as usize; // Widening: always safe
-            (p + 8 + npairs * 8) - pc
+            if p + 8 > code.len() { return 1; }
+            let npairs_raw = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
+            let npairs = match checked_lookupswitch_npairs(npairs_raw) {
+                Some(n) => n,
+                None => return 1,
+            };
+            match npairs.checked_mul(8)
+                .and_then(|x| x.checked_add(p + 8))
+                .and_then(|x| x.checked_sub(pc))
+            {
+                Some(len) => len,
+                None => 1,
+            }
         }
         _ => 1,
     }
@@ -9448,7 +9577,9 @@ impl Compiler {
                             }
                         }
                     }
-                    // tableswitch
+                    // tableswitch — HIGH security fix: bound `cnt` via
+                    // `checked_tableswitch_count`. On overflow / cap exceeded
+                    // we abort the entire compile (interpreter handles it).
                     0xaa => {
                         let base = p;
                         let mut q = p + 1;
@@ -9460,7 +9591,10 @@ impl Compiler {
                             }
                             let low = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
                             let high = i32::from_be_bytes([code[q+8], code[q+9], code[q+10], code[q+11]]);
-                            let cnt = (high - low + 1).max(0) as usize; // Cast: address arithmetic
+                            let cnt = match checked_tableswitch_count(low, high) {
+                                Some(n) => n,
+                                None => return false, // adversarial range → bail
+                            };
                             q += 12;
                             for _ in 0..cnt {
                                 if q + 4 <= code_len {
@@ -9473,7 +9607,9 @@ impl Compiler {
                             }
                         }
                     }
-                    // lookupswitch
+                    // lookupswitch — HIGH security fix: bound `npairs` via
+                    // `checked_lookupswitch_npairs`. Negative or oversize
+                    // values cause a clean bail.
                     0xab => {
                         let base = p;
                         let mut q = p + 1;
@@ -9483,7 +9619,11 @@ impl Compiler {
                             if let Some(t) = base.checked_add_signed(def as isize) { // Cast: address arithmetic
                                 if t < code_len { branch_targets[t] = true; }
                             }
-                            let npairs = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]) as usize; // Widening: always safe
+                            let npairs_raw = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
+                            let npairs = match checked_lookupswitch_npairs(npairs_raw) {
+                                Some(n) => n,
+                                None => return false, // adversarial npairs → bail
+                            };
                             q += 8;
                             for _ in 0..npairs {
                                 if q + 8 <= code_len {
@@ -11591,7 +11731,14 @@ impl Compiler {
                     pc += 3;
                 }
 
-                // tableswitch — jump table for dense tables, CMP chain for small
+                // tableswitch — jump table for dense tables, CMP chain for small.
+                //
+                // HIGH security fix: validate the `(high - low + 1)` count
+                // with `checked_tableswitch_count` so we never lower a
+                // method whose range overflows `i32` (e.g. `low = i32::MIN`
+                // crafted with `high = i32::MAX`) or exceeds
+                // [`MAX_TABLESWITCH_ENTRIES`]. Return `false` to abort the
+                // compile and fall back to the interpreter.
                 0xaa => {
                     self.flush_scratch_registers();
                     self.pop_to_rax();
@@ -11614,7 +11761,10 @@ impl Compiler {
                         code[pc + 10],
                         code[pc + 11],
                     ]);
-                    let count = (high - low + 1).max(0) as usize; // Cast: address arithmetic
+                    let count = match checked_tableswitch_count(low, high) {
+                        Some(n) => n,
+                        None => return false,
+                    };
                     pc += 12;
 
                     // Collect all targets from the bytecode
@@ -11704,7 +11854,12 @@ impl Compiler {
                     dead = true;
                 }
 
-                // lookupswitch — CMP chain for small, binary search for large
+                // lookupswitch — CMP chain for small, binary search for large.
+                //
+                // HIGH security fix: validate `npairs` with
+                // `checked_lookupswitch_npairs` to reject negative values
+                // (e.g. `i32::MIN`, which previously cast directly to a huge
+                // `usize`) and anything above [`MAX_LOOKUPSWITCH_NPAIRS`].
                 0xab => {
                     self.flush_scratch_registers();
                     self.pop_to_rax();
@@ -11715,12 +11870,16 @@ impl Compiler {
                     }
                     let default_offset =
                         i32::from_be_bytes([code[pc], code[pc + 1], code[pc + 2], code[pc + 3]]);
-                    let npairs = i32::from_be_bytes([
+                    let npairs_raw = i32::from_be_bytes([
                         code[pc + 4],
                         code[pc + 5],
                         code[pc + 6],
                         code[pc + 7],
-                    ]) as usize; // Cast: address arithmetic
+                    ]);
+                    let npairs = match checked_lookupswitch_npairs(npairs_raw) {
+                        Some(n) => n,
+                        None => return false,
+                    };
                     pc += 8;
 
                     // Collect all (key, target) pairs
