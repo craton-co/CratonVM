@@ -70,40 +70,69 @@ const SIG_PRIVATE_SLOTS: usize = 5;
 // key id.  Real-JDK `Signature` is allocated against the loaded class whose
 // inherited layout makes raw-slot writes of `Value::Int` collide with
 // `Object`-typed slots (`engine`, `provider`, …), silently coercing reads to
-// `Object(None)`.  Side tables keyed on the `ObjectRef` receiver carry the
+// `Object(None)`.  Side tables keyed on the receiver's identity carry the
 // state reliably across `getInstance` → `init*` → `sign`/`verify`.
+//
+// C15 fix: keys are `i32` identity-hash-code, NOT `ObjectRef`.  `ObjectRef`'s
+// `Hash` impl hashes the raw pointer (`self.ptr.as_ptr() as usize`,
+// `types/src/value.rs`).  When the GC relocates a `Signature` instance during
+// compaction every entry becomes orphaned: `Signature.sign()` after GC then
+// reports `state == 0` (`UNINIT`) from the side-table miss and the fallback
+// slot read also returns `Object(None)`, throwing `IllegalStateException`.
+// `NativeContext::identity_hash_code` is GC-stable
+// (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`).  All
+// accessors therefore thread `&mut dyn NativeContext`.  Mirrors the pattern
+// from `lang_invoke::VH_META_TABLE` (`native-builtins/src/lang_invoke.rs`).
 // ---------------------------------------------------------------------------
 
 fn sig_algo_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
         OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 fn sig_state_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> =
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
         OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
 fn sig_keyid_table()
-    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, u64>> {
+    -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, u64>>> =
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, u64>>> =
         OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn set_sig_algo(this: ObjectRef, idx: i32) { sig_algo_table().lock().insert(this, idx); }
-fn get_sig_algo(this: ObjectRef) -> Option<i32> { sig_algo_table().lock().get(&this).copied() }
-fn set_sig_state(this: ObjectRef, st: i32) { sig_state_table().lock().insert(this, st); }
-fn get_sig_state(this: ObjectRef) -> Option<i32> { sig_state_table().lock().get(&this).copied() }
-fn set_sig_keyid(this: ObjectRef, kid: u64) { sig_keyid_table().lock().insert(this, kid); }
-fn get_sig_keyid(this: ObjectRef) -> Option<u64> { sig_keyid_table().lock().get(&this).copied() }
+fn set_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef, idx: i32) {
+    let key = ctx.identity_hash_code(this);
+    sig_algo_table().lock().insert(key, idx);
+}
+fn get_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let key = ctx.identity_hash_code(this);
+    sig_algo_table().lock().get(&key).copied()
+}
+fn set_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef, st: i32) {
+    let key = ctx.identity_hash_code(this);
+    sig_state_table().lock().insert(key, st);
+}
+fn get_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let key = ctx.identity_hash_code(this);
+    sig_state_table().lock().get(&key).copied()
+}
+fn set_sig_keyid(ctx: &mut dyn NativeContext, this: ObjectRef, kid: u64) {
+    let key = ctx.identity_hash_code(this);
+    sig_keyid_table().lock().insert(key, kid);
+}
+fn get_sig_keyid(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<u64> {
+    let key = ctx.identity_hash_code(this);
+    sig_keyid_table().lock().get(&key).copied()
+}
 
 const STATE_UNINIT: i32 = 0;
 const STATE_SIGN: i32 = 1;
@@ -207,7 +236,7 @@ fn sig_id(this: ObjectRef) -> u64 {
 }
 
 fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
-    if let Some(kid) = get_sig_keyid(this) {
+    if let Some(kid) = get_sig_keyid(ctx, this) {
         if kid != 0 {
             return kid;
         }
@@ -288,10 +317,11 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     );
     // SigProbe fix: side-table is the authoritative store; the base-offset
     // slot writes remain for any synthetic-mode caller that goes through
-    // slot indexing.
-    set_sig_algo(obj, idx);
-    set_sig_state(obj, STATE_UNINIT);
-    set_sig_keyid(obj, 0);
+    // slot indexing.  C15: keyed on identity hash code so GC compaction
+    // doesn't orphan the entries.
+    set_sig_algo(ctx, obj, idx);
+    set_sig_state(ctx, obj, STATE_UNINIT);
+    set_sig_keyid(ctx, obj, 0);
     let algo_str = ctx.create_string(&alg);
     ctx.set_field_by_name(obj, "algorithm", Value::Object(Some(algo_str)));
     ctx.set_field(obj, base + SIG_OFF_ALGO, Value::Int(idx));
@@ -305,12 +335,12 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    set_sig_state(this, STATE_SIGN);
+    set_sig_state(ctx, this, STATE_SIGN);
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_SIGN));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let kid = extract_key_id_from_key(ctx, *k);
-        set_sig_keyid(this, kid);
+        set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
     }
     crypto_impl::sig_data_clear(sig_id(this));
@@ -320,12 +350,12 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    set_sig_state(this, STATE_VERIFY);
+    set_sig_state(ctx, this, STATE_VERIFY);
     ctx.set_field(this, base + SIG_OFF_STATE, Value::Int(STATE_VERIFY));
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
     if let Some(Value::Object(Some(k))) = args.get(1) {
         let kid = extract_key_id_from_key(ctx, *k);
-        set_sig_keyid(this, kid);
+        set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
     }
     crypto_impl::sig_data_clear(sig_id(this));
@@ -375,23 +405,47 @@ fn sig_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(None)
 }
 
+/// C15: convert a missing side-table state lookup into a loud
+/// `IllegalStateException` instead of silently degrading to a slot-read
+/// that the real-JDK layout will return as `Object(None)`.  After the
+/// identity-hash-code key migration, a miss here means the receiver was
+/// either never produced by our `getInstance` or — pre-fix — was orphaned
+/// by GC compaction; either way, silently returning `STATE_UNINIT` masks
+/// the underlying defect.
+fn require_sig_state(ctx: &mut dyn NativeContext, this: ObjectRef)
+    -> Result<i32, cratonvm_types::error::MethodCallFailed>
+{
+    if let Some(st) = get_sig_state(ctx, this) {
+        return Ok(st);
+    }
+    Err(RuntimeError::IllegalStateException {
+        message: "Signature state missing post-GC or never initialized".into(),
+    }
+    .into())
+}
+
+fn require_sig_algo(ctx: &mut dyn NativeContext, this: ObjectRef)
+    -> Result<i32, cratonvm_types::error::MethodCallFailed>
+{
+    if let Some(a) = get_sig_algo(ctx, this) {
+        return Ok(a);
+    }
+    Err(RuntimeError::IllegalStateException {
+        message: "Signature state missing post-GC or never initialized".into(),
+    }
+    .into())
+}
+
 fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
-        Value::Int(n) => n,
-        _ => 0,
-    });
+    let state = require_sig_state(ctx, this)?;
     if state != STATE_SIGN {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for signing".into(),
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
-        Value::Int(n) => n,
-        _ => -1,
-    });
+    let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
 
@@ -402,21 +456,14 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
-        Value::Int(n) => n,
-        _ => 0,
-    });
+    let state = require_sig_state(ctx, this)?;
     if state != STATE_SIGN {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for signing".into(),
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
-        Value::Int(n) => n,
-        _ => -1,
-    });
+    let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
     let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
@@ -440,21 +487,14 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
-        Value::Int(n) => n,
-        _ => 0,
-    });
+    let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for verification".into(),
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
-        Value::Int(n) => n,
-        _ => -1,
-    });
+    let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
     let provided = match args.get(1) {
@@ -468,21 +508,14 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let state = get_sig_state(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_STATE) {
-        Value::Int(n) => n,
-        _ => 0,
-    });
+    let state = require_sig_state(ctx, this)?;
     if state != STATE_VERIFY {
         return Err(RuntimeError::IllegalStateException {
             message: "Signature object not initialized for verification".into(),
         }
         .into());
     }
-    let alg = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
-        Value::Int(n) => n,
-        _ => -1,
-    });
+    let alg = require_sig_algo(ctx, this)?;
     let key_id = key_id_of(ctx, this);
     let data = take_data(ctx, this);
 
@@ -504,8 +537,12 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn sig_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // `getAlgorithm()` is a benign accessor — keep the slot-read fallback
+    // so callers that only invoke it after a state-eroding bug elsewhere
+    // still get *some* answer instead of an exception cascade.  The loud
+    // error path is reserved for the cryptographic operations above.
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let idx = get_sig_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
+    let idx = get_sig_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + SIG_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     });
