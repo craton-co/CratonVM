@@ -49,57 +49,111 @@ use crate::{alloc_concurrent_synthetic, obj_arg};
 // insertProviderAt / removeProvider` persist for the lifetime of the VM.
 // ---------------------------------------------------------------------------
 
-fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64)>> {
+// C19: each seed-list entry carries a `coverage` description so callers
+// can tell, via `Provider.getInfo()`, what the provider actually backs.
+// "Unbacked" providers (no Service map registered) advertise:
+//   "coverage: none — placeholder provider for legacy app compatibility,
+//    no Service map registered"
+// so downstream `Provider.getService(...)` returning null isn't a mystery
+// when the diagnostic string is inspected.  Backed providers describe
+// the actual algorithm set wired through the rest of the `jca/` tree
+// (see `message_digest.rs`, `signature.rs`, `cipher.rs`).
+//
+// User-added providers (via `Security.addProvider` / `insertProviderAt`)
+// get `USER_PROVIDER_COVERAGE` since we don't introspect their Service
+// map — the caller furnished the Provider instance.
+const COVERAGE_UNBACKED: &str =
+    "coverage: none — placeholder provider for legacy app compatibility, no Service map registered";
+const COVERAGE_SUN: &str =
+    "coverage: MessageDigest{MD5,SHA-1,SHA-256,SHA-384,SHA-512,SHA3-256,SHA3-384,SHA3-512}, \
+     SecureRandom";
+const COVERAGE_SUN_RSA_SIGN: &str =
+    "coverage: KeyPairGenerator{RSA}, KeyFactory{RSA}, \
+     Signature{SHA1withRSA,SHA256withRSA,SHA384withRSA,SHA512withRSA}";
+const COVERAGE_SUN_JCE: &str =
+    "coverage: Cipher{AES (ECB/CBC/GCM, PKCS5Padding/NoPadding)} via in-tree AES/GCM \
+     (see jca/cipher.rs); KeyFactory{EC}, Signature{SHA256withECDSA,SHA384withECDSA,Ed25519}";
+const USER_PROVIDER_COVERAGE: &str =
+    "coverage: user-registered Provider — Service map (if any) supplied by caller";
+
+fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64, &'static str)>> {
     use std::sync::OnceLock;
-    static CHAIN: OnceLock<parking_lot::Mutex<Vec<(String, f64)>>> = OnceLock::new();
+    static CHAIN: OnceLock<parking_lot::Mutex<Vec<(String, f64, &'static str)>>> = OnceLock::new();
     CHAIN.get_or_init(|| {
         // Seed list — order, names, and version match the JDK 25.0.1
         // reference HotSpot output (captured via `Security.getProviders()`
         // on a stock install). Version 25.0 — formatted as "25" by
         // `getVersionStr()` to match HotSpot's `Provider.versionStr`.
+        //
+        // C19: third tuple field is the coverage disclosure string,
+        // surfaced through `Provider.getInfo()` and consulted by the
+        // `getService` debug-log path so an unbacked-provider lookup
+        // can be diagnosed without spelunking the source.
         parking_lot::Mutex::new(vec![
-            ("SUN".to_string(), 25.0),
-            ("SunRsaSign".to_string(), 25.0),
-            ("SunEC".to_string(), 25.0),
-            ("SunJSSE".to_string(), 25.0),
-            ("SunJCE".to_string(), 25.0),
-            ("SunJGSS".to_string(), 25.0),
-            ("SunSASL".to_string(), 25.0),
-            ("XMLDSig".to_string(), 25.0),
-            ("SunPCSC".to_string(), 25.0),
-            ("JdkLDAP".to_string(), 25.0),
-            ("JdkSASL".to_string(), 25.0),
-            ("SunMSCAPI".to_string(), 25.0),
-            ("SunPKCS11".to_string(), 25.0),
+            ("SUN".to_string(), 25.0, COVERAGE_SUN),
+            ("SunRsaSign".to_string(), 25.0, COVERAGE_SUN_RSA_SIGN),
+            // SunEC: the EC algorithm wiring lives in jca/signature.rs
+            // (ECDSA Signature, EC KeyFactory) but BouncyCastle's EC
+            // <clinit> shim above no-ops EC mapping under WildFly; mark
+            // as unbacked at the provider level since
+            // `getService("KeyPairGenerator","EC")` on the SunEC Provider
+            // returns null (entries land under "BC" only).
+            ("SunEC".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunJSSE".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunJCE".to_string(), 25.0, COVERAGE_SUN_JCE),
+            ("SunJGSS".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunSASL".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("XMLDSig".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunPCSC".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("JdkLDAP".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("JdkSASL".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunMSCAPI".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunPKCS11".to_string(), 25.0, COVERAGE_UNBACKED),
         ])
     })
 }
 
-fn snapshot() -> Vec<(String, f64)> {
+fn snapshot() -> Vec<(String, f64, &'static str)> {
     provider_chain().lock().clone()
 }
 
-fn find(name: &str) -> Option<f64> {
+fn find(name: &str) -> Option<(f64, &'static str)> {
     provider_chain()
         .lock()
         .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| *v)
+        .find(|(n, _, _)| n == name)
+        .map(|(_, v, c)| (*v, *c))
+}
+
+/// True if the named provider is in the seed list with coverage
+/// marked as unbacked. Used by `getService` to log a hint when a
+/// lookup hits a placeholder provider (which always returns null
+/// because no Service entries are ever registered to its name).
+///
+/// Compares coverage strings by value rather than pointer identity —
+/// `const &str` items in Rust are not guaranteed to share an address
+/// across uses, so `std::ptr::eq` would falsely report mismatches in
+/// release builds where the compiler may duplicate the data.
+fn is_unbacked_provider(name: &str) -> bool {
+    provider_chain()
+        .lock()
+        .iter()
+        .any(|(n, _, c)| n == name && *c == COVERAGE_UNBACKED)
 }
 
 fn add(name: String, ver: f64) -> i32 {
     let mut list = provider_chain().lock();
-    if let Some(idx) = list.iter().position(|(n, _)| *n == name) {
+    if let Some(idx) = list.iter().position(|(n, _, _)| *n == name) {
         list[idx].1 = ver;
         return (idx + 1) as i32;
     }
-    list.push((name, ver));
+    list.push((name, ver, USER_PROVIDER_COVERAGE));
     list.len() as i32
 }
 
 fn insert_at(name: String, ver: f64, pos: i32) -> i32 {
     let mut list = provider_chain().lock();
-    if let Some(idx) = list.iter().position(|(n, _)| *n == name) {
+    if let Some(idx) = list.iter().position(|(n, _, _)| *n == name) {
         return (idx + 1) as i32;
     }
     let target = if pos < 1 {
@@ -107,13 +161,13 @@ fn insert_at(name: String, ver: f64, pos: i32) -> i32 {
     } else {
         ((pos - 1) as usize).min(list.len())
     };
-    list.insert(target, (name, ver));
+    list.insert(target, (name, ver, USER_PROVIDER_COVERAGE));
     (target + 1) as i32
 }
 
 fn remove(name: &str) {
     let mut list = provider_chain().lock();
-    if let Some(idx) = list.iter().position(|(n, _)| n == name) {
+    if let Some(idx) = list.iter().position(|(n, _, _)| n == name) {
         list.remove(idx);
     }
 }
@@ -126,7 +180,12 @@ fn remove(name: &str) {
 /// numeric version. Used by every read-side path
 /// (`getProviders`, `getProvider`); we never cache `ObjectRef` values
 /// across callbacks so the heap is free to GC the previous instance.
-fn make_provider(ctx: &mut dyn NativeContext, name: &str, version: f64) -> ObjectRef {
+fn make_provider(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    version: f64,
+    coverage: &str,
+) -> ObjectRef {
     // `alloc_concurrent_synthetic` upsizes to the real-JDK field count
     // (Provider has > 10 instance fields counting inherited Properties
     // slots), so writing to slots 0/1/2 stays in bounds even when our
@@ -142,9 +201,16 @@ fn make_provider(ctx: &mut dyn NativeContext, name: &str, version: f64) -> Objec
     // Synthetic-mode allocations (where the class isn't loaded and
     // `set_field_by_name` is a no-op) still fall back to the slot-based
     // path below so existing fixtures keep working.
+    //
+    // C19: `info` carries the cratonvm coverage disclosure so
+    // `Provider.getInfo()` callers (logs, BC's `isFipsMode()` audit,
+    // diagnostic dumps) can see whether the named provider actually
+    // backs any algorithm — particularly important for unbacked
+    // entries like SunPKCS11 / SunMSCAPI / SunPCSC that look real but
+    // never resolve a Service.
     let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 8);
     let n = ctx.create_string(name);
-    let info_str = format!("{} security provider (cratonvm)", name);
+    let info_str = format!("{} security provider (cratonvm) — {}", name, coverage);
     let info = ctx.create_string(&info_str);
     let ver_str_text = if version.fract() == 0.0 {
         format!("{}", version as i64)
@@ -315,8 +381,8 @@ fn provider_get_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let chain = snapshot();
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, chain.len());
-    for (i, (name, ver)) in chain.iter().enumerate() {
-        let p = make_provider(ctx, name, *ver);
+    for (i, (name, ver, coverage)) in chain.iter().enumerate() {
+        let p = make_provider(ctx, name, *ver, coverage);
         ctx.set_array_element(arr, i, Value::Object(Some(p)));
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -328,8 +394,8 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => String::new(),
     };
     match find(&name_str) {
-        Some(ver) => {
-            let p = make_provider(ctx, &name_str, ver);
+        Some((ver, coverage)) => {
+            let p = make_provider(ctx, &name_str, ver, coverage);
             Ok(Some(Value::Object(Some(p))))
         }
         // JDK contract: return null for unknown name.
@@ -903,7 +969,29 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             let svc = make_service(ctx, &entry, this);
             Ok(Some(Value::Object(Some(svc))))
         }
-        None => Ok(Some(Value::Object(None))),
+        None => {
+            // C19: when a placeholder ("unbacked") provider is asked
+            // for a Service, log a debug breadcrumb. This is the most
+            // common cause of the "Cipher.getInstance throws deep
+            // NoSuchAlgorithmException" puzzle — the caller asked SUN /
+            // SunMSCAPI / SunPKCS11 / ... for an algorithm that we've
+            // never registered because the provider is purely an
+            // entry in the chain for legacy-app compatibility.
+            //
+            // Only fire when both type and algo are non-empty: empty
+            // strings reach here from `args` decoding fallbacks (null
+            // String arg etc.) and aren't a useful diagnostic signal.
+            if !type_str.is_empty() && !algo.is_empty() && is_unbacked_provider(&prov_name) {
+                tracing::debug!(
+                    provider = %prov_name,
+                    service_type = %type_str,
+                    algorithm = %algo,
+                    "Provider.getService on unbacked provider — no Service map registered \
+                     (placeholder entry for legacy app compatibility); lookup returns null"
+                );
+            }
+            Ok(Some(Value::Object(None)))
+        }
     }
 }
 
@@ -1089,12 +1177,74 @@ mod tests {
     fn seed_chain_has_thirteen_jdk25_providers() {
         let chain = snapshot();
         assert_eq!(chain.len(), 13);
-        let names: Vec<&str> = chain.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = chain.iter().map(|(n, _, _)| n.as_str()).collect();
         // Spot-check: SUN must be first, SunPKCS11 last, SunJCE in the middle.
         assert_eq!(names[0], "SUN");
         assert_eq!(names[12], "SunPKCS11");
         assert!(names.contains(&"SunJCE"));
         assert!(names.contains(&"SunEC"));
+    }
+
+    // -----------------------------------------------------------------
+    // C19 — coverage disclosure for unbacked providers.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn c19_seed_chain_marks_unbacked_providers() {
+        // The placeholder providers (SunPKCS11, SunMSCAPI, SunPCSC,
+        // JdkLDAP, JdkSASL, SunJGSS, SunSASL, XMLDSig, SunJSSE, SunEC)
+        // must all expose `COVERAGE_UNBACKED`. SUN, SunRsaSign, SunJCE
+        // expose backed-coverage strings.
+        for unbacked in [
+            "SunPKCS11",
+            "SunMSCAPI",
+            "SunPCSC",
+            "JdkLDAP",
+            "JdkSASL",
+            "SunJGSS",
+            "SunSASL",
+            "XMLDSig",
+            "SunJSSE",
+            "SunEC",
+        ] {
+            assert!(
+                is_unbacked_provider(unbacked),
+                "{unbacked} must be flagged as unbacked so getService can log a hint"
+            );
+            let (_, cov) = find(unbacked).expect("seed provider present");
+            assert_eq!(
+                cov, COVERAGE_UNBACKED,
+                "{unbacked} coverage string must be the canonical unbacked-disclosure constant"
+            );
+        }
+        for backed in ["SUN", "SunRsaSign", "SunJCE"] {
+            assert!(
+                !is_unbacked_provider(backed),
+                "{backed} backs at least one algorithm and must not be flagged unbacked"
+            );
+            let (_, cov) = find(backed).expect("seed provider present");
+            assert!(
+                cov.starts_with("coverage: ") && cov != COVERAGE_UNBACKED,
+                "{backed} coverage must describe what is actually wired, got: {cov}"
+            );
+        }
+    }
+
+    #[test]
+    fn c19_user_added_provider_carries_user_coverage_string() {
+        // `Security.addProvider(...)` lands here; we don't introspect
+        // the caller's Service map, so the disclosure says exactly that.
+        let name = format!("__jca_test_user_cov_{}", std::process::id());
+        let pos = add(name.clone(), 7.5);
+        assert!(pos >= 1);
+        let (ver, cov) = find(&name).expect("user-added provider visible to find()");
+        assert_eq!(ver, 7.5);
+        assert_eq!(cov, USER_PROVIDER_COVERAGE);
+        // User-added providers are NOT seed unbacked entries — the
+        // unbacked flag is set by string-equality against
+        // COVERAGE_UNBACKED, so USER_PROVIDER_COVERAGE must not match.
+        assert!(!is_unbacked_provider(&name));
+        remove(&name);
     }
 
     #[test]
