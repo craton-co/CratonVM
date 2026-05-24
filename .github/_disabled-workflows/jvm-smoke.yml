@@ -1,3 +1,16 @@
+# TODO(orchestrator): refresh and re-activate.
+#
+# Parked: the RI.1..RI.17 smoke matrix runs 17 parallel application
+# reproducers on every PR. Each `scripts/smoke/riN_*.sh` runner expects an
+# externally-staged fixture (SPECjvm2008 jar, DaCapo mirror, Keycloak
+# tarball, etc.) and exits non-zero (typically `exit 78` "skipped") when
+# the mirror env var is unset. With no mirrors configured in repo secrets,
+# every slot fails red on every PR — defeating the point of CI.
+#
+# Re-activate once: (a) `SPECJVM_MIRROR_URL` / DaCapo / Keycloak mirror
+# URLs are wired as repo secrets, OR (b) the runners are updated to treat
+# `exit 78` (EX_CONFIG / skipped) as success and the workflow distinguishes
+# "skipped" from "failed" in the summary job.
 name: JVM Smoke (RI.1..RI.17)
 
 # Runs the Phase-I end-to-end application smoke matrix on every merge

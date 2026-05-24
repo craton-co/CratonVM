@@ -18,15 +18,18 @@ jobs:
     strategy:
       matrix:
         include:
+          # `cargo build -p cratonvm-cli` produces the `cratonvm` binary
+          # (see `vm-cli/Cargo.toml`'s `[[bin]] name = "cratonvm"`), NOT a
+          # binary named `cratonvm-cli`. Package the actual binary file.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: cratonvm-cli
+            artifact: cratonvm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: cratonvm-cli.exe
+            artifact: cratonvm.exe
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: cratonvm-cli
+            artifact: cratonvm
 
     steps:
       - uses: actions/checkout@v4

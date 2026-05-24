@@ -16,7 +16,7 @@ on:
       - 'native-builtins/**'
       - 'native-api/**'
       - 'bench/**'
-      - '/bench-gate.yml'
+      - '.github/workflows/bench-gate.yml'
 
 env:
   CARGO_TERM_COLOR: always

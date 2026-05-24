@@ -1,3 +1,12 @@
+# TODO(orchestrator): refresh and re-activate.
+#
+# Parked: this file defines `name: CI`, which would collide with the
+# currently-active `.github/workflows/ci.yml` (also named "CI"). The active
+# CI is a slimmer matrix (ubuntu+windows, build+clippy+test); this parked
+# variant adds macOS, JDK 25 setup, `cargo doc`, coverage, audit, and miri
+# jobs. Activating it requires either (a) merging the extra jobs into the
+# active `ci.yml`, or (b) renaming this workflow and pruning the duplicated
+# build+test jobs to avoid double-running on every PR.
 name: CI
 
 on:
