@@ -1118,42 +1118,39 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         return; // Another STW in progress
     }
 
-    // Phase 2: Concurrent Mark — runs on a background worker thread
-    // Spawn a thread that incrementally marks reachable objects in G1 regions
-    // while application threads continue running (with SATB write barriers active).
+    // Phase 2: Concurrent Mark — the background worker that drains
+    // the mark worklist is owned by the VmHeap-level
+    // `ConcurrentMarkController` (task #56). `g1_start_concurrent_mark`
+    // above spawned it during the initial-mark STW, so by the time we
+    // get here the marker is already running concurrently with mutators.
+    //
+    // Phase 3+4: spawn a watcher that polls until the marker has
+    // exhausted the worklist naturally, then runs cleanup via
+    // `g1_signal_marking_complete`. The poll-then-signal pattern
+    // preserves the legacy behaviour (let marking finish, *then*
+    // cleanup) — without it, calling g1_signal_marking_complete
+    // immediately would stop the worker before it scanned anything.
     {
         let shared_arc = shared.self_arc.read().as_ref().and_then(|w| w.upgrade());
         if let Some(shared_ref) = shared_arc {
             std::thread::Builder::new()
-                .name("G1-ConcurrentMark".to_string())
+                .name("G1-MarkComplete".to_string())
                 .spawn(move || {
-                    // Incremental marking: process up to 4096 objects per step
-                    let mut total_scanned = 0usize;
-                    loop {
-                        let done = shared_ref.heap.g1_concurrent_mark_step(4096);
-                        total_scanned += 4096;
-                        if done {
-                            break;
-                        }
-                        // Yield to application threads between steps
-                        std::thread::yield_now();
+                    // Poll until the controller's worker has drained
+                    // the worklist and exited naturally. 1 ms backoff
+                    // matches the legacy yield cadence closely enough
+                    // that mutators are not starved.
+                    while !shared_ref.heap.g1_concurrent_mark_finished() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    tracing::debug!(
-                        "[G1] Concurrent mark complete: ~{} objects scanned",
-                        total_scanned
-                    );
-
-                    // Phase 3: Remark — brief STW (initiated from marker thread)
-                    // We can't call brief_stw from a non-JVM thread directly,
-                    // so we signal completion and let the next safepoint handle remark.
+                    // Worker has exited — drain the slot, run cleanup,
+                    // return phase to Idle. The remark STW proper is
+                    // handled at the next safepoint check.
                     shared_ref.heap.g1_signal_marking_complete();
                 })
                 .ok(); // Ignore spawn errors (e.g., too many threads)
         }
     }
-
-    // Phase 3 & 4 are handled on the next safepoint check after the marker
-    // thread signals completion. See safepoint_check() → g1_maybe_remark().
 }
 
 // ---------------------------------------------------------------------------
