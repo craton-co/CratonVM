@@ -74,6 +74,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 #[allow(unused_imports)]
 use std::time::{Duration, Instant};
+// C27 (Round-11 GC-safety fix): the sk_table side-table is now keyed by
+// a SelectionKey's GC-stable identity hash code (i32). FxHashMap matches
+// the rest of the crate's small-int side-tables and avoids SipHash on
+// the hot select() / interest-op update paths.
+use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
 // OP_* constants (JDK SelectionKey.OP_*)
@@ -170,10 +175,25 @@ struct KeyState {
     interest_ops: i32,
     /// Last-computed ready bitmask.
     ready_ops: i32,
-    /// Java-side SelectionKeyImpl pointer, opaque to native.
-    /// Encoded as a raw usize since ObjectRef is !Send — but we only ever
-    /// use it through a NativeContext on the same thread that owns the VM.
-    key_obj: usize,
+    /// Java-side SelectionKeyImpl. `None` for synthetic / test
+    /// registrations that don't carry a real key.
+    ///
+    /// C27 (Round-11 GC-safety fix): previously this was a raw
+    /// `usize = obj.as_ptr() as usize`, resurrected via
+    /// `unsafe { ObjectRef::from_raw(raw as *mut u8) }` whenever
+    /// `selector_selected_keys` / `selector_keys` needed the Java key
+    /// back. Under a moving GC the raw pointer is stale after
+    /// compaction; the previous code returned wrong-object or wild
+    /// dereferences. Store the `ObjectRef` directly so a future
+    /// `update_after_gc` hook can remap it; pair it with `key_hash`
+    /// (GC-stable identity hash code) for cross-table identity
+    /// comparisons that mustn't depend on the post-GC pointer.
+    key_obj: Option<ObjectRef>,
+    /// GC-stable identity hash code of the SelectionKey (0 for synthetic
+    /// / test registrations that don't carry a real key). Used to look
+    /// up the matching `SkState` row in `sk_table` and to compare key
+    /// identity across selectors without dereferencing `key_obj`.
+    key_hash: i32,
     /// True if cancel() has been called; pruned at the start of the next
     /// select cycle.
     cancelled: bool,
@@ -473,11 +493,20 @@ pub fn selector_wakeup(id: i32) -> Result<(), MethodCallFailed> {
 
 /// Register a selectable handle with a selector. Idempotent on re-register
 /// of the same net_fd (updates interestOps + replaces the handle clone).
+///
+/// `key_obj` is the SelectionKey ObjectRef the selector should hand back
+/// from `selectedKeys()` / `keys()`; pass `None` for synthetic
+/// registrations that don't have a Java-side key. `key_hash` is the
+/// SelectionKey's GC-stable identity hash code (or 0 for synthetic);
+/// it's used to cross-match against `sk_table` rows in cancel /
+/// interest-op updates without dereferencing `key_obj` (which may have
+/// been relocated by the GC between registration and the next lookup).
 pub fn selector_register(
     id: i32,
     net_fd: i32,
     interest_ops: i32,
-    key_obj: usize,
+    key_obj: Option<ObjectRef>,
+    key_hash: i32,
     kind: Option<SelectableKind>,
 ) -> Result<(), MethodCallFailed> {
     let handle = match kind {
@@ -508,6 +537,7 @@ pub fn selector_register(
             interest_ops,
             ready_ops: 0,
             key_obj,
+            key_hash,
             cancelled: false,
             handle,
         },
@@ -1396,15 +1426,13 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
 }
 
 fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
-    // Prefer the side-table mapping (populated at register time).
-    let raw = sk_table()
+    // C27: side-table is now keyed by GC-stable identity hash code; the
+    // stored `channel` is an `ObjectRef`, not a raw pointer.
+    let key = ctx.identity_hash_code(key_obj);
+    let channel = sk_table()
         .read()
-        .get(&(key_obj.as_ptr() as usize))
+        .get(&key)
         .map(|s| s.channel)?;
-    if raw == 0 {
-        return None;
-    }
-    let channel = unsafe { ObjectRef::from_raw(raw as *mut u8) };
     let nf = ctx.object_num_fields(channel);
     if nf == 0 {
         return None;
@@ -1424,14 +1452,13 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
 }
 
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
-    let raw = sk_table()
+    // C27: identity-hash-code key + stored `ObjectRef` value (no
+    // from_raw resurrection).
+    let key = ctx.identity_hash_code(key_obj);
+    let s = sk_table()
         .read()
-        .get(&(key_obj.as_ptr() as usize))
+        .get(&key)
         .map(|s| s.selector)?;
-    if raw == 0 {
-        return None;
-    }
-    let s = unsafe { ObjectRef::from_raw(raw as *mut u8) };
     Some(selector_id_from_obj(ctx, s))
 }
 
@@ -1514,21 +1541,23 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// Mirror the native readyOps onto the SelectionKey side-table so user
 /// code reading `key.readyOps()` sees the post-select state.
 fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
-    let snap: Vec<(usize, i32)> = {
+    // C27: side-table is keyed by the SelectionKey's identity hash
+    // code; carry the hash through instead of a raw pointer.
+    let snap: Vec<(i32, i32)> = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else { return };
         let st = s.lock();
         st.keys
             .values()
-            .map(|k| (k.key_obj, k.ready_ops))
+            .map(|k| (k.key_hash, k.ready_ops))
             .collect()
     };
     let mut table = sk_table().write();
-    for (raw, ready) in snap {
-        if raw == 0 {
+    for (hash, ready) in snap {
+        if hash == 0 {
             continue;
         }
-        if let Some(state) = table.get_mut(&raw) {
+        if let Some(state) = table.get_mut(&hash) {
             state.ready_ops = ready;
         }
     }
@@ -1558,29 +1587,116 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // Side-table mapping SelectionKey object → (channel, selector, interestOps,
 // readyOps, attachment). Used because `sun/nio/ch/SelectionKeyImpl` has its
 // own JDK-managed instance layout and writing to ad-hoc slots collides.
+//
+// C27 (Round-11 GC-safety fix): the previous incarnation keyed this table
+// by `key.as_ptr() as usize` and stored channel/selector/attachment as
+// raw `usize` pointers, resurrecting them via
+// `unsafe { ObjectRef::from_raw(raw as *mut u8) }` at read time. Under
+// CratonVM's moving GC any compaction relocated the keys (so lookups
+// missed and a freshly-allocated object at the old address silently
+// collided with the orphaned row) and the embedded values (so the
+// resurrected ObjectRef referred to whatever now lived at the old
+// address — wrong-object dispatch in the lucky case, wild dereference
+// in the unlucky one).
+//
+// The fix:
+//   * Re-key on the SelectionKey's GC-stable identity hash code (i32) —
+//     the GC's HashCodeTable preserves the hash word across compaction
+//     (see `gc/src/compact_header.rs::HashCodeTable::update_after_gc`).
+//   * Store the embedded references as actual `ObjectRef` so a future
+//     post-compaction hook (`sk_table_update_after_gc`, below) can
+//     remap them through the GC's pointer_map. Until that hook is
+//     wired into `vm/src/memory/gc.rs`, the worst-case outcome of an
+//     intervening compaction is a missed accessor (returns Object(None)
+//     / Int(0)) rather than a wild dereference.
+//
+// Mirrors `SEED_TABLE` (native-builtins/src/securerandom.rs) and the
+// `VH_META_TABLE` pattern (native-builtins/src/lang_invoke.rs).
 struct SkState {
-    channel: usize,   // raw ObjectRef ptr
-    selector: usize,
+    channel: ObjectRef,
+    selector: ObjectRef,
     interest_ops: i32,
     ready_ops: i32,
-    attachment: Option<usize>,
+    attachment: Option<ObjectRef>,
     cancelled: bool,
 }
 
-fn sk_table() -> &'static parking_lot::RwLock<std::collections::HashMap<usize, SkState>> {
-    static REG: std::sync::OnceLock<parking_lot::RwLock<std::collections::HashMap<usize, SkState>>>
+fn sk_table() -> &'static parking_lot::RwLock<FxHashMap<i32, SkState>> {
+    static REG: std::sync::OnceLock<parking_lot::RwLock<FxHashMap<i32, SkState>>>
         = std::sync::OnceLock::new();
-    REG.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()))
+    REG.get_or_init(|| parking_lot::RwLock::new(FxHashMap::default()))
 }
 
-fn sk_state_get_field<F: FnOnce(&SkState) -> Value>(key: ObjectRef, f: F) -> Option<Value> {
-    let table = sk_table().read();
-    table.get(&(key.as_ptr() as usize)).map(f)
-}
-
-fn sk_state_with_mut<F: FnOnce(&mut SkState) -> R, R>(key: ObjectRef, f: F) -> Option<R> {
+/// Post-GC hook — remap every ObjectRef stored in `sk_table` through the
+/// GC's pointer map. The keys (identity hash codes) are GC-stable on
+/// their own; only the embedded `channel` / `selector` / `attachment`
+/// ObjectRef values need rewriting after compaction. Mirrors
+/// `gc_update_lambda_callsite_cache_refs` in
+/// `native-builtins/src/lang_invoke.rs`. Until this hook is wired into
+/// `vm/src/memory/gc.rs`'s post-compaction step, the table will return
+/// stale ObjectRef values for any entry whose underlying objects moved;
+/// see the SkState doc-block for the residual behaviour.
+#[allow(dead_code)]
+pub fn sk_table_update_after_gc(
+    pointer_map: &FxHashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let remap = |obj: ObjectRef| -> ObjectRef {
+        let old = obj.as_ptr() as usize;
+        match pointer_map.get(&old) {
+            Some(&new_addr) if new_addr != 0 => {
+                // SAFETY: `new_addr` is the GC's relocated address for
+                // the same logical object; the GC guarantees the new
+                // address satisfies ObjectRef's non-null/8-byte-align
+                // invariants.
+                unsafe { ObjectRef::from_raw(new_addr as *mut u8) }
+            }
+            _ => obj,
+        }
+    };
+    // Lock order: `selectors()` before `sk_table()` (matches
+    // `apply_ready_ops` which takes the same pair in this order).
+    {
+        let regs = selectors().read();
+        for sel in regs.values() {
+            let mut st = sel.lock();
+            for k in st.keys.values_mut() {
+                if let Some(obj) = k.key_obj {
+                    k.key_obj = Some(remap(obj));
+                }
+            }
+        }
+    }
     let mut table = sk_table().write();
-    table.get_mut(&(key.as_ptr() as usize)).map(f)
+    for state in table.values_mut() {
+        state.channel = remap(state.channel);
+        state.selector = remap(state.selector);
+        if let Some(att) = state.attachment {
+            state.attachment = Some(remap(att));
+        }
+    }
+}
+
+fn sk_state_get_field<F: FnOnce(&SkState) -> Value>(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+    f: F,
+) -> Option<Value> {
+    let k = ctx.identity_hash_code(key);
+    let table = sk_table().read();
+    table.get(&k).map(f)
+}
+
+fn sk_state_with_mut<F: FnOnce(&mut SkState) -> R, R>(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+    f: F,
+) -> Option<R> {
+    let k = ctx.identity_hash_code(key);
+    let mut table = sk_table().write();
+    table.get_mut(&k).map(f)
 }
 
 fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1648,26 +1764,28 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             _ => None,
         })
         .ok_or_else(|| ioex("register: could not allocate SelectionKeyImpl"))?;
-    // Stash the key state in a side-table so our accessor natives don't
-    // have to reach into JDK-managed slots on the SelectionKeyImpl.
-    let attachment_raw = match attachment {
-        Value::Object(Some(o)) => Some(o.as_ptr() as usize),
+    // C27: stash the key state in a side-table keyed by the
+    // SelectionKey's GC-stable identity hash code (i32). The embedded
+    // ObjectRefs are stored directly so a future post-GC hook can
+    // remap them through the GC's pointer_map.
+    let key_hash = ctx.identity_hash_code(key_obj);
+    let attachment_obj = match attachment {
+        Value::Object(Some(o)) => Some(o),
         _ => None,
     };
     sk_table().write().insert(
-        key_obj.as_ptr() as usize,
+        key_hash,
         SkState {
-            channel: channel.as_ptr() as usize,
-            selector: selector_obj.as_ptr() as usize,
+            channel,
+            selector: selector_obj,
             interest_ops: ops,
             ready_ops: 0,
-            attachment: attachment_raw,
+            attachment: attachment_obj,
             cancelled: false,
         },
     );
 
-    let raw = key_obj.as_ptr() as usize;
-    selector_register(sel_id, net_fd, ops, raw, kind)?;
+    selector_register(sel_id, net_fd, ops, Some(key_obj), key_hash, kind)?;
 
     Ok(Some(Value::Object(Some(key_obj))))
 }
@@ -1722,40 +1840,35 @@ fn key_cancel_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // that mask readyOps() against OP_*).
 // ---------------------------------------------------------------------------
 
-fn sk_channel(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_channel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    let v = sk_state_get_field(this, |s| {
-        let obj = unsafe { ObjectRef::from_raw(s.channel as *mut u8) };
-        Value::Object(Some(obj))
-    })
-    .unwrap_or(Value::Object(None));
+    // C27: stored as a real ObjectRef now (no more from_raw resurrection).
+    let v = sk_state_get_field(ctx, this, |s| Value::Object(Some(s.channel)))
+        .unwrap_or(Value::Object(None));
     Ok(Some(v))
 }
 
-fn sk_selector(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_selector(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    let v = sk_state_get_field(this, |s| {
-        let obj = unsafe { ObjectRef::from_raw(s.selector as *mut u8) };
-        Value::Object(Some(obj))
-    })
-    .unwrap_or(Value::Object(None));
+    let v = sk_state_get_field(ctx, this, |s| Value::Object(Some(s.selector)))
+        .unwrap_or(Value::Object(None));
     Ok(Some(v))
 }
 
-fn sk_interest_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let v = sk_state_get_field(this, |s| Value::Int(s.interest_ops))
+    let v = sk_state_get_field(ctx, this, |s| Value::Int(s.interest_ops))
         .unwrap_or(Value::Int(0));
     Ok(Some(v))
 }
 
-fn sk_set_interest_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
@@ -1763,103 +1876,107 @@ fn sk_set_interest_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    sk_state_with_mut(this, |s| {
+    let key_hash = ctx.identity_hash_code(this);
+    // Snapshot sk_table membership under a brief read lock, then drop
+    // it before grabbing `selectors()` to keep the canonical
+    // lock-order (selectors() before sk_table()) that `apply_ready_ops`
+    // and `sk_table_update_after_gc` use.
+    let known = sk_table().read().contains_key(&key_hash);
+    sk_state_with_mut(ctx, this, |s| {
         s.interest_ops = ops;
     });
-    // Mirror to native KeyState so the next select() picks up the change.
-    let table = sk_table().read();
-    if let Some(s) = table.get(&(this.as_ptr() as usize)) {
+    // Mirror to native KeyState so the next select() picks up the
+    // change. C27: cross-match on the GC-stable identity hash code
+    // rather than the raw pointer (which can drift under compaction).
+    if known {
         let regs = selectors().read();
         for (sel_id, sel) in regs.iter() {
             let mut st = sel.lock();
             for k in st.keys.values_mut() {
-                if k.key_obj == this.as_ptr() as usize {
+                if k.key_hash == key_hash {
                     k.interest_ops = ops;
                     let _ = selector_set_interest(*sel_id, k.net_fd, ops);
                     break;
                 }
             }
         }
-        let _ = s; // silence
     }
     Ok(Some(Value::Object(Some(this))))
 }
 
-fn sk_ready_ops(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_ready_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let v = sk_state_get_field(this, |s| Value::Int(s.ready_ops))
+    let v = sk_state_get_field(ctx, this, |s| Value::Int(s.ready_ops))
         .unwrap_or(Value::Int(0));
     Ok(Some(v))
 }
 
-fn sk_is_valid(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Int(0)));
     };
-    let valid = sk_state_get_field(this, |s| {
+    let valid = sk_state_get_field(ctx, this, |s| {
         Value::Int(if s.cancelled { 0 } else { 1 })
     })
     .unwrap_or(Value::Int(0));
     Ok(Some(valid))
 }
 
-fn sk_attach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_attach(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    let new_att_raw = match args.get(1) {
-        Some(Value::Object(Some(o))) => Some(o.as_ptr() as usize),
+    let new_att_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
         _ => None,
     };
-    let prev = sk_state_with_mut(this, |s| {
+    // C27: store the attachment as a real ObjectRef (was a raw usize
+    // before, with a from_raw resurrection at read time).
+    let prev = sk_state_with_mut(ctx, this, |s| {
         let prev = s.attachment.take();
-        s.attachment = new_att_raw;
+        s.attachment = new_att_obj;
         prev
     })
     .flatten();
     let prev_v = match prev {
-        Some(raw) => {
-            let obj = unsafe { ObjectRef::from_raw(raw as *mut u8) };
-            Value::Object(Some(obj))
-        }
+        Some(obj) => Value::Object(Some(obj)),
         None => Value::Object(None),
     };
     Ok(Some(prev_v))
 }
 
-fn sk_attachment(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_attachment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    let v = sk_state_get_field(this, |s| match s.attachment {
-        Some(raw) => {
-            let obj = unsafe { ObjectRef::from_raw(raw as *mut u8) };
-            Value::Object(Some(obj))
-        }
+    let v = sk_state_get_field(ctx, this, |s| match s.attachment {
+        Some(obj) => Value::Object(Some(obj)),
         None => Value::Object(None),
     })
     .unwrap_or(Value::Object(None));
     Ok(Some(v))
 }
 
-fn sk_cancel_public(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn sk_cancel_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(None);
     };
-    sk_state_with_mut(this, |s| {
+    let key_hash = ctx.identity_hash_code(this);
+    sk_state_with_mut(ctx, this, |s| {
         s.cancelled = true;
         s.ready_ops = 0;
     });
     // Walk all selectors looking for this key and mark cancelled.
+    // C27: identity-hash comparison instead of raw-pointer comparison.
     let regs = selectors().read();
     for (sel_id, sel) in regs.iter() {
         let mut st = sel.lock();
         let Some(target) = st
             .keys
             .iter()
-            .find(|(_, k)| k.key_obj == this.as_ptr() as usize)
+            .find(|(_, k)| k.key_hash == key_hash)
             .map(|(fd, _)| *fd)
         else {
             continue;
@@ -1882,7 +1999,8 @@ fn selector_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Ok(Some(Value::Object(None)));
     };
     let id = selector_id_from_obj(ctx, obj);
-    let raw_keys: Vec<usize> = if id == 0 {
+    // C27: collect ObjectRefs directly (was raw usize + from_raw).
+    let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()
     } else {
         let regs = selectors().read();
@@ -1891,13 +2009,13 @@ fn selector_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 .lock()
                 .keys
                 .values()
-                .filter(|k| !k.cancelled && k.ready_ops != 0 && k.key_obj != 0)
-                .map(|k| k.key_obj)
+                .filter(|k| !k.cancelled && k.ready_ops != 0)
+                .filter_map(|k| k.key_obj)
                 .collect(),
             None => Vec::new(),
         }
     };
-    Ok(Some(Value::Object(Some(build_set(ctx, &raw_keys)))))
+    Ok(Some(Value::Object(Some(build_set(ctx, &key_objs)))))
 }
 
 fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1905,7 +2023,7 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         return Ok(Some(Value::Object(None)));
     };
     let id = selector_id_from_obj(ctx, obj);
-    let raw_keys: Vec<usize> = if id == 0 {
+    let key_objs: Vec<ObjectRef> = if id == 0 {
         Vec::new()
     } else {
         let regs = selectors().read();
@@ -1914,13 +2032,13 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 .lock()
                 .keys
                 .values()
-                .filter(|k| !k.cancelled && k.key_obj != 0)
-                .map(|k| k.key_obj)
+                .filter(|k| !k.cancelled)
+                .filter_map(|k| k.key_obj)
                 .collect(),
             None => Vec::new(),
         }
     };
-    Ok(Some(Value::Object(Some(build_set(ctx, &raw_keys)))))
+    Ok(Some(Value::Object(Some(build_set(ctx, &key_objs)))))
 }
 
 /// Build a HashSet populated with the given key objects. Allocates a real
@@ -1928,7 +2046,10 @@ fn selector_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// each key via `add(Object)`. The selector calls this on every
 /// `selectedKeys()` / `keys()` invocation; lifetimes are short so we keep
 /// it simple.
-fn build_set(ctx: &mut dyn NativeContext, raw_keys: &[usize]) -> ObjectRef {
+///
+/// C27: takes a slice of real ObjectRefs (was a slice of raw usize with
+/// a from_raw resurrection per element — GC-unsafe).
+fn build_set(ctx: &mut dyn NativeContext, keys: &[ObjectRef]) -> ObjectRef {
     // Allocate + run the no-arg constructor so the backing HashMap field
     // (`map`) is non-null. Without <init> the JDK HashSet bytecode NPEs at
     // `map.keySet()` during iterator()/size()/etc.
@@ -1947,15 +2068,12 @@ fn build_set(ctx: &mut dyn NativeContext, raw_keys: &[usize]) -> ObjectRef {
         },
     };
     let _ = ctx.invoke_special("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
-    for raw in raw_keys {
-        // SAFETY: stored from a live ObjectRef at SelectionKey allocation
-        // time; the heap entry is kept alive while the selector exists.
-        let key = unsafe { ObjectRef::from_raw(*raw as *mut u8) };
+    for key in keys {
         let _ = ctx.invoke_virtual(
             set,
             "add",
             "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(key))],
+            &[Value::Object(Some(*key))],
         );
     }
     set
@@ -2357,7 +2475,9 @@ mod tests {
     fn t19_7_a_selector_close_invalidates_keys() {
         let id = selector_open();
         let fd = fake_fd();
-        selector_register(id, fd, OP_READ, 0xdead_beef, None).unwrap();
+        // C27: signature is now (id, fd, ops, key_obj: Option<ObjectRef>,
+        // key_hash: i32, kind). Tests use None + a sentinel hash.
+        selector_register(id, fd, OP_READ, None, 0xdead_beef_u32 as i32, None).unwrap();
         assert_eq!(selector_key_count(id), 1);
         selector_close(id);
         assert_eq!(selector_key_count(id), 0);
@@ -2375,7 +2495,8 @@ mod tests {
             id,
             fd,
             OP_ACCEPT,
-            0xcafe_babe,
+            None,
+            0xcafe_babe_u32 as i32,
             Some(SelectableKind::Listener(listener)),
         )
         .unwrap();
@@ -2384,7 +2505,8 @@ mod tests {
         let st = regs.get(&id).unwrap().lock();
         let k = st.keys.get(&fd).unwrap();
         assert_eq!(k.interest_ops, OP_ACCEPT);
-        assert_eq!(k.key_obj, 0xcafe_babe);
+        assert_eq!(k.key_hash, 0xcafe_babe_u32 as i32);
+        assert!(k.key_obj.is_none());
         drop(st);
         drop(regs);
         selector_close(id);
@@ -2399,6 +2521,7 @@ mod tests {
             id,
             fd,
             OP_ACCEPT,
+            None,
             0,
             Some(SelectableKind::Listener(listener)),
         )
@@ -2428,6 +2551,7 @@ mod tests {
             id,
             fd,
             OP_ACCEPT,
+            None,
             0,
             Some(SelectableKind::Listener(listener)),
         )
@@ -2456,6 +2580,7 @@ mod tests {
             id,
             server_fd,
             OP_READ,
+            None,
             0,
             Some(SelectableKind::Stream(server)),
         )
@@ -2487,6 +2612,7 @@ mod tests {
             id,
             fd,
             OP_ACCEPT,
+            None,
             0,
             Some(SelectableKind::Listener(listener)),
         )
@@ -2519,6 +2645,7 @@ mod tests {
             id,
             server_fd,
             0,
+            None,
             0,
             Some(SelectableKind::Stream(server)),
         )
@@ -2544,6 +2671,7 @@ mod tests {
             id,
             server_fd,
             OP_READ,
+            None,
             0,
             Some(SelectableKind::Stream(server)),
         )
@@ -2607,6 +2735,7 @@ mod tests {
             id,
             fd,
             OP_ACCEPT,
+            None,
             0,
             Some(SelectableKind::Listener(listener)),
         )
@@ -2628,7 +2757,7 @@ mod tests {
         // A selector key with no live handle never reports ready.
         let id = selector_open();
         let fd = fake_fd();
-        selector_register(id, fd, OP_READ | OP_WRITE | OP_ACCEPT, 0, None).unwrap();
+        selector_register(id, fd, OP_READ | OP_WRITE | OP_ACCEPT, None, 0, None).unwrap();
         let n = selector_select(id, 0).unwrap();
         assert_eq!(n, 0, "dummy handle never reports ready");
         selector_close(id);
@@ -2650,6 +2779,7 @@ mod tests {
                 id,
                 fd,
                 OP_READ,
+                None,
                 0,
                 Some(SelectableKind::Stream(server)),
             )
