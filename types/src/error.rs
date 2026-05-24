@@ -258,6 +258,13 @@ pub enum RuntimeError {
     #[error("IllegalStateException: {message}")]
     IllegalStateException { message: String },
 
+    /// Thrown when a method is invoked by an unauthorized caller. Used by the
+    /// Panama native-access gate when `--enable-native-access` has not been
+    /// granted to the calling module — matches OpenJDK's
+    /// `java.lang.IllegalCallerException` semantics.
+    #[error("IllegalCallerException: {message}")]
+    IllegalCallerException { message: String },
+
     #[error("ConcurrentModificationException")]
     ConcurrentModificationException,
 
@@ -637,6 +644,38 @@ mod tests {
             message: "closed".into(),
         };
         assert_eq!(format!("{err}"), "IllegalStateException: closed");
+    }
+
+    #[test]
+    fn runtime_error_illegal_caller_display() {
+        // The new variant exists and formats consistently with its siblings —
+        // bare class name followed by ": <message>", no double prefix.
+        let err = RuntimeError::IllegalCallerException {
+            message: "Native access is not enabled for this module".into(),
+        };
+        assert_eq!(
+            format!("{err}"),
+            "IllegalCallerException: Native access is not enabled for this module"
+        );
+    }
+
+    #[test]
+    fn runtime_error_illegal_caller_is_distinct_from_illegal_state() {
+        // Regression guard for task #57: the Panama native-access gate used
+        // to fold IllegalCallerException into IllegalStateException because
+        // the variant did not exist. The two variants must remain distinct
+        // at the Rust level so the exception-mapping table can route them
+        // to different Java classes.
+        let caller = RuntimeError::IllegalCallerException {
+            message: "denied".into(),
+        };
+        let state = RuntimeError::IllegalStateException {
+            message: "denied".into(),
+        };
+        assert!(matches!(caller, RuntimeError::IllegalCallerException { .. }));
+        assert!(matches!(state, RuntimeError::IllegalStateException { .. }));
+        // Display strings must not collide.
+        assert_ne!(format!("{caller}"), format!("{state}"));
     }
 
     #[test]
