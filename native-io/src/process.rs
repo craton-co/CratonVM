@@ -500,13 +500,13 @@ fn native_unix_fork_and_exec(
     // Since we route through `std::process::Command` which uses real
     // argv arrays, we decode the byte-block form back to strings.
     fn decode_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
+        // AUDIT 2026-05-24: bulk read via NativeContext intrinsic
+        // instead of per-element `get_array_element`. Single memcpy
+        // from the heap byte[] payload.
         let len = ctx.array_length(arr);
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            if let Value::Int(b) = ctx.get_array_element(arr, i) {
-                out.push((b & 0xff) as u8);
-            }
-        }
+        let mut out = vec![0u8; len];
+        let n = ctx.read_byte_array_into(arr, 0, &mut out);
+        out.truncate(n);
         out
     }
     let prog_bytes = match args.get(2) {

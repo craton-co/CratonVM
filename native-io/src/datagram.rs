@@ -330,13 +330,12 @@ fn dgram_send0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         return Ok(Some(Value::Int(0)));
     }
     let n_to_send = (limit - position) as usize;
+    // AUDIT 2026-05-24: bulk read via NativeContext intrinsic instead
+    // of a per-byte `get_array_element` loop. Single memcpy from the
+    // heap byte[] payload.
     let mut bytes = vec![0u8; n_to_send];
-    for i in 0..n_to_send {
-        bytes[i] = match ctx.get_array_element(arr, position as usize + i) {
-            Value::Int(v) => (v & 0xFF) as u8,
-            _ => 0,
-        };
-    }
+    let n_read = ctx.read_byte_array_into(arr, position as usize, &mut bytes);
+    bytes.truncate(n_read);
     let sent = dgram_with(id, |s| s.sock.send_to(&bytes, target))
         .ok_or_else(|| io_error("send: socket missing"))?
         .map_err(|e| io_error(format!("send_to {target}: {e}")))?;
@@ -371,9 +370,10 @@ fn dgram_receive0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
         Err(e) => return Err(io_error(format!("recv_from: {e}"))),
     };
-    for i in 0..n {
-        ctx.set_array_element(arr, position as usize + i, Value::Int(bytes[i] as i8 as i32));
-    }
+    // AUDIT 2026-05-24: bulk write via NativeContext intrinsic instead
+    // of a per-byte `set_array_element` loop. Single memcpy into the
+    // heap byte[] payload.
+    ctx.write_byte_array_from(arr, position as usize, &bytes[..n]);
     buffer_advance(ctx, buf, position + n as i32);
     let isa = encode_isa(ctx, peer).ok_or_else(|| io_error("receive: encode peer"))?;
     Ok(Some(Value::Object(Some(isa))))

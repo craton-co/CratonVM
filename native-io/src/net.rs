@@ -640,9 +640,25 @@ fn net_set_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 s.set_nodelay(val != 0).map_err(|e| net_err("TCP_NODELAY", e))?;
             }
             (SOL_SOCKET, SO_KEEPALIVE) => {
-                // std::net::TcpStream has no keepalive setter until
-                // the socket2 crate is pulled in; remember the value
-                // so getIntOption0 is consistent.
+                // CONTRACT-DRIFT (documented 2026-05-24): the JDK
+                // contract for `setOption(StandardSocketOptions.SO_KEEPALIVE,
+                // true)` is that the kernel will start sending TCP
+                // keepalive probes on the connection after the
+                // SO_KEEPALIVE timer expires. `std::net::TcpStream`
+                // exposes no setter for this; wiring through
+                // `socket2::SockRef::set_keepalive` would require
+                // adding the `socket2` crate to `Cargo.toml` (it is
+                // NOT currently in our workspace dependency tree
+                // despite what some older docs suggest).
+                //
+                // We persist the value in `net_opts` so
+                // `getIntOption0` returns what the user set, but the
+                // kernel-side keepalive probe is a SILENT NO-OP. Java
+                // code that relies on keepalive timer behaviour to
+                // detect dead peers will not see those callbacks.
+                //
+                // Resolution path: add `socket2` dep + use
+                // `SockRef::from(&*s).set_keepalive(val != 0)`.
             }
             _ => {}
         }
