@@ -7,6 +7,41 @@
 //! (`hs_err_pid<pid>.log`) with thread, process, and system information.
 //! On Unix, also registers a signal handler for SIGSEGV/SIGBUS/SIGFPE via
 //! raw libc so that hardware faults produce the same diagnostic output.
+//!
+//! # Async-signal-safety discipline (READ BEFORE EDITING)
+//!
+//! This module has TWO entry points that look superficially similar but live
+//! in very different execution contexts:
+//!
+//! 1. **The Rust panic hook** (`install_crash_handler` -> closure passed to
+//!    `std::panic::set_hook`). This runs in *normal* Rust context — the
+//!    allocator is fine, mutexes are fine, `format!` / `eprintln!` /
+//!    `std::fs::File::create` are all fine. The full report is written here.
+//!
+//! 2. **The Unix signal handler** (`crash_signal_handler` in
+//!    `install_signal_handlers`). This runs in *async-signal context*: it
+//!    can be invoked at literally any instruction boundary, including while
+//!    the malloc lock or stdio buffer lock is held. POSIX permits only a
+//!    tiny whitelist of functions to be called here (`signal(7)` /
+//!    `signal-safety(7)`). In particular it is UB / deadlock-prone to call:
+//!      - any allocator function (`malloc`, `Box::new`, `String`, `format!`,
+//!        `Vec::push`, `to_string`),
+//!      - any locking primitive (`Mutex`, `RwLock`, `OnceLock` populated
+//!        lazily, the stdio locks behind `eprintln!`/`println!`),
+//!      - any `std::fs` API (they call `malloc`),
+//!      - any `std::backtrace::Backtrace` (allocates + locks symbol tables).
+//!
+//! Inside the signal handler we use ONLY:
+//!   - direct libc syscalls (`write`, `open`, `close`, `signal`, `raise`,
+//!     `getpid`),
+//!   - reads of immutable `static` data,
+//!   - reads/writes of `AtomicBool` / `AtomicI32` with relaxed semantics,
+//!   - pre-allocated static / thread-local byte buffers,
+//!   - the `itoa_into_buf` helper, which is allocation-free.
+//!
+//! If you find yourself wanting to add anything else to the signal path,
+//! please STOP and put it on the panic-hook path instead — or skip it.
+//! A deadlocked crash handler is worse than a sparser one.
 
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
@@ -272,6 +307,175 @@ pub fn install_crash_handler() {
     install_signal_handlers();
 }
 
+// ── Async-signal-safe primitives ───────────────────────────────────────────
+//
+// Everything in this section MUST be callable from a signal handler. See the
+// module-level docstring for the discipline.
+
+/// Format a non-negative integer into `buf` in decimal, allocation-free.
+///
+/// Returns the number of bytes written. The output is left-justified at the
+/// start of `buf` (i.e. `buf[..n]` is the digits, in normal reading order).
+/// If `buf` is too small the function writes as many digits as fit, starting
+/// with the most-significant digit that fits, and returns `buf.len()`.
+///
+/// This helper is the ONLY number-formatting routine used inside the signal
+/// handler. It does not allocate, does not lock, and does not call into the
+/// standard library's formatting machinery.
+///
+/// # Examples
+///
+/// ```
+/// use cratonvm_vm::runtime::crash_handler::itoa_into_buf;
+///
+/// let mut buf = [0u8; 32];
+/// let n = itoa_into_buf(&mut buf, 0);
+/// assert_eq!(&buf[..n], b"0");
+///
+/// let n = itoa_into_buf(&mut buf, 12345);
+/// assert_eq!(&buf[..n], b"12345");
+///
+/// let n = itoa_into_buf(&mut buf, u64::MAX);
+/// assert_eq!(&buf[..n], b"18446744073709551615");
+/// ```
+pub fn itoa_into_buf(buf: &mut [u8], n: u64) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+
+    // Write digits least-significant-first into a stack scratch (u64::MAX is
+    // 20 digits), then reverse-copy the most-significant `out_len` digits
+    // into `buf`. If `buf` is too small, low-order digits are dropped — the
+    // signal handler's pre-sized buffers always have room for u64::MAX.
+    let mut scratch = [0u8; 20];
+    let mut len = 0usize;
+    let mut v = n;
+    while v > 0 && len < scratch.len() {
+        scratch[len] = b'0' + (v % 10) as u8;
+        v /= 10;
+        len += 1;
+    }
+
+    let out_len = core::cmp::min(len, buf.len());
+    for i in 0..out_len {
+        // scratch is little-endian-digits; reverse to put the most-
+        // significant digit first.
+        buf[i] = scratch[len - 1 - i];
+    }
+    out_len
+}
+
+#[cfg(unix)]
+mod async_signal_safe {
+    //! Async-signal-safe helpers used by the SIGSEGV handler.
+    //!
+    //! Every function here must avoid: allocation, locking, stdio buffering,
+    //! `std::fs`, `format!`, panics. Verified by manual audit only — there is
+    //! no compiler check for async-signal safety in Rust today.
+
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    /// STDERR file descriptor number on every POSIX system.
+    pub const STDERR_FD: i32 = 2;
+
+    /// Cached process id, populated at installation time so the signal path
+    /// does not need to call `getpid` (which IS safe, but caching one libc
+    /// call per signal is a minor improvement and keeps the path obvious).
+    pub static CACHED_PID: AtomicI32 = AtomicI32::new(0);
+
+    /// Write `bytes` to `fd` using raw `write(2)`. Retries on EINTR.
+    ///
+    /// Async-signal-safe: `write` is on the POSIX whitelist.
+    pub fn write_all(fd: i32, bytes: &[u8]) {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let ptr = unsafe { bytes.as_ptr().add(off) } as *const libc::c_void;
+            let want = bytes.len() - off;
+            let r = unsafe { libc::write(fd, ptr, want) };
+            if r < 0 {
+                // EINTR -> retry; any other error -> give up silently.
+                // We cannot call `*libc::__errno_location()` portably without
+                // worrying about TLS reentrancy, so just retry once and bail.
+                let again = unsafe { libc::write(fd, ptr, want) };
+                if again <= 0 {
+                    return;
+                }
+                off += again as usize;
+            } else if r == 0 {
+                return;
+            } else {
+                off += r as usize;
+            }
+        }
+    }
+
+    /// Open `path` for writing (create + truncate, mode 0644) and return the
+    /// fd, or -1 on failure. `path` MUST be NUL-terminated.
+    ///
+    /// Async-signal-safe: `open` is on the POSIX whitelist.
+    pub fn open_write_trunc(path_nul: &[u8]) -> i32 {
+        debug_assert!(path_nul.last() == Some(&0));
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+        let mode = 0o644 as libc::c_int;
+        unsafe { libc::open(path_nul.as_ptr() as *const libc::c_char, flags, mode) }
+    }
+
+    /// Close a file descriptor, ignoring errors.
+    pub fn close(fd: i32) {
+        unsafe { libc::close(fd) };
+    }
+
+    /// Map a signal number to a `&'static [u8]` name. Static-data lookup is
+    /// async-signal-safe.
+    pub fn signal_name_bytes(sig: i32) -> &'static [u8] {
+        match sig {
+            libc::SIGSEGV => b"SIGSEGV",
+            libc::SIGBUS => b"SIGBUS",
+            libc::SIGFPE => b"SIGFPE",
+            libc::SIGILL => b"SIGILL",
+            libc::SIGABRT => b"SIGABRT",
+            _ => b"SIG?",
+        }
+    }
+}
+
+#[cfg(unix)]
+std::thread_local! {
+    /// Per-thread scratch buffer the signal handler can write into without
+    /// allocating. Populated lazily on first access from a *normal* (non-
+    /// signal) context; the signal handler only reads it. 256 bytes is
+    /// sufficient for the short async-signal-safe message we emit.
+    ///
+    /// NOTE: thread-local access itself is implementation-defined in async-
+    /// signal context. On glibc + musl the fast path is just a TLS offset
+    /// load, which is safe. On platforms where the first access initializes
+    /// lazily via `pthread_setspecific`, we pre-touch the buffer at thread
+    /// start (see `prime_signal_tls`) to avoid that case.
+    static SIGNAL_SCRATCH: core::cell::UnsafeCell<[u8; 256]> =
+        core::cell::UnsafeCell::new([0u8; 256]);
+}
+
+/// Pre-touch the thread-local signal scratch buffer so that the lazy TLS
+/// initialization (which on some platforms calls into the allocator) happens
+/// in *normal* context, not in the signal handler.
+///
+/// Call this from every thread that might receive a fatal signal. It is a
+/// no-op on platforms without thread-local storage support.
+#[cfg(unix)]
+pub fn prime_signal_tls() {
+    SIGNAL_SCRATCH.with(|cell| {
+        // Touch the first byte to force initialization.
+        unsafe { (*cell.get())[0] = 0 };
+    });
+}
+
+#[cfg(not(unix))]
+pub fn prime_signal_tls() {}
+
 // ── Unix signal handlers ───────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -287,13 +491,38 @@ fn install_signal_handlers() {
         libc::SIGABRT,
     ];
 
-    extern "C" fn crash_signal_handler(sig: c_int) {
-        // Guard against reentry.
+    // Pre-allocated constant strings used by the signal handler. Storing them
+    // as `&'static [u8]` means no allocation is needed to reference them.
+    const HDR: &[u8] = b"\n#\n# A fatal error has been detected by the CratonVM Runtime Environment:\n#  ";
+    const AT_PC: &[u8] = b" at pc=0x0, pid=";
+    const TID_LBL: &[u8] = b", tid=";
+    const NL_REPORT: &[u8] = b"\n#  Error report saved to: ";
+    const FOOTER: &[u8] = b"\n#\n";
+    const FILE_PREFIX: &[u8] = b"hs_err_pid";
+    const FILE_SUFFIX: &[u8] = b".log";
+
+    // Cache the pid in normal context so the handler doesn't need libc::getpid
+    // (which is technically signal-safe, but we minimize syscalls).
+    async_signal_safe::CACHED_PID
+        .store(std::process::id() as i32, Ordering::Relaxed);
+
+    // Prime TLS on the installing thread (each VM-spawned thread should also
+    // call `prime_signal_tls` itself at startup).
+    prime_signal_tls();
+
+    // ── THE SIGNAL HANDLER ────────────────────────────────────────────────
+    //
+    // This function executes in async-signal context. See the module doc
+    // for the rules. Roughly: only libc syscalls, atomics, and stack-local
+    // arithmetic are allowed. No allocations, no locks, no formatting
+    // machinery, no `std::fs`, no `Backtrace::capture`.
+    extern "C" fn crash_signal_handler(sig: std::ffi::c_int) {
+        // Re-entry guard. `compare_exchange` on an `AtomicBool` is lock-free
+        // and async-signal-safe on every architecture we target.
         if CRASH_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            // Already in the handler; reset to default and re-raise.
             unsafe {
                 libc::signal(sig, libc::SIG_DFL);
                 libc::raise(sig);
@@ -301,24 +530,82 @@ fn install_signal_handlers() {
             return;
         }
 
-        let crash = CrashInfo::from_signal(sig);
-        let pid = crash.pid;
-        let filename = format!("hs_err_pid{}.log", pid);
-        let path = std::path::PathBuf::from(&filename);
+        // Stack buffers — no heap.
+        let mut pid_buf = [0u8; 20];
+        let mut tid_buf = [0u8; 20];
+        let mut filename = [0u8; 64];
 
-        // Best-effort write; we are in a signal handler so many things are
-        // unsafe, but generating the report is all in-process memory work.
-        let _ = write_crash_report(&crash, &path);
+        let pid = async_signal_safe::CACHED_PID.load(Ordering::Relaxed) as u64;
+        let pid_len = itoa_into_buf(&mut pid_buf, pid);
 
-        // Minimal stderr output (write(2) is async-signal-safe).
-        let msg = format!(
-            "\n#\n# A fatal error has been detected by the CratonVM Runtime Environment:\n\
-             #  Signal {} ({})\n\
-             #  Error report saved to: {}\n#\n",
-            crash.signal_name, sig, filename
+        // Thread id via `pthread_self` -> usize cast. pthread_self is on the
+        // POSIX async-signal-safe whitelist.
+        let tid = unsafe { libc::pthread_self() as u64 };
+        let tid_len = itoa_into_buf(&mut tid_buf, tid);
+
+        // Build "hs_err_pid<pid>.log\0" into `filename` without allocating.
+        let mut fpos = 0usize;
+        let parts: [&[u8]; 3] = [
+            FILE_PREFIX,
+            &pid_buf[..pid_len],
+            FILE_SUFFIX,
+        ];
+        for part in parts.iter() {
+            for &b in part.iter() {
+                if fpos + 1 < filename.len() {
+                    filename[fpos] = b;
+                    fpos += 1;
+                }
+            }
+        }
+        // NUL-terminate for `open(2)`.
+        filename[fpos] = 0;
+        let path_nul = &filename[..=fpos];
+
+        let sig_name = async_signal_safe::signal_name_bytes(sig);
+
+        // ── Emit message to stderr (write(2) is async-signal-safe) ─────────
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, HDR);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, sig_name);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, AT_PC);
+        async_signal_safe::write_all(
+            async_signal_safe::STDERR_FD,
+            &pid_buf[..pid_len],
         );
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, TID_LBL);
+        async_signal_safe::write_all(
+            async_signal_safe::STDERR_FD,
+            &tid_buf[..tid_len],
+        );
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, NL_REPORT);
+        // Write filename without the trailing NUL.
+        async_signal_safe::write_all(
+            async_signal_safe::STDERR_FD,
+            &filename[..fpos],
+        );
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, FOOTER);
+
+        // ── Write a minimal hs_err_pid file via raw open/write/close ──────
+        //
+        // We intentionally write a SHORT marker file rather than the full
+        // HotSpot report. The full report requires allocation (Backtrace,
+        // String, /proc parsing) which is forbidden here. The panic-hook
+        // path writes the rich report for ordinary panics; for hardware
+        // faults the user gets just enough to start debugging.
+        let fd = async_signal_safe::open_write_trunc(path_nul);
+        if fd >= 0 {
+            async_signal_safe::write_all(fd, b"# CratonVM fatal signal: ");
+            async_signal_safe::write_all(fd, sig_name);
+            async_signal_safe::write_all(fd, b"\n# pid=");
+            async_signal_safe::write_all(fd, &pid_buf[..pid_len]);
+            async_signal_safe::write_all(fd, b"\n# tid=");
+            async_signal_safe::write_all(fd, &tid_buf[..tid_len]);
+            async_signal_safe::write_all(
+                fd,
+                b"\n# (truncated: full report requires allocator, unsafe in \
+                  signal handler)\n",
+            );
+            async_signal_safe::close(fd);
         }
 
         // Re-raise with default handler so the exit code reflects the signal.
@@ -866,6 +1153,45 @@ mod tests {
     fn days_to_ymd_epoch() {
         let (y, m, d) = days_to_ymd(0);
         assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn itoa_into_buf_zero() {
+        let mut buf = [0u8; 8];
+        let n = itoa_into_buf(&mut buf, 0);
+        assert_eq!(&buf[..n], b"0");
+    }
+
+    #[test]
+    fn itoa_into_buf_small() {
+        let mut buf = [0u8; 8];
+        let n = itoa_into_buf(&mut buf, 1);
+        assert_eq!(&buf[..n], b"1");
+
+        let n = itoa_into_buf(&mut buf, 9);
+        assert_eq!(&buf[..n], b"9");
+
+        let n = itoa_into_buf(&mut buf, 10);
+        assert_eq!(&buf[..n], b"10");
+
+        let n = itoa_into_buf(&mut buf, 42);
+        assert_eq!(&buf[..n], b"42");
+    }
+
+    #[test]
+    fn itoa_into_buf_large() {
+        let mut buf = [0u8; 32];
+        let n = itoa_into_buf(&mut buf, 1_000_000);
+        assert_eq!(&buf[..n], b"1000000");
+
+        let n = itoa_into_buf(&mut buf, u64::MAX);
+        assert_eq!(&buf[..n], b"18446744073709551615");
+    }
+
+    #[test]
+    fn itoa_into_buf_empty_returns_zero() {
+        let mut buf = [];
+        assert_eq!(itoa_into_buf(&mut buf, 123), 0);
     }
 
     #[test]
