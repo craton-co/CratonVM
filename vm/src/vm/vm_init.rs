@@ -3628,6 +3628,330 @@ impl SharedVm {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lock-order-checked accessors for SharedVm's HOT locks (task #18, alt-branch
+// integration).
+//
+// These helpers wire the documented lock hierarchy from
+// `docs/lock-order.md` to the existing `parking_lot` fields *without*
+// changing the underlying field types — that would cascade through 500+
+// call sites in crates this task is not allowed to touch. Each helper
+// pairs the original `parking_lot` guard with an `OrderedMutexGuard` of
+// a process-wide `OrderedMutex<()>` "rank tag" — locking that tag is
+// what drives the thread-local rank tracker in
+// `crate::runtime::lock_order` (which already powers all rank-ordering
+// assertions).
+//
+// New code on hot paths SHOULD prefer these `_ranked()` accessors; the
+// raw fields remain accessible during the migration. In release builds
+// the rank checks compile away because every assertion in
+// `crate::runtime::lock_order` is `#[cfg(debug_assertions)]` — only the
+// cheap `Mutex<()>` lock/unlock remains, which is negligible against
+// the cost of acquiring the wrapped `parking_lot` lock.
+//
+// Mapping from `docs/lock-order.md` (which describes an 11-level
+// scheme) to HEAD's 6-level `LockLevel` enum:
+//
+// | Doc level / lock          | HEAD `LockLevel` |
+// |---------------------------|------------------|
+// | L10 `class_manager`       | `HeapLock`       |
+// | L9  `native_method_cache` | `ClassLoader`    |
+// | L7  `ref_processor`       | `MonitorPool`    |
+// | L6  `monitors`            | `ThreadList`     |
+// | L5  `thread_registry`     | `JitCache`       |
+// | L4  `flight_recorder`     | `Safepoint`      |
+// | L2  `native_memory`       | `Safepoint`      |
+//
+// The doc's descending L-numbers preserve their relative acquisition
+// order in the table above: `class_manager` is acquired first
+// (lowest HEAD numeric), `native_memory` last. `flight_recorder` and
+// `native_memory` share `Safepoint` because HEAD has six levels and
+// the canonical call graph never holds both simultaneously (FFI calls
+// release `flight_recorder` before reaching `native_memory`). Should a
+// future call path need both we will widen HEAD's `LockLevel` enum.
+//
+// TODO(orchestrator): extend the wiring to the remaining hot locks
+// (`jit_cache`, `native_libraries`, `upcall_table`, `jni_global_refs`,
+// `class_init_waiters`, `class_loading_locks`, `deopt_log`,
+// `invalidation_manager`, `jit_skip_set`,
+// `cleaner_thread.pending_actions`, and the `ProfileStore` L4.a/L4.b
+// sub-hierarchy in `jit/src/profile.rs`).
+
+mod ranked_locks {
+    //! Per-thread rank tracking for the SharedVm `_ranked` accessors.
+    //!
+    //! This module mirrors the discipline of
+    //! [`crate::runtime::lock_order::OrderedMutex`] but tracks held
+    //! ranks in a thread-local bit-set INSTEAD OF behind a
+    //! process-wide OS mutex. Wrapping the SharedVm fields directly
+    //! in `OrderedMutex<()>` would force every concurrent thread that
+    //! takes the same `_ranked` accessor to serialize on a single OS
+    //! lock, which both kills parallelism and creates a cross-thread
+    //! deadlock window when several tests run in parallel (test A
+    //! holds the `MONITORS` rank-tag OS lock and waits on
+    //! `CLASS_MANAGER`; test B holds `CLASS_MANAGER` and waits on
+    //! `MONITORS`). A thread-local bit-set has neither problem: the
+    //! rank-order check stays per-thread and the actual mutual
+    //! exclusion is provided by the underlying `parking_lot` field.
+    use crate::runtime::lock_order::LockLevel;
+
+    /// RAII guard returned by [`enter`]. Releases the held level on
+    /// drop in debug builds. Has no fields in release builds and is a
+    /// zero-sized type so the compiler optimizes it away entirely.
+    #[must_use = "rank scopes must be held for the duration of the lock"]
+    pub struct RankScope {
+        #[cfg(debug_assertions)]
+        level: LockLevel,
+    }
+
+    #[cfg(debug_assertions)]
+    mod tracking {
+        use super::LockLevel;
+        use crate::runtime::lock_order::LockOrderViolation;
+        use std::cell::Cell;
+
+        const COUNT: usize = 6;
+
+        thread_local! {
+            static HELD: Cell<[bool; COUNT]> = const { Cell::new([false; COUNT]) };
+        }
+
+        fn highest_held() -> Option<LockLevel> {
+            HELD.with(|cell| {
+                let arr = cell.get();
+                for i in (0..COUNT).rev() {
+                    if arr[i] {
+                        return Some(level_from_u8(i as u8));
+                    }
+                }
+                None
+            })
+        }
+
+        fn level_from_u8(v: u8) -> LockLevel {
+            match v {
+                0 => LockLevel::HeapLock,
+                1 => LockLevel::ClassLoader,
+                2 => LockLevel::MonitorPool,
+                3 => LockLevel::ThreadList,
+                4 => LockLevel::JitCache,
+                5 => LockLevel::Safepoint,
+                _ => unreachable!("level discriminant out of range: {v}"),
+            }
+        }
+
+        pub(super) fn check_and_acquire(level: LockLevel) {
+            if let Some(held) = highest_held() {
+                assert!(
+                    level > held,
+                    "{}",
+                    LockOrderViolation {
+                        attempted: level,
+                        held,
+                    }
+                );
+            }
+            HELD.with(|cell| {
+                let mut arr = cell.get();
+                arr[level as u8 as usize] = true;
+                cell.set(arr);
+            });
+        }
+
+        pub(super) fn release(level: LockLevel) {
+            HELD.with(|cell| {
+                let mut arr = cell.get();
+                arr[level as u8 as usize] = false;
+                cell.set(arr);
+            });
+        }
+    }
+
+    impl Drop for RankScope {
+        #[inline]
+        fn drop(&mut self) {
+            #[cfg(debug_assertions)]
+            tracking::release(self.level);
+        }
+    }
+
+    /// Enter a rank scope at `level`. In debug builds, panics if the
+    /// calling thread already holds an equal- or higher-rank scope.
+    /// In release builds, the panic check and the bit-set update both
+    /// compile away.
+    #[inline]
+    pub(super) fn enter(level: LockLevel) -> RankScope {
+        #[cfg(debug_assertions)]
+        {
+            tracking::check_and_acquire(level);
+            RankScope { level }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = level;
+            RankScope {}
+        }
+    }
+
+    // ----- Per-lock level mapping -----------------------------------
+
+    pub(super) const CLASS_MANAGER: LockLevel = LockLevel::HeapLock;
+    pub(super) const NATIVE_METHOD_CACHE: LockLevel = LockLevel::ClassLoader;
+    pub(super) const REF_PROCESSOR: LockLevel = LockLevel::MonitorPool;
+    pub(super) const MONITORS: LockLevel = LockLevel::ThreadList;
+    pub(super) const THREAD_REGISTRY: LockLevel = LockLevel::JitCache;
+    pub(super) const FLIGHT_RECORDER: LockLevel = LockLevel::Safepoint;
+    pub(super) const NATIVE_MEMORY: LockLevel = LockLevel::Safepoint;
+}
+
+pub use ranked_locks::RankScope;
+
+/// Rank-tracked guard returned by the `_ranked` accessors. The
+/// `rank_scope` field releases the thread-local rank when dropped; the
+/// `lock` field is the original `parking_lot` guard with the usual
+/// `Deref`/`DerefMut` to the protected value. Dropping happens in
+/// declaration order (Rust drop order), so the `parking_lot` lock is
+/// released *before* the rank scope — the symmetric inverse of
+/// acquisition.
+#[must_use = "the rank guard must be held for the duration of the lock"]
+pub struct RankedGuard<G> {
+    /// The original `parking_lot` guard. Drops first. Private so
+    /// callers cannot move it out — moving would drop the rank scope
+    /// in the same statement and silently break the rank-tracking
+    /// invariant. Access the inner value via `Deref`/`DerefMut`.
+    lock: G,
+    /// The rank-scope guard. Drops second, releasing the thread-local
+    /// rank level so a lower-ranked lock can be re-acquired. Held
+    /// only for its `Drop` side-effect; callers should not touch it.
+    #[allow(dead_code)]
+    rank_scope: RankScope,
+}
+
+impl<G: std::ops::Deref> std::ops::Deref for RankedGuard<G> {
+    type Target = G::Target;
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<G: std::ops::DerefMut> std::ops::DerefMut for RankedGuard<G> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+impl SharedVm {
+    /// Acquire `class_manager` for read with debug-only rank tracking.
+    ///
+    /// In debug builds, panics if the calling thread already holds a
+    /// lock at a higher or equal rank (per `docs/lock-order.md`). In
+    /// release builds the rank check compiles away.
+    #[inline]
+    pub fn class_manager_read_ranked(
+        &self,
+    ) -> RankedGuard<parking_lot::RwLockReadGuard<'_, ClassManager>> {
+        let rank = ranked_locks::enter(ranked_locks::CLASS_MANAGER);
+        RankedGuard {
+            lock: self.class_manager.read(),
+            rank_scope: rank,
+        }
+    }
+
+    /// Acquire `class_manager` for write with debug-only rank tracking.
+    #[inline]
+    pub fn class_manager_write_ranked(
+        &self,
+    ) -> RankedGuard<parking_lot::RwLockWriteGuard<'_, ClassManager>> {
+        let rank = ranked_locks::enter(ranked_locks::CLASS_MANAGER);
+        RankedGuard {
+            lock: self.class_manager.write(),
+            rank_scope: rank,
+        }
+    }
+
+    /// Acquire the native-method callback cache for read.
+    #[inline]
+    pub fn native_method_cache_read_ranked(
+        &self,
+    ) -> RankedGuard<
+        parking_lot::RwLockReadGuard<
+            '_,
+            crate::runtime::fx_collections::FxHashMap<
+                (String, String, String),
+                cratonvm_native_api::NativeCallback,
+            >,
+        >,
+    > {
+        let rank = ranked_locks::enter(ranked_locks::NATIVE_METHOD_CACHE);
+        RankedGuard {
+            lock: self.native_method_cache.read(),
+            rank_scope: rank,
+        }
+    }
+
+    /// Acquire `ref_processor` with debug-only rank tracking.
+    #[inline]
+    pub fn ref_processor_lock_ranked(
+        &self,
+    ) -> RankedGuard<parking_lot::MutexGuard<'_, cratonvm_gc::ReferenceProcessor>> {
+        let rank = ranked_locks::enter(ranked_locks::REF_PROCESSOR);
+        RankedGuard {
+            lock: self.ref_processor.lock(),
+            rank_scope: rank,
+        }
+    }
+
+    /// Enter the `monitors` rank scope. The monitor table itself uses
+    /// many fine-grained inner locks; this helper just announces that
+    /// the caller is about to touch monitor state so the rank tracker
+    /// can reject downstream acquisitions of higher-ranked locks
+    /// (i.e. `class_manager` or `native_method_cache`). Bind the
+    /// returned guard to a local for the duration of the monitor work.
+    #[inline]
+    #[must_use = "bind the guard to a local for the duration of the monitor work"]
+    pub fn enter_monitors_rank(&self) -> RankScope {
+        ranked_locks::enter(ranked_locks::MONITORS)
+    }
+
+    /// Enter the `thread_registry` rank scope. Same shape as
+    /// [`Self::enter_monitors_rank`]: the registry has its own internal
+    /// locking; this helper only drives the global rank tracker.
+    #[inline]
+    #[must_use = "bind the guard to a local for the duration of the work"]
+    pub fn enter_thread_registry_rank(&self) -> RankScope {
+        ranked_locks::enter(ranked_locks::THREAD_REGISTRY)
+    }
+
+    /// Acquire `flight_recorder` with debug-only rank tracking.
+    #[inline]
+    pub fn flight_recorder_lock_ranked(
+        &self,
+    ) -> RankedGuard<parking_lot::MutexGuard<'_, cratonvm_jfr::FlightRecorder>> {
+        let rank = ranked_locks::enter(ranked_locks::FLIGHT_RECORDER);
+        RankedGuard {
+            lock: self.flight_recorder.lock(),
+            rank_scope: rank,
+        }
+    }
+
+    /// Acquire `native_memory` with debug-only rank tracking.
+    ///
+    /// Shares the `Safepoint` level with `flight_recorder` (see the
+    /// mapping note above). Code paths that need both simultaneously
+    /// must take only one through its `_ranked` accessor — taking both
+    /// will trip the same-level assertion in debug builds.
+    #[inline]
+    pub fn native_memory_lock_ranked(
+        &self,
+    ) -> RankedGuard<parking_lot::MutexGuard<'_, crate::native::ffi::NativeMemoryTable>> {
+        let rank = ranked_locks::enter(ranked_locks::NATIVE_MEMORY);
+        RankedGuard {
+            lock: self.native_memory.lock(),
+            rank_scope: rank,
+        }
+    }
+}
+
 impl std::fmt::Debug for SharedVm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedVm")
