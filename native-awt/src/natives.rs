@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! AWT/Swing/Java2D native method registration.
 //!
 //! Registers native callbacks for `java/awt/*`, `javax/swing/*`, and

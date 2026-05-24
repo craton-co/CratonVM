@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.6 — Vert.x / Netty `NioEventLoop` scheduler.
 //!
 //! Keycloak 26 (Quarkus) serves HTTP through Vert.x, Vert.x wraps Netty, and

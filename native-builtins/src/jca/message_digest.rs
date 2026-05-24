@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.2 — `java.security.MessageDigest` real-JDK native dispatch.
 //!
 //! The probe (`apps/digest_probe/DigestProbe.java`) calls

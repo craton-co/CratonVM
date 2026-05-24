@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Test helpers — load real `.class` files compiled by `build.rs` from
 //! `test_classes/gpu/`.
 //!

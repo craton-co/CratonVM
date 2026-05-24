@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.1 — `java.lang.reflect` modern JDK 25 reflection coverage.
 //!
 //! Verifies the registry-side surface for the WP2.1 net-new natives

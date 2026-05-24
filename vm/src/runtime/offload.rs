@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Part E — GPU offload cache and lookup.
 //!
 //! The whole module is gated behind the `gpu-offload` Cargo feature on

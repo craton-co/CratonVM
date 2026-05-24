@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.4 — `jdk.internal.access.SharedSecrets` bridge layer.
 //!
 //! HotSpot exposes a family of `jdk.internal.access.Java*Access`

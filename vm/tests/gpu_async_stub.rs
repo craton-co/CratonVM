@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase 3 Item P3-8 — stub-mode integration test for the async GPU
 //! offload path.
 //!

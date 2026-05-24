@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Neo4j Community Edition boot-test shims.
 //!
 //! **HISTORY**: Previously this module short-circuited Neo4j's entry

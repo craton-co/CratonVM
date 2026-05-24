@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JVM monitor (intrinsic lock) implementation.
 //!
 //! Every Java object can be used as a monitor. The JVM's `monitorenter` and

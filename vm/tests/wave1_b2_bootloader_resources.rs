@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 1 B2 — `ClassLoader.getResources` boot-loader-resource regression.
 //!
 //! Pins three behaviors of `ClassLoader.getSystemClassLoader().getResources(name)`:

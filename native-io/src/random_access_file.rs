@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! java.io.RandomAccessFile JNI-style natives for real-JDK mode.
 //!
 //! These implement the private native delegates that the JDK 25

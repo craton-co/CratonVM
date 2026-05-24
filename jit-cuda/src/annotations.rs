@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Reader for the `craton.gpu.*` annotations on Java methods and classes.
 //!
 //! Phase-1 spec §2.2 / §2.3. This module is **leaf-level** — every other

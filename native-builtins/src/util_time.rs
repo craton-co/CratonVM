@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Synthetic java.time implementations backed by Rust arithmetic.
 //!
 //! **DEPRECATED (Session 15)**: This module is gated behind `#[cfg(feature = "synthetic-jdk")]`.

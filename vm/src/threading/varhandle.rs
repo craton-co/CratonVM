@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! VarHandle API implementation (java.lang.invoke.VarHandle, Java 9+).
 //!
 //! Provides typed access to variables with memory ordering semantics,

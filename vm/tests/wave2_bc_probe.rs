@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2, BcProbe — BouncyCastle provider boot smoke.
 //!
 //! Cluster D / Session 107 follow-up. BcProbe is a 4-line program that

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
 use cratonvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};

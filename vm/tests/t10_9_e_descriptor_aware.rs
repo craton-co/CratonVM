@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T10.9.E — Descriptor-aware field-decode integration tests.
 //!
 //! Validates the Session-93-ticking-time-bomb scenario: a long-typed

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! The contract every GPU lowering backend must satisfy.
 //!
 //! The trait exists so the interpreter's offload glue (Part E of the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP5.5 — `java.net.http.HttpClient` (JDK 11+) native methods.
 //!
 //! Targets `jdk/internal/net/http/*` — the package where the real JDK 11+

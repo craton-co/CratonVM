@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Loop analysis scaffolding for LICM (Loop-Invariant Code Motion).
 //!
 //! Round-8 wave-3 HIGH fix (Fix 3): scaffold for generic LICM of

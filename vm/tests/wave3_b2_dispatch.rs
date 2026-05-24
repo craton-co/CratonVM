@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave-3 Task B² regression: HttpServer.getAddress().getPort() must dispatch
 //! onto `java.net.InetSocketAddress.getPort()` (final method that proxies into
 //! `holder.getPort()`), not onto a stray `java/lang/String.getPort()`.

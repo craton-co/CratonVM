@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JDWP command-set handlers.
 //!
 //! The central entry point is [`dispatch`] which routes an incoming command

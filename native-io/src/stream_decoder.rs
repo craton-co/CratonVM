@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Real-mode shim for `sun.nio.cs.StreamDecoder`.
 //!
 //! The JDK class normally wraps a `CharsetDecoder` around an

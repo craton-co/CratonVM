@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase H integration tests for the garbage-collector crate.
 //!
 //! Each test targets one roadmap subphase (RH.1 … RH.8) and verifies

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Tier 1 (T1) verification tests.
 //!
 //! Covers the small-but-load-bearing items added during the T1 push:

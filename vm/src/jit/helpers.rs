@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JIT runtime helper functions — called from JIT-compiled code via absolute CALL.
 //!
 //! These functions need access to `SharedVm` and other VM internals, so they

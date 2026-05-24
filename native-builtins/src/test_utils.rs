@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Minimal mock NativeContext for unit testing native method implementations.
 //!
 //! Provides a simple heap-backed context that supports string creation/reading,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 1, Task D — `apps/xml_probe/XmlProbe.java` regression test.
 //!
 //! Pin the JAXP / StAX (`javax.xml.stream`) cursor API end-to-end against

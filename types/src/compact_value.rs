@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Compact 8-byte tagged value representation for JVM operand stacks.
 //!
 //! `CompactValue` uses a NaN-boxing scheme to represent all JVM value types

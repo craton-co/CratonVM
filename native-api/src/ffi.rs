@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Panama FFI infrastructure (JEP 454).
 //!
 //! Provides off-heap memory management and native library loading for the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Compressed object pointers (CompressedOops) for heaps under 32 GB.
 //!
 //! When the Java heap fits in 32 GB, every object reference can be stored as a

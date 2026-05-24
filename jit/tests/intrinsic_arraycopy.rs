@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential tests for the ARRAYCOPY JIT intrinsic family — the
 //! `java.lang.System.arraycopy` call-site intrinsic (Phase 2).
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase B (RB.8) round-trip test for `Files.newBufferedWriter` /
 //! `Files.newBufferedReader` at the fd-table level.  The native-built-
 //! ins implementation of `newBufferedWriter` opens a file via

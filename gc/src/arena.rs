@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Linear arena allocator for the semi-space copying GC.
 //!
 //! Each arena is a contiguous block of memory (`Vec<u8>`) with a cursor

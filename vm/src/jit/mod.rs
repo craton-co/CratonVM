@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JIT compiler integration.
 //!
 //! Re-exports types from the `cratonvm-jit` crate and provides VM-specific

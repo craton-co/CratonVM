@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.4-A — `java.lang.instrument` runtime infrastructure.
 //!
 //! Provides the Rust-side state for the `Instrumentation` API exposed

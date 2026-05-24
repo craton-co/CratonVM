@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! CP12 — Startup time pipeline wiring.
 //!
 //! This module implements the two sub-tasks of CP12 on top of the

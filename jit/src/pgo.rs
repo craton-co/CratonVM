@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Profile-Guided Optimization (PGO) pipeline for the CratonVM JIT compiler.
 //!
 //! Collects and analyses runtime profiling data to drive:

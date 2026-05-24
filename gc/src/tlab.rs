@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Thread-Local Allocation Buffers (TLABs).
 //!
 //! Each thread gets a small chunk of the young generation's from-space

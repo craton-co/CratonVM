@@ -5,6 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["gpu", "annotations", "java", "jvm"]
+categories = ["development-tools::build-utils"]
 description = "Java annotation sources for CratonVM GPU/parallel-compute support, compiled at build time"
 build = "build.rs"
 # Virtual `links` name. No actual native library is linked; this purely

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.4-C — `-javaagent:` JAR loader and `Premain-Class` dispatcher.
 //!
 //! When the user passes `-javaagent:foo.jar=opts` on the command line, the

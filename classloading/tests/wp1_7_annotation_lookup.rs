@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.7 — `classloading::annotations` lookup helpers against real fixtures.
 //!
 //! These tests complement `reader/tests/wp1_7_attrs.rs` by validating the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.6 — minimal ASN.1 DER encoder/decoder for the JCA surface.
 //!
 //! The only DER-touching probe in the wave is the X500Principal round-trip

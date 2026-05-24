@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JVM access flags (`ACC_*`) as defined in JVMS §4.1, §4.5, §4.6, §4.7.
 //!
 //! These are the canonical bit patterns for class, field, and method

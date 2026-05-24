@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T14 — `java/lang/System` bootstrap chain conformance test suite.
 //!
 //! Verifies that all T14 System and VM native methods are registered,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Deprecated java.lang.* API native implementations.
 //!
 //! Every method marked `@Deprecated` (or `@Deprecated(forRemoval=true)`) in

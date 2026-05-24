@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave-1 Task B — `ClassLoader.getResource` (singular) must agree
 //! with `ClassLoader.getResources` (plural enumeration). When the
 //! plural enumerator returns N≥1 URLs for a name, the singular

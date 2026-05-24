@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! I/O bootstrap tests (Session 12).
 //!
 //! Tests cover: FileInputStream, FileOutputStream, BufferedReader,

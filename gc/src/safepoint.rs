@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! GPU / GC coordination primitives (Part F of the GPU offload plan).
 //!
 //! This module exists only when the `gpu-offload` Cargo feature is on. It

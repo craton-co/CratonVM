@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T4.10 -- Differential testing harness.
 //!
 //! Runs the same Java method under both CratonVM and HotSpot (via

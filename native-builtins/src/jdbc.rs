@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP7.1 — `DriverManager` + `ServiceLoader`-backed JDBC driver discovery.
 //!
 //! The roadmap (Wave 7, §10) frames this work package as JVM-level driver

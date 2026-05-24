@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! GarbageCollector trait -- abstraction over heap implementations.
 //!
 //! Allows swapping between the simple semi-space `Heap` and the

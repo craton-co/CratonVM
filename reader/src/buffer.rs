@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 use crate::class_reader_error::ClassReaderError;
 
 /// A byte buffer for reading binary data from a `.class` file.

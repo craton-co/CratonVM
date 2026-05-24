@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! AWT event model — maps Java AWT events to Rust structures.
 //!
 //! Every constant in this module matches its Java counterpart exactly, so

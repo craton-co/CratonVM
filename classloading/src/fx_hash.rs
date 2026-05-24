@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Minimal FxHasher + type aliases for hot-path caches in classloading.
 //!
 //! Mirrors the implementation in `vm/src/runtime/fx_collections.rs` but lives

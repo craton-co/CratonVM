@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T4.8 -- JDWP Conformance Tests
 //!
 //! These tests verify that the CratonVM JDWP (Java Debug Wire Protocol)

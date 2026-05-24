@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JDWP (Java Debug Wire Protocol) foundation.
 //!
 //! This module implements the wire protocol that IDE debuggers (IntelliJ,

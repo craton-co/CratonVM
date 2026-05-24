@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Lower the scheduled IR graph to x86-64 machine code.
 //!
 //! Walks the scheduled basic blocks, emits native instructions for each

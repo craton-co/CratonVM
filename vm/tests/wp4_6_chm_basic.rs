@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP4.6 — ConcurrentHashMap regression tests.
 //!
 //! Pins the K1-family coercion fix at `vm/src/runtime/value_stack.rs:385-460`

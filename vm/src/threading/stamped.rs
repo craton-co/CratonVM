@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP4.7 — `java.util.concurrent.locks.StampedLock` and
 //! `java.util.concurrent.locks.ReentrantReadWriteLock` integration shim.
 //!

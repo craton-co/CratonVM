@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! ARM64 (AArch64) JIT backend compilation pipeline.
 //!
 //! Translates JVM bytecode into a sequence of `Arm64Instruction` pseudo-ops that

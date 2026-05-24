@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Object helpers: Java String interning, Class mirrors, static field access.
 
 use crate::classloading::ClassId;

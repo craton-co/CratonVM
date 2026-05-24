@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Interpreter intrinsic handlers for `java/lang/StringBuilder`.
 //!
 //! Every handler here is behavior-identical to the normal native-registry

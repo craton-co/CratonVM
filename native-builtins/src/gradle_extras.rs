@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Gradle launcher boot-test shim.
 //!
 //! **HISTORY**: Previously this module short-circuited the Gradle

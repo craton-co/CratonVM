@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! `DeviceModule::launch_on_stream` — stream-aware kernel launch.
 //!
 //! Phase 2, Item P2-4. Mirrors the existing single-stream

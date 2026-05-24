@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase I — Smoke tests per app family (roadmap items RI.1 .. RI.10).
 //!
 //! This file is the Phase-I harness described in

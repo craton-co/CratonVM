@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP3.3 + WP3.6 — Real `sun/nio/ch/FileDispatcherImpl.map0` /
 //! `unmap0` / `transferTo0` / `maxDirectTransferSize0`.
 //!

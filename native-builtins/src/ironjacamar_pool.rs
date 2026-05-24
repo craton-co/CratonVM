@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.8 — IronJacamar (WildFly JCA) JDBC connection pool natives.
 //!
 //! WildFly / Keycloak 16 routes its datasource through IronJacamar, the

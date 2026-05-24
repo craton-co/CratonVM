@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential tests for the CRC32 / CRC32C JIT `update` call-site
 //! intrinsic family (Phase 4c).
 //!

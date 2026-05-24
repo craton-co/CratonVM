@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! RA.4 — JBoss Modules `module.xml` parser.
 //!
 //! `org.jboss.modules.xml.ModuleXmlParser.parseModuleXml(...)` is the

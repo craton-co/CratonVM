@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.9 — `java.lang.StackWalker` / full stack-trace machinery.
 //!
 //! This module hosts the helpers used by:

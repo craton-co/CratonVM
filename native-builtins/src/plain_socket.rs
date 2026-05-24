@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP5.7 — `java.net.PlainSocketImpl` / `sun.nio.ch.NioSocketImpl` /
 //! `java.net.PlainServerSocketImpl` (legacy classical-blocking-I/O surface).
 //!

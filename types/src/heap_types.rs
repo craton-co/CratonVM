@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Heap object layout types and constants.
 //!
 //! Defines the on-heap object header layout shared by the GC, JIT, and

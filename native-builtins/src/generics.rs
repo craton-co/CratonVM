@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.8 — Runtime conversion: parsed signature AST → Java reflective Type objects.
 //!
 //! The parser itself lives in `cratonvm_reader::signature`. This module

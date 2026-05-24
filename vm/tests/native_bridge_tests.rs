@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Native method bridging tests (Session 10).
 //!
 //! Tests cover: System.arraycopy, Object.hashCode, Thread.currentThread,

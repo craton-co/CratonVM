@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Real cryptographic primitive implementations (software-based, no external crate dependencies).
 //!
 //! Phase 19.2 — AES (ECB/CBC/GCM), SHA-2 (256/384/512), HMAC, HKDF, SecureRandom.

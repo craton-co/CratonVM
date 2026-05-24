@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP5.8 — `java.net.InetAddress` real DNS resolver.
 //!
 //! Owns the *implementation type* surface for IPv4 and IPv6 resolution:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! FreeMind (Java mind-mapping desktop app) boot-test shims.
 //!
 //! **HISTORY**: Previously this module short-circuited FreeMind's entry

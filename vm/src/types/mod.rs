@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JVM value types and type system.
 //!
 //! This module defines the runtime representation of JVM values.

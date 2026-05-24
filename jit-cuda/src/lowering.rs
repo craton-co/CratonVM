@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Java bytecode → PTX kernel lowering — entry point.
 //!
 //! The architecture is two-stage:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! `ObjectStreamClass` per-class cache.
 //!
 //! Each `Class` has (at most) one `ObjectStreamClass` descriptor. Once a

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.2.e — WildFly Datasources subsystem + JTA Transactions glue.
 //!
 //! Keycloak 16 boots through WildFly's `datasources` subsystem to bind

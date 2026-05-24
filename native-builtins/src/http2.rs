@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! HTTP/2 Java client native method implementations.
 //!
 //! Provides java.net.http.HttpClient, HttpRequest, HttpResponse,

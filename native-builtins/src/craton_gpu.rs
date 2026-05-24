@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Native shims for `craton.gpu.internal.Native` (Phase 3 — Item P3-4).
 //!
 //! These are the Rust-side handlers behind every `Native.*` method the

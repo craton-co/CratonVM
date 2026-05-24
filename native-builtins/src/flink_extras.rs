@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Apache Flink boot-test shims.
 //!
 //! Flink's `bin/flink` CLI dispatches to `org.apache.flink.client.cli.CliFrontend.main`,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! ARM64 (AArch64) code emitter — Phase 7.2.
 //!
 //! This module contains the ARM64 instruction encoder and code generator,

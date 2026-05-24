@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 3, Task C — `apps/selector_probe/SelectorProbe.java` regression test.
 //!
 //! Pin the JDK NIO selector loop end-to-end against the cratonvm CLI in

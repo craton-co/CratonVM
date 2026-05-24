@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP7.1 — `DriverManager` + ServiceLoader-based JDBC driver discovery.
 //!
 //! Pins the WP7.1 acceptance criterion from `docs/wildfly-ejbca-roadmap.md`

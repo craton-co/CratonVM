@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2, Task D — `Cleaner.create()` + `ByteBuffer.allocateDirect` end-to-end.
 //!
 //! S107 Cluster D pinned a regression where the CleanerProbe — which exercises

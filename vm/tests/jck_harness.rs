@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JCK harness — discovers and runs JCK test classes through the CratonVM.
 //!
 //! This test is `#[ignore]` by default because it requires a valid JCK

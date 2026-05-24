@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! craton-gpu — Java annotation classes for GPU offload directives.
 //!
 //! Annotations live in src/main/java/craton/gpu/ and are compiled by

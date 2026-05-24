@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 1, Task D — JAXP / StAX (`javax.xml.stream`) native overrides.
 //!
 //! Provides a minimal but spec-faithful StAX cursor API backed by the

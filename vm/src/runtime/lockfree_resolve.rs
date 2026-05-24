@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Lock-free method resolution caching for the interpreter's hot path.
 //!
 //! This module provides a two-level resolution cache that eliminates lock

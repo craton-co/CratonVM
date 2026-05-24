@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential & correctness tests for the interpreter intrinsic table.
 //!
 //! Feature: `docs/feature_roadmap_interpreter_intrinsic_table.md`

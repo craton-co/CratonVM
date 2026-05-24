@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Interpreter intrinsic handlers for `java/lang/String`.
 //!
 //! See `docs/internal/intrinsic_table_contract.md` and

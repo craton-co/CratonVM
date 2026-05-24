@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.2 — `Method.invoke` 50-case matrix.
 //!
 //! End-to-end coverage for `java.lang.reflect.Method.invoke` and supporting

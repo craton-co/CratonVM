@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.7 — Annotation proxy spec-compliance tests.
 //!
 //! These tests verify the runtime contract of the annotation proxy after

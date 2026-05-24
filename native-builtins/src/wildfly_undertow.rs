@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.2.d — WildFly Undertow HTTP subsystem + IO integration.
 //!
 //! Undertow is WildFly's embedded HTTP server. For Keycloak 16 it binds to

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.1 — JBoss MSC (Modular Service Container) native glue.
 //!
 //! WildFly's boot sequence, after `org.jboss.modules.Main.main()` has

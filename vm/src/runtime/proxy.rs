@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.5 — Dynamic `java.lang.reflect.Proxy.newProxyInstance` support.
 //!
 //! ## Strategy (B+: enhanced synthetic Proxy$Instance)

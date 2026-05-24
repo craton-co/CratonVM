@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.7.d — XNIO Conduit stream channels + `ChannelListener`.
 //!
 //! XNIO's read/write abstraction is the "conduit" channel. Undertow reads HTTP

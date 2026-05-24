@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP8.11.6 — PKCS#10 / X.509 v3 ASN.1 helpers.
 //!
 //! BC's `JcaPKCS10CertificationRequestBuilder.build(signer)` (the first

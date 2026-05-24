@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave1-C: per-Thread `UncaughtExceptionHandler` side-table.
 //!
 //! `Thread.setUncaughtExceptionHandler(handler)` was previously a noop

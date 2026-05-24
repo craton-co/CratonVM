@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Build tool compatibility checks for Maven and Gradle.
 //!
 //! Provides checkers that verify a CratonVM installation can be used by

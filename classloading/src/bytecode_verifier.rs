@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Bytecode verification — Pass 3 (JVM spec 4.10.1).
 //!
 //! Type-checking verification for Java 7+ classes using StackMapTable frames.

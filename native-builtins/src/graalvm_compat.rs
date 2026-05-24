@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! GraalVM Native Image Compatibility Layer (Phase 17.2).
 //!
 //! Provides metadata structures for GraalVM native-image configuration

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JDWP event system — breakpoints, thread events, VM lifecycle.
 //!
 //! The debugger client registers *event requests* that describe what it wants

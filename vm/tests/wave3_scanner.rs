@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 3 — `Scanner` against `System.in` regression.
 //!
 //! Pins the S110 fix that wires `System.in` to OS stdin (fd id 0 in the

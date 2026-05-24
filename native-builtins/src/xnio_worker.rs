@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.7.b — JBoss XNIO `XnioWorker` + thread pool.
 //!
 //! XNIO is the asynchronous-IO framework JBoss / WildFly Undertow use. The

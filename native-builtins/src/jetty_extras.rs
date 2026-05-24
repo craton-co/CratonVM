@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Jetty 11 boot-test shims.
 //!
 //! The boot test target is `java -jar jetty-home-11.0.20/start.jar`. Under

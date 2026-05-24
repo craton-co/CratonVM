@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP5.6 — legacy `sun.net.www.protocol.http(s).HttpURLConnection` natives.
 //!
 //! The JDK's HTTP/1.1 stack predates `java.net.http.HttpClient` and exposes

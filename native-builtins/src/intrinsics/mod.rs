@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Interpreter intrinsic table — fast-path dispatch for hot JDK methods.
 //!
 //! This module provides two functions used by the interpreter inline cache:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.10 — Infinispan local-mode cache natives.
 //!
 //! Keycloak (both KC16 and KC26) uses Infinispan in **local mode** for its

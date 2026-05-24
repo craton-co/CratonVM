@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Registry for native method implementations.
 //!
 //! Maps (class, method, descriptor) triples to Rust function callbacks

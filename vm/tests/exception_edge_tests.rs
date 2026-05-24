@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Exception handling edge-case tests (Session 2 hardening).
 //!
 //! Tests cover: finally semantics, deep unwinding, catch priority,

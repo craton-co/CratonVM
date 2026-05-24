@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! End-to-end Phase 1 test: load each annotated fixture, assert the
 //! `OffloadCache` decision matches the canonical behavior matrix.
 //!

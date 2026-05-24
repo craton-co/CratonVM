@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Java bytecode → PTX lowering for CratonVM GPU offload.
 //!
 //! This crate is consumed by the VM to decide whether a static method

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NUMA-aware allocation (Phase 16.3) and string deduplication (Phase 16.4).
 //!
 //! Real platform NUMA detection lives in [`NumaTopology::detect`] with

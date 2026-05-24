@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Hand-rolled X.509 / PKCS#7 Subject-DN parser for the SecurityManager
 //! policy engine.
 //!

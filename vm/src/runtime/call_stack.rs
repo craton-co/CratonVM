@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! The JVM call stack (thread execution stack).
 //!
 //! Each thread has its own call stack that tracks method invocation metadata.

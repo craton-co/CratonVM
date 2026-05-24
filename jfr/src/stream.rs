@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Live event stream for consuming JFR events as they are emitted.
 //!
 //! `EventStream` provides an iterator/poll interface over a recording's event

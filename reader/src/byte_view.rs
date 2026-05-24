@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Shared, zero-copy byte view into a parent `Arc<[u8]>` allocation.
 //!
 //! `ByteView` exists to fix the round-4 regression where

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T4.9 -- Real-Application Conformance Test Suite
 //!
 //! These tests verify that CratonVM can boot and partially execute real-world

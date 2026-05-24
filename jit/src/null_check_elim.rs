@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T5.2.14 — Null-check elimination pass.
 //!
 //! A forward dataflow analysis that tracks which local variables are

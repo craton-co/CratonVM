@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2 (Cluster D v2 — Session 108) — `apps/bytebuddy_probe/ByteBuddyProbe`.
 //!
 //! Pin two natives that, when missing, cause silent-swallow cascades during

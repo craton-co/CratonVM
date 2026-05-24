@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP5.3 — `X509KeyManager` / `X509TrustManager` per-connection.
 //!
 //! This module owns the SunJSSE-internal native surface for the X509 manager

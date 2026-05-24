@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! AUDIT-2026-05-16: Differential FP testing for the JIT.
 //!
 //! The roadmap calls out "JIT crashes on FP math" as a top blocker, yet the

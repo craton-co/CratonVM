@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.6 — synthetic `LambdaMetafactory` proxy metadata.
 //!
 //! The bulk of lambda proxy creation (bootstrap + allocation) lives in

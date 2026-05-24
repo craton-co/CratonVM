@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.2 — comprehensive `sun.misc.Unsafe` / `jdk.internal.misc.Unsafe`
 //! native method coverage.
 //!

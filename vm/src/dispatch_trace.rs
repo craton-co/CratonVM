@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! 256-slot ring buffer for postmortem dispatch tracing.
 //!
 //! Gated by `CRATONVM_DBG_LETSGO=1`. When enabled, every bytecode-method

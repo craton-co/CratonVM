@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase 18.3: Threading <-> VM Integration
 //!
 //! Wires virtual threads, VarHandle, JMM fence/volatile semantics,

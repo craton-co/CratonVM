@@ -7,8 +7,8 @@ license.workspace = true
 description = "Thin CUDA Driver API bridge for CratonVM GPU offload"
 readme = "../README.md"
 repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["cuda", "ffi", "gpu", "nvidia"]
+categories = ["api-bindings", "external-ffi-bindings"]
 
 [dependencies]
 thiserror = { workspace = true }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.5 — built-in class loader hierarchy: boot, platform, application.
 //!
 //! In the JVM spec (§5.3) and JDK 9+ implementation:

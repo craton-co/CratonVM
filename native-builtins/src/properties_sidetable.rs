@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19_K3_PROPS_SIDETABLE — robust `java.util.Properties` storage.
 //!
 //! KC26 / KeycloakMain.<clinit> reads `org.keycloak.common.Version.VERSION`,

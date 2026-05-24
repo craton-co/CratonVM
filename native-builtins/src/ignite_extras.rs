@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Apache Ignite boot-test shims.
 //!
 //! The primary `bin/ignite.sh` entry point is

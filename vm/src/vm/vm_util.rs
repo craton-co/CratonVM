@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Utility functions: class initialization, preparation, descriptor helpers,
 //! and the ClassStoreHierarchy adapter for the bytecode verifier.
 

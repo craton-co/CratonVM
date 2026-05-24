@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Process-global ring buffer recording the last N native methods entered.
 //!
 //! Diagnostic aid for hangs in native (Rust) code. When the watchdog

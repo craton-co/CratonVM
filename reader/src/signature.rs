@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.8 — JVM generic signature parser (JVMS §4.7.9.1).
 //!
 //! Parses the strings stored in the `Signature` attribute and exposes

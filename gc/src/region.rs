@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! G1-style region-based garbage collector.
 //!
 //! Divides the heap into equal-sized regions (default 1 MB) that can be

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase B integration tests for the shared charset engine
 //! (`cratonvm_native_api::charset`). These tests correspond to the
 //! success criteria listed in `docs/roadmap-any-java-app.md`:

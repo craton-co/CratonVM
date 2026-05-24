@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.3 — `ClassManager::define_class_with_options` backend conformance.
 //!
 //! These tests pin down the contract that ALL four `defineClass` entry

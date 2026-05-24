@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! # cratonvm-jfr — Java Flight Recorder support for CratonVM
 //!
 //! ## Per-thread event rings

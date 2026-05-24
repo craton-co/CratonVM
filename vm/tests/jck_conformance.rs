@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NEW-16: JCK-style java.base conformance harness.
 //!
 //! Runs the curated `Tck*` test corpus under `tests/resources/cratonvm/` through

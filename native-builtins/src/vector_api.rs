@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! SIMD Vector API native method implementations (JEP 508 — 10th Incubator, JDK 25).
 //!
 //! Covers:

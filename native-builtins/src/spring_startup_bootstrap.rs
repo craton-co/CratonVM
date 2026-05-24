@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! S-SB: Spring ApplicationStartup bootstrap.
 //!
 //! Spring Boot's `AbstractApplicationContext` has an instance field:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP0.1 — regression test for the "Cannot invoke write on null" P0 bug
 //! (discovered 2026-04-24 while staging EJBCA; see
 //! `docs/wildfly-ejbca-roadmap.md` WP0.1).

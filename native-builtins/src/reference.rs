@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! `java.lang.ref.*` native method implementations.
 //!
 //! T16.8: Reference types (Reference / WeakReference / SoftReference /

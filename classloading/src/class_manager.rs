@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Class manager — loading, parsing, and caching of Java classes.
 //!
 //! The `ClassManager` is the central component that:

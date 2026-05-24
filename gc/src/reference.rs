@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Java reference processing for the garbage collector.
 //!
 //! Implements the four reference types defined by `java.lang.ref`:

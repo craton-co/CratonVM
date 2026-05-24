@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! AWT/Swing/Java2D native peer implementation for CratonVM.
 //!
 //! This crate provides the native method implementations that back Java's

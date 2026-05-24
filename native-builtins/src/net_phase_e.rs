@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase E — Networking natives (roadmap items RE.1 .. RE.10).
 //!
 //! This module implements the ten Phase-E items from

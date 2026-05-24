@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Event type and `Stream::record_event` / `Stream::wait_event`.
 //!
 //! A CUDA event is a synchronisation point recorded on one stream that

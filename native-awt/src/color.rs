@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! AWT Color model — ARGB color representation and color-space conversions.
 //!
 //! This module backs `java.awt.Color` and provides the color primitives used

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Java serialization runtime support.
 //!
 //! This module provides the VM-side infrastructure backing

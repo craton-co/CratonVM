@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Virtual thread scheduler (JEP 444, Java 21).
 //!
 //! Implements a simplified virtual thread model: virtual threads are still
