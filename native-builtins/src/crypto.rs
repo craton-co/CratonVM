@@ -152,6 +152,65 @@ fn is_pbkdf2(alg_idx: i32) -> bool {
     alg_idx >= 3
 }
 
+// ---------------------------------------------------------------------------
+// Unsupported-algorithm rejection (C16, C17 from the 2026-05-24 review).
+//
+// CratonVM ships PQ-crypto (ML-KEM / ML-DSA) and KDF (HKDF / PBKDF2) as
+// size-only synthetic stubs in this module — `KEM.newDecapsulator(...)` and
+// `KDF.deriveKey(...)` historically returned well-formed-but-fixed byte
+// arrays, which is a "silently wrong key material" footgun. The user-chosen
+// disposition is to surface failure loudly: the `getInstance` entry points
+// for the affected algorithm names throw `NoSuchAlgorithmException` (mapped
+// to `RuntimeError::IllegalArgumentException`, the existing in-file idiom
+// for "unsupported algorithm at getInstance") with a message that explains
+// the placeholder status and tells the user exactly which algorithm was
+// rejected. The semantic intent ("there is no such algorithm in this
+// build") matches the JDK's `NoSuchAlgorithmException` contract; the
+// message body is the disambiguator since `RuntimeError` has no NSAE
+// variant.
+// ---------------------------------------------------------------------------
+
+/// Names of post-quantum KEM/Signature algorithms whose `getInstance` we
+/// reject because the implementation is a size-only stub.
+fn is_unsupported_pq_algorithm(name: &str) -> bool {
+    matches!(
+        name,
+        "ML-KEM"
+            | "ML-KEM-512"
+            | "ML-KEM-768"
+            | "ML-KEM-1024"
+            | "ML-DSA"
+            | "ML-DSA-44"
+            | "ML-DSA-65"
+            | "ML-DSA-87"
+    )
+}
+
+/// Names of KDF algorithms whose `getInstance` we reject because
+/// `crypto_impl::derive_key_bytes` is a fixed-salt / fixed-IKM stub.
+fn is_unsupported_kdf_algorithm(name: &str) -> bool {
+    matches!(
+        name,
+        "HKDF"
+            | "HKDFExtract"
+            | "HKDFExpand"
+            | "HKDF-SHA256"
+            | "HKDF-SHA384"
+            | "HKDF-SHA512"
+    ) || name.starts_with("PBKDF2WithHmacSHA")
+}
+
+/// Build the standard rejection message for an unsupported crypto algorithm.
+/// The "NoSuchAlgorithmException" prefix is load-bearing: Java callers and
+/// tests grep for it to distinguish "we don't have it" from "your input was
+/// malformed", since `RuntimeError` does not carry a dedicated NSAE variant.
+fn unsupported_algorithm_message(name: &str) -> String {
+    format!(
+        "NoSuchAlgorithmException: Algorithm '{}' is not supported in this CratonVM build (post-quantum / KDF natives are placeholders pending real implementation).",
+        name
+    )
+}
+
 fn default_iteration_count(alg_idx: i32) -> i32 {
     if is_pbkdf2(alg_idx) { 310_000 } else { 0 }
 }
@@ -285,12 +344,23 @@ fn register_kdf(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // getInstance(String algorithm) -> KDF
+    //
+    // C17: reject all HKDF/PBKDF2 algorithm names — the underlying
+    // `crypto_impl::derive_key_bytes` is a fixed-salt / fixed-IKM stub
+    // that returns the same bytes per (algorithm, length) across every
+    // process, so any code reaching deriveKey/deriveData would get a
+    // single hard-coded "secret". Surface failure loudly here.
     r.register(
         cls,
         "getInstance",
         "(Ljava/lang/String;)Ljavax/crypto/KDF;",
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
+            if is_unsupported_kdf_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = kdf_algorithm_idx(&alg);
             if alg_idx < 0 {
                 return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
@@ -315,6 +385,11 @@ fn register_kdf(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
             let prov = read_string_arg(ctx, args, 1);
+            if is_unsupported_kdf_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = kdf_algorithm_idx(&alg);
             if alg_idx < 0 {
                 return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
@@ -661,12 +736,22 @@ fn register_key_pair_generator(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // getInstance(String algorithm) -> KeyPairGenerator
+    //
+    // C16: reject ML-KEM-*/ML-DSA-* — the generateKeyPair fallback for
+    // these algorithm indices allocates zero-filled "key" objects of the
+    // right byte length, which is silently-wrong key material. Real RSA
+    // (alg_idx 6), EC (7), and Ed25519 (8) still flow through.
     r.register(
         cls,
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;",
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
+            if is_unsupported_pq_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = kpg_algorithm_idx(&alg);
             let key_size = mlkem_key_size(alg_idx);
             let obj = alloc_concurrent_synthetic(ctx, "java/security/KeyPairGenerator", 3);
@@ -684,6 +769,11 @@ fn register_key_pair_generator(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyPairGenerator;",
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
+            if is_unsupported_pq_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = kpg_algorithm_idx(&alg);
             let key_size = mlkem_key_size(alg_idx);
             let obj = alloc_concurrent_synthetic(ctx, "java/security/KeyPairGenerator", 3);
@@ -838,12 +928,23 @@ fn register_kem(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // getInstance(String algorithm) -> KEM
+    //
+    // C16: reject ML-KEM-* — `newDecapsulator(...).decapsulate(...)`
+    // would otherwise return a zero-filled shared-secret of the right
+    // length, which is silently-wrong key material. ECDH/X25519/X448
+    // remain registered but are still synthetic (out of scope for this
+    // change).
     r.register(
         cls,
         "getInstance",
         "(Ljava/lang/String;)Ljavax/crypto/KEM;",
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
+            if is_unsupported_pq_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = kem_algorithm_idx(&alg);
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KEM", 4);
             ctx.set_field(obj, 0, Value::Int(alg_idx));
@@ -862,6 +963,11 @@ fn register_kem(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
             let prov = read_string_arg(ctx, args, 1);
+            if is_unsupported_pq_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = kem_algorithm_idx(&alg);
             let prov_idx = provider_idx(&prov);
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KEM", 4);
@@ -1026,12 +1132,23 @@ fn register_signature(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // getInstance(String algorithm) -> Signature
+    //
+    // C16: reject ML-DSA-* — the `sign()` fallback for these algorithm
+    // indices returns zero-filled bytes of the right length, which a
+    // user-side `verify()` will accept (the synthetic verify path checks
+    // only the length when no real key is registered). Real RSA/ECDSA
+    // (alg_idx 3, 4) still flow through.
     r.register(
         cls,
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/Signature;",
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
+            if is_unsupported_pq_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = sig_algorithm_idx(&alg);
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 5);
             ctx.set_field(obj, 0, Value::Int(alg_idx));
@@ -1051,6 +1168,11 @@ fn register_signature(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let alg = read_string_arg(ctx, args, 0);
             let prov = read_string_arg(ctx, args, 1);
+            if is_unsupported_pq_algorithm(&alg) {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: unsupported_algorithm_message(&alg),
+                }.into());
+            }
             let alg_idx = sig_algorithm_idx(&alg);
             let prov_idx = provider_idx(&prov);
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 5);
@@ -2355,5 +2477,78 @@ mod crypto_tests {
         assert_eq!(named_param_idx("ML-DSA-44"), 3);
         assert_eq!(named_param_idx("Ed25519"), 6);
         assert_eq!(named_param_idx("X25519"), 8);
+    }
+
+    // --- C16 / C17 rejection helpers (2026-05-24 review) ------------------
+
+    #[test]
+    fn test_is_unsupported_pq_algorithm_rejects_ml_kem() {
+        assert!(is_unsupported_pq_algorithm("ML-KEM"));
+        assert!(is_unsupported_pq_algorithm("ML-KEM-512"));
+        assert!(is_unsupported_pq_algorithm("ML-KEM-768"));
+        assert!(is_unsupported_pq_algorithm("ML-KEM-1024"));
+    }
+
+    #[test]
+    fn test_is_unsupported_pq_algorithm_rejects_ml_dsa() {
+        assert!(is_unsupported_pq_algorithm("ML-DSA"));
+        assert!(is_unsupported_pq_algorithm("ML-DSA-44"));
+        assert!(is_unsupported_pq_algorithm("ML-DSA-65"));
+        assert!(is_unsupported_pq_algorithm("ML-DSA-87"));
+    }
+
+    #[test]
+    fn test_is_unsupported_pq_algorithm_accepts_classical() {
+        // Real-backed algorithms must NOT be rejected at getInstance.
+        assert!(!is_unsupported_pq_algorithm("RSA"));
+        assert!(!is_unsupported_pq_algorithm("EC"));
+        assert!(!is_unsupported_pq_algorithm("Ed25519"));
+        assert!(!is_unsupported_pq_algorithm("X25519"));
+        assert!(!is_unsupported_pq_algorithm("SHA256withRSA"));
+        assert!(!is_unsupported_pq_algorithm(""));
+    }
+
+    #[test]
+    fn test_is_unsupported_kdf_algorithm_rejects_hkdf() {
+        assert!(is_unsupported_kdf_algorithm("HKDF"));
+        assert!(is_unsupported_kdf_algorithm("HKDFExtract"));
+        assert!(is_unsupported_kdf_algorithm("HKDFExpand"));
+        assert!(is_unsupported_kdf_algorithm("HKDF-SHA256"));
+        assert!(is_unsupported_kdf_algorithm("HKDF-SHA384"));
+        assert!(is_unsupported_kdf_algorithm("HKDF-SHA512"));
+    }
+
+    #[test]
+    fn test_is_unsupported_kdf_algorithm_rejects_pbkdf2() {
+        assert!(is_unsupported_kdf_algorithm("PBKDF2WithHmacSHA1"));
+        assert!(is_unsupported_kdf_algorithm("PBKDF2WithHmacSHA256"));
+        assert!(is_unsupported_kdf_algorithm("PBKDF2WithHmacSHA384"));
+        assert!(is_unsupported_kdf_algorithm("PBKDF2WithHmacSHA512"));
+    }
+
+    #[test]
+    fn test_is_unsupported_kdf_algorithm_accepts_unrelated() {
+        assert!(!is_unsupported_kdf_algorithm(""));
+        assert!(!is_unsupported_kdf_algorithm("AES"));
+        assert!(!is_unsupported_kdf_algorithm("SHA-256"));
+        assert!(!is_unsupported_kdf_algorithm("Argon2"));
+    }
+
+    #[test]
+    fn test_unsupported_algorithm_message_format() {
+        let msg = unsupported_algorithm_message("ML-KEM-768");
+        // Must lead with "NoSuchAlgorithmException:" so Java callers and
+        // tests can distinguish the disposition from "bad input".
+        assert!(
+            msg.starts_with("NoSuchAlgorithmException:"),
+            "message must lead with NSAE prefix, got: {msg}"
+        );
+        // Must name the rejected algorithm so the user can see what failed.
+        assert!(msg.contains("ML-KEM-768"), "message must mention algorithm, got: {msg}");
+        // Must hint at why it's rejected so users don't think it's a typo.
+        assert!(
+            msg.contains("placeholder") || msg.contains("CratonVM"),
+            "message must explain the placeholder status, got: {msg}"
+        );
     }
 }

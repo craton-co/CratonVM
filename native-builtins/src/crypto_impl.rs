@@ -1022,20 +1022,31 @@ impl Hkdf {
     }
 }
 
-/// Derive key bytes using HKDF with the hash function corresponding to the
-/// KDF algorithm index (0 = HKDF-SHA256, 1 = HKDF-SHA384, 2 = HKDF-SHA512).
-/// For PBKDF2 indices (3-5), falls back to HKDF with the matching hash.
-/// Uses a fixed salt and info of "cratonvm-kdf" for deterministic derivation
-/// when no explicit keying material is provided from the JVM layer.
+/// TEST ONLY — do not use for production key material; fixed IKM/salt.
+///
+/// C17 (2026-05-24 review): this function returns the *same* derived bytes
+/// for every call with the same `(alg_idx, key_bytes)` pair, across every
+/// VM run and every process, because the salt/IKM/info inputs are fixed
+/// string literals (`"cratonvm-kdf-salt"`, `"cratonvm-kdf-ikm"`,
+/// `"cratonvm-kdf"`). It exists only so the synthetic KDF surface can
+/// return non-zero bytes during round-trip experiments — anyone using it
+/// as key material would get a single hard-coded "secret".
+///
+/// The production call sites (`crypto.rs::KDF.getInstance(...)`) now
+/// reject HKDF/PBKDF2 algorithm names with `NoSuchAlgorithmException`, so
+/// this path is unreachable from Java code. The function is kept as a
+/// `#[doc(hidden)]` test helper for the in-crate HKDF unit tests; it must
+/// not be promoted back into a production path without first replacing
+/// the fixed inputs with real `AlgorithmParameterSpec`-derived bytes.
+#[doc(hidden)]
 pub fn derive_key_bytes(alg_idx: i32, key_bytes: usize) -> Vec<u8> {
     let hash_fn = match alg_idx {
         1 | 4 => HashFunction::Sha384,
         2 | 5 => HashFunction::Sha512,
         _ => HashFunction::Sha256, // 0, 3, or fallback
     };
-    // Use a fixed IKM and salt so the stub produces non-zero deterministic output.
-    // Real key material would come from the JVM-side AlgorithmParameterSpec in a
-    // full implementation; this ensures callers at least get usable derived bytes.
+    // Fixed salt/IKM/info — see TEST ONLY warning above. The bytes are
+    // deterministic per (alg_idx, key_bytes); never use as real key material.
     let salt = b"cratonvm-kdf-salt";
     let ikm = b"cratonvm-kdf-ikm";
     let info = b"cratonvm-kdf";
