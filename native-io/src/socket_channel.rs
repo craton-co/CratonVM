@@ -699,7 +699,22 @@ fn sc_connect_inner(
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
 
     if allow_block {
-        let stream = TcpStream::connect(&target).map_err(|e| map_err(&target, e))?;
+        // Task #16: SSRF hardening. Route through `policy_connect`, which
+        // (1) consults the outbound-host policy (default: reject link-local
+        // cloud-metadata IPs like 169.254.169.254) and (2) applies the
+        // configured connect timeout (default 30 s) so a black-hole target
+        // can't pin the VM thread for the OS-default ~2 minutes.
+        let stream = match crate::outbound_policy::policy_connect(&target) {
+            Ok(s) => s,
+            Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
+                return Err(ioex(format!(
+                    "connect denied by outbound policy: {reason}"
+                )));
+            }
+            Err(crate::outbound_policy::PolicyConnectError::Io(e)) => {
+                return Err(map_err(&target, e));
+            }
+        };
         // Apply current blocking state if non-blocking flag was set before
         // connect (rare, but handled).
         let blocking = read_blocking_flag(ctx, this);
@@ -721,6 +736,17 @@ fn sc_connect_inner(
         }
         ipc_dbg(format!("connect success(blocking) id={id} local_port={local_port}"));
         return Ok(true);
+    }
+
+    // Task #16: policy gate also applies to non-blocking connects. We
+    // keep the existing 750 ms fast-path timeout here (deliberately
+    // shorter than the global 30 s cap — this is the Surefire IPC
+    // path, where localhost should answer in milliseconds), but a
+    // policy denial must still short-circuit the connect attempt.
+    if let Err(reason) = crate::outbound_policy::check_outbound(&target) {
+        return Err(ioex(format!(
+            "connect denied by outbound policy: {reason}"
+        )));
     }
 
     // Non-blocking path fast-path: for localhost IPC (e.g., Surefire

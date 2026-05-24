@@ -458,7 +458,22 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("connect0: FileDescriptor has no fd id"))?;
 
-    let stream = TcpStream::connect(&conn_addr).map_err(|e| net_err(&conn_addr, e))?;
+    // Task #16: SSRF hardening. Apply the outbound-host policy + configured
+    // connect timeout (default 30 s) before dialing. Without this, guest
+    // code calling `sun/nio/ch/Net.connect0` could reach cloud-metadata
+    // endpoints (e.g. AWS IMDS at 169.254.169.254) or pin the VM thread
+    // on a black-hole target for the OS-default TCP timeout (~2 min).
+    let stream = match crate::outbound_policy::policy_connect(&conn_addr) {
+        Ok(s) => s,
+        Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
+            return Err(ioex(format!(
+                "connect denied by outbound policy: {reason}"
+            )));
+        }
+        Err(crate::outbound_policy::PolicyConnectError::Io(e)) => {
+            return Err(net_err(&conn_addr, e));
+        }
+    };
 
     net_sockets()
         .write()

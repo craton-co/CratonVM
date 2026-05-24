@@ -52,6 +52,11 @@ pub mod file_channel;
 pub mod socket_channel;
 // WP3.2 — AsynchronousSocketChannel / AsynchronousServerSocketChannel + AsynchronousChannelGroup.
 pub mod async_socket;
+// Task #16 — SSRF outbound-policy hook + configurable connect timeout shared
+// by the async path (`async_socket`) and the blocking NIO path
+// (`socket_channel`, `net`). Default policy blocks link-local cloud-metadata
+// IPs; default timeout is 30 s.
+pub mod outbound_policy;
 // WP3.5 — DirectByteBuffer real allocation + Bits accounting + power-of-two pool.
 pub mod direct_buffer;
 // WP3.7 — Pipe.open() backed by libc::pipe / CreatePipe.
