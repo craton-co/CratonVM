@@ -474,7 +474,7 @@ impl<'a> Lowerer<'a> {
         for &(patch_pos, target_block) in &self.branch_patches {
             let target_offset = self.block_offsets[target_block];
             let rel32 = target_offset as i32 - (patch_pos as i32 + 4);
-            self.buf.patch_i32(patch_pos, rel32);
+            self.buf.try_patch_i32(patch_pos, rel32).expect("codegen patch in-bounds");
         }
     }
 }

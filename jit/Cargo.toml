@@ -17,6 +17,7 @@ cratonvm-reader = { path = "../reader", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
 parking_lot.workspace = true
 rustc-hash.workspace = true
+tracing.workspace = true
 
 [features]
 vm-tests = []
