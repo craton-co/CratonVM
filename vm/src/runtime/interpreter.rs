@@ -13890,8 +13890,24 @@ fn execute_invokevirtual_vtable_fast(
                 .find(rcv_name, &method_name, &method_descriptor)
                 .is_some()
             {
+                if &**rcv_name == "java/lang/invoke/ConstantCallSite"
+                    && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
+                {
+                    eprintln!(
+                        "[ccs-probe] vtable_fast: native found for {} {}{} — emitting CacheMiss",
+                        rcv_name, method_name, method_descriptor,
+                    );
+                }
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
+            }
+            if &**rcv_name == "java/lang/invoke/ConstantCallSite"
+                && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some()
+            {
+                eprintln!(
+                    "[ccs-probe] vtable_fast: native NOT found for {} {}{}",
+                    rcv_name, method_name, method_descriptor,
+                );
             }
             // FJP fix: walk the parent chain to find natives registered on
             // a superclass (e.g. `RecursiveTask.fork()` defined on
