@@ -21,4 +21,3 @@
 
 # CI and infrastructure
 /.github/ @craton-co/cratonvm-maintainers
-/justfile @craton-co/cratonvm-maintainers

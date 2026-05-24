@@ -44,8 +44,9 @@ This document describes how to cut a new release of CratonVM.
    ```
 
 5. **Build and publish the release artifacts.** A release-workflow
-   template lives at `.github/.wf/release.yml` (not yet activated — move it
-   into `.github/workflows/` to enable automatic tag-triggered releases).
+   template lives at `.github/_disabled-workflows/release.yml`
+   (currently disabled — see RELEASING.md §2; move it into
+   `.github/workflows/` to enable automatic tag-triggered releases).
    Until then, build and upload the artifacts manually:
    - Build `cratonvm-cli` for `x86_64-unknown-linux-gnu`,
      `x86_64-pc-windows-msvc`, and `aarch64-apple-darwin`.

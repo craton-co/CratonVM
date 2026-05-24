@@ -5,7 +5,8 @@
 > outcomes onto JCK sections — **not** a claim of OCTLA-signed
 > conformance. Only an Oracle-endorsed run of the actual JCK bundle
 > can produce that claim; see `docs/legal.md` for how to obtain the
-> bundle and `.github/workflows/jck.yml` for the harness that drives
+> bundle and `.github/_disabled-workflows/jck.yml` (currently
+> disabled — see RELEASING.md §2) for the harness that drives
 > it once `JCK_HOME` is configured.
 >
 > Until then, each section tracks two numbers:
@@ -14,8 +15,8 @@
 >   `cratonvm-vm` integration tests + Phase-I smoke runners) that
 >   exercise the section's API surface, weighted by rough surface area.
 > * **Open bugs** — count of unresolved items in
->   `docs/roadmap-any-java-app.md` + `docs/roadmap.md` that affect
->   that section.
+>   `docs/internal/roadmap-any-java-app.md` + `docs/internal/roadmap.md`
+>   that affect that section.
 >
 > When the real JCK bundle lands, this table is regenerated from
 > `runtests/report/junit-report.xml` via `scripts/jck-matrix.sh`.
