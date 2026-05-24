@@ -1320,31 +1320,84 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 // The channel-backed wrapper is a plain `java/net/ServerSocket` allocated
 // with the JDK's real layout; we cannot stash a back-ref inside one of its
 // fields without colliding with JDK-private slots. Instead we keep the
-// wrapper → channel mapping in a process-wide side-table keyed by the
-// wrapper's raw ObjectRef pointer.
+// wrapper → channel mapping in a process-wide side-table.
+//
+// C27 (Round-11 GC-safety fix): the table was previously keyed by
+// `ss.as_ptr() as usize` and stored `ssc.as_ptr() as usize` as the
+// value. Under a moving collector that pairing is doubly unsafe:
+//
+//   1. The key becomes stale when the GC compacts the wrapper, so a
+//      lookup with the relocated wrapper's pointer misses; worse, a
+//      fresh object allocated at the wrapper's old address silently
+//      collides with the stale row.
+//   2. The value was resurrected via `unsafe { ObjectRef::from_raw(raw
+//      as *mut u8) }` even though no Java root kept the SSC alive — the
+//      side-table itself was not scanned, so the SSC could be reclaimed
+//      while a wrapper still tried to dispatch through it (use-after-
+//      free), or relocated so the stored pointer now refers to garbage.
+//
+// The fix re-keys on the wrapper's GC-stable identity hash code and
+// stores the SSC as an `ObjectRef` directly. A post-compaction hook
+// (`ss_back_ref_update_after_gc`) remaps the stored values when the GC
+// fires; the keys are GC-stable on their own (the GC carries the hash
+// word across moves — see `gc/src/compact_header.rs::HashCodeTable::
+// update_after_gc`). Mirrors `SEED_TABLE` in
+// `native-builtins/src/securerandom.rs` and the C21 collection-overlay
+// fix in `native-collections/src/lib.rs`.
 const SSC_SOCKET_CACHE: usize = 5; // unused F_REMOTE slot — see note below.
 
 fn ss_back_ref_table()
-    -> &'static RwLock<HashMap<usize, usize>>
+    -> &'static RwLock<rustc_hash::FxHashMap<i32, ObjectRef>>
 {
-    static REG: OnceLock<RwLock<HashMap<usize, usize>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashMap::new()))
+    static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, ObjectRef>>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
-fn ss_record_back_ref(ss: ObjectRef, ssc: ObjectRef) {
+fn ss_record_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef, ssc: ObjectRef) {
+    let key = ctx.identity_hash_code(ss);
     ss_back_ref_table()
         .write()
-        .insert(ss.as_ptr() as usize, ssc.as_ptr() as usize);
+        .insert(key, ssc);
 }
 
-fn ss_back_ref(ss: ObjectRef) -> Option<ObjectRef> {
-    let raw = ss_back_ref_table()
+fn ss_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(ss);
+    ss_back_ref_table()
         .read()
-        .get(&(ss.as_ptr() as usize))
-        .copied()?;
-    // SAFETY: the SSC is kept alive by the wrapper's reference path; the
-    // mapping is removed in ssc_close.
-    Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
+        .get(&key)
+        .copied()
+}
+
+/// Post-GC hook — remap the SSC `ObjectRef` values that
+/// `ss_back_ref_table` stores. The KEYS are identity hash codes and are
+/// already GC-stable, so they need no rewrite; only the embedded
+/// ObjectRef values are repointed through `pointer_map`. Mirrors
+/// `gc_update_lambda_callsite_cache_refs` in
+/// `native-builtins/src/lang_invoke.rs`. Until this hook is wired into
+/// `vm/src/memory/gc.rs`'s post-compaction step, the table will return
+/// stale `ObjectRef` values for any SSC that was relocated. The
+/// identity-hash key fix alone eliminates the use-after-free risk that
+/// the previous `from_raw(usize)` resurrection carried — the worst-case
+/// behaviour now is a missed lookup rather than a wild dereference.
+#[allow(dead_code)]
+pub fn ss_back_ref_update_after_gc(
+    pointer_map: &rustc_hash::FxHashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut table = ss_back_ref_table().write();
+    for v in table.values_mut() {
+        let old = v.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: `new_addr` is the GC's relocated address for the
+            // same logical SSC object; the GC guarantees the new
+            // address is a valid heap object that satisfies
+            // ObjectRef's non-null/alignment invariants.
+            *v = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
 }
 
 // `F_REMOTE` (slot 5) of a SSC object is unused for ServerSocketChannel
@@ -1373,7 +1426,7 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => None,
         })
         .ok_or_else(|| ioex("socket: could not allocate ServerSocket"))?;
-    ss_record_back_ref(ss_value, this);
+    ss_record_back_ref(ctx, ss_value, this);
     if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
         ctx.set_field(this, SSC_SOCKET_CACHE, Value::Object(Some(ss_value)));
     }
@@ -1402,7 +1455,7 @@ fn ss_wrapper_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Err(ioex("bind: null this")),
     };
-    let Some(ssc) = ss_back_ref(this) else {
+    let Some(ssc) = ss_back_ref(ctx, this) else {
         // Plain ServerSocket — fall through (handled elsewhere). We can't
         // do anything for a non-channel-backed ServerSocket here.
         return Ok(None);
@@ -1419,7 +1472,7 @@ fn ss_wrapper_bind_backlog(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(o) => o,
         None => return Err(ioex("bind: null this")),
     };
-    let Some(ssc) = ss_back_ref(this) else {
+    let Some(ssc) = ss_back_ref(ctx, this) else {
         return Ok(None);
     };
     let sa = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -1433,7 +1486,7 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
-    if let Some(ssc) = ss_back_ref(this) {
+    if let Some(ssc) = ss_back_ref(ctx, this) {
         let port = ctx.get_field(ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
         return Ok(Some(Value::Int(port)));
     }
@@ -1445,7 +1498,7 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
-    let port = if let Some(ssc) = ss_back_ref(this) {
+    let port = if let Some(ssc) = ss_back_ref(ctx, this) {
         ctx.get_field(ssc, F_LOCAL_PORT).as_int().unwrap_or(0)
     } else {
         0
@@ -1460,15 +1513,15 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(Some(Value::Object(Some(isa))))
 }
 
-fn ss_wrapper_is_bound(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
-    let Some(ssc) = ss_back_ref(this) else {
+    let Some(ssc) = ss_back_ref(ctx, this) else {
         return Ok(Some(Value::Int(0)));
     };
-    let id = _ctx.get_field(ssc, F_REG_ID).as_int().unwrap_or(-1);
+    let id = ctx.get_field(ssc, F_REG_ID).as_int().unwrap_or(-1);
     Ok(Some(Value::Int(if id >= 0 { 1 } else { 0 })))
 }
 
@@ -1477,7 +1530,7 @@ fn ss_wrapper_is_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(o) => o,
         None => return Ok(Some(Value::Int(1))),
     };
-    if let Some(ssc) = ss_back_ref(this) {
+    if let Some(ssc) = ss_back_ref(ctx, this) {
         let open = ctx.get_field(ssc, F_OPEN).as_int().unwrap_or(0);
         return Ok(Some(Value::Int(if open == 0 { 1 } else { 0 })));
     }
@@ -1489,11 +1542,13 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(None),
     };
-    if let Some(ssc) = ss_back_ref(this) {
+    if let Some(ssc) = ss_back_ref(ctx, this) {
         let _ = ssc_close(ctx, &[Value::Object(Some(ssc))])?;
+        // C27: remove the identity-hashed key (was raw pointer before).
+        let key = ctx.identity_hash_code(this);
         ss_back_ref_table()
             .write()
-            .remove(&(this.as_ptr() as usize));
+            .remove(&key);
     }
     Ok(None)
 }

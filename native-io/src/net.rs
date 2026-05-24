@@ -361,11 +361,15 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
     let listener = TcpListener::bind(&bind_addr).map_err(|e| net_err(&bind_addr, e))?;
 
-    // Best-effort: record the resolved local port back onto the FileDescriptor
-    // so the JDK's `localPort` shortcut sees it.
-    if let Ok(local) = listener.local_addr() {
-        ctx.set_field_by_name(fd_obj, "handle", Value::Long(local.port() as i64));
-    }
+    // C26 fix: do NOT write the resolved port into FileDescriptor.handle —
+    // `handle` is the fd-id sentinel that `net_fd_from_descriptor` falls back
+    // to (see lines 262-266). Overwriting it with the port value broke later
+    // lookups into `net_sockets`. The local port is reachable via
+    // `local_addr()` on the underlying TcpListener (see `net_local_port`
+    // at lines 691-716), so the JDK's `localPort` shortcut still works
+    // without us touching the FileDescriptor here. Mirrors the connect0
+    // path (lines 446-469), which similarly does not write back the local
+    // port.
 
     net_sockets()
         .write()
@@ -388,7 +392,11 @@ fn net_listen(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
 /// synthetic layout), and returns the new fd.
 fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
-    let newfd_obj = args.get(1).copied();
+    // C26: `args[1]` (the new FileDescriptor object) is intentionally
+    // ignored. The pre-fix code wrote the peer port into its `handle`
+    // slot, which silently broke `net_fd_from_descriptor`'s fallback
+    // path; see the comment below the accept() call. The new fd id is
+    // returned via the Int return value instead.
     let isaa = args.get(2).copied();
 
     let fd = net_fd_from_descriptor(ctx, fd_obj)
@@ -413,12 +421,14 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         listener.accept().map_err(|e| net_err("accept", e))?
     };
 
-    // Write peer port onto the FileDescriptor's `handle` for round-tripping
-    // through synthetic tests that inspect it directly.
-    if let Some(Value::Object(Some(nfd))) = newfd_obj {
-        let peer_port = peer.port() as i64;
-        ctx.set_field_by_name(nfd, "handle", Value::Long(peer_port));
-    }
+    // C26 fix: do NOT clobber the new FileDescriptor's `handle` slot with
+    // the peer port — `handle` is the fd-id sentinel that
+    // `net_fd_from_descriptor` falls back to (lines 262-266). The new fd
+    // id is returned to the caller via the Int return value below and
+    // the caller is expected to write it into the FileDescriptor.fd
+    // slot. The peer port is reachable via `peer_addr()` on the
+    // underlying TcpStream (see `net_remote_port` at lines 762-779) and
+    // is also delivered to the caller through `isaa[0]` below.
 
     // Populate isaa[0] if the caller supplied an array. Synthetic
     // InetSocketAddress = 2 fields (host, port).
