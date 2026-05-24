@@ -299,30 +299,20 @@ pub(crate) fn resolve_class_name_robust(
             return Some(name);
         }
     }
-    // 3. Last resort: attempt to reconstruct the name string ObjectRef from
-    // the slot-1 raw bits.  The descriptor cache returned `b'L'` so the heap
-    // applied the b'L' coercion which preserves Object/Int(0)/Long(0)/Double
-    // but lets non-zero Int/Long fall through unchanged.  Recover the
-    // ObjectRef from the bit-pattern when it looks heap-aligned.
-    let raw = ctx.get_field(mirror, 1);
-    let bits: Option<u64> = match raw {
-        Value::Long(l) => Some(l as u64),
-        Value::Int(i) if i != 0 => Some(i as u32 as u64),
-        _ => None,
-    };
-    if let Some(bits) = bits {
-        if (bits & 0x7) == 0 && bits != 0 && bits < (1u64 << 48) {
-            let ptr = bits as usize as *mut u8;
-            // SAFETY: ptr is heap-aligned and in the canonical address space;
-            // ObjectRef::from_raw + read_string validates via header reads.
-            let name_obj = unsafe { ObjectRef::from_raw(ptr) };
-            if let Some(s) = ctx.read_string(name_obj) {
-                if !s.is_empty() {
-                    return Some(s);
-                }
-            }
-        }
-    }
+    // 3. C20 — REMOVED: previously this fell back to reconstructing a
+    // String `ObjectRef` from the slot-1 raw bits (Long or Int(non-zero))
+    // after only an alignment+48-bit-range check. That was the
+    // memory-safety footgun called out in review item #5: arbitrary
+    // Java-controlled scalars satisfying the bit-pattern predicate would
+    // be fed to `ctx.read_string(...)`, which dereferences the pointer to
+    // read the header.
+    //
+    // `NativeContext` does not expose an `is_heap_addr` probe (the
+    // primitive the C7 interpreter fix uses on `&shared.heap`), and we
+    // have no reverse-map for arbitrary String objects analogous to
+    // `class_id_from_mirror` for Class mirrors. The remaining safe
+    // recovery is steps 1-2 above; if both miss, the right answer is
+    // `None` rather than fabricating a wild reference.
     None
 }
 
@@ -330,7 +320,24 @@ pub(crate) fn resolve_class_name_robust(
 /// that may have been compacted to Long/Int bits by the descriptor-coercion
 /// path. Returns the original ObjectRef when slot value is Object, otherwise
 /// reconstructs from heap-aligned 48-bit bit patterns.
-pub(crate) fn recover_class_mirror_from_slot(value: Value) -> Option<ObjectRef> {
+///
+/// C20 — heap-membership filter on Java-controlled `ObjectRef::from_raw`
+/// reconstruction. Mirrors the `vm::interpreter::pop_object_ref_ctx_with`
+/// C7 fix: alignment + 48-bit-range alone are not sufficient to prove a
+/// Long/Int slot holds a smuggled mirror — an honest scalar value can
+/// satisfy them too. Because `NativeContext` does not expose a raw
+/// `is_heap_addr` probe, we use `ctx.class_id_from_mirror(candidate)` as
+/// the heap-membership oracle: it consults the VM's
+/// `class_mirrors_reverse` map (a hashmap lookup keyed on the
+/// `ObjectRef`'s raw address — no dereference) and returns `Some(_)`
+/// only when the candidate is a registered Class mirror. On miss we
+/// return `None`, matching the function's existing "miss" idiom rather
+/// than fabricating a wild `ObjectRef` for downstream `read_string` /
+/// `heap_kind_of` calls to dereference.
+pub(crate) fn recover_class_mirror_from_slot(
+    ctx: &dyn NativeContext,
+    value: Value,
+) -> Option<ObjectRef> {
     match value {
         Value::Object(Some(o)) => Some(o),
         Value::Object(None) => None,
@@ -338,7 +345,19 @@ pub(crate) fn recover_class_mirror_from_slot(value: Value) -> Option<ObjectRef> 
             let bits = l as u64;
             if bits != 0 && (bits & 0x7) == 0 && bits < (1u64 << 48) {
                 let ptr = bits as usize as *mut u8;
-                Some(unsafe { ObjectRef::from_raw(ptr) })
+                // SAFETY: the alignment+range pre-checks above narrow the
+                // candidate to addresses our heap arenas could in principle
+                // hand out. `ObjectRef::from_raw` is a typed wrapper that
+                // does not dereference; the immediately-following
+                // `class_id_from_mirror` lookup is a hashmap probe on the
+                // raw address (no header read), so a wild candidate is
+                // rejected without ever being touched as a pointer.
+                let candidate = unsafe { ObjectRef::from_raw(ptr) };
+                if ctx.class_id_from_mirror(candidate).is_some() {
+                    Some(candidate)
+                } else {
+                    None
+                }
             } else { None }
         }
         Value::Int(i) if i != 0 => {
@@ -348,7 +367,14 @@ pub(crate) fn recover_class_mirror_from_slot(value: Value) -> Option<ObjectRef> 
             let bits = i as u32 as u64;
             if (bits & 0x7) == 0 && bits != 0 && bits < (1u64 << 48) {
                 let ptr = bits as usize as *mut u8;
-                Some(unsafe { ObjectRef::from_raw(ptr) })
+                // SAFETY: see Long-arm comment above. Same `class_id_from_mirror`
+                // hashmap probe gates the candidate before any heap access.
+                let candidate = unsafe { ObjectRef::from_raw(ptr) };
+                if ctx.class_id_from_mirror(candidate).is_some() {
+                    Some(candidate)
+                } else {
+                    None
+                }
             } else { None }
         }
         _ => None,
@@ -365,6 +391,7 @@ fn descriptor_from_method_type(ctx: &dyn NativeContext, mt: ObjectRef) -> String
         let len = ctx.array_length(params_arr);
         for i in 0..len {
             if let Some(param_mirror) = recover_class_mirror_from_slot(
+                ctx,
                 ctx.get_array_element(params_arr, i),
             ) {
                 desc.push_str(&mirror_to_descriptor(ctx, param_mirror));
@@ -374,7 +401,7 @@ fn descriptor_from_method_type(ctx: &dyn NativeContext, mt: ObjectRef) -> String
     desc.push(')');
 
     // Return type (field 0 = Class mirror) — recover from any slot encoding.
-    if let Some(ret_mirror) = recover_class_mirror_from_slot(ctx.get_field(mt, 0)) {
+    if let Some(ret_mirror) = recover_class_mirror_from_slot(ctx, ctx.get_field(mt, 0)) {
         desc.push_str(&mirror_to_descriptor(ctx, ret_mirror));
     } else {
         desc.push('V'); // default void
@@ -2599,7 +2626,18 @@ pub fn gc_update_lambda_callsite_cache_refs(
         };
         let old_v = v.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_v) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // C20 — runtime guard (was `debug_assert!` only). After class
+            // unloading the pointer map can contain stale `addr → 0`
+            // entries; in release builds the previous `debug_assert!` was
+            // a no-op and `ObjectRef::from_raw(0)`'s own null check is
+            // also debug-only, so a null entry would silently fabricate
+            // an invalid `NonNull<u8>` that the next GC root scan would
+            // dereference. Skip the entry instead — the lambda CallSite
+            // is unrooted from the cache for this cycle and will be
+            // rebuilt on next bootstrap; never insert a wild pointer.
+            if new_addr == 0 {
+                continue;
+            }
             v = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
         cache.insert(k_new, v);
