@@ -807,7 +807,17 @@ impl ValueStack {
             if cv.is_object() {
                 if let Some(old_ptr) = cv.as_object_ptr() {
                     if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
-                        self.slots[i].update_object_ptr(new_addr as u64);
+                        // SAFETY: `new_addr` comes from a `HashMap<usize,
+                        // usize>` of live-heap pointers populated by the GC
+                        // compactor; every entry is the moved address of a
+                        // post-compaction object, which the allocator
+                        // guarantees fits in the 47-bit address space (same
+                        // invariant `CompactValue::object` enforces for
+                        // initial construction). The checked
+                        // `update_object_ptr` would still succeed here; the
+                        // `_unchecked` variant skips the redundant range
+                        // check on the GC hot path.
+                        self.slots[i].update_object_ptr_unchecked(new_addr as u64);
                     }
                 }
             } else if cv.tag() == CompactTag::Double {

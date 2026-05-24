@@ -160,6 +160,26 @@ pub fn global_pool() -> &'static StringPool {
 /// `StringPool` has no such guarantee — which is exactly why no
 /// `&'static`-returning method is exposed on `StringPool` itself; use
 /// [`StringPool::intern_arc`] for a non-`'static` pool.
+///
+/// # WARNING — do NOT call from a `Drop` impl that may run during teardown
+///
+/// The `'static` lifetime extension below relies on the global `OnceLock`
+/// remaining initialised for the entire process. `Drop` impls on
+/// thread-locals, `lazy_static!`-style singletons, or `OnceLock`-stored
+/// values may execute **after** the runtime has begun tearing down statics —
+/// on some platforms (notably under `std::process::exit` /
+/// `__cxa_atexit`-style teardown) the global pool's storage backing may be
+/// finalised before another static's drop runs. Calling `intern` (or
+/// `intern_arc` via the global pool) at that point would observe a
+/// partially-released `Arc<str>`, and the `'static` reference returned to
+/// the `Drop` body could outlive the bytes it points at.
+///
+/// In practice this means: do not put `intern(...)` calls inside a
+/// `Drop::drop` impl. Cache the `&'static str` (or an `Arc<str>` produced by
+/// [`intern_arc`]) at construction time and read it during drop, or, if the
+/// drop body needs an owned string, clone it ahead of time. The hot-path
+/// callers in the VM already follow this pattern; this note exists so future
+/// natives or class-loader teardown helpers do not accidentally regress it.
 pub fn intern(s: &str) -> &'static str {
     let arc = global_pool().intern_arc(s);
     // SAFETY: `arc` is a clone of an `Arc<str>` owned by the *global* pool.

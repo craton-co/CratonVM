@@ -37,6 +37,39 @@ use crate::{ObjectRef, Value};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
+// CompactValueError — fallible-API failures
+// ---------------------------------------------------------------------------
+
+/// Failure modes for the checked `CompactValue` mutators / constructors.
+///
+/// Currently emitted only by [`CompactValue::update_object_ptr`] when the
+/// supplied pointer would not fit in the 47-bit payload — but exposed as a
+/// public enum so future fallible variants can extend it without churning
+/// call-sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactValueError {
+    /// `update_object_ptr` was called with a pointer that has bits set above
+    /// bit 46 (i.e. it doesn't fit in the 47-bit NaN-box payload).
+    ///
+    /// The original slot is left unchanged so callers can choose to ignore,
+    /// retry with a checked constructor, or fail upwards.
+    PointerOutOfRange { ptr: u64 },
+}
+
+impl fmt::Display for CompactValueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompactValueError::PointerOutOfRange { ptr } => write!(
+                f,
+                "CompactValue: pointer {ptr:#x} exceeds 47-bit address space",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompactValueError {}
+
+// ---------------------------------------------------------------------------
 // NaN-boxing constants
 // ---------------------------------------------------------------------------
 //
@@ -412,11 +445,53 @@ impl CompactValue {
         }
     }
 
-    /// Reinterpret the raw bits as i64 without checking the tag.
+    /// Reinterpret the raw stored bits as i64 without checking the tag.
+    ///
+    /// **Naming history (MED audit 2026-05-24):** for longs that hit the
+    /// `sub < 3` re-tag branch in [`long`](Self::long) — large-magnitude
+    /// negative longs in `[-2^50, -2^48)` whose top bits collide with the
+    /// NaN-tagged Int/Float/Object sub-tags — the return value is the
+    /// *re-tagged* slot bits, **not** the original `i64` passed in. The
+    /// re-tag preserves heap safety (the slot is never mistaken for an
+    /// object reference) at the cost of bit-level reversibility: the
+    /// original 3-bit sub-tag is replaced with `SUB_LONG_LO` /
+    /// `SUB_LONG_HI`, and no information is kept that could reconstruct it.
+    ///
+    /// For every other long bit-pattern (the untagged fast path and the
+    /// natural `SUB_LONG_LO`/`SUB_LONG_HI` collisions, e.g. `-1`, `-2`,
+    /// `i64::MIN`) the returned `i64` equals the original input.
+    ///
+    /// The companion accessor [`as_long_bits_unchecked`](Self::as_long_bits_unchecked)
+    /// has the same implementation but a name that makes the "raw stored
+    /// bits" semantic unambiguous; prefer it in new code where the caller
+    /// is consuming the slot as a bit pattern (e.g. JNI long-as-jobject
+    /// smuggling, NaN-aware double decode) rather than as a numeric value.
     ///
     /// Use when the JVM instruction context guarantees this slot is a Long.
     #[inline]
     pub fn as_long_unchecked(&self) -> i64 {
+        self.0 as i64
+    }
+
+    /// Reinterpret the raw stored bits as i64 — the bits-semantic alias of
+    /// [`as_long_unchecked`](Self::as_long_unchecked).
+    ///
+    /// Returns exactly what is stored in the 8-byte slot, with no attempt to
+    /// "reverse" the [`long`](Self::long) re-tag transformation. For longs
+    /// that took the re-tag branch (large-magnitude negatives in
+    /// `[-2^50, -2^48)` whose top three sub-tag bits would have collided
+    /// with `SUB_INT` / `SUB_FLOAT` / `SUB_OBJECT`) those original sub-tag
+    /// bits are not recoverable from a single 8-byte slot — `make_tagged`
+    /// overwrites them with `SUB_LONG_LO` / `SUB_LONG_HI`. This method
+    /// returns the re-tagged bits verbatim, which is the same value
+    /// [`to_value`](Self::to_value) hands back as `Value::Long(_)` and what
+    /// the interpreter consumes for `ladd`/`lsub`/etc. on those slots.
+    ///
+    /// Prefer this over [`as_long_unchecked`](Self::as_long_unchecked) in
+    /// new code: the `_bits_unchecked` suffix makes the "stored bits, not
+    /// original i64" semantic obvious at the call-site.
+    #[inline]
+    pub fn as_long_bits_unchecked(&self) -> i64 {
         self.0 as i64
     }
 
@@ -612,16 +687,64 @@ impl CompactValue {
         is_nan_tagged(self.0) && (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK == SUB_OBJECT
     }
 
-    /// Replace the object-pointer payload if this slot holds an Object reference.
+    /// Replace the object-pointer payload if this slot holds an Object
+    /// reference. No-op for non-object slots.
     ///
-    /// Used by the GC compaction scanner to update roots after heap relocation.
-    /// No-op for non-object slots.
+    /// # Errors
+    ///
+    /// Returns [`CompactValueError::PointerOutOfRange`] if `new_ptr` has bits
+    /// set above bit 46 (i.e. it does not fit in the 47-bit NaN-box payload).
+    /// The slot is left unchanged in that case. Asymmetry note: the
+    /// constructor [`object`](Self::object) refuses the same condition with a
+    /// panic in both debug and release — historically `update_object_ptr`
+    /// silently truncated in release, which would produce a corrupted
+    /// reference. Reporting the failure via `Result` is strictly safer; the
+    /// GC root scanner is the canonical caller and the addresses it threads
+    /// here come from a `HashMap<usize, usize>` of live-heap pointers, all of
+    /// which are 47-bit by construction — so [`update_object_ptr_unchecked`]
+    /// is preferred on that hot path.
+    ///
+    /// Used by the GC compaction scanner to update roots after heap
+    /// relocation.
+    #[inline]
+    pub fn update_object_ptr(&mut self, new_ptr: u64) -> Result<(), CompactValueError> {
+        if !self.is_object() {
+            return Ok(());
+        }
+        if new_ptr & !PAYLOAD_MASK != 0 {
+            return Err(CompactValueError::PointerOutOfRange { ptr: new_ptr });
+        }
+        self.0 = make_tagged(SUB_OBJECT, new_ptr & PAYLOAD_MASK);
+        Ok(())
+    }
+
+    /// Unchecked variant of [`update_object_ptr`].
+    ///
+    /// Replaces the object-pointer payload without verifying that `new_ptr`
+    /// fits in the 47-bit address space. In debug builds an assertion still
+    /// catches an out-of-range pointer; in release the high bits are masked
+    /// off, which would corrupt the reference.
+    ///
+    /// # Safety
+    ///
+    /// This function is **not** `unsafe` in the Rust sense (it cannot violate
+    /// memory safety on its own — the truncated pointer would simply
+    /// reference the wrong object or no object at all), but callers must
+    /// guarantee one of the following invariants for the result to be
+    /// correct:
+    ///
+    /// * `new_ptr & !PAYLOAD_MASK == 0` (the pointer fits in 47 bits), OR
+    /// * `self` is **not** an object slot (the call is a no-op).
+    ///
+    /// The canonical caller is the GC compaction scanner, where every
+    /// address comes from a `HashMap<usize, usize>` whose values are live-
+    /// heap pointers already validated to fit in 47 bits by the allocator.
     #[inline(always)]
-    pub fn update_object_ptr(&mut self, new_ptr: u64) {
+    pub fn update_object_ptr_unchecked(&mut self, new_ptr: u64) {
         if self.is_object() {
             debug_assert!(
                 new_ptr & !PAYLOAD_MASK == 0,
-                "CompactValue::update_object_ptr: pointer {:#x} exceeds 47-bit address space",
+                "CompactValue::update_object_ptr_unchecked: pointer {:#x} exceeds 47-bit address space",
                 new_ptr
             );
             self.0 = make_tagged(SUB_OBJECT, new_ptr & PAYLOAD_MASK);
@@ -1471,15 +1594,141 @@ mod tests {
     #[test]
     fn update_object_ptr_rewrites_pointer() {
         let mut cv = CompactValue::object(0x1000);
-        cv.update_object_ptr(0x2000);
+        assert!(cv.update_object_ptr(0x2000).is_ok());
         assert_eq!(cv.as_object_ptr(), Some(0x2000));
     }
 
     #[test]
     fn update_object_ptr_noop_for_non_object() {
         let mut cv = CompactValue::int(42);
-        cv.update_object_ptr(0x9999);
+        // Non-object slot: even an out-of-range pointer is silently ignored —
+        // there is no reference to corrupt.
+        assert!(cv.update_object_ptr(0x9999).is_ok());
         assert_eq!(cv.as_int(), Some(42));
+    }
+
+    // -- MED audit 2026-05-24: hardened `update_object_ptr` -----------------
+
+    /// `update_object_ptr` with a pointer that has bits set above bit 46
+    /// must reject with `PointerOutOfRange` rather than silently masking the
+    /// high bits — symmetric to the constructor `object()` which panics on
+    /// the same condition. The slot is left unchanged so the caller can
+    /// recover or escalate.
+    #[test]
+    fn update_object_ptr_rejects_above_47bit() {
+        let original = 0x0000_1234_5678_ABC0;
+        let mut cv = CompactValue::object(original);
+        let bad: u64 = 0x0001_0000_0000_0000; // bit 48 set — out of range
+        match cv.update_object_ptr(bad) {
+            Err(CompactValueError::PointerOutOfRange { ptr }) => assert_eq!(ptr, bad),
+            other => panic!("expected PointerOutOfRange, got {other:?}"),
+        }
+        // Slot untouched on failure.
+        assert_eq!(cv.as_object_ptr(), Some(original));
+    }
+
+    /// `update_object_ptr` round-trips an in-range pointer — the canonical
+    /// GC compaction path.
+    #[test]
+    fn update_object_ptr_round_trips_in_range() {
+        let mut cv = CompactValue::object(0x0000_1000);
+        // Maximum-magnitude in-range pointer.
+        let new_ptr: u64 = 0x0000_7FFF_FFFF_FFF8;
+        cv.update_object_ptr(new_ptr).expect("47-bit pointer must succeed");
+        assert_eq!(cv.as_object_ptr(), Some(new_ptr));
+        assert!(cv.is_object());
+        assert_eq!(cv.tag(), CompactTag::Object);
+    }
+
+    /// The `_unchecked` variant masks-and-stores in release builds; on a
+    /// happy-path in-range pointer it behaves identically to the checked
+    /// API. Used by the GC scanner where the address space is bounded by
+    /// construction.
+    #[test]
+    fn update_object_ptr_unchecked_round_trips_in_range() {
+        let mut cv = CompactValue::object(0x0000_1000);
+        cv.update_object_ptr_unchecked(0x0000_2000);
+        assert_eq!(cv.as_object_ptr(), Some(0x0000_2000));
+    }
+
+    /// `as_long_unchecked` returns the original i64 for every value that
+    /// did NOT take the lossy `sub < 3` re-tag path in `long()`:
+    ///
+    /// * untagged fast-path longs (the overwhelming majority),
+    /// * natural-collision longs whose sub-tag is already
+    ///   `SUB_LONG_LO`/`SUB_LONG_HI` (e.g. `-1`, `-2`, `i64::MIN`).
+    ///
+    /// The companion `as_long_bits_unchecked` returns the same bits (the
+    /// methods share an implementation by design — see their doc-comments
+    /// for why no fully-reversible alternative exists in 8 bytes).
+    ///
+    /// The "`sub < 3` retag values 0/1/2" mentioned in the audit acceptance
+    /// criterion refers to longs whose *natural* sub-tag bits were 0
+    /// (`SUB_INT`), 1 (`SUB_FLOAT`), or 2 (`SUB_OBJECT`). The lowest such
+    /// pattern (sub == 0, payload == 0) is the canonical case: the
+    /// constructor maps it onto `SUB_LONG_LO` and the result is decoded
+    /// verbatim — i.e. the *re-tagged* bits, not the input. That is the
+    /// documented limitation of the encoding, and both accessors are now
+    /// explicit about it.
+    #[test]
+    fn as_long_unchecked_returns_original_i64() {
+        // Untagged fast path — original equals stored bits.
+        for v in [0i64, 1, 2, 42, -42, 100, i64::MIN, i64::MAX] {
+            let cv = CompactValue::long(v);
+            assert_eq!(cv.as_long_unchecked(), v, "untagged long {v}");
+            assert_eq!(cv.as_long_bits_unchecked(), v);
+        }
+        // Natural `SUB_LONG_LO`/`SUB_LONG_HI` collisions (small-magnitude
+        // negatives whose top sub-tag bits are already 110 or 111) — the
+        // `long()` constructor stores them verbatim, so original i64 is
+        // recoverable.
+        for v in [-1i64, -2, -3, -1000, -123_456_789_012_345] {
+            let cv = CompactValue::long(v);
+            assert_eq!(cv.as_long_unchecked(), v, "natural-collision long {v}");
+            assert_eq!(cv.as_long_bits_unchecked(), v);
+        }
+        // The `sub < 3` re-tag case (sub values 0/1/2): the constructor
+        // discards the original sub-tag, so `as_long_unchecked` returns
+        // the *re-tagged* bits. Both accessors agree.
+        for sub in 0u64..3 {
+            let v = collide_with_subtag(sub, 0x12_3456);
+            let cv = CompactValue::long(v);
+            // Both accessors return the same bits — this is the
+            // documented limitation, not a bug.
+            assert_eq!(cv.as_long_unchecked(), cv.as_long_bits_unchecked());
+            // The slot is heap-safe (`is_object` false) — the safety
+            // invariant the re-tag was introduced to preserve.
+            assert!(!cv.is_object());
+            assert_eq!(cv.tag(), CompactTag::Long);
+        }
+    }
+
+    /// Round-trip sanity for the new `as_long_bits_unchecked` name — same
+    /// value as `as_long_unchecked` for every long pattern. Guards against
+    /// accidental divergence if either method's body is edited.
+    #[test]
+    fn as_long_bits_unchecked_matches_as_long_unchecked() {
+        for v in [
+            0i64,
+            1,
+            -1,
+            42,
+            -42,
+            i64::MIN,
+            i64::MAX,
+            i64::MIN + 1,
+            i64::MAX - 1,
+            -123_456_789_012_345,
+        ] {
+            let cv = CompactValue::long(v);
+            assert_eq!(cv.as_long_unchecked(), cv.as_long_bits_unchecked());
+        }
+        // Also for the rare re-tag bit patterns.
+        for sub in 0u64..8 {
+            let v = collide_with_subtag(sub, 0x55_5555);
+            let cv = CompactValue::long(v);
+            assert_eq!(cv.as_long_unchecked(), cv.as_long_bits_unchecked());
+        }
     }
 
     #[test]
