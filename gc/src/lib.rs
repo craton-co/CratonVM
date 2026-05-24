@@ -52,6 +52,11 @@ pub mod vm_heap;
 // the feature on once a real consumer lands.
 #[cfg(feature = "zgc")]
 pub mod zgc;
+// Task #55: ZGC concurrent-mark controller — mirrors the G1
+// `ConcurrentMarkController` shape so the two converge once ZGC moves off
+// the page-storage simulation. Gated under the same `zgc` feature.
+#[cfg(feature = "zgc")]
+pub mod zgc_concurrent;
 
 pub use collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 pub use gc::{

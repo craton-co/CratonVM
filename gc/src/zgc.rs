@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
-
 //! ZGC (Z Garbage Collector) — low-latency concurrent garbage collector.
 //!
 //! Implements colored pointers, load barriers, ZPages, concurrent GC phases,
@@ -653,30 +650,77 @@ impl ZgcCollector {
         self.mark_stack.extend(roots);
     }
 
-    /// Concurrent tri-color mark: drain the mark stack.
+    /// Concurrent tri-color mark: drain the mark stack to completion.
     ///
-    /// TODO(task #54, ZGC): unlike G1 (see `g1_concurrent.rs`), ZGC's
-    /// `concurrent_mark` currently runs synchronously on the caller's
-    /// thread. The G1 controller pattern (background `std::thread::spawn`
-    /// + `parking_lot::Condvar` shutdown) is intentionally narrow and
-    /// can be reused here once ZGC moves off the simulation to real
-    /// backing pages — at that point the mark_stack-drain loop below
-    /// belongs in a worker thread launched between `pause_mark_start`
-    /// (STW) and `pause_mark_end` (STW), with the load-barrier good-color
-    /// set serving the role G1's SATB queue plays as the mutator-side
-    /// concurrent-mark invariant.
+    /// This is the synchronous entry point used by `trigger_gc`. For the
+    /// concurrent-thread variant — where a background worker calls
+    /// [`Self::concurrent_mark_step`] in a loop while mutators run — see
+    /// [`crate::zgc_concurrent::ZgcConcurrentMarkController`] (task #55).
+    ///
+    /// The synchronous path is preserved as the canonical "single
+    /// threaded" body: a full drain with no per-step budget.
     pub fn concurrent_mark(&mut self) {
-        self.phase = ZgcPhase::ConcurrentMark;
-        // In a real JVM we'd traverse the object graph here.
-        // For simulation, mark every page's live bytes as reachable.
-        while let Some(addr) = self.mark_stack.pop() {
+        // Delegate to the step-based body with an unbounded budget so the
+        // two code paths converge on identical per-pointer logic. This
+        // also means any future change to the mark-pointer step only
+        // needs to happen in one place.
+        while !self.concurrent_mark_step(usize::MAX) {}
+    }
+
+    /// Drain up to `budget` gray pointers from the mark stack. Returns
+    /// `true` iff the stack is now empty (fixed point reached) and the
+    /// caller should park / advance to the remark STW.
+    ///
+    /// Called from:
+    /// - [`Self::concurrent_mark`] (synchronous full-drain path).
+    /// - The background worker spawned by
+    ///   [`crate::zgc_concurrent::ZgcConcurrentMarkController::spawn`]
+    ///   (per-call budget for prompt stop-signal observation).
+    ///
+    /// The body intentionally does NOT touch `load_barrier.good_colors`
+    /// or transition `phase` to `PauseMarkEnd` — those are STW
+    /// transitions owned by the coordinator. The only state the step
+    /// mutates is `phase` (the first call advances it to `ConcurrentMark`,
+    /// matching the G1 step-machine shape) and `live_bytes` on touched
+    /// pages.
+    ///
+    /// ## Simulation note
+    ///
+    /// In a real ZGC each gray pointer would be a colored pointer; the
+    /// step would (a) strip its color, (b) consult the load barrier to
+    /// flip the marked-color bit on the object header, (c) trace its
+    /// out-references onto the stack. Because `ZPage` has no backing
+    /// storage (see [`Self::concurrent_relocate`] doc-comment) the
+    /// simulation collapses this to "mark every byte on the touched
+    /// page as live" — which is enough to keep the controller lifecycle
+    /// honest but does not faithfully model object-level marking. See
+    /// [`crate::zgc_concurrent`] module-doc for the full
+    /// page-storage-simulation status.
+    pub fn concurrent_mark_step(&mut self, budget: usize) -> bool {
+        // First-touch phase transition. The G1 controller does this on
+        // the collector side; we do it here so a caller that drives the
+        // step directly (a test, or the synchronous path) doesn't have
+        // to remember to flip phase manually.
+        if self.phase != ZgcPhase::ConcurrentMark {
+            self.phase = ZgcPhase::ConcurrentMark;
+        }
+
+        let mut drained = 0usize;
+        while drained < budget {
+            let addr = match self.mark_stack.pop() {
+                Some(a) => a,
+                None => return true, // stack empty → fixed point
+            };
             if let Some(p) = self.heap.pages.iter_mut().find(|p| p.virtual_start == addr) {
-                // Simulate: all allocated bytes on a non-relocating page stay live.
                 if !p.is_relocating {
                     p.live_bytes = p.top;
                 }
             }
+            drained += 1;
         }
+
+        // Budget exhausted with possibly more work remaining.
+        self.mark_stack.is_empty()
     }
 
     /// STW: drain any remaining mark stack entries.
