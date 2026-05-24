@@ -2465,19 +2465,51 @@ pub fn detect_neon_patterns(bytecode: &[u8], _num_locals: usize) -> Vec<NeonVect
 // Machine code emission
 // ---------------------------------------------------------------------------
 
-/// Convert an `Arm64Register` (0..31) to a `Reg` for the emitter.
-fn to_reg(r: Arm64Register) -> crate::aarch64::Reg {
-    // Safety: values 0..31 map 1:1 to Reg variants.
-    // We transmute since Reg is repr(u8).
-    assert!(r.0 <= 31, "to_reg called on non-GP register {}", r.0);
-    unsafe { std::mem::transmute::<u8, crate::aarch64::Reg>(r.0) }
+/// Convert an `Arm64Register` (0..=31) to a `Reg` for the emitter.
+///
+/// Returns `None` if `r` is not a valid GP register encoding. The JIT
+/// contract is "never panic in production; bail to interpreter instead"
+/// (C11), so call sites either propagate the `None` upward or — when the
+/// regalloc has already proven the register is a GP — use
+/// `.expect("regalloc invariant: ...")` to surface a clear message if the
+/// invariant is ever violated.
+fn to_reg(r: Arm64Register) -> Option<crate::aarch64::Reg> {
+    // In debug builds, surface the precondition immediately so misuse during
+    // development is caught at the call site rather than far away in the
+    // emitter.
+    debug_assert!(r.0 <= 31, "to_reg called on non-GP register {}", r.0);
+    crate::aarch64::Reg::from_u8(r.0)
 }
 
 /// Convert an `Arm64Register` (V0=32..V7=39) to an `FpReg` for the emitter.
-fn to_fpreg(r: Arm64Register) -> crate::aarch64::FpReg {
-    assert!(r.0 >= 32 && r.0 <= 39, "to_fpreg called on non-FP register {}", r.0);
-    let idx = r.0 - 32;
-    unsafe { std::mem::transmute::<u8, crate::aarch64::FpReg>(idx) }
+///
+/// Returns `None` if `r` is not a valid FP register encoding. See `to_reg`
+/// for the rationale on returning `Option` instead of asserting (C11).
+fn to_fpreg(r: Arm64Register) -> Option<crate::aarch64::FpReg> {
+    debug_assert!(
+        r.0 >= 32 && r.0 <= 39,
+        "to_fpreg called on non-FP register {}",
+        r.0
+    );
+    if r.0 < 32 {
+        return None;
+    }
+    crate::aarch64::FpReg::from_u8(r.0 - 32)
+}
+
+/// Shorthand for unwrapping `to_reg` at call sites where the register
+/// allocator guarantees the register is a valid GPR. Centralising the
+/// expect-message keeps the regalloc contract documented in one place.
+#[inline]
+fn r(reg: Arm64Register) -> crate::aarch64::Reg {
+    to_reg(reg).expect("regalloc invariant: Arm64Register is a valid GPR (0..=31)")
+}
+
+/// Shorthand for unwrapping `to_fpreg` at call sites where the register
+/// allocator guarantees the register is a valid FP register.
+#[inline]
+fn fp(reg: Arm64Register) -> crate::aarch64::FpReg {
+    to_fpreg(reg).expect("regalloc invariant: Arm64Register is a valid FP reg (32..=39)")
 }
 
 /// Convert an `Arm64Condition` to an `aarch64::Cond`.
@@ -2527,109 +2559,109 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
 
             // -- Arithmetic --
             Arm64Instruction::Add { rd, rn, rm } => {
-                emitter.add(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.add(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::AddImm { rd, rn, imm } => {
                 if *imm >= 0 {
-                    emitter.add_imm(to_reg(*rd), to_reg(*rn), *imm as u16, false);
+                    emitter.add_imm(r(*rd), r(*rn), *imm as u16, false);
                 } else {
-                    emitter.sub_imm(to_reg(*rd), to_reg(*rn), (-*imm) as u16, false);
+                    emitter.sub_imm(r(*rd), r(*rn), (-*imm) as u16, false);
                 }
             }
             Arm64Instruction::Sub { rd, rn, rm } => {
-                emitter.sub(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.sub(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::SubImm { rd, rn, imm } => {
                 if *imm >= 0 {
-                    emitter.sub_imm(to_reg(*rd), to_reg(*rn), *imm as u16, false);
+                    emitter.sub_imm(r(*rd), r(*rn), *imm as u16, false);
                 } else {
-                    emitter.add_imm(to_reg(*rd), to_reg(*rn), (-*imm) as u16, false);
+                    emitter.add_imm(r(*rd), r(*rn), (-*imm) as u16, false);
                 }
             }
             Arm64Instruction::Mul { rd, rn, rm } => {
-                emitter.mul(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.mul(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::SDiv { rd, rn, rm } => {
-                emitter.sdiv(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.sdiv(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::Neg { rd, rn } => {
                 // NEG Xd, Xn = SUB Xd, XZR, Xn
-                emitter.sub(to_reg(*rd), crate::aarch64::Reg::SP, to_reg(*rn));
+                emitter.sub(r(*rd), crate::aarch64::Reg::SP, r(*rn));
             }
             Arm64Instruction::Madd { rd, rn, rm, ra } => {
-                emitter.madd(to_reg(*rd), to_reg(*rn), to_reg(*rm), to_reg(*ra));
+                emitter.madd(r(*rd), r(*rn), r(*rm), r(*ra));
             }
             Arm64Instruction::Msub { rd, rn, rm, ra } => {
-                emitter.msub(to_reg(*rd), to_reg(*rn), to_reg(*rm), to_reg(*ra));
+                emitter.msub(r(*rd), r(*rn), r(*rm), r(*ra));
             }
 
             // -- Logical --
             Arm64Instruction::And { rd, rn, rm } => {
-                emitter.and(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.and(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::Orr { rd, rn, rm } => {
-                emitter.orr(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.orr(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::Eor { rd, rn, rm } => {
-                emitter.eor(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.eor(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::Lsl { rd, rn, rm } => {
-                emitter.lsl(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.lsl(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::Lsr { rd, rn, rm } => {
-                emitter.lsr(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.lsr(r(*rd), r(*rn), r(*rm));
             }
             Arm64Instruction::Asr { rd, rn, rm } => {
-                emitter.asr(to_reg(*rd), to_reg(*rn), to_reg(*rm));
+                emitter.asr(r(*rd), r(*rn), r(*rm));
             }
 
             // -- Compare --
             Arm64Instruction::Cmp { rn, rm } => {
-                emitter.cmp(to_reg(*rn), to_reg(*rm));
+                emitter.cmp(r(*rn), r(*rm));
             }
             Arm64Instruction::CmpImm { rn, imm } => {
-                emitter.cmp_imm(to_reg(*rn), *imm as u16);
+                emitter.cmp_imm(r(*rn), *imm as u16);
             }
             Arm64Instruction::Tst { rn, rm } => {
-                emitter.tst(to_reg(*rn), to_reg(*rm));
+                emitter.tst(r(*rn), r(*rm));
             }
 
             // -- Move --
             Arm64Instruction::Mov { rd, rm } => {
-                emitter.mov(to_reg(*rd), to_reg(*rm));
+                emitter.mov(r(*rd), r(*rm));
             }
             Arm64Instruction::MovImm { rd, imm } => {
-                emitter.mov_imm64(to_reg(*rd), *imm as u64);
+                emitter.mov_imm64(r(*rd), *imm as u64);
             }
             Arm64Instruction::MovK { rd, imm, shift } => {
-                emitter.movk(to_reg(*rd), *imm, *shift);
+                emitter.movk(r(*rd), *imm, *shift);
             }
 
             // -- Load / Store --
             Arm64Instruction::Ldr { rt, rn, offset } => {
                 if *offset >= 0 && *offset % 8 == 0 {
-                    emitter.ldr_imm(to_reg(*rt), to_reg(*rn), *offset as u16);
+                    emitter.ldr_imm(r(*rt), r(*rn), *offset as u16);
                 } else {
-                    emitter.ldr_pre(to_reg(*rt), to_reg(*rn), *offset as i16);
+                    emitter.ldr_pre(r(*rt), r(*rn), *offset as i16);
                 }
             }
             Arm64Instruction::Str { rt, rn, offset } => {
                 if *offset >= 0 && *offset % 8 == 0 {
-                    emitter.str_imm(to_reg(*rt), to_reg(*rn), *offset as u16);
+                    emitter.str_imm(r(*rt), r(*rn), *offset as u16);
                 } else {
-                    emitter.str_pre(to_reg(*rt), to_reg(*rn), *offset as i16);
+                    emitter.str_pre(r(*rt), r(*rn), *offset as i16);
                 }
             }
             Arm64Instruction::Ldp { rt1, rt2, rn, offset } => {
-                emitter.ldp(to_reg(*rt1), to_reg(*rt2), to_reg(*rn), *offset as i16);
+                emitter.ldp(r(*rt1), r(*rt2), r(*rn), *offset as i16);
             }
             Arm64Instruction::Stp { rt1, rt2, rn, offset } => {
-                emitter.stp(to_reg(*rt1), to_reg(*rt2), to_reg(*rn), *offset as i16);
+                emitter.stp(r(*rt1), r(*rt2), r(*rn), *offset as i16);
             }
             Arm64Instruction::LdrLiteral { rt, label } => {
                 // Emit a real LDR (literal) instruction. The offset to the
                 // target label will be patched after all code is emitted.
-                let pos = emitter.ldr_literal_x(to_reg(*rt));
+                let pos = emitter.ldr_literal_x(r(*rt));
                 literal_patches.push((pos, *label));
             }
 
@@ -2647,124 +2679,124 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
                 branch_patches.push((pos, *label, false));
             }
             Arm64Instruction::Br { rn } => {
-                emitter.br(to_reg(*rn));
+                emitter.br(r(*rn));
             }
             Arm64Instruction::Blr { rn } => {
-                emitter.blr(to_reg(*rn));
+                emitter.blr(r(*rn));
             }
             Arm64Instruction::Ret => {
                 emitter.ret_lr();
             }
             Arm64Instruction::Cbz { rt, label } => {
-                let pos = emitter.cbz(to_reg(*rt), 0);
+                let pos = emitter.cbz(r(*rt), 0);
                 branch_patches.push((pos, *label, true));
             }
             Arm64Instruction::Cbnz { rt, label } => {
-                let pos = emitter.cbnz(to_reg(*rt), 0);
+                let pos = emitter.cbnz(r(*rt), 0);
                 branch_patches.push((pos, *label, true));
             }
 
             // -- FP move --
             Arm64Instruction::FmovToFp { vd, rn } => {
-                emitter.fmov_d_from_gp(to_fpreg(*vd), to_reg(*rn));
+                emitter.fmov_d_from_gp(fp(*vd), r(*rn));
             }
             Arm64Instruction::FmovFromFp { rd, vn } => {
-                emitter.fmov_gp_from_d(to_reg(*rd), to_fpreg(*vn));
+                emitter.fmov_gp_from_d(r(*rd), fp(*vn));
             }
             Arm64Instruction::FmovFp { vd, vn } => {
-                emitter.fmov_d(to_fpreg(*vd), to_fpreg(*vn));
+                emitter.fmov_d(fp(*vd), fp(*vn));
             }
 
             // -- FP negate --
             Arm64Instruction::FnegDouble { vd, vn } => {
-                emitter.fneg_d(to_fpreg(*vd), to_fpreg(*vn));
+                emitter.fneg_d(fp(*vd), fp(*vn));
             }
 
             // -- FP single-precision --
             Arm64Instruction::FaddSingle { vd, vn, vm } => {
-                emitter.fadd_s(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fadd_s(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FsubSingle { vd, vn, vm } => {
-                emitter.fsub_s(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fsub_s(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FmulSingle { vd, vn, vm } => {
-                emitter.fmul_s(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fmul_s(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FdivSingle { vd, vn, vm } => {
-                emitter.fdiv_s(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fdiv_s(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FcmpSingle { vn, vm } => {
-                emitter.fcmp_s(to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fcmp_s(fp(*vn), fp(*vm));
             }
             Arm64Instruction::FnegSingle { vd, vn } => {
-                emitter.fneg_s(to_fpreg(*vd), to_fpreg(*vn));
+                emitter.fneg_s(fp(*vd), fp(*vn));
             }
 
             // -- Conversion --
             Arm64Instruction::ScvtfDouble { vd, rn } => {
-                emitter.scvtf_d_x(to_fpreg(*vd), to_reg(*rn));
+                emitter.scvtf_d_x(fp(*vd), r(*rn));
             }
             Arm64Instruction::ScvtfSingle { vd, rn } => {
-                emitter.scvtf_s_w(to_fpreg(*vd), to_reg(*rn));
+                emitter.scvtf_s_w(fp(*vd), r(*rn));
             }
             Arm64Instruction::FcvtzsInt { rd, vn } => {
-                emitter.fcvtzs_x_d(to_reg(*rd), to_fpreg(*vn));
+                emitter.fcvtzs_x_d(r(*rd), fp(*vn));
             }
             Arm64Instruction::FcvtzsSingle { rd, vn } => {
-                emitter.fcvtzs_w_s(to_reg(*rd), to_fpreg(*vn));
+                emitter.fcvtzs_w_s(r(*rd), fp(*vn));
             }
             Arm64Instruction::FcvtSingleToDouble { vd, vn } => {
-                emitter.fcvt_d_s(to_fpreg(*vd), to_fpreg(*vn));
+                emitter.fcvt_d_s(fp(*vd), fp(*vn));
             }
             Arm64Instruction::FcvtDoubleToSingle { vd, vn } => {
-                emitter.fcvt_s_d(to_fpreg(*vd), to_fpreg(*vn));
+                emitter.fcvt_s_d(fp(*vd), fp(*vn));
             }
 
             // -- FP Load / Store --
             Arm64Instruction::FpLdr { vt, rn, offset, is_double } => {
                 if *is_double {
-                    emitter.ldr_fp_d(to_fpreg(*vt), to_reg(*rn), *offset as u16);
+                    emitter.ldr_fp_d(fp(*vt), r(*rn), *offset as u16);
                 } else {
-                    emitter.ldr_fp_s(to_fpreg(*vt), to_reg(*rn), *offset as u16);
+                    emitter.ldr_fp_s(fp(*vt), r(*rn), *offset as u16);
                 }
             }
             Arm64Instruction::FpStr { vt, rn, offset, is_double } => {
                 if *is_double {
-                    emitter.str_fp_d(to_fpreg(*vt), to_reg(*rn), *offset as u16);
+                    emitter.str_fp_d(fp(*vt), r(*rn), *offset as u16);
                 } else {
-                    emitter.str_fp_s(to_fpreg(*vt), to_reg(*rn), *offset as u16);
+                    emitter.str_fp_s(fp(*vt), r(*rn), *offset as u16);
                 }
             }
 
             // -- NEON FP (double) --
             Arm64Instruction::FaddDouble { vd, vn, vm } => {
-                emitter.fadd_d(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fadd_d(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FsubDouble { vd, vn, vm } => {
-                emitter.fsub_d(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fsub_d(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FmulDouble { vd, vn, vm } => {
-                emitter.fmul_d(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fmul_d(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FdivDouble { vd, vn, vm } => {
-                emitter.fdiv_d(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fdiv_d(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::FcmpDouble { vn, vm } => {
-                emitter.fcmp_d(to_fpreg(*vn), to_fpreg(*vm));
+                emitter.fcmp_d(fp(*vn), fp(*vm));
             }
 
             // -- NEON SIMD (integer vector, 4x32) --
             Arm64Instruction::NeonLd1_4s { vt, rn } => {
-                emitter.ld1_4s(to_fpreg(*vt), to_reg(*rn));
+                emitter.ld1_4s(fp(*vt), r(*rn));
             }
             Arm64Instruction::NeonSt1_4s { vt, rn } => {
-                emitter.st1_4s(to_fpreg(*vt), to_reg(*rn));
+                emitter.st1_4s(fp(*vt), r(*rn));
             }
             Arm64Instruction::NeonAdd4s { vd, vn, vm } => {
-                emitter.add_v4s(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.add_v4s(fp(*vd), fp(*vn), fp(*vm));
             }
             Arm64Instruction::NeonMul4s { vd, vn, vm } => {
-                emitter.mul_v4s(to_fpreg(*vd), to_fpreg(*vn), to_fpreg(*vm));
+                emitter.mul_v4s(fp(*vd), fp(*vn), fp(*vm));
             }
 
             // -- System --
@@ -2955,6 +2987,37 @@ impl Arm64PeepholeOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- to_reg / to_fpreg tests (C11) --------------------------------------
+    //
+    // Note: `to_reg` / `to_fpreg` carry a `debug_assert!` precondition so
+    // that misuse trips immediately during development. The Option return
+    // is the production safety-net (debug_assert is a no-op in release
+    // builds, so an out-of-range register encoding returns None instead of
+    // panicking, letting the caller bail to the interpreter). We therefore
+    // test the happy path here; the negative path is verified at the
+    // underlying constructor level (Reg::from_u8 / FpReg::from_u8 in
+    // aarch64.rs) where no debug-precondition exists.
+
+    #[test]
+    fn to_reg_accepts_all_gpr_encodings() {
+        for n in 0..=31u8 {
+            assert!(
+                to_reg(Arm64Register(n)).is_some(),
+                "to_reg({n}) should be Some for valid GPR"
+            );
+        }
+    }
+
+    #[test]
+    fn to_fpreg_accepts_v0_through_v7() {
+        for n in 32..=39u8 {
+            assert!(
+                to_fpreg(Arm64Register(n)).is_some(),
+                "to_fpreg({n}) should be Some for valid FP reg"
+            );
+        }
+    }
 
     // -- Arm64Register tests ------------------------------------------------
 

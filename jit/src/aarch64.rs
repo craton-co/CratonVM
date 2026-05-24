@@ -93,6 +93,51 @@ impl Reg {
     pub fn enc(self) -> u32 {
         self as u32
     }
+
+    /// Construct a `Reg` from a raw 0..=31 encoding without using `transmute`.
+    ///
+    /// Returns `None` if `n` is out of range. Used by the ARM64 backend to
+    /// convert register-allocator outputs (`Arm64Register`) into emitter
+    /// `Reg` values without panicking on regalloc bugs — the JIT contract is
+    /// "never panic in production; bail to interpreter instead" (C11).
+    #[inline]
+    pub fn from_u8(n: u8) -> Option<Reg> {
+        match n {
+            0 => Some(Reg::X0),
+            1 => Some(Reg::X1),
+            2 => Some(Reg::X2),
+            3 => Some(Reg::X3),
+            4 => Some(Reg::X4),
+            5 => Some(Reg::X5),
+            6 => Some(Reg::X6),
+            7 => Some(Reg::X7),
+            8 => Some(Reg::X8),
+            9 => Some(Reg::X9),
+            10 => Some(Reg::X10),
+            11 => Some(Reg::X11),
+            12 => Some(Reg::X12),
+            13 => Some(Reg::X13),
+            14 => Some(Reg::X14),
+            15 => Some(Reg::X15),
+            16 => Some(Reg::X16),
+            17 => Some(Reg::X17),
+            18 => Some(Reg::X18),
+            19 => Some(Reg::X19),
+            20 => Some(Reg::X20),
+            21 => Some(Reg::X21),
+            22 => Some(Reg::X22),
+            23 => Some(Reg::X23),
+            24 => Some(Reg::X24),
+            25 => Some(Reg::X25),
+            26 => Some(Reg::X26),
+            27 => Some(Reg::X27),
+            28 => Some(Reg::X28),
+            29 => Some(Reg::X29),
+            30 => Some(Reg::X30),
+            31 => Some(Reg::SP),
+            _ => None,
+        }
+    }
 }
 
 /// An ARM64 FP/SIMD register (D0–D31 for double, S0–S31 for single,
@@ -139,6 +184,52 @@ impl FpReg {
     #[inline]
     pub fn enc(self) -> u32 {
         self as u32
+    }
+
+    /// Construct an `FpReg` from a raw 0..=31 encoding without using `transmute`.
+    ///
+    /// Returns `None` if `n` is out of range. Used by the ARM64 backend to
+    /// convert register-allocator outputs (`Arm64Register` with the FP-bias
+    /// stripped) into emitter `FpReg` values without panicking on regalloc
+    /// bugs — the JIT contract is "never panic in production; bail to
+    /// interpreter instead" (C11).
+    #[inline]
+    pub fn from_u8(n: u8) -> Option<FpReg> {
+        match n {
+            0 => Some(FpReg::D0),
+            1 => Some(FpReg::D1),
+            2 => Some(FpReg::D2),
+            3 => Some(FpReg::D3),
+            4 => Some(FpReg::D4),
+            5 => Some(FpReg::D5),
+            6 => Some(FpReg::D6),
+            7 => Some(FpReg::D7),
+            8 => Some(FpReg::D8),
+            9 => Some(FpReg::D9),
+            10 => Some(FpReg::D10),
+            11 => Some(FpReg::D11),
+            12 => Some(FpReg::D12),
+            13 => Some(FpReg::D13),
+            14 => Some(FpReg::D14),
+            15 => Some(FpReg::D15),
+            16 => Some(FpReg::D16),
+            17 => Some(FpReg::D17),
+            18 => Some(FpReg::D18),
+            19 => Some(FpReg::D19),
+            20 => Some(FpReg::D20),
+            21 => Some(FpReg::D21),
+            22 => Some(FpReg::D22),
+            23 => Some(FpReg::D23),
+            24 => Some(FpReg::D24),
+            25 => Some(FpReg::D25),
+            26 => Some(FpReg::D26),
+            27 => Some(FpReg::D27),
+            28 => Some(FpReg::D28),
+            29 => Some(FpReg::D29),
+            30 => Some(FpReg::D30),
+            31 => Some(FpReg::D31),
+            _ => None,
+        }
     }
 }
 
@@ -1356,6 +1447,38 @@ fn ldst_pair(opc: u32, v: u32, l: u32, encoding: u32, imm: i16, rt2: Reg, rn: Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Reg::from_u8 / FpReg::from_u8 (C11) --------------------------------
+
+    #[test]
+    fn reg_from_u8_round_trips_all_valid_encodings() {
+        for n in 0..=31u8 {
+            let r = Reg::from_u8(n).expect("0..=31 must round-trip");
+            assert_eq!(r as u8, n, "Reg::from_u8({n}) must encode back to {n}");
+        }
+    }
+
+    #[test]
+    fn reg_from_u8_rejects_out_of_range() {
+        for n in [32u8, 40, 64, 100, 200, 255] {
+            assert!(Reg::from_u8(n).is_none(), "Reg::from_u8({n}) must be None");
+        }
+    }
+
+    #[test]
+    fn fpreg_from_u8_round_trips_all_valid_encodings() {
+        for n in 0..=31u8 {
+            let r = FpReg::from_u8(n).expect("0..=31 must round-trip");
+            assert_eq!(r as u8, n, "FpReg::from_u8({n}) must encode back to {n}");
+        }
+    }
+
+    #[test]
+    fn fpreg_from_u8_rejects_out_of_range() {
+        for n in [32u8, 40, 64, 100, 200, 255] {
+            assert!(FpReg::from_u8(n).is_none(), "FpReg::from_u8({n}) must be None");
+        }
+    }
 
     /// Helper: read the last emitted 32-bit instruction word.
     fn last_inst(e: &Aarch64Emitter) -> u32 {
