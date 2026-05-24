@@ -67,6 +67,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 ## [0.3.0] - 2026-05-24
 
 ### Added
+- Real cryptographic signature verification in `x509_manager::validate_chain` for RSA-SHA256 (PKCS#1 v1.5) and ECDSA-with-SHA256 over P-256, replacing the previous structural-only "signature present" check. DSA-with-SHA1, RSA-PSS, and Ed25519 now report `TrustError::NotImplemented { oid }` so callers can choose to delegate to JCE.
 - JIT XMM register allocation for float/double locals (callee-saved XMM8-XMM15 on Windows x64), eliminating frame spills for FP-heavy methods.
 - JIT `Math.sqrt` intrinsic inlined as `SQRTSD` instead of going through interpreter dispatch.
 - JIT `dup2` opcode support, enabling compound array assignments like `a[i] += x`.

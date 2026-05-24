@@ -251,6 +251,33 @@ const OID_EXT_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 ///   2.5.29.19 — BasicConstraints
 const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 
+/// Signature-algorithm OIDs (the OID inside `tbsCertificate.signature` and
+/// the outer `signatureAlgorithm`).
+///   1.2.840.113549.1.1.11 — sha256WithRSAEncryption (PKCS#1 v1.5)
+const OID_SIG_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+///   1.2.840.10045.4.3.2 — ecdsa-with-SHA256 (P-256 most common)
+const OID_SIG_ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+
+// --- Signature-algorithm OIDs we deliberately do NOT support yet. ---
+//
+// These are recognised but routed to `TrustError::NotImplemented` so the
+// caller can distinguish "we don't know this OID at all" from "we know it
+// and chose not to implement it in this layer". WP5.3.followup will pick
+// them up:
+//
+//   * 1.2.840.10040.4.3 — id-dsa-with-sha1 (DSA, deprecated by NIST 2024)
+//   * 1.2.840.113549.1.1.10 — id-RSASSA-PSS (RSA-PSS, needs salt-length
+//     + MGF1 parameter parsing from the algorithm-identifier `parameters`
+//     SEQUENCE)
+//   * 1.3.101.112 — id-Ed25519 (pure EdDSA over Curve25519, separate
+//     verify path — no SHA-256 preimage)
+///   1.2.840.10040.4.3 — id-dsa-with-sha1
+const OID_SIG_DSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x03];
+///   1.2.840.113549.1.1.10 — id-RSASSA-PSS
+const OID_SIG_RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
+///   1.3.101.112 — id-Ed25519
+const OID_SIG_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+
 // ---- KeyUsage bit positions (RFC 5280 §4.2.1.3) ----
 pub const KU_DIGITAL_SIGNATURE: u16 = 1 << 0;
 pub const KU_NON_REPUDIATION: u16 = 1 << 1;
@@ -718,7 +745,23 @@ pub enum TrustError {
     BrokenChain { at: usize },
     NotCa { at: usize },
     NoTrustAnchor,
+    /// Signature *value* was missing or otherwise structurally unusable
+    /// (issuer SPKI couldn't be decoded, signature length mismatch with
+    /// modulus, etc.). Kept for backwards compatibility with code that
+    /// matched on `SignatureFailed { at }` before we split out the
+    /// cryptographic-failure paths.
     SignatureFailed { at: usize },
+    /// The cryptographic signature verification step itself rejected the
+    /// pair `(issuer SPKI, signature)` for cert `at`. RSA-PKCS1v15 padding
+    /// mismatch / decoded digest mismatch, ECDSA `u1*G + u2*Q.x ≠ r mod n`,
+    /// or any other algorithm-level failure.
+    BadSignature { at: usize },
+    /// The signature-algorithm OID is recognised but this verifier doesn't
+    /// implement it. Lets callers distinguish "DSA chain — please fall back
+    /// to JCE" from "we have no idea what 1.2.3.4 is". Currently fires
+    /// for DSA (id-dsa-with-sha1), RSA-PSS (id-RSASSA-PSS), and Ed25519
+    /// (id-Ed25519). See the OID const block for the upgrade plan.
+    NotImplemented { at: usize, oid: Vec<u8> },
     Parse(CertParseError),
 }
 
@@ -734,7 +777,17 @@ impl std::fmt::Display for TrustError {
             TrustError::NotCa { at } => write!(f, "cert at index {} is not a CA", at),
             TrustError::NoTrustAnchor => f.write_str("no trust anchor found for chain"),
             TrustError::SignatureFailed { at } => {
-                write!(f, "signature verification failed at index {}", at)
+                write!(f, "signature verification failed at index {} (structural)", at)
+            }
+            TrustError::BadSignature { at } => {
+                write!(f, "signature verification failed at index {} (cryptographic)", at)
+            }
+            TrustError::NotImplemented { at, oid } => {
+                write!(
+                    f,
+                    "signature-algorithm OID at index {} not implemented (oid bytes={:02x?})",
+                    at, oid
+                )
             }
             TrustError::Parse(e) => write!(f, "parse: {}", e),
         }
@@ -751,24 +804,23 @@ impl std::fmt::Display for TrustError {
 ///   2. Date-check every cert.
 ///   3. Verify chain continuity (issuer ↔ subject DN match).
 ///   4. Verify each non-leaf cert has `BasicConstraints.cA = TRUE`.
-///   5. Find a trust anchor whose subject DN matches the last cert's issuer
-///      (or last cert's own subject if it is self-signed and itself an anchor).
-///   6. Verify each cert's signature against its issuer's SPKI (the trust
-///      anchor's SPKI for the last hop).
+///   5. Find a trust anchor whose subject DN matches the last cert's
+///      subject (the chain ends at an anchor) or the last cert's issuer
+///      (the chain stops one hop short of the anchor — the classic
+///      `[leaf, intermediate]` shape).
+///   6. Cryptographically verify each cert's signature against its issuer's
+///      SPKI — `parsed[i+1].spki_der` for intermediate hops, the matched
+///      trust anchor's SPKI for the last cert (skipped when the last cert
+///      IS the anchor, per RFC 5280 §6.1.1).
 ///
-/// Signature verification is performed at the SPKI level — we do *not* peel
-/// the bit-string into a PSS / RSA / ECDSA verifier here. Instead we assert
-/// that the issuer SPKI matches what the cert was signed against by
-/// requiring DN continuity AND the issuer SPKI is present in the chain or
-/// in `trust.anchors`. This is the same posture rustls/webpki adopt at the
-/// pre-handshake plumbing layer; the actual cryptographic verification of
-/// the leaf's signature happens during the TLS handshake itself in
-/// `t27_tls.rs`'s rustls path. For chains that bypass the TLS handshake
-/// (raw `X509TrustManager.checkServerTrusted` calls from Java code), the
-/// continuity + anchor-presence check is what RFC 5280 §6.1 actually
-/// requires the path validator to enforce; cryptographic signature
-/// verification is layered on as Step 6 only when the issuer cert's SPKI
-/// algorithm is one we know how to verify.
+/// Cryptographic dispatch covers the two algorithms real-world JARs and
+/// PKIX chains overwhelmingly use today:
+///   * `1.2.840.113549.1.1.11` — sha256WithRSAEncryption (PKCS#1 v1.5)
+///   * `1.2.840.10045.4.3.2`   — ecdsa-with-SHA256 (P-256)
+///
+/// Everything else returns `TrustError::NotImplemented` so the caller can
+/// choose to delegate to a JCE provider. See the OID block above for the
+/// inventory of recognised-but-unimplemented OIDs.
 pub fn validate_chain(
     chain: &[Vec<u8>],
     trust: &TrustManagerState,
@@ -829,33 +881,122 @@ pub fn validate_chain(
     // The last cert's issuer must be present in the trust set — unless the
     // last cert is itself the anchor (self-signed root packaged in the
     // chain). We accept either presentation.
-    let _anchor_spki: &[u8] = match trust.anchors.get(&last.issuer_der) {
-        Some(a) => a.spki_der.as_slice(),
-        None => match trust.anchors.get(&last.subject_der) {
-            Some(a) => a.spki_der.as_slice(),
+    //
+    // We probe `subject_der` first so a self-signed root that the caller
+    // both put in the trust set AND repeated at the bottom of the chain is
+    // recognised as the anchor itself — RFC 5280 §6.1.1 says a trust
+    // anchor's public key is taken as authoritative without further
+    // verification, so the cryptographic step below must NOT attempt to
+    // re-verify it. Only when the cert is *not* itself an anchor do we
+    // fall through to the issuer-DN lookup (cross-signed roots, classic
+    // intermediate-anchored chains).
+    let (anchor_spki, last_is_anchor): (&[u8], bool) = match trust.anchors.get(&last.subject_der) {
+        Some(a) => (a.spki_der.as_slice(), true),
+        None => match trust.anchors.get(&last.issuer_der) {
+            Some(a) => (a.spki_der.as_slice(), false),
             None => return Err(TrustError::NoTrustAnchor),
         },
     };
 
-    // Step 6: signature verification.
+    // Step 6: cryptographic signature verification.
     //
-    // We perform a structural check: each cert's signature value must be
-    // present and non-empty, the algorithm OID must match the one nested
-    // inside its `tbsCertificate`, and the issuer's SPKI must be parseable
-    // as one of our recognised public-key algorithms. Full
-    // PSS / RSA-PKCS1 / ECDSA cryptographic verification is performed by
-    // rustls during the TLS handshake itself (see `t27_tls.rs`); calling
-    // path-validation outside the handshake (e.g. raw
-    // `X509TrustManager.checkServerTrusted` from a custom validator) gets
-    // the structural check here, which is what real-JDK SunJSSE does in
-    // the same code path before delegating to the JCE Signature provider.
+    // For each cert[i] in the chain we re-verify its `signatureValue` against
+    // the issuer's `SubjectPublicKeyInfo`:
+    //
+    //   * `i < parsed.len() - 1` → issuer SPKI is `parsed[i+1].spki_der`.
+    //   * `i == parsed.len() - 1` and the last cert is *not* itself the
+    //     anchor → issuer SPKI is `anchor_spki` (the matched trust anchor's
+    //     SPKI).
+    //   * `i == parsed.len() - 1` and the last cert *is* the anchor → skip;
+    //     RFC 5280 §6.1.1 (the "trust anchor information" definition) says
+    //     a trust anchor's public key is taken as authoritative without
+    //     re-verification.
+    //
+    // The OID dispatch covers the two algorithms real-world JARs and PKIX
+    // chains overwhelmingly use today; everything else maps to
+    // `NotImplemented { oid }` so the caller can choose to defer to JCE.
     for i in 0..parsed.len() {
         if parsed[i].signature_value.is_empty() {
             return Err(TrustError::SignatureFailed { at: i });
         }
+        let issuer_spki: &[u8] = if i + 1 < parsed.len() {
+            parsed[i + 1].spki_der.as_slice()
+        } else if last_is_anchor {
+            // Anchor's signature is trusted by definition — nothing to check.
+            continue;
+        } else {
+            anchor_spki
+        };
+        verify_one_signature(i, &parsed[i], issuer_spki)?;
     }
 
     Ok(())
+}
+
+/// Verify cert[i]'s signature against its issuer's SubjectPublicKeyInfo.
+///
+/// Dispatches on `parsed.signature_algorithm_oid` (the outer
+/// `signatureAlgorithm.algorithm` OID, equivalent to the algorithm name a
+/// Java `Signature.getInstance(...)` call would use). Returns `Ok(())`
+/// when the signature verifies, `Err(BadSignature)` when the cryptographic
+/// check fails, or `Err(NotImplemented)` when the OID is recognised but
+/// this in-tree verifier doesn't implement it.
+fn verify_one_signature(
+    at: usize,
+    cert: &ParsedCert,
+    issuer_spki: &[u8],
+) -> Result<(), TrustError> {
+    use crate::crypto::crypto_impl::{
+        parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256,
+    };
+
+    let oid = cert.signature_algorithm_oid.as_slice();
+    let sig = cert.signature_value.as_slice();
+    let tbs = cert.tbs_bytes.as_slice();
+
+    if oid == OID_SIG_SHA256_RSA {
+        // PKCS#1 v1.5 RSA-SHA256: hash(tbs) → EMSA-PKCS1-v1_5 envelope, then
+        // s^e mod n and byte-equality compare.
+        let pk = match parse_rsa_public_key(issuer_spki) {
+            Some(k) => k,
+            None => return Err(TrustError::BadSignature { at }),
+        };
+        if Rsa::verify_sha256(&pk, tbs, sig) {
+            Ok(())
+        } else {
+            Err(TrustError::BadSignature { at })
+        }
+    } else if oid == OID_SIG_ECDSA_SHA256 {
+        // ECDSA-with-SHA256 over P-256: DER-decoded (r, s), check u1*G +
+        // u2*Q.x ≡ r (mod n). `verify_with_digest` takes a pre-hashed
+        // digest so we hash the TBS once here.
+        let pk = match parse_ecdsa_public_key(issuer_spki) {
+            Some(k) => k,
+            None => return Err(TrustError::BadSignature { at }),
+        };
+        let digest = Sha256::digest(tbs);
+        if Ecdsa::verify_with_digest(&pk, &digest, sig) {
+            Ok(())
+        } else {
+            Err(TrustError::BadSignature { at })
+        }
+    } else if oid == OID_SIG_DSA_SHA1 || oid == OID_SIG_RSA_PSS || oid == OID_SIG_ED25519 {
+        // Known-but-unimplemented. See OID const block for the rationale —
+        // each of these needs additional parsing (PSS parameters) or a
+        // distinct primitive (DSA, EdDSA) we don't expose at this layer yet.
+        Err(TrustError::NotImplemented {
+            at,
+            oid: oid.to_vec(),
+        })
+    } else {
+        // Totally unrecognised OID — still NotImplemented (rather than
+        // BadSignature) so callers see a structural rather than a
+        // cryptographic-rejection signal and can decide to delegate.
+        Err(TrustError::NotImplemented {
+            at,
+            oid: oid.to_vec(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,5 +2208,335 @@ mod tests {
             .concat(),
         );
         assert_eq!(classify_key_type_from_pkcs8(&pkcs8_ec), "EC");
+    }
+
+    // ====================================================================
+    // Real-signature chain-verification tests (RSA-SHA256 and ECDSA-P256).
+    //
+    // These build a self-consistent toy CA in-memory: anchor + leaf are
+    // signed with a real generated keypair, then validate_chain re-verifies
+    // them through the same primitives. No openssl / no fixtures.
+    // ====================================================================
+
+    use crate::crypto::crypto_impl::{
+        Ecdsa, EcdsaPrivateKey, EcdsaPublicKey, Rsa, RsaPrivateKey, RsaPublicKey, Sha256,
+    };
+
+    /// Variant of `CertSpec` that takes a *real* SPKI DER (already encoded
+    /// by `Rsa::public_key_to_der` / `Ecdsa::public_key_to_der`) instead of
+    /// a fake algorithm-OID-only SPKI. We also accept the issuer's signing
+    /// algorithm (the cert's `signatureAlgorithm`) so RSA and ECDSA chains
+    /// share the same builder.
+    struct SignedCertSpec<'a> {
+        not_before_utc: &'static str,
+        not_after_utc: &'static str,
+        subject_cn: &'static str,
+        issuer_cn: &'static str,
+        spki_der: &'a [u8],
+        sig_alg_oid: &'static [u8],
+        key_usage_bits: Option<u16>,
+        ext_key_usages: &'static [&'static [u8]],
+        basic_constraints_ca: Option<bool>,
+    }
+
+    /// Build the *tbsCertificate* DER for a SignedCertSpec. Used both to
+    /// produce the bytes the issuer signs and (after the signature is
+    /// computed) to assemble the final SEQUENCE { tbs, sigAlg, sigValue }.
+    fn build_tbs(spec: &SignedCertSpec) -> Vec<u8> {
+        let mut tbs: Vec<u8> = Vec::new();
+        // version [0] EXPLICIT INTEGER 2 (v3)
+        tbs.extend_from_slice(&der_context_explicit(0, &der_int(2)));
+        // serial
+        tbs.extend_from_slice(&der_int(1));
+        // signature alg (this MUST match the outer sigAlg byte-for-byte;
+        // RFC 5280 §4.1.1.2 requires it)
+        let sig_alg_seq = der_seq(
+            [der_oid(spec.sig_alg_oid), der_tlv(TAG_NULL, &[])].concat(),
+        );
+        tbs.extend_from_slice(&sig_alg_seq);
+        // issuer
+        tbs.extend_from_slice(&name_with_cn(spec.issuer_cn));
+        // validity
+        tbs.extend_from_slice(&der_seq(
+            [
+                der_utctime(spec.not_before_utc),
+                der_utctime(spec.not_after_utc),
+            ]
+            .concat(),
+        ));
+        // subject
+        tbs.extend_from_slice(&name_with_cn(spec.subject_cn));
+        // SPKI — already DER-encoded by the keypair serializer
+        tbs.extend_from_slice(spec.spki_der);
+        // extensions
+        let mut exts: Vec<u8> = Vec::new();
+        if let Some(bits) = spec.key_usage_bits {
+            exts.extend_from_slice(&extension(
+                OID_EXT_KEY_USAGE,
+                true,
+                ku_bitstring(bits),
+            ));
+        }
+        if !spec.ext_key_usages.is_empty() {
+            exts.extend_from_slice(&extension(
+                OID_EXT_EXTENDED_KEY_USAGE,
+                false,
+                eku_seq(spec.ext_key_usages),
+            ));
+        }
+        if let Some(ca) = spec.basic_constraints_ca {
+            exts.extend_from_slice(&extension(
+                OID_EXT_BASIC_CONSTRAINTS,
+                true,
+                bc_seq(ca),
+            ));
+        }
+        if !exts.is_empty() {
+            tbs.extend_from_slice(&der_context_explicit(3, &der_seq(exts)));
+        }
+        der_seq(tbs)
+    }
+
+    /// Encrypted sigAlg DER (SEQUENCE { OID, NULL }) for use in the outer
+    /// SEQUENCE.
+    fn sig_alg_seq(oid: &[u8]) -> Vec<u8> {
+        der_seq([der_oid(oid), der_tlv(TAG_NULL, &[])].concat())
+    }
+
+    /// Assemble Certificate ::= SEQUENCE { tbs, sigAlgorithm, signatureValue }
+    /// once `tbs` and `signature` bytes are known.
+    fn assemble_cert(tbs: &[u8], sig_alg_oid: &[u8], signature: &[u8]) -> Vec<u8> {
+        let outer_sig_alg = sig_alg_seq(sig_alg_oid);
+        let sig_bs = der_bit_string(0, signature);
+        let mut outer = Vec::with_capacity(tbs.len() + outer_sig_alg.len() + sig_bs.len());
+        outer.extend_from_slice(tbs);
+        outer.extend_from_slice(&outer_sig_alg);
+        outer.extend_from_slice(&sig_bs);
+        der_seq(outer)
+    }
+
+    /// Sign-and-bundle a cert with an RSA issuer key.
+    fn mk_rsa_signed_cert(spec: &SignedCertSpec, issuer_sk: &RsaPrivateKey) -> Vec<u8> {
+        let tbs = build_tbs(spec);
+        let signature = Rsa::sign_sha256(issuer_sk, &tbs);
+        assemble_cert(&tbs, spec.sig_alg_oid, &signature)
+    }
+
+    /// Sign-and-bundle a cert with an ECDSA P-256 issuer key.
+    fn mk_ecdsa_signed_cert(spec: &SignedCertSpec, issuer_sk: &EcdsaPrivateKey) -> Vec<u8> {
+        let tbs = build_tbs(spec);
+        let digest = Sha256::digest(&tbs);
+        let signature = Ecdsa::sign_with_digest(issuer_sk, &digest);
+        assemble_cert(&tbs, spec.sig_alg_oid, &signature)
+    }
+
+    /// Lazily cached RSA-1024 root keypair so the test suite doesn't pay
+    /// for `generate_keypair` more than once. Keypair generation can take
+    /// several seconds on debug builds — sharing it across the three RSA
+    /// tests keeps the suite snappy without weakening coverage (each test
+    /// still drives its own validate_chain end-to-end).
+    fn shared_rsa_root() -> &'static (RsaPublicKey, RsaPrivateKey) {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<(RsaPublicKey, RsaPrivateKey)> = OnceLock::new();
+        CELL.get_or_init(|| Rsa::generate_keypair(1024))
+    }
+
+    /// Lazily cached ECDSA P-256 root keypair (parallel rationale to
+    /// `shared_rsa_root`).
+    fn shared_ecdsa_root() -> &'static (EcdsaPublicKey, EcdsaPrivateKey) {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<(EcdsaPublicKey, EcdsaPrivateKey)> = OnceLock::new();
+        CELL.get_or_init(|| Ecdsa::generate_keypair())
+    }
+
+    #[test]
+    fn validate_chain_real_rsa_sha256_signature_passes() {
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+
+        // Build a self-signed root (anchor) with REAL RSA SPKI and a real
+        // sha256WithRSAEncryption signature over its TBS.
+        let root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Real RSA Root",
+                issuer_cn: "Real RSA Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            root_sk,
+        );
+
+        // Build a leaf signed by the same root. (Sharing the keypair is a
+        // shortcut — the leaf's *own* SPKI is irrelevant to the verifier
+        // because we never re-sign anything from the leaf in this test.)
+        let leaf = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "leaf.example.com",
+                issuer_cn: "Real RSA Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE | KU_KEY_ENCIPHERMENT),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            root_sk,
+        );
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+        validate_chain(&[leaf, root], &trust).expect("real RSA chain must validate");
+    }
+
+    #[test]
+    fn validate_chain_real_rsa_tampered_signature_is_bad_signature() {
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+
+        let root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Real RSA Root",
+                issuer_cn: "Real RSA Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            root_sk,
+        );
+
+        // Build a leaf, then *flip a byte in the signature bit-string* so
+        // PKCS#1 v1.5 padding-decode will produce the wrong EMSA envelope.
+        let mut leaf = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "tampered.example",
+                issuer_cn: "Real RSA Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            root_sk,
+        );
+        // Flip the very last byte of the cert — that's inside the signature
+        // BIT STRING. (We don't shift any DER length headers, so the cert
+        // still parses; only the cryptographic check should fail.)
+        let last_idx = leaf.len() - 1;
+        leaf[last_idx] ^= 0x01;
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+        match validate_chain(&[leaf, root], &trust) {
+            Err(TrustError::BadSignature { at }) => {
+                assert_eq!(at, 0, "leaf is at index 0");
+            }
+            other => panic!("expected BadSignature, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_chain_real_ecdsa_p256_sha256_signature_passes() {
+        let (root_pk, root_sk) = shared_ecdsa_root();
+        let root_spki = Ecdsa::public_key_to_der(root_pk);
+
+        let root = mk_ecdsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Real EC Root",
+                issuer_cn: "Real EC Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_ECDSA_SHA256,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN | KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            root_sk,
+        );
+
+        let leaf = mk_ecdsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "300101000000Z",
+                subject_cn: "ec-leaf.example.com",
+                issuer_cn: "Real EC Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_ECDSA_SHA256,
+                key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+                ext_key_usages: &[OID_KP_SERVER_AUTH],
+                basic_constraints_ca: Some(false),
+            },
+            root_sk,
+        );
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+        validate_chain(&[leaf, root], &trust).expect("real ECDSA chain must validate");
+    }
+
+    #[test]
+    fn validate_chain_unknown_signature_oid_reports_not_implemented() {
+        // Build a chain where the leaf is signed with id-RSASSA-PSS — an OID
+        // the verifier knows but explicitly does not implement (no PSS
+        // parameter parsing today). The anchor is still RSA-SHA256-signed
+        // so the chain reaches Step 6 cleanly; the rejection comes from the
+        // leaf's OID dispatch.
+        let (root_pk, root_sk) = shared_rsa_root();
+        let root_spki = Rsa::public_key_to_der(root_pk);
+
+        let root = mk_rsa_signed_cert(
+            &SignedCertSpec {
+                not_before_utc: "200101000000Z",
+                not_after_utc: "490101000000Z",
+                subject_cn: "Real RSA Root",
+                issuer_cn: "Real RSA Root",
+                spki_der: &root_spki,
+                sig_alg_oid: OID_SIG_SHA256_RSA,
+                key_usage_bits: Some(KU_KEY_CERT_SIGN),
+                ext_key_usages: &[],
+                basic_constraints_ca: Some(true),
+            },
+            root_sk,
+        );
+
+        // Build the leaf's TBS with PSS OID, then sign with PKCS#1 v1.5
+        // anyway — the *signature bytes* don't matter; we only need the
+        // outer sigAlg OID to route to NotImplemented before we touch the
+        // cryptographic verifier.
+        let tbs = build_tbs(&SignedCertSpec {
+            not_before_utc: "200101000000Z",
+            not_after_utc: "300101000000Z",
+            subject_cn: "pss-leaf",
+            issuer_cn: "Real RSA Root",
+            spki_der: &root_spki,
+            sig_alg_oid: OID_SIG_RSA_PSS,
+            key_usage_bits: Some(KU_DIGITAL_SIGNATURE),
+            ext_key_usages: &[OID_KP_SERVER_AUTH],
+            basic_constraints_ca: Some(false),
+        });
+        let fake_sig = Rsa::sign_sha256(root_sk, &tbs);
+        let leaf = assemble_cert(&tbs, OID_SIG_RSA_PSS, &fake_sig);
+
+        let mut trust = TrustManagerState::default();
+        insert_anchor(&mut trust, root.clone());
+        match validate_chain(&[leaf, root], &trust) {
+            Err(TrustError::NotImplemented { at, oid }) => {
+                assert_eq!(at, 0);
+                assert_eq!(oid, OID_SIG_RSA_PSS.to_vec());
+            }
+            other => panic!("expected NotImplemented for PSS, got {:?}", other),
+        }
     }
 }
