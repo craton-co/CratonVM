@@ -143,6 +143,19 @@ impl Event {
         self.id
     }
 
+    /// AUDIT 2026-05-24 (HIGH correctness): crate-internal accessor
+    /// returning the underlying `sys::CUevent` handle so callers in
+    /// `lib.rs` can `cuEventRecord` against arbitrary cudarc streams
+    /// (specifically `ctx.copy_h2d` for `from_host_async`'s upload-
+    /// completion marker, and `ctx.compute` for `launch_on_stream`'s
+    /// kernel-completion marker). Cuda-mode only — the stub backend
+    /// has no real event handle.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    pub(crate) fn cu_event_raw(&self) -> cudarc::driver::sys::CUevent {
+        self.inner.cu_event
+    }
+
     /// Block until this event is reached on whatever stream recorded
     /// it. Returns `Err(DeviceError::NoDriver)` in stub mode if the
     /// event was never recorded.

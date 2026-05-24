@@ -207,6 +207,31 @@ impl DeviceContextInner {
     pub(crate) fn device(&self) -> &Arc<CudaDevice> {
         &self.dev
     }
+
+    /// AUDIT 2026-05-24 (HIGH correctness): expose `copy_h2d`'s raw
+    /// stream handle so `lib.rs::DeviceBuffer::from_host_async` can
+    /// `cuEventRecord` the buffer's `last_write` event on the same
+    /// stream the H→D copy ran on. Without this, a subsequent
+    /// `cuStreamWaitEvent(user_stream, last_write)` would observe an
+    /// event that was never recorded on the upload-side queue and
+    /// would not actually wait on the copy retiring (the cudarc
+    /// `htod_sync_copy` is sync today, so the practical effect is
+    /// nil — but the contract becomes correct against any future
+    /// async-upload refactor).
+    pub(crate) fn copy_h2d_raw(&self) -> cudarc::driver::sys::CUstream {
+        self.copy_h2d.stream
+    }
+
+    /// AUDIT 2026-05-24 (HIGH correctness): expose `compute`'s raw
+    /// stream handle so `lib.rs::DeviceModule::launch_on_stream` can
+    /// `cuEventRecord` the kernel-done event on the stream the kernel
+    /// actually ran on. Recording it on the user `Stream` instead
+    /// would mark "user stream's queue position" rather than "kernel
+    /// completion", because the launch goes onto `ctx.compute` rather
+    /// than the user stream.
+    pub(crate) fn compute_raw(&self) -> cudarc::driver::sys::CUstream {
+        self.compute.stream
+    }
 }
 
 /// A loaded PTX module. cudarc stores the underlying `CudaModule` in a

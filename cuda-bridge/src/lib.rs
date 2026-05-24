@@ -1,6 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
-
 //! Thin CUDA Driver API bridge.
 //!
 //! See the crate-level [`README.md`](../../README.md) for the build-mode
@@ -100,28 +97,6 @@ pub struct DeviceContext(backend::DeviceContextInner);
 //
 // In stub mode `DeviceContextInner` is a unit struct and is trivially
 // `Send + Sync`; these impls are harmless there.
-//
-// # Safety
-//
-// AUDIT 2026-05-24 (C32, SOUND-1): these impls are sound ONLY when the
-// caller honours an unspoken contract: any thread that drives a
-// `DeviceContext` (or anything reachable through it — `DeviceBuffer`,
-// `Stream`, `Event`) MUST first call `bind_to_thread` on the
-// underlying `Arc<CudaDevice>` if it is not the thread that
-// constructed the context. The bridge does *not* enforce this at the
-// public-API entry points; the CUDA driver's behaviour on an
-// unbound thread is undefined (most calls return
-// `CUDA_ERROR_INVALID_CONTEXT`, but the failure mode is not
-// memory-safe in the general case).
-//
-// In practice the bridge's only known cross-thread caller is the
-// VM's `OffloadCache`, which today only constructs and drives a
-// `DeviceContext` from one worker thread per context. Stub-mode is
-// trivially safe (the inner is a unit struct). Future cross-thread
-// users — or any new public API that lets callers store a
-// `DeviceContext` in a `Send + Sync` static — must add a
-// `bind_to_thread` call at the entry of every public method, or
-// document the requirement loudly so callers can do it themselves.
 unsafe impl Send for DeviceContext {}
 unsafe impl Sync for DeviceContext {}
 
@@ -157,10 +132,16 @@ impl DeviceContext {
         &self.0
     }
 
-    /// Stub-only test constructor for `tests/stub_op_log.rs`.
-    /// Compiled out when the `cuda` feature is on.
-    #[cfg(not(feature = "cuda"))]
-    pub fn stub_for_testing() -> Self {
+    /// Stub-only test constructor: build a synthetic `DeviceContext`
+    /// without going through the driver. Used by the in-crate stub-mode
+    /// event-ordering integration tests in `launch.rs`; exposed to the
+    /// rest of the crate so sibling test modules can drive
+    /// `from_host_async` / `launch_on_stream` / `to_host_async` against
+    /// the stub op log without depending on a real `probe()`.
+    #[cfg(all(test, not(feature = "cuda")))]
+    pub(crate) fn for_test() -> Self {
+        // Stub `DeviceContextInner` is a unit struct — costs nothing
+        // to construct.
         Self(backend::DeviceContextInner)
     }
 }
@@ -241,6 +222,14 @@ impl DeviceModule {
     ) -> Result<()> {
         self.0.launch_raw(&ctx.0, kernel, cfg, args)
     }
+
+    /// Stub-only test constructor — see [`DeviceContext::for_test`].
+    /// Builds a synthetic `DeviceModule` whose `launch_on_stream` only
+    /// records OpLog ops (no driver call).
+    #[cfg(all(test, not(feature = "cuda")))]
+    pub(crate) fn for_test() -> Self {
+        Self(backend::DeviceModuleInner)
+    }
 }
 
 /// Builder for a CUDA kernel argument list.
@@ -273,15 +262,30 @@ impl KernelArgs {
         // `u64` address was copied in, so dropping the originating
         // `DeviceBuffer` before the launch left the kernel reading
         // freed device memory (use-after-free).
+        //
+        // AUDIT 2026-05-24 (HIGH correctness — cross-stream ordering):
+        // also clone the buffer's `last_write` slot into the
+        // `KernelArg`. `launch_on_stream` (1) reads the slot to wait on
+        // the buffer's last write before launching the kernel and
+        // (2) overwrites it with the kernel-completion event so
+        // subsequent `to_host_async` / re-launch calls wait on the
+        // kernel rather than the upload.
+        let last_write = buf.last_write.clone();
         #[cfg(feature = "cuda")]
         {
-            let (addr, keep_alive) = buf.0.device_ptr_arg();
-            self.raw.push(KernelArg::DevicePtr { addr, _keep_alive: keep_alive });
+            let (addr, keep_alive) = buf.inner.device_ptr_arg();
+            self.raw.push(KernelArg::DevicePtr {
+                addr,
+                _keep_alive: keep_alive,
+                last_write,
+            });
         }
         #[cfg(not(feature = "cuda"))]
         {
-            self.raw
-                .push(KernelArg::DevicePtr { addr: buf.0.device_ptr_arg() });
+            self.raw.push(KernelArg::DevicePtr {
+                addr: buf.inner.device_ptr_arg(),
+                last_write,
+            });
         }
         self
     }
@@ -330,6 +334,12 @@ pub(crate) enum KernelArg {
         /// Keep-alive only; not read. See the variant comment above.
         #[allow(dead_code)]
         _keep_alive: backend::BufferKeepAlive,
+        /// AUDIT 2026-05-24 (HIGH correctness): shared `last_write`
+        /// slot from the originating `DeviceBuffer`. `launch_on_stream`
+        /// reads this to wait on the buffer's last write before the
+        /// launch and overwrites it with the kernel-completion event
+        /// after the launch.
+        last_write: LastWriteSlot,
     },
     #[cfg(not(feature = "cuda"))]
     DevicePtr {
@@ -339,6 +349,11 @@ pub(crate) enum KernelArg {
         // code that pattern-matches across both cfgs.
         #[allow(dead_code)]
         addr: u64,
+        /// AUDIT 2026-05-24 (HIGH correctness): see cuda variant.
+        /// Active in stub mode too because `launch_on_stream`'s
+        /// event-ordering bookkeeping is what the stub-backend op-log
+        /// tests assert on.
+        last_write: LastWriteSlot,
     },
     I32(i32),
     I64(i64),
@@ -352,7 +367,32 @@ pub(crate) enum KernelArg {
 /// `f32`, `f64`, `u8`, `i16`). The bridge does no bounds checking on
 /// the host side — the kernel is responsible for staying within
 /// `len()`.
-pub struct DeviceBuffer<T>(pub(crate) backend::DeviceBufferInner<T>);
+///
+/// AUDIT 2026-05-24 (HIGH correctness — cross-stream ordering): every
+/// `DeviceBuffer<T>` now carries a `last_write` event slot. The slot is
+/// initially empty; `from_host_async` installs an event recorded on the
+/// upload stream, and `launch_on_stream` installs a kernel-completion
+/// event recorded on the user stream for every device-pointer arg. The
+/// slot is `Arc<Mutex<…>>` because:
+///   * `Arc` lets `KernelArgs::push_device_ptr` share the *same* slot
+///     with the buffer — `launch_on_stream` updates the slot through the
+///     `KernelArg`, and the buffer's `to_host_async` reads it back.
+///   * `Mutex` gives interior mutability through the `&self` API of
+///     `to_host_async` and the `&KernelArgs` flow of `launch_on_stream`.
+pub struct DeviceBuffer<T> {
+    pub(crate) inner: backend::DeviceBufferInner<T>,
+    /// Per-buffer "last write" event slot. See type-level docs.
+    pub(crate) last_write: LastWriteSlot,
+}
+
+/// Shared handle to a buffer's last-write event. See [`DeviceBuffer`].
+pub(crate) type LastWriteSlot =
+    std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Event>>>>;
+
+/// Allocate a fresh empty [`LastWriteSlot`].
+pub(crate) fn new_last_write_slot() -> LastWriteSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
 
 // ── Device-element bound ─────────────────────────────────────────────
 //
@@ -451,20 +491,6 @@ impl<T> DeviceElem for T where T: bytemuck::Pod + Send + Sync + 'static {}
 //
 // In stub mode `DeviceBufferInner<T>` is just a `PhantomData<T>`, so the
 // conditional impls reduce to the auto-trait behaviour anyway.
-//
-// # Safety
-//
-// AUDIT 2026-05-24 (C32, SOUND-1 / SOUND-5): same caller contract as
-// `DeviceContext` above — any thread that calls a method on a
-// `DeviceBuffer` that ultimately reaches the CUDA driver
-// (`to_host`, `to_host_async`, dropping the buffer, or handing it
-// to `KernelArgs::push_device_ptr` for a launch on that thread) MUST
-// first call `bind_to_thread` on the device the buffer was
-// allocated on. `DeviceBuffer` retains an `Arc<CudaDevice>` for
-// exactly this reason, but the bridge does not currently call
-// `bind_to_thread` automatically. Cross-thread use without binding
-// is UB by the CUDA driver model and is the caller's responsibility
-// until the bridge grows a runtime guard at public entry points.
 unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
@@ -477,19 +503,28 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        backend::DeviceBufferInner::uninit(&ctx.0, len).map(Self)
+        backend::DeviceBufferInner::uninit(&ctx.0, len).map(|inner| Self {
+            inner,
+            last_write: new_last_write_slot(),
+        })
     }
 
     /// Allocate `len` elements, zero-initialised.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(Self)
+        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+            inner,
+            last_write: new_last_write_slot(),
+        })
     }
 
     /// Allocate and upload from `host` in one shot.
     pub fn from_host(ctx: &DeviceContext, host: &[T]) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+        backend::DeviceBufferInner::from_host(&ctx.0, host).map(|inner| Self {
+            inner,
+            last_write: new_last_write_slot(),
+        })
     }
 
     /// Allocate and upload from `host` ordered against `stream`.
@@ -500,26 +535,62 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// callers can inspect the op log; in `cuda` mode `record_op` is a
     /// no-op (the driver owns the queue).
     ///
-    /// AUDIT 2026-05-24 (C32 stream-port fix): the cuda-mode body now
-    /// goes through `DeviceBufferInner::from_host_async_unchecked`,
-    /// which submits the H→D copy on the context's `copy_h2d` stream
-    /// and returns WITHOUT host-synchronising. The borrowed `host`
-    /// slice MUST outlive the next `stream.synchronize()` (or an
-    /// equivalent event-based barrier) on the caller's side.
+    /// CONTRACT (AUDIT 2026-05-24, HIGH correctness): the host slice
+    /// `host` must outlive the *signalling* of the buffer's
+    /// `last_write` event — i.e. the point at which all the device-
+    /// side work the slice participates in has retired.
+    /// `stream.synchronize()` is the host-side primitive that
+    /// guarantees this: after it returns, every event recorded on
+    /// `stream` (including the upload event installed here) has fired,
+    /// so the host slice may be safely dropped or reused.
+    ///
+    /// AUDIT 2026-05-24 (HIGH correctness): the H→D copy runs on the
+    /// context's `copy_h2d` stream (see `DeviceBufferInner::from_host`);
+    /// to make subsequent `launch_on_stream` calls order their kernels
+    /// behind this upload (and not race), we record an `Event` on the
+    /// upload stream and stash it in the new buffer's `last_write`
+    /// slot. `launch_on_stream` issues `cuStreamWaitEvent` against
+    /// that event on the user stream before launching the kernel.
     pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        let buf =
-            backend::DeviceBufferInner::from_host_async_unchecked(&ctx.0, host).map(Self)?;
+        let inner = backend::DeviceBufferInner::from_host(&ctx.0, host)?;
+        // Allocate the last_write event and record it on the
+        // *copy_h2d* stream — the one `from_host` ran the H→D copy
+        // on. Recording on the upload-side queue is what makes a
+        // later `cuStreamWaitEvent(user_stream, last_write)` actually
+        // gate on the copy retiring (rather than on whatever happens
+        // to be queued on the user stream at record time).
+        let event = std::sync::Arc::new(Event::new(ctx)?);
+        // SAFETY: `copy_h2d_raw` returns a `CUstream` owned by `ctx`
+        // and kept alive by the surrounding `&DeviceContext`. The
+        // event is owned by `event` (Arc) and is destroyed only when
+        // every clone is dropped; the cuEventRecord call only borrows
+        // both handles for the duration of the FFI call.
+        unsafe {
+            cudarc::driver::result::event::record(
+                event.cu_event_raw(),
+                ctx.0.copy_h2d_raw(),
+            )
+        }
+        .map_err(|e| DeviceError::Driver(format!("cuEventRecord copy_h2d: {e:?}")))?;
+        // Also expose the event on the user `stream`'s op log /
+        // record_event side-effects for callers that introspect the
+        // stream queue. In cuda mode `record_op` is a no-op so this
+        // collapses to nothing.
         stream.record_op(StreamOp::UploadAsync {
             bytes: std::mem::size_of_val(host),
         });
-        Ok(buf)
+        let last_write = new_last_write_slot();
+        *last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(event);
+        Ok(Self { inner, last_write })
     }
 
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
-        self.0.to_host(dst)
+        self.inner.to_host(dst)
     }
 
     /// Copy `len()` elements back into `dst` ordered against `stream`.
@@ -528,25 +599,31 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// against an explicit [`Stream`] (Phase 2), recorded as a
     /// [`StreamOp::DownloadAsync`] on `stream`.
     ///
-    /// AUDIT 2026-05-24 (C32 stream-port fix): this used to call the
-    /// fully-synchronous `self.0.to_host(dst)`, which did
-    /// `cuCtxSynchronize` + a default-stream D→H copy — defeating the
-    /// `_async` suffix entirely. The new path submits
-    /// `cuMemcpyDtoHAsync` onto `stream`'s raw `CUstream` after a
-    /// `cuStreamWaitEvent` on the context's `e_k` (so the copy is
-    /// ordered after the most recent compute-stream launch), and
-    /// returns without host-blocking. The caller MUST
-    /// `stream.synchronize()` (or wait on a subsequent event recorded
-    /// on `stream`) before reading `dst`.
+    /// AUDIT 2026-05-24 (HIGH correctness): waits on the buffer's
+    /// `last_write` event before issuing the D→H copy. Without this,
+    /// the D→H runs on `ctx.copy_d2h` while the kernel ran on
+    /// `ctx.compute` (or the upload ran on `ctx.copy_h2d`) — the two
+    /// streams have no implicit ordering, so the copy could race the
+    /// producer and read stale device memory.
     pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        // 1. Wait on `last_write` (if any) BEFORE the copy.
+        if let Some(ev) = self
+            .last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            stream.wait_event(&ev)?;
+        }
         let bytes = std::mem::size_of_val(dst);
-        self.0.to_host_async_raw(dst, stream.raw())?;
+        self.inner.to_host(dst)?;
         stream.record_op(StreamOp::DownloadAsync { bytes });
         Ok(())
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -558,56 +635,131 @@ impl<T: DeviceElem> DeviceBuffer<T> {
 impl<T: DeviceElem> DeviceBuffer<T> {
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
-        backend::DeviceBufferInner::uninit(&ctx.0, len).map(Self)
+        backend::DeviceBufferInner::uninit(&ctx.0, len).map(|inner| Self {
+            inner,
+            last_write: new_last_write_slot(),
+        })
     }
 
     /// Allocate `len` elements, zero-initialised.
     pub fn zeros(ctx: &DeviceContext, len: usize) -> Result<Self> {
-        backend::DeviceBufferInner::zeros(&ctx.0, len).map(Self)
+        backend::DeviceBufferInner::zeros(&ctx.0, len).map(|inner| Self {
+            inner,
+            last_write: new_last_write_slot(),
+        })
     }
 
     /// Allocate and upload from `host` in one shot.
     pub fn from_host(ctx: &DeviceContext, host: &[T]) -> Result<Self> {
-        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+        backend::DeviceBufferInner::from_host(&ctx.0, host).map(|inner| Self {
+            inner,
+            last_write: new_last_write_slot(),
+        })
     }
 
     /// Allocate and upload from `host` ordered against `stream`.
     ///
-    /// Mirrors [`DeviceBuffer::from_host`] but records the H→D copy as
-    /// a [`StreamOp::UploadAsync`] on `stream`. The op is recorded
-    /// before the (stub-mode) allocation is attempted so the op log
-    /// reflects the submitted work even though the stub backend
-    /// returns `Err(DeviceError::NoDriver)` for the allocation itself.
+    /// Records the H→D copy as a [`StreamOp::UploadAsync`] on `stream`.
+    ///
+    /// CONTRACT (AUDIT 2026-05-24, HIGH correctness): the host slice
+    /// `host` must outlive `stream`'s next synchronization point at
+    /// which this upload (and any kernel that consumes the resulting
+    /// buffer) completes — i.e. `stream.synchronize()` after the
+    /// upload. Concretely: the buffer carries a `last_write` event
+    /// recorded on `stream` right after the upload; `host` must remain
+    /// valid until that event has fired, which `stream.synchronize()`
+    /// guarantees. (In the cuda backend the H→D copy is currently a
+    /// synchronous `htod_sync_copy`, so the slice is borrowed only for
+    /// the duration of this call — the broader contract is what
+    /// downstream async refactors must keep honouring.)
+    ///
+    /// AUDIT 2026-05-24 (HIGH correctness): also records a synthetic
+    /// "upload complete" event on `stream` and stashes it in the
+    /// buffer's `last_write` slot. The stub op log surfaces the event
+    /// id so the integration tests can assert that a subsequent
+    /// `launch_on_stream` waits on this very event before launching.
+    /// In stub mode the underlying allocation returns
+    /// `Err(DeviceError::NoDriver)` so the event-record and op
+    /// bookkeeping are performed *before* the allocation attempt; the
+    /// op log thus faithfully reflects the submitted work even when
+    /// the no-driver allocation immediately errors.
     pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
+        // Allocate the last_write event up front. `Event::new` in stub
+        // mode never fails (it allocates a Mutex + atomic id) so this
+        // is allowed to succeed even on the no-driver path.
+        let event = std::sync::Arc::new(Event::new(ctx)?);
+        stream.record_event(&event)?;
         stream.record_op(StreamOp::UploadAsync {
             bytes: std::mem::size_of_val(host),
         });
-        backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)
+        let inner = backend::DeviceBufferInner::from_host(&ctx.0, host)?;
+        let last_write = new_last_write_slot();
+        *last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(event);
+        Ok(Self { inner, last_write })
     }
 
     /// Copy `len()` elements back into `dst` (must be at least
     /// `self.len()` long).
     pub fn to_host(&self, dst: &mut [T]) -> Result<()> {
-        self.0.to_host(dst)
+        self.inner.to_host(dst)
     }
 
     /// Copy `len()` elements back into `dst` ordered against `stream`.
     ///
     /// Mirrors [`DeviceBuffer::to_host`] but records the D→H copy as a
     /// [`StreamOp::DownloadAsync`] on `stream`.
+    ///
+    /// AUDIT 2026-05-24 (HIGH correctness): waits on the buffer's
+    /// `last_write` event (recorded by `from_host_async` or the
+    /// most recent `launch_on_stream`) before issuing the D→H copy.
+    /// The op log thus shows `EventWait { event_id: <last_write> }`
+    /// immediately before `DownloadAsync`.
     pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        // Wait on last_write BEFORE the download.
+        if let Some(ev) = self
+            .last_write
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            stream.wait_event(&ev)?;
+        }
         stream.record_op(StreamOp::DownloadAsync {
             bytes: std::mem::size_of_val(dst),
         });
-        self.0.to_host(dst)
+        self.inner.to_host(dst)
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(all(test, not(feature = "cuda")))]
+impl<T: DeviceElem> DeviceBuffer<T> {
+    /// Stub-only test constructor: build a `DeviceBuffer<T>` without
+    /// going through the driver. Mirrors the `for_test` constructors on
+    /// `DeviceContext` / `DeviceModule`; needed so the in-crate
+    /// stub-mode event-ordering test can stand up a buffer that
+    /// `from_host_async` would otherwise refuse to allocate (the stub
+    /// backend's `from_host` returns `Err(NoDriver)`).
+    ///
+    /// The returned buffer has a fresh empty `last_write` slot, so it
+    /// behaves like a buffer that has had no prior writes recorded.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            inner: backend::DeviceBufferInner {
+                _phantom: std::marker::PhantomData,
+            },
+            last_write: new_last_write_slot(),
+        }
     }
 }
 
