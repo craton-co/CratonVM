@@ -68,7 +68,12 @@ rustls-pki-types = "1"
 rustls-native-certs = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 flate2 = "1"
-zip = "0.6"
+# Round-12 follow-up to round-8 cross-cutting Bug 3: now on workspace 2.x
+# alongside `native-io`. The migration from 0.6 → 2.x switched every
+# `start_file` call site to `SimpleFileOptions` (the un-generic write
+# options type that 2.x exposes from `zip::write`); read paths
+# (`ZipArchive::new`, `by_name`, `ZipError`) are API-compatible.
+zip.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 # libc is used unconditionally for the NIO Selector poll path: on Unix it
 # exposes `poll(2)`, on Windows it exposes `WSAPoll` through the same API

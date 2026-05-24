@@ -3580,8 +3580,11 @@ mod tests {
         let jar_path = main_dir.join("x.jar");
         let f = std::fs::File::create(&jar_path).unwrap();
         let mut zw = zip::ZipWriter::new(f);
-        zw.start_file("Outer$Inner.class", zip::write::FileOptions::default())
-            .unwrap();
+        zw.start_file(
+            "Outer$Inner.class",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
         use std::io::Write;
         zw.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
         zw.finish().unwrap();

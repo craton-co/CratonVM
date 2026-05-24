@@ -1908,7 +1908,7 @@ mod tests {
         {
             let f = std::fs::File::create(&jar_path).unwrap();
             let mut zw = zip::ZipWriter::new(f);
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             // Minimal valid class file: we won't actually parse it, but
             // ClassPath.find_class_code_source_info doesn't care about
@@ -2169,7 +2169,7 @@ mod tests {
         {
             let f = std::fs::File::create(&jar_path).unwrap();
             let mut zw = zip::ZipWriter::new(f);
-            let opts = zip::write::FileOptions::default()
+            let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             zw.start_file("com/acme/Foo.class", opts).unwrap();
             zw.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
