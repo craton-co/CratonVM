@@ -65,6 +65,15 @@ struct Args {
     #[arg(long = "noverify")]
     noverify: bool,
 
+    /// Disable JIT compilation (interpreter-only execution).
+    ///
+    /// Equivalent to setting `CRATONVM_DISABLE_JIT=1` in the environment.
+    /// Useful for diagnosing whether a misbehaviour originates in the JIT
+    /// versus the interpreter, and as a safety fallback when the JIT is
+    /// known to mis-compile a particular library.
+    #[arg(long = "nojit")]
+    nojit: bool,
+
     /// Bytecode verification policy (-Xverify:none|remote|all).
     /// `none` skips verification entirely (equivalent to --noverify).
     /// `remote` (HotSpot default) verifies non-boot classes only.
@@ -172,11 +181,11 @@ struct Args {
     #[arg(long = "Xlog", value_name = "SPEC")]
     xlog: Option<String>,
 
-    /// T19.H1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ if set, spawn a watchdog thread that, after `SECONDS`,
+    /// T19.H1 — if set, spawn a watchdog thread that, after `SECONDS`,
     /// signals every interpreter thread to dump its frame chain to
     /// stderr and then calls `std::process::abort()`. Used to
     /// diagnose silent-hang bootstraps (Keycloak, WildFly, Quarkus).
-    /// The flag is honoured on a best-effort basis Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ threads stuck
+    /// The flag is honoured on a best-effort basis — threads stuck
     /// inside Rust native code will not dump (the watchdog still
     /// aborts with a reduced-information banner in that case).
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
@@ -276,7 +285,7 @@ fn validate_class_name(name: &str) -> Result<()> {
 /// Some libraries ship as a single "all-in-one" fat JAR (e.g.
 /// `netty-all.jar`, `groovy-all.jar`) or, alternatively, as a set of split
 /// modules that live next to it (e.g. `netty-common.jar`, `netty-buffer.jar`,
-/// Р В Р вЂ Р В РІР‚С™Р вЂ™Р’В¦).  When a user passes a classpath entry that points at the aggregate JAR
+/// …).  When a user passes a classpath entry that points at the aggregate JAR
 /// but the repository only contains the split distribution, the classloader
 /// silently drops the entry and the program fails with a puzzling
 /// `NoClassDefFoundError`.
@@ -345,7 +354,7 @@ fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
             }
         }
         if substitutes.is_empty() {
-            // Nothing to substitute Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ preserve original entry so downstream
+            // Nothing to substitute — preserve original entry so downstream
             // logging surfaces the missing file.
             out.push(entry);
             continue;
@@ -382,6 +391,16 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "-p",
     "--module-path",
     "-mp",
+    // HotSpot single-dash forms used as separate tokens (`-Xmx 256m`,
+    // `-Xshare on`, etc.). Most users write them inline (`-Xmx256m`),
+    // but Maven Surefire and some test harnesses split them. Listing
+    // them here keeps the separator-inserter from mistaking the value
+    // token for a bare main-class name.
+    "-Xmx",
+    "-Xshare",
+    "-Xverify",
+    "-Xbootclasspath",
+    "-Xlog",
     "--Xmx",
     "--Xbootclasspath",
     "--java-home",
@@ -490,6 +509,20 @@ fn insert_program_args_separator(args: Vec<String>) -> Vec<String> {
 }
 
 /// Rewrite common HotSpot launcher spellings so clap can parse them.
+///
+/// HotSpot uses single-dash flags with idiosyncratic syntax (`-Xmx256m`,
+/// `-Xshare:on`, `-XX:AOTMode=off`, `-XX:-UseContainerSupport`, etc.) that
+/// clap's "long option" parser cannot handle natively — clap expects
+/// `--Xmx 256m`. The `[[bin]] name = "java"` alias (see Cargo.toml) exists
+/// specifically so the cratonvm binary is drop-in compatible with stock
+/// `java`, so a Maven / Surefire / Gradle invocation like
+/// `java -Xmx256m -classpath x Main` MUST parse.
+///
+/// This function rewrites every HotSpot single-dash spelling we care about
+/// to the equivalent double-dash clap form *before* clap sees the argv.
+/// `extract_hotspot_flags` handles the few cases that aren't expressible as
+/// clap long options (`-XX:+/-Foo` boolean toggles for `HeapDumpOnOutOfMemoryError`,
+/// `-agentlib:` / `-agentpath:` / `-javaagent:`).
 fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
     if args.is_empty() {
         return args;
@@ -537,7 +570,131 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             out.push("--classpath".into());
             out.push(rest.to_string());
             i += 1;
-        } else {
+        }
+        // -------- HotSpot -X compat: inline single-dash spellings --------
+        // `-Xmx256m` / `-Xmx 256m` -> `--Xmx 256m`
+        else if let Some(rest) = a.strip_prefix("-Xmx") {
+            if rest.is_empty() && i + 1 < args.len() {
+                out.push("--Xmx".into());
+                out.push(args[i + 1].clone());
+                i += 2;
+            } else {
+                out.push("--Xmx".into());
+                out.push(rest.to_string());
+                i += 1;
+            }
+        }
+        // `-Xshare:on` / `-Xshare:off` -> `--Xshare on`
+        else if let Some(rest) = a.strip_prefix("-Xshare:") {
+            out.push("--Xshare".into());
+            out.push(rest.to_string());
+            i += 1;
+        }
+        // `-Xshare<sp>val` -> `--Xshare val` (rare)
+        else if a == "-Xshare" && i + 1 < args.len() {
+            out.push("--Xshare".into());
+            out.push(args[i + 1].clone());
+            i += 2;
+        }
+        // `-Xverify:none|remote|all` -> `--Xverify none|remote|all`
+        else if let Some(rest) = a.strip_prefix("-Xverify:") {
+            // `-Xverify:none` is the HotSpot shorthand for `-noverify`.
+            // Translate to `--noverify` so the boolean flag fires; the
+            // existing CLI also accepts `--Xverify none` as a value flag.
+            if rest == "none" {
+                out.push("--noverify".into());
+            } else {
+                out.push("--Xverify".into());
+                out.push(rest.to_string());
+            }
+            i += 1;
+        }
+        // `-Xverify val` (separate token, rare)
+        else if a == "-Xverify" && i + 1 < args.len() {
+            out.push("--Xverify".into());
+            out.push(args[i + 1].clone());
+            i += 2;
+        }
+        // `-noverify` -> `--noverify` (HotSpot deprecated but still accepted)
+        else if a == "-noverify" {
+            out.push("--noverify".into());
+            i += 1;
+        }
+        // `-Xbootclasspath:path` / `-Xbootclasspath/a:path` / `-Xbootclasspath/p:path`
+        // -> `--Xbootclasspath path`. The /a (append) and /p (prepend) forms
+        // are collapsed to a plain replace; cratonvm does not model the three
+        // positions separately (boot CP is a single ordered list).
+        else if let Some(rest) = a.strip_prefix("-Xbootclasspath/a:") {
+            out.push("--Xbootclasspath".into());
+            out.push(rest.to_string());
+            i += 1;
+        } else if let Some(rest) = a.strip_prefix("-Xbootclasspath/p:") {
+            out.push("--Xbootclasspath".into());
+            out.push(rest.to_string());
+            i += 1;
+        } else if let Some(rest) = a.strip_prefix("-Xbootclasspath:") {
+            out.push("--Xbootclasspath".into());
+            out.push(rest.to_string());
+            i += 1;
+        } else if a == "-Xbootclasspath" && i + 1 < args.len() {
+            out.push("--Xbootclasspath".into());
+            out.push(args[i + 1].clone());
+            i += 2;
+        }
+        // `-Xlog:spec` -> `--Xlog spec`
+        else if let Some(rest) = a.strip_prefix("-Xlog:") {
+            out.push("--Xlog".into());
+            out.push(rest.to_string());
+            i += 1;
+        } else if a == "-Xlog" && i + 1 < args.len() {
+            out.push("--Xlog".into());
+            out.push(args[i + 1].clone());
+            i += 2;
+        }
+        // -------- HotSpot -XX compat: -XX:Foo=val and -XX:+/-Foo --------
+        // `-XX:SharedArchiveFile=path` -> `--XX:SharedArchiveFile path`
+        else if let Some(rest) = a.strip_prefix("-XX:SharedArchiveFile=") {
+            out.push("--XX:SharedArchiveFile".into());
+            out.push(rest.to_string());
+            i += 1;
+        }
+        // `-XX:AOTMode=off|training|production` -> `--XX:AOTMode <val>`
+        else if let Some(rest) = a.strip_prefix("-XX:AOTMode=") {
+            out.push("--XX:AOTMode".into());
+            out.push(rest.to_string());
+            i += 1;
+        }
+        // `-XX:AOTCache=path` -> `--XX:AOTCache <path>`
+        else if let Some(rest) = a.strip_prefix("-XX:AOTCache=") {
+            out.push("--XX:AOTCache".into());
+            out.push(rest.to_string());
+            i += 1;
+        }
+        // `-XX:AOTCacheOutput=path` -> `--XX:AOTCacheOutput <path>`
+        else if let Some(rest) = a.strip_prefix("-XX:AOTCacheOutput=") {
+            out.push("--XX:AOTCacheOutput".into());
+            out.push(rest.to_string());
+            i += 1;
+        }
+        // `-XX:+AuditMissingNatives` -> `--XX:AuditMissingNatives`
+        // `-XX:-AuditMissingNatives` -> drop (default off).
+        else if a == "-XX:+AuditMissingNatives" {
+            out.push("--XX:AuditMissingNatives".into());
+            i += 1;
+        } else if a == "-XX:-AuditMissingNatives" {
+            // Default is off; nothing to emit.
+            i += 1;
+        }
+        // `-XX:-UseContainerSupport` -> `--XX:-UseContainerSupport`
+        // (the clap long name literally is `XX:-UseContainerSupport`).
+        else if a == "-XX:-UseContainerSupport" {
+            out.push("--XX:-UseContainerSupport".into());
+            i += 1;
+        } else if a == "-XX:+UseContainerSupport" {
+            // Default is on; nothing to emit.
+            i += 1;
+        }
+        else {
             out.push(args[i].clone());
             i += 1;
         }
@@ -599,7 +756,7 @@ struct HotspotFlags {
     heap_dump_on_oom: Option<bool>,
     /// `-XX:HeapDumpPath=<path>` companion.
     heap_dump_path: Option<String>,
-    /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the
+    /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` — the
     /// entire token (including prefix) is preserved so the existing
     /// `AgentRegistry::parse_agent_option` can consume it verbatim.
     agent_options: Vec<String>,
@@ -616,7 +773,7 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     let mut out = HotspotFlags::default();
     let mut past_separator = false;
     for arg in raw {
-        // Tokens after `--` are program arguments Р Р†Р вЂљРІР‚Сњ pass through unchanged.
+        // Tokens after `--` are program arguments — pass through unchanged.
         if past_separator {
             filtered.push(arg);
             continue;
@@ -692,6 +849,21 @@ fn run() -> Result<()> {
     // non-standard spellings (`-XX:+Foo`, `-agentlib:`) don't confuse it.
     let (filtered_args, hotspot_flags) = extract_hotspot_flags(filtered_args);
     let mut args = Args::parse_from(filtered_args);
+
+    // --nojit: surface as the CRATONVM_DISABLE_JIT env var so the
+    // already-existing kill-switch in `vm/src/runtime/env_cache.rs`
+    // observes it on first read. Must happen *before* any code path
+    // that calls `env_cache::disable_jit()` (interpreter / JIT
+    // dispatcher) — the cache uses `OnceLock`, so a late `set_var`
+    // would be ignored. Setting it here, immediately after clap
+    // parsing, is well before `Vm::new(config)` runs any bytecode.
+    //
+    // We're still on the main thread with no cratonvm-spawned threads
+    // yet, so the documented `set_var` race against concurrent readers
+    // (which is why it became unsafe in edition 2024) cannot fire here.
+    if args.nojit {
+        std::env::set_var("CRATONVM_DISABLE_JIT", "1");
+    }
 
     // GPU handlers — only compiled when the `gpu` Cargo feature is on.
     // Without the feature, the CPU execution path below is reached
@@ -1115,7 +1287,7 @@ fn run() -> Result<()> {
         config = config.with_xlog_spec(xlog_spec.clone());
     }
 
-    // T6.1.2 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ `-XX:+HeapDumpOnOutOfMemoryError` / `-XX:HeapDumpPath=...`.
+    // T6.1.2 — `-XX:+HeapDumpOnOutOfMemoryError` / `-XX:HeapDumpPath=...`.
     // The interpreter's OOM path already honors these config fields (see
     // `maybe_dump_heap_on_oom` in `vm/src/runtime/interpreter.rs`); we
     // only need to thread the CLI values through.
@@ -1126,7 +1298,7 @@ fn run() -> Result<()> {
         config.heap_dump_path = Some(path);
     }
 
-    // T6.3.3 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
+    // T6.3.3 — `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
     // are stashed here and handed to the JVMTI `AgentRegistry` at VM
     // startup; registering them in a dedicated config field lets the
     // startup path load them in the canonical Agent_OnLoad order.
@@ -1147,7 +1319,7 @@ fn run() -> Result<()> {
                         // Per the `java.lang.instrument` package spec, a
                         // misconfigured agent should fail loudly enough
                         // that the operator notices, but the VM should
-                        // still try to run the application Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ match the
+                        // still try to run the application — match the
                         // HotSpot warn-and-continue behaviour.
                         eprintln!("Warning: ignoring {opt}: {e}");
                     }
@@ -1169,18 +1341,18 @@ fn run() -> Result<()> {
     // Create VM and execute main method
     let mut vm = Vm::new(config);
 
-    // T19.H1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ optional watchdog that dumps every interpreter thread's
+    // T19.H1 — optional watchdog that dumps every interpreter thread's
     // frame chain and aborts the process if the main method hasn't
     // completed within the configured deadline. Triggered by the
     // `--stack-dump-on-timeout=SECONDS` CLI flag.
     //
-    // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ make hangs visible by default.
+    // I1 — make hangs visible by default.
     //
     // When neither `--stack-dump-on-timeout` is supplied nor the
     // `CRATONVM_DISABLE_DEFAULT_WATCHDOG` env var is set, install a
     // conservative 45-second default. This guarantees a hung VM emits
     // **something** to stderr before the surrounding harness kills the
-    // process Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the previous default of "no watchdog" produced empty
+    // process — the previous default of "no watchdog" produced empty
     // stderr + Windows TerminateProcess rc=-1 from the bench runners,
     // which made hangs (e.g. CGLIB's `String.indexOf` looping inside
     // `TypeUtils.parseSignature`) visually indistinguishable from a
@@ -1192,7 +1364,7 @@ fn run() -> Result<()> {
     // every existing probe runner's 60s `TIMEOUT_SEC`. Long-running
     // services (Keycloak, Quarkus, WildFly) should pass an explicit
     // `--stack-dump-on-timeout=N` (with N suitably large) or set
-    // `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the same way they pass
+    // `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` — the same way they pass
     // explicit `-Xmx` instead of relying on heap defaults.
     let effective_watchdog = match args.stack_dump_on_timeout {
         Some(s) if s > 0 => Some(s),
@@ -1236,7 +1408,7 @@ fn run() -> Result<()> {
         // the actionable diagnostic for "main thread is in native code".
         cratonvm_vm::dispatch_trace::enable();
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
-        // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ capture the audit-dump paths into the watchdog
+        // RKC16N.5 — capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
         // census. Without this, the only flush path is the
         // clean-shutdown branch at the end of `main()`, and every
@@ -1329,7 +1501,7 @@ fn run() -> Result<()> {
                     );
                 }
 
-                // RKC16N.5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ flush the missing-natives audit BEFORE
+                // RKC16N.5 — flush the missing-natives audit BEFORE
                 // `process::abort()` so a hung or watchdog-killed run
                 // still produces the diagnostic JSON. Errors are
                 // logged but never unwrap; abort still happens.
@@ -1372,45 +1544,25 @@ fn run() -> Result<()> {
         );
     }
 
-    // Load the main class
-    if let Err(e) = vm.load_class(&class_name) {
-        bail!(
-            "Could not find or load main class {}: {e}",
-            class_name.replace('/', ".")
-        );
-    }
-
-    // Build String[] args array for main(String[])
-    let java_args: Vec<Value> = args
-        .args
-        .iter()
-        .map(|a| Value::Object(Some(create_java_string(&vm.shared, a))))
-        .collect();
-
-    // Resolve the String[] class id for the args array.
-    // ClassId(0) is java/lang/Object Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the base reference array element type.
-    let string_array_class_id = cratonvm_vm::ClassId::new(0);
-    let args_array = vm.shared.heap.alloc_array(
-        string_array_class_id,
-        cratonvm_vm::memory::heap::ArrayElementType::Reference,
-        java_args.len(),
-    );
-    for (i, val) in java_args.into_iter().enumerate() {
-        vm.shared
-            .heap
-            .set_array_element(args_array, i, val)
-            .map_err(|idx| anyhow::anyhow!("Failed to set args array element {i} (index {idx} out of bounds)"))?;
-    }
-
-    // T14: Run System.initPhase1() when booting from real JDK classes.
+    // T14: Run System.initPhase1() when booting from real JDK classes
+    // BEFORE loading the user main class.
+    //
     // In HotSpot this is called from Threads::create_vm() after the
-    // bootstrap classloader is initialized. It sets up system properties,
-    // encodings, and the standard I/O streams (System.in/out/err).
+    // bootstrap classloader is initialized but before any user class is
+    // resolved. It sets up system properties, encodings, and the standard
+    // I/O streams (System.in/out/err).
+    //
+    // Previously the main class was loaded first, which forced eager
+    // resolution of `java/lang/Object`, `String`, etc. under an
+    // uninitialised system-properties / charset subsystem. A
+    // NoClassDefFoundError originating in the half-bootstrapped JDK then
+    // surfaced as the confusing "Could not find or load main class …"
+    // instead of a clean bootstrap error.
     if vm.shared.config.java_home.is_some() {
         match vm.invoke("java/lang/System", "initPhase1", "()V", &[]) {
             Ok(_) => {
                 tracing::info!("System.initPhase1() completed");
-                // WP1.3: initPhase1 just finished Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ advance to level 2.
+                // WP1.3: initPhase1 just finished — advance to level 2.
                 vm.shared.set_init_level(2);
             }
             Err(e) => {
@@ -1437,7 +1589,7 @@ fn run() -> Result<()> {
                 vm.shared.resolution_cache.write().clear();
                 // WP1.3: even though initPhase1 threw mid-flight, the
                 // early system-properties / stream installation ran
-                // before the failure Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ enough for callers gated on
+                // before the failure — enough for callers gated on
                 // level 2 (e.g. `java.class.path` availability) to
                 // proceed.  Bump anyway so downstream `initLevel()`
                 // observers don't stall at 1.
@@ -1452,13 +1604,13 @@ fn run() -> Result<()> {
         // subsystems we don't implement), but many callers key on
         // `initLevel() >= 3` to decide whether
         // `ClassLoader.getSystemClassLoader()` may read the `scl`
-        // field directly.  We leave the level at 2 here Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ bumping
+        // field directly.  We leave the level at 2 here — bumping
         // past it would send those callers down a null-deref path.
         // The CLI bumps to 4 below, just before `main()`, once the
         // initPhase2 gate no longer matters.
     }
 
-    // WP1.3: right before `main()` starts, advance to level 4 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ
+    // WP1.3: right before `main()` starts, advance to level 4 —
     // HotSpot's "VM fully initialized" state.  This is the signal
     // that `ClassLoader.getSystemClassLoader()` may return `scl` if
     // it is populated (in cratonvm it usually isn't, so callers fall
@@ -1470,7 +1622,53 @@ fn run() -> Result<()> {
     vm.shared.set_init_level(3);
     vm.shared.set_init_level(4);
 
-    // WP2.4-C Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ run every `-javaagent:` agent's `premain(String,
+    // Now (after `initPhase1` has set up system properties / encodings
+    // / standard streams) it's safe to resolve and load the user main
+    // class. See the comment on the `initPhase1` block above for why
+    // this ordering matters in real-JDK mode.
+    if let Err(e) = vm.load_class(&class_name) {
+        bail!(
+            "Could not find or load main class {}: {e}",
+            class_name.replace('/', ".")
+        );
+    }
+
+    // Build String[] args array for main(String[]).
+    let java_args: Vec<Value> = args
+        .args
+        .iter()
+        .map(|a| Value::Object(Some(create_java_string(&vm.shared, a))))
+        .collect();
+
+    // Resolve the `java/lang/String` class id for the args array's
+    // element type. Previously this was hard-coded to `ClassId::new(0)`
+    // (which is `java/lang/Object` — the base reference array element
+    // type), but JLS / JVMS require `main(String[])` to receive a
+    // `[Ljava/lang/String;` array, NOT `[Ljava/lang/Object;`. Code
+    // that inspects `args.getClass().getComponentType()` (e.g. test
+    // harnesses, generic helpers) observes the wrong component class
+    // when ClassId(0) is used.
+    //
+    // `load_class_concurrent` is idempotent and the boot classloader
+    // resolves `String` extremely early, so this is effectively a
+    // hash-table lookup.
+    let string_array_class_id = vm
+        .shared
+        .load_class_concurrent("java/lang/String")
+        .unwrap_or_else(|_| cratonvm_vm::ClassId::new(0));
+    let args_array = vm.shared.heap.alloc_array(
+        string_array_class_id,
+        cratonvm_vm::memory::heap::ArrayElementType::Reference,
+        java_args.len(),
+    );
+    for (i, val) in java_args.into_iter().enumerate() {
+        vm.shared
+            .heap
+            .set_array_element(args_array, i, val)
+            .map_err(|idx| anyhow::anyhow!("Failed to set args array element {i} (index {idx} out of bounds)"))?;
+    }
+
+    // WP2.4-C — run every `-javaagent:` agent's `premain(String,
     // Instrumentation)` hook BEFORE the application's `main`. Per the
     // `java.lang.instrument` package spec, agent failures are warnings
     // (logged inside the dispatcher) unless the agent throws a fatal
@@ -1512,7 +1710,7 @@ fn run() -> Result<()> {
     // missing-natives audit log to the user-specified JSON path. We
     // do this unconditionally (regardless of Ok/Err) so a crashing
     // program still produces a census file. Any I/O error surfaces
-    // as a warning Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the primary invocation result takes precedence.
+    // as a warning — the primary invocation result takes precedence.
     if let Some(path) = &args.dump_missing_natives {
         match vm.shared.dump_missing_natives_json(path) {
             Ok(()) => {
@@ -1582,7 +1780,7 @@ fn run() -> Result<()> {
         }
     }
 
-    // T19.K1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ wait for non-daemon threads before exiting.
+    // T19.K1 — wait for non-daemon threads before exiting.
     //
     // Per the JVM specification, the VM keeps running until every
     // non-daemon thread has terminated. Daemon threads (GC workers,
@@ -1599,7 +1797,7 @@ fn run() -> Result<()> {
     // We only wait when `main()` returned cleanly (`Ok`). On
     // exception we propagate to the existing error-printing path
     // which calls `bail!()` and lets the process exit with non-zero
-    // status Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ same as HotSpot's "Exception in thread \"main\"".
+    // status — same as HotSpot's "Exception in thread \"main\"".
     // Waiting for daemons or worker threads after a fatal error
     // would just delay the stack trace.
     //
@@ -1608,16 +1806,16 @@ fn run() -> Result<()> {
     // and bounding the wait would surprise users. CI runs that need
     // to bound execution can use the existing
     // `--stack-dump-on-timeout` watchdog which `abort()`s the
-    // process from a separate thread Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ this loop will be
+    // process from a separate thread — this loop will be
     // interrupted by the watchdog's `process::abort()` call.
     if matches!(result, Ok(_)) {
-        // T19.K1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ diagnostic only when the wait is actually
+        // T19.K1 — diagnostic only when the wait is actually
         // observable (i.e. there ARE non-daemon threads). HelloWorld
         // and any program that doesn't `Thread.start()` a user
         // thread skips this message and exits silently. Long-running
         // apps (Quarkus, Keycloak, embedded Jetty) print one line so
         // the user can tell the wait is what's holding the process
-        // alive Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ useful when a CI run mysteriously sits at "main
+        // alive — useful when a CI run mysteriously sits at "main
         // returned" forever.
         let pending = vm
             .shared
@@ -1658,14 +1856,14 @@ fn run() -> Result<()> {
             // current cratonvm, `Throwable.fillInStackTrace` (see
             // `native-builtins/src/lang_misc.rs`) only stashes frames into the
             // per-thread `JvmThread::throwable_stacks` map keyed by identity
-            // hash Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ it does NOT populate the heap-side `stackTrace` /
+            // hash — it does NOT populate the heap-side `stackTrace` /
             // `backtrace` field. The Java code only writes that field lazily
             // when something calls `Throwable.getStackTrace()`. For unhandled
             // exceptions that escape `main()`, that has typically never
             // happened, so the renderer below will usually find a null array
             // and emit no `\tat ...` lines. Promoting the synthetic capture
             // to populate the heap field (or wiring this CLI to read from
-            // `throwable_stacks` directly) is roadmap item T2.2.18 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see
+            // `throwable_stacks` directly) is roadmap item T2.2.18 — see
             // `docs/roadmap-100.md` line 471.
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
@@ -1680,7 +1878,7 @@ fn run() -> Result<()> {
                 //
                 // Find fields by name so we work regardless of layout.
                 // Also probe `target` (used by InvocationTargetException
-                // in lieu of Throwable.cause Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ see its `getCause()` override)
+                // in lieu of Throwable.cause — see its `getCause()` override)
                 // so that `Caused by:` chains still walk through the wrapper.
                 let (cname, msg_idx, cause_idx, stack_idx, target_idx) = {
                     let cm = vm.shared.class_manager.read();
@@ -1817,11 +2015,11 @@ fn run() -> Result<()> {
                 }
 
                 // Fallback: when `Throwable.stackTrace[]` was never populated
-                // (the array is null or empty Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the typical case for an
+                // (the array is null or empty — the typical case for an
                 // exception that escapes `main()` without anyone calling
                 // `getStackTrace()`), pull frames from the per-thread
                 // `JvmThread::throwable_stacks` map keyed by identity hash
-                // Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ that's where `Throwable.fillInStackTrace` actually
+                // — that's where `Throwable.fillInStackTrace` actually
                 // stashes the captured frames in this VM. See
                 // `vm/src/vm/vm_init.rs::Vm::throwable_stack_for`.
                 if !emitted_frames {
@@ -1843,7 +2041,7 @@ fn run() -> Result<()> {
                 // Follow cause. Throwable.cause is the canonical chain link,
                 // but InvocationTargetException stores the wrapped exception
                 // in its own `target` field and its `getCause()` override
-                // returns that Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ so the heap-level `cause` is null/self while
+                // returns that — so the heap-level `cause` is null/self while
                 // the real cause lives in `target`. Probe both.
                 let mut next_cause = {
                     let mut next = None;
@@ -2179,13 +2377,13 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    // I1 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ Visibility-first panic hook.
+    // I1 — Visibility-first panic hook.
     //
     // The previous T14 hook silenced **every** Rust panic by routing it to
     // `tracing::debug!`. That worked for the well-known initPhase1
     // bootstrap-path panics (unaligned-pointer reads, transient null
     // dereferences) which the outer `safe_native_call` already logs once
-    // via a user-facing warning Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ but it also silenced *real* panics that
+    // via a user-facing warning — but it also silenced *real* panics that
     // escaped a `catch_unwind`. Because the tracing subscriber installed
     // by `run()` filters at WARN+, debug-level panic notices were never
     // written to stderr, and any genuine VM crash showed up in the logs
@@ -2197,13 +2395,13 @@ fn main() {
     // `--stack-dump-on-timeout`), and the failure was indistinguishable
     // from a successful run that produced no output.
     //
-    // The new hook routes everything to `stderr` directly Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the only sink
+    // The new hook routes everything to `stderr` directly — the only sink
     // that is guaranteed to survive every other failure mode (tracing
     // subscriber not initialized, WARN-level filter, panic firing from a
     // worker thread before `run()` builds the subscriber). For
     // bootstrap-path panics that are still expected to be quiet, the
     // outer `safe_native_call` continues to swallow them via its own
-    // `catch_unwind` Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the hook fires *before* `catch_unwind` catches
+    // `catch_unwind` — the hook fires *before* `catch_unwind` catches
     // the unwind, but only the recovery path knows the panic was caught,
     // so we always emit at hook time. The cost is a couple of extra
     // stderr lines on the (rare) bootstrap-panic path; the gain is that
@@ -2273,7 +2471,7 @@ fn main() {
         } else {
             let _ = writeln!(stderr, "thread '{thread_name}' panicked:\n{msg}");
         }
-        // Backtrace only when explicitly requested Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ matches the stock
+        // Backtrace only when explicitly requested — matches the stock
         // Rust hook semantics so users opting out of backtrace still see
         // the panic message but no overhead.
         let bt = std::backtrace::Backtrace::capture();
@@ -2583,7 +2781,7 @@ mod tests {
 
     #[test]
     fn extract_d_value_with_equals() {
-        // -Dkey=val=ue  Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ  key = "val=ue"
+        // -Dkey=val=ue  →  key = "val=ue"
         let raw = vec!["cratonvm".to_string(), "-Dpath=a=b".to_string()];
         let (_, props) = extract_system_properties(raw);
         assert_eq!(props, vec![("path".to_string(), "a=b".to_string())]);
@@ -2756,5 +2954,195 @@ mod tests {
         let expanded = expand_aggregate_jars(vec![missing.clone()]);
         assert_eq!(expanded, vec![missing]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // HotSpot single-dash compatibility rewrites — C36 acceptance.
+    //
+    // Stock `java -Xmx256m -classpath x Main` must parse, otherwise the
+    // `[[bin]] name = "java"` alias is useless for Maven Surefire / Gradle.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hotspot_xmx_inline_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-Xmx256m", "-classpath", "x", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(
+            out,
+            argv(&["java", "--Xmx", "256m", "--classpath", "x", "Main"])
+        );
+    }
+
+    #[test]
+    fn hotspot_xmx_separate_token_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-Xmx", "1g", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--Xmx", "1g", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xshare_colon_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-Xshare:on", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--Xshare", "on", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xverify_none_collapses_to_noverify_flag() {
+        let raw = argv(&["java", "-Xverify:none", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--noverify", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xverify_remote_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-Xverify:remote", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--Xverify", "remote", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xbootclasspath_inline_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-Xbootclasspath:/opt/boot", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(
+            out,
+            argv(&["java", "--Xbootclasspath", "/opt/boot", "Main"])
+        );
+    }
+
+    #[test]
+    fn hotspot_xbootclasspath_append_and_prepend_normalise() {
+        // /a (append) and /p (prepend) collapse to a plain replace — cratonvm
+        // does not model the three boot-CP positions separately.
+        let raw = argv(&["java", "-Xbootclasspath/a:/opt/extra", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(
+            out,
+            argv(&["java", "--Xbootclasspath", "/opt/extra", "Main"])
+        );
+
+        let raw = argv(&["java", "-Xbootclasspath/p:/opt/pre", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(
+            out,
+            argv(&["java", "--Xbootclasspath", "/opt/pre", "Main"])
+        );
+    }
+
+    #[test]
+    fn hotspot_xlog_colon_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-Xlog:gc*=info", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--Xlog", "gc*=info", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_shared_archive_file_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-XX:SharedArchiveFile=app.jsa", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(
+            out,
+            argv(&["java", "--XX:SharedArchiveFile", "app.jsa", "Main"])
+        );
+    }
+
+    #[test]
+    fn hotspot_xx_aot_flags_rewrite_to_clap_long() {
+        let raw = argv(&[
+            "java",
+            "-XX:AOTMode=training",
+            "-XX:AOTCache=in.aot",
+            "-XX:AOTCacheOutput=out.aot",
+            "Main",
+        ]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(
+            out,
+            argv(&[
+                "java",
+                "--XX:AOTMode", "training",
+                "--XX:AOTCache", "in.aot",
+                "--XX:AOTCacheOutput", "out.aot",
+                "Main",
+            ])
+        );
+    }
+
+    #[test]
+    fn hotspot_xx_use_container_support_toggle() {
+        // `-XX:-UseContainerSupport` -> clap long form.
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:-UseContainerSupport",
+            "Main",
+        ]));
+        assert_eq!(
+            out,
+            argv(&["java", "--XX:-UseContainerSupport", "Main"])
+        );
+        // `-XX:+UseContainerSupport` is the default; gets dropped.
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:+UseContainerSupport",
+            "Main",
+        ]));
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xx_audit_missing_natives_toggle() {
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:+AuditMissingNatives",
+            "Main",
+        ]));
+        assert_eq!(out, argv(&["java", "--XX:AuditMissingNatives", "Main"]));
+        // Disabled form drops the flag (default is off).
+        let out = normalize_java_launcher_argv(argv(&[
+            "java",
+            "-XX:-AuditMissingNatives",
+            "Main",
+        ]));
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_noverify_rewrites_to_clap_long() {
+        let raw = argv(&["java", "-noverify", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "--noverify", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xmx_after_separator_is_program_arg() {
+        // Tokens past `--` belong to the Java program, not the launcher.
+        let raw = argv(&["java", "Main", "--", "-Xmx256m"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "Main", "--", "-Xmx256m"]));
+    }
+
+    #[test]
+    fn hotspot_xmx_passes_clap_after_full_pipeline() {
+        // C36 acceptance test: stock `java -Xmx256m -classpath x Main`
+        // must parse end-to-end. Exercises the entire pre-clap pipeline
+        // exactly as `run()` would.
+        let argv0: Vec<String> = argv(&["java", "-Xmx256m", "-classpath", "x", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must accept HotSpot -Xmx");
+        assert_eq!(parsed.max_heap.as_deref(), Some("256m"));
+        assert_eq!(parsed.classpath.as_deref(), Some("x"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn nojit_flag_is_accepted_by_clap() {
+        // README documents `--nojit`; clap must accept it.
+        let parsed = Args::try_parse_from(argv(&["cratonvm", "--nojit", "Main"]))
+            .expect("clap must accept --nojit");
+        assert!(parsed.nojit);
     }
 }
