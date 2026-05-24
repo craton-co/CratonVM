@@ -906,7 +906,7 @@ impl VmHeap {
                 tracing::warn!(
                     "g1_start_concurrent_mark: prior controller still parked \
                      ({} steps) — joining before restart",
-                    stale.steps_so_far(),
+                    stale.steps_performed(),
                 );
                 drop(slot); // release before potentially-blocking join
                 let _ = stale.request_stop_and_join();
@@ -943,7 +943,7 @@ impl VmHeap {
     pub fn g1_concurrent_mark_finished(&self) -> bool {
         if let VmHeap::G1(state) = self {
             let slot = state.concurrent_mark.lock();
-            return slot.as_ref().map_or(true, |c| c.is_finished());
+            return slot.as_ref().map_or(true, |c| !c.is_running());
         }
         true
     }
@@ -964,11 +964,12 @@ impl VmHeap {
             let ctrl = state.concurrent_mark.lock().take();
             match ctrl {
                 Some(ctrl) => {
+                    let steps = ctrl.steps_performed();
                     let outcome = ctrl.request_stop_and_join();
                     tracing::debug!(
-                        "g1_signal_marking_complete: joined (steps={}, natural={})",
-                        outcome.steps,
-                        outcome.finished_naturally,
+                        "g1_signal_marking_complete: joined (steps={}, joined_ok={})",
+                        steps,
+                        outcome.is_ok(),
                     );
                     state.collector.gc_state.set_phase(ConcurrentGcPhase::ConcurrentSweep);
                     state.collector.cleanup();

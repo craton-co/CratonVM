@@ -68,6 +68,53 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
+// Switch-instruction validation helpers (HIGH security, task #8)
+// ---------------------------------------------------------------------------
+//
+// Adversarial bytecode can pass `tableswitch` ranges or `lookupswitch` npair
+// counts that overflow when treated naively as `usize`. The interpreter
+// validates these at verify-time; the JIT must do the same before allocating
+// a jump table of that size. Both helpers return `None` on any overflow OR
+// cap exceeded → the caller falls back to the interpreter, no panic.
+
+/// Maximum tableswitch entries we'll lay out as a dense jump table.
+/// Matches the JVMS upper bound and is well under any reasonable code-cache
+/// size budget; anything larger is almost certainly an adversarial input.
+const MAX_TABLESWITCH_COUNT: usize = 1 << 24;
+
+/// Maximum lookupswitch pairs we'll emit. lookupswitch is sparser than
+/// tableswitch so a tighter cap is appropriate.
+const MAX_LOOKUPSWITCH_NPAIRS: usize = 1 << 20;
+
+/// Validate `high - low + 1` against signed-overflow AND a sane upper bound.
+/// Returns the count as `usize` if both checks pass.
+pub fn checked_tableswitch_count(low: i32, high: i32) -> Option<usize> {
+    let span = (high as i64).checked_sub(low as i64)?;
+    let count = span.checked_add(1)?;
+    if count <= 0 {
+        return None;
+    }
+    let count = usize::try_from(count).ok()?;
+    if count > MAX_TABLESWITCH_COUNT {
+        return None;
+    }
+    Some(count)
+}
+
+/// Validate `npairs` (the count of (match, offset) pairs in a lookupswitch
+/// payload) against negative values AND a sane upper bound.
+pub fn checked_lookupswitch_npairs(npairs: i32) -> Option<usize> {
+    if npairs < 0 {
+        return None;
+    }
+    let n = npairs as usize;
+    if n > MAX_LOOKUPSWITCH_NPAIRS {
+        return None;
+    }
+    Some(n)
+}
+
+// ---------------------------------------------------------------------------
 // Register encoding for x86-64
 // ---------------------------------------------------------------------------
 
@@ -11833,7 +11880,8 @@ impl Compiler {
                                                 && delta <= i32::MAX as i128,
                                             "unrolled helper rel32 out of range",
                                         );
-                                        self.buf.patch_i32(copy_po, delta as i32); // Cast: rel32 displacement
+                                        self.buf.try_patch_i32(copy_po, delta as i32)
+                                            .expect("unroll helper rel32 patch"); // Cast: rel32 displacement
                                     }
 
                                     // Per-clone MIC/PIC slots. For each IC
@@ -11877,10 +11925,10 @@ impl Compiler {
                                         // `MOV R10, imm64` (10-byte form).
                                         let bytes = fresh_ptr.to_le_bytes();
                                         for i in 0..8 {
-                                            self.buf.patch_byte(
+                                            self.buf.try_patch_byte(
                                                 copy_po + i,
                                                 bytes[i],
-                                            );
+                                            ).expect("unroll IC imm64 patch");
                                         }
                                     }
 
