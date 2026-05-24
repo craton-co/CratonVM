@@ -4006,6 +4006,12 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(keys.len() as i32));
+    // Wire backing HashSet for Iterator.remove() — without this, JDK code
+    // like MXBeanSupport.findMXBeanInterface (which iterates a HashSet and
+    // calls it.remove() inside the loop) throws UnsupportedOperationException
+    // because dispatch falls through to the default Iterator.remove().
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -4091,7 +4097,13 @@ fn al_itr_last_ret_slot(ctx: &dyn NativeContext) -> usize {
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
 const MAP_KEY_ITR_FIELD_CURSOR: usize = 1;
 const MAP_KEY_ITR_FIELD_TOTAL: usize = 2;
-const MAP_KEY_ITR_NUM_FIELDS: usize = 3;
+// Backing collection (HashSet/HashMap ref) used by Iterator.remove().
+// May be Object(None) for snapshot-only iterators from make_iterator_from_array;
+// in that case remove() throws UnsupportedOperationException.
+const MAP_KEY_ITR_FIELD_BACKING: usize = 3;
+// Index of the last key returned by next(); -1 before first next() and after remove().
+const MAP_KEY_ITR_FIELD_LAST_RET: usize = 4;
+const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
     // ArrayList$Itr
@@ -4126,6 +4138,12 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         "next",
         "()Ljava/lang/Object;",
         native_map_key_itr_next,
+    );
+    r.register(
+        "java/util/HashMap$KeyItr",
+        "remove",
+        "()V",
+        native_map_key_itr_remove,
     );
 }
 
@@ -4258,7 +4276,66 @@ fn native_map_key_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let val = ctx.get_array_element(keys, cursor as usize);
     ctx.set_field(this, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(cursor + 1));
+    // Record index just returned for a subsequent Iterator.remove().
+    // Iterator allocated with <5 fields (older snapshot iterators) silently
+    // ignores the write because alloc_object pre-sized the field block.
+    let n_fields = ctx.object_num_fields(this);
+    if n_fields > MAP_KEY_ITR_FIELD_LAST_RET {
+        ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(cursor));
+    }
     Ok(Some(val))
+}
+
+/// Native `HashMap$KeyItr.remove()` — pairs with `native_hs_iterator` so
+/// JDK code that iterates a HashSet (or HashMap.keySet()) and calls
+/// `it.remove()` actually deletes the entry, instead of falling through
+/// to the `Iterator.remove()` default that throws `UnsupportedOperationException`.
+///
+/// Trigger case: `com.sun.jmx.mbeanserver.MXBeanSupport.findMXBeanInterface`
+/// builds a `HashSet<Class<?>>` of candidate MXBean interfaces and uses
+/// `it.remove()` to drop superseded ones during platform-MBean registration.
+/// Without this native, `ManagementFactory.getPlatformMBeanServer()` fails
+/// with `NotCompliantMBeanException: sun.management.GarbageCollectorImpl: remove`,
+/// blocking jboss-modules / WildFly / Keycloak boot.
+fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    // Iterators allocated via the legacy 3-field snapshot path
+    // (`make_iterator_from_array`) have no backing reference — surface
+    // UnsupportedOperationException so callers see the JDK-spec behaviour.
+    let n_fields = ctx.object_num_fields(this);
+    if n_fields <= MAP_KEY_ITR_FIELD_LAST_RET {
+        return Err(unsupported_op());
+    }
+    let last_ret = match ctx.get_field(this, MAP_KEY_ITR_FIELD_LAST_RET) {
+        Value::Int(v) => v,
+        _ => -1,
+    };
+    if last_ret < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let backing = match ctx.get_field(this, MAP_KEY_ITR_FIELD_BACKING) {
+        Value::Object(Some(b)) => b,
+        _ => return Err(unsupported_op()),
+    };
+    let keys = match ctx.get_field(this, MAP_KEY_ITR_FIELD_KEYS) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(None),
+    };
+    let key = ctx.get_array_element(keys, last_ret as usize);
+    // Delegate to the receiver's own remove(Object). HashSet.remove unwraps
+    // to native_map_remove on the backing HashMap; HashMap.keySet().iterator()
+    // would route through native_hs_remove on the synthetic KeySet, which
+    // chains to native_map_remove on the underlying map. Either way the
+    // entry actually disappears from the source collection.
+    let _ = native_hs_remove(ctx, &[Value::Object(Some(backing)), key])?;
+    ctx.set_field(this, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    Ok(None)
 }
 
 // ===========================================================================
@@ -13924,12 +14001,25 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // HashMap$KeyItr layout-compatible iterators (field 0 = Object[], field
+    // 1 = cursor) also happen to satisfy the snapshot-iterator shape — but
+    // they carry an extra `lastRet` slot that subsequent Iterator.remove()
+    // reads. Route via the dedicated KeyItr native so the lastRet write
+    // happens, otherwise it.remove() throws spurious IllegalStateException.
+    // HashMap$KeyItr layout-compatible iterators (field 0 = Object[], field
+    // 1 = cursor) also satisfy the snapshot-iterator shape — but they carry
+    // an extra `lastRet` slot that subsequent Iterator.remove() reads.
+    // Route via the dedicated KeyItr native so the lastRet write happens,
+    // otherwise it.remove() throws spurious IllegalStateException.
+    let cid = ctx.class_id_of_object(this);
+    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+    if cn == "java/util/HashMap$KeyItr" {
+        return native_map_key_itr_next(ctx, args);
+    }
     // Real-JDK fallback: see `native_snapshot_itr_has_next` doc comment.
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
         _ => {
-            let cid = ctx.class_id_of_object(this);
-            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
             if !cn.is_empty() && cn != "java/util/Iterator" && cn != "java/util/ListIterator" {
                 return ctx.invoke(&cn, "next", "()Ljava/lang/Object;", &[Value::Object(Some(this))]);
             }
@@ -20580,10 +20670,29 @@ fn native_empty_enumeration(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(en))))
 }
 
-fn native_itr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Iterator.remove() is an optional operation; this snapshot-based iterator
-    // does not support it. Throw UnsupportedOperationException per the contract
-    // instead of silently doing nothing (which would mask caller bugs).
+fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Dispatcher: the force-native override in `vm_exec::invoke_on_class_shared_inner`
+    // routes every `invokeinterface Iterator.remove ()V` here, regardless of
+    // the receiver's runtime class. Route by class so iterators that DO
+    // support remove (e.g. HashMap$KeyItr backed by a real HashSet) run their
+    // own native instead of throwing. Without this, JDK code that does
+    // `it.remove()` inside a HashSet/HashMap iteration loop (e.g.
+    // `MXBeanSupport.findMXBeanInterface` during platform-MBean registration)
+    // unconditionally fails with UnsupportedOperationException, blocking
+    // jboss-modules / WildFly / Keycloak boot.
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let cid = ctx.class_id_of_object(this);
+        let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+        match cn.as_str() {
+            "java/util/HashMap$KeyItr" => return native_map_key_itr_remove(ctx, args),
+            "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => {
+                return native_al_itr_remove(ctx, args);
+            }
+            _ => {}
+        }
+    }
+    // Snapshot-only iterators (no backing collection) genuinely do not
+    // support remove — throw the spec-mandated UOE.
     Err(cratonvm_types::error::RuntimeError::UnsupportedOperationException {
         message: "remove".to_string(),
     }

@@ -104,7 +104,7 @@ MAX_SIZE_MB=200
 MAX_RUNS=0
 FILTER=""
 LABEL=""
-JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot"
+JDK="C:/Program Files/Java/jdk-25"
 RJVM=""
 XMX=""
 DO_BUILD=0
@@ -509,8 +509,8 @@ run_smoke() {
             -c "$cp" org.apache.spark.deploy.SparkSubmit -- --version
     fi
 
-    if [ -d "$APPS/kafka_2.13-3.6.1" ]; then
-        local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.6.1/libs")
+    if [ -d "$APPS/kafka_2.13-3.7.0" ]; then
+        local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.7.0/libs")
         [ -n "$cp" ] && run_oneshot kafka "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
             -c "$cp" kafka.Kafka
@@ -543,12 +543,12 @@ run_smoke() {
         "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
         --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
 
-    if [ -d "$APPS/wildfly-39.0.1.Final" ]; then
+    if [ -d "$APPS/wildfly-32.0.1.Final" ]; then
         run_oneshot wildfly "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            "-Djboss.home.dir=$APPS/wildfly-39.0.1.Final" \
-            --jar "$APPS/wildfly-39.0.1.Final/jboss-modules.jar" \
-            -- -mp "$APPS/wildfly-39.0.1.Final/modules" \
+            "-Djboss.home.dir=$APPS/wildfly-32.0.1.Final" \
+            --jar "$APPS/wildfly-32.0.1.Final/jboss-modules.jar" \
+            -- -mp "$APPS/wildfly-32.0.1.Final/modules" \
             org.jboss.as.standalone --version
     fi
 
@@ -660,9 +660,9 @@ func_wildfly() {
     in_filter "$name" || return 0
     launch_daemon "$name" 'WildFly.*started in|WFLYSRV0025' "$TIMEOUT_S" \
         "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-        "-Djboss.home.dir=$APPS/wildfly-39.0.1.Final" \
-        --jar "$APPS/wildfly-39.0.1.Final/jboss-modules.jar" \
-        -- -mp "$APPS/wildfly-39.0.1.Final/modules" org.jboss.as.standalone
+        "-Djboss.home.dir=$APPS/wildfly-32.0.1.Final" \
+        --jar "$APPS/wildfly-32.0.1.Final/jboss-modules.jar" \
+        -- -mp "$APPS/wildfly-32.0.1.Final/modules" org.jboss.as.standalone
     if [ $? -eq 0 ]; then
         if probe_http http://localhost:9990/management 5; then
             echo "$name | rc=0 | wildfly up, :9990 responded"
@@ -722,12 +722,12 @@ func_bytebuddy_probe() {
 func_kafka() {
     local name=kafka
     in_filter "$name" || return 0
-    local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.6.1/libs")
+    local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.7.0/libs")
     launch_daemon "$name" 'Kafka Server started|Awaiting socket connections' \
         "$TIMEOUT_S" \
         "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
         -c "$cp" kafka.Kafka \
-        "$APPS/kafka_2.13-3.6.1/config/server.properties"
+        "$APPS/kafka_2.13-3.7.0/config/server.properties"
     [ $? -eq 0 ] && echo "$name | rc=0 | kafka announced ready"
     kill_daemon "$name"
 }
