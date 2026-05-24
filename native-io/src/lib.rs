@@ -21,6 +21,15 @@
 //! single inflated entry to guard against decompression bombs; see
 //! `zip_real_jar::DEFAULT_MAX_ENTRY_BYTES` and the
 //! `CRATONVM_ZIP_MAX_ENTRY_BYTES` environment variable.
+//!
+//! # Platform support
+//!
+//! For the per-feature Linux / Windows / macOS matrix (File I/O,
+//! FileChannel.mmap / lock, AIO, Selector, Sockets, UDP, Multicast,
+//! TLS, Pipe, WatchService, Process spawn) and the env vars / runtime
+//! flags that affect platform behaviour, see
+//! [`docs/PLATFORMS.md`](https://github.com/craton-co/cratonvm/blob/main/docs/PLATFORMS.md)
+//! in the workspace root.
 
 use std::collections::HashMap;
 use std::fs;

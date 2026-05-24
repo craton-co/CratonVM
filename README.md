@@ -209,6 +209,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the codebase s
 See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarking, and project structure.
 See [docs/INSTALL.md](docs/INSTALL.md) for binary installation and getting started.
 See [docs/CONFIG.md](docs/CONFIG.md) for all configuration options and tuning parameters.
+See [docs/embedding.md](docs/embedding.md) for embedding `cratonvm-vm` as a library in a Rust application.
+See [docs/gc-tuning.md](docs/gc-tuning.md) for choosing a GC backend, sizing the heap, and diagnosing pauses.
+See [docs/PLATFORMS.md](docs/PLATFORMS.md) for the per-feature Linux / Windows / macOS support matrix.
 See [ROADMAP.md](ROADMAP.md) for future plans and the performance roadmap.
 See [docs/gpu/README.md](docs/gpu/README.md) for the full GPU-offload reference: build modes, CLI flags, architecture, file index, FAQ. The feature is opt-in via Cargo features — the default `cargo build` produces a CPU-only JVM with no GPU code linked.
 
