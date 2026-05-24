@@ -4,6 +4,34 @@
 > It is NOT intended for production use and MUST NOT be used to run untrusted
 > Java code in security-sensitive environments.**
 
+## Cryptographic Implementation Status
+
+CratonVM's `javax.crypto.*` / `java.security.*` natives are NOT considered
+production-ready as of the 0.3.0 release. Specific limitations:
+
+- **ML-KEM (JEP 496) and ML-DSA (JEP 497)**: post-quantum algorithm
+  resolution now throws `NoSuchAlgorithmException`. Earlier prototypes
+  returned zero-filled "keys" that decapsulated to constant values.
+- **HKDF / PBKDF2WithHmacSHA***: throws `NoSuchAlgorithmException`.
+  Earlier prototype used fixed salt/IKM constants and produced the same
+  output across every process.
+- **AES / AES-GCM**: routed through the `aes`/`aes-gcm` RustCrypto
+  crates (constant-time, AES-NI capable). Previous in-tree implementation
+  used T-table SBOX lookups (cache-timing oracle).
+- **JCA provider chain**: 13 provider names are advertised; only `SUN`,
+  `SunJCE`, and `SunRsaSign` are backed by real Service maps. Others
+  return null on `Provider.getService(...)` lookups by design — see
+  `Provider.getInfo()` for each provider's actual coverage.
+- **TLS (SunJSSE / SunJSSL)**: TLS endpoints are NOT supported. Use the
+  process's external TLS terminator (nginx, Envoy) instead.
+
+We recommend running CratonVM behind a process boundary that handles
+key management and TLS termination via mature implementations. For
+research and benchmarking, the in-tree crypto is adequate.
+
+See [`docs/CRYPTO_STATUS.md`](docs/CRYPTO_STATUS.md) for a detailed
+per-algorithm implementation matrix.
+
 ## Scope
 
 CratonVM is a research and learning project. It has not undergone a security
