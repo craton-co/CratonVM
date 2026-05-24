@@ -114,11 +114,27 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_collections_utility_natives(registry);
     register_map_entry_natives(registry);
     register_factory_natives(registry);
-    register_stream_natives(registry);
-    register_collectors_natives(registry);
-    register_int_stream_natives(registry);
-    register_long_stream_natives(registry);
-    register_double_stream_natives(registry);
+    // DISABLED — see kc26 / streams_probe / synthetic-stream eradication.
+    // The previous synthetic-Stream shim built `java/util/stream/Stream`
+    // interface instances and force-intercepted every `Stream.*` /
+    // `IntStream.*` / `LongStream.*` / `DoubleStream.*` virtual call. Now
+    // that the real-JDK `AbstractCollection.stream()` default method runs,
+    // dispatch must land on the real `ReferencePipeline` / `IntPipeline` /
+    // `LongPipeline` / `DoublePipeline` bodies instead. Re-enabling these
+    // would break any stream chain originating from a real-JDK collection
+    // (every `Stream.*` native reads field 0 as an `Object[]` of elements;
+    // a real `ReferencePipeline$Head` has a `sourceSpliterator`, not an
+    // elements array — so `count` returns 0, `forEachOrdered` lands on the
+    // synthetic Stream interface receiver and throws `AbstractMethodError`,
+    // etc.). Collectors are also disabled: real `ReferencePipeline.collect`
+    // calls `Collector.supplier()` / `.accumulator()` / `.finisher()` on
+    // the collector, which our synthetic tagged-Collector instances do not
+    // implement.
+    // register_stream_natives(registry);
+    // register_collectors_natives(registry);
+    // register_int_stream_natives(registry);
+    // register_long_stream_natives(registry);
+    // register_double_stream_natives(registry);
     register_interface_natives(registry);
     register_copy_constructor_natives(registry);
     register_comparator_natives(registry);
@@ -4597,12 +4613,17 @@ fn register_optional_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;)Ljava/util/Optional;",
         native_opt_or,
     );
-    r.register(
-        o,
-        "stream",
-        "()Ljava/util/stream/Stream;",
-        native_opt_stream,
-    );
+    // DISABLED — see kc26 / streams_probe / synthetic-stream eradication.
+    // `Optional.stream()` allocated a synthetic `java/util/stream/Stream`
+    // interface instance via `make_stream`. The real-JDK default method
+    // (or the override in `Optional`) returns a proper Stream wrapped over
+    // the value — let the real bytecode run.
+    // r.register(
+    //     o,
+    //     "stream",
+    //     "()Ljava/util/stream/Stream;",
+    //     native_opt_stream,
+    // );
     r.register(
         o,
         "orElseThrow",
@@ -6076,31 +6097,37 @@ fn make_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCallRes
 }
 
 /// Extract elements from a Stream.
-fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    // For our synthetic Stream object, field 0 holds an Object[] of elements.
-    // But some streams are real JDK ReferencePipeline instances (returned by
-    // e.g. Spring's MergedAnnotations.stream()). In those cases we can't peek
-    // at field 0 — fall through to materialize via Stream.toArray().
+/// Resolve a Stream-shaped object to its element list.
+///
+/// Two cases:
+///
+/// 1. **Synthetic Stream/IntStream/LongStream/DoubleStream** (allocated by
+///    our `make_stream` / `make_int_stream` / etc.): field 0 holds an
+///    `Object[]` backing array — read it directly.
+///
+/// 2. **Real-JDK `ReferencePipeline`** (returned by e.g.
+///    `AbstractCollection.stream()`, `Spring`'s `MergedAnnotations.stream()`,
+///    `ServiceLoader.stream()`): we cannot peek at field 0. Materialize via
+///    `Stream.toArray()`.
+///
+/// Jenkins bug (2026-05-24): `native_stream_find_first` previously called the
+/// immutable `stream_elements` variant, which silently returned `Vec::new()`
+/// for real-JDK pipelines — making `Arrays.asList(...).stream().findFirst()`
+/// always return `Optional.empty()`. Winstone's `Level.parse(String.valueOf(5))`
+/// → `KnownLevel.findByValue(5, KnownLevel::referent)` then threw
+/// `NoSuchElementException` despite the level being correctly registered. All
+/// terminal/intermediate ops registered on `java/util/stream/Stream` now share
+/// one mutable-context helper that handles both cases.
+fn stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = class_name == "java/util/stream/Stream";
-    if is_synthetic {
-        if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
-            let len = ctx.array_length(arr);
-            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
-        }
-    }
-    // Non-synthetic streams (real JDK ReferencePipeline etc.) require an
-    // `invoke_virtual` call to materialize via `Stream.toArray()` — use
-    // `stream_elements_mut` from a context that has `&mut dyn NativeContext`.
-    Vec::new()
-}
-
-/// Mutable variant of stream_elements that can invoke virtual methods.
-fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
-    let class_id = ctx.class_id_of_object(stream);
-    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = class_name == "java/util/stream/Stream";
+    let is_synthetic = matches!(
+        class_name.as_str(),
+        "java/util/stream/Stream"
+            | "java/util/stream/IntStream"
+            | "java/util/stream/LongStream"
+            | "java/util/stream/DoubleStream"
+    );
     if is_synthetic {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
@@ -6116,6 +6143,12 @@ fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Va
         }
         _ => Vec::new(),
     }
+}
+
+/// Legacy alias retained for callers that previously distinguished the
+/// mutable variant. Both names now route through the same implementation.
+fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+    stream_elements(ctx, stream)
 }
 
 fn register_stream_natives(r: &mut NativeMethodRegistry) {
@@ -7995,7 +8028,7 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(stream))))
 }
 
-fn int_stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
+fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     stream_elements(ctx, stream)
 }
 

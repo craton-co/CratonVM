@@ -1639,6 +1639,19 @@ pub fn execute(
             }
             found
         };
+        // DEBUG diagnostic — print every JIT compile decision for the
+        // LazyProjection.equals method while bytebuddy_probe diagnosis
+        // is in progress. Remove after fix lands.
+        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+            && class_name_str.contains("LazyProjection")
+            && method_name == "equals"
+        {
+            eprintln!(
+                "[BBLP-firstcall] class={} method={} desc={} native_skip={} static_skip={:?} fjp_skip={} already_skipped={}",
+                &*class_name_str, method_name, method_descriptor,
+                native_skip, static_skip_reason, fjp_skip, already_skipped,
+            );
+        }
         // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
@@ -10415,12 +10428,25 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
+        eprintln!(
+            "[ccs-probe] intercept_force_registered_native: class={} method={}{} \
+             force={}",
+            class_name,
+            method_name,
+            method_descriptor,
+            force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
+        );
+    }
     if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
         return None;
     }
     let cb = shared
         .native_methods
         .find(class_name, method_name, method_descriptor)?;
+    if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
+        eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
+    }
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -12311,6 +12337,13 @@ fn try_jit_upgrade_with_gate(
             .find(&cached.class_name, &cached.method_name, &cached.method_descriptor)
             .is_some()
         {
+            if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+                && cached.class_name.contains("LazyProjection")
+                && &*cached.method_name == "equals"
+            {
+                eprintln!("[BBLP-upgrade] direct-native skip {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor);
+            }
             return None;
         }
         let cm = shared.class_manager.read();
@@ -12323,11 +12356,25 @@ fn try_jit_upgrade_with_gate(
                         .find(&parent.name, &cached.method_name, &cached.method_descriptor)
                         .is_some()
                     {
+                        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+                            && cached.class_name.contains("LazyProjection")
+                            && &*cached.method_name == "equals"
+                        {
+                            eprintln!("[BBLP-upgrade] parent-native skip {}.{}{} via parent={}",
+                                cached.class_name, cached.method_name, cached.method_descriptor, parent.name);
+                        }
                         return None;
                     }
                 }
                 cid = parent_id;
             }
+        }
+        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+            && cached.class_name.contains("LazyProjection")
+            && &*cached.method_name == "equals"
+        {
+            eprintln!("[BBLP-upgrade] no native shadow, COMPILING {}.{}{}",
+                cached.class_name, cached.method_name, cached.method_descriptor);
         }
     }
     // W2-CHM: honor the JIT skip list on this caller-method-counter
@@ -12858,6 +12905,12 @@ pub fn try_jit_compile_callee(
     {
         let cm_native_check = shared.class_manager.read();
         if shared.native_methods.find(class_name, method_name, descriptor).is_some() {
+            if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+                && class_name.contains("LazyProjection")
+                && method_name == "equals"
+            {
+                eprintln!("[BBLP-callee] direct-native skip {}.{}{}", class_name, method_name, descriptor);
+            }
             return None;
         }
         if let Some(start_cid) = cm_native_check.find_class_by_name(class_name) {
@@ -12871,11 +12924,25 @@ pub fn try_jit_compile_callee(
                         .find(&parent.name, method_name, descriptor)
                         .is_some()
                     {
+                        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+                            && class_name.contains("LazyProjection")
+                            && method_name == "equals"
+                        {
+                            eprintln!("[BBLP-callee] parent-native skip {}.{}{} via parent={}",
+                                class_name, method_name, descriptor, parent.name);
+                        }
                         return None;
                     }
                 }
                 cid = parent_id;
             }
+        }
+        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
+            && class_name.contains("LazyProjection")
+            && method_name == "equals"
+        {
+            eprintln!("[BBLP-callee] no native shadow, will COMPILE {}.{}{}",
+                class_name, method_name, descriptor);
         }
     }
     // Check JIT cache first

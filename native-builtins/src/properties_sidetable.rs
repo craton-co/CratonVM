@@ -123,7 +123,13 @@ fn drain_input_stream(
         _ => None,
     };
     if let (Some(arr), Some(c), Some(p)) = (buf_by_name, count_by_name, pos_by_name) {
-        if c <= MAX_LOAD_BYTES && p <= c {
+        // Require c > 0: a BufferedInputStream / JarInputStream wrapping
+        // another stream has buf=byte[8192], pos=0, count=0 BEFORE the first
+        // fill().  Treating that as "0 bytes available" is wrong — the
+        // wrapped stream may have content that only flows through invoke_virtual
+        // read([BII)I.  See ActiveMQ XBean factory load: BufferedInputStream
+        // wrapping a JarURLConnection stream returned by URLClassLoader.
+        if c > 0 && c <= MAX_LOAD_BYTES && p <= c {
             let len = c.saturating_sub(p);
             let mut out = Vec::with_capacity(len);
             for i in p..c {

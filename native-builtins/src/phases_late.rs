@@ -31295,6 +31295,18 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 }
             };
             let field0 = ctx.get_field(spliterator, 0);
+            if std::env::var("CRATONVM_DBG_STREAMSUPP").is_ok() {
+                let cid = ctx.class_id_of_object(spliterator);
+                let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+                let f0_kind = match field0 {
+                    Value::Object(Some(a)) => format!("Object(kind={:?})", ctx.heap_kind_of(a)),
+                    Value::Object(None) => "Object(null)".to_string(),
+                    Value::Int(i) => format!("Int({})", i),
+                    Value::Long(l) => format!("Long({})", l),
+                    _ => "other".to_string(),
+                };
+                eprintln!("[STREAMSUPP-DBG] spliterator class={} field0={}", cn, f0_kind);
+            }
             let arr = match field0 {
                 Value::Object(Some(a)) if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
                 _ => {
