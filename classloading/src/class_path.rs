@@ -1592,19 +1592,52 @@ impl ClassPath {
                 ClassPathEntry::Directory(dir) => {
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
-                        // Canonicalize and verify the resolved path is under the classpath root.
-                        if let (Ok(canon_dir), Ok(canon_path)) = (
-                            self.canonicalize_cached(dir),
-                            self.canonicalize_cached(&full_path),
-                        ) {
-                            if !canon_path.starts_with(&canon_dir) {
+                        // C35 audit fix (HIGH security): mirror
+                        // `find_class`'s fail-CLOSED canonicalize
+                        // contract. Previously the
+                        // `if let (Ok(canon_dir), Ok(canon_path))` block
+                        // *silently fell through* on canonicalize error
+                        // and the un-canonicalized `full_path` was still
+                        // read — an attacker who could plant a symlink
+                        // that causes `fs::canonicalize` to fail (e.g.
+                        // dangling symlink, permission-denied on a
+                        // segment, or a Windows reparse point we can't
+                        // resolve) could load arbitrary files via
+                        // `getResourceAsStream`, even though the
+                        // matching `find_class` path correctly rejected
+                        // them. Now: on canonicalize failure we skip
+                        // this entry (`continue`) so other classpath
+                        // entries may still answer the probe, but this
+                        // specific filesystem read does NOT proceed.
+                        let canon_dir = match self.canonicalize_cached(dir) {
+                            Ok(p) => p,
+                            Err(e) => {
                                 debug!(
-                                    "Resource path traversal blocked: {} escapes {}",
-                                    canon_path.display(),
-                                    canon_dir.display()
+                                    "Refusing to read resource {name}: cannot \
+                                     canonicalize classpath root {}: {e}",
+                                    dir.display()
                                 );
-                                return None;
+                                continue;
                             }
+                        };
+                        let canon_path = match self.canonicalize_cached(&full_path) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                debug!(
+                                    "Refusing to read resource {name}: cannot \
+                                     canonicalize resolved path {}: {e}",
+                                    full_path.display()
+                                );
+                                continue;
+                            }
+                        };
+                        if !canon_path.starts_with(&canon_dir) {
+                            debug!(
+                                "Resource path traversal blocked: {} escapes {}",
+                                canon_path.display(),
+                                canon_dir.display()
+                            );
+                            return None;
                         }
                         // Round 7 audit fix (MED #12): resources can be
                         // large (config files, embedded assets, JS
@@ -1734,13 +1767,24 @@ impl ClassPath {
             match entry {
                 ClassPathEntry::Directory(dir) => {
                     let full_path = dir.join(Path::new(name));
-                    if let (Ok(canon_dir), Ok(canon_path)) = (
-                        self.canonicalize_cached(dir),
-                        self.canonicalize_cached(&full_path),
-                    ) {
-                        if !canon_path.starts_with(&canon_dir) {
-                            continue;
-                        }
+                    // C35 audit fix (HIGH security): fail-CLOSED on
+                    // canonicalize error. The previous
+                    // `if let (Ok, Ok)` silently fell through to the
+                    // unchecked `read_file_for_classpath` call below,
+                    // matching the `find_resource` fail-open hole. A
+                    // symlink an attacker can plant such that one of
+                    // these canonicalize calls fails is now skipped
+                    // rather than read.
+                    let canon_dir = match self.canonicalize_cached(dir) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let canon_path = match self.canonicalize_cached(&full_path) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if !canon_path.starts_with(&canon_dir) {
+                        continue;
                     }
                     // Round 7 audit fix (MED #12): same mmap-or-read
                     // helper as the single-resource path above.
@@ -1835,18 +1879,34 @@ impl ClassPath {
                 ClassPathEntry::Directory(dir) => {
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
-                        if let (Ok(canon_dir), Ok(canon_path)) = (
-                            self.canonicalize_cached(dir),
-                            self.canonicalize_cached(&full_path),
-                        ) {
-                            if !canon_path.starts_with(&canon_dir) {
-                                continue;
-                            }
+                        // C35 audit fix (HIGH security): fail-CLOSED on
+                        // canonicalize error. Previously the
+                        // `if let (Ok, Ok)` silently fell through to the
+                        // `urls.push(file:/...)` emission below — an
+                        // attacker who could plant a symlink causing
+                        // canonicalize to fail could leak the existence
+                        // of arbitrary files via `getResources()`
+                        // enumeration (even though the matching
+                        // `find_class` path correctly rejected the same
+                        // symlink).
+                        let canon_dir = match self.canonicalize_cached(dir) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        let canon_path = match self.canonicalize_cached(&full_path) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        if !canon_path.starts_with(&canon_dir) {
+                            continue;
                         }
-                        let abs = self
-                            .canonicalize_cached(&full_path)
-                            .unwrap_or(full_path);
-                        let p = abs.to_string_lossy().replace('\\', "/");
+                        // `canon_path` is the already-canonicalized
+                        // resolved path; reuse it directly instead of
+                        // re-canonicalizing (and avoid the
+                        // `unwrap_or(full_path)` fallback that, prior to
+                        // this fix, would have emitted the
+                        // un-canonicalized path on canonicalize error).
+                        let p = canon_path.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
                         urls.push(format!("file:/{p}"));
