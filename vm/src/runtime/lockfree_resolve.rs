@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // Round-9 MED-1: doc cleanup. `SharedResolutionState` below holds three
 // `parking_lot::RwLock` maps (`global_methods`, `global_fields`,
@@ -28,34 +29,169 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // parking_lot.
 use parking_lot::RwLock;
 
+#[allow(unused_imports)]
 use super::fx_collections::{fx_hashmap, FxBuildHasher, FxHashMap, FxHasher};
 use crate::classloading::resolution::CachedInvokeTarget;
 use crate::classloading::ClassId;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 
 // ---------------------------------------------------------------------------
 // ResolutionKey
 // ---------------------------------------------------------------------------
 
-/// Resolution key -- (class_name_hash, method_name_hash, descriptor_hash).
+/// Resolution cache key.
 ///
-/// Using pre-computed hashes avoids string comparisons in the hot path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// HIGH (security) — Previously the key was a 3-tuple of `FxHasher` digests of
+/// `(class_name, member_name, descriptor)`. `FxHasher` is a non-cryptographic
+/// hash with poor diffusion; an adversary that controls bytecode can forge a
+/// triple whose digests collide with an unrelated triple already in the cache,
+/// causing the cache to return the WRONG `ResolvedTarget` / `ResolvedField`
+/// on lookup. That is type-confusion / privilege bypass.
+///
+/// The fix has two parts:
+///
+/// 1. **Identity validation (option *a* from the harden brief).** The key
+///    stores the full interned strings as `Arc<str>` so the `Eq` impl can
+///    verify byte-for-byte that the looked-up entry actually matches; hash
+///    collisions only ever land in the same hashmap bucket and the linear
+///    probe rejects collisions via `Eq`. This is correctness-not-probabilistic.
+///
+///    `Hash` keeps the precomputed digests so the fast path still hashes the
+///    key by writing three `u64`s, not by re-walking each string.
+///
+/// 2. **Loader isolation.** A `loader_epoch` field is included so a cache
+///    entry promoted by loader L1 can never satisfy a lookup from loader L2
+///    sharing the same FQN (JVMS §5.3.4 — initiating + defining loader pair
+///    is part of class identity).
+///
+/// PERF NOTE: the `Eq` impl on a hit pays one short-circuited `Arc::ptr_eq`
+/// per field followed by a byte compare only on the (rare) interning miss.
+/// The vast majority of hot-path lookups go through the JVM's existing
+/// `Arc<str>` interner, so `Arc::ptr_eq` returns true in O(1) without
+/// touching the underlying bytes. The cost relative to the broken `u64`-only
+/// `Eq` is a handful of pointer compares per resolution — correctness wins.
+#[derive(Clone, Debug)]
 pub struct ResolutionKey {
     pub class_hash: u64,
     pub name_hash: u64,
     pub desc_hash: u64,
+    /// Defining classloader epoch / handle hash. Two loaders that have
+    /// independently loaded a class of the same FQN MUST get distinct cache
+    /// entries — JVMS §5.3.4 makes the loader pair part of class identity.
+    pub loader_epoch: u64,
+    /// Full class name. Preserved on the key so `Eq` can byte-compare on
+    /// hash collision and refuse to return a poisoned entry.
+    pub class_name: Arc<str>,
+    /// Full member (method / field) name. See `class_name`.
+    pub member_name: Arc<str>,
+    /// Full type descriptor. See `class_name`.
+    pub descriptor: Arc<str>,
 }
 
 impl ResolutionKey {
-    /// Build a key from the raw JVM strings.
-    pub fn new(class_name: &str, method_name: &str, descriptor: &str) -> Self {
+    /// Build a key from the raw JVM strings using loader epoch `0`. Suitable
+    /// for tests and for call sites that have not yet plumbed the
+    /// defining-loader handle through. Production code paths SHOULD use
+    /// [`ResolutionKey::with_loader`] so that two loaders with overlapping
+    /// FQNs do not cross-contaminate the cache.
+    pub fn new(class_name: &str, member_name: &str, descriptor: &str) -> Self {
+        Self::with_loader(class_name, member_name, descriptor, 0)
+    }
+
+    /// Build a key from the raw JVM strings plus a defining-classloader epoch.
+    ///
+    /// `loader_epoch` is any value that uniquely identifies the defining
+    /// classloader — a monotonically-bumped counter, an `Arc::as_ptr` cast,
+    /// or a stable handle hash. Two loaders MUST yield different epochs.
+    pub fn with_loader(
+        class_name: &str,
+        member_name: &str,
+        descriptor: &str,
+        loader_epoch: u64,
+    ) -> Self {
         Self {
             class_hash: fx_hash_str(class_name),
-            name_hash: fx_hash_str(method_name),
+            name_hash: fx_hash_str(member_name),
             desc_hash: fx_hash_str(descriptor),
+            loader_epoch,
+            class_name: Arc::from(class_name),
+            member_name: Arc::from(member_name),
+            descriptor: Arc::from(descriptor),
         }
     }
+
+    /// Build a key directly from already-interned `Arc<str>` handles. Hot-path
+    /// callers (`invokevirtual`, `getfield`, etc.) that obtain their strings
+    /// from the JVM's interner SHOULD use this constructor: the `Arc<str>`
+    /// is cloned by bumping a refcount, never allocated, and `Eq` short-
+    /// circuits via `Arc::ptr_eq`.
+    pub fn from_interned(
+        class_name: Arc<str>,
+        member_name: Arc<str>,
+        descriptor: Arc<str>,
+        loader_epoch: u64,
+    ) -> Self {
+        Self {
+            class_hash: fx_hash_str(&class_name),
+            name_hash: fx_hash_str(&member_name),
+            desc_hash: fx_hash_str(&descriptor),
+            loader_epoch,
+            class_name,
+            member_name,
+            descriptor,
+        }
+    }
+}
+
+/// Equality is *full identity*, not just hash equality. This is the security-
+/// critical bit: an attacker who forges a triple whose `FxHasher` digests
+/// collide with a cached entry still gets a cache miss because the byte
+/// comparison rejects the forged strings.
+impl PartialEq for ResolutionKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Cheap rejects first — the precomputed digests + loader epoch are
+        // 4 × u64 and on a real miss they almost always differ. Only on a
+        // hash match do we fall through to the string compares.
+        if self.class_hash != other.class_hash
+            || self.name_hash != other.name_hash
+            || self.desc_hash != other.desc_hash
+            || self.loader_epoch != other.loader_epoch
+        {
+            return false;
+        }
+        // Same-interner hot path: pointer-equal `Arc<str>` => equal in O(1).
+        // Fallback to byte compare for the rare cross-interner case (e.g.
+        // tests, defensively-decoded strings).
+        arc_str_eq(&self.class_name, &other.class_name)
+            && arc_str_eq(&self.member_name, &other.member_name)
+            && arc_str_eq(&self.descriptor, &other.descriptor)
+    }
+}
+
+impl Eq for ResolutionKey {}
+
+/// `Hash` writes only the precomputed digests + loader epoch — O(1), no
+/// re-walk of the underlying string bytes. The full strings are kept *only*
+/// for `Eq` to defeat collisions; they MUST NOT participate in the hash, or
+/// the hashmap bucket lookup would re-hash multi-byte strings on every probe
+/// and the perf justification for `FxHasher` digests disappears.
+impl Hash for ResolutionKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.class_hash);
+        state.write_u64(self.name_hash);
+        state.write_u64(self.desc_hash);
+        state.write_u64(self.loader_epoch);
+    }
+}
+
+/// Fast string equality: pointer-equal `Arc<str>` short-circuits, otherwise
+/// fall back to byte compare. Hot-path callers using the JVM's interner hit
+/// the fast path on every lookup.
+#[inline]
+fn arc_str_eq(a: &Arc<str>, b: &Arc<str>) -> bool {
+    Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref()
 }
 
 /// Hash a string slice with `FxHasher`.
@@ -170,6 +306,11 @@ impl ThreadLocalResolveCache {
 
     /// Insert (or update) a method resolution result.  If the cache has
     /// reached `max_entries`, the oldest method entry is evicted first.
+    ///
+    /// HIGH (security) — `ResolutionKey` now embeds the full interned
+    /// strings + loader epoch so the bucket linear-probe rejects forged
+    /// collisions via byte compare. See the `ResolutionKey` doc for the
+    /// full rationale.
     pub fn put_method(&mut self, key: ResolutionKey, target: ResolvedTarget) {
         if !self.methods.contains_key(&key) {
             // Evict oldest method entry if we are at capacity. O(1)
@@ -182,7 +323,7 @@ impl ThreadLocalResolveCache {
                     self.methods.remove(&oldest);
                 }
             }
-            self.method_order.push_back(key);
+            self.method_order.push_back(key.clone());
         }
         self.methods.insert(key, target);
     }
@@ -211,6 +352,8 @@ impl ThreadLocalResolveCache {
 
     /// Insert (or update) a field resolution result, evicting the oldest
     /// field entry if at capacity.
+    ///
+    /// HIGH (security) — see `put_method`.
     pub fn put_field(&mut self, key: ResolutionKey, field: ResolvedField) {
         if !self.fields.contains_key(&key) {
             // O(1) front-pop eviction via `VecDeque`.
@@ -221,7 +364,7 @@ impl ThreadLocalResolveCache {
                     self.fields.remove(&oldest);
                 }
             }
-            self.field_order.push_back(key);
+            self.field_order.push_back(key.clone());
         }
         self.fields.insert(key, field);
     }
@@ -516,12 +659,28 @@ mod tests {
 
     // -- ThreadLocalResolveCache: method put/get --------------------------
 
+    /// Helper: build a `ResolutionKey` directly from arbitrary numeric
+    /// digests for eviction / collision tests. Strings are formatted from
+    /// the same digests so the `Eq` impl behaves consistently with the
+    /// hashes.
+    fn key_from_parts(class_hash: u64, name_hash: u64, desc_hash: u64) -> ResolutionKey {
+        ResolutionKey {
+            class_hash,
+            name_hash,
+            desc_hash,
+            loader_epoch: 0,
+            class_name: std::sync::Arc::from(format!("C{class_hash}")),
+            member_name: std::sync::Arc::from(format!("N{name_hash}")),
+            descriptor: std::sync::Arc::from(format!("D{desc_hash}")),
+        }
+    }
+
     #[test]
     fn thread_local_cache_put_get_method() {
         let mut cache = ThreadLocalResolveCache::new(128);
         let key = ResolutionKey::new("A", "m", "()V");
         let target = sample_target(1);
-        cache.put_method(key, target.clone());
+        cache.put_method(key.clone(), target.clone());
         assert_eq!(cache.get_method(&key), Some(&target));
     }
 
@@ -530,7 +689,7 @@ mod tests {
         let mut cache = ThreadLocalResolveCache::new(128);
         let key = ResolutionKey::new("A", "x", "I");
         let field = sample_field(1);
-        cache.put_field(key, field.clone());
+        cache.put_field(key.clone(), field.clone());
         assert_eq!(cache.get_field(&key), Some(&field));
     }
 
@@ -546,7 +705,7 @@ mod tests {
     fn thread_local_cache_hit_rate_tracking() {
         let mut cache = ThreadLocalResolveCache::new(128);
         let key = ResolutionKey::new("A", "m", "()V");
-        cache.put_method(key, sample_target(1));
+        cache.put_method(key.clone(), sample_target(1));
 
         // 1 hit
         let _ = cache.get_method(&key);
@@ -565,30 +724,18 @@ mod tests {
 
         // Fill to capacity with 3 method entries.
         for i in 0..3u64 {
-            let key = ResolutionKey {
-                class_hash: i,
-                name_hash: 0,
-                desc_hash: 0,
-            };
+            let key = key_from_parts(i, 0, 0);
             cache.put_method(key, sample_target(i));
         }
         assert_eq!(cache.len(), 3);
 
         // Inserting a 4th should evict the oldest (class_hash=0).
-        let new_key = ResolutionKey {
-            class_hash: 99,
-            name_hash: 0,
-            desc_hash: 0,
-        };
-        cache.put_method(new_key, sample_target(99));
+        let new_key = key_from_parts(99, 0, 0);
+        cache.put_method(new_key.clone(), sample_target(99));
         assert_eq!(cache.len(), 3);
 
         // The oldest entry should be gone.
-        let evicted_key = ResolutionKey {
-            class_hash: 0,
-            name_hash: 0,
-            desc_hash: 0,
-        };
+        let evicted_key = key_from_parts(0, 0, 0);
         // Use contains_key directly to avoid affecting hit/miss stats.
         assert!(!cache.methods.contains_key(&evicted_key));
         assert!(cache.methods.contains_key(&new_key));
@@ -601,9 +748,9 @@ mod tests {
         let k2 = ResolutionKey::new("A", "m2", "()V");
         let k3 = ResolutionKey::new("B", "m1", "()V");
 
-        cache.put_method(k1, sample_target(10));
+        cache.put_method(k1.clone(), sample_target(10));
         cache.put_method(k2, sample_target(10));
-        cache.put_method(k3, sample_target(20));
+        cache.put_method(k3.clone(), sample_target(20));
         cache.put_field(k1, sample_field(10));
 
         assert_eq!(cache.len(), 4);
@@ -617,8 +764,8 @@ mod tests {
     fn thread_local_cache_clear() {
         let mut cache = ThreadLocalResolveCache::new(128);
         let key = ResolutionKey::new("A", "m", "()V");
-        cache.put_method(key, sample_target(1));
-        cache.put_field(key, sample_field(1));
+        cache.put_method(key.clone(), sample_target(1));
+        cache.put_field(key.clone(), sample_field(1));
         let _ = cache.get_method(&key); // hit=1
         assert!(cache.len() > 0);
         cache.clear();
@@ -631,8 +778,8 @@ mod tests {
     fn cache_stats_computation() {
         let mut cache = ThreadLocalResolveCache::new(128);
         let key = ResolutionKey::new("A", "m", "()V");
-        cache.put_method(key, sample_target(1));
-        cache.put_field(key, sample_field(1));
+        cache.put_method(key.clone(), sample_target(1));
+        cache.put_field(key.clone(), sample_field(1));
         // Generate hits and misses.
         let _ = cache.get_method(&key); // hit
         let _ = cache.get_method(&key); // hit
@@ -655,7 +802,7 @@ mod tests {
         let state = SharedResolutionState::new();
         let key = ResolutionKey::new("A", "m", "()V");
         let target = sample_target(1);
-        state.cache_method(key, target.clone());
+        state.cache_method(key.clone(), target.clone());
         assert_eq!(state.resolve_method(&key), Some(target));
     }
 
@@ -670,7 +817,7 @@ mod tests {
             is_native: false,
             vtable_slot: Some(3),
         };
-        state.cache_method(key, target.clone());
+        state.cache_method(key.clone(), target.clone());
         let resolved = state.resolve_method(&key).unwrap();
         assert_eq!(resolved, target);
         assert_eq!(state.method_count(), 1);
@@ -681,12 +828,13 @@ mod tests {
         let state = Arc::new(SharedResolutionState::new());
         let key = ResolutionKey::new("A", "m", "()V");
         let target = sample_target(1);
-        state.cache_method(key, target.clone());
+        state.cache_method(key.clone(), target.clone());
 
         let mut handles = Vec::new();
         for _ in 0..4 {
             let state = Arc::clone(&state);
             let expected = target.clone();
+            let key = key.clone();
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
                     let got = state.resolve_method(&key);
@@ -703,8 +851,8 @@ mod tests {
     fn shared_state_invalidate_all() {
         let state = SharedResolutionState::new();
         let key = ResolutionKey::new("A", "m", "()V");
-        state.cache_method(key, sample_target(1));
-        state.cache_field(key, sample_field(1));
+        state.cache_method(key.clone(), sample_target(1));
+        state.cache_field(key.clone(), sample_field(1));
         assert_eq!(state.method_count(), 1);
         assert_eq!(state.field_count(), 1);
 
@@ -920,9 +1068,9 @@ mod tests {
         let target_c = sample_target(3);
 
         // Pre-populate thread-local with key_a.
-        local.put_method(key_a, target_a.clone());
+        local.put_method(key_a.clone(), target_a.clone());
         // Pre-populate shared with key_b.
-        shared.cache_method(key_b, target_b.clone());
+        shared.cache_method(key_b.clone(), target_b.clone());
 
         // Step 1: thread-local hit for key_a.
         assert_eq!(local.get_method(&key_a), Some(&target_a));
@@ -932,7 +1080,7 @@ mod tests {
         let from_shared = shared.resolve_method(&key_b).unwrap();
         assert_eq!(from_shared, target_b);
         // Populate thread-local from shared.
-        local.put_method(key_b, from_shared);
+        local.put_method(key_b.clone(), from_shared);
         // Now thread-local has it.
         assert_eq!(local.get_method(&key_b), Some(&target_b));
 
@@ -940,10 +1088,97 @@ mod tests {
         assert_eq!(local.get_method(&key_c), None);
         assert_eq!(shared.resolve_method(&key_c), None);
         // Simulate full resolution: populate both.
-        shared.cache_method(key_c, target_c.clone());
-        local.put_method(key_c, target_c.clone());
+        shared.cache_method(key_c.clone(), target_c.clone());
+        local.put_method(key_c.clone(), target_c.clone());
         // Now both have it.
         assert_eq!(local.get_method(&key_c), Some(&target_c));
         assert_eq!(shared.resolve_method(&key_c), Some(target_c));
+    }
+
+    // -- HIGH security harden tests ---------------------------------------
+    //
+    // These tests prove the cache rejects (1) forged hash collisions
+    // (an adversary crafts a triple whose `FxHasher` digests match a
+    // cached entry's despite the strings differing — would return the
+    // wrong target on the vulnerable key) and (2) cross-classloader
+    // contamination (loader L1 and L2 both load the same FQN — JVMS
+    // §5.3.4 makes the defining loader part of class identity).
+
+    /// Forge a `ResolutionKey` whose precomputed digests match `real`'s
+    /// digests but whose underlying strings differ. We construct the
+    /// forgery directly rather than brute-forcing a real `FxHasher`
+    /// collision — the security property is "keys that hash the same
+    /// but whose Eq-relevant data differs MUST NOT alias", which the
+    /// directly-forged key exercises identically.
+    fn forge_collision(real: &ResolutionKey) -> ResolutionKey {
+        ResolutionKey {
+            class_hash: real.class_hash,
+            name_hash: real.name_hash,
+            desc_hash: real.desc_hash,
+            loader_epoch: real.loader_epoch,
+            class_name: Arc::from("AttackerClass"),
+            member_name: Arc::from("AttackerMethod"),
+            descriptor: Arc::from("(Lattacker/Payload;)V"),
+        }
+    }
+
+    #[test]
+    fn forged_hash_collision_method_returns_miss() {
+        let mut cache = ThreadLocalResolveCache::new(128);
+        let real = ResolutionKey::new("java/lang/Object", "hashCode", "()I");
+        let real_target = sample_target(0xDEADBEEF);
+        cache.put_method(real.clone(), real_target.clone());
+        assert_eq!(cache.get_method(&real), Some(&real_target));
+
+        // Forged key — same hash digests, different strings. Lookup MUST
+        // miss; otherwise the cache would return `real_target` for an
+        // attacker-controlled triple (type confusion / privilege bypass).
+        let forged = forge_collision(&real);
+        assert_eq!(forged.class_hash, real.class_hash);
+        assert_eq!(forged.name_hash, real.name_hash);
+        assert_eq!(forged.desc_hash, real.desc_hash);
+        assert_ne!(forged, real);
+        assert!(
+            cache.get_method(&forged).is_none(),
+            "SECURITY: forged collision returned cached entry — type confusion!"
+        );
+        // Same property for the shared cross-thread cache.
+        let state = SharedResolutionState::new();
+        state.cache_method(real.clone(), real_target.clone());
+        assert!(state.resolve_method(&forged).is_none());
+        // And the field cache.
+        let field_key = ResolutionKey::new("java/lang/String", "value", "[B");
+        let real_field = sample_field(0xCAFEBABE);
+        cache.put_field(field_key.clone(), real_field.clone());
+        let forged_field = forge_collision(&field_key);
+        assert!(cache.get_field(&forged_field).is_none());
+    }
+
+    #[test]
+    fn two_classloaders_same_fqn_do_not_cross_contaminate() {
+        // L1 and L2 both load `org/x/Foo::bar()V` independently. The
+        // string hashes are identical; only the loader epoch separates
+        // them. L1's resolution MUST NOT satisfy L2's lookup.
+        let mut cache = ThreadLocalResolveCache::new(128);
+        let k_l1 = ResolutionKey::with_loader("org/x/Foo", "bar", "()V", 0xA1A1);
+        let k_l2 = ResolutionKey::with_loader("org/x/Foo", "bar", "()V", 0xB2B2);
+        assert_eq!(k_l1.class_hash, k_l2.class_hash);
+        assert_eq!(k_l1.name_hash, k_l2.name_hash);
+        assert_eq!(k_l1.desc_hash, k_l2.desc_hash);
+        assert_ne!(k_l1, k_l2);
+
+        let l1_target = sample_target(100);
+        cache.put_method(k_l1.clone(), l1_target.clone());
+        assert_eq!(cache.get_method(&k_l1), Some(&l1_target));
+        assert!(
+            cache.get_method(&k_l2).is_none(),
+            "SECURITY: L2 saw L1's resolution — loader isolation broken"
+        );
+
+        let l2_target = sample_target(200);
+        cache.put_method(k_l2.clone(), l2_target.clone());
+        // Both loaders' resolutions coexist; lookups don't cross over.
+        assert_eq!(cache.get_method(&k_l1), Some(&l1_target));
+        assert_eq!(cache.get_method(&k_l2), Some(&l2_target));
     }
 }
