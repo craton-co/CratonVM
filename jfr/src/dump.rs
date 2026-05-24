@@ -571,8 +571,14 @@ fn write_header<W: Write>(
 /// callers can do `global_ring_registry().drain_all()` and forward the
 /// result as `extra_events`.
 ///
-/// `extra_events` are sorted by `start_time` and filtered to known event
-/// types, then serialized AFTER the in-repository events.
+/// Round-9 HIGH-4 fix (2026-05-24): `extra_events` and the repository's
+/// own events are MERGE-SORTED by absolute `start_time` and written as
+/// one globally-monotonic stream. Previously each source was written in
+/// its own block, producing per-event timestamps that were non-monotonic
+/// across shards — which broke the JMC timeline view, especially in
+/// combination with the round-5 delta-timestamp wire format. The merged
+/// sort is O(N log N) on a cold path; dumps are rare enough that the
+/// trade-off is acceptable in exchange for a JMC-correct file.
 ///
 /// Returns the total number of bytes written.
 /// Round-5: `durable` controls whether the writer issues `sync_all` (fsync)
@@ -606,29 +612,53 @@ pub fn dump_to_file(
     extra_events: Vec<EventInstance>,
     durable: bool,
 ) -> Result<u64, JfrDumpError> {
-    // --- Pre-process caller-supplied extra events ----------------------------
-    // Cold path: dump frequency is on the order of seconds (typically at
-    // recording stop). We pay an O(n log n) sort and a single linear filter.
-    // The events were already drained by the caller (typically
-    // `FlightRecorder::dump_recording`), which fans them out to every running
-    // recording. Re-draining here would steal events from sibling recordings —
-    // see Bug 1.
+    // --- Build the chunk's event list, globally sorted by start_time --------
     //
-    // Round-4 (2026-05-17) — sort rationale:
-    //   The JFR v2 file format does NOT require global timestamp ordering
-    //   within a chunk: consumers reconstruct order from the per-event
-    //   `start_time` field on read. The sort here is purely a courtesy to
-    //   human readers / older JMC versions that don't re-sort. Because dumps
-    //   are cold-path, we keep it — but note that skipping it would still
-    //   produce a spec-compliant file and would save the O(n log n) cost on
-    //   very large drained sets. (Per-thread blocks remain monotonic in this
-    //   sort because `sort_by_key` is stable.)
-    let mut drained: Vec<EventInstance> = extra_events;
-    drained.sort_by_key(|e| e.start_time);
+    // Cold path: dump frequency is on the order of seconds (typically at
+    // recording stop). We pay an O(N log N) sort over (repository + extra)
+    // and a single linear filter.
+    //
+    // Round-9 HIGH-4 fix (2026-05-24):
+    //   Previously this function sorted `extra_events` on its own and then
+    //   wrote them after the repository's events in two separate loops. With
+    //   the per-thread-ring drain pattern the repository ALREADY contains
+    //   events from many shards (`FlightRecorder::drain_per_thread_into_repository`
+    //   fans them out per recording), and shard order is "producer-insertion
+    //   per shard, then concatenated" with "no global ordering enforced
+    //   across shards" — i.e. the on-disk timestamps were non-monotonic
+    //   *within* a chunk. JDK Mission Control's timeline view requires
+    //   per-event `start_time` to be globally monotonic for the chunk; the
+    //   round-5 delta-encoding wire-format change (`JFR_VERSION_MINOR = 1`)
+    //   makes the non-monotonicity worse on JMC versions that decode deltas
+    //   against the previous event's tick instead of `chunk_start_time`.
+    //
+    //   New shape: collect references from both sources into a single
+    //   `Vec<&EventInstance>` (just pointer-sized, no event clones), sort by
+    //   absolute `start_time` (already-resolved by both the per-recording
+    //   repository and the caller-side drain so we have a uniform key),
+    //   then serialize in one pass. The repository is iterated by reference
+    //   so its events are NOT cloned; only the `extra_events` Vec is owned
+    //   here.
+    //
+    //   Cost: ~16 bytes per event for the pointer Vec plus O(N log N) for
+    //   the sort. Dumps are cold-path and trade this for a JMC-correct
+    //   on-disk timeline.
+    let mut extra: Vec<EventInstance> = extra_events;
     // Filter to events whose type_id is registered. Unknown type_ids cannot be
     // round-tripped through `read_events` (which looks up the type to decode
     // fields), so writing them would produce unreadable records.
-    drained.retain(|e| registry.get(e.type_id).is_some());
+    extra.retain(|e| registry.get(e.type_id).is_some());
+    // Collect refs from both sources into one Vec for the merge-sort pass.
+    // The repository iter and `extra` slice both borrow for the rest of the
+    // function — no event-by-event clones.
+    let mut chunk_events: Vec<&EventInstance> =
+        Vec::with_capacity(repository.len() + extra.len());
+    chunk_events.extend(repository.iter());
+    chunk_events.extend(extra.iter());
+    // Stable sort by `start_time` so equal-timestamp events keep their
+    // per-shard relative order — this matches what JMC expects for events
+    // emitted by the same thread within one tick.
+    chunk_events.sort_by_key(|e| e.start_time);
 
     // Write to a sibling `<name>.jfr.part` file and atomically rename on
     // success.  If anything fails partway through, the prior `.jfr` file is
@@ -661,11 +691,12 @@ pub fn dump_to_file(
     // a compressed-int pool index per string instead of the full UTF-8 body,
     // turning N copies of "Allocation Failure" into a single pool entry + N
     // 1-byte tag-and-index references.
+    //
+    // Round-9 HIGH-4 (2026-05-24): walk the merged `chunk_events` rather
+    // than the two original sources separately — same set of strings,
+    // single pass.
     let mut string_pool = StringPool::new();
-    for ev in repository.iter() {
-        intern_event_strings(&mut string_pool, &ev.fields);
-    }
-    for ev in &drained {
+    for ev in &chunk_events {
         intern_event_strings(&mut string_pool, &ev.fields);
     }
 
@@ -688,29 +719,16 @@ pub fn dump_to_file(
         let mut scratch: Vec<u8> = Vec::with_capacity(256);
         let pool_ref = if string_pool.len() == 0 { None } else { Some(&string_pool) };
 
-        // Write events from the recording's repository first, preserving the
-        // existing on-disk ordering relative to drained events.
+        // Round-9 HIGH-4 (2026-05-24): write the globally-sorted merged
+        // event stream in one pass. `chunk_events` already holds refs
+        // from both the recording's repository and the caller-supplied
+        // `extra_events`, sorted by absolute `start_time`. This is what
+        // produces a JMC-correct monotonic timeline within the chunk.
         //
         // Round-5 Fix 3: pass `start_time_ns` as the chunk start so each
         // event's `start_time` is written as a delta. This is the writer
         // half of the JFR_VERSION_MINOR=1 wire-format change.
-        for event in repository.iter() {
-            serialize_event_into(
-                &mut scratch,
-                &mut writer,
-                event.type_id,
-                event.start_time,
-                event.end_time,
-                event.thread_id,
-                &event.fields,
-                pool_ref,
-                start_time_ns,
-            )?;
-        }
-
-        // Then write the drained per-thread events (already sorted by
-        // start_time, already filtered to known types).
-        for event in &drained {
+        for event in &chunk_events {
             serialize_event_into(
                 &mut scratch,
                 &mut writer,
@@ -1883,6 +1901,70 @@ mod tests {
         // was not already monotonically increasing).
         assert_ne!(push_order.to_vec(), sorted,
             "test setup bug: push_order happens to equal sorted order");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Round-9 HIGH-4 fix (2026-05-24): events that originate from the
+    /// per-recording repository AND the caller-supplied `extra_events` must
+    /// be merge-sorted by `start_time` and written as one monotonic stream.
+    /// Previously the repository block was written first (in insertion order
+    /// across shards) and the `extra_events` block second — a JMC reader
+    /// would see a per-event timestamp that went backwards in the middle of
+    /// the chunk.
+    #[test]
+    fn test_dump_merges_repository_and_extra_events_by_start_time() {
+        let (reg, type_id) = make_registry_with_one_type();
+
+        // Repository holds an early and a late event; `extra_events` carries
+        // a middle one. Without the cross-shard sort, the on-disk order
+        // would be [early, late, middle] — i.e. non-monotonic.
+        let mut repo = EventRepository::new(10);
+        repo.push(EventInstance {
+            type_id,
+            start_time: 100,
+            end_time: 110,
+            thread_id: 1,
+            fields: smallvec![EventValue::Int(0), EventValue::from_str("early")],
+        });
+        repo.push(EventInstance {
+            type_id,
+            start_time: 500,
+            end_time: 510,
+            thread_id: 1,
+            fields: smallvec![EventValue::Int(2), EventValue::from_str("late")],
+        });
+        let extra = vec![EventInstance {
+            type_id,
+            start_time: 300,
+            end_time: 310,
+            thread_id: 2,
+            fields: smallvec![EventValue::Int(1), EventValue::from_str("middle")],
+        }];
+
+        let dir = std::env::temp_dir().join("jfr_test_merge_sort");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("merge_sort.jfr");
+        dump_to_file(&path, &repo, &reg, 0, 1000, extra, false).unwrap();
+
+        // The reader walks records in file order, so the resulting `Vec`
+        // preserves on-disk order. Assert the three known events come out
+        // sorted by `start_time`.
+        let events = read_events(&path, &reg).unwrap();
+        let starts: Vec<u64> = events.iter().map(|e| e.start_time).collect();
+        // Filter to our three known starts in case any cross-test ring
+        // stragglers leaked through.
+        let ours: Vec<u64> = starts
+            .iter()
+            .copied()
+            .filter(|s| *s == 100 || *s == 300 || *s == 500)
+            .collect();
+        assert_eq!(
+            ours,
+            vec![100, 300, 500],
+            "merge sort should produce a monotonic on-disk timeline across the repository and extra events",
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

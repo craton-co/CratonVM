@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Java Flight Recorder support for CratonVM"
-readme = "../README.md"
+readme = "README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -24,6 +24,12 @@ rustc-hash.workspace = true
 # (no length-vs-pointer tag) and is the standard configuration for
 # performance-sensitive use.
 smallvec = { workspace = true, features = ["union"] }
+# Round-9 CRIT-3 (2026-05-24): low-frequency `tracing::debug!` from the
+# filtered-event drain path so operators can diagnose "why aren't my
+# events showing up?" without grepping stats counters. Capped at
+# `release_max_level_info` workspace-wide, so debug emissions vanish in
+# release builds.
+tracing.workspace = true
 
 [lints]
 workspace = true

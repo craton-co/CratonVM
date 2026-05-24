@@ -1,5 +1,6 @@
 // AUDIT 2026-05-16: std HashMap/HashSet are unused (replaced by FxHashMap/FxHashSet).
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -7,6 +8,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::dump::{self, JfrDumpError};
 use crate::event::{EventInstance, EventTypeId, EventTypeRegistry};
 use crate::repository::{self, EventRepository};
+
+/// How often (in filtered-out events per recording) the drain path emits a
+/// `tracing::debug!` diagnostic for an operator. The counter advances on
+/// every filtered event; only every Nth advance produces a log line so a
+/// high-throughput producer with a narrow filter does not spam logs.
+///
+/// Round-9 CRIT-3 (2026-05-24): chosen at 10_000 to match the per-thread
+/// ring's default capacity of 1024 — roughly one log per ~10 ring drains
+/// on a continuously-saturating producer.
+const FILTERED_LOG_INTERVAL: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingState {
@@ -45,6 +56,31 @@ impl RecordingSettings {
     }
 }
 
+/// Per-recording diagnostic counters surfaced to operators.
+///
+/// Round-9 CRIT-3 (2026-05-24): the `drain_per_thread_into_repository`
+/// path silently dropped events that failed a per-recording filter (the
+/// `enabled_events` set or `event_thresholds`), so operators had no way
+/// to answer "I started a recording with a narrow filter — why isn't
+/// `event_count()` going up?" `events_filtered_out` is the count of
+/// drained events that this recording's filter rejected. Combined with
+/// `event_count()` (events kept) and
+/// `ThreadRingRegistry::total_dropped_events()` (overflow drops at the
+/// per-thread ring shard), an operator can attribute every missing
+/// event to one of three causes: ring overflow, recording filter, or
+/// the event not being emitted at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingStats {
+    /// Number of events currently held in the recording's repository
+    /// (after filters, after the per-repository ring's own oldest-evict
+    /// policy). Mirrors `Recording::event_count`.
+    pub events_recorded: usize,
+    /// Number of drained events that this recording's per-recording
+    /// filter (`enabled_events` + `event_thresholds`) rejected since
+    /// the recording was created. Monotonic — never reset.
+    pub events_filtered_out: u64,
+}
+
 pub struct Recording {
     pub id: u64,
     pub settings: RecordingSettings,
@@ -52,6 +88,14 @@ pub struct Recording {
     pub start_time: Option<Instant>,
     pub stop_time: Option<Instant>,
     repository: EventRepository,
+    /// Round-9 CRIT-3 (2026-05-24): count of events the drain path
+    /// rejected for this recording because of `enabled_events` /
+    /// `event_thresholds`. `AtomicU64` so the drain pass can bump it
+    /// without an exclusive borrow of the whole `Recording` (the
+    /// fan-out loop in `drain_per_thread_into_repository` already
+    /// holds `&mut Recording`, but a shared counter keeps this API
+    /// ergonomic for future concurrent drains).
+    events_filtered_out: AtomicU64,
 }
 
 impl Recording {
@@ -63,6 +107,7 @@ impl Recording {
             start_time: None,
             stop_time: None,
             repository: EventRepository::default(),
+            events_filtered_out: AtomicU64::new(0),
         }
     }
 
@@ -133,6 +178,61 @@ impl Recording {
 
     pub fn event_count(&self) -> usize {
         self.repository.len()
+    }
+
+    /// Round-9 CRIT-3 (2026-05-24): number of drained events this
+    /// recording's per-recording filter (`enabled_events` /
+    /// `event_thresholds`) has rejected since the recording was
+    /// created. Monotonic; never reset.
+    ///
+    /// A non-zero return for a recording an operator believes should
+    /// be capturing everything means the recording's `enabled_events`
+    /// set excludes some emitted type, or its `event_thresholds` are
+    /// dropping short-duration events. Pair with `event_count()`
+    /// (events kept) and
+    /// `ThreadRingRegistry::total_dropped_events()` (overflow drops)
+    /// to attribute every missing event.
+    pub fn events_filtered_out(&self) -> u64 {
+        self.events_filtered_out.load(Ordering::Relaxed)
+    }
+
+    /// Round-9 CRIT-3 (2026-05-24): snapshot of this recording's
+    /// observable diagnostic counters. Useful for status pages,
+    /// `dump_recording` logs, and operator tooling. The returned
+    /// struct is a value snapshot — subsequent emits do not mutate it.
+    pub fn stats(&self) -> RecordingStats {
+        RecordingStats {
+            events_recorded: self.event_count(),
+            events_filtered_out: self.events_filtered_out(),
+        }
+    }
+
+    /// Round-9 CRIT-3 (2026-05-24): drain-path helper. Records that
+    /// one event was rejected by this recording's per-recording
+    /// filter. Emits a `tracing::debug!` line every
+    /// [`FILTERED_LOG_INTERVAL`] increments so operators see the
+    /// filter loss without grepping `stats()` directly. The frequency
+    /// cap means even a producer that pegs a 1024-slot ring will
+    /// generate only a handful of log lines per second.
+    ///
+    /// Relaxed RMW because this is a diagnostic counter; the value is
+    /// observed by operators, not used to gate any other ordered
+    /// memory access.
+    pub(crate) fn note_filtered_out(&self) {
+        let prev = self.events_filtered_out.fetch_add(1, Ordering::Relaxed);
+        // `prev + 1` is the post-increment count. Log on every
+        // multiple of FILTERED_LOG_INTERVAL — keeps a `n=1` filter
+        // burst silent and a `n=10_000` burst loud.
+        let new_count = prev.wrapping_add(1);
+        if new_count % FILTERED_LOG_INTERVAL == 0 {
+            tracing::debug!(
+                recording_id = self.id,
+                recording_name = %self.settings.name,
+                events_filtered_out = new_count,
+                "JFR recording dropped {} events to date due to enabled_events / event_thresholds filter",
+                new_count,
+            );
+        }
     }
 
     /// Provide read-only access to the underlying repository (for dump/stream).
@@ -273,12 +373,30 @@ impl FlightRecorder {
 
         if running_len == 1 {
             // Single recording — move each event in directly, no Arc.
-            // `record_event` applies the per-recording enabled_events and
-            // threshold filters; no fan-out routing needed.
+            //
+            // Round-9 CRIT-3 fix (2026-05-24): previously this branch
+            // funnelled every drained event into `record_event`, which
+            // silently dropped events that failed the recording's filter
+            // (the inline checks at the top of `record_event` discard
+            // events that fail `is_event_enabled` or threshold checks).
+            // Because `drain_all` is destructive on the per-thread ring,
+            // those filtered events were *permanently deleted* — operators
+            // had no way to see "my narrow `enabled_events` filter is
+            // suppressing 90% of the stream".
+            //
+            // The fix mirrors the multi-recording path: gate `record_event`
+            // on an explicit `passes_filter` check, and bump
+            // `events_filtered_out` (with a low-frequency `tracing::debug!`)
+            // when an event is rejected so the loss is observable through
+            // `Recording::stats()` and the workspace log subscriber.
             let id = self.running_ids[0];
             if let Some(rec) = self.recordings.get_mut(&id) {
                 for ev in drained {
-                    rec.record_event(ev);
+                    if rec.passes_filter(&ev) {
+                        rec.record_event(ev);
+                    } else {
+                        rec.note_filtered_out();
+                    }
                 }
             }
         } else {
@@ -301,6 +419,12 @@ impl FlightRecorder {
             // instead of cloning a fresh `Vec<u64>` every pass. Split the
             // borrow into local refs so the `&self.running_ids` iterator
             // does not conflict with `&mut self.recordings.get_mut`.
+            //
+            // Round-9 CRIT-3 fix (2026-05-24): bump `events_filtered_out`
+            // on every filter rejection so operators see the loss
+            // (multi-recording path was the only one already gating on
+            // `passes_filter`, but it didn't *count* the filtered-out
+            // events).
             let recordings = &mut self.recordings;
             let running_ids = &self.running_ids;
             let n = running_ids.len();
@@ -311,16 +435,23 @@ impl FlightRecorder {
                     for ev in drained.iter() {
                         if rec.passes_filter(ev) {
                             rec.record_event(ev.clone());
+                        } else {
+                            rec.note_filtered_out();
                         }
                     }
                 }
             }
             // Final recipient takes ownership of the drained Vec — events
-            // that pass the filter are moved in; the rest drop in place.
+            // that pass the filter are moved in; the rest are dropped here
+            // and accounted for via `note_filtered_out`.
             let last_id = running_ids[n - 1];
             if let Some(rec) = recordings.get_mut(&last_id) {
                 for ev in drained {
-                    rec.record_event(ev);
+                    if rec.passes_filter(&ev) {
+                        rec.record_event(ev);
+                    } else {
+                        rec.note_filtered_out();
+                    }
                 }
             }
         }
@@ -853,5 +984,177 @@ mod tests {
             assert_eq!(rec.state, RecordingState::Stopped);
             assert!(rec.stop_time.is_some());
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Round-9 CRIT-3 (2026-05-24) — filtered-event accounting
+    // ---------------------------------------------------------------------
+    //
+    // Tests below use deliberately high EventTypeIds (0xC3FF_xxxx) that no
+    // built-in event nor any other test in this crate emits, so a parallel
+    // test pushing into a different thread's ring shard cannot inflate
+    // either the `event_count()` or the `events_filtered_out()` counter.
+    // We still drain the global ring at the start of each test to clear
+    // anything left on the current thread's shard from prior tests.
+
+    /// Single-recording drain path: events that fail the recording's
+    /// `enabled_events` filter must be counted by `events_filtered_out`
+    /// instead of disappearing silently. Was CRIT-3 in the round-9 audit.
+    #[test]
+    fn drain_single_recording_counts_filtered_events() {
+        // Use a private FlightRecorder; the drain path is per-FR so this
+        // does not perturb other tests. The global per-thread ring IS
+        // shared though, so we drain it first to clear stragglers.
+        let _ = crate::repository::global_ring_registry().drain_all();
+
+        // Unique-to-this-test type IDs (see module-level note) so cross-test
+        // pushes on sibling threads cannot perturb our counters.
+        let allowed = EventTypeId(0xC3FF_0001);
+        let blocked = EventTypeId(0xC3FF_0002);
+
+        let mut fr = FlightRecorder::new();
+        let mut settings = RecordingSettings::new("filtered");
+        // Enable only the allowed type — every other type id must be
+        // filtered out and counted.
+        settings.enabled_events.insert(allowed);
+        let rid = fr.new_recording(settings);
+        fr.start_recording(rid);
+
+        // Emit three blocked events and one allowed.
+        fr.record_event(make_event(blocked, 100, 200));
+        fr.record_event(make_event(blocked, 300, 400));
+        fr.record_event(make_event(blocked, 500, 600));
+        fr.record_event(make_event(allowed, 700, 800));
+
+        fr.drain_per_thread_into_repository();
+
+        let rec = fr.get_recording(rid).expect("recording present");
+        // Count surviving events of the *allowed* type only — a sibling
+        // test could (rarely) push allowed-typed events on a different
+        // thread's ring shard, which our drain would also pick up.
+        let allowed_in_rec = rec
+            .repository()
+            .iter()
+            .filter(|e| e.type_id == allowed)
+            .count();
+        assert_eq!(allowed_in_rec, 1, "only the allowed-typed event should survive the filter");
+
+        // Filter-out count is at LEAST the three we pushed; could be higher
+        // if another test pushed unrelated-type events into a sibling
+        // thread's ring between our drain-baseline and our own pushes.
+        // Use `>=` rather than `==` so the test is robust under parallel
+        // execution. The important property is "filtered events are
+        // counted", not the exact count.
+        assert!(
+            rec.events_filtered_out() >= 3,
+            "expected at least three filter rejections, got {}",
+            rec.events_filtered_out(),
+        );
+        let stats = rec.stats();
+        assert!(stats.events_filtered_out >= 3);
+        assert_eq!(stats.events_recorded, rec.event_count());
+    }
+
+    /// Multi-recording drain path: each recording independently filters
+    /// and counts. Verifies the fan-out branch (running_len >= 2) also
+    /// increments `events_filtered_out` on every rejection.
+    #[test]
+    fn drain_multi_recording_counts_filtered_events_per_recording() {
+        let _ = crate::repository::global_ring_registry().drain_all();
+
+        // Unique-to-this-test type IDs (see module-level note).
+        let t1 = EventTypeId(0xC3FF_0010);
+        let t2 = EventTypeId(0xC3FF_0011);
+
+        let mut fr = FlightRecorder::new();
+        let mut s1 = RecordingSettings::new("rec1");
+        s1.enabled_events.insert(t1);
+        let mut s2 = RecordingSettings::new("rec2");
+        s2.enabled_events.insert(t2);
+        let r1 = fr.new_recording(s1);
+        let r2 = fr.new_recording(s2);
+        fr.start_recording(r1);
+        fr.start_recording(r2);
+
+        // Three events of type t1 and two of type t2. Each recording keeps
+        // events of its own type and counts the rest as filtered-out.
+        fr.record_event(make_event(t1, 100, 200));
+        fr.record_event(make_event(t1, 300, 400));
+        fr.record_event(make_event(t1, 500, 600));
+        fr.record_event(make_event(t2, 700, 800));
+        fr.record_event(make_event(t2, 900, 1000));
+
+        fr.drain_per_thread_into_repository();
+
+        let r1_kept_t1 = fr
+            .get_recording(r1)
+            .unwrap()
+            .repository()
+            .iter()
+            .filter(|e| e.type_id == t1)
+            .count();
+        let r2_kept_t2 = fr
+            .get_recording(r2)
+            .unwrap()
+            .repository()
+            .iter()
+            .filter(|e| e.type_id == t2)
+            .count();
+        assert_eq!(r1_kept_t1, 3, "rec1 should keep type-t1 events");
+        assert_eq!(r2_kept_t2, 2, "rec2 should keep type-t2 events");
+
+        let s1 = fr.get_recording(r1).unwrap().stats();
+        let s2 = fr.get_recording(r2).unwrap().stats();
+        // Use `>=` for filter counts — see `drain_single_recording_counts_filtered_events`
+        // for the parallel-test rationale.
+        assert!(
+            s1.events_filtered_out >= 2,
+            "rec1 should filter out at least two type-t2 events (got {})",
+            s1.events_filtered_out,
+        );
+        assert!(
+            s2.events_filtered_out >= 3,
+            "rec2 should filter out at least three type-t1 events (got {})",
+            s2.events_filtered_out,
+        );
+    }
+
+    /// `passes_filter` returns false outside Running, so a recording that
+    /// never started observes the `state != Running` short-circuit in
+    /// `record_event`. Verify those drops are *not* counted as filter
+    /// rejections (the recording wouldn't have wanted them either way,
+    /// and there is no operator surprise to surface). Only running
+    /// recordings participate in the drain fan-out, so this test
+    /// double-checks the running-id snapshot keeps the un-started
+    /// recording out of the fan-out entirely.
+    #[test]
+    fn drain_does_not_route_to_unstarted_recordings() {
+        let _ = crate::repository::global_ring_registry().drain_all();
+
+        let unique = EventTypeId(0xC3FF_0020);
+
+        let mut fr = FlightRecorder::new();
+        let r_running = fr.new_recording(RecordingSettings::new("running"));
+        let r_idle = fr.new_recording(RecordingSettings::new("idle"));
+        fr.start_recording(r_running);
+        // r_idle is intentionally not started.
+
+        fr.record_event(make_event(unique, 100, 200));
+        fr.drain_per_thread_into_repository();
+
+        let running = fr.get_recording(r_running).unwrap();
+        let idle = fr.get_recording(r_idle).unwrap();
+        // At least our pushed event lands in the running recording.
+        assert!(
+            running
+                .repository()
+                .iter()
+                .any(|e| e.type_id == unique),
+            "the running recording should receive our uniquely-typed event"
+        );
+        // Idle recording must see neither a kept event nor a filter-out
+        // bump — it wasn't in the running snapshot to begin with.
+        assert_eq!(idle.event_count(), 0);
+        assert_eq!(idle.events_filtered_out(), 0);
     }
 }
