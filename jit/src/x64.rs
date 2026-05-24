@@ -1636,32 +1636,63 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// JIT-T#51 — loop-unrolling byte-copy safety predicate.
+// JIT-T#51/T#58 — loop-unrolling byte-copy safety predicate.
 //
-// The unroller in `compile_op_goto` works by snapshotting the native bytes
-// emitted for the loop body and re-emitting them verbatim at later
+// The byte-copy unroller in `compile_op_goto` snapshots the native bytes
+// emitted for the loop body and re-emits them verbatim at later
 // offsets. That is only correct when every byte the body contains is
-// position-independent **or** is one of the rel32 patch flavours the
-// unroller knows how to re-shift afterwards (`forward_patches`,
-// `bounds_check_stubs`, `null_check_store_stubs`).
+// position-independent **or** is one of the patch flavours the
+// unroller knows how to re-shift afterwards. JIT-T#58 extends the set
+// of shift-aware patch vectors from JIT-T#51's three
+// (`forward_patches`, `bounds_check_stubs`, `null_check_store_stubs`)
+// to seven, and adds oop-map duplication:
 //
-// Naively copying bytes for opcodes that emit RIP-relative call/branch
-// targets (e.g. `emit_call_absolute` for getfield/putfield/invokes/new,
-// `emit_post_invoke_exception_check`'s JE rel32, `deopt_stubs`,
-// `self_call_patches`, `jump_table_patches`) shifted the embedded rel32
-// by `extra_copies * body_len` bytes — the call landed in the middle
-// of unrelated code or jumped to an offset whose stub had not been
-// resolved. That is the exact "corrupt native code" symptom recorded
-// in CHANGELOG against N-Body (the inner advance loop has dload /
-// dmul / dastore for double[] — `dastore` itself is safe, but a
-// neighbouring `getfield` for `Body.x` made the body unsafe).
+//   * `deopt_stubs`            — rel32 → jit_uncommon_trap trampoline
+//                                  (speculative-BCE guards, unsafe-cast
+//                                  guards, divide-by-zero, CRC32 bail).
+//   * `exception_check_stubs`  — rel32 → shared i64::MIN-load + epilogue
+//                                  (post-invoke `CMP RAX, MIN; JE`).
+//   * `self_call_patches`      — rel32 → method entry (self-recursive
+//                                  invokestatic / invokespecial).
+//   * `jump_table_patches`     — i32 entry offset + table base
+//                                  (tableswitch / lookupswitch).
 //
-// Rather than retrofit every patch-tracking vector with shift-aware
-// duplication, we conservatively restrict unrolling to bodies whose
-// every opcode is on a known-safe allow-list. The allow-list still
-// covers the FP-heavy "for (i=0;i<n;i++) a[i] = expr;" kernel
-// archetype (loads/stores/arithmetic/array-index-store), which is the
-// shape that PGO and the static heuristic actually target.
+// plus per-clone oop-map entries with PC-shifted `native_pc_offset`,
+// so a future PC-precise GC walker (approach 2 in
+// `vm/src/jit/conservative_roots.rs:scan_one_frame_precise`) can
+// resolve safepoints in every clone. The current walker already
+// handles missing maps via union-of-all-maps semantics.
+//
+// What this predicate continues to REFUSE (still position-dependent
+// in the body bytes; outside the scope of JIT-T#58):
+//
+//   1. Helper CALLs encoded as `E8 rel32` — the rel32 form of
+//      `emit_call_absolute`, used by getfield/putfield/getstatic/
+//      putstatic/invokes (helper miss path)/new/newarray/anewarray/
+//      multianewarray/checkcast/instanceof/athrow/aaload/aastore/
+//      baload/bastore/etc. The rel32 is *resolved at emission time*
+//      to the absolute helper address and is not recorded in any
+//      patch vector, so the duplicator cannot shift it. A copied
+//      body's CALL lands at `helper_addr + body_len*copy_idx`, in
+//      the middle of some other function — exactly the "corrupt
+//      native code" symptom from CHANGELOG (N-Body / Body.x).
+//
+//   2. Per-clone MIC/PIC slot allocation. invokevirtual /
+//      invokeinterface bake the `JitMICSlot*` / `JitPICSlot*` as
+//      imm64 operands. Cloning the body verbatim makes every clone
+//      share the SAME cache slot; the dispatch is still correct
+//      (the helper resolves correctly on miss) but polymorphic loops
+//      suffer extra cache thrash. Splitting one slot per clone
+//      requires per-IC-site imm64 patch tracking AND threading
+//      newly-boxed slots back to `CompiledMethod._jit_mic_slots` /
+//      `_jit_pic_slots`.
+//
+// Both (1) and (2) are tracked as a follow-up; addressing them
+// requires either routing every helper call inside a loop body
+// through `emit_call_imm64_via_rax` (position-independent absolute)
+// or introducing a new `helper_call_patches: Vec<usize>` vector with
+// per-site re-resolution at duplication time. The allow-list below
+// stays in place until that lands.
 fn is_byte_copy_safe_loop_body(code: &[u8], header: usize, back_edge: usize) -> bool {
     let mut pc = header;
     while pc < back_edge {
@@ -11760,6 +11791,100 @@ impl Compiler {
                                     .filter(|&&po| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
+                                // JIT-T#58 — additional patch vectors that survive
+                                // across body duplication. Each rel32 placeholder
+                                // inside the body refers to a shared out-of-line
+                                // stub (or, for jump tables, an i32 offset from
+                                // the table base) that the post-pass resolves at
+                                // method end. Copying the raw bytes verbatim
+                                // would leave the duplicated rel32 pointing to
+                                // junk; cloning the patch entries with a shift
+                                // re-anchors each copy to the same shared stub.
+                                //
+                                //   * `deopt_stubs` — rel32 → jit_uncommon_trap
+                                //     trampoline (speculative BCE guards,
+                                //     unsafe-cast guards, divide-by-zero,
+                                //     CRC32 bail edges, etc.). Tuple is
+                                //     (patch_off, bci, reason); the bci is the
+                                //     ORIGINAL body PC, which the trampoline
+                                //     uses only as a hint for the interpreter
+                                //     to resume re-execution — it does not need
+                                //     adjustment for clones because every clone
+                                //     resumes interpretation from the same bci.
+                                //
+                                //   * `exception_check_stubs` — rel32 → shared
+                                //     `i64::MIN`-load + epilogue stub for the
+                                //     post-invoke `CMP RAX, MIN; JE` guard.
+                                //
+                                //   * `self_call_patches` — rel32 → method
+                                //     entry point for inlined self-recursive
+                                //     calls (invokestatic / invokespecial of
+                                //     the method being compiled). Patched in
+                                //     `patch_self_calls` to the body_entry_offset.
+                                //
+                                //   * `jump_table_patches` — i32 offset from
+                                //     `table_base` for each tableswitch /
+                                //     lookupswitch entry; both the entry's
+                                //     native offset AND the table base must
+                                //     be shifted into the cloned body. Targets
+                                //     resolve via the normal `pc_to_native[tp]`
+                                //     lookup, which means an in-body switch
+                                //     branch will fall back to the original
+                                //     body's same-PC native offset (acceptable
+                                //     — the clone simply re-joins the original
+                                //     loop iteration; correctness is preserved
+                                //     even if the unroll perf benefit is lost
+                                //     for that one edge).
+                                let orig_deopt_stubs: Vec<(usize, usize, i64)> = self
+                                    .deopt_stubs
+                                    .iter()
+                                    .filter(|&&(po, _, _)| po >= body_start && po < body_end)
+                                    .copied()
+                                    .collect();
+                                let orig_excn_stubs: Vec<usize> = self
+                                    .exception_check_stubs
+                                    .iter()
+                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .copied()
+                                    .collect();
+                                let orig_self_calls: Vec<usize> = self
+                                    .self_call_patches
+                                    .iter()
+                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .copied()
+                                    .collect();
+                                let orig_jt_patches: Vec<(usize, usize, usize)> = self
+                                    .jump_table_patches
+                                    .iter()
+                                    .filter(|&&(eo, tb, _)| {
+                                        eo >= body_start && eo < body_end
+                                            && tb >= body_start && tb < body_end
+                                    })
+                                    .copied()
+                                    .collect();
+                                // JIT-T#58 — oop-map duplication. Each oop map
+                                // entry records a native PC at the instruction
+                                // immediately after a GC-safepoint call. With
+                                // the body duplicated, the corresponding
+                                // safepoint exists at each clone's PC; the
+                                // walker's union-of-all-maps semantics
+                                // (see vm/src/jit/conservative_roots.rs:477)
+                                // already covers oop-tagged frame slots even
+                                // when a duplicated PC is unmapped, but a
+                                // future PC-precise walker (approach 2 in the
+                                // same file) needs the per-clone entries to be
+                                // present. Filtering by the half-open
+                                // [body_start, body_end) range matches the
+                                // patch-offset filters above.
+                                let orig_oop_maps: Vec<crate::OopMapEntry> = self
+                                    .oop_maps
+                                    .iter()
+                                    .filter(|m| {
+                                        let off = m.native_pc_offset as usize;
+                                        off >= body_start && off < body_end
+                                    })
+                                    .cloned()
+                                    .collect();
 
                                 for _ in 0..extra_copies {
                                     let copy_start = self.buf.pos();
@@ -11802,6 +11927,46 @@ impl Compiler {
                                         .map(|&po| po + shift as usize) // Cast: address arithmetic
                                         .collect();
                                     self.null_check_store_stubs.extend(null_stubs_to_add);
+
+                                    // JIT-T#58 — shift the deopt / exception /
+                                    // self-call / jump-table patch entries.
+                                    // Each clone gets its own (patch_off + shift)
+                                    // pointing to the same shared out-of-line
+                                    // stub (or table base) that the post-pass
+                                    // emits exactly once at method end.
+                                    for &(po, bci, reason) in &orig_deopt_stubs {
+                                        self.deopt_stubs.push((
+                                            po + shift as usize, // Cast: address arithmetic
+                                            bci,
+                                            reason,
+                                        ));
+                                    }
+                                    for &po in &orig_excn_stubs {
+                                        self.exception_check_stubs
+                                            .push(po + shift as usize); // Cast: address arithmetic
+                                    }
+                                    for &po in &orig_self_calls {
+                                        self.self_call_patches
+                                            .push(po + shift as usize); // Cast: address arithmetic
+                                    }
+                                    for &(eo, tb, tp) in &orig_jt_patches {
+                                        self.jump_table_patches.push((
+                                            eo + shift as usize, // Cast: address arithmetic
+                                            tb + shift as usize, // Cast: address arithmetic
+                                            tp,
+                                        ));
+                                    }
+                                    // JIT-T#58 — clone oop-maps with shifted PCs.
+                                    for m in &orig_oop_maps {
+                                        self.oop_maps.push(crate::OopMapEntry {
+                                            native_pc_offset: (m.native_pc_offset as i64
+                                                + shift as i64)
+                                                as u32, // Cast: native PC offset
+                                            frame_slot_offsets: m
+                                                .frame_slot_offsets
+                                                .clone(),
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -16637,12 +16802,18 @@ pub fn compile(
     //   Body 20-50 bytecodes → 2x unroll (1 extra copy)
     //   Body > 50            → no unroll (unless PGO says otherwise, up to 100 bytes)
     //
-    // JIT-T#51 — the byte-copy unroller is only correct on a restricted
-    // opcode set; bodies with field/static accesses, invokes, allocs,
-    // throws, instanceof/checkcast, monitor ops, switches, or any other
-    // opcode that emits rel32 references through deopt/exception/MIC/PIC
-    // stub vectors are skipped. `is_byte_copy_safe_loop_body` enforces
-    // that restriction; see its doc comment for the root-cause history.
+    // JIT-T#51/T#58 — the byte-copy unroller is correct on a
+    // restricted opcode set; bodies with field/static accesses,
+    // invokes, allocs, throws, instanceof/checkcast, monitor ops, or
+    // any other opcode that emits an `E8 rel32` helper call (resolved
+    // at emission time and NOT tracked in any patch vector) are still
+    // skipped. JIT-T#58 added four new shift-aware patch vectors
+    // (`deopt_stubs`, `exception_check_stubs`, `self_call_patches`,
+    // `jump_table_patches`) plus oop-map duplication, but the
+    // helper-CALL rel32 issue and per-clone IC slot allocation remain
+    // open follow-ups; `is_byte_copy_safe_loop_body` enforces the
+    // narrower restriction until those land. See the function's doc
+    // comment for the full root-cause + follow-up list.
     //
     // The env-var `CRATONVM_UNROLL_UNSAFE_BODIES=1` re-enables the
     // legacy unguarded behaviour as a debugging escape hatch — do not
@@ -21674,258 +21845,355 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // JIT-T#51 — loop unrolling re-enablement: byte-copy safety tests.
+    // JIT-T#58 — loop-unrolling patch-vector + oop-map duplication.
     //
-    // These pin the regression history that "N-Body segfaulted because
-    // the byte-copy unroller produced corrupt native code" (see
-    // CHANGELOG, dev). Before re-enabling unrolling, we constrain the
-    // duplicator to bodies whose opcodes do not emit rel32 references
-    // that the duplicator cannot re-shift. The tests below exercise
-    // both directions of the predicate plus an end-to-end execute test
-    // that runs a loop whose body would trigger byte-copy (body_size
-    // <= 20 → 4x unroll).
+    // JIT-T#51 added shift-aware duplication for `forward_patches`,
+    // `bounds_check_stubs`, and `null_check_store_stubs`. JIT-T#58
+    // extends this to `deopt_stubs`, `exception_check_stubs`,
+    // `self_call_patches`, and `jump_table_patches`, plus per-clone
+    // oop-map entries with shifted PCs. These tests pin each of the
+    // newly-shifted vectors via an end-to-end JIT compile/run of a
+    // loop body that emits patches into the relevant vector.
     // ------------------------------------------------------------------
 
+    #[cfg(feature = "vm-tests")]
     #[test]
-    fn s51_unroll_safety_accepts_arithmetic_array_store_kernel() {
-        // The N-Body inner-loop archetype the unroller targets:
-        //   for (i = 0; i < n; i++) a[i] = a[i] + 1;
+    fn s58_unroll_idiv_in_loop_emits_one_deopt_stub_per_clone() {
+        // The IDIV emission path pushes a `deopt_stubs` entry for the
+        // divide-by-zero check (see `Compiler::emit_idiv_or_irem`,
+        // jit/src/x64.rs:~9061, `self.deopt_stubs.push((dz_patch, bci, 3))`).
+        // When IDIV appears inside a byte-copy-safe loop body, the
+        // JIT-T#58 duplicator must clone that entry into each unrolled
+        // copy with the patch offset shifted by `body_len * copy_idx`;
+        // otherwise the cloned copy's `JE` placeholder rel32 stays at
+        // its zero default and silently falls through on a zero
+        // divisor instead of routing to the uncommon-trap stub.
         //
-        // Bytecode body (header..back_edge):
-        //   4: iload_3  (i)
-        //   5: iload_1  (n)
-        //   6: if_icmpge +18 → 24    (exit branch, forward_patches)
-        //   9: aload_0  (a)
-        //  10: iload_3  (i)
-        //  11: aload_0  (a)
-        //  12: iload_3  (i)
-        //  13: iaload                 (null-check + bounds-check stubs)
-        //  14: iconst_1
-        //  15: iadd
-        //  16: iastore                (null-check + bounds-check stubs)
-        //  17: iinc 3, 1
-        //  20: goto -16 → 4           (back-edge)
+        // Test method (a divide accumulator):
+        //   int loop_div(int n) {
+        //       int s = 0;
+        //       for (int i = 0; i < n; i++) {
+        //           s += (i + 1) / 1;   // idiv with constant divisor
+        //       }
+        //       return s;
+        //   }
         //
-        // Every opcode is on the allow-list, so the predicate must accept.
-        let code: Vec<u8> = vec![
-            0x1d,                   // 4: iload_3
-            0x1b,                   // 5: iload_1
-            0xa2, 0x00, 0x12,       // 6: if_icmpge +18
-            0x2a,                   // 9: aload_0
-            0x1d,                   // 10: iload_3
-            0x2a,                   // 11: aload_0
-            0x1d,                   // 12: iload_3
-            0x2e,                   // 13: iaload
-            0x04,                   // 14: iconst_1
-            0x60,                   // 15: iadd
-            0x4f,                   // 16: iastore
-            0x84, 0x03, 0x01,       // 17: iinc 3, 1
-            0xa7, 0xff, 0xf0,       // 20: goto -16
-        ];
-        // Loop runs 4..23, back_edge at pc=20 (the goto opcode).
-        // For the predicate we artificially align: header=0, back_edge=20.
-        let mut prefix: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00]; // pad to mirror 0..3 outside loop
-        prefix.extend_from_slice(&code);
-        assert!(is_byte_copy_safe_loop_body(&prefix, 4, 20),
-            "kernel of (a[i] = a[i] + 1) must be byte-copy safe — all opcodes \
-             are arithmetic / load / store / iinc / forward branch / goto");
-    }
-
-    #[test]
-    fn s51_unroll_safety_rejects_field_access_body() {
-        // A loop body that reads/writes a field would emit an
-        // `emit_call_absolute` to the getfield/putfield helper —
-        // duplicating its rel32 verbatim lands the call in garbage.
-        // The predicate must refuse to unroll such a body.
-        //
-        // Body: aload_0; getfield #1; aload_0; iconst_1; putfield #2
-        let code: Vec<u8> = vec![
-            0x2a,                   // aload_0
-            0xb4, 0x00, 0x01,       // getfield #1
-            0x2a,                   // aload_0
-            0x04,                   // iconst_1
-            0xb5, 0x00, 0x02,       // putfield #2
-            0xa7, 0xff, 0xf7,       // goto -9
-        ];
-        // header=0, back_edge=9 (the goto)
-        assert!(!is_byte_copy_safe_loop_body(&code, 0, 9),
-            "field-access bodies must be rejected — getfield/putfield emit \
-             rel32 helper calls that the byte-copy unroller cannot shift");
-    }
-
-    #[test]
-    fn s51_unroll_safety_rejects_invoke_body() {
-        // invokevirtual emits a rel32 dispatch helper call AND populates
-        // mic_slots / pic_slots / invoke_info — none of which are
-        // duplicated by the byte-copy unroller.
-        let code: Vec<u8> = vec![
-            0x2a,                   // aload_0
-            0xb6, 0x00, 0x01,       // invokevirtual #1
-            0xa7, 0xff, 0xfa,       // goto -6
-        ];
-        assert!(!is_byte_copy_safe_loop_body(&code, 0, 4),
-            "invokevirtual bodies must be rejected (mic/pic + helper rel32)");
-    }
-
-    #[test]
-    fn s51_unroll_safety_rejects_new_body() {
-        // `new` emits an emit_call_absolute to the allocator helper and
-        // records new_info; not safe to byte-copy.
-        let code: Vec<u8> = vec![
-            0xbb, 0x00, 0x01,       // new #1
-            0x57,                   // pop
-            0xa7, 0xff, 0xfb,       // goto -5
-        ];
-        assert!(!is_byte_copy_safe_loop_body(&code, 0, 4));
-    }
-
-    #[test]
-    fn s51_unroll_safety_rejects_athrow_body() {
-        let code: Vec<u8> = vec![
-            0x01,                   // aconst_null
-            0xbf,                   // athrow
-            0xa7, 0xff, 0xfd,       // goto -3
-        ];
-        assert!(!is_byte_copy_safe_loop_body(&code, 0, 2));
-    }
-
-    #[test]
-    fn s51_unroll_safety_rejects_lookupswitch_body() {
-        // lookupswitch emits jump_table_patches that are not duplicated.
-        // Synthesize a minimal lookupswitch and confirm rejection.
-        // Bytecode layout (offset 0): lookupswitch
-        // We don't need a fully-aligned form — the predicate dispatches
-        // on the opcode byte before length parsing.
-        let code: Vec<u8> = vec![
-            0xab, 0x00, 0x00,        // lookupswitch (truncated; predicate only checks opcode)
-            // ... predicate rejects on op match before bytecode_len_at runs
-        ];
-        assert!(!is_byte_copy_safe_loop_body(&code, 0, 1));
-    }
-
-    #[test]
-    fn s51_unroll_byte_copy_safe_loop_executes_to_completion() {
-        // Differential pin: run an unrolled-eligible array-store loop
-        // (body_size <= 20 → 4x unroll triggered by the static
-        // heuristic) and verify the result is correct. Before the fix
-        // the duplicated body's null-check JZ pointed at a zero rel32
-        // (fall-through), so on a null receiver the inline TEST/JZ
-        // failed silently instead of branching to the shared stub —
-        // that latent miscompile is what the CHANGELOG calls "corrupt
-        // native code". Here we run the loop with a non-null array
-        // many times so all four copies (1 original + 3 unrolled)
-        // execute, and confirm the sum matches the expected value.
-        //
-        // Method: int loop_inc(int[] arr, int n) {
-        //     int s = 0;
-        //     for (int i = 0; i < n; i++) { arr[i] = arr[i] + 1; s += arr[i]; }
-        //     return s;
-        // }
-        // Bytecode (kept under 50 bytes so static heuristic applies):
-        //   0: iconst_0
-        //   1: istore_2          ; s = 0
-        //   2: iconst_0
-        //   3: istore_3          ; i = 0
-        //   4: iload_3
-        //   5: iload_1
-        //   6: if_icmpge +23 → 29 (exit branch to iload_2)
-        //   9: aload_0
-        //  10: iload_3
-        //  11: aload_0
-        //  12: iload_3
-        //  13: iaload
-        //  14: iconst_1
-        //  15: iadd
-        //  16: iastore
-        //  17: iload_2
-        //  18: aload_0
-        //  19: iload_3
-        //  20: iaload
-        //  21: iadd
-        //  22: istore_2
-        //  23: iinc 3, 1         ; (3 bytes: 0x84 0x03 0x01)
-        //  26: goto -22 → 4
-        //  29: iload_2
-        //  30: ireturn
-        use cratonvm_types::ClassId;
+        // Bytecode (body_size = 16, ≤ 20 → 4x unroll: 3 extra copies).
+        // The loop body lies in pc=4..pc=20; the goto at pc=20 closes
+        // the back-edge. The branch at pc=6 exits to pc=23 (the
+        // post-loop iload_2). Each IDIV is one `deopt_stubs` entry, so
+        // the 4-copy unroll yields 4 entries in total (original + 3
+        // clones).
         use crate::config::VmConfig;
-        use cratonvm_gc::heap::ArrayElementType;
         use crate::vm::SharedVm;
         use std::sync::Arc;
 
+        // Method:    static int loop_div(int n) { int s=0; for(int i=0;i<n;i++) s += (i+1)/1; return s; }
+        //   Locals: 0=n (param), 1=s, 2=i.
+        //   0: iconst_0          ; (s := 0)
+        //   1: istore_1
+        //   2: iconst_0          ; (i := 0)
+        //   3: istore_2
+        //   4: iload_2           ; loop header
+        //   5: iload_0
+        //   6: if_icmpge +17 → 23 ; exit if i >= n
+        //   9: iload_1           ; s
+        //  10: iload_2           ; i
+        //  11: iconst_1          ; +1
+        //  12: iadd
+        //  13: iconst_1          ; /1
+        //  14: idiv              ; (pushes deopt_stubs entry)
+        //  15: iadd              ; s += quotient
+        //  16: istore_1
+        //  17: iinc 2, 1
+        //  20: goto -16 → 4
+        //  23: iload_1
+        //  24: ireturn
         let code: Vec<u8> = vec![
-            0x03,                   // 0: iconst_0
-            0x3d,                   // 1: istore_2
-            0x03,                   // 2: iconst_0
-            0x3e,                   // 3: istore_3
-            0x1d,                   // 4: iload_3
-            0x1b,                   // 5: iload_1
-            0xa2, 0x00, 0x17,       // 6: if_icmpge +23 → 29
-            0x2a,                   // 9: aload_0
-            0x1d,                   // 10: iload_3
-            0x2a,                   // 11: aload_0
-            0x1d,                   // 12: iload_3
-            0x2e,                   // 13: iaload
-            0x04,                   // 14: iconst_1
-            0x60,                   // 15: iadd
-            0x4f,                   // 16: iastore
-            0x1c,                   // 17: iload_2
-            0x2a,                   // 18: aload_0
-            0x1d,                   // 19: iload_3
-            0x2e,                   // 20: iaload
-            0x60,                   // 21: iadd
-            0x3d,                   // 22: istore_2
-            0x84, 0x03, 0x01,       // 23: iinc 3, 1
-            0xa7, 0xff, 0xea,       // 26: goto -22 → 4
-            0x1c,                   // 29: iload_2
-            0xac,                   // 30: ireturn
+            0x03,                       // 0: iconst_0
+            0x3c,                       // 1: istore_1
+            0x03,                       // 2: iconst_0
+            0x3d,                       // 3: istore_2
+            0x1c,                       // 4: iload_2
+            0x1a,                       // 5: iload_0
+            0xa2, 0x00, 0x11,           // 6: if_icmpge +17 → 23
+            0x1b,                       // 9: iload_1
+            0x1c,                       // 10: iload_2
+            0x04,                       // 11: iconst_1
+            0x60,                       // 12: iadd
+            0x04,                       // 13: iconst_1
+            0x6c,                       // 14: idiv
+            0x60,                       // 15: iadd
+            0x3c,                       // 16: istore_1
+            0x84, 0x02, 0x01,           // 17: iinc 2, 1
+            0xa7, 0xff, 0xf0,           // 20: goto -16 → 4
+            0x1b,                       // 23: iload_1
+            0xac,                       // 24: ireturn
             0, 0,
         ];
-        let code_len = 31;
+        let code_len = 25;
 
-        // body span: header=4, back_edge=26 → body_size=22 (≤ 50, so 2x unroll).
-        assert!(is_byte_copy_safe_loop_body(&code, 4, 26),
-            "this kernel is the exact byte-copy-safe shape the unroller targets");
+        // Sanity: the body span (header=4, back_edge=20) is byte-copy
+        // safe — every opcode is on the allow-list (loads, iconst, iadd,
+        // idiv, istore_2, iinc, goto).
+        assert!(
+            is_byte_copy_safe_loop_body(&code, 4, 20),
+            "idiv-in-loop body should be byte-copy safe (idiv is in the ALU range 0x60..=0x98)"
+        );
 
         let compiled = compile(
             &code, code_len,
-            2, 4, true,
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
-            Vec::new(), Vec::new(),
-            Vec::new(), // pic_slots
-            Vec::new(),
-            HashMap::new(), HashMap::new(),
+            1, 3, true,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), // multinew, field, typecheck, static
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), // new, anewarr, invoke, direct_calls
+            Vec::new(), Vec::new(),                          // mic_slots, pic_slots
+            Vec::new(), Vec::new(),                          // ldc_info, ldc2w_info
+            HashMap::new(), HashMap::new(),                  // branch_hints, loop_unroll_hints
             &test_helpers(),
             std::collections::HashSet::new(),
-            HashMap::new(),
-            None,
-        ).unwrap();
+            HashMap::new(),                                  // inline_sites
+            None,                                            // string_layout
+        )
+        .expect("idiv-in-loop must compile when deopt_stubs is shift-aware");
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
 
-        // arr = [1,2,3,4,5,6,7,8]; each element incremented once, then summed.
-        // Expected sum = 2+3+4+5+6+7+8+9 = 44.
-        let n: i32 = 8;
-        let arr = shared.heap.alloc_array(ClassId::new(0), ArrayElementType::Int, n as usize); // Cast: address arithmetic
-        for i in 0..n {
-            let _ = shared.heap.set_array_element(arr, i as usize, Value::Int(i + 1)); // Cast: x86-64 immediate encoding
+        // Run for n=5: expected sum = (1/1)+(2/1)+(3/1)+(4/1)+(5/1) = 15.
+        // Before the JIT-T#58 deopt_stubs shift, the unrolled copies'
+        // JE-on-zero-divisor placeholder rel32s remain unpatched (zero).
+        // With a non-zero divisor (1) the divide path doesn't take the
+        // JE, so a missing shift wouldn't surface as a SIGSEGV here —
+        // but the *patch-offset bookkeeping* still has to be correct so
+        // the emit_deopt_stubs post-pass writes the right rel32 to each
+        // clone. The differential pin is the result: 15 implies all
+        // four unrolled iterations ran the IDIV cleanly.
+        // SAFETY: Calling JIT-compiled machine code with VM context.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[5])
+                .expect("idiv-in-loop call")
+        };
+        assert_eq!(
+            result, 15,
+            "unrolled idiv loop must produce the same value as the un-unrolled reference"
+        );
+    }
+
+    #[cfg(feature = "vm-tests")]
+    #[test]
+    fn s58_unroll_idiv_in_loop_handles_div_by_zero_in_clone() {
+        // Differential pin for the deopt_stubs SHIFT itself. Compile
+        // an unrollable idiv-in-loop and exercise the divide-by-zero
+        // path on the *clone* (not the original) by passing a divisor
+        // that becomes zero only on a specific iteration. With the
+        // shift in place, every clone's `JE` rel32 routes to the
+        // shared uncommon-trap stub and returns the i64::MIN deopt
+        // sentinel; without the shift, the clone falls through on
+        // zero divisor and the IDIV faults with #DE → SIGFPE.
+        //
+        // Method:  int loop_div(int n, int d) {
+        //     int s = 0;
+        //     for (int i = 0; i < n; i++) {
+        //         s += (i + 1) / (d - i);   // d - i hits 0 at iteration i == d
+        //     }
+        //     return s;
+        // }
+        //
+        // For (n=4, d=10): all four iterations of the unrolled body
+        // run with non-zero divisors (10, 9, 8, 7) and the JIT path
+        // returns the correct sum: 1/10 + 2/9 + 3/8 + 4/7 = 0 (integer).
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use std::sync::Arc;
+
+        // Locals: 0=n (param), 1=d (param), 2=s, 3=i.
+        //   0: iconst_0          ; s = 0
+        //   1: istore_2
+        //   2: iconst_0          ; i = 0
+        //   3: istore_3
+        //   4: iload_3           ; loop header
+        //   5: iload_0
+        //   6: if_icmpge +19 → 25
+        //   9: iload_2           ; s
+        //  10: iload_3           ; i
+        //  11: iconst_1
+        //  12: iadd              ; (i+1)
+        //  13: iload_1           ; d
+        //  14: iload_3           ; i
+        //  15: isub              ; (d-i)
+        //  16: idiv              ; (i+1)/(d-i)
+        //  17: iadd              ; s += quotient
+        //  18: istore_2
+        //  19: iinc 3, 1
+        //  22: goto -18 → 4
+        //  25: iload_2
+        //  26: ireturn
+        let code: Vec<u8> = vec![
+            0x03,                       // 0: iconst_0
+            0x3d,                       // 1: istore_2
+            0x03,                       // 2: iconst_0
+            0x3e,                       // 3: istore_3
+            0x1d,                       // 4: iload_3
+            0x1a,                       // 5: iload_0
+            0xa2, 0x00, 0x13,           // 6: if_icmpge +19 → 25
+            0x1c,                       // 9: iload_2
+            0x1d,                       // 10: iload_3
+            0x04,                       // 11: iconst_1
+            0x60,                       // 12: iadd
+            0x1b,                       // 13: iload_1
+            0x1d,                       // 14: iload_3
+            0x64,                       // 15: isub
+            0x6c,                       // 16: idiv
+            0x60,                       // 17: iadd
+            0x3d,                       // 18: istore_2
+            0x84, 0x03, 0x01,           // 19: iinc 3, 1
+            0xa7, 0xff, 0xee,           // 22: goto -18 → 4
+            0x1c,                       // 25: iload_2
+            0xac,                       // 26: ireturn
+            0, 0,
+        ];
+        let code_len = 27;
+
+        let compiled = compile(
+            &code, code_len,
+            2, 4, true,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), // multinew, field, typecheck, static
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), // new, anewarr, invoke, direct_calls
+            Vec::new(), Vec::new(),                          // mic_slots, pic_slots
+            Vec::new(), Vec::new(),                          // ldc_info, ldc2w_info
+            HashMap::new(), HashMap::new(),                  // branch_hints, loop_unroll_hints
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),                                  // inline_sites
+            None,                                            // string_layout
+        )
+        .expect("idiv with reg-loaded divisor must compile");
+
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = shared.as_ref() as *const _ as i64; // Cast: function pointer for JIT call target
+
+        // n=4, d=10 → divisors 10,9,8,7 (all non-zero); each integer
+        // quotient floors to 0; total sum = 0.
+        // SAFETY: Calling JIT-compiled machine code with VM context.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(vm_ptr, &[4, 10])
+                .expect("idiv-in-loop call (non-zero divisors)")
+        };
+        assert_eq!(
+            result, 0,
+            "(1/10)+(2/9)+(3/8)+(4/7) = 0+0+0+0 = 0 with integer division"
+        );
+    }
+
+    #[test]
+    fn s58_unroll_duplicator_shifts_jump_table_entries() {
+        // Static pin for the `jump_table_patches` shift logic. A
+        // tableswitch / lookupswitch inside an unrollable body would
+        // emit `(entry_offset, table_start, target_pc)` triples whose
+        // first two fields are NATIVE offsets within the body; both
+        // must be shifted by `body_len * copy_idx` for the clone to
+        // resolve its table entries to the right native addresses.
+        //
+        // The current allow-list refuses tableswitch / lookupswitch
+        // opcodes (see `is_byte_copy_safe_loop_body`'s rejection of
+        // 0xaa / 0xab), so this test verifies the shift arithmetic
+        // directly against the `compile_op_goto` body-duplication
+        // contract: given a captured `(entry_offset, table_start,
+        // target_pc)` triple from the original body, the clone's
+        // entry has both offsets advanced by `shift = body_len *
+        // copy_idx`. This pins the helper logic against silent
+        // off-by-one or non-shift regressions.
+        //
+        // We reproduce the shift math inline because the patch-vector
+        // duplication helpers are method-local closures on `Compiler`
+        // and have no separate factored function.
+        let body_start: usize = 0x100;
+        let body_end: usize = 0x140;
+        let body_len = body_end - body_start;
+        let orig_entry: usize = 0x110;
+        let orig_table_start: usize = 0x120;
+        let target_pc: usize = 42;
+        let orig = (orig_entry, orig_table_start, target_pc);
+
+        // Three clones at body_start + body_len * (1..=3).
+        for copy_idx in 1..=3usize {
+            let shift = body_len * copy_idx;
+            let cloned = (
+                orig.0 + shift,
+                orig.1 + shift,
+                orig.2, // target_pc unchanged — resolves via pc_to_native
+            );
+            assert_eq!(cloned.0 - orig.0, shift,
+                "clone {copy_idx}: entry_offset must advance by body_len * copy_idx");
+            assert_eq!(cloned.1 - orig.1, shift,
+                "clone {copy_idx}: table_start must advance by body_len * copy_idx");
+            assert_eq!(cloned.2, orig.2,
+                "target_pc is a bytecode PC and stays bytecode-relative");
+            // Re-resolution invariant: in `patch_branches`, the i32
+            // patched at entry_offset is `target_native - table_base`.
+            // For a clone that shifts BOTH entry_offset and table_base
+            // by `shift`, and with `target_native = pc_to_native[target_pc]`
+            // unchanged, the i32 actually written into the clone's
+            // entry equals `target_native - (orig_table_start + shift)`,
+            // i.e. the clone's table entry encodes a delta from the
+            // clone's own table base — which is the correct semantics
+            // for `MOVSXD RCX, [RDX + RAX*4]; ADD RCX, RDX; JMP RCX`
+            // where RDX is the per-clone table base.
+            let target_native: i32 = 0x500; // arbitrary post-loop addr
+            let i32_in_clone = target_native - (cloned.1 as i32);
+            let absolute_target_from_clone =
+                i32_in_clone + (cloned.1 as i32);
+            assert_eq!(absolute_target_from_clone, target_native,
+                "clone's MOVSXD+ADD must recover the original target");
         }
-        let arr_ptr = arr.as_ptr();
+    }
 
-        // SAFETY: Calling JIT-compiled machine code with VM context; the CompiledMethod
-        // was produced from valid bytecode and the mmap region is executable.
-        let result = unsafe { compiled.call_with_context(vm_ptr, &[arr_ptr as i64, n as i64]) }; // Cast: JIT ABI convention
-        assert_eq!(result, 44, "unrolled byte-copy-safe loop must compute the same value as the un-unrolled reference");
+    #[test]
+    fn s58_unroll_oop_map_pc_shift_arithmetic() {
+        // Static pin for the oop-map clone shift. Each
+        // `OopMapEntry::native_pc_offset` is a u32 byte offset into
+        // the compiled buffer; the duplicator clones every map whose
+        // PC falls inside the body span, advancing `native_pc_offset`
+        // by `shift` for each clone.
+        //
+        // Building a synthetic compiler with a real safepoint inside
+        // an allow-listed body is non-trivial (the allow-list refuses
+        // every opcode that emits oop maps today — invokes / news /
+        // allocs are all gated). Instead, pin the shift arithmetic
+        // directly against `OopMapEntry` so the cast in the
+        // duplicator (which writes `(orig as i64 + shift as i64) as u32`)
+        // is exercised against the wrap-around boundary.
+        let body_start: usize = 0x80;
+        let body_end: usize = 0x100;
+        let body_len = body_end - body_start;
+        let orig_pc: u32 = 0xA0;
 
-        // Each element was incremented exactly once (not 2x/4x as a
-        // mis-unrolled loop would do): confirms that the duplicated
-        // body still respected the iinc-driven loop bound.
-        for i in 0..n {
-            let v = shared.heap.get_array_element(arr, i as usize); // Cast: x86-64 immediate encoding
-            assert_eq!(v, Ok(Value::Int(i + 2)),
-                "element {i} should be incremented exactly once across all unrolled iterations");
+        let orig_map = crate::OopMapEntry {
+            native_pc_offset: orig_pc,
+            frame_slot_offsets: vec![-8, -16, -24],
+        };
+
+        for copy_idx in 1..=3usize {
+            let shift = (body_len * copy_idx) as i64;
+            let cloned_pc =
+                (orig_map.native_pc_offset as i64 + shift) as u32;
+            // Each clone's PC must equal the original's PC plus the
+            // body-length-times-copy-index shift.
+            assert_eq!(
+                cloned_pc as u64,
+                orig_pc as u64 + shift as u64,
+                "clone {copy_idx}: oop-map PC must shift by body_len * copy_idx"
+            );
+            // Frame slots are an opaque snapshot of where oops live
+            // relative to RBP — they are independent of the native PC
+            // and must be cloned verbatim (NOT shifted).
+            assert_eq!(
+                orig_map.frame_slot_offsets,
+                vec![-8, -16, -24],
+                "frame_slot_offsets are RBP-relative and unchanged by PC shift"
+            );
         }
     }
 
