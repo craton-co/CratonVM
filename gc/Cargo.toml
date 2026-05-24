@@ -18,6 +18,17 @@ rustc-hash.workspace = true
 
 [dev-dependencies]
 cratonvm-jit = { path = "../jit" }
+# Property-based tests for GC reachability (see tests/proptest_graph.rs).
+# Catches card-table race conditions and write-barrier completeness
+# regressions more reliably than hand-rolled stress tests.
+proptest = "1"
+
+# loom is a permutation-testing tool for concurrent code. We use it under
+# the `cfg(loom)` flag — guarded so production builds do not pay the cost
+# of swapping std atomics for loom's instrumented atomics. Run with:
+#   RUSTFLAGS="--cfg loom" cargo test --test loom_satb
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
 
 [features]
 default = []
