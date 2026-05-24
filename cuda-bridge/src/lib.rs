@@ -100,6 +100,28 @@ pub struct DeviceContext(backend::DeviceContextInner);
 //
 // In stub mode `DeviceContextInner` is a unit struct and is trivially
 // `Send + Sync`; these impls are harmless there.
+//
+// # Safety
+//
+// AUDIT 2026-05-24 (C32, SOUND-1): these impls are sound ONLY when the
+// caller honours an unspoken contract: any thread that drives a
+// `DeviceContext` (or anything reachable through it — `DeviceBuffer`,
+// `Stream`, `Event`) MUST first call `bind_to_thread` on the
+// underlying `Arc<CudaDevice>` if it is not the thread that
+// constructed the context. The bridge does *not* enforce this at the
+// public-API entry points; the CUDA driver's behaviour on an
+// unbound thread is undefined (most calls return
+// `CUDA_ERROR_INVALID_CONTEXT`, but the failure mode is not
+// memory-safe in the general case).
+//
+// In practice the bridge's only known cross-thread caller is the
+// VM's `OffloadCache`, which today only constructs and drives a
+// `DeviceContext` from one worker thread per context. Stub-mode is
+// trivially safe (the inner is a unit struct). Future cross-thread
+// users — or any new public API that lets callers store a
+// `DeviceContext` in a `Send + Sync` static — must add a
+// `bind_to_thread` call at the entry of every public method, or
+// document the requirement loudly so callers can do it themselves.
 unsafe impl Send for DeviceContext {}
 unsafe impl Sync for DeviceContext {}
 
@@ -422,6 +444,20 @@ impl<T> DeviceElem for T where T: bytemuck::Pod + Send + Sync + 'static {}
 //
 // In stub mode `DeviceBufferInner<T>` is just a `PhantomData<T>`, so the
 // conditional impls reduce to the auto-trait behaviour anyway.
+//
+// # Safety
+//
+// AUDIT 2026-05-24 (C32, SOUND-1 / SOUND-5): same caller contract as
+// `DeviceContext` above — any thread that calls a method on a
+// `DeviceBuffer` that ultimately reaches the CUDA driver
+// (`to_host`, `to_host_async`, dropping the buffer, or handing it
+// to `KernelArgs::push_device_ptr` for a launch on that thread) MUST
+// first call `bind_to_thread` on the device the buffer was
+// allocated on. `DeviceBuffer` retains an `Arc<CudaDevice>` for
+// exactly this reason, but the bridge does not currently call
+// `bind_to_thread` automatically. Cross-thread use without binding
+// is UB by the CUDA driver model and is the caller's responsibility
+// until the bridge grows a runtime guard at public entry points.
 unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
@@ -456,9 +492,17 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// recorded as a [`StreamOp::UploadAsync`] on `stream` so stub-mode
     /// callers can inspect the op log; in `cuda` mode `record_op` is a
     /// no-op (the driver owns the queue).
+    ///
+    /// AUDIT 2026-05-24 (C32 stream-port fix): the cuda-mode body now
+    /// goes through `DeviceBufferInner::from_host_async_unchecked`,
+    /// which submits the H→D copy on the context's `copy_h2d` stream
+    /// and returns WITHOUT host-synchronising. The borrowed `host`
+    /// slice MUST outlive the next `stream.synchronize()` (or an
+    /// equivalent event-based barrier) on the caller's side.
     pub fn from_host_async(ctx: &DeviceContext, host: &[T], stream: &Stream) -> Result<Self> {
         let _ = Self::ASSERT_DEVICE_REPR;
-        let buf = backend::DeviceBufferInner::from_host(&ctx.0, host).map(Self)?;
+        let buf =
+            backend::DeviceBufferInner::from_host_async_unchecked(&ctx.0, host).map(Self)?;
         stream.record_op(StreamOp::UploadAsync {
             bytes: std::mem::size_of_val(host),
         });
@@ -476,9 +520,20 @@ impl<T: DeviceElem> DeviceBuffer<T> {
     /// Mirrors [`DeviceBuffer::to_host`] but submits the D→H copy
     /// against an explicit [`Stream`] (Phase 2), recorded as a
     /// [`StreamOp::DownloadAsync`] on `stream`.
+    ///
+    /// AUDIT 2026-05-24 (C32 stream-port fix): this used to call the
+    /// fully-synchronous `self.0.to_host(dst)`, which did
+    /// `cuCtxSynchronize` + a default-stream D→H copy — defeating the
+    /// `_async` suffix entirely. The new path submits
+    /// `cuMemcpyDtoHAsync` onto `stream`'s raw `CUstream` after a
+    /// `cuStreamWaitEvent` on the context's `e_k` (so the copy is
+    /// ordered after the most recent compute-stream launch), and
+    /// returns without host-blocking. The caller MUST
+    /// `stream.synchronize()` (or wait on a subsequent event recorded
+    /// on `stream`) before reading `dst`.
     pub fn to_host_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
         let bytes = std::mem::size_of_val(dst);
-        self.0.to_host(dst)?;
+        self.0.to_host_async_raw(dst, stream.raw())?;
         stream.record_op(StreamOp::DownloadAsync { bytes });
         Ok(())
     }

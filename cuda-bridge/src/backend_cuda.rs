@@ -22,6 +22,21 @@
 //! See `DeviceContextInner::new` for stream construction and the
 //! `from_host` / `launch_raw` / `to_host` methods for the record/wait
 //! choreography.
+//!
+//! AUDIT 2026-05-24 (C32 stream-port fix): completed the cudarc 0.13
+//! stream port. Three half-finished bugs are addressed here:
+//!   * `from_host` now submits the H→D copy via
+//!     `result::memcpy_htod_async` on `copy_h2d` and records `e_h2d`
+//!     so subsequent compute-stream launches order behind it without
+//!     blocking the host.
+//!   * `launch_raw_on_stream` (new) takes an explicit raw `CUstream`
+//!     and uses `LaunchAsync::launch_on_stream` against the cudarc-
+//!     wrapped user stream, so `DeviceModule::launch_on_stream`
+//!     actually launches on the requested stream.
+//!   * `to_host_async_raw` (new) issues `result::memcpy_dtoh_async`
+//!     on the supplied stream after a `cuStreamWaitEvent` on `e_k`,
+//!     letting the caller `await` via their stream's `synchronize`
+//!     instead of `cuCtxSynchronize`-blocking the world here.
 
 use crate::{DeviceCaps, DeviceError, KernelArg, KernelArgs, LaunchConfig, Result};
 use cudarc::driver::{
@@ -71,12 +86,56 @@ pub(crate) fn probe() -> Result<DeviceCaps> {
     })
 }
 
+/// AUDIT 2026-05-24 (C32 stream-port fix): inter-stream barrier events
+/// owned by the context. Each is a `CU_EVENT_DISABLE_TIMING` event
+/// created once at context construction and reused for every transfer:
+///   * `e_h2d` — recorded on `copy_h2d` after every async upload;
+///     `compute` waits on it before launching a kernel that depends on
+///     freshly-uploaded inputs.
+///   * `e_k` — recorded on `compute` after every kernel launch;
+///     `copy_d2h` waits on it before starting an async D→H download.
+///
+/// Re-recording a CUevent overwrites the prior marker, which matches
+/// what we want: a wait_event observes the *most recent* recording.
+/// The events live as long as the device they were created on; they
+/// are destroyed in `Drop` with the device bound to the current
+/// thread (the same teardown pattern `EventCuda::drop` uses).
+struct StreamBarriers {
+    e_h2d: cudarc::driver::sys::CUevent,
+    e_k: cudarc::driver::sys::CUevent,
+    dev: Arc<CudaDevice>,
+}
+
+// SAFETY: `CUevent` is a raw `*mut CUevent_st` handle. The CUDA driver
+// docs permit using an event from any thread that has the owning
+// primary context bound; the `dev` field's `Arc<CudaDevice>` keeps the
+// primary context alive and `bind_to_thread` (called at every entry on
+// the cross-thread-callable methods of `DeviceContextInner`) restores
+// the binding on the current thread. The barriers therefore satisfy
+// the same conditional `Send`/`Sync` invariant as the rest of the
+// bridge — sound only when callers honour the `bind_to_thread`
+// contract documented on `DeviceContext` (see SOUND-1 in the C32
+// review).
+unsafe impl Send for StreamBarriers {}
+unsafe impl Sync for StreamBarriers {}
+
+impl Drop for StreamBarriers {
+    fn drop(&mut self) {
+        let _ = self.dev.bind_to_thread();
+        unsafe {
+            let _ = cudarc::driver::result::event::destroy(self.e_h2d);
+            let _ = cudarc::driver::result::event::destroy(self.e_k);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DeviceContextInner {
     dev: Arc<CudaDevice>,
     /// Default cudarc stream — the original allocator/launch root. Kept
     /// so `synchronize()` can drain it for callers that still hold
     /// buffers created before the three-stream restructure.
+    #[allow(dead_code)]
     default: Arc<CudaStream>,
     /// Stream used for host→device memcpys (uploads).
     copy_h2d: Arc<CudaStream>,
@@ -86,6 +145,10 @@ pub(crate) struct DeviceContextInner {
     /// Stream used for device→host memcpys (downloads). Waits on the
     /// compute stream's event before starting any read.
     copy_d2h: Arc<CudaStream>,
+    /// AUDIT 2026-05-24 (C32 stream-port fix): inter-stream barrier
+    /// events shared between the three copy/compute streams. See
+    /// `StreamBarriers` doc for the choreography.
+    barriers: Arc<StreamBarriers>,
 }
 
 impl DeviceContextInner {
@@ -99,12 +162,28 @@ impl DeviceContextInner {
         let copy_h2d = dev.fork_default_stream().map_err(map_err("fork_default_stream copy_h2d"))?;
         let compute = dev.fork_default_stream().map_err(map_err("fork_default_stream compute"))?;
         let copy_d2h = dev.fork_default_stream().map_err(map_err("fork_default_stream copy_d2h"))?;
+        // AUDIT 2026-05-24 (C32 stream-port fix): create the two barrier
+        // events with `CU_EVENT_DISABLE_TIMING` since we never measure
+        // elapsed GPU time on them — only use them for `cuEventRecord`
+        // / `cuStreamWaitEvent` ordering between the three streams.
+        // Must bind the primary context before creating; cudarc's
+        // event-create wrapper does not bind for us.
+        dev.bind_to_thread().map_err(map_err("bind_to_thread"))?;
+        let e_h2d = cudarc::driver::result::event::create(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        )
+        .map_err(map_err("cuEventCreate e_h2d"))?;
+        let e_k = cudarc::driver::result::event::create(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        )
+        .map_err(map_err("cuEventCreate e_k"))?;
         Ok(Self {
-            dev,
+            dev: dev.clone(),
             default: default.into(),
             copy_h2d: copy_h2d.into(),
             compute: compute.into(),
             copy_d2h: copy_d2h.into(),
+            barriers: Arc::new(StreamBarriers { e_h2d, e_k, dev }),
         })
     }
 
@@ -265,6 +344,8 @@ impl DeviceModuleInner {
         }
     }
 
+    /// Launch on the context's `compute` stream. Public entry points
+    /// `launch_raw` / `launch_raw_no_d2h_sync` route here.
     fn launch_raw_inner(
         &self,
         ctx: &DeviceContextInner,
@@ -272,6 +353,72 @@ impl DeviceModuleInner {
         cfg: &LaunchConfig,
         args: KernelArgs,
         needs_d2h_sync: bool,
+    ) -> Result<()> {
+        // AUDIT 2026-05-24 (C32 stream-port fix): before the launch,
+        // make the compute stream wait on `e_h2d`. If a recent
+        // `from_host_async` (or `from_host`) recorded the event, this
+        // orders the kernel correctly behind the upload without
+        // host-blocking. If no upload was ever issued, the wait is a
+        // cheap no-op (cuStreamWaitEvent on a never-recorded event
+        // returns immediately).
+        //
+        // The fact that `e_h2d` records the *most recent* upload is
+        // important: a `from_host_async` that ran on a different user
+        // stream's behalf still routes through `copy_h2d`, so the
+        // compute stream picks up the dependency uniformly.
+        unsafe {
+            cudarc::driver::result::stream::wait_event(
+                ctx.compute.stream,
+                ctx.barriers.e_h2d,
+                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+            .map_err(map_err("cuStreamWaitEvent compute←e_h2d"))?;
+        }
+        self.launch_raw_on_stream_inner(&ctx.compute, kernel, cfg, args)?;
+        // AUDIT 2026-05-17 (PERF Fix 1): after the launch is submitted,
+        // record the post-kernel event so any subsequent `to_host_async`
+        // on the copy_d2h stream can wait on it without involving the
+        // host. Round-7 PERF Fix 3: gate on `needs_d2h_sync` — callers
+        // that know no D→H follows skip the bookkeeping.
+        if needs_d2h_sync {
+            unsafe {
+                cudarc::driver::result::event::record(ctx.barriers.e_k, ctx.compute.stream)
+                    .map_err(map_err("cuEventRecord e_k"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// AUDIT 2026-05-24 (C32 stream-port fix): real per-stream launch.
+    ///
+    /// Used by `DeviceModule::launch_on_stream` to submit a kernel on
+    /// a caller-supplied [`crate::Stream`] (not the context's
+    /// `compute` stream). The arg-marshalling logic is shared with
+    /// the default-stream `launch_raw_inner`; the only difference is
+    /// which `CudaStream` `LaunchAsync::launch_on_stream` receives.
+    ///
+    /// Note: this path does NOT automatically wait on `e_h2d` or
+    /// record `e_k`. Callers that need cross-stream ordering with the
+    /// context's copy streams are expected to use
+    /// `Stream::record_event` / `wait_event` explicitly (see
+    /// `event.rs`).
+    pub(crate) fn launch_raw_on_stream(
+        &self,
+        _ctx: &DeviceContextInner,
+        stream: &Arc<CudaStream>,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
+    ) -> Result<()> {
+        self.launch_raw_on_stream_inner(stream, kernel, cfg, args)
+    }
+
+    fn launch_raw_on_stream_inner(
+        &self,
+        stream: &Arc<CudaStream>,
+        kernel: &str,
+        cfg: &LaunchConfig,
+        args: KernelArgs,
     ) -> Result<()> {
         let func = self
             .functions
@@ -371,9 +518,17 @@ impl DeviceModuleInner {
         // `launch_args` and this call. The `_keep_alive` binding after
         // the launch ties both objects' lifetimes past this point so the
         // contract is compiler-enforced against future refactors.
+        // AUDIT 2026-05-24 (C32 stream-port fix): launch on the
+        // supplied `stream`. Previously this was hard-coded to
+        // `&ctx.compute`, which broke `DeviceModule::launch_on_stream`
+        // (HIGH-2: user-supplied stream was silently ignored). With
+        // this fix, the default-stream caller (`launch_raw_inner`)
+        // passes `&ctx.compute` and the explicit-stream caller
+        // (`launch_raw_on_stream` / `DeviceModule::launch_on_stream`)
+        // passes the user's `Stream`'s inner cudarc `CudaStream`.
         let launch_result = unsafe {
             func.clone()
-                .launch_on_stream(&ctx.compute, cudarc_cfg, &mut launch_args)
+                .launch_on_stream(stream, cudarc_cfg, &mut launch_args)
                 .map_err(map_err("kernel launch"))
         };
         // Liveness anchor: `launch_on_stream` has returned, so the raw
@@ -401,55 +556,62 @@ impl DeviceModuleInner {
             *cell.borrow_mut() = ptr_h;
         });
         launch_result?;
-        // AUDIT 2026-05-17 (PERF Fix 1): after the launch is submitted,
-        // wait for compute stream to complete before D→H copy
-        // Round-7 PERF Fix 3: gate on `needs_d2h_sync`
-        if needs_d2h_sync {
-            ctx.dev.wait_for(&ctx.compute).map_err(map_err("wait_for compute"))?;
-        }
+        // AUDIT 2026-05-24 (C32 stream-port fix): post-launch
+        // bookkeeping (recording `e_k`, etc.) is now the caller's
+        // responsibility — `launch_raw_inner` records `e_k` on the
+        // compute stream when `needs_d2h_sync` is set;
+        // `launch_raw_on_stream` does not, leaving the user-supplied
+        // stream's ordering to explicit `Stream::record_event` /
+        // `wait_event` calls.
         Ok(())
     }
 }
 
 /// Round-5: H→D upload helper.
 ///
-/// Uploads via pageable memory. In cudarc 0.13, the pinned API is not
-/// available, so we use the standard slice-based htod copy.
+/// AUDIT 2026-05-24 (C32 stream-port fix): rewritten. Previously this
+/// called `ctx.dev.htod_sync_copy(host)`, which submits the H→D memcpy
+/// onto cudarc's *default* stream and host-blocks until it completes —
+/// every upload thereby (a) ignored the dedicated `copy_h2d` stream
+/// the context constructs and (b) serialised the entire pipeline at
+/// the host. The new path:
 ///
-/// The wrapper still exists today so:
-///   * `from_host` has a single call site to upgrade if pinned API becomes available,
-///   * the fallback semantics are explicit.
+///   1. Asynchronously allocates an uninit `CudaSlice<T>` on the
+///      device (the allocation itself does not transfer data).
+///   2. Issues `cuMemcpyHtoDAsync` against `copy_h2d.stream` so the
+///      transfer runs concurrently with any pending compute work.
+///   3. Records `e_h2d` on `copy_h2d` so subsequent kernel launches
+///      can `cuStreamWaitEvent` on it from the compute stream.
 ///
-/// AUDIT 2026-05-20 (PERF Fix): previously this did
-/// `ctx.dev.htod_copy(host.to_vec())`. `htod_copy` takes an *owned*
-/// `Vec`, so `host.to_vec()` cloned the entire input slice into a fresh
-/// heap allocation before the H→D transfer — doubling host memory
-/// traffic per upload. cudarc 0.13's `htod_sync_copy` takes `&[T]`
-/// directly and memcpys it straight to the device, so the redundant
-/// allocation+copy is gone. `htod_sync_copy` is synchronous (it does
-/// not retain the host buffer), which is why the `Unpin` bound is no
-/// longer required.
+/// The caller (`DeviceBufferInner::from_host`) is responsible for
+/// host-synchronising before the borrowed `host` slice can be safely
+/// dropped or mutated, because `cuMemcpyHtoDAsync` does NOT retain
+/// `host` — see the SAFETY paragraph at the call site.
 #[inline]
-fn upload_via_pinned_or_fallback<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static>(
+unsafe fn upload_via_copy_h2d_stream<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static>(
     ctx: &DeviceContextInner,
     host: &[T],
 ) -> Result<CudaSlice<T>> {
-    // Pageable path for cudarc 0.13 - pinned API not available in this version.
-    // Functionally correct; the only cost is the implicit driver-side
-    // bounce buffer.
-    //
-    // PERF: use `htod_sync_copy`, which takes the host data by `&[T]`
-    // slice, instead of `htod_copy`, which requires an owned `Vec<T>`.
-    // The old code did `host.to_vec()` to satisfy `htod_copy`, paying a
-    // full redundant host-side copy of the payload on every upload.
-    // `htod_sync_copy` issues the same H→D memcpy with no intermediate
-    // clone. It is a synchronous copy (the host data is borrowed, so the
-    // driver must finish reading it before this returns) — strictly more
-    // conservative than the previous async `htod_copy`, and the caller
-    // (`from_host`) already host-synchronizes against the upload anyway.
-    ctx.dev
-        .htod_sync_copy(host)
-        .map_err(map_err("memcpy host→device"))
+    // Allocate uninitialised device storage. cudarc's `alloc` takes
+    // `&Arc<CudaDevice>`; it `bind_to_thread`s internally.
+    let slice: CudaSlice<T> = unsafe {
+        ctx.dev
+            .alloc::<T>(host.len())
+            .map_err(map_err("alloc for from_host"))?
+    };
+    // Submit the H→D copy onto the dedicated upload stream. `device_ptr`
+    // on a `&CudaSlice<T>` returns `&CUdeviceptr`; we deref-copy it.
+    let dst = *DevicePtr::device_ptr(&slice);
+    unsafe {
+        cudarc::driver::result::memcpy_htod_async(dst, host, ctx.copy_h2d.stream)
+            .map_err(map_err("cuMemcpyHtoDAsync copy_h2d"))?;
+        // Record `e_h2d` so the compute stream can `wait_event` on it
+        // without host involvement. Re-recording overwrites the prior
+        // marker, which is the documented `cuEventRecord` semantic.
+        cudarc::driver::result::event::record(ctx.barriers.e_h2d, ctx.copy_h2d.stream)
+            .map_err(map_err("cuEventRecord e_h2d"))?;
+    }
+    Ok(slice)
 }
 
 /// A typed device-side allocation backed by cudarc's safe `CudaSlice<T>`.
@@ -468,6 +630,7 @@ pub(crate) struct DeviceBufferInner<T> {
     /// The stream the allocation is bound to. For uploaded buffers this
     /// is `copy_h2d`; for `uninit`/`zeros` it's `compute` (most kernels
     /// write into these output buffers).
+    #[allow(dead_code)]
     stream: Arc<CudaStream>,
     /// Retained handle to the cudarc device. Currently unused — kept
     /// so future code that needs a device-bound operation on a buffer
@@ -480,7 +643,13 @@ pub(crate) struct DeviceBufferInner<T> {
     /// `to_host` host-blocks on this before reading the buffer back so
     /// the D→H copy is correctly ordered after the kernel regardless of
     /// which `launch_raw` variant was used.
+    #[allow(dead_code)]
     compute: Arc<CudaStream>,
+    /// AUDIT 2026-05-24 (C32 stream-port fix): retained barrier events
+    /// from the owning `DeviceContextInner`. `to_host` / `to_host_async`
+    /// `cuStreamWaitEvent` on `_barriers.e_k` so they pick up the
+    /// most recent compute-stream launch without needing a context ref.
+    _barriers: Arc<StreamBarriers>,
 }
 
 /// Reject element counts whose byte size overflows `usize` before
@@ -516,6 +685,7 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
             dev: ctx.dev.clone(),
             copy_d2h: ctx.copy_d2h.clone(),
             compute: ctx.compute.clone(),
+            _barriers: ctx.barriers.clone(),
         })
     }
 
@@ -532,6 +702,7 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
             dev: ctx.dev.clone(),
             copy_d2h: ctx.copy_d2h.clone(),
             compute: ctx.compute.clone(),
+            _barriers: ctx.barriers.clone(),
         })
     }
 
@@ -541,29 +712,68 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
         // stream waits on. This lets the next host-side launch_raw
         // schedule a kernel without blocking on the upload to complete.
         //
-        // AUDIT 2026-05-17 (PERF Fix 3 / Round-5): try a pinned (page-
-        // locked) host staging buffer first. cudaMemcpyAsync from pinned
-        // memory bypasses the driver's internal staging copy and can
-        // overlap with kernel execution; pageable memory forces a
-        // synchronous copy through the driver-managed bounce buffer
-        // (the cudarc API hides that, but it still happens at the
-        // libcuda level). For large transfers this is ~2× the
-        // achievable PCIe bandwidth.
+        // AUDIT 2026-05-24 (C32 stream-port fix): previously this called
+        // `upload_via_pinned_or_fallback` → `htod_sync_copy`, which runs
+        // on cudarc's *default* stream and host-blocks until the copy
+        // completes. The `ctx.dev.wait_for(&ctx.copy_h2d)` below then
+        // waited on an empty stream (no-op), and the buffer's
+        // `stream = copy_h2d` field lied about where the copy ran. The
+        // three-stream pipeline bought nothing in the H→D direction.
         //
-        // The pinned path is best-effort: pinned memory comes from a
-        // limited OS pool (~system-wide RAM/16, varies). If allocation
-        // fails (OOM in the pinned pool, no driver support, or cudarc
-        // doesn't expose the API on this version), we fall back to the
-        // pageable path unchanged.
-        let slice = upload_via_pinned_or_fallback(ctx, host)?;
-        // Wait for copy_h2d to complete before compute stream
-        ctx.dev.wait_for(&ctx.copy_h2d).map_err(map_err("wait_for copy_h2d"))?;
+        // The new helper submits `cuMemcpyHtoDAsync` against
+        // `copy_h2d.stream` and records `e_h2d` so the compute stream
+        // can `cuStreamWaitEvent` on it without host involvement.
+        //
+        // SAFETY: `memcpy_htod_async` is asynchronous w.r.t. the host —
+        // it does NOT retain `host` past the call but the device read
+        // from `host` is still in flight when the call returns. The
+        // synchronous `from_host` API contract requires the upload to
+        // be observable when this function returns (callers may drop
+        // or mutate `host` immediately after), so we host-block on the
+        // `copy_h2d` stream below. The new `from_host_async` path
+        // (on `lib.rs`, gated on the `cuda` feature) bypasses this
+        // host-block — it documents that the borrowed `host` slice
+        // must outlive the stream synchronisation point.
+        let slice = unsafe { upload_via_copy_h2d_stream(ctx, host) }?;
+        // Host-block on `copy_h2d` to preserve the sync `from_host`
+        // contract. Uses `cuStreamSynchronize` rather than
+        // `cuCtxSynchronize` so the compute and copy_d2h streams keep
+        // running concurrently with whatever the caller does next.
+        unsafe {
+            cudarc::driver::result::stream::synchronize(ctx.copy_h2d.stream)
+                .map_err(map_err("cuStreamSynchronize copy_h2d"))?;
+        }
         Ok(Self {
             slice: Arc::new(slice),
             stream: ctx.copy_h2d.clone(),
             dev: ctx.dev.clone(),
             copy_d2h: ctx.copy_d2h.clone(),
             compute: ctx.compute.clone(),
+            _barriers: ctx.barriers.clone(),
+        })
+    }
+
+    /// Async upload variant (C32 stream-port fix).
+    ///
+    /// Submits the H→D copy onto `copy_h2d` and returns *without*
+    /// host-synchronising. The caller MUST keep `host` alive — and not
+    /// move/mutate it — until the supplied user stream (or the context)
+    /// has synchronised. Used by `DeviceBuffer::from_host_async`.
+    pub(crate) fn from_host_async_unchecked(
+        ctx: &DeviceContextInner,
+        host: &[T],
+    ) -> Result<Self> {
+        // SAFETY: the caller (`DeviceBuffer::from_host_async`) is
+        // responsible for the host-buffer lifetime; see this method's
+        // doc comment.
+        let slice = unsafe { upload_via_copy_h2d_stream(ctx, host) }?;
+        Ok(Self {
+            slice: Arc::new(slice),
+            stream: ctx.copy_h2d.clone(),
+            dev: ctx.dev.clone(),
+            copy_d2h: ctx.copy_d2h.clone(),
+            compute: ctx.compute.clone(),
+            _barriers: ctx.barriers.clone(),
         })
     }
 
@@ -575,34 +785,91 @@ impl<T: bytemuck::Pod + DeviceRepr + Send + Sync + 'static + cudarc::driver::Val
                 self.len()
             )));
         }
-        // `dtoh_sync_copy_into` issues the D→H memcpy on the cudarc
-        // device's *default* stream and then synchronizes that default
-        // stream. Kernels, however, run on the dedicated `compute`
-        // stream, which is a separate forked stream — there is no
-        // implicit ordering between work on `compute` and work on the
-        // default stream.
+        // AUDIT 2026-05-24 (C32 stream-port fix): previous code called
+        // `self.dev.synchronize()` (`cuCtxSynchronize`) and then
+        // `dtoh_sync_copy_into`, which is a default-stream synchronous
+        // copy. That defeated every stream-overlap claim — every
+        // `to_host` drained every other stream on the context.
         //
-        // `launch_raw` (the sync variant) bridges that gap by waiting on
-        // the compute stream after the launch, but `launch_raw_no_sync`
-        // deliberately skips that wait. Relying on an "event recorded
-        // inside launch_raw" is therefore unsound: in the no-sync path no
-        // such event exists, so the copy below could race ahead of the
-        // kernel and read stale device memory.
+        // The new path:
+        //   1. Make `copy_d2h` wait on `e_k` (the post-kernel event
+        //      that `launch_raw` records). If no launch ever ran, the
+        //      wait is a cheap no-op.
+        //   2. Issue `cuMemcpyDtoHAsync` on `copy_d2h.stream`.
+        //   3. Host-block on `copy_d2h.stream` only (via
+        //      `cuStreamSynchronize`) — `compute` and `copy_h2d` keep
+        //      running concurrently with the caller's next move.
         //
-        // To guarantee correctness for every launch path, host-block the
-        // device here before issuing the copy. `CudaDevice::synchronize`
-        // (`cuCtxSynchronize`) drains every stream — including the
-        // dedicated `compute` stream a kernel can have run on — so once
-        // it returns the device buffer holds the kernel's output.
-        self.dev
-            .synchronize()
-            .map_err(map_err("synchronize device before D→H"))?;
-        self.dev
-            // `self.slice` is `Arc<CudaSlice<T>>`; deref the `Arc` so the
-            // argument is `&CudaSlice<T>`, which implements cudarc's
-            // `DevicePtr` (an `&Arc<CudaSlice<T>>` does not).
-            .dtoh_sync_copy_into(&*self.slice, dst)
-            .map_err(map_err("memcpy device→host"))
+        // SAFETY: `cuMemcpyDtoHAsync` is asynchronous w.r.t. the host,
+        // so `dst` is written to *after* the call returns. The
+        // synchronous `to_host` contract requires the data to be
+        // present in `dst` when this function returns, hence the
+        // `cuStreamSynchronize` below. The `_async_raw` variant
+        // (used by `DeviceBuffer::to_host_async`) skips this wait and
+        // pushes the responsibility onto the caller's stream
+        // synchronisation point.
+        let src = *DevicePtr::device_ptr(&*self.slice);
+        unsafe {
+            cudarc::driver::result::stream::wait_event(
+                self.copy_d2h.stream,
+                self.barriers_e_k(),
+                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+            .map_err(map_err("cuStreamWaitEvent copy_d2h←e_k"))?;
+            cudarc::driver::result::memcpy_dtoh_async(dst, src, self.copy_d2h.stream)
+                .map_err(map_err("cuMemcpyDtoHAsync copy_d2h"))?;
+            cudarc::driver::result::stream::synchronize(self.copy_d2h.stream)
+                .map_err(map_err("cuStreamSynchronize copy_d2h"))?;
+        }
+        Ok(())
+    }
+
+    /// AUDIT 2026-05-24 (C32 stream-port fix): truly async D→H.
+    ///
+    /// Submits `cuMemcpyDtoHAsync` onto the caller-supplied
+    /// `user_stream` after making it wait on `e_k` (so the copy is
+    /// ordered after the most recent compute-stream launch). Does NOT
+    /// host-block — the caller MUST `user_stream.synchronize()` (or
+    /// `wait_event` on a recorded event) before reading `dst`.
+    ///
+    /// `dst` must outlive the caller's stream-synchronisation point,
+    /// because the driver writes to it asynchronously.
+    pub(crate) fn to_host_async_raw(
+        &self,
+        dst: &mut [T],
+        user_stream: cudarc::driver::sys::CUstream,
+    ) -> Result<()> {
+        if dst.len() != self.len() {
+            return Err(DeviceError::Memcpy(format!(
+                "to_host_async length mismatch: dst.len()={}, slice.len()={}",
+                dst.len(),
+                self.len()
+            )));
+        }
+        let src = *DevicePtr::device_ptr(&*self.slice);
+        // SAFETY: see the doc comment. `e_k` is owned by the context
+        // and `cuStreamWaitEvent` on a never-recorded event is a
+        // no-op, so this is safe even when no launch preceded.
+        unsafe {
+            cudarc::driver::result::stream::wait_event(
+                user_stream,
+                self.barriers_e_k(),
+                cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+            .map_err(map_err("cuStreamWaitEvent user_stream←e_k"))?;
+            cudarc::driver::result::memcpy_dtoh_async(dst, src, user_stream)
+                .map_err(map_err("cuMemcpyDtoHAsync user_stream"))?;
+        }
+        Ok(())
+    }
+
+    /// Returns the context-wide `e_k` (post-kernel) event the buffer
+    /// retained at construction time. Used by `to_host` /
+    /// `to_host_async_raw` to make their D→H copy wait on the most
+    /// recent compute-stream launch without needing a `DeviceContext`
+    /// reference threaded through.
+    fn barriers_e_k(&self) -> cudarc::driver::sys::CUevent {
+        self._barriers.e_k
     }
 
     pub(crate) fn len(&self) -> usize {

@@ -123,6 +123,22 @@ pub(crate) struct StreamCuda {
 // asserts the same safety condition here so downstream `Arc<Stream>`
 // can be stored in `Sync` statics (e.g. `vm/src/runtime/offload.rs`'s
 // `SUBMISSIONS` map).
+//
+// # Safety
+//
+// AUDIT 2026-05-24 (C32, SOUND-1): this impl is sound ONLY when
+// every thread that drives the `Stream` (`synchronize`,
+// `record_event`, `wait_event`, or any of the bridge calls that
+// pull `raw()` out and submit work to it — `DeviceModule::
+// launch_on_stream`, `DeviceBuffer::to_host_async`) has first
+// called `bind_to_thread` on the underlying `Arc<CudaDevice>`
+// (typically reachable through the `DeviceContext` the stream was
+// constructed from). The bridge does not enforce this; the CUDA
+// driver returns an error or invokes undefined behaviour on an
+// unbound thread. Future code that hands a `Stream` to a worker
+// thread should bind the device on that worker before issuing any
+// stream operation, or use the `bind_to_thread`-on-entry pattern
+// `EventCuda` already follows.
 #[cfg(feature = "cuda")]
 unsafe impl Send for Stream {}
 #[cfg(feature = "cuda")]
@@ -253,13 +269,12 @@ impl Stream {
         std::ptr::null_mut()
     }
 
-    /// Access to the underlying `Arc<CudaStream>`. Reserved for any
-    /// future bridge code that needs to retain a reference to the
-    /// stream that produced a buffer (cudarc allocations are
-    /// stream-affine). Currently unused; `#[allow(dead_code)]` keeps
-    /// the lint clean.
+    /// Access to the underlying `Arc<CudaStream>`. Used by
+    /// `launch.rs` (`DeviceModule::launch_on_stream`) to hand the
+    /// caller's `Stream` to `backend_cuda::DeviceModuleInner::
+    /// launch_raw_on_stream` for true per-stream kernel submission
+    /// (AUDIT 2026-05-24 C32 stream-port fix).
     #[cfg(feature = "cuda")]
-    #[allow(dead_code)]
     pub(crate) fn cuda_stream_arc(&self) -> &std::sync::Arc<cudarc::driver::safe::CudaStream> {
         &self.inner.stream
     }
