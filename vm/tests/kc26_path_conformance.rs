@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! KC26 — Path/FileSystem dispatch conformance tests.
 //!
 //! Verifies that all Path, FileSystem, and FileSystems native methods needed

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! RKC16N.12 — `java/lang/management/ManagementFactory.<clinit>` regression.
 //!
 //! Pin the fix that lets `ManagementFactory` initialize without raising

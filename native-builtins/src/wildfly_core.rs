@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.2.a — WildFly Core kernel: Deployment + Threads + Logging subsystems.
 //!
 //! After T19.1 MSC kernel (`jboss_msc.rs`) gets the service orchestrator

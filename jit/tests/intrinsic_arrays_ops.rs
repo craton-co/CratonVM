@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential / behavioural tests for the ARRAYS_OPS JIT intrinsic family
 //! (`java.util.Arrays.fill` and `java.util.Arrays.equals`).
 //!

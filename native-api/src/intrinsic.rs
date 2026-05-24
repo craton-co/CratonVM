@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Interpreter intrinsic identity.
 //!
 //! `InterpIntrinsic` is the enum tag for a hot JDK method that the interpreter

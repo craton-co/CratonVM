@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Virtual-thread probe regression test.
 //!
 //! Pins the runtime behavior of `Thread.ofVirtual().start(...)` end-to-end

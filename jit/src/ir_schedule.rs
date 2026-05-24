@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Linearize the Sea-of-Nodes IR graph into a sequence of basic blocks.
 //!
 //! The scheduler places each data node into a basic block such that:

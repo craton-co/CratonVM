@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Concurrent marking for the garbage collector.
 //!
 //! Implements tri-color marking that runs concurrently with application

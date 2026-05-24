@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 /// Upper bound on the number of entries in a `tableswitch.offsets` or
 /// `lookupswitch.pairs` table. JVMS bounds bytecode at 65,535 bytes, so even
 /// the largest legal switch table can only contain a few thousand entries —

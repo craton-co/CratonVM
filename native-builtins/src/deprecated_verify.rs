@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T8.5 — Verification of all deprecated API round-trips.
 //!
 //! This module contains the `deprecated_apis_round_trip` test suite that

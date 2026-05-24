@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Apache Felix OSGi framework boot-test shim.
 //!
 //! `org.apache.felix.main.Main` SEGVs on CratonVM (rc=139) during the

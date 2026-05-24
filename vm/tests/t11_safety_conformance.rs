@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T11 — Safety & Hardening conformance test suite.
 //!
 //! Verifies that CratonVM satisfies all T11 safety requirements from

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Instruction type effects for bytecode verification.
 //!
 //! Each JVM instruction has a well-defined effect on the operand stack and local

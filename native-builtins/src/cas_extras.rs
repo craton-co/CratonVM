@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Apereo CAS (Central Authentication Service) boot-test shims.
 //!
 //! **HISTORY**: Previously this module short-circuited the CAS Spring

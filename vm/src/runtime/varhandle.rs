@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.6 — runtime-side `VarHandle` support.
 //!
 //! `java.lang.invoke.VarHandle` is the replacement for `sun.misc.Unsafe`

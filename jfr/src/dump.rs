@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JFR binary file writer.
 //!
 //! Implements the JFR v2.0 binary format used by OpenJDK's Flight Recorder.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Apache Spark boot-test shims.
 //!
 //! Spark's `bin/spark-submit` shell wrapper delegates to two main classes

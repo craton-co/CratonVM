@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T13 — `java/lang/Class` JDK 25 natives conformance test suite.
 //!
 //! Verifies that all 28 registered `java/lang/Class` native methods are

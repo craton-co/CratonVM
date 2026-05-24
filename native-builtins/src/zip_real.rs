@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Real-JDK-mode native implementations for `java.util.zip.Inflater` and
 //! `java.util.zip.Deflater`, backed by the `flate2` crate.
 //!

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP5.9 — `sun.net.spi.DefaultProxySelector`.
 //!
 //! Builds a real implementation of the JDK's default `ProxySelector`:

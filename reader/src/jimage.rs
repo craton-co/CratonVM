@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NEW-5 — jimage v1 reader for `$JAVA_HOME/lib/modules`.
 //!
 //! # Format overview

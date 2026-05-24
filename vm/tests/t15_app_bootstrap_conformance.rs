@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T15 — Real-app bootstrap conformance test suite.
 //!
 //! Verifies that all T15.1 native methods are registered and wired to

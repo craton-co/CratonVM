@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Cluster A — AQS / ConcurrentHashMap park-livelock regression.
 //!
 //! Pins the fix for `LockSupport.parkNanos(long)` (and the `(Object,long)`,

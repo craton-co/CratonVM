@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Class loading subsystem — thin re-export shim.
 //!
 //! The implementation lives in the `cratonvm-classloading` crate.

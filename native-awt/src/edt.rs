@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Event Dispatch Thread (EDT) coordinator.
 //!
 //! In Java, all GUI operations run on the EDT. This module provides:

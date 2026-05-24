@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JNI (Java Native Interface) implementation.
 //!
 //! Provides the standard C API for native code to interact with the JVM.

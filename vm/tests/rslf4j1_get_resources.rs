@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! RSLF4J.1 — `ClassLoader.getSystemClassLoader().getResources(...)`
 //! must enumerate matches that live inside JAR classpath entries when
 //! the VM runs in real-JDK mode.

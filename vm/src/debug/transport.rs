@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JDWP TCP transport layer.
 //!
 //! Listens for a single debugger connection, performs the JDWP handshake, and

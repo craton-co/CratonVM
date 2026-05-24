@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Stream-terminal and Flow.Subscriber native overrides.
 //!
 //! T16.9: Streams — the JDK's real `Stream.reduce` / `Stream.collect`

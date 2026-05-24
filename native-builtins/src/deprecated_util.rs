@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T8.2 — Deprecated java.util / java.lang / java.io API native implementations.
 //!
 //! Implements all deprecated API natives called out in T8.2.  Each sub-item

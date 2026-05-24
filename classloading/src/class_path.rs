@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 use cratonvm_types::error::ClassFileError;
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, VecDeque};

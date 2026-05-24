@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Decides whether a Java static method is GPU-eligible.
 //!
 //! The first cut targets a deliberately narrow class of methods:

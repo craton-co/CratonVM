@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.4-B — `ClassManager::redefine_class` JEP 109 conformance.
 //!
 //! These tests pin down the contract of the JVMTI `RedefineClasses` /

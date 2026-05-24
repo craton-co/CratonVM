@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! LETSGO_S2 — broader real-JDK / synthetic-stub compatibility layer.
 //!
 //! This module registers Rust-side native fallbacks for JDK methods that

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.3 — Process-wide JVM bootstrap init-level state.
 //!
 //! Mirrors HotSpot's `VM::_init_level` integer state machine so the

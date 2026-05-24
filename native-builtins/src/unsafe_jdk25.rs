@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T12 JDK 25 `jdk/internal/misc/Unsafe` native methods.
 //!
 //! Implements the remaining Unsafe methods that JDK 25 declares as native but

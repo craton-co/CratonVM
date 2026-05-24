@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Stop-the-world GC barrier for multi-threaded execution.
 //!
 //! When garbage collection is needed, the triggering thread requests a

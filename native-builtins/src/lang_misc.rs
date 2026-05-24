@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Throwable, StackTraceElement, Enum, and Record native method implementations.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};

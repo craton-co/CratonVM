@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JCK failure capture and JSON report generation.
 //!
 //! Provides structured recording of JCK test outcomes. Each failure is captured

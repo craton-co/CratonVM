@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Software rasterizer — draws into ARGB pixel buffers.
 //!
 //! All drawing is done in pure Rust, producing `Vec<u32>` buffers

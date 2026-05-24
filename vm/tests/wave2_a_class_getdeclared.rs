@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2, Task A — `Class.getDeclaredFields/Methods/Constructors` regression.
 //!
 //! Pin the contract that the three "getDeclared*" reflection natives in

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NEW-1.5 — process-wide GC quiescence flag for active JIT frames.
 //!
 //! See [`crate::vm_heap::VmHeap::is_object_address`] and the upper-layer

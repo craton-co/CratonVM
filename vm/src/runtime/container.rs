@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Container/cgroup detection for container-aware JVM behavior.
 //!
 //! Detects cgroup v1 and v2 memory/CPU limits so the JVM can automatically

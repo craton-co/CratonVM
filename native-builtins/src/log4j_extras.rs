@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Log4j 2.x API shims: keep `org.apache.logging.log4j.LogManager` callers
 //! from NPE'ing when the real log4j-core provider chain doesn't bootstrap
 //! under CratonVM.

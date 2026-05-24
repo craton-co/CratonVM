@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! HotSpot-style unified logging framework (`-Xlog`).
 //!
 //! Implements the JEP 158 unified logging syntax:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Apache Hadoop boot-test shims.
 //!
 //! Hadoop's `bin/hadoop version` entry point is

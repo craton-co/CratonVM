@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Class file reader — parses raw bytes into a [`ClassFile`] structure.
 //!
 //! Reference: <https://docs.oracle.com/javase/specs/jvms/se21/html/jvms-4.html>

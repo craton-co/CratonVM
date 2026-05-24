@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 3 — Spring Boot 3.2 fat-jar launcher partial fix.
 //!
 //! Pins the fix that lets a Spring Boot 3.2 executable JAR get past the

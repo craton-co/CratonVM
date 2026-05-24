@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Win32 platform backend -- Windows windowing via the `windows` crate,
 //! GDI for buffer blitting, and DirectWrite for text rasterization.
 

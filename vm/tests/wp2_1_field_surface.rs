@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.1-field — `java.lang.reflect.Field` surface end-to-end probes.
 //!
 //! Roadmap reference: `docs/wildfly-ejbca-roadmap.md` §5 (Wave 2 — WP2.1

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP7.3 — `java.sql.Types` + `Date`/`Time`/`Timestamp` interop conformance.
 //!
 //! The roadmap (`docs/wildfly-ejbca-roadmap.md` §10 WP7.3) demands legacy

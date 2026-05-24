@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential tests for the INT_BITS JIT intrinsic family — the
 //! `java.lang.Integer` bit-manipulation methods (Phase 1a).
 //!

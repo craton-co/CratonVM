@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Escape analysis and scalar replacement for the JIT compiler.
 //!
 //! Determines whether heap-allocated objects escape the current method,

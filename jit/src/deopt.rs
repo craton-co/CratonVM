@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Deoptimization framework for the JIT compiler.
 //!
 //! When speculative optimizations turn out to be invalid at runtime, the JIT

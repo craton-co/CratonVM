@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WildFly-specific entry-point shims that short-circuit pieces of the
 //! JBoss Modules bootstrap which currently livelock CratonVM after the
 //! BigInteger / `Module.BOOT_MODULE_LOADER` post-clinit fixup.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! RA.5 — JBoss Modules `ResourceRootFactory.createResourceLoader` native.
 //!
 //! `ResourceRootFactory.createResourceLoader(File, String, String)` is

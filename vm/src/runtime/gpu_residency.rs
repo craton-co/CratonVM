@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Side-table tracking `GpuArray<T>` host bytes and any pinned
 //! device residency. Phase 3 surfaces this via
 //! `craton.gpu.internal.Native.arrayWrap*`.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! SecurityManager, AccessController, and AccessControlContext native implementations.
 //!
 //! SecurityManager is deprecated for removal (JEP 411, Java 17+) but JDK 25 still

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JDK 25 Language Feature Runtime Support
 //!
 //! Implements runtime backing for three finalized JDK 25 JEPs:

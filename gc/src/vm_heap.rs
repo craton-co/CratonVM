@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Unified heap abstraction for the VM.
 //!
 //! `VmHeap` wraps the available GC implementations (GenerationalHeap, G1Collector)

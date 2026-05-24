@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential tests for the ARRAYS_SORT JIT intrinsic family — the
 //! `java.util.Arrays.sort(prim[])` single-argument overloads (Phase 4b).
 //!

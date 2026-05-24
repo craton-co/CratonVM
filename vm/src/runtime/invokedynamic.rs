@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! invokedynamic support: StringConcatFactory and LambdaMetafactory.
 //!
 //! Handles the two most common bootstrap methods produced by javac:

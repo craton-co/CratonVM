@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Graph-coloring register allocator for JVM bytecode locals.
 //!
 //! Performs backward dataflow liveness analysis on the bytecode CFG,

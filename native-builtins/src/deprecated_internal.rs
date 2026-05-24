@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Deprecated java.beans, java.rmi, sun.misc, and jdk.internal.* native implementations.
 //!
 //! These APIs are deprecated or removed in modern JDKs but legacy code may still call

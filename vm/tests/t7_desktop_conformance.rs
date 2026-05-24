@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T7 — Desktop (AWT/Swing/Java2D) conformance test suite.
 //!
 //! These tests verify that CratonVM's native-awt crate correctly implements

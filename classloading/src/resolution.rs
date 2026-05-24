@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Resolution cache for symbolic references.
 //!
 //! Caches resolved constant pool references (fields, methods, and call sites) to avoid

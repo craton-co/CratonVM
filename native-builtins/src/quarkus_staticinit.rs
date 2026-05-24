@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.3 — Quarkus static-init replay natives.
 //!
 //! Quarkus (Keycloak 26.2.4 is Quarkus-native) splits its boot across two

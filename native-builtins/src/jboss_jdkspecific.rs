@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.H2 — JBoss Modules `JDKSpecific` boot-time natives.
 //!
 //! `org.jboss.modules.JDKSpecific.<clinit>` probes the JDK for module /

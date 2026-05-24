@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.2.c — WildFly Security (JAAS + SecurityDomains + login modules).
 //!
 //! Keycloak 16 is itself an identity provider, but it *also* leans on

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Ahead-of-Time Compilation / Project Leyden (JEPs 483, 514, 515).
 //!
 //! Provides:

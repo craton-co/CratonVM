@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! FxHashMap / FxHashSet wrappers for hot paths in the JVM.
 //!
 //! Provides the Fx hash function (from rustc) as an inline hasher, plus

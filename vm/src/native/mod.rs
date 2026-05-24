@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Native method support.
 //!
 //! Provides a registry for native method implementations and built-in natives

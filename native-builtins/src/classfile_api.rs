@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Java Class-File API (JEP 484, JDK 24) native method registrations.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};

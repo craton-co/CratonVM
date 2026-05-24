@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.3 — `javax.crypto.Cipher` real-JDK class-init shim.
 //!
 //! ## Why this module exists

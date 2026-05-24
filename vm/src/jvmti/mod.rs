@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JVMTI (JVM Tool Interface) foundation.
 //!
 //! Provides the core types for agent loading, event callbacks, and

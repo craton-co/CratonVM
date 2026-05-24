@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! ClassLoader hierarchy, URLClassLoader, MethodHandles.Lookup, ProtectionDomain,
 //! and CodeSource native method implementations.
 

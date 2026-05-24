@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Crash recovery and `hs_err_pid` log generation.
 //!
 //! Installs a Rust panic hook that produces HotSpot-compatible crash log files

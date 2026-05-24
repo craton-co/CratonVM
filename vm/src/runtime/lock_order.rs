@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Lock ordering enforcement framework.
 //!
 //! This module is the **runtime enforcement** of the lock hierarchy spelled out

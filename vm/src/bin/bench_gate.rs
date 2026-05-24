@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NEW-20: benchmark gate.
 //!
 //! Reads the criterion run output in `target/criterion/<bench>/.../estimates.json`,

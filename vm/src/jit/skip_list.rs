@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! JIT compilation skip list — static eligibility predicate.
 //!
 //! This module is the **single source of truth** for the static decision

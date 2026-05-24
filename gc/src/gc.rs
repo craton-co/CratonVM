@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Semi-space copying garbage collector (Cheney algorithm).
 //!
 //! The collector copies all live objects from from-space to to-space,

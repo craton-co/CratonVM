@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NEW-19: JPMS `opens`/`exports` enforcement for reflection (JEP 403).
 //!
 //! This file has two layers of tests:

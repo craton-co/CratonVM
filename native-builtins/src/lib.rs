@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Built-in native method implementations.
 //!
 //! These are the essential native methods needed for the minimum viable

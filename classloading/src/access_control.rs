@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Access control enforcement (JVM spec 5.4.4).
 //!
 //! Checks whether a class, field, or method is accessible from a given context.

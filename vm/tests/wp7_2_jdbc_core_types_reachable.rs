@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP7.2 — `java.sql.*` core types reachable under reflection.
 //!
 //! Roadmap reference: `docs/wildfly-ejbca-roadmap.md` §10 (Wave 7 — JDBC +

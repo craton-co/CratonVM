@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! ClassLoader natives for real-JDK mode.
 //!
 //! The real JDK `ClassLoader.<init>` is extremely complex — it creates

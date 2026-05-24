@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP0.2 — integration tests for `ObjectStreamClass.lookup` / cache.
 //!
 //! Exercises the VM-side `OscCache` directly (pure-Rust assertions on

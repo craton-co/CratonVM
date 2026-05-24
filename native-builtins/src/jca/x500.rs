@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.6 — `javax.security.auth.x500.X500Principal` natives.
 //!
 //! ## Probe surface

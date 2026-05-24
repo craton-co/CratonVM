@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! ZGC (Z Garbage Collector) — low-latency concurrent garbage collector.
 //!
 //! Implements colored pointers, load barriers, ZPages, concurrent GC phases,

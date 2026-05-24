@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! `java/lang/Long` interpreter intrinsics.
 //!
 //! Group file for the interpreter intrinsic-dispatch fast path

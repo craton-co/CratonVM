@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Sea-of-Nodes Intermediate Representation for the JIT compiler.
 //!
 //! The IR sits between bytecode and x86-64 machine code, decoupling

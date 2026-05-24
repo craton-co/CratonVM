@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP3.2 — Real `AsynchronousSocketChannel` /
 //! `AsynchronousServerSocketChannel` natives backed by a worker-thread
 //! completion pump. Spec-compliant on platforms that don't have IOCP /

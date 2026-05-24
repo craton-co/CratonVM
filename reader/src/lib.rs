@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 // TODO: Re-enable missing_docs once the public API stabilises and doc comments
 // are added to all spec-derived types (struct fields, enum variants, etc.).
 #![allow(missing_docs)]

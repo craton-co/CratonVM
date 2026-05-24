@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Heap — semi-space copying GC object and array storage.
 //!
 //! Objects are laid out as contiguous blocks:

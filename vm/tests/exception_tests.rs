@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Advanced exception handling integration tests.
 //!
 //! These tests exercise complex exception scenarios: nested try/catch,

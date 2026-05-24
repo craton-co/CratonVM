@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP2.6 — `java.lang.reflect.Constructor.newInstance` edge cases.
 //!
 //! The native `Constructor.newInstance` lives in

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2 — H2 JDBC connection regression.
 //!
 //! Pins the contract that `DriverManager.getConnection("jdbc:h2:mem:...",

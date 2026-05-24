@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Process-lifetime cache for the `CRATONVM_*` debug/trace environment
 //! variables that are read from interpreter and JIT hot paths.
 //!

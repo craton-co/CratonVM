@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Synthetic native implementations for the Java Collections Framework.
 //!
 //! **DEPRECATED (Session 15)**: These are Rust-backed synthetic stubs used only when

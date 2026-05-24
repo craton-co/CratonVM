@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T14 — System bootstrap native methods for real JDK 25 boot.
 //!
 //! Implements the native methods required by `java.lang.System.initPhase1()`:

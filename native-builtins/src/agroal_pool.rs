@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.8 — Agroal (Quarkus) JDBC connection pool natives.
 //!
 //! Quarkus / Keycloak 26 uses Agroal as its datasource pool implementation.

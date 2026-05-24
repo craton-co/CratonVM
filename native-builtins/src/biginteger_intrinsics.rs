@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.H13 — `java.math.BigInteger` intrinsic-candidate native overrides.
 //!
 //! KC16's WildFly bootstrap exercises the SunJCE provider's static

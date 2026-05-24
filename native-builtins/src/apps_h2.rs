@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Legacy per-method Thread state overrides.
 //!
 //! These used to be registered from `register_essential_natives` to paper

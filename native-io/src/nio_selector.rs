@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP3.1 — real platform-backed `sun.nio.ch.Selector`, `SelectionKey`,
 //! `SelectableChannel` natives.
 //!

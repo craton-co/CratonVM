@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.4 - Quarkus ArC (CDI) container natives.
 //!
 //! Quarkus 3.x ships a build-time CDI container named **ArC**. At runtime,

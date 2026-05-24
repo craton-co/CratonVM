@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Optimization passes on the Sea-of-Nodes IR graph.
 //!
 //! Each pass takes `&mut Graph` and transforms it in place.

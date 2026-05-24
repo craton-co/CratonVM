@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential tests for the LONG_BITS JIT intrinsic family (Phase 1b).
 //!
 //! Each test JIT-compiles a tiny synthetic method whose only body is an

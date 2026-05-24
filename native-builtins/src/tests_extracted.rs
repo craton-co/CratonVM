@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]

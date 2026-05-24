@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP8.10.9 — `String.contains(CharSequence)` (and `startsWith(String,I)`)
 //! native registration regression.
 //!

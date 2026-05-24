@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP8.10 — JBoss Modules boot smoke test.
 //!
 //! This is the *deterministic* unit-test version of

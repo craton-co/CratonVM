@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! X11 platform backend — Linux windowing via `x11rb`, software blitting
 //! via `put_image`, and text rasterization via `fontdue`.
 

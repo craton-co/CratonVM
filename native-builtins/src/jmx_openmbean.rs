@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T19.H14 — JMX OpenType / MXBeanIntrospector translation natives.
 //! T19.M1 — Proactive hardening for all 8 platform MXBeans.
 //!

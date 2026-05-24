@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! C22: ResourceBundle locale-data overrides for real-JDK mode.
 //!
 //! Jackson's `StdDateFormat.<clinit>` calls `SimpleDateFormat`, which in turn

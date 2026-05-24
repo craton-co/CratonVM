@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.5 finish — provider-chain Cipher/Signature resolution end-to-end.
 //!
 //! Builds on top of session 101's `Provider$Service.<init>` shim by

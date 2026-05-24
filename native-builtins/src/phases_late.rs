@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Phase 55-72 + Phase D native method registrations.
 
 use std::sync::atomic::{fence, Ordering};

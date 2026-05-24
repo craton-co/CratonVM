@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP1.8-narrow — close the two synthetic-stub method-table gaps that
 //! prevent `java.util.ServiceLoader.load(Class).iterator()` from running
 //! end-to-end.

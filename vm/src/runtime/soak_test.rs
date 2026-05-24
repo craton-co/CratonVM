@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Soak/stress testing framework for the JVM runtime.
 //!
 //! Detects memory leaks, thread leaks, file descriptor leaks, and performance

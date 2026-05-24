@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! cudarc-backed real CUDA backend.
 //!
 //! Only compiled when the `cuda` Cargo feature is enabled.

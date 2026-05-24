@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Platform-specific windowing backends for AWT.
 //!
 //! Each target OS has its own backend that implements [`backend::PlatformBackend`].

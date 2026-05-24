@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Old generation free-list allocator with mark-compact collection.
 //!
 //! The old generation uses a free-list allocator for allocation and a sliding

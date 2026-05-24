@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! C4 — Boot loader native methods.
 //!
 //! `jdk.internal.loader.BootLoader.<clinit>` in real JDK 25 calls three

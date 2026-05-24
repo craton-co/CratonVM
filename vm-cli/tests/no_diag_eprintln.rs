@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! RJ.1 CI gate: forbid reintroduction of investigative debug-trace
 //! `eprintln!` / `println!` markers across the workspace.
 //!

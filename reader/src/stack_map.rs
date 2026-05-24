@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! StackMapTable parser (JVM spec 4.7.4).
 //!
 //! The StackMapTable attribute is used during bytecode verification (Pass 3, JVM spec 4.10.1)

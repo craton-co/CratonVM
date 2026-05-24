@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T8 — Deprecated API conformance test suite.
 //!
 //! Verifies that CratonVM correctly implements all deprecated JDK 25 APIs

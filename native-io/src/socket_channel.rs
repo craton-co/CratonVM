@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP3.4 — Real `sun/nio/ch/SocketChannelImpl` and
 //! `sun/nio/ch/ServerSocketChannelImpl` natives with non-blocking
 //! (EAGAIN) semantics.

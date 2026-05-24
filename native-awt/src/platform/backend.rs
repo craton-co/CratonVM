@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Platform backend trait and shared types.
 //!
 //! Every platform (Win32, X11, Cocoa) implements [`PlatformBackend`] so

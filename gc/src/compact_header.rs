@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Compact 64-bit object headers per JEP 519 / Project Lilliput.
 //!
 //! Reduces the per-object header from 32 bytes ([`ObjectHeader`]) to 8 bytes,

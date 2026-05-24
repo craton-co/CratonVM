@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Signal handling, shutdown hooks, and helpful NullPointerException messages.
 //!
 //! - **Phase 16.1**: Signal registration, shutdown hook lifecycle, thread dumping.

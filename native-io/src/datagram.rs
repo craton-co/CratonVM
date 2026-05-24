@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP3.7 — `java.nio.channels.DatagramChannel` extensions: real
 //! send/receive of payloads, multicast group membership, broadcast
 //! support.

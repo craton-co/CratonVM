@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.1 + WP6.2 — Java Cryptography Architecture (JCA) provider chain
 //! and `MessageDigest` engine, available in real-JDK mode.
 //!

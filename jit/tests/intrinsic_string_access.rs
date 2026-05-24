@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Differential tests for the STRING_ACCESS JIT intrinsic family — the
 //! `java/lang/String` instance-method call-site intrinsics (Phase 3a):
 //! `length()I`, `isEmpty()Z`, `charAt(I)C`, `hashCode()I`.

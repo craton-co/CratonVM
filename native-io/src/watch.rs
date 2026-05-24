@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP3.8 — `WatchService` file-system notifications via real OS APIs.
 //!
 //! This module registers natives for the JDK's *internal* `sun/nio/fs/*`

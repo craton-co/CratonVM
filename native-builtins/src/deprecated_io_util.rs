@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Deprecated APIs from java.io, java.util, java.text, and related packages.
 //!
 //! This module provides native implementations for deprecated methods that

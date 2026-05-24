@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T5.1.2 — HotSpot C2 ratio comparator.
 //!
 //! Reads two committed baseline files:

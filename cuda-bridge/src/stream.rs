@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Async stream abstraction (Phase 2, Item P2-1).
 //!
 //! A `Stream` is a per-context queue of asynchronous GPU work: uploads,

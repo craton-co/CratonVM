@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 // AUDIT 2026-05-16: std HashMap/HashSet are unused (replaced by FxHashMap/FxHashSet).
 use std::path::Path;
 use std::time::{Duration, Instant};

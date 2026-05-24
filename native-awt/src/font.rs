@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Font specification, metrics, and heuristic text measurement.
 //!
 //! Backs `java.awt.Font` and `java.awt.FontMetrics`. Provides approximate

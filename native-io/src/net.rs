@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T16.5 + T19.5 net support.
 //!
 //! T16.5 (pre-existing): `java.net.MulticastSocket` factory overrides with

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! NEW-18: libffi-backed Panama FFI bridge.
 //!
 //! This module translates CratonVM's `java.lang.foreign.MemoryLayout`

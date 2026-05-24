@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! T16.7 — Concurrent extras: real ForkJoinPool + real SynchronousQueue.
 //!
 //! This module provides hardened implementations of two concurrent utilities

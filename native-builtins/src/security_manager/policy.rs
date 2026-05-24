@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Parser for `java.policy` files.
 //!
 //! Grammar supported (simplified JDK 8+ policy file syntax):

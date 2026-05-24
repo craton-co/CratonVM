@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2, T19.H1 — `String.indexOf(String, int)` regression.
 //!
 //! The cglib `TypeUtils.map` regex path sits in a tight loop calling

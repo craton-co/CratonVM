@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Serviceability Tools — jcmd/jstack/jmap diagnostic infrastructure.
 //!
 //! Provides attach API, diagnostic command processing, thread dump generation,

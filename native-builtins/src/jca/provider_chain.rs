@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP6.1 — `java.security.Security` provider list + `java.security.Provider`
 //! accessors. Available in real-JDK mode (synthetic-jdk wires the same
 //! surface through `phases_early::register_phase53_security`, so when both

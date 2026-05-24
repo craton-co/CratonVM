@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! SATB (Snapshot-At-The-Beginning) write barrier buffers.
 //!
 //! During concurrent marking, application threads may overwrite reference

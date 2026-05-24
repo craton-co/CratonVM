@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! TLS 1.3 Handshake Implementation.
 //!
 //! Provides a real TLS 1.3 handshake state machine, record layer, key schedule,

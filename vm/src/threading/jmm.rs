@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Java Memory Model (JSR-133) compliance for the JVM threading subsystem.
 //!
 //! Implements happens-before tracking, volatile semantics, monitor ordering,

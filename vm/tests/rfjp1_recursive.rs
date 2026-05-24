@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! RFJP.1 — `apps/fjp_probe/FjpProbe` (`pool.invoke(RecursiveTask)` of a
 //! divide-and-conquer Long sum) must print `sum = 499999500000` and `OK`.
 //!

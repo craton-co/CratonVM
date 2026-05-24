@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Memory management: garbage collector, object model, allocation.
 //!
 //! The core GC and heap implementations live in the `cratonvm-gc` crate.

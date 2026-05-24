@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Wave 2, Task C — `apps/methodhandles_probe/MhProbe.java` regression test.
 //!
 //! Pin the JDK 11+ `java.lang.invoke.MethodHandles.Lookup` API end-to-end:

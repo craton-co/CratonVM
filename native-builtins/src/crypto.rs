@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Cryptography native method implementations for JDK 25.
 //!
 //! Covers:

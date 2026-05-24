@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP4.3 — `java.util.concurrent.ForkJoinPool` infrastructure.
 //!
 //! Provides a process-wide work-stealing pool that the native overrides in

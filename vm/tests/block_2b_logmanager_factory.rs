@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Block 2B — `java.util.logging.LogManager.getLogManager()` honours the
 //! `-Djava.util.logging.manager=<className>` system property.
 //!

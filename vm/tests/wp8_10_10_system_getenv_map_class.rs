@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! WP8.10.10 — `System.getenv()` regression: ensure the returned Map carries
 //! a real `java/util/HashMap` class_id so virtual dispatch on
 //! `Map.get(key)` resolves to the registered native instead of bottoming

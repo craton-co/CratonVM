@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! gRPC Java boot-test shims.
 //!
 //! The canonical gRPC Java boot test runs the bundled example server

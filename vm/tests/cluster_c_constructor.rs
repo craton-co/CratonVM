@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Cluster C — `java.lang.reflect.Constructor.newInstance` end-to-end.
 //!
 //! Pins the 11/11 PASS outcome of `apps/constructor_probe/ConstructorProbe`,
