@@ -276,7 +276,24 @@ fn open_and_register(
     this: ObjectRef,
     path_str: &str,
 ) -> MethodCallResult {
-    let file = File::open(path_str).map_err(|e| {
+    // SECURITY (HIGH): mirror the validation done by every other
+    // guest-controlled file entry point in this crate. Under
+    // `set_path_confine_to_cwd(true)` a guest must not be able to open
+    // an arbitrary jar/zip outside the sandbox and read its contents —
+    // and jars are routinely fed to class-loaders, so the read path is
+    // privileged downstream. We surface a validation failure with the
+    // same `Internal`-shaped error that the missing-file path uses
+    // below, matching `JarFile`'s observed behavior for unreadable
+    // archives.
+    let validated_path = match crate::validate_path(path_str) {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("JarFile: path rejected by sandbox: `{path_str}`"),
+            }));
+        }
+    };
+    let file = File::open(&validated_path).map_err(|e| {
         MethodCallFailed::InternalError(VmError::Internal {
             message: format!("JarFile: cannot open `{path_str}`: {e}"),
         })
@@ -287,7 +304,7 @@ fn open_and_register(
         })
     })?;
     let state = JarState {
-        path: PathBuf::from(path_str),
+        path: PathBuf::from(&validated_path),
         archive,
         name_index: None,
     };

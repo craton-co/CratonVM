@@ -46,6 +46,10 @@ pub(crate) struct MockNativeContext {
     next_ptr: usize,
     pub scripts: Vec<InvokeScript>,
     pub calls: UnsafeCell<Vec<InvokeCall>>,
+    /// Optional `ObjectRef` -> Rust-side `String` mapping so `read_string`
+    /// can return a real value. Populated lazily by `attach_string` /
+    /// `create_string` so most tests pay nothing for it.
+    pub strings: UnsafeCell<HashMap<usize, String>>,
 }
 
 impl MockNativeContext {
@@ -56,7 +60,25 @@ impl MockNativeContext {
             next_ptr: 8,
             scripts: Vec::new(),
             calls: UnsafeCell::new(Vec::new()),
+            strings: UnsafeCell::new(HashMap::new()),
         }
+    }
+
+    fn strings_mut(&self) -> &mut HashMap<usize, String> {
+        unsafe { &mut *self.strings.get() }
+    }
+    fn strings_ref(&self) -> &HashMap<usize, String> {
+        unsafe { &*self.strings.get() }
+    }
+
+    /// Allocate a dummy object and associate it with the given string so
+    /// `ctx.read_string(obj)` returns `Some(text)`. Used by tests that
+    /// exercise natives reading guest-supplied path/string arguments.
+    pub(crate) fn attach_string(&mut self, text: &str) -> ObjectRef {
+        let obj = self.alloc_object(0);
+        let ptr = obj.as_ptr() as usize;
+        self.strings_mut().insert(ptr, text.to_string());
+        obj
     }
 
     fn heap_mut(&self) -> &mut Vec<HeapEntry> {
@@ -215,8 +237,16 @@ impl NativeContext for MockNativeContext {
     }
     fn heap_kind_of(&self, _o: ObjectRef) -> ObjectKind { ObjectKind::Object }
     fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType { ArrayElementType::Reference }
-    fn create_string(&mut self, _t: &str) -> ObjectRef { self.alloc_object(0) }
-    fn read_string(&self, _o: ObjectRef) -> Option<String> { None }
+    fn create_string(&mut self, t: &str) -> ObjectRef {
+        let obj = self.alloc_object(0);
+        let ptr = obj.as_ptr() as usize;
+        self.strings_mut().insert(ptr, t.to_string());
+        obj
+    }
+    fn read_string(&self, o: ObjectRef) -> Option<String> {
+        let ptr = o.as_ptr() as usize;
+        self.strings_ref().get(&ptr).cloned()
+    }
     fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef { self.alloc_object(0) }
     fn record_printed_line(&mut self, _t: String) {}
     fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> { None }
@@ -320,4 +350,23 @@ impl NativeContext for MockNativeContext {
     fn discover_reference(
         &mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>,
     ) {}
+}
+
+// ---------------------------------------------------------------------------
+// Cross-module test serialization for `set_path_confine_to_cwd`.
+//
+// `PATH_CONFINE_TO_CWD` is a global atomic; tests that flip it briefly
+// would otherwise race with parallel tests that depend on it being off
+// (e.g. the WatchService tests in `watch.rs` register absolute /tmp
+// paths). A single process-wide mutex guarantees only one confinement
+// test runs at a time, and the test always pairs `set(true)` with
+// `set(false)` while still holding the guard.
+// ---------------------------------------------------------------------------
+
+use parking_lot::Mutex as PlMutex;
+use std::sync::OnceLock as StdOnceLock;
+
+pub(crate) fn confine_test_lock() -> &'static PlMutex<()> {
+    static LOCK: StdOnceLock<PlMutex<()>> = StdOnceLock::new();
+    LOCK.get_or_init(|| PlMutex::new(()))
 }

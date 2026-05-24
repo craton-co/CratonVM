@@ -278,6 +278,18 @@ fn native_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         return Err(fnf(&path_str));
     }
 
+    // SECURITY (HIGH): run the crate-wide path validator BEFORE the open
+    // syscall. Under `set_path_confine_to_cwd(true)` this rejects
+    // `../../etc/passwd`-style escapes; without confinement it still
+    // rejects literal `..` segments and null bytes. The validator's
+    // `SecurityException` is translated to `FileNotFoundException` so
+    // the Java-visible failure matches what RAF would throw for any
+    // other unreadable file (RandomAccessFile.open0's declared throws).
+    let path_str = match crate::validate_path(&path_str) {
+        Ok(p) => p,
+        Err(_) => return Err(fnf(&path_str)),
+    };
+
     let mut opts = OpenOptions::new();
     // O_RDONLY == 1 means read-only; O_RDWR == 2 means read+write.
     // Java spec: "rw" => O_RDWR; "r" => O_RDONLY.  The private open()
@@ -624,5 +636,53 @@ mod tests {
         opts.read(true);
         let mut f = opts.open(tmp.path()).unwrap();
         assert!(f.write_all(b"y").is_err());
+    }
+
+    /// HIGH-severity security regression guard: under
+    /// `set_path_confine_to_cwd(true)`, `RandomAccessFile.open0` must
+    /// reject a relative-path traversal *before* opening the file. The
+    /// Java-visible failure must be `FileNotFoundException` (matching
+    /// `open0`'s declared throws), not a `SecurityException` leaking
+    /// out of the native into a confused Java caller.
+    #[test]
+    fn raf_open0_rejects_relative_traversal_under_confinement() {
+        use crate::test_support::MockNativeContext;
+        use cratonvm_native_api::NativeContext;
+
+        let _g = crate::test_support::confine_test_lock().lock();
+        crate::set_path_confine_to_cwd(true);
+
+        // Build minimal `this`: an object whose `fd` field references
+        // another (empty) FileDescriptor object. open0 will call
+        // `raf_fd_object` on `this` via `get_field_by_name("fd")` —
+        // our mock returns `Value::Object(None)` from that, so the
+        // fd_object lookup yields None and `write_handle` becomes a
+        // no-op. That doesn't matter here: validation runs and rejects
+        // BEFORE any handle is written.
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(1);
+        let path = ctx.attach_string("../../etc/passwd");
+        let args = [
+            Value::Object(Some(this)),
+            Value::Object(Some(path)),
+            Value::Int(1), // O_RDONLY
+        ];
+
+        let r = native_open0(&mut ctx, &args);
+
+        crate::set_path_confine_to_cwd(false);
+
+        assert!(r.is_err(), "RAF.open0 accepted traversal path");
+        let err = format!("{:?}", r.unwrap_err());
+        assert!(
+            err.contains("FileNotFoundException"),
+            "expected FileNotFoundException, got: {err}"
+        );
+        // Confirm the SecurityException did NOT leak out — the entry
+        // point's contract is `throws FileNotFoundException` only.
+        assert!(
+            !err.contains("SecurityException"),
+            "SecurityException leaked out of RAF.open0: {err}"
+        );
     }
 }

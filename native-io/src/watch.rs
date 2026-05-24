@@ -197,7 +197,28 @@ pub fn open_watch_service() -> Result<i32, MethodCallFailed> {
 /// Register a directory with the watcher and return a fresh key_id.
 /// `kinds_mask` is a bitwise-or of `KIND_CREATE | KIND_DELETE | KIND_MODIFY`.
 pub fn register_dir(ws_id: i32, dir: &str, kinds_mask: i32) -> Result<i32, MethodCallFailed> {
-    let canonical = canonicalize_or_passthrough(dir);
+    // SECURITY (HIGH): run the crate-wide path validator BEFORE handing
+    // the directory off to the OS-side notify watcher. Without this, a
+    // guest under `set_path_confine_to_cwd(true)` could call
+    // `WatchService.register("../../etc")` and receive file-system
+    // change notifications for paths outside the sandbox root —
+    // inotify / ReadDirectoryChangesW don't enforce our policy on
+    // their own. The validator's `SecurityException` is translated to
+    // `IOException` so the Java-visible failure matches what
+    // `WatchService.register0` would throw for any other unwatchable
+    // directory.
+    let dir = match crate::validate_path(dir) {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(RuntimeError::IOException {
+                message: format!(
+                    "WatchService.register: path rejected by sandbox: {dir}"
+                ),
+            }
+            .into());
+        }
+    };
+    let canonical = canonicalize_or_passthrough(&dir);
     if !canonical.exists() {
         return Err(RuntimeError::IOException {
             message: format!("WatchService.register: no such file or directory: {dir}"),
@@ -1032,5 +1053,37 @@ mod tests {
         let k2 = register_dir(id, dir2.path().to_str().unwrap(), KIND_CREATE).unwrap();
         assert_ne!(k1, k2);
         close_watch_service(id);
+    }
+
+    /// HIGH-severity security regression guard: under
+    /// `set_path_confine_to_cwd(true)`, a guest must not be able to call
+    /// `WatchService.register("../../etc")` and bypass `validate_path`
+    /// via the inotify / ReadDirectoryChangesW backend. The Java-visible
+    /// failure must be an `IOException` (the entry point's declared
+    /// throws), not a panic, not a silent success, and not a
+    /// `SecurityException` leaking up out of the watch service API.
+    #[test]
+    fn ws_register_rejects_relative_traversal_under_confinement() {
+        let _g = crate::test_support::confine_test_lock().lock();
+        crate::set_path_confine_to_cwd(true);
+
+        let id = open_watch_service().expect("open watch service");
+        let r = register_dir(id, "../../etc/passwd", KIND_CREATE);
+
+        // Restore default BEFORE assertions so a failing assert doesn't
+        // strand the rest of the test suite in confinement mode.
+        crate::set_path_confine_to_cwd(false);
+        close_watch_service(id);
+
+        assert!(r.is_err(), "traversal path accepted by WatchService.register");
+        let err = format!("{:?}", r.unwrap_err());
+        assert!(
+            err.contains("IOException"),
+            "expected IOException, got: {err}"
+        );
+        assert!(
+            err.contains("sandbox") || err.contains("traversal"),
+            "expected sandbox/traversal-related message, got: {err}"
+        );
     }
 }

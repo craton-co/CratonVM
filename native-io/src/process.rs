@@ -170,7 +170,29 @@ pub fn spawn_and_wrap(
     }
     if let Some(dir) = work_dir {
         if !dir.is_empty() {
-            command.current_dir(dir);
+            // SECURITY (HIGH): the child process inherits ambient
+            // authority from us, so once it `chdir`s into `dir` it can
+            // open files relative to that location — completely
+            // bypassing every per-syscall path check we do for the
+            // guest JVM itself. Under `set_path_confine_to_cwd(true)`
+            // we must therefore reject a `work_dir` that escapes the
+            // sandbox before spawning. The validator's
+            // `SecurityException` is translated to `IOException` to
+            // match what `ProcessBuilder.start` / `UNIXProcess.forkAndExec`
+            // would throw for any other unusable working directory.
+            match crate::validate_path(dir) {
+                Ok(validated) => {
+                    command.current_dir(validated);
+                }
+                Err(_) => {
+                    return Err(RuntimeError::IOException {
+                        message: format!(
+                            "ProcessBuilder.start: working directory rejected by sandbox: {dir}"
+                        ),
+                    }
+                    .into());
+                }
+            }
         }
     }
 

@@ -204,7 +204,7 @@ pub fn is_path_confine_to_cwd() -> bool {
 /// read or write anywhere the host process has permission, including via
 /// symlink escape. Do not assume `validate_path` sandboxes you — it does not
 /// unless you turn confinement on.
-fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
+pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // Reject null bytes (security check — runs even when validation
     // is otherwise disabled, since a NUL truncates the path at the
     // host C-string boundary).
@@ -362,7 +362,7 @@ fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
 }
 
 /// Convenience: validate and return path, or an IO-style error.
-fn validated_path(path: &str) -> Result<String, MethodCallFailed> {
+pub(crate) fn validated_path(path: &str) -> Result<String, MethodCallFailed> {
     validate_path(path).map(normalize_for_os)
 }
 

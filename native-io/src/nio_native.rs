@@ -591,6 +591,17 @@ fn t16_afc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             if path.is_empty() {
                 return Ok(Some(Value::Long(0)));
             }
+            // AUDIT-NOTE 2026-05-24 (HIGH security pass): metadata-only.
+            // This native services `AsynchronousFileChannel.size()` and
+            // reads no file contents — it only returns a `len()` for a
+            // path that the guest *already* opened. If the open itself
+            // was sandbox-rejected, the path slot on the AFC object
+            // stays empty (we returned 0 above). Re-validating here
+            // would either be redundant (already enforced at open time)
+            // or — under a future `setPathConfineToCwd(false)` runtime
+            // toggle on a long-lived AFC — incorrectly reject a path
+            // that was legitimate at open time. We deliberately do not
+            // call `validate_path` here.
             let sz = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
             Ok(Some(Value::Long(sz)))
         }
