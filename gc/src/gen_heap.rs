@@ -2338,6 +2338,18 @@ impl GenerationalHeap {
             cursor += total_size;
         }
 
+        // Defence-in-depth: unconditionally clear `GC_FLAG_MARKED` on every
+        // object header in the from-space. The survivor branch above already
+        // clears the bit for objects it visited, but if the walk broke out
+        // early (corrupt / zero-size header) every later survivor would keep
+        // a stale mark. The next non-moving sweep treats any object with the
+        // mark bit set as live regardless of root reachability, which would
+        // retain garbage indefinitely (bug C5). Re-walk and clear all marks
+        // — cheap (one byte per header) and idempotent on this path. Runs on
+        // both the normal-completion and the `break` arm because it sits
+        // after the `while` loop.
+        clear_all_mark_bits_in_arena(&mut young_from);
+
         // Publish reclaimed regions to the arena's free list. Subsequent
         // `try_alloc_young` calls will satisfy allocations from these
         // holes before bumping the cursor — reclaiming memory without
@@ -3252,6 +3264,59 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
 fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
     // SAFETY: Caller guarantees `index` is within the object's slot count; pointer arithmetic stays within the allocation.
     unsafe { obj_ref.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE) }
+}
+
+/// Walk every object header in `arena` and clear `GC_FLAG_MARKED`.
+///
+/// Used after `sweep_young_non_moving` to guarantee no stale mark bits
+/// survive into the next collection (bug C5). The non-moving sweep's main
+/// loop only clears marks on objects it visits as survivors; if the loop
+/// breaks early on a corrupt / zero-size header, every still-marked object
+/// past the breakout point would be treated as live by the *next* sweep
+/// (`header.gc_flags & GC_FLAG_MARKED != 0`), retaining unreachable
+/// garbage indefinitely.
+///
+/// Walks the same layout as the sweep — skipping known free blocks, parsing
+/// headers in place — and is equally defensive about corruption: a
+/// zero-size or out-of-range header stops the walk (we cannot safely
+/// continue past unknown structure), but every header we *did* reach gets
+/// its mark cleared. Cheap (one byte per header) and idempotent.
+fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
+    let base = arena.base_ptr() as usize;
+    let used = arena.used();
+    let free_blocks = arena.free_blocks_sorted();
+    let mut free_iter = free_blocks.iter().peekable();
+    let mut cursor: usize = 0;
+    while cursor < used {
+        // Skip known free blocks — their bytes are stale and must not be
+        // parsed as object headers.
+        if let Some(&&(off, sz)) = free_iter.peek() {
+            if cursor == off {
+                cursor += sz;
+                free_iter.next();
+                continue;
+            }
+        }
+        // SAFETY: `cursor` is within `used`; the arena's `[base, base+used)`
+        // region is backed by mapped, allocated memory.
+        let obj_ptr = unsafe { (base + cursor) as *mut u8 };
+        // SAFETY: `obj_ptr` is 8-byte-aligned (bump arena) and points at the
+        // start of an object header within the live region.
+        let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+        let total_size = gen_object_total_size(header);
+        if total_size < HEADER_SIZE || cursor + total_size > used {
+            // Corruption — same defence as the sweep loop. Stop rather than
+            // risk parsing arbitrary bytes as a header. Any marks past this
+            // point remain, but on the normal-completion path of the sweep
+            // this branch is unreachable; on the break path the sweep
+            // already abandoned freeing past this offset for the same
+            // reason, so any retained mark is no worse than the sweep's own
+            // pre-existing conservativism.
+            break;
+        }
+        header.gc_flags &= !GC_FLAG_MARKED;
+        cursor += total_size;
+    }
 }
 
 /// Read a `Value` from a slot pointer.
