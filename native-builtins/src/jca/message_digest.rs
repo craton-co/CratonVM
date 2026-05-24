@@ -38,6 +38,18 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, compute_digest, obj_arg};
 
+// C14 fix: the previous implementation keyed the side-table on `ObjectRef`,
+// whose `Hash` impl derives from the raw pointer (`self.ptr.as_ptr() as usize`,
+// see `types/src/value.rs`).  When the GC relocates a `MessageDigest`
+// instance during compaction the entry becomes orphaned: every accumulated
+// `update(byte[])` byte is unreachable and `digest()` on the relocated
+// receiver hashes an empty input — silent data loss.
+//
+// Switch to keying on `NativeContext::identity_hash_code(this)`, which is
+// GC-stable (`HashCodeTable::update_after_gc` remaps the table on
+// compaction — see `gc/src/compact_header.rs`).  Mirrors the pattern from
+// `lang_invoke::VH_META_TABLE` (`native-builtins/src/lang_invoke.rs:178+`).
+
 // Slot indices (synthetic-mode layout — real-JDK Field map is wider so
 // these are only used as fallbacks when the receiver isn't an actual
 // real-JDK MessageDigest instance).  Real-JDK reads/writes go through
@@ -54,43 +66,51 @@ const FIELD_ALGO: usize = 0;
 // put the accumulator.  Using a free slot on the MessageDigest object
 // works in synthetic mode but is fragile in real-JDK mode (the object is
 // allocated with the real layout, every "free" slot collides with an
-// inherited field).  Side-table keyed by `ObjectRef` sidesteps that:
-// the heap object stays untouched, the data lives in process-wide state,
-// and the receiver identity (ObjectRef) is the lookup key.
+// inherited field).  Side-table keyed by `identity_hash_code(receiver)`
+// sidesteps that: the heap object stays untouched, the data lives in
+// process-wide state, and the identity hash survives GC compaction.
 // ---------------------------------------------------------------------------
 
-fn accumulators() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, Vec<u8>>> {
+fn accumulators() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, Vec<u8>>> {
     use std::sync::OnceLock;
-    static ACC: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, Vec<u8>>>> =
+    static ACC: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, Vec<u8>>>> =
         OnceLock::new();
     ACC.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn read_accumulator(_ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+fn read_accumulator(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+    let key = ctx.identity_hash_code(this);
     accumulators()
         .lock()
-        .get(&this)
+        .get(&key)
         .cloned()
         .unwrap_or_default()
 }
 
-fn write_accumulator(_ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
-    accumulators().lock().insert(this, bytes.to_vec());
+fn write_accumulator(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
+    let key = ctx.identity_hash_code(this);
+    accumulators().lock().insert(key, bytes.to_vec());
 }
 
-fn append_accumulator(_ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
+fn append_accumulator(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
+    let key = ctx.identity_hash_code(this);
     accumulators()
         .lock()
-        .entry(this)
+        .entry(key)
         .or_default()
         .extend_from_slice(bytes);
 }
 
-fn reset_accumulator(this: ObjectRef) {
-    accumulators().lock().remove(&this);
+/// Check whether an accumulator entry exists for `this`.  Used by `digest()`
+/// to distinguish "freshly-reset, empty input" from "side-table never seen
+/// this receiver" (which after the GC-key fix should only happen if the
+/// receiver was never returned by our `getInstance`).
+fn accumulator_present(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    accumulators().lock().contains_key(&key)
 }
 
 /// Read a Java-byte array from a `Value::Object(Some(arr))`.
@@ -159,8 +179,12 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(md, FIELD_ALGO, Value::Object(Some(algo_str)));
     // Initialise the side-table accumulator to empty so update→digest
     // round-trips don't see stale state from a previous getInstance
-    // (the side-table is process-wide, keyed by ObjectRef).
-    reset_accumulator(md);
+    // (the side-table is process-wide, keyed by identity hash code).
+    // We `write_accumulator(..&[])` rather than `reset_accumulator` so
+    // the post-GC missing-state check in `md_digest` can distinguish
+    // "this instance was initialised but never written" from "this
+    // instance was never seen by getInstance" (orphan lookup).
+    write_accumulator(ctx, md, &[]);
     Ok(Some(Value::Object(Some(md))))
 }
 
@@ -235,11 +259,23 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // C14: surface side-table misses as a loud IllegalStateException rather
+    // than silently hashing empty input.  After the identity-hash-code key
+    // fix, the only way to land here with no entry is if the receiver was
+    // never produced by our `getInstance` — caller bug, not a GC artefact.
+    if !accumulator_present(ctx, this) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "MessageDigest state missing post-GC or never initialized".into(),
+        }
+        .into());
+    }
     let algo = read_algo(ctx, this);
     let data = read_accumulator(ctx, this);
     let hash = compute_digest(&algo, &data);
-    // Reset accumulator after digest() per JDK contract.
-    reset_accumulator(this);
+    // Reset accumulator after digest() per JDK contract.  Re-seed with an
+    // empty entry so subsequent update→digest round-trips on the same
+    // instance still satisfy the presence check above.
+    write_accumulator(ctx, this, &[]);
     let arr = make_byte_array(ctx, &hash);
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -256,9 +292,12 @@ fn md_digest_input(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     md_digest(ctx, &[Value::Object(Some(this))])
 }
 
-fn md_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    reset_accumulator(this);
+    // Reset to an empty accumulator (rather than removing the entry) so
+    // the post-GC presence check in `md_digest` still recognises this
+    // instance after `reset()`.
+    write_accumulator(ctx, this, &[]);
     Ok(None)
 }
 
