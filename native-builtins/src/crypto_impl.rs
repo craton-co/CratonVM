@@ -3311,23 +3311,107 @@ pub fn ed25519_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool>
     })
 }
 
-/// Global signature-context store: maps Signature object ID -> accumulated data.
-static SIG_DATA_STORE: parking_lot::RwLock<Option<HashMap<u64, Vec<u8>>>> =
+// ---------------------------------------------------------------------------
+// C18: GC-stable Signature payload store
+//
+// `jca::signature` accumulates each `Signature.update(...)` call's bytes here
+// so `sign()` / `verify()` can recover them later.  The original key type
+// was `u64` — the receiver's raw heap pointer (`this.as_ptr() as u64`).
+// Moving GCs (compaction, class-unloading) relocate `Signature` instances;
+// their post-move pointer no longer hashes to the same bucket, so the stored
+// payload is silently orphaned and `sign()` returns a signature over the
+// empty string.  Same defect class as C12-C15
+// (`securerandom::SEED_TABLE`, `jca::cipher::CIPHER_TABLE`,
+// `jca::message_digest::accumulators()`, `jca::signature`'s sibling
+// algo/state/keyid tables) and the canonical exemplar at
+// `lang_invoke::VH_META_TABLE` (`native-builtins/src/lang_invoke.rs:178-203`).
+//
+// Fix: key on `NativeContext::identity_hash_code(this)` which is GC-stable
+// (`HashCodeTable::update_after_gc`, `gc/src/compact_header.rs`).  The
+// canonical surface is the new `sig_data_append_h` / `sig_data_take_h` /
+// `sig_data_clear_h` taking `i32`, backed by a `HashMap<i32, Vec<u8>>`.
+//
+// The original `u64`-keyed `sig_data_append` / `_take` / `_clear` are
+// retained for `crypto.rs` (the `legacy-synthetic-crypto`-feature shim)
+// whose call sites this task does not have edit authority over.  Those
+// entries live in a *separate* map (`SIG_DATA_STORE_RAW_PTR`) so a
+// truncated raw pointer cannot alias a real identity-hash-code key in
+// the canonical store.  They retain the original GC-aliasing defect;
+// the `crypto.rs` synthetic-crypto path should migrate to the `_h` API
+// in a follow-up.  (The legacy functions are deliberately *not* marked
+// `#[deprecated]` because CI builds with `-D warnings`, which would
+// promote the deprecation lint at the `crypto.rs` call sites into
+// build errors.)
+// ---------------------------------------------------------------------------
+
+/// GC-stable signature-payload store: keyed on `identity_hash_code(this)`.
+static SIG_DATA_STORE: parking_lot::RwLock<Option<HashMap<i32, Vec<u8>>>> =
     parking_lot::RwLock::new(None);
 
-pub fn sig_data_append(id: u64, data: &[u8]) {
+/// Append `data` to the payload accumulated against `key`
+/// (the receiver's identity hash code).
+pub fn sig_data_append_h(key: i32, data: &[u8]) {
     let mut guard = SIG_DATA_STORE.write();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.entry(key).or_insert_with(Vec::new).extend_from_slice(data);
+}
+
+/// Remove and return the payload accumulated against `key`.  Returns
+/// `None` when no payload exists for the key — callers that treat the
+/// absence as "the receiver was never initialised here" should raise a
+/// loud `IllegalStateException` rather than substituting an empty buffer
+/// (which would silently produce a signature over `b""`).
+pub fn sig_data_take_h(key: i32) -> Option<Vec<u8>> {
+    let mut guard = SIG_DATA_STORE.write();
+    guard.as_mut().and_then(|m| m.remove(&key))
+}
+
+/// Reset the payload for `key` to an empty buffer (replacing any prior
+/// accumulation).  Use from `init*` paths so a subsequent `sig_data_take_h`
+/// can distinguish "no `update()` was called" (returns `Some(empty)`) from
+/// "the side-table entry was orphaned post-GC or `init*` was never
+/// invoked" (returns `None` — caller raises `IllegalStateException`).
+pub fn sig_data_clear_h(key: i32) {
+    let mut guard = SIG_DATA_STORE.write();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(key, Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// Legacy raw-pointer-keyed API (retained for `crypto.rs`)
+//
+// The `u64`-keyed surface below keeps the `legacy-synthetic-crypto`-gated
+// `crypto.rs::register_signature` shim compiling — that file's ~12 call
+// sites are out of edit scope for C18 (and would need an orchestrator
+// follow-up to migrate to the `_h` API).  These functions are NOT marked
+// `#[deprecated]` because the project's CI builds with `-D warnings`;
+// the deprecation warnings would turn the legacy callers into build
+// errors.  Treat the unsuffixed API as soft-deprecated: it inherits the
+// pre-C18 GC-aliasing defect and new code should use `sig_data_*_h(i32)`
+// keyed on `NativeContext::identity_hash_code(this)`.  Entries live in a
+// *separate* map so a truncated raw pointer cannot alias an
+// identity-hash-code key in the canonical `SIG_DATA_STORE`.
+// ---------------------------------------------------------------------------
+
+static SIG_DATA_STORE_RAW_PTR: parking_lot::RwLock<Option<HashMap<u64, Vec<u8>>>> =
+    parking_lot::RwLock::new(None);
+
+/// Legacy raw-pointer-keyed append.  Prefer `sig_data_append_h(i32, ...)`.
+pub fn sig_data_append(id: u64, data: &[u8]) {
+    let mut guard = SIG_DATA_STORE_RAW_PTR.write();
     let map = guard.get_or_insert_with(HashMap::new);
     map.entry(id).or_insert_with(Vec::new).extend_from_slice(data);
 }
 
+/// Legacy raw-pointer-keyed take.  Prefer `sig_data_take_h(i32)`.
 pub fn sig_data_take(id: u64) -> Vec<u8> {
-    let mut guard = SIG_DATA_STORE.write();
+    let mut guard = SIG_DATA_STORE_RAW_PTR.write();
     guard.as_mut().and_then(|m| m.remove(&id)).unwrap_or_default()
 }
 
+/// Legacy raw-pointer-keyed clear.  Prefer `sig_data_clear_h(i32)`.
 pub fn sig_data_clear(id: u64) {
-    let mut guard = SIG_DATA_STORE.write();
+    let mut guard = SIG_DATA_STORE_RAW_PTR.write();
     if let Some(m) = guard.as_mut() { m.remove(&id); }
 }
 
