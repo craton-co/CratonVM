@@ -76,8 +76,18 @@ fn aio_register(h: AioHandle) -> i32 {
     id
 }
 
+/// Round-8 C29 fix: actually remove the entry from `aio_registry`
+/// instead of leaving an `AioHandle::Closed` tombstone behind. Workers
+/// that already cloned an `Arc<Mutex<TcpStream>>` out of the entry keep
+/// the stream alive via their Arc — the registry slot is purely a
+/// lookup table, and dropping the slot does not invalidate in-flight
+/// worker handles. Other readers (Read/Write/Accept) match on the live
+/// variants (`Stream(_)` / `Listener(_)`) and treat any other state as
+/// "channel closed", so converting the previous `Closed` tombstone into
+/// a true `remove` is observationally equivalent to callers but stops
+/// the map from growing monotonically on heavy connect/close churn.
 fn aio_remove(id: i32) {
-    aio_registry().write().insert(id, AioHandle::Closed);
+    aio_registry().write().remove(&id);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +135,11 @@ const DRAIN_LIMIT: usize = 64;
 fn drain_completions(ctx: &mut dyn NativeContext) {
     // Flush any pending heap-array writes first so handlers see the data.
     flush_pending_array_writes_inner(ctx);
+    // Round-8 C29: apply any field resets parked by failed worker jobs
+    // (e.g. clearing `F_CONNECTED` after a connect error) before we
+    // dispatch the matching completion — handlers must observe the
+    // post-failure state, not the pre-failure optimistic state.
+    flush_pending_field_resets(ctx);
     for _ in 0..DRAIN_LIMIT {
         let next = completion_queue().lock().pop_front();
         let Some(c) = next else { break };
@@ -198,6 +213,13 @@ enum Job {
         addr: String,
         handler: Option<ObjectRef>,
         attachment: Option<ObjectRef>,
+        /// Round-8 C29: the user-visible `AsynchronousSocketChannel`
+        /// object whose `F_CONNECTED` flag was set optimistically by
+        /// `aio_asc_connect` before this job ran. On connect failure
+        /// the worker parks a `PendingFieldReset` so the next user-
+        /// thread drain clears it back to 0 — otherwise the channel
+        /// would lie to `isConnected()` after a failed connect.
+        channel: Option<ObjectRef>,
     },
     Read {
         id: i32,
@@ -269,6 +291,7 @@ fn handle_job(job: Job) -> Result<(), String> {
             addr,
             handler,
             attachment,
+            channel,
         } => {
             let result = match addr.parse::<SocketAddr>() {
                 Ok(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(30)),
@@ -289,6 +312,27 @@ fn handle_job(job: Job) -> Result<(), String> {
                 }
                 Err(e) => {
                     aio_remove(id);
+                    // Round-8 C29: reset the optimistic `F_CONNECTED = 1`
+                    // that `aio_asc_connect` set synchronously before
+                    // enqueuing this job. Without this, `isConnected()`
+                    // returns true after a failed connect — a JDK
+                    // contract violation. We can't touch the Java object
+                    // from this worker thread; park a field-reset that
+                    // the next user-thread drain applies.
+                    if let Some(ch) = channel {
+                        pending_field_resets().lock().push(PendingFieldReset {
+                            target: ch,
+                            field: F_CONNECTED,
+                            value: Value::Int(0),
+                        });
+                        // Also clear the registry id so callers don't
+                        // try to look up a now-removed handle.
+                        pending_field_resets().lock().push(PendingFieldReset {
+                            target: ch,
+                            field: F_REG_ID,
+                            value: Value::Int(-1),
+                        });
+                    }
                     if let Some(h) = handler {
                         completion_queue().lock().push_back(Completion {
                             handler: h,
@@ -625,6 +669,31 @@ fn flush_pending_array_writes_inner(ctx: &mut dyn NativeContext) {
     }
 }
 
+/// Round-8 C29 fix: workers can't touch the user-visible Java object
+/// directly (no `&mut NativeContext`). When a worker needs to reset a
+/// field on a channel — e.g. clearing `F_CONNECTED = 0` after a connect
+/// failure — it parks a `PendingFieldReset` here and the next AIO native
+/// call on the user thread drains it via `flush_pending_field_resets`.
+struct PendingFieldReset {
+    target: ObjectRef,
+    field: usize,
+    value: Value,
+}
+
+fn pending_field_resets() -> &'static Mutex<Vec<PendingFieldReset>> {
+    static V: OnceLock<Mutex<Vec<PendingFieldReset>>> = OnceLock::new();
+    V.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn flush_pending_field_resets(ctx: &mut dyn NativeContext) {
+    let parked = std::mem::take(&mut *pending_field_resets().lock());
+    for r in parked {
+        if ctx.object_num_fields(r.target) > r.field {
+            ctx.set_field(r.target, r.field, r.value);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
@@ -777,6 +846,7 @@ fn aio_asc_open_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn aio_asc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     drain_completions(ctx);
     flush_pending_array_writes_inner(ctx);
+    flush_pending_field_resets(ctx);
     match obj_or_none(args, 0) {
         Some(o) if ctx.object_num_fields(o) > F_OPEN => Ok(Some(ctx.get_field(o, F_OPEN))),
         _ => Ok(Some(Value::Int(0))),
@@ -862,6 +932,9 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         addr,
         handler,
         attachment,
+        // Round-8 C29: pass the user-visible channel so the worker can
+        // park a `F_CONNECTED = 0` reset on connect failure.
+        channel: Some(this),
     }) {
         return Err(ioex("connect: aio worker pool unavailable"));
     }
@@ -1263,6 +1336,7 @@ mod tests {
             addr: format!("127.0.0.1:{port}"),
             handler: None,
             attachment: None,
+            channel: None,
         });
 
         // Wait for the registry to flip to Stream.
