@@ -508,6 +508,17 @@ fn read_attributes(
         let _ = buf.read_bytes(length)?;
         let end = start + length;
 
+        // Eager shape-only validation for a small, fixed set of
+        // attribute kinds whose laziness would otherwise hide
+        // structural errors (fixed-size cp-index attributes + `Code`
+        // body shape) until first downstream access. The full per-kind
+        // decode remains lazy via `LazyAttribute::decode`; this walk
+        // only runs the cheap structural predicate. See
+        // `attribute::validate_attribute_shape` and the module-level
+        // "Validation policy" docs in `attribute.rs` for the list and
+        // the rationale.
+        validate_attribute_shape(&name, &source[start..end])?;
+
         // Zero-copy construction: refcount-bump `source` and remember the
         // range. No per-attribute `Vec<u8>` allocation, no memcpy of the
         // body. On java.base bootstrap this saves ~25 MB of malloc churn

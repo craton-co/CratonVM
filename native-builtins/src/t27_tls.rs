@@ -64,20 +64,82 @@ use crate::alloc_concurrent_synthetic;
 use crate::servlet;
 
 // -----------------------------------------------------------------------------
-// Embedded test-cert material (used by T2.7.16–.19 integration tests *and* by
-// a JVM-callable self-test hook registered below). All certs were generated
-// offline via OpenSSL; the CA has a 100-year lifetime so the tests don't rot.
+// Test cert/key fixtures
 // -----------------------------------------------------------------------------
+//
+// SECURITY (HIGH): the offline-generated PEM material used by the
+// T2.7.16–.19 integration tests is *intentionally* gated behind `cfg(test)`
+// so that release binaries cannot accidentally serve a publicly-known
+// private key. Code paths that previously consumed `SERVER_CRT_PEM` /
+// `SERVER_KEY_PEM` in release builds now go through `runtime_tls_identity()`
+// and fail closed (`IllegalStateException`) when no real identity has been
+// installed via the keystore configuration path. The `t27_certs/` directory
+// on disk is only read by `include_str!` at *compile time* in test builds.
+//
+// Trust material (the `CA` cert used to validate the test peer in the
+// loopback handshake) is also gated — there is no reason to ship the
+// test CA in a release artifact.
 
-pub(crate) const CA_CRT_PEM: &str = include_str!("t27_certs/ca.crt");
-pub(crate) const SERVER_CRT_PEM: &str = include_str!("t27_certs/server.crt");
-pub(crate) const SERVER_KEY_PEM: &str = include_str!("t27_certs/server.key");
-pub(crate) const SERVER1_CRT_PEM: &str = include_str!("t27_certs/server1.crt");
-pub(crate) const SERVER1_KEY_PEM: &str = include_str!("t27_certs/server1.key");
-pub(crate) const SERVER2_CRT_PEM: &str = include_str!("t27_certs/server2.crt");
-pub(crate) const SERVER2_KEY_PEM: &str = include_str!("t27_certs/server2.key");
-pub(crate) const CLIENT_CRT_PEM: &str = include_str!("t27_certs/client.crt");
-pub(crate) const CLIENT_KEY_PEM: &str = include_str!("t27_certs/client.key");
+#[cfg(test)]
+mod test_fixtures {
+    pub(crate) const CA_CRT_PEM: &str = include_str!("t27_certs/ca.crt");
+    pub(crate) const SERVER_CRT_PEM: &str = include_str!("t27_certs/server.crt");
+    pub(crate) const SERVER_KEY_PEM: &str = include_str!("t27_certs/server.key");
+    pub(crate) const SERVER1_CRT_PEM: &str = include_str!("t27_certs/server1.crt");
+    pub(crate) const SERVER1_KEY_PEM: &str = include_str!("t27_certs/server1.key");
+    pub(crate) const SERVER2_CRT_PEM: &str = include_str!("t27_certs/server2.crt");
+    pub(crate) const SERVER2_KEY_PEM: &str = include_str!("t27_certs/server2.key");
+    pub(crate) const CLIENT_CRT_PEM: &str = include_str!("t27_certs/client.crt");
+    pub(crate) const CLIENT_KEY_PEM: &str = include_str!("t27_certs/client.key");
+}
+
+// -----------------------------------------------------------------------------
+// Runtime TLS server identity (set by the keystore-configuration path)
+// -----------------------------------------------------------------------------
+//
+// A real deployment installs a (cert chain, private key) pair here, typically
+// from a PKCS#12 / JKS keystore loaded via `javax.net.ssl.keyStore`. Until that
+// happens the slot is `None`, and every server-side code path that would have
+// otherwise consumed the embedded test material instead refuses to start with
+// an `IllegalStateException`. The slot stores raw PEM so it can be fed
+// directly into `build_server_config_single_cert`.
+
+#[derive(Clone)]
+pub(crate) struct RuntimeTlsIdentity {
+    pub(crate) cert_pem: String,
+    pub(crate) key_pem: String,
+    /// Optional client-CA bundle used when the server is asked to perform
+    /// mTLS via `setNeedClientAuth(true)`. `None` means client auth is
+    /// rejected with a config error rather than silently disabled.
+    pub(crate) client_ca_pem: Option<String>,
+}
+
+static RUNTIME_TLS_IDENTITY: OnceLock<Mutex<Option<RuntimeTlsIdentity>>> = OnceLock::new();
+
+fn runtime_tls_identity_slot() -> &'static Mutex<Option<RuntimeTlsIdentity>> {
+    RUNTIME_TLS_IDENTITY.get_or_init(|| Mutex::new(None))
+}
+
+/// Public setter for VM bootstrap / keystore-configuration code. Replaces any
+/// previously installed identity. Pass `None` to clear (used by tests to
+/// restore a known starting state).
+#[allow(dead_code)]
+pub fn set_runtime_tls_identity(identity: Option<RuntimeTlsIdentity>) {
+    *runtime_tls_identity_slot().lock() = identity;
+}
+
+/// Fetch the currently configured runtime TLS identity (if any).
+pub(crate) fn runtime_tls_identity() -> Option<RuntimeTlsIdentity> {
+    runtime_tls_identity_slot().lock().clone()
+}
+
+/// Return the runtime TLS identity or the canonical `IllegalStateException`
+/// that every server-side entry point uses when no keystore is configured.
+fn require_runtime_tls_identity() -> Result<RuntimeTlsIdentity, RuntimeError> {
+    runtime_tls_identity().ok_or_else(|| RuntimeError::IllegalStateException {
+        message: "No TLS key/cert configured; set javax.net.ssl.keyStore".to_string(),
+    })
+}
 
 // -----------------------------------------------------------------------------
 // PEM helpers
@@ -712,16 +774,19 @@ fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
 fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     // T2.7.9: SSLServerSocketFactory.createServerSocket(int port) —
     // binds a TcpListener on 0.0.0.0:port, builds a rustls ServerConfig
-    // from the embedded test server cert (used by unit tests and as the
-    // self-test default), and registers both in the module registry.
+    // from the configured runtime TLS identity, and registers both in the
+    // module registry.
     //
-    // NOTE: in production, a caller would first initialize an SSLContext
-    // with a KMF holding a real identity; we honor that by reading the
-    // SSLContext's stored cert PEM if present (via a side-channel field
-    // on SSLServerSocketFactory). For now the factory uses the embedded
-    // test cert — real KMF integration is plumbed through the
-    // `SSLContext.getServerSocketFactory` code path in a follow-up
-    // session once KMF.init actually stores a PKCS#12 identity.
+    // SECURITY: this entry point no longer falls back to any embedded
+    // private key. Until `set_runtime_tls_identity(Some(_))` has been
+    // called (typically from the `javax.net.ssl.keyStore` /
+    // `SSLContext.init` plumbing), every invocation throws
+    // `IllegalStateException("No TLS key/cert configured; set
+    // javax.net.ssl.keyStore")` rather than silently serving traffic
+    // under a publicly known key. Real KMF integration is plumbed through
+    // the `SSLContext.getServerSocketFactory` code path in a follow-up
+    // session once KMF.init actually stores a PKCS#12 identity into this
+    // slot.
     let sssf = "javax/net/ssl/SSLServerSocketFactory";
     r.register(
         sssf,
@@ -735,9 +800,10 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            let identity = require_runtime_tls_identity()?;
             let config = build_server_config_single_cert(
-                SERVER_CRT_PEM,
-                SERVER_KEY_PEM,
+                &identity.cert_pem,
+                &identity.key_pem,
                 &["h2", "http/1.1"],
                 false,
                 None,
@@ -1039,11 +1105,16 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
 
 fn register_self_test(r: &mut NativeMethodRegistry) {
     // A JVM-callable self-test that spins up a rustls server on a loopback
-    // ephemeral port using the embedded test certs, connects to it with a
-    // rustls client configured with the test CA as the only trust anchor,
-    // exchanges a short ping/pong, verifies the negotiated protocol is
-    // TLSv1.3 and that ALPN selected "h2", then returns "OK" as a Java
-    // String. Any failure yields the error text.
+    // ephemeral port using the *configured runtime* TLS identity, connects
+    // to it with a rustls client, exchanges a short ping/pong, verifies the
+    // negotiated protocol is TLSv1.3 and that ALPN selected "h2", then
+    // returns "OK" as a Java String. Any failure yields the error text.
+    //
+    // SECURITY: this self-test no longer reaches for an embedded private
+    // key. If no runtime identity has been installed (no keystore
+    // configured), `T27SelfTest.run()` returns
+    // `"ERR: No TLS key/cert configured; set javax.net.ssl.keyStore"`
+    // rather than booting a server under a publicly known key.
     //
     // This is exposed as `cratonvm.tls.T27SelfTest.run()` — callable from
     // Java tests (or interactively) to prove the entire rustls pipeline is
@@ -1053,7 +1124,16 @@ fn register_self_test(r: &mut NativeMethodRegistry) {
         "run",
         "()Ljava/lang/String;",
         |ctx, _args| {
-            let result = run_loopback_self_test();
+            let result = match runtime_tls_identity() {
+                Some(id) => run_loopback_self_test(
+                    &id.cert_pem,
+                    &id.key_pem,
+                    id.client_ca_pem.as_deref(),
+                ),
+                None => Err(
+                    "No TLS key/cert configured; set javax.net.ssl.keyStore".to_string(),
+                ),
+            };
             let s = match result {
                 Ok(msg) => ctx.create_string(&msg),
                 Err(e) => ctx.create_string(&format!("ERR: {}", e)),
@@ -1063,12 +1143,26 @@ fn register_self_test(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// End-to-end loopback handshake using the embedded test certs. Returns
-/// a "OK proto=... cipher=... alpn=..." string on success.
-pub(crate) fn run_loopback_self_test() -> Result<String, String> {
+/// End-to-end loopback handshake using the caller-supplied PEM material.
+///
+/// `trust_pem` is the CA used by the client to verify the server. When
+/// `None`, the client uses the system root store (suitable for fixtures
+/// whose leaf chains up to a publicly trusted CA; tests pass the test CA
+/// here explicitly). Returns `"OK proto=... cipher=... alpn=..."` on
+/// success.
+pub(crate) fn run_loopback_self_test(
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    trust_pem: Option<&str>,
+) -> Result<String, String> {
     // Server side.
-    let server_config =
-        build_server_config_single_cert(SERVER_CRT_PEM, SERVER_KEY_PEM, &["h2", "http/1.1"], false, None)?;
+    let server_config = build_server_config_single_cert(
+        server_cert_pem,
+        server_key_pem,
+        &["h2", "http/1.1"],
+        false,
+        None,
+    )?;
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|e| format!("bind loopback: {}", e))?;
     let port = listener
@@ -1121,10 +1215,19 @@ pub(crate) fn run_loopback_self_test() -> Result<String, String> {
 
     // Client side.
     let mut roots = RootCertStore::empty();
-    for cert in parse_cert_chain_pem(CA_CRT_PEM)? {
-        roots
-            .add(cert)
-            .map_err(|e| format!("add CA: {}", e))?;
+    if let Some(ca) = trust_pem {
+        for cert in parse_cert_chain_pem(ca)? {
+            roots
+                .add(cert)
+                .map_err(|e| format!("add CA: {}", e))?;
+        }
+    } else {
+        // No explicit trust supplied: fall back to the host's native trust
+        // store. This is what real-world callers want; the test harness
+        // always passes an explicit `trust_pem`.
+        if let Ok(native) = load_native_root_store() {
+            roots = native;
+        }
     }
     let client_config = build_client_config(roots, &["h2", "http/1.1"], None)?;
     let tcp = TcpStream::connect(("127.0.0.1", port))
@@ -1213,10 +1316,63 @@ fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_fixtures::*;
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+
+    /// Guard so tests that mutate the global `RUNTIME_TLS_IDENTITY` slot
+    /// don't race with each other. Each test acquires the lock for its
+    /// duration; the previous slot value is restored on drop.
+    static IDENTITY_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// RAII helper: stash a runtime TLS identity for the lifetime of a
+    /// test, then restore whatever was there before. Acquires the
+    /// `IDENTITY_TEST_LOCK` so concurrent tests are serialized.
+    struct IdentityGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<super::RuntimeTlsIdentity>,
+    }
+
+    impl IdentityGuard {
+        fn install(identity: super::RuntimeTlsIdentity) -> Self {
+            // `lock()` can fail only if the mutex is poisoned by a panicking
+            // test; recover the guard so we still serialize.
+            let lock = IDENTITY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev = super::runtime_tls_identity();
+            super::set_runtime_tls_identity(Some(identity));
+            IdentityGuard { _lock: lock, prev }
+        }
+
+        fn install_none() -> Self {
+            let lock = IDENTITY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev = super::runtime_tls_identity();
+            super::set_runtime_tls_identity(None);
+            IdentityGuard { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for IdentityGuard {
+        fn drop(&mut self) {
+            super::set_runtime_tls_identity(self.prev.take());
+        }
+    }
+
+    /// Install the test fixtures (server cert+key + test CA) as the
+    /// runtime TLS identity for the duration of a test.
+    fn install_test_identity() -> IdentityGuard {
+        IdentityGuard::install(super::RuntimeTlsIdentity {
+            cert_pem: SERVER_CRT_PEM.to_string(),
+            key_pem: SERVER_KEY_PEM.to_string(),
+            client_ca_pem: Some(CA_CRT_PEM.to_string()),
+        })
+    }
 
     #[test]
     fn t27_parses_embedded_certs() {
@@ -1230,10 +1386,95 @@ mod tests {
     #[test]
     fn t27_loopback_self_test() {
         // T2.7.16 / T2.7.17 — full in-process handshake + app-data exchange.
-        let msg = run_loopback_self_test().expect("self-test succeeds");
+        let msg = run_loopback_self_test(SERVER_CRT_PEM, SERVER_KEY_PEM, Some(CA_CRT_PEM))
+            .expect("self-test succeeds");
         assert!(msg.starts_with("OK "), "unexpected result: {}", msg);
         assert!(msg.contains("proto=TLSv1.3"));
         assert!(msg.contains("alpn=h2"));
+    }
+
+    /// T2.7-SEC-1 — release-config server with no keystore must refuse to
+    /// start with an `IllegalStateException`, not panic and not hang. This
+    /// is the regression test for the HIGH-severity finding "embedded TLS
+    /// keys in release binary": once the embedded keys are gated behind
+    /// `cfg(test)`, the only way to start a server is via an explicitly
+    /// installed runtime identity, and the absence of one must surface as
+    /// a clean Java exception.
+    #[test]
+    fn t27_sec_no_keystore_raises_illegal_state() {
+        let _guard = IdentityGuard::install_none();
+        let mut r = NativeMethodRegistry::new();
+        super::register_sslserversocket(&mut r);
+        let handler = r
+            .find(
+                "javax/net/ssl/SSLServerSocketFactory",
+                "createServerSocket",
+                "(I)Ljava/net/ServerSocket;",
+            )
+            .expect("createServerSocket(I) registered");
+
+        let mut ctx = crate::test_utils::mock_ctx();
+        // Two args: the (synthetic) receiver and the port (0 = ephemeral).
+        let args = [Value::Object(None), Value::Int(0)];
+        let result = handler(&mut ctx, &args);
+        let err = result.expect_err("must fail without a runtime identity");
+        // The convention in this crate is to surface `RuntimeError` via
+        // `Into<MethodCallFailed>`. We re-stringify the wrapped error and
+        // assert on both the exception class and the message — that keeps
+        // the test resilient to any future re-shaping of `MethodCallFailed`
+        // while still proving the correct exception type reaches the JVM.
+        let s = format!("{:?}", err);
+        assert!(
+            s.contains("IllegalStateException"),
+            "expected IllegalStateException, got: {}",
+            s
+        );
+        assert!(
+            s.contains("No TLS key/cert configured"),
+            "unexpected ISE message in: {}",
+            s
+        );
+        assert!(
+            s.contains("javax.net.ssl.keyStore"),
+            "ISE message should mention javax.net.ssl.keyStore: {}",
+            s
+        );
+    }
+
+    /// T2.7-SEC-2 — companion to the above: the JVM-callable self-test
+    /// must also refuse (returning a structured `"ERR: ..."` string)
+    /// rather than reaching for any embedded test key when no keystore is
+    /// configured.
+    #[test]
+    fn t27_sec_self_test_with_no_identity_returns_err_string() {
+        let _guard = IdentityGuard::install_none();
+        let mut r = NativeMethodRegistry::new();
+        super::register_self_test(&mut r);
+        let handler = r
+            .find("cratonvm/tls/T27SelfTest", "run", "()Ljava/lang/String;")
+            .expect("self-test registered");
+        let mut ctx = crate::test_utils::mock_ctx();
+        let v = handler(&mut ctx, &[]).expect("native returns Ok");
+        // Pull the Rust String back out so we can pattern-match. The mock
+        // context's `create_string` stores the source in a heap slot that
+        // we can read back via `string_to_rust`.
+        let s_obj = match v {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected String object, got {:?}", other),
+        };
+        let s = ctx
+            .read_string(s_obj)
+            .expect("self-test result is a String");
+        assert!(
+            s.starts_with("ERR: "),
+            "self-test should report an error when no keystore is configured: {}",
+            s
+        );
+        assert!(
+            s.contains("No TLS key/cert configured"),
+            "self-test error should mention the missing keystore: {}",
+            s
+        );
     }
 
     #[test]
@@ -1695,13 +1936,33 @@ mod tests {
     }
 
     #[test]
-    fn wp51_default_engine_server_config_uses_embedded_certs() {
-        // Server config builds from the embedded test cert + ALPN list.
+    fn wp51_default_engine_server_config_uses_runtime_identity() {
+        // Server config builds from the runtime-configured TLS identity
+        // (here the test fixtures, installed via `install_test_identity`)
+        // plus the ALPN list. Asserts that the gating of the embedded
+        // keys behind `cfg(test)` did not break the engine code path.
+        let _guard = install_test_identity();
         let alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
         let cfg = super::default_engine_server_config(&alpn, false);
-        assert!(cfg.is_ok());
+        assert!(cfg.is_ok(), "expected Ok with identity installed: {:?}", cfg.err());
         let cfg = cfg.unwrap();
         assert_eq!(cfg.alpn_protocols, alpn);
+    }
+
+    #[test]
+    fn wp51_default_engine_server_config_no_identity_is_err() {
+        // Companion to the above: with no runtime identity installed,
+        // the engine-side default config builder must fail cleanly rather
+        // than reaching for any embedded key.
+        let _guard = IdentityGuard::install_none();
+        let alpn: Vec<Vec<u8>> = vec![b"h2".to_vec()];
+        let cfg = super::default_engine_server_config(&alpn, false);
+        let err = cfg.err().expect("must fail without runtime identity");
+        assert!(
+            err.contains("No TLS key/cert configured"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -2213,8 +2474,15 @@ fn default_engine_client_config(alpn: &[Vec<u8>]) -> Result<Arc<ClientConfig>, S
 }
 
 /// Build a default rustls ServerConfig for engine paths that didn't have an
-/// SSLContext attach one. Uses the embedded test cert + ALPN list. This is
-/// the path Keycloak's SSLContext.createSSLEngine() takes during dev.
+/// SSLContext attach one. Uses the *runtime-configured* TLS identity (set via
+/// `set_runtime_tls_identity`) and the supplied ALPN list. This is the path
+/// `SSLContext.createSSLEngine()` takes when the caller never installed a
+/// `KeyManagerFactory` of their own.
+///
+/// SECURITY: returns a config-error string (which `engine_begin` propagates
+/// as an `IOException` to the JVM, identical to other handshake misconfig
+/// failures) when no runtime identity has been installed. There is no
+/// silent fallback to an embedded private key.
 fn default_engine_server_config(
     alpn: &[Vec<u8>],
     need_client_auth: bool,
@@ -2223,16 +2491,29 @@ fn default_engine_server_config(
         .iter()
         .filter_map(|p| std::str::from_utf8(p).ok())
         .collect();
+    let identity = runtime_tls_identity()
+        .ok_or_else(|| {
+            "No TLS key/cert configured; set javax.net.ssl.keyStore".to_string()
+        })?;
+    let client_ca = if need_client_auth {
+        match identity.client_ca_pem.as_deref() {
+            Some(ca) => Some(ca.to_string()),
+            None => {
+                return Err(
+                    "setNeedClientAuth(true) requires javax.net.ssl.trustStore"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        None
+    };
     build_server_config_single_cert(
-        SERVER_CRT_PEM,
-        SERVER_KEY_PEM,
+        &identity.cert_pem,
+        &identity.key_pem,
         &alpn_strs,
         need_client_auth,
-        if need_client_auth {
-            Some(CA_CRT_PEM)
-        } else {
-            None
-        },
+        client_ca.as_deref(),
     )
 }
 

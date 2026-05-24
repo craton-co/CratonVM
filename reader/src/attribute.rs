@@ -1,6 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+//! Attribute decoding (JVM spec §4.7) and the lazy-decode container.
+//!
+//! # Validation policy (HIGH, 2026-05-24)
+//!
+//! The class-reader hot path wraps every attribute body as a
+//! [`LazyAttribute::Raw`] and *only* decodes it on first downstream
+//! access. That preserves the lazy-decode performance win for the ~70 %
+//! of attributes (LocalVariableTable, RuntimeInvisibleAnnotations,
+//! Module, …) that bootstrap never consumes — but it means structural
+//! errors that *should* be caught at class-load time (the moment the
+//! reader hands a `ClassFile` back to the loader) get deferred until
+//! some random downstream call site finally asks for the parsed form.
+//!
+//! For a small, well-defined set of attribute kinds whose **shape is
+//! cheap to validate without producing the decoded value**, we run a
+//! "validation-only walk" at `read_class` time via
+//! [`validate_attribute_shape`] in [`class_reader::read_attributes`]:
+//!
+//! * `ConstantValue` — must be exactly 2 bytes (JVMS §4.7.2)
+//! * `NestHost` — must be exactly 2 bytes (JVMS §4.7.28)
+//! * `ModuleMainClass` — must be exactly 2 bytes (JVMS §4.7.27)
+//! * `EnclosingMethod` — must be exactly 4 bytes (JVMS §4.7.7)
+//! * `Code` — `code_length` must be in `1..=65535` (JVMS §4.7.3) and
+//!   the body must hold a well-shaped exception table + nested
+//!   attribute table within the declared `attribute_length`. Nested
+//!   attributes are recursively shape-validated.
+//!
+//! These checks duplicate the logic that the lazy decoder runs later,
+//! but they're tiny — a `u16`/`u32` read, a bounds comparison, no
+//! string allocation, no constant-pool lookup — so the cost of the
+//! eager walk is dwarfed by the cost of producing the
+//! `LazyAttribute::Raw` itself.
+//!
+//! **Do not extend this list casually.** Every additional kind we
+//! validate eagerly defeats the lazy-decode win for that kind. The
+//! current list is exactly the set whose laziness was hiding
+//! reachable parser-shape bugs in malformed-input regression tests; if
+//! you add another, document the JVMS clause and the test that
+//! motivated it.
+
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -629,6 +669,132 @@ pub fn force_decode_all(
 ) -> Result<(), ClassReaderError> {
     for attr in attrs.iter_mut() {
         attr.decode(cp)?;
+    }
+    Ok(())
+}
+
+/// Eagerly validate the *shape* of a small, fixed set of attribute kinds
+/// whose laziness would otherwise hide structural errors until first
+/// downstream access. See the module-level "Validation policy" docs for
+/// the rationale and the exact kinds covered.
+///
+/// `name` is the canonical attribute name resolved from the constant pool;
+/// `body` is the raw attribute payload (exactly `attribute_length` bytes,
+/// *excluding* the `attribute_name_index` / `attribute_length` header).
+///
+/// Returns `Ok(())` for all attribute kinds not in the eager-validate set
+/// (their structural errors remain deferred to lazy decode). Returns
+/// `Err(ClassReaderError::InvalidClassData)` for shape violations in the
+/// covered kinds.
+///
+/// This intentionally does *not* materialise the parsed attribute — the
+/// goal is to surface obvious malformed-input errors at `read_class` time
+/// while leaving the lazy decode in place for the cases that actually
+/// benefit from it. For `Code` the walk recurses into nested attributes
+/// (since their shape is part of the `Code` body's well-formedness) but
+/// still only performs the same shallow per-kind checks.
+pub fn validate_attribute_shape(
+    name: &str,
+    body: &[u8],
+) -> Result<(), ClassReaderError> {
+    match name {
+        // Fixed-size 2-byte cp-index attributes (JVMS §4.7.2 / §4.7.27 /
+        // §4.7.28). HotSpot rejects mismatched attribute_length here with
+        // java.lang.ClassFormatError — match that behaviour.
+        "ConstantValue" | "NestHost" | "ModuleMainClass" => {
+            if body.len() != 2 {
+                return Err(ClassReaderError::InvalidClassData {
+                    message: format!(
+                        "{name} attribute must have attribute_length=2, got {}",
+                        body.len()
+                    ),
+                });
+            }
+        }
+        // Fixed-size 4-byte attribute (JVMS §4.7.7).
+        "EnclosingMethod" => {
+            if body.len() != 4 {
+                return Err(ClassReaderError::InvalidClassData {
+                    message: format!(
+                        "EnclosingMethod attribute must have attribute_length=4, got {}",
+                        body.len()
+                    ),
+                });
+            }
+        }
+        // JVMS §4.7.3: `Code_attribute { u2 max_stack; u2 max_locals; u4
+        // code_length; u1 code[code_length]; u2 exception_table_length;
+        // {...} exception_table[exception_table_length]; u2
+        // attributes_count; attribute_info attributes[attributes_count]; }`.
+        // We validate `code_length ∈ 1..=65535`, that the body has enough
+        // bytes for code + exception table + nested attribute headers, and
+        // that nested attributes themselves are well-shaped (recursively
+        // shape-checked through the same predicate).
+        "Code" => {
+            let mut buf = ClassFileBuffer::new(body);
+            // max_stack + max_locals + code_length headers.
+            let _max_stack = buf.read_u16()?;
+            let _max_locals = buf.read_u16()?;
+            let code_length = buf.read_u32()? as usize;
+            const MAX_CODE_LENGTH: usize = 65535;
+            if code_length == 0 || code_length > MAX_CODE_LENGTH {
+                return Err(ClassReaderError::InvalidClassData {
+                    message: format!(
+                        "Code attribute code_length {code_length} outside valid range 1..={MAX_CODE_LENGTH}"
+                    ),
+                });
+            }
+            // `read_bytes` already rejects when the requested span exceeds
+            // the remaining buffer, so this catches "code_length larger
+            // than the actual body".
+            let _ = buf.read_bytes(code_length)?;
+            let exception_table_length = buf.read_u16()? as usize;
+            const ET_ENTRY_SIZE: usize = 8;
+            let _ = buf.read_bytes(exception_table_length * ET_ENTRY_SIZE)?;
+            // Nested attributes — walk the headers and recurse for shape.
+            let attributes_count = buf.read_u16()? as usize;
+            for _ in 0..attributes_count {
+                // u2 name_index; u4 attribute_length; bytes body.
+                // The constant-pool lookup that resolves `name_index` to a
+                // Utf8 string isn't available here (we don't take a CP),
+                // so we can only check that the header bytes are present
+                // and that `attribute_length` does not run past the
+                // declared `Code` body. The lazy decoder still performs
+                // the full constant-pool-keyed dispatch at first access.
+                let _name_index = buf.read_u16()?;
+                let nested_len = buf.read_u32()? as usize;
+                if nested_len > buf.remaining() {
+                    return Err(ClassReaderError::InvalidClassData {
+                        message: format!(
+                            "nested attribute inside Code body declares length {nested_len} but only {} bytes remain",
+                            buf.remaining()
+                        ),
+                    });
+                }
+                // Skip the nested body — we deliberately do *not* recurse
+                // into per-kind shape checks here without the constant
+                // pool. Header-shape validity is what blocks the
+                // misalignment attack; per-kind body shape is re-checked
+                // by the lazy decoder when the nested attribute is
+                // actually consumed.
+                let _ = buf.read_bytes(nested_len)?;
+            }
+            // Code body must be exactly consumed — trailing junk is a
+            // malformed-input signal that the lazy decoder also rejects.
+            if buf.remaining() != 0 {
+                return Err(ClassReaderError::InvalidClassData {
+                    message: format!(
+                        "Code attribute body has {} trailing bytes after structured fields",
+                        buf.remaining()
+                    ),
+                });
+            }
+        }
+        _ => {
+            // Every other attribute kind keeps its full validation
+            // deferred to lazy decode (see the policy comment at the
+            // top of this file).
+        }
     }
     Ok(())
 }

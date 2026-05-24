@@ -116,6 +116,14 @@ struct SigParser<'a> {
     /// Current recursion depth — incremented when descending into a nested
     /// type signature, decremented on the way back out.
     depth: usize,
+    /// Sticky flag: set once any recursive descent (`parse_type_sig`) is
+    /// refused because it would exceed [`MAX_SIG_DEPTH`]. The flag is read by
+    /// the public `parse_*` entry points so that hostile signatures with
+    /// pathological generic nesting (`Lp<Lp<...>;>;`) fail outright instead
+    /// of returning a partial parse — the `parse_type_args` loop otherwise
+    /// silently `break`s on the inner `None` and the outer
+    /// `parse_class_type_sig` returns `Some(...)`.
+    depth_exceeded: bool,
 }
 
 impl<'a> SigParser<'a> {
@@ -124,6 +132,7 @@ impl<'a> SigParser<'a> {
             input: s.as_bytes(),
             pos: 0,
             depth: 0,
+            depth_exceeded: false,
         }
     }
 
@@ -228,8 +237,15 @@ impl<'a> SigParser<'a> {
 
     fn parse_type_sig(&mut self) -> Option<TypeSig> {
         // Bound recursion on untrusted input — nested generics and array
-        // dimensions both descend through this function.
+        // dimensions both descend through this function. We *also* latch
+        // `depth_exceeded` so callers up-stack of `parse_type_args` (which
+        // intentionally `break`s on an inner `None` to handle malformed
+        // type-arg lists gracefully) can still distinguish a depth-guard
+        // refusal from a normal end-of-list. Without the sticky flag a
+        // pathological `Lp<Lp<...>;>;` signature returns `Some(partial)`
+        // from the outermost `parse_class_type_sig`, defeating the guard.
         if self.depth >= MAX_SIG_DEPTH {
+            self.depth_exceeded = true;
             return None;
         }
         self.depth += 1;
@@ -392,17 +408,30 @@ impl<'a> SigParser<'a> {
 
 /// Parse a class signature string.
 pub fn parse_class_signature(sig: &str) -> Option<ClassSig> {
-    SigParser::new(sig).parse_class_sig()
+    let mut p = SigParser::new(sig);
+    let r = p.parse_class_sig();
+    if p.depth_exceeded { None } else { r }
 }
 
 /// Parse a method signature string.
 pub fn parse_method_signature(sig: &str) -> Option<MethodSig> {
-    SigParser::new(sig).parse_method_sig()
+    let mut p = SigParser::new(sig);
+    let r = p.parse_method_sig();
+    if p.depth_exceeded { None } else { r }
 }
 
 /// Parse a field signature string (a single reference type signature).
+///
+/// Returns `None` if the input is malformed *or* if any nested recursion
+/// hit the `MAX_SIG_DEPTH` cap. The depth-guard latches the parser's
+/// `depth_exceeded` flag so that hostile signatures whose inner failure is
+/// otherwise swallowed by `parse_type_args`' `break`-on-`None` loop still
+/// surface as a hard reject (see also the in-crate regression test
+/// `deeply_nested_signature_is_rejected_not_overflow`).
 pub fn parse_field_signature(sig: &str) -> Option<TypeSig> {
-    SigParser::new(sig).parse_type_sig()
+    let mut p = SigParser::new(sig);
+    let r = p.parse_type_sig();
+    if p.depth_exceeded { None } else { r }
 }
 
 // ---------------------------------------------------------------------------
