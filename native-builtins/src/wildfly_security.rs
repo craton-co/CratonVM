@@ -72,7 +72,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -707,35 +707,41 @@ impl Drop for IdentityGuard {
 // ===========================================================================
 
 /// Map from a Java-side synthetic `Subject` / `LoginContext` object to
-/// its Rust-side handle.  Keyed on the `ObjectRef`'s usize value so we
-/// don't need to pay the cost of wrapping every native call in a
-/// `Mutex<HashMap<ObjectRef, ...>>` with a custom hasher.
-static SUBJECT_HANDLES: OnceLock<RwLock<HashMap<usize, Arc<Subject>>>> = OnceLock::new();
-static LOGIN_CONTEXT_HANDLES: OnceLock<RwLock<HashMap<usize, Arc<LoginContext>>>> = OnceLock::new();
-static DOMAIN_SERVICE_HANDLES: OnceLock<RwLock<HashMap<usize, Arc<SecurityDomainService>>>> =
+/// its Rust-side handle.  Keyed on `NativeContext::identity_hash_code(obj)`,
+/// which is GC-stable: `HashCodeTable::update_after_gc` remaps the
+/// per-object hash code when the GC relocates the Java object during
+/// compaction (see `gc/src/compact_header.rs`).  Earlier keying on
+/// `obj.as_ptr() as usize` orphaned every Subject / LoginContext after
+/// the first compaction cycle — `Subject.getPrincipals()` returned the
+/// "defensive empty set" branch and `LoginContext.login()` raised
+/// `IllegalStateException` for a context that *was* initialised.  Same
+/// fix class as C12/C13/C14/C15; canonical reference is
+/// `lang_invoke::VH_META_TABLE` at
+/// `native-builtins/src/lang_invoke.rs:178-203`.
+static SUBJECT_HANDLES: OnceLock<RwLock<HashMap<i32, Arc<Subject>>>> = OnceLock::new();
+static LOGIN_CONTEXT_HANDLES: OnceLock<RwLock<HashMap<i32, Arc<LoginContext>>>> = OnceLock::new();
+static DOMAIN_SERVICE_HANDLES: OnceLock<RwLock<HashMap<i32, Arc<SecurityDomainService>>>> =
     OnceLock::new();
-static IDENTITY_HANDLES: OnceLock<RwLock<HashMap<usize, Arc<SecurityIdentity>>>> = OnceLock::new();
+static IDENTITY_HANDLES: OnceLock<RwLock<HashMap<i32, Arc<SecurityIdentity>>>> = OnceLock::new();
 
-fn subject_handles() -> &'static RwLock<HashMap<usize, Arc<Subject>>> {
+fn subject_handles() -> &'static RwLock<HashMap<i32, Arc<Subject>>> {
     SUBJECT_HANDLES.get_or_init(|| RwLock::new(HashMap::new()))
 }
-fn login_context_handles() -> &'static RwLock<HashMap<usize, Arc<LoginContext>>> {
+fn login_context_handles() -> &'static RwLock<HashMap<i32, Arc<LoginContext>>> {
     LOGIN_CONTEXT_HANDLES.get_or_init(|| RwLock::new(HashMap::new()))
 }
-fn domain_service_handles() -> &'static RwLock<HashMap<usize, Arc<SecurityDomainService>>> {
+fn domain_service_handles() -> &'static RwLock<HashMap<i32, Arc<SecurityDomainService>>> {
     DOMAIN_SERVICE_HANDLES.get_or_init(|| RwLock::new(HashMap::new()))
 }
-fn identity_handles() -> &'static RwLock<HashMap<usize, Arc<SecurityIdentity>>> {
+fn identity_handles() -> &'static RwLock<HashMap<i32, Arc<SecurityIdentity>>> {
     IDENTITY_HANDLES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn obj_key(obj: ObjectRef) -> usize {
-    // ObjectRef wraps a heap pointer; its raw pointer value is a stable,
-    // per-object identity within a VM run (GC compaction would invalidate
-    // this, but the handle map is only consulted on the same call that
-    // populated it — field lookups always re-resolve through the same
-    // ObjectRef).
-    obj.as_ptr() as usize
+fn obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+    // GC-stable identity hash code; survives compaction via
+    // `HashCodeTable::update_after_gc`.  See module-level docs for why
+    // the earlier `obj.as_ptr() as usize` keying was incorrect.
+    ctx.identity_hash_code(obj)
 }
 
 fn next_oid() -> u64 {
@@ -750,18 +756,31 @@ fn next_oid() -> u64 {
 fn native_subject_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let subject = Subject::new();
-    subject_handles().write().insert(obj_key(this), subject);
+    let key = obj_key(ctx, this);
+    subject_handles().write().insert(key, subject);
     // Field 0 = principals, Field 1 = publicCreds, Field 2 =
     // privateCreds; we leave them null because real bytecode never
     // reads the raw sets directly (goes via getPrincipals()).  A
     // handle-attach token written to the identity-hash-code slot is
     // pointless — Java code stores its Subject by reference.
-    let _ = ctx;
     Ok(None)
 }
 
-fn get_subject_from_this(this: ObjectRef) -> Option<Arc<Subject>> {
-    subject_handles().read().get(&obj_key(this)).cloned()
+fn get_subject_from_this(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Arc<Subject>> {
+    let key = obj_key(ctx, this);
+    subject_handles().read().get(&key).cloned()
+}
+
+/// Loud post-GC missing-state error.  After re-keying on the GC-stable
+/// identity hash code the only way to miss is when the receiver was
+/// never produced by `<init>` — caller bug, not a GC artefact.  Matches
+/// the C14 MessageDigest precedent (prefer `IllegalStateException` over
+/// the previous silent "defensive empty set" fallback).
+fn subject_missing_err() -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: "Subject state missing post-GC or never initialized".into(),
+    }
+    .into()
 }
 
 fn native_subject_get_principals(
@@ -769,11 +788,8 @@ fn native_subject_get_principals(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(subject) = get_subject_from_this(this) else {
-        // Defensive: an uninitialized synthetic Subject returns an
-        // empty set rather than NPEing.
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        return Ok(Some(Value::Object(Some(set))));
+    let Some(subject) = get_subject_from_this(ctx, this) else {
+        return Err(subject_missing_err());
     };
     let principals = subject.get_principals();
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
@@ -788,9 +804,8 @@ fn native_subject_get_private_credentials(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(subject) = get_subject_from_this(this) else {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        return Ok(Some(Value::Object(Some(set))));
+    let Some(subject) = get_subject_from_this(ctx, this) else {
+        return Err(subject_missing_err());
     };
     let creds = subject.get_private_credentials();
     // Do NOT log the credential bytes; use redact_private.
@@ -805,9 +820,8 @@ fn native_subject_get_public_credentials(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(subject) = get_subject_from_this(this) else {
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-        return Ok(Some(Value::Object(Some(set))));
+    let Some(subject) = get_subject_from_this(ctx, this) else {
+        return Err(subject_missing_err());
     };
     let creds = subject.get_public_credentials();
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
@@ -826,10 +840,15 @@ fn native_subject_do_as(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
     // Install the subject for the scope of action.run().  The
     // SubjectGuard ensures restoration even if run() panics or
-    // returns an Err.
-    let subject = subject_obj
-        .and_then(get_subject_from_this)
-        .unwrap_or_else(Subject::new);
+    // returns an Err.  If the caller passes a non-null Subject ref
+    // whose handle is missing, that's a caller bug (after the GC-key
+    // fix it cannot be a relocation artefact) — surface it loudly.
+    let subject = if let Some(s_obj) = subject_obj {
+        get_subject_from_this(ctx, s_obj).ok_or_else(subject_missing_err)?
+    } else {
+        // Null Subject is JDK-conformant: doAs runs unauthenticated.
+        Subject::new()
+    };
     let _g = SubjectGuard::push(subject);
     ctx.invoke_virtual(action, "run", "()Ljava/lang/Object;", &[])
 }
@@ -854,14 +873,20 @@ fn native_login_context_init(
     // Try to resolve a registered domain by name; fall back to an
     // empty chain so LoginContext.<init> never fails just because a
     // domain wasn't registered (real JAAS defers until login()).
-    let subject = subject_obj
-        .and_then(get_subject_from_this)
-        .unwrap_or_else(Subject::new);
+    // A non-null Subject ref whose handle isn't recognised is a
+    // caller bug (post-GC-key fix it can't be a relocation artefact)
+    // — surface loudly.
+    let subject = if let Some(s_obj) = subject_obj {
+        get_subject_from_this(ctx, s_obj).ok_or_else(subject_missing_err)?
+    } else {
+        Subject::new()
+    };
     let modules = lookup_security_domain(&name)
         .map(|d| d.policy.modules.clone())
         .unwrap_or_default();
     let lc = LoginContext::new(name, subject, modules);
-    login_context_handles().write().insert(obj_key(this), lc);
+    let key = obj_key(ctx, this);
+    login_context_handles().write().insert(key, lc);
 
     // Field 0 = name — we write a placeholder Long so real-JDK mode
     // doesn't trip on a null while reflectively dumping the context.
@@ -869,20 +894,28 @@ fn native_login_context_init(
     Ok(None)
 }
 
-fn get_login_context_from_this(this: ObjectRef) -> Option<Arc<LoginContext>> {
-    login_context_handles().read().get(&obj_key(this)).cloned()
+fn get_login_context_from_this(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Option<Arc<LoginContext>> {
+    let key = obj_key(ctx, this);
+    login_context_handles().read().get(&key).cloned()
+}
+
+fn login_context_missing_err() -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: "LoginContext state missing post-GC or never initialized".into(),
+    }
+    .into()
 }
 
 fn native_login_context_login(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(lc) = get_login_context_from_this(this) else {
-        return Err(RuntimeError::IllegalStateException {
-            message: "LoginContext.login() on uninitialized context".into(),
-        }
-        .into());
+    let Some(lc) = get_login_context_from_this(ctx, this) else {
+        return Err(login_context_missing_err());
     };
     let result = lc.login();
     if !result.success {
@@ -895,11 +928,15 @@ fn native_login_context_login(
 }
 
 fn native_login_context_logout(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if let Some(lc) = get_login_context_from_this(this) {
+    // `logout()` on an unknown LoginContext is left as a no-op so
+    // shutdown paths that race with finalisation don't observe a
+    // spurious exception — the receiver having no handle here is
+    // benign (nothing to release).
+    if let Some(lc) = get_login_context_from_this(ctx, this) {
         lc.logout();
     }
     Ok(None)
@@ -910,11 +947,15 @@ fn native_login_context_get_subject(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let Some(lc) = get_login_context_from_this(this) else {
-        return Ok(Some(Value::Object(None)));
+    let Some(lc) = get_login_context_from_this(ctx, this) else {
+        // Post-GC-key fix: missing state is a caller bug, not a
+        // relocation artefact.  Surface loudly instead of returning
+        // a silent null (which earlier code did).
+        return Err(login_context_missing_err());
     };
     let subject_obj = alloc_concurrent_synthetic(ctx, "javax/security/auth/Subject", 3);
-    subject_handles().write().insert(obj_key(subject_obj), lc.get_subject());
+    let key = obj_key(ctx, subject_obj);
+    subject_handles().write().insert(key, lc.get_subject());
     Ok(Some(Value::Object(Some(subject_obj))))
 }
 
@@ -935,12 +976,22 @@ fn native_security_identity_get_roles(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+    let key = obj_key(ctx, this);
     let count = identity_handles()
         .read()
-        .get(&obj_key(this))
+        .get(&key)
         .map(|id| id.roles.len())
-        .unwrap_or(0);
+        // Post-GC-key fix: missing state is a caller bug.  Surface
+        // loudly instead of silently reporting an empty role set
+        // (which would have masked the previous GC-aliasing
+        // regression).
+        .ok_or_else(|| -> MethodCallFailed {
+            RuntimeError::IllegalStateException {
+                message: "SecurityIdentity state missing post-GC or never initialized".into(),
+            }
+            .into()
+        })?;
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
     ctx.set_field(set, 1, Value::Int(count as i32));
     Ok(Some(Value::Object(Some(set))))
 }
@@ -953,13 +1004,17 @@ fn native_security_identity_run_as(
     let this = obj_arg(args, 0)?;
     let callable = obj_arg(args, 1)?;
 
-    if let Some(identity) = identity_handles().read().get(&obj_key(this)).cloned() {
+    let key = obj_key(ctx, this);
+    if let Some(identity) = identity_handles().read().get(&key).cloned() {
         let _g = IdentityGuard::push(identity);
         ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[])
     } else {
         // Unknown identity — call without elevation.  Matches the
         // JDK's behaviour of silently running the callable when the
-        // current identity isn't tagged.
+        // current identity isn't tagged.  The "run without elevation"
+        // fallback is intentional (and pre-existed the C-series GC
+        // fix) — `runAs` is documented to be safe to call even when
+        // the identity wasn't registered on our side.
         ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[])
     }
 }

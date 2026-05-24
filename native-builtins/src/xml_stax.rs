@@ -29,7 +29,13 @@
 //!     `invokevirtual` / `invokeinterface` to find the override.
 //!
 //! State is held in a process-wide side-table keyed by the reader's
-//! `ObjectRef` pointer (mirrors `t27_tls::sock_alpn_table`).
+//! GC-stable identity hash code (see `NativeContext::identity_hash_code`,
+//! remapped across compaction by `HashCodeTable::update_after_gc` in
+//! `gc/src/compact_header.rs`).  The earlier `obj.as_ptr() as usize`
+//! keying was orphaned by a moving collector, after which subsequent
+//! `next()` / `getEventType()` calls silently fell back to defaults —
+//! mirrors the WP4.2 / Round-9 fix in `lang_invoke::VH_META_TABLE`
+//! (`native-builtins/src/lang_invoke.rs:178-203`).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -100,32 +106,58 @@ impl ReaderState {
 }
 
 // ---------------------------------------------------------------------------
-// Side-table keyed by reader ObjectRef pointer.
+// Side-table keyed by reader identity hash code (GC-stable; see module docs).
 // ---------------------------------------------------------------------------
 
-fn reader_table() -> &'static Mutex<HashMap<usize, ReaderState>> {
-    static T: OnceLock<Mutex<HashMap<usize, ReaderState>>> = OnceLock::new();
+fn reader_table() -> &'static Mutex<HashMap<i32, ReaderState>> {
+    static T: OnceLock<Mutex<HashMap<i32, ReaderState>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn obj_key(o: ObjectRef) -> usize {
-    o.as_ptr() as usize
+fn obj_key(ctx: &dyn NativeContext, o: ObjectRef) -> i32 {
+    // `identity_hash_code` is GC-stable: `HashCodeTable::update_after_gc`
+    // remaps the table when the GC relocates an object, so the key the
+    // side-table was inserted under continues to resolve the same
+    // ReaderState entry after a compaction cycle.
+    ctx.identity_hash_code(o)
 }
 
-fn store_state(reader: ObjectRef, state: ReaderState) {
-    reader_table().lock().insert(obj_key(reader), state);
+fn store_state(ctx: &dyn NativeContext, reader: ObjectRef, state: ReaderState) {
+    reader_table().lock().insert(obj_key(ctx, reader), state);
 }
 
-fn with_state<F, R>(reader: ObjectRef, f: F) -> Option<R>
+fn with_state<F, R>(ctx: &dyn NativeContext, reader: ObjectRef, f: F) -> Option<R>
 where
     F: FnOnce(&mut ReaderState) -> R,
 {
+    let key = obj_key(ctx, reader);
     let mut tbl = reader_table().lock();
-    tbl.get_mut(&obj_key(reader)).map(f)
+    tbl.get_mut(&key).map(f)
 }
 
-fn drop_state(reader: ObjectRef) {
-    reader_table().lock().remove(&obj_key(reader));
+fn drop_state(ctx: &dyn NativeContext, reader: ObjectRef) {
+    let key = obj_key(ctx, reader);
+    reader_table().lock().remove(&key);
+}
+
+/// Loud post-GC missing-state guard.  Returns Err with a clear
+/// IllegalStateException when the receiver has no entry — after the
+/// identity-hash-code re-key the only way to hit this is when the
+/// receiver was never produced by our `createXMLStreamReader`, i.e. a
+/// caller bug rather than a GC artefact.  Matches the C14
+/// MessageDigest precedent (loud `IllegalStateException` over silent
+/// fallback).
+fn require_state(ctx: &dyn NativeContext, reader: ObjectRef) -> Result<(), MethodCallFailed> {
+    let key = obj_key(ctx, reader);
+    if reader_table().lock().contains_key(&key) {
+        Ok(())
+    } else {
+        Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IllegalStateException {
+                message: "XMLStreamReader state missing post-GC or never initialized".into(),
+            },
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +424,7 @@ fn native_create_reader_from_input_stream(
     let bytes = drain_input_stream(ctx, stream);
     let events = parse_to_events(&bytes);
     let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
-    store_state(reader, ReaderState { events, cursor: 0 });
+    store_state(ctx, reader, ReaderState { events, cursor: 0 });
     Ok(Some(Value::Object(Some(reader))))
 }
 
@@ -446,13 +478,14 @@ fn native_create_reader_from_reader(
     }
     let events = parse_to_events(text.as_bytes());
     let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
-    store_state(reader, ReaderState { events, cursor: 0 });
+    store_state(ctx, reader, ReaderState { events, cursor: 0 });
     Ok(Some(Value::Object(Some(reader))))
 }
 
-fn native_has_next(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
-    let has = with_state(this, |s| {
+    require_state(ctx, this)?;
+    let has = with_state(ctx, this, |s| {
         let next = (s.cursor + 1) as usize;
         next < s.events.len()
     })
@@ -460,9 +493,10 @@ fn native_has_next(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Int(if has { 1 } else { 0 })))
 }
 
-fn native_next(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
-    let kind = with_state(this, |s| {
+    require_state(ctx, this)?;
+    let kind = with_state(ctx, this, |s| {
         s.cursor += 1;
         s.current().map(|e| e.kind).unwrap_or(END_DOCUMENT)
     })
@@ -470,9 +504,10 @@ fn native_next(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     Ok(Some(Value::Int(kind)))
 }
 
-fn native_get_event_type(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_get_event_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
-    let kind = with_state(this, |s| s.current().map(|e| e.kind).unwrap_or(START_DOCUMENT))
+    require_state(ctx, this)?;
+    let kind = with_state(ctx, this, |s| s.current().map(|e| e.kind).unwrap_or(START_DOCUMENT))
         .unwrap_or(START_DOCUMENT);
     Ok(Some(Value::Int(kind)))
 }
@@ -483,7 +518,8 @@ fn current_string<F: FnOnce(&StaxEvent) -> String>(
     f: F,
 ) -> MethodCallResult {
     let this = this_obj(args)?;
-    let s = with_state(this, |st| st.current().map(f).unwrap_or_default()).unwrap_or_default();
+    require_state(ctx, this)?;
+    let s = with_state(ctx, this, |st| st.current().map(f).unwrap_or_default()).unwrap_or_default();
     let obj = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -505,6 +541,7 @@ fn native_get_attribute_value_named(
     args: &[Value],
 ) -> MethodCallResult {
     let this = this_obj(args)?;
+    require_state(ctx, this)?;
     // args: [this, namespaceURI (nullable), localName]
     let ns = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
@@ -514,7 +551,7 @@ fn native_get_attribute_value_named(
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
-    let found = with_state(this, |st| {
+    let found = with_state(ctx, this, |st| {
         st.current().and_then(|e| {
             e.attributes
                 .iter()
@@ -536,11 +573,12 @@ fn native_get_attribute_value_indexed(
     args: &[Value],
 ) -> MethodCallResult {
     let this = this_obj(args)?;
+    require_state(ctx, this)?;
     let idx = match args.get(1) {
         Some(Value::Int(i)) => *i,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let found = with_state(this, |st| {
+    let found = with_state(ctx, this, |st| {
         st.current()
             .and_then(|e| e.attributes.get(idx as usize).map(|a| a.value.clone()))
     })
@@ -556,11 +594,12 @@ fn native_get_attribute_local_name(
     args: &[Value],
 ) -> MethodCallResult {
     let this = this_obj(args)?;
+    require_state(ctx, this)?;
     let idx = match args.get(1) {
         Some(Value::Int(i)) => *i,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let found = with_state(this, |st| {
+    let found = with_state(ctx, this, |st| {
         st.current()
             .and_then(|e| e.attributes.get(idx as usize).map(|a| a.local_name.clone()))
     })
@@ -571,40 +610,46 @@ fn native_get_attribute_local_name(
     }
 }
 
-fn native_get_attribute_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_get_attribute_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
-    let n = with_state(this, |st| {
+    require_state(ctx, this)?;
+    let n = with_state(ctx, this, |st| {
         st.current().map(|e| e.attributes.len() as i32).unwrap_or(0)
     })
     .unwrap_or(0);
     Ok(Some(Value::Int(n)))
 }
 
-fn native_close(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
-    drop_state(this);
+    // `close()` is allowed on a never-seen receiver (no-op) — spec
+    // says close() must not throw, so we deliberately do not invoke
+    // `require_state` here.
+    drop_state(ctx, this);
     Ok(None)
 }
 
-fn native_is_kind(args: &[Value], expected: i32) -> MethodCallResult {
+fn native_is_kind(ctx: &mut dyn NativeContext, args: &[Value], expected: i32) -> MethodCallResult {
     let this = this_obj(args)?;
-    let yes = with_state(this, |st| st.current().map(|e| e.kind == expected).unwrap_or(false))
+    require_state(ctx, this)?;
+    let yes = with_state(ctx, this, |st| st.current().map(|e| e.kind == expected).unwrap_or(false))
         .unwrap_or(false);
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
 }
 
-fn native_is_start_element(_c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
-    native_is_kind(a, START_ELEMENT)
+fn native_is_start_element(c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
+    native_is_kind(c, a, START_ELEMENT)
 }
-fn native_is_end_element(_c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
-    native_is_kind(a, END_ELEMENT)
+fn native_is_end_element(c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
+    native_is_kind(c, a, END_ELEMENT)
 }
-fn native_is_characters(_c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
-    native_is_kind(a, CHARACTERS)
+fn native_is_characters(c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
+    native_is_kind(c, a, CHARACTERS)
 }
-fn native_is_whitespace(_c: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
+fn native_is_whitespace(ctx: &mut dyn NativeContext, a: &[Value]) -> MethodCallResult {
     let this = this_obj(a)?;
-    let yes = with_state(this, |st| {
+    require_state(ctx, this)?;
+    let yes = with_state(ctx, this, |st| {
         st.current()
             .map(|e| {
                 (e.kind == CHARACTERS || e.kind == CDATA)
