@@ -667,9 +667,17 @@ mod tests {
 
     #[test]
     fn test_stream_with_flight_recorder() {
+        // Round-4/5 (C33): `emit_*` writes through the per-thread ring;
+        // events are not visible in the recording's repository (and so not
+        // in the stream's polled slice) until
+        // `drain_per_thread_into_repository` runs. Each emit batch below is
+        // followed by an explicit drain. Baseline drain at the start clears
+        // any stragglers from other tests running in parallel.
         let mut fr = crate::create_flight_recorder();
         let rid = fr.new_recording(crate::recording::RecordingSettings::new("stream-test"));
         fr.start_recording(rid);
+
+        let _ = crate::repository::global_ring_registry().drain_all();
 
         let rec = fr.get_recording(rid).unwrap();
         let mut stream = EventStream::new(rec.repository());
@@ -678,6 +686,7 @@ mod tests {
         crate::builtin::emit_gc_event(&mut fr, 1, "G1", "Alloc", 1000, 500);
         crate::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2000);
 
+        fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
         assert_eq!(events.len(), 2);
@@ -685,6 +694,7 @@ mod tests {
         // Emit one more
         crate::builtin::emit_class_load_event(&mut fr, "java/lang/Object", "boot", "boot", 3000, 100);
 
+        fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
         assert_eq!(events.len(), 1);
@@ -698,11 +708,17 @@ mod tests {
 
     #[test]
     fn test_stream_filter_by_event_type_name() {
+        // Same per-thread-ring contract as above: drain after emits before
+        // the polled stream slice is materialised. The stream filter is what
+        // we're actually exercising — it must accept only `gc_type_id`
+        // events.
         let mut fr = crate::create_flight_recorder();
         let gc_type_id = fr.type_registry.find_by_name("jdk.GarbageCollection").unwrap();
 
         let rid = fr.new_recording(crate::recording::RecordingSettings::new("filter-test"));
         fr.start_recording(rid);
+
+        let _ = crate::repository::global_ring_registry().drain_all();
 
         let rec = fr.get_recording(rid).unwrap();
         let mut stream = EventStream::new(rec.repository());
@@ -712,6 +728,7 @@ mod tests {
         crate::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2000);
         crate::builtin::emit_gc_event(&mut fr, 2, "G1", "Alloc", 3000, 300);
 
+        fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
         let events = stream.poll(rec.repository());
         assert_eq!(events.len(), 2);

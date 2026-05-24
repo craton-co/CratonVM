@@ -328,6 +328,11 @@ mod tests {
 
     #[test]
     fn test_multiple_simultaneous_recordings() {
+        // Round-4/5 (C33): `record_event` now writes into the per-thread
+        // ring rather than directly into each recording's repository.
+        // Tests must drain the rings via `drain_per_thread_into_repository`
+        // before observing `event_count()`. Baseline drains keep cross-test
+        // stragglers from leaking into our assertions.
         let mut fr = create_flight_recorder();
         let r1 = fr.new_recording(RecordingSettings::new("rec1"));
         let r2 = fr.new_recording(RecordingSettings::new("rec2"));
@@ -335,17 +340,26 @@ mod tests {
         fr.start_recording(r2);
         assert_eq!(fr.active_recording_count(), 2);
 
+        // Clear anything already in the per-thread rings before our first push.
+        let _ = global_ring_registry().drain_all();
+
         let evt = make_event(EventTypeId(1), 100, 200);
         fr.record_event(evt);
 
+        fr.drain_per_thread_into_repository();
         assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
         assert_eq!(fr.get_recording(r2).unwrap().event_count(), 1);
 
         fr.stop_recording(r1);
         assert_eq!(fr.active_recording_count(), 1);
 
+        // Drain again so the post-stop emit's effects can be observed
+        // cleanly relative to the running r2 recording only.
+        let _ = global_ring_registry().drain_all();
+
         let evt2 = make_event(EventTypeId(1), 300, 400);
         fr.record_event(evt2);
+        fr.drain_per_thread_into_repository();
         assert_eq!(fr.get_recording(r1).unwrap().event_count(), 1);
         assert_eq!(fr.get_recording(r2).unwrap().event_count(), 2);
     }

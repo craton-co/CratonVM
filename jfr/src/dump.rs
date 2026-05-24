@@ -1608,7 +1608,12 @@ mod tests {
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
-        assert!(header.checkpoint_offset > HEADER_SIZE);
+        // J1 (round-2) layout: checkpoint section sits immediately after the
+        // file header (so readers resolve the string pool before walking
+        // events). Previously the writer emitted events first and the
+        // checkpoint last, so `checkpoint_offset > HEADER_SIZE` held.
+        assert_eq!(header.checkpoint_offset, HEADER_SIZE);
+        assert!(header.metadata_offset > header.checkpoint_offset);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
@@ -1793,11 +1798,19 @@ mod tests {
         let drained = global_ring_registry().drain_all();
         let _file_size = dump_to_file(&path, &repo, &reg, 0, 0, drained, false).unwrap();
 
-        // Header should be valid
+        // Header should be valid.
+        // J1 (round-2) layout: checkpoint section now precedes the event
+        // region (so readers resolve the string pool before walking events),
+        // meaning `checkpoint_offset == HEADER_SIZE` regardless of how many
+        // events were drained. The previous `> HEADER_SIZE` assertion was
+        // checking the old "events first, checkpoint last" layout. Verify
+        // there *are* events by asserting metadata_offset sits past the
+        // checkpoint payload plus the serialized events.
         let header = read_jfr_header(&path).unwrap();
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
-        assert!(header.checkpoint_offset > HEADER_SIZE,
-            "events region should be non-empty after draining rings");
+        assert_eq!(header.checkpoint_offset, HEADER_SIZE);
+        assert!(header.metadata_offset > header.checkpoint_offset,
+            "metadata should sit past checkpoint + events region");
 
         // Read events back and verify each pushed event is present.
         let events = read_events(&path, &reg).unwrap();
@@ -1893,15 +1906,28 @@ mod tests {
 
     #[test]
     fn test_dump_file_complete_lifecycle() {
-        // Full lifecycle: create FlightRecorder, record events, dump, verify
+        // Round-4/5 (C33): `emit_*` writes into the per-thread ring rather
+        // than the recording's repository. `drain_per_thread_into_repository`
+        // (or `dump_recording`, which calls it internally) is required to
+        // make events visible to `event_count()` / `get_events()`. We baseline
+        // the ring first so cross-test stragglers don't inflate our count.
+        //
+        // Round-5 wire-format change: the writer now emits
+        // `JFR_VERSION_MINOR = 1` (delta-encoded timestamps). The previous
+        // assertion `header.minor == 0` was stale.
         let mut fr = crate::create_flight_recorder();
         let rid = fr.new_recording(crate::recording::RecordingSettings::new("dump-test"));
         fr.start_recording(rid);
+
+        let _ = crate::repository::global_ring_registry().drain_all();
 
         crate::builtin::emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1_000_000, 500_000);
         crate::builtin::emit_thread_start_event(&mut fr, "main", "", 1, 2_000_000);
         crate::builtin::emit_class_load_event(&mut fr, "java/lang/Object", "bootstrap", "bootstrap", 3_000_000, 100_000);
 
+        // Drain ring shards into the recording's repository before stopping
+        // so the snapshot below reflects the three emitted events.
+        fr.drain_per_thread_into_repository();
         fr.stop_recording(rid);
 
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -1927,12 +1953,14 @@ mod tests {
         let header = read_jfr_header(&path).unwrap();
 
         assert_eq!(header.magic, JFR_MAGIC);
-        assert_eq!(header.major, 2);
-        assert_eq!(header.minor, 0);
+        assert_eq!(header.major, JFR_VERSION_MAJOR);
+        assert_eq!(header.minor, JFR_VERSION_MINOR);
         assert_eq!(header.file_state, FILE_STATE_COMPLETE);
         assert_eq!(header.file_size, file_size);
         assert_eq!(header.ticks_per_second, TICKS_PER_SECOND);
-        assert!(header.checkpoint_offset > HEADER_SIZE);
+        // J1 (round-2) layout: checkpoint section sits immediately after the
+        // header. Previously the writer placed it after the event region.
+        assert_eq!(header.checkpoint_offset, HEADER_SIZE);
         assert!(header.metadata_offset > header.checkpoint_offset);
 
         let _ = std::fs::remove_file(&path);
