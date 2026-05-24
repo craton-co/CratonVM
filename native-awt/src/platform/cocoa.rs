@@ -13,7 +13,8 @@ use objc2::runtime::AnyObject;
 use objc2::{msg_send, ClassType};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventType, NSFont,
-    NSPasteboard, NSPasteboardTypeString, NSView, NSWindow, NSWindowStyleMask,
+    NSFontAttributeName, NSPasteboard, NSPasteboardTypeString, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     CGPoint, CGRect, CGSize, MainThreadMarker, NSPoint, NSRect, NSSize, NSString,
@@ -332,85 +333,105 @@ impl PlatformBackend for CocoaBackend {
     ) -> Result<(), PlatformError> {
         let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
 
-        if (width * height) as usize > pixels.len() {
+        if (width as usize)
+            .checked_mul(height as usize)
+            .map(|n| n > pixels.len())
+            .unwrap_or(true)
+        {
             return Err(PlatformError::CreationFailed("pixel buffer too small".into()));
         }
 
-        // Use Core Graphics to create a bitmap context and draw it.
-        // This requires objc2-core-graphics or raw CG calls. For now
-        // we use NSBitmapImageRep via the view's lockFocus pattern.
+        // Core Graphics blit using the **C ABI** entry points (the previous
+        // version of this function sent Objective-C selectors to symbols
+        // (`CGColorSpace`, `CGDataProvider`, `CGImage`) that are
+        // CoreFoundation types, not Objective-C classes — so every call
+        // either no-op'd or aborted with "unrecognized selector". The
+        // function below links the real C symbols (declared in the
+        // `core_graphics` extern block at the bottom of this file) and
+        // releases every CF handle it creates via `CFRelease`.
         //
-        // In practice the Java2D software renderer will blit through
-        // a CGImage backed by the pixel buffer. The full CG path
-        // requires the "CoreGraphics" feature. We store the buffer
-        // for the next drawRect.
-        //
-        // Minimal approach: use CGContextRef from lockFocus.
+        // Layout: ARGB32 little-endian (the format the software renderer
+        // emits). CGBitmapInfo flags select
+        //   kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+        // so that a `u32` of `0xAARRGGBB` is interpreted byte-for-byte as
+        // (B, G, R, A) on a little-endian host, matching the renderer's
+        // pre-multiplied output. Memory ordering matches the existing
+        // Win32 GDI path; see `core_graphics` extern block for the C API
+        // contract.
         unsafe {
-            if info.view.lockFocusIfCanDraw() {
-                // Get the current graphics context and draw pixel data.
-                // objc2-app-kit provides NSGraphicsContext, from which we
-                // can obtain a CGContextRef. Full implementation requires
-                // objc2-core-graphics; for now we do a
-                // CGBitmapContextCreate → CGImageCreate → draw dance via
-                // raw objc messages.
-
-                let cg_colorspace: *mut AnyObject =
-                    msg_send![objc2::class!(CGColorSpace), deviceRGBColorSpace];
-
-                // Create CGDataProvider from pixel data.
-                let data_ptr = pixels.as_ptr() as *const std::ffi::c_void;
-                let data_len = (width * height * 4) as usize;
-
-                let provider: *mut AnyObject = msg_send![
-                    objc2::class!(CGDataProvider),
-                    dataProviderWithData: std::ptr::null::<std::ffi::c_void>(),
-                    data: data_ptr,
-                    size: data_len,
-                    releaseData: std::ptr::null::<std::ffi::c_void>()
-                ];
-
-                if !provider.is_null() {
-                    let bits_per_component: usize = 8;
-                    let bits_per_pixel: usize = 32;
-                    let bytes_per_row: usize = (width * 4) as usize;
-                    // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = 0x2002
-                    let bitmap_info: u32 = 0x2002;
-
-                    let cg_image: *mut AnyObject = msg_send![
-                        objc2::class!(CGImage),
-                        imageWithWidth: width as usize,
-                        height: height as usize,
-                        bitsPerComponent: bits_per_component,
-                        bitsPerPixel: bits_per_pixel,
-                        bytesPerRow: bytes_per_row,
-                        colorSpace: cg_colorspace,
-                        bitmapInfo: bitmap_info,
-                        provider: provider,
-                        decode: std::ptr::null::<f64>(),
-                        shouldInterpolate: false,
-                        intent: 0u32 // kCGRenderingIntentDefault
-                    ];
-
-                    if !cg_image.is_null() {
-                        // Draw into the current NSGraphicsContext.
-                        let ns_gc = objc2_app_kit::NSGraphicsContext::currentContext(self.mtm);
-                        if let Some(gc) = ns_gc {
-                            let cg_ctx: *mut AnyObject = msg_send![&gc, CGContext];
-                            if !cg_ctx.is_null() {
-                                let rect = CGRect::new(
-                                    CGPoint::new(0.0, 0.0),
-                                    CGSize::new(width as f64, height as f64),
-                                );
-                                let _: () =
-                                    msg_send![cg_ctx, drawImage: cg_image, inRect: rect];
-                            }
-                        }
-                    }
-                }
-
-                info.view.unlockFocus();
+            if !info.view.lockFocusIfCanDraw() {
+                return Ok(());
             }
+
+            // Wrap unlock-on-drop so an early `return` from a fallible CG
+            // step still calls `unlockFocus` (otherwise the next `drawRect:`
+            // would assert).
+            struct LockGuard<'a>(&'a NSView);
+            impl Drop for LockGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.unlockFocus();
+                }
+            }
+            let _guard = LockGuard(&info.view);
+
+            let cs = core_graphics::CGColorSpaceCreateDeviceRGB();
+            if cs.is_null() {
+                return Ok(());
+            }
+
+            let data_ptr = pixels.as_ptr() as *const std::ffi::c_void;
+            let data_len = (width as usize) * (height as usize) * 4;
+            let provider = core_graphics::CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                data_ptr,
+                data_len,
+                None,
+            );
+            if provider.is_null() {
+                core_graphics::CFRelease(cs);
+                return Ok(());
+            }
+
+            const BITS_PER_COMPONENT: usize = 8;
+            const BITS_PER_PIXEL: usize = 32;
+            let bytes_per_row = (width as usize) * 4;
+            // kCGImageAlphaPremultipliedFirst (2) | kCGBitmapByteOrder32Little (2 << 12) = 0x2002
+            const BITMAP_INFO: u32 = 0x2002;
+            const INTENT_DEFAULT: i32 = 0; // kCGRenderingIntentDefault
+
+            let image = core_graphics::CGImageCreate(
+                width as usize,
+                height as usize,
+                BITS_PER_COMPONENT,
+                BITS_PER_PIXEL,
+                bytes_per_row,
+                cs,
+                BITMAP_INFO,
+                provider,
+                std::ptr::null(),
+                false as u8,
+                INTENT_DEFAULT,
+            );
+            // The image (when non-null) retains the colour space and data
+            // provider, so we can drop our own references now.
+            core_graphics::CFRelease(provider);
+            core_graphics::CFRelease(cs);
+            if image.is_null() {
+                return Ok(());
+            }
+
+            // Pull the destination CGContext from the current NSGraphicsContext.
+            if let Some(gc) = objc2_app_kit::NSGraphicsContext::currentContext(self.mtm) {
+                let cg_ctx_ptr: *mut std::ffi::c_void = msg_send![&gc, CGContext];
+                if !cg_ctx_ptr.is_null() {
+                    let rect = CGRect::new(
+                        CGPoint::new(0.0, 0.0),
+                        CGSize::new(width as f64, height as f64),
+                    );
+                    core_graphics::CGContextDrawImage(cg_ctx_ptr, rect, image);
+                }
+            }
+            core_graphics::CFRelease(image);
         }
         Ok(())
     }
@@ -501,16 +522,27 @@ impl PlatformBackend for CocoaBackend {
             };
 
             let text_ns = NSString::from_str(text);
-            // Use NSString sizeWithAttributes for measurement.
-            // We need an NSDictionary with NSFontAttributeName → font.
-            let dict: Retained<objc2_foundation::NSDictionary<objc2_foundation::NSString, AnyObject>> = {
-                let key = NSString::from_str("NSFont");
-                let font_obj: &AnyObject = std::mem::transmute(&*font);
+            // `-[NSString sizeWithAttributes:]` requires the framework's own
+            // `NSFontAttributeName` constant as the dictionary key. The
+            // previous version of this code constructed a fresh
+            // `NSString::from_str("NSFont")` as the key — AppKit then failed
+            // the attribute lookup and silently fell back to the 12pt system
+            // font, producing wrong widths for every non-12pt-system layout
+            // (a 24pt bold label would under-measure by ~2x). We now use
+            // the real `NSFontAttributeName` static (a typed
+            // `&NSAttributedStringKey`) from `objc2_app_kit`, matching the
+            // JDK's `Font.getStringBounds` behaviour.
+            //
+            // The dictionary is typed `NSString → AnyObject` because the
+            // `NSAttributedStringKey` type alias is just `NSString` and
+            // `NSDictionary::from_id_slice` takes `Retained<K>` for the key.
+            let key: Retained<NSString> = NSFontAttributeName.copy();
+            let font_obj: &AnyObject = std::mem::transmute(&*font);
+            let dict: Retained<objc2_foundation::NSDictionary<NSString, AnyObject>> =
                 objc2_foundation::NSDictionary::from_id_slice(
                     &[key],
                     &[font_obj.retain()],
-                )
-            };
+                );
 
             let size: NSSize = msg_send![&text_ns, sizeWithAttributes: &*dict];
             (size.width as f32, size.height as f32)
@@ -786,4 +818,74 @@ fn load_fontdue_font(_settings: &FontdueSettings) -> Option<fontdue::Font> {
             None
         })
         .clone()
+}
+
+// ---------------------------------------------------------------------------
+// Core Graphics C ABI bindings
+// ---------------------------------------------------------------------------
+//
+// These extern declarations link against the C symbols exported by the
+// `CoreGraphics.framework` (CoreFoundation types — `CGColorSpace`,
+// `CGDataProvider`, `CGImage`, `CGContext`). They are **not** Objective-C
+// classes, so `objc2::msg_send!` cannot reach them; the previous version of
+// `blit_buffer` made that mistake and silently no-op'd on macOS. The
+// framework is auto-linked by AppKit (which is pulled in via
+// `objc2-app-kit`), so no `#[link]` attribute is required here.
+//
+// Memory ownership: every `*Create*` function returns a +1-retained CF
+// handle that the caller must release with `CFRelease`. `CGImageCreate`
+// retains its colour-space and data-provider arguments internally, so the
+// caller is free to release its own references after `CGImageCreate` returns.
+#[allow(non_snake_case)]
+mod core_graphics {
+    use objc2_foundation::CGRect;
+
+    pub type CGColorSpaceRef = *mut std::ffi::c_void;
+    pub type CGDataProviderRef = *mut std::ffi::c_void;
+    pub type CGImageRef = *mut std::ffi::c_void;
+    pub type CGContextRef = *mut std::ffi::c_void;
+    pub type CFTypeRef = *const std::ffi::c_void;
+
+    /// `CGDataProviderReleaseDataCallback` — fired when the provider is
+    /// destroyed. Passing `None` (the C `NULL`) tells CG not to touch the
+    /// buffer, which is correct here because the pixel data is borrowed
+    /// from a Rust slice that outlives the `CGImage` (we `CFRelease` the
+    /// image before returning from `blit_buffer`).
+    pub type CGDataProviderReleaseDataCallback = Option<
+        unsafe extern "C" fn(
+            info: *mut std::ffi::c_void,
+            data: *const std::ffi::c_void,
+            size: usize,
+        ),
+    >;
+
+    extern "C" {
+        pub fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+
+        pub fn CGDataProviderCreateWithData(
+            info: *mut std::ffi::c_void,
+            data: *const std::ffi::c_void,
+            size: usize,
+            release_data: CGDataProviderReleaseDataCallback,
+        ) -> CGDataProviderRef;
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn CGImageCreate(
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bits_per_pixel: usize,
+            bytes_per_row: usize,
+            space: CGColorSpaceRef,
+            bitmap_info: u32,
+            provider: CGDataProviderRef,
+            decode: *const f64,
+            should_interpolate: u8,
+            intent: i32,
+        ) -> CGImageRef;
+
+        pub fn CGContextDrawImage(c: CGContextRef, rect: CGRect, image: CGImageRef);
+
+        pub fn CFRelease(cf: CFTypeRef);
+    }
 }

@@ -213,8 +213,20 @@ impl Win32Backend {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
+    /// Decode an `LPARAM` packing two signed 16-bit coordinates (X = LOWORD,
+    /// Y = HIWORD), the convention used by `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`,
+    /// and friends. See the `GET_X_LPARAM` / `GET_Y_LPARAM` macros in
+    /// `<windowsx.h>`.
+    ///
+    /// Both halves must be **sign-extended** to `i32` — a previous version
+    /// of this helper masked with `0xFFFF`, which silently converted negative
+    /// coordinates (the user dragging the mouse outside the client rect)
+    /// into the 32_768..65_535 range. We now widen via `i16` so the sign
+    /// bit is preserved on the way to `i32`.
     fn lparam_xy(lp: LPARAM) -> (i32, i32) {
-        ((lp.0 as i32) & 0xFFFF, ((lp.0 as i32) >> 16) & 0xFFFF)
+        let lo = (lp.0 & 0xFFFF) as i16 as i32;
+        let hi = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+        (lo, hi)
     }
 
     fn current_modifiers() -> KeyModifiers {
@@ -239,6 +251,10 @@ impl Win32Backend {
         match msg.message {
             WM_CLOSE => Some(PlatformEvent::WindowClose { id }),
             WM_SIZE => {
+                // WM_SIZE encodes width/height as **unsigned** 16-bit values
+                // (per Win32 docs) — unlike mouse coordinates which are signed
+                // (`lparam_xy`). Masking with `0xFFFF` is therefore correct
+                // here; do not sign-extend.
                 let w = (msg.lParam.0 as u32) & 0xFFFF;
                 let h = ((msg.lParam.0 as u32) >> 16) & 0xFFFF;
                 Some(PlatformEvent::WindowResize { id, w, h })
@@ -883,5 +899,60 @@ impl PlatformBackend for Win32Backend {
                 flags,
             );
         }
+    }
+}
+
+impl Drop for Win32Backend {
+    /// Tear down any live windows and unregister the window class so that
+    /// repeated VM init/teardown cycles (e.g. test runs that construct a
+    /// fresh backend per case) do not leak `HWND` handles or the
+    /// `CratonVMAWTWindow` class registration. Mirrors the equivalent
+    /// `Drop` impls on `X11Backend` and `CocoaBackend`.
+    fn drop(&mut self) {
+        let ids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for id in ids {
+            let _ = self.destroy_window(id);
+        }
+        if self.class_registered {
+            let class_name = w!("CratonVMAWTWindow");
+            // `UnregisterClassW` is safe to call after every window using
+            // the class has been destroyed. We ignore the return value:
+            // failure here is non-fatal (e.g. the class was already torn
+            // down by another instance) and we are already in `drop`.
+            unsafe {
+                let _ = UnregisterClassW(class_name, self.hinstance());
+            }
+            self.class_registered = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the C30 sign-extension fix in `lparam_xy`. The
+    /// old implementation masked LOWORD/HIWORD with `0xFFFF` and produced
+    /// `(0, 65534)` for an LPARAM packing `(0, -2)`; mouse drags outside
+    /// the client rect were therefore mis-reported as positions in the
+    /// 32_768..65_535 range. The fixed version widens through `i16` so the
+    /// sign bit reaches `i32`.
+    #[test]
+    fn lparam_xy_sign_extends_negative_coords() {
+        // LPARAM packing x = 0, y = -2 (i16) → bits 0xFFFE0000.
+        let lp = LPARAM(0xFFFE0000u32 as isize);
+        assert_eq!(Win32Backend::lparam_xy(lp), (0, -2));
+
+        // LPARAM packing x = -1, y = -1 → bits 0xFFFFFFFF.
+        let lp = LPARAM(0xFFFFFFFFu32 as isize);
+        assert_eq!(Win32Backend::lparam_xy(lp), (-1, -1));
+
+        // Positive coordinates should be unchanged.
+        let lp = LPARAM(((100i32 as u32) | ((200u32) << 16)) as isize);
+        assert_eq!(Win32Backend::lparam_xy(lp), (100, 200));
+
+        // The most-negative coordinate the i16 encoding can carry.
+        let lp = LPARAM(0x80008000u32 as isize);
+        assert_eq!(Win32Backend::lparam_xy(lp), (-32768, -32768));
     }
 }

@@ -15,26 +15,47 @@
 //! │  ┌───────────┬────────────────┐ │
 //! │  │ platform  │ software       │ │
 //! │  │ backend   │ renderer       │ │
-//! │  │ (Win32/   │ (pixel buffer  │ │
-//! │  │  X11/     │  rasterizer)   │ │
-//! │  │  Cocoa)   │                │ │
+//! │  │ (scaffold)│ (pixel buffer  │ │
+//! │  │           │  rasterizer)   │ │
 //! │  └───────────┴────────────────┘ │
 //! └─────────────────────────────────┘
 //! ```
 //!
-//! ## Platform backends
+//! ## Runtime mode: headless-only
 //!
-//! - **Windows**: Win32 API via the `windows` crate (CreateWindowExW,
-//!   GDI for blitting, DirectWrite for text).
-//! - **Linux**: X11 via `x11rb`, fontdue for text rasterization.
-//! - **macOS**: AppKit via `objc2-app-kit`.
+//! The current native-method surface (see [`natives::register_all`]) operates
+//! in **headless-only** mode and aligns with `docs/javafx-status.md` and the
+//! workspace README: every `Frame.setVisible`, `Graphics.drawString`, and
+//! mouse / keyboard event is handled in-process without touching an OS window
+//! manager. `EventQueue.getNextEvent` only synthesises `Invocation` events
+//! today; `Mouse*`, `Key*`, and `Window*` events from the platform layer are
+//! not yet plumbed through to Java listeners.
+//!
+//! ## Platform backends (scaffolded, not yet wired)
+//!
+//! The `platform/` module ships scaffold backends for the three target OSes:
+//!
+//! - **Windows** (`platform::win32::Win32Backend`): Win32 API via the
+//!   `windows` crate, GDI for blitting, DirectWrite for text.
+//! - **Linux** (`platform::x11::X11Backend`): X11 via `x11rb`, fontdue for
+//!   glyph rasterization.
+//! - **macOS** (`platform::cocoa::CocoaBackend`): AppKit via `objc2-app-kit`,
+//!   fontdue for glyph rasterization.
+//!
+//! These backends compile and have their own unit-test coverage, but they
+//! are **not instantiated from `natives.rs`** — `Frame.setVisible(true)`
+//! does not open an on-screen window today. Wiring the backends through
+//! the natives layer (and synthesising Java `AWTEvent` objects in
+//! `EventQueue.getNextEvent`) is tracked as future work. Until that lands,
+//! treat the backend modules as a forward-looking API surface — not as live
+//! display infrastructure.
 //!
 //! ## Software renderer
 //!
-//! Graphics2D operations are rendered into ARGB pixel buffers. The
-//! platform backend is only responsible for blitting the final buffer
-//! to the screen. This keeps the rendering logic platform-independent
-//! and testable without a display.
+//! Graphics2D operations are rendered into ARGB pixel buffers. When the
+//! platform backends are wired up, they will be responsible only for
+//! blitting the final buffer to the screen — the rendering logic stays
+//! platform-independent and testable without a display.
 //!
 //! ## Thread safety
 //!
