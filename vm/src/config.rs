@@ -105,9 +105,16 @@ pub struct VmConfig {
     pub aot_cache_output: Option<String>,
 
     /// Use synthetic JDK stubs instead of real JDK bytecode (`--synthetic-jdk`).
-    /// When `true` (default): all ~5,200 native Rust stubs are registered, no real
+    /// When `true`: all ~5,200 native Rust stubs are registered, no real
     /// JDK class files needed. When `false`: only ~300 truly native methods are
     /// registered, and real JDK classes are loaded from JAVA_HOME/jmods.
+    ///
+    /// `VmConfig::default()` keeps this `true` so the embedded library/test
+    /// path stays hermetic. The `cratonvm` launcher flips the default to
+    /// `false` whenever [`detect_real_jdk`] returns `Some` so end users with
+    /// a JDK on `PATH`/`JAVA_HOME` get real-JDK boot out of the box. The
+    /// explicit `--synthetic-jdk` CLI flag forces synthetic mode in either
+    /// case.
     pub use_synthetic_jdk: bool,
 
     /// When enabled, collect a structured audit log of every ACC_NATIVE method
@@ -372,6 +379,29 @@ impl VmConfig {
 impl VmConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a `VmConfig` whose `use_synthetic_jdk` default reflects
+    /// the host: `false` (real-JDK / JMOD boot) when [`detect_real_jdk`]
+    /// returns `Some`, `true` (synthetic stubs) otherwise.
+    ///
+    /// Used by the `cratonvm` launcher so end users get real-JDK boot by
+    /// default whenever a JDK is present on `PATH`/`JAVA_HOME`. Library
+    /// callers that want hermetic, test-style behaviour should keep using
+    /// [`VmConfig::new`] / [`VmConfig::default`], which always start in
+    /// synthetic mode.
+    pub fn with_host_jdk_default() -> Self {
+        let mut cfg = Self::default();
+        cfg.use_synthetic_jdk = detect_real_jdk().is_none();
+        cfg
+    }
+
+    /// Explicit setter for `use_synthetic_jdk`. Use this in launcher code
+    /// when an explicit `--synthetic-jdk` CLI flag has been provided so
+    /// the override is visible at the call site.
+    pub fn with_synthetic_jdk(mut self, synthetic: bool) -> Self {
+        self.use_synthetic_jdk = synthetic;
+        self
     }
 
     pub fn with_max_heap_size(mut self, size: usize) -> Self {
@@ -694,6 +724,39 @@ pub fn discover_ext_classpath(java_home: Option<&str>) -> Vec<String> {
 /// and by the VM initialization code.
 pub fn resolve_java_home_public(explicit: Option<&str>) -> Option<PathBuf> {
     resolve_java_home(explicit)
+}
+
+/// Probe the host for a real JDK installation suitable for booting
+/// `java.base` from JMOD (or `lib/modules`).
+///
+/// Resolution order matches [`resolve_java_home_public`]:
+///   1. `CRATONVM_JAVA_HOME`
+///   2. `JAVA_HOME`
+///   3. `java` on `PATH` (via `java -XshowSettings:properties`)
+///
+/// Returns `Some(java_home)` only when the resolved directory actually
+/// contains `jmods/java.base.jmod` (JDK 9+) **or** `lib/modules`
+/// (JRE / `jlink` image) — i.e. only when the JMOD/jimage boot path is
+/// actually loadable. Returns `None` otherwise.
+///
+/// Used by the `cratonvm` launcher to decide the default boot mode:
+/// JMOD when detection succeeds, synthetic stubs when it fails.
+/// `VmConfig::default()` deliberately does **not** call this, so the
+/// embedded library path stays hermetic and tests stay fast.
+pub fn detect_real_jdk() -> Option<PathBuf> {
+    let java_home = resolve_java_home(None)?;
+    let jmod = java_home.join("jmods").join("java.base.jmod");
+    if jmod.is_file() {
+        return Some(java_home);
+    }
+    let lib_modules = java_home.join("lib").join("modules");
+    if lib_modules.is_file() {
+        return Some(java_home);
+    }
+    // The `java` executable was found but neither `jmods/java.base.jmod`
+    // nor `lib/modules` is present — this is e.g. a JDK 8 install with
+    // `rt.jar` only, or a broken installation. Fall back to synthetic.
+    None
 }
 
 /// Resolve the JAVA_HOME path from an explicit value, the environment, or
@@ -1273,6 +1336,184 @@ mod tests {
     fn parse_add_exports_invalid() {
         assert!(VmConfig::parse_add_exports("garbage").is_none());
         assert!(VmConfig::parse_add_exports("mod=target").is_none()); // missing /package
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-JDK detection and boot-default decision (task #53)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a fake JDK layout containing `jmods/java.base.jmod`.
+    fn fake_jdk_with_jmod(root: &std::path::Path) {
+        let jmods = root.join("jmods");
+        std::fs::create_dir_all(&jmods).unwrap();
+        std::fs::write(jmods.join("java.base.jmod"), b"JM\x01\x00").unwrap();
+    }
+
+    /// Helper: create a fake jlink-image layout with `lib/modules`.
+    fn fake_jdk_with_lib_modules(root: &std::path::Path) {
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("modules"), b"jimg\x00\x00\x00\x01").unwrap();
+    }
+
+    /// `with_host_jdk_default` flips `use_synthetic_jdk` off when a real
+    /// JDK (jmods layout) is visible via `JAVA_HOME`. We exercise the
+    /// public surface by setting `JAVA_HOME` to a synthesised tree.
+    ///
+    /// The `JAVA_HOME` / `CRATONVM_JAVA_HOME` env vars are process-wide,
+    /// so this test races with any concurrent test that also touches
+    /// them. We isolate by stashing/restoring and serialising via a
+    /// static mutex below.
+    fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let prev = std::env::var_os(key);
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        result
+    }
+
+    /// Avoid env-var races between the detection tests.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn detect_real_jdk_returns_some_when_java_base_jmod_present() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        fake_jdk_with_jmod(tmp.path());
+        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
+            with_env("JAVA_HOME", None, || {
+                let detected = detect_real_jdk();
+                assert!(
+                    detected.is_some(),
+                    "detect_real_jdk should find synthetic JDK at {}",
+                    tmp.path().display()
+                );
+                assert_eq!(detected.unwrap(), tmp.path());
+            });
+        });
+    }
+
+    #[test]
+    fn detect_real_jdk_returns_some_for_lib_modules_image() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        fake_jdk_with_lib_modules(tmp.path());
+        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
+            with_env("JAVA_HOME", None, || {
+                let detected = detect_real_jdk();
+                assert!(
+                    detected.is_some(),
+                    "detect_real_jdk should accept jlink-image layout"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn detect_real_jdk_returns_none_when_only_rtjar_present() {
+        // JDK 8-style: `lib/rt.jar` only. We have no JMOD/jimage loader,
+        // so this should NOT count as "real JDK boot available".
+        // `CRATONVM_JAVA_HOME` is the highest-priority probe in
+        // `resolve_java_home`, so we don't need to scrub `JAVA_HOME` or
+        // `PATH` — the synthesised directory wins.
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("rt.jar"), b"PK\x03\x04").unwrap();
+        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
+            assert!(
+                detect_real_jdk().is_none(),
+                "rt.jar-only install must not satisfy detect_real_jdk"
+            );
+        });
+    }
+
+    /// Boot-default decision: when `detect_real_jdk` returns `Some`,
+    /// `with_host_jdk_default` must clear `use_synthetic_jdk`.
+    #[test]
+    fn with_host_jdk_default_picks_jmod_when_detected() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        fake_jdk_with_jmod(tmp.path());
+        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
+            with_env("JAVA_HOME", None, || {
+                let cfg = VmConfig::with_host_jdk_default();
+                assert!(
+                    !cfg.use_synthetic_jdk,
+                    "with_host_jdk_default must prefer JMOD when JDK is present"
+                );
+            });
+        });
+    }
+
+    /// Boot-default decision: when the resolved `JAVA_HOME` is a real
+    /// directory but contains no `jmods/java.base.jmod` and no
+    /// `lib/modules`, `with_host_jdk_default` must leave
+    /// `use_synthetic_jdk = true`.
+    ///
+    /// Using an empty real directory (instead of unsetting `JAVA_HOME`
+    /// and emptying `PATH`) avoids racing with the system `java`
+    /// binary, which `Command::new("java")` may still resolve on
+    /// Windows via `CreateProcess` fallback search paths even with an
+    /// empty `PATH`.
+    #[test]
+    fn with_host_jdk_default_falls_back_to_synthetic_when_no_jdk() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // Bare directory: no `jmods/`, no `lib/modules`. `resolve_java_home`
+        // will accept it (it's a real directory) but `detect_real_jdk`
+        // must reject it because neither boot blob is present.
+        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
+            with_env("JAVA_HOME", None, || {
+                let cfg = VmConfig::with_host_jdk_default();
+                assert!(
+                    cfg.use_synthetic_jdk,
+                    "with_host_jdk_default must fall back to synthetic when the \
+                     resolved JAVA_HOME contains no boot modules"
+                );
+            });
+        });
+    }
+
+    /// Explicit `--synthetic-jdk` opt-in must beat detection: even with
+    /// a real JDK on the host, `with_synthetic_jdk(true)` forces synthetic.
+    #[test]
+    fn explicit_synthetic_jdk_override_wins_over_detection() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        fake_jdk_with_jmod(tmp.path());
+        with_env("CRATONVM_JAVA_HOME", Some(tmp.path().to_str().unwrap()), || {
+            with_env("JAVA_HOME", None, || {
+                let cfg = VmConfig::with_host_jdk_default().with_synthetic_jdk(true);
+                assert!(
+                    cfg.use_synthetic_jdk,
+                    "Explicit --synthetic-jdk override must force synthetic mode"
+                );
+            });
+        });
+    }
+
+    /// `VmConfig::default()` must remain hermetic (synthetic) so library
+    /// callers and the ~5000-test suite don't accidentally start
+    /// resolving JMODs from the host JDK.
+    #[test]
+    fn default_config_stays_synthetic_regardless_of_host() {
+        let cfg = VmConfig::default();
+        assert!(
+            cfg.use_synthetic_jdk,
+            "VmConfig::default() must remain synthetic — only the launcher \
+             (with_host_jdk_default) flips the default based on the host"
+        );
     }
 
     #[test]

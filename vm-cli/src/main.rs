@@ -93,7 +93,15 @@ struct Args {
     xshare: String,
 
     /// Force synthetic JDK mode (Rust stubs instead of real JDK bytecode).
-    /// When omitted and JAVA_HOME is set, real JDK classes are loaded.
+    ///
+    /// As of task #53 the launcher defaults to real-JDK boot via JMOD
+    /// (`java.base.jmod` from `JAVA_HOME` / `CRATONVM_JAVA_HOME` / `java`
+    /// on `PATH`) whenever a JDK is detected on the host. Passing this
+    /// flag forces synthetic mode even when a JDK is present — useful
+    /// for hermetic test runs or when comparing synthetic vs. real-JDK
+    /// behaviour. When no JDK is detectable the launcher falls back to
+    /// synthetic automatically, so this flag is only an explicit
+    /// override.
     #[arg(long = "synthetic-jdk")]
     synthetic_jdk: bool,
 
@@ -1130,7 +1138,12 @@ fn run() -> Result<()> {
         None
     };
 
-    let mut config = VmConfig::new()
+    // Task #53: the launcher prefers real-JDK boot (JMOD) when a JDK is
+    // detected on the host (JAVA_HOME / CRATONVM_JAVA_HOME / `java` on
+    // PATH); otherwise it falls back to the synthetic stubs. The library
+    // path (`VmConfig::default`) stays synthetic so embedded callers and
+    // the in-tree test suite are unaffected.
+    let mut config = VmConfig::with_host_jdk_default()
         .with_classpath(classpath)
         .with_verbose_class_loading(args.verbose_class)
         .with_verbose_gc(args.verbose_gc)
@@ -1202,17 +1215,21 @@ fn run() -> Result<()> {
         }
     };
 
-    // Synthetic JDK mode: default to real JDK when a JDK is available.
-    // Check explicit --java-home, JAVA_HOME env, or java on PATH.
+    // Synthetic JDK override (task #53): the launcher already picked the
+    // host-driven default via `with_host_jdk_default()` above (real JDK
+    // when detected, synthetic otherwise). Three cases override that:
+    //
+    //   * `--synthetic-jdk` flag → force synthetic (explicit opt-in)
+    //   * `--java-home` CLI arg → force real-JDK (user pointed at a JDK)
+    //   * `JAVA_HOME` already on `VmConfig` → force real-JDK
+    //
+    // The `--synthetic-jdk` flag wins over `--java-home` so users can
+    // explicitly compare synthetic vs. real-JDK behaviour against the
+    // same install.
     if args.synthetic_jdk {
         config.use_synthetic_jdk = true;
-    } else if config.java_home.is_some() || args.java_home.is_some() {
+    } else if args.java_home.is_some() || config.java_home.is_some() {
         config.use_synthetic_jdk = false;
-    } else {
-        // Auto-detect: if a JDK is available via env or PATH, use real JDK
-        if cratonvm_vm::config::resolve_java_home_public(None).is_some() {
-            config.use_synthetic_jdk = false;
-        }
     }
 
     // AOT configuration

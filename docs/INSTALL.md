@@ -90,15 +90,29 @@ cratonvm --classpath . HelloWorld
 
 CratonVM can run in two modes:
 
-| Mode | Flag | Description |
-|------|------|-------------|
-| **Synthetic** (default) | `--synthetic-jdk=true` | Uses built-in Rust implementations of Java stdlib. No JDK needed. |
-| **Real JDK** | `--synthetic-jdk=false` | Loads real JDK classes from JMOD files. Requires `--java-home` or `JAVA_HOME`. |
+| Mode | Description |
+|------|-------------|
+| **Real JDK** (default when a JDK is present) | Loads real JDK classes from `java.base.jmod` (or `lib/modules` on a jlink image) discovered via `JAVA_HOME`, `CRATONVM_JAVA_HOME`, or `java` on `PATH`. |
+| **Synthetic** (default when no JDK is detected, or with `--synthetic-jdk`) | Uses built-in Rust implementations of the Java stdlib. No JDK needed. |
 
-### Real JDK mode
+At startup the launcher probes the host for a real JDK (see
+`detect_real_jdk` in `vm/src/config.rs`). When `jmods/java.base.jmod`
+or `lib/modules` is found, the VM boots from that. When no JDK is
+detected, it falls back to the synthetic stubs.
+
+### Forcing synthetic mode
+
+Even with a JDK on the host you can force the synthetic path — useful
+for hermetic test runs or for comparing the two backends side-by-side:
 
 ```bash
-cratonvm --synthetic-jdk=false --java-home /path/to/jdk-25 --classpath . HelloWorld
+cratonvm --synthetic-jdk --classpath . HelloWorld
+```
+
+### Pointing at a specific JDK
+
+```bash
+cratonvm --java-home /path/to/jdk-25 --classpath . HelloWorld
 ```
 
 ## Troubleshooting
