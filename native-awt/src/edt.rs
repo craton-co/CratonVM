@@ -467,6 +467,80 @@ impl EventDispatchThread {
         evt
     }
 
+    /// Peek at the next event without dequeueing it.  Returns `None` if the
+    /// queue is empty.
+    ///
+    /// Unlike [`Self::poll_event`] this does NOT fire the
+    /// `invoke_and_wait` completion signal — peeking must be observation-only
+    /// so a Java `EventQueue.peekEvent()` call cannot accidentally release a
+    /// blocked `invokeAndWait` waiter before the event is actually dispatched.
+    pub fn peek_event(&self) -> Option<AwtEvent> {
+        self.queue.lock().front().cloned()
+    }
+
+    /// Block the calling thread until an event is available, the timeout
+    /// expires, or the supplied `interrupted` predicate returns `true`.
+    ///
+    /// This is the bridge used by `EventQueue.getNextEvent`: the JDK
+    /// contract is to block indefinitely on an empty queue, returning only
+    /// when an event arrives or the calling thread is interrupted. The
+    /// caller passes `interrupted` so the Java-side interrupt flag (held
+    /// by the VM, not this crate) gets consulted between wake attempts.
+    ///
+    /// `max_wait_ms` is the *total* upper bound on how long we will
+    /// block. `chunk_ms` (clamped to ≥1) is the per-iteration wake
+    /// interval used to re-check the `interrupted` predicate while
+    /// asleep. `max_wait_ms == u64::MAX` means "block indefinitely" —
+    /// appropriate for the EDT dispatch loop, which only exits when the
+    /// calling thread is interrupted.
+    ///
+    /// Note: unlike `wait_event` this method intentionally does NOT
+    /// consult `is_running()`. The EDT singleton (`edt::get_edt`) is
+    /// never explicitly `start()`-ed in production — the field is only
+    /// flipped on by unit tests — so honouring `is_running()` here would
+    /// cause the production `getNextEvent` native to return null
+    /// immediately and the JDK dispatch loop to peg at 100% CPU.
+    ///
+    /// Returns `Some(evt)` on success, `None` on interrupt / timeout.
+    pub fn wait_event_blocking<F: Fn() -> bool>(
+        &self,
+        max_wait_ms: u64,
+        chunk_ms: u64,
+        interrupted: F,
+    ) -> Option<AwtEvent> {
+        let chunk_ms = chunk_ms.max(1);
+        let start = std::time::Instant::now();
+        let deadline = if max_wait_ms == u64::MAX {
+            None
+        } else {
+            Some(start + Duration::from_millis(max_wait_ms))
+        };
+        loop {
+            // Fast path first: an event is already on the queue.
+            {
+                let mut q = self.queue.lock();
+                if let Some(evt) = q.pop_front() {
+                    drop(q);
+                    self.notify_if_invocation(&evt);
+                    return Some(evt);
+                }
+            }
+            // Honour shutdown / interrupt between sleeps so a long-blocked
+            // EDT dispatch loop unwinds promptly.
+            if interrupted() {
+                return None;
+            }
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    return None;
+                }
+            }
+            let recv = self.wake_receiver.lock();
+            let _ = recv.recv_timeout(Duration::from_millis(chunk_ms));
+            drop(recv);
+        }
+    }
+
     /// Blocking dequeue with a timeout (in milliseconds).  Returns `None` if
     /// the timeout expires without an event arriving.
     pub fn wait_event(&self, timeout_ms: u64) -> Option<AwtEvent> {

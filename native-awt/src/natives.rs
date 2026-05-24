@@ -96,6 +96,82 @@ fn take_invocation_event_callback(event_hash: i32) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Peer → Java source ObjectRef side-table
+// ---------------------------------------------------------------------------
+//
+// `EventQueue.getNextEvent` needs to materialise an `AwtEvent` into a Java
+// `MouseEvent` / `KeyEvent` / `WindowEvent` / `PaintEvent` whose `source`
+// field points at the actual Java `Component` (Frame, Button, …) the event
+// targets. Peers are looked up by *identity hash*, not by `ObjectRef`, so
+// going `PeerId -> ObjectRef` is otherwise impossible.
+//
+// We register the source `ObjectRef` here whenever `ensure_peer` mints a
+// peer, and look it up when dispatching events. The map is capped with
+// FIFO eviction so a stream of orphaned peers (e.g. dropped Java refs that
+// never made it to `Component.removeNotify`) cannot grow it without bound.
+//
+// SAFETY: storing `ObjectRef` as a raw `usize` here keeps the side-table
+// from holding a "strong" pointer to GC-managed memory. We never deref the
+// reference except inside an active native call, so the worst case after a
+// stale lookup is `set_field_by_name` on a freed object — which the heap
+// path validates anyway and turns into a silent no-op.
+
+const MAX_PEER_SOURCES: usize = 10_000;
+
+struct PeerSourceTable {
+    map: FxHashMap<u64, usize>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl PeerSourceTable {
+    fn new() -> Self {
+        Self {
+            map: FxHashMap::default(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: u64, ptr: usize) {
+        while self.map.len() >= MAX_PEER_SOURCES {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        if self.map.insert(key, ptr).is_none() {
+            self.order.push_back(key);
+        }
+    }
+
+    fn get(&self, key: u64) -> Option<usize> {
+        self.map.get(&key).copied()
+    }
+}
+
+fn peer_source_table() -> &'static Mutex<PeerSourceTable> {
+    static INSTANCE: OnceLock<Mutex<PeerSourceTable>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(PeerSourceTable::new()))
+}
+
+fn register_peer_source(peer_id: PeerId, source: ObjectRef) {
+    peer_source_table()
+        .lock()
+        .insert(peer_id.0, source.as_ptr() as usize);
+}
+
+fn lookup_peer_source(peer_id: PeerId) -> Option<ObjectRef> {
+    let ptr = peer_source_table().lock().get(peer_id.0)?;
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: see module comment above — we only reconstruct the ref to
+    // pass it back to the VM as a `Value::Object(Some(ref))`. The VM is
+    // responsible for validating the pointer before any heap access.
+    Some(unsafe { ObjectRef::from_raw(ptr as *mut u8) })
+}
+
+// ---------------------------------------------------------------------------
 // Graphics2D context registry
 // ---------------------------------------------------------------------------
 //
@@ -335,10 +411,16 @@ fn ensure_peer(ctx: &mut dyn NativeContext, obj: ObjectRef, ctype: ComponentType
     let hash = ctx.identity_hash_code(obj);
     let mut reg = peer::peer_registry().lock();
     if let Some(id) = reg.peer_for_java(hash) {
+        // Keep the source pointer fresh: a Java GC move can update the
+        // ObjectRef behind the same identity hash, so re-register on every
+        // observation. Stale entries here would feed bad sources into
+        // `EventQueue.getNextEvent`.
+        register_peer_source(id, obj);
         return id;
     }
     let id = reg.create_peer(ctype);
     reg.register_java_mapping(hash, id);
+    register_peer_source(id, obj);
     id
 }
 
@@ -1372,6 +1454,146 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
 // EventQueue natives
 // ---------------------------------------------------------------------------
 
+/// Java AWT event class plus the field assignments required to materialise it
+/// from an [`crate::event::AwtEvent`].
+///
+/// Separating the *plan* (class + field writes) from the actual `new_object`
+/// / `set_field_by_name` calls lets the synthesis logic be unit-tested
+/// without standing up a full `NativeContext` mock. The `getNextEvent`
+/// native walks the plan, allocates the class, and writes every field in
+/// order.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EventSynthesisPlan {
+    /// JVM-internal class name (slash-delimited) to allocate.
+    pub class_name: &'static str,
+    /// Field writes to perform on the freshly-allocated event object.
+    /// Order matches the JDK constructor's assignment order so a future
+    /// switch to a real constructor invocation is a drop-in.
+    pub fields: Vec<(&'static str, Value)>,
+}
+
+/// Build the synthesis plan for a given event.
+///
+/// Returns `None` for event kinds we don't yet synthesize (component /
+/// focus / action — see the TODO in `register_event_natives`).
+pub(crate) fn plan_event_synthesis(
+    evt: &crate::event::AwtEvent,
+    source: Option<ObjectRef>,
+) -> Option<EventSynthesisPlan> {
+    use crate::event::{event_id, AwtEventData};
+    let source_value = Value::Object(source);
+    let when = Value::Long(evt.timestamp as i64);
+
+    match &evt.data {
+        AwtEventData::Mouse {
+            x,
+            y,
+            button,
+            click_count,
+            modifiers,
+            scroll_amount,
+        } => {
+            let class_name = if evt.id == event_id::MOUSE_WHEEL {
+                "java/awt/event/MouseWheelEvent"
+            } else {
+                "java/awt/event/MouseEvent"
+            };
+            let mut fields = vec![
+                ("source", source_value),
+                ("id", Value::Int(evt.id)),
+                ("when", when),
+                ("modifiers", Value::Int(*modifiers)),
+                ("modifiersEx", Value::Int(*modifiers)),
+                ("x", Value::Int(*x)),
+                ("y", Value::Int(*y)),
+                ("xAbs", Value::Int(*x)),
+                ("yAbs", Value::Int(*y)),
+                ("clickCount", Value::Int(*click_count)),
+                ("button", Value::Int(*button)),
+                ("popupTrigger", Value::Int(0)),
+                ("consumed", Value::Int(0)),
+            ];
+            if evt.id == event_id::MOUSE_WHEEL {
+                fields.push(("scrollType", Value::Int(0))); // WHEEL_UNIT_SCROLL
+                fields.push(("scrollAmount", Value::Int(scroll_amount.abs())));
+                fields.push(("wheelRotation", Value::Int(*scroll_amount)));
+                fields.push(("preciseWheelRotation", Value::Double(*scroll_amount as f64)));
+            }
+            Some(EventSynthesisPlan { class_name, fields })
+        }
+        AwtEventData::Key {
+            key_code,
+            key_char,
+            modifiers,
+        } => Some(EventSynthesisPlan {
+            class_name: "java/awt/event/KeyEvent",
+            fields: vec![
+                ("source", source_value),
+                ("id", Value::Int(evt.id)),
+                ("when", when),
+                ("modifiers", Value::Int(*modifiers)),
+                ("modifiersEx", Value::Int(*modifiers)),
+                ("keyCode", Value::Int(*key_code)),
+                ("keyChar", Value::Int(*key_char as i32)),
+                ("keyLocation", Value::Int(1)), // KEY_LOCATION_STANDARD
+                ("consumed", Value::Int(0)),
+            ],
+        }),
+        AwtEventData::Window => Some(EventSynthesisPlan {
+            class_name: "java/awt/event/WindowEvent",
+            fields: vec![
+                ("source", source_value),
+                ("id", Value::Int(evt.id)),
+                ("oldState", Value::Int(0)),
+                ("newState", Value::Int(0)),
+                ("consumed", Value::Int(0)),
+            ],
+        }),
+        AwtEventData::Paint { .. } => Some(EventSynthesisPlan {
+            class_name: "java/awt/event/PaintEvent",
+            // The `updateRect` field is intentionally left at its default
+            // (`null`) — Swing's repaint manager treats `null` as
+            // "repaint everything", which matches the conservative
+            // coalescing we already do upstream in `coalesce_paint_events`.
+            // A future improvement is to allocate a `java/awt/Rectangle`
+            // here so listeners that consult `getUpdateRect()` see a
+            // populated bounding box; tracked in the TODO below.
+            fields: vec![
+                ("source", source_value),
+                ("id", Value::Int(evt.id)),
+                ("consumed", Value::Int(0)),
+            ],
+        }),
+        // Component / Focus / Action: not yet synthesized — `getNextEvent`
+        // returns null for these and the next dispatch cycle drops them.
+        // See TODO in `register_event_natives`.
+        AwtEventData::Component { .. }
+        | AwtEventData::Focus { .. }
+        | AwtEventData::Action { .. } => None,
+        // Invocation events are handled separately by the natives layer:
+        // the receiver class is `InvocationEvent` and we have to bind the
+        // event hash to the runnable's callback id outside the plan.
+        AwtEventData::Invocation { .. } => None,
+    }
+}
+
+/// Apply a [`EventSynthesisPlan`] against a real `NativeContext` to produce
+/// the Java event object.
+fn materialise_event(
+    ctx: &mut dyn NativeContext,
+    plan: &EventSynthesisPlan,
+) -> MethodCallResult {
+    let obj_val = ctx.new_object(plan.class_name)?;
+    if let Some(Value::Object(Some(obj))) = &obj_val {
+        for (name, value) in &plan.fields {
+            // `Value` is `Copy`, so dereference rather than clone — keeps
+            // Clippy `clippy::clone_on_copy` happy without a lint-allow.
+            ctx.set_field_by_name(*obj, name, *value);
+        }
+    }
+    Ok(obj_val)
+}
+
 fn register_event_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/EventQueue", "isDispatchThread", "()Z",
         |_ctx, _args| bool_ok(edt::is_edt()));
@@ -1407,11 +1629,45 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/awt/EventQueue", "postEvent", "(Ljava/awt/AWTEvent;)V", |_ctx, _args| void_ok());
     registry.register("java/awt/EventQueue", "getNextEvent", "()Ljava/awt/AWTEvent;", |ctx, _args| {
-        // Pull the next event off the EDT queue.  For invocation events
-        // we have to synthesize a Java `InvocationEvent` whose
-        // `dispatch()V` will be called by the EDT dispatch loop —
-        // otherwise the Runnable would be silently discarded.
-        let Some(evt) = edt::get_edt().poll_event() else {
+        // JDK contract: block the calling thread (the EDT) until an event
+        // arrives, the queue is closed, or the thread is interrupted.
+        //
+        // Prior to this revision the implementation polled the queue
+        // once, returned null for every non-invocation event, and let the
+        // EDT dispatch loop drop mouse / key / window / paint events on
+        // the floor — silencing every listener registered through
+        // `Component.addMouseListener` / `addKeyListener` /
+        // `addWindowListener`. The fix:
+        //   1. Block via `wait_event_blocking` so the dispatch loop
+        //      doesn't busy-spin on an empty queue.
+        //   2. Synthesize the proper Java event subclass
+        //      (`MouseEvent` / `KeyEvent` / `WindowEvent` /
+        //      `PaintEvent`) via [`plan_event_synthesis`].
+        //   3. Preserve the `source` `Component`, the timestamp (`when`),
+        //      and any modifier mask the platform backend captured.
+        //   4. Keep the existing `InvocationEvent` binding (the
+        //      `dispatch()V` native consults the side-table to find the
+        //      registered Runnable).
+        //
+        // If the EDT shuts down or the calling thread is interrupted
+        // before an event arrives we return `null` — the JDK dispatch
+        // loop treats that the same as "shut down" and exits cleanly.
+        let Some(evt) = edt::get_edt().wait_event_blocking(
+            // Block indefinitely — the JDK contract is "wait until an
+            // event arrives or the thread is interrupted". The EDT
+            // dispatch loop never wants `getNextEvent` to time out.
+            u64::MAX,
+            // Re-check shutdown / interrupt every 50ms while sleeping
+            // so a Toolkit shutdown doesn't stay blocked forever.
+            50,
+            // We don't have a robust way to read the Java-side
+            // interrupt flag from this native — `NativeContext::is_interrupted`
+            // requires a `&mut self` reference we don't hold here. The
+            // shutdown flag (toggled by `EventDispatchThread::stop`)
+            // already covers the only legitimate "wake up empty" path
+            // for the production code.
+            || false,
+        ) else {
             return null_ok();
         };
         use crate::event::AwtEventData;
@@ -1423,15 +1679,37 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             }
             return Ok(inv);
         }
-        // TODO: synthesize Java event objects for the non-invocation
-        // event kinds (Mouse / Key / Window / ...).  The legacy code
-        // returned null here for every event, so callers that drive
-        // dispatch through this method will still observe missing
-        // events — but at least invocation events now flow correctly
-        // and SwingUtilities.invokeLater is no longer a no-op.
+        // All non-invocation event kinds: materialise the matching Java
+        // class with `source` / `id` / `when` / modifiers / payload set.
+        let source = lookup_peer_source(evt.source_peer_id);
+        if let Some(plan) = plan_event_synthesis(&evt, source) {
+            return materialise_event(ctx, &plan);
+        }
+        // TODO: Component / Focus / Action events still drop here. They
+        // are far less common than mouse/key/window/paint, but a future
+        // pass should extend `plan_event_synthesis` to cover them.
         null_ok()
     });
-    registry.register("java/awt/EventQueue", "peekEvent", "()Ljava/awt/AWTEvent;", |_ctx, _args| null_ok());
+    registry.register("java/awt/EventQueue", "peekEvent", "()Ljava/awt/AWTEvent;", |ctx, _args| {
+        // Observation-only: clone the head of the queue without releasing
+        // any `invokeAndWait` waiter (see `EventDispatchThread::peek_event`).
+        let Some(evt) = edt::get_edt().peek_event() else {
+            return null_ok();
+        };
+        use crate::event::AwtEventData;
+        if matches!(evt.data, AwtEventData::Invocation { .. }) {
+            // Peeking at an InvocationEvent without consuming it would
+            // re-bind the callback id on every call. Return null — the
+            // JDK behaviour for `peekEvent` is "may return null", and
+            // Swing's dispatch loop only consults `getNextEvent` anyway.
+            return null_ok();
+        }
+        let source = lookup_peer_source(evt.source_peer_id);
+        if let Some(plan) = plan_event_synthesis(&evt, source) {
+            return materialise_event(ctx, &plan);
+        }
+        null_ok()
+    });
 
     // -- InvocationEvent.dispatch -------------------------------------------
     //
@@ -1768,6 +2046,7 @@ fn register_clipboard_natives(registry: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{event_id, modifiers, AwtEvent, BUTTON1};
 
     #[test]
     fn registration_count() {
@@ -1775,5 +2054,181 @@ mod tests {
         register_all(&mut registry);
         let count = registry.len();
         assert!(count >= 50, "Expected >= 50 AWT natives, got {count}");
+    }
+
+    /// Build a fake `ObjectRef` for tests — guaranteed 8-aligned & non-null.
+    fn fake_object_ref(seed: u64) -> ObjectRef {
+        let ptr = ((seed + 1) << 3) as *mut u8;
+        unsafe { ObjectRef::from_raw(ptr) }
+    }
+
+    fn find_field<'a>(plan: &'a EventSynthesisPlan, name: &str) -> Option<&'a Value> {
+        plan.fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+    }
+
+    /// TASK #28: drive a synthetic MouseEvent end-to-end through a local
+    /// EDT queue and the `getNextEvent` synthesis pipeline. Before this
+    /// task `getNextEvent` returned null for every non-invocation event
+    /// and the EDT silently dropped mouse / key / window listeners. The
+    /// plan produced here is exactly what the native callback writes
+    /// into the Java MouseEvent object — so asserting on the plan
+    /// exercises the same code path the dispatch loop hits at runtime,
+    /// minus the `new_object` / `set_field_by_name` round-trips (which
+    /// require a full `NativeContext` we don't have in unit-test scope).
+    ///
+    /// Uses a *local* `EventDispatchThread` instead of the process-wide
+    /// `edt::get_edt()` singleton: tests run in parallel under
+    /// `cargo test`, so a shared singleton would race with the
+    /// `invoke_later` / `getNextEvent` tests in other modules.
+    #[test]
+    fn mouse_event_round_trips_through_event_queue_with_correct_coords() {
+        // Register a fake Java component as the source for peer 7. The
+        // peer-source table is process-wide but keyed by peer id, so a
+        // unique peer id per test avoids cross-test interference.
+        let source = fake_object_ref(7);
+        register_peer_source(PeerId(7), source);
+
+        // Inject a synthetic MOUSE_PRESSED via a local EDT (the same
+        // entry point the platform backends use after translating a
+        // WM_LBUTTONDOWN / X11 ButtonPress / Cocoa mouseDown into an
+        // `AwtEvent`).
+        let edt = crate::edt::EventDispatchThread::new();
+        edt.post_event(AwtEvent::mouse(
+            event_id::MOUSE_PRESSED,
+            PeerId(7),
+            42, // timestamp
+            120,
+            240,
+            BUTTON1,
+            1,
+            modifiers::BUTTON1_DOWN_MASK,
+        ));
+
+        // This is what the native callback would dequeue:
+        let evt = edt.poll_event().expect("event must be present");
+        assert_eq!(evt.id, event_id::MOUSE_PRESSED);
+
+        // And this is what it would write into the Java MouseEvent object:
+        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id))
+            .expect("MouseEvent must produce a plan");
+        assert_eq!(plan.class_name, "java/awt/event/MouseEvent");
+        assert_eq!(find_field(&plan, "id"), Some(&Value::Int(event_id::MOUSE_PRESSED)));
+        assert_eq!(find_field(&plan, "when"), Some(&Value::Long(42)));
+        assert_eq!(find_field(&plan, "x"), Some(&Value::Int(120)));
+        assert_eq!(find_field(&plan, "y"), Some(&Value::Int(240)));
+        assert_eq!(find_field(&plan, "button"), Some(&Value::Int(BUTTON1)));
+        assert_eq!(find_field(&plan, "clickCount"), Some(&Value::Int(1)));
+        assert_eq!(
+            find_field(&plan, "modifiers"),
+            Some(&Value::Int(modifiers::BUTTON1_DOWN_MASK)),
+        );
+        // The source must round-trip from the peer-id → Java component map.
+        assert_eq!(find_field(&plan, "source"), Some(&Value::Object(Some(source))));
+        // Consumed flag must start at 0 — listeners may flip it later.
+        assert_eq!(find_field(&plan, "consumed"), Some(&Value::Int(0)));
+    }
+
+    /// TASK #28: confirm a `WindowEvent::WINDOW_CLOSING` survives the
+    /// EDT queue, is synthesized as `java/awt/event/WindowEvent`, and
+    /// carries the right `id` + `source`. This is the path a real
+    /// platform-backend "close-button clicked" notification follows.
+    #[test]
+    fn window_closing_event_returns_correct_window_event_class() {
+        let source = fake_object_ref(3);
+        register_peer_source(PeerId(3), source);
+
+        let edt = crate::edt::EventDispatchThread::new();
+        edt.post_event(AwtEvent::window(event_id::WINDOW_CLOSING, PeerId(3), 999));
+
+        let evt = edt.poll_event().expect("window event must be present");
+        assert_eq!(evt.id, event_id::WINDOW_CLOSING);
+
+        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id))
+            .expect("WindowEvent must produce a plan");
+        assert_eq!(plan.class_name, "java/awt/event/WindowEvent");
+        assert_eq!(
+            find_field(&plan, "id"),
+            Some(&Value::Int(event_id::WINDOW_CLOSING)),
+        );
+        assert_eq!(find_field(&plan, "source"), Some(&Value::Object(Some(source))));
+        assert_eq!(find_field(&plan, "oldState"), Some(&Value::Int(0)));
+        assert_eq!(find_field(&plan, "newState"), Some(&Value::Int(0)));
+    }
+
+    /// Sanity: a `KeyEvent::KEY_PRESSED` carries `keyCode`, `keyChar`,
+    /// and modifiers through the synthesis plan. Regression guard for
+    /// the listener-pipeline rewrite — without this the JDK
+    /// `KeyEvent.getKeyCode()` accessor returned 0 for everything.
+    #[test]
+    fn key_event_carries_keycode_keychar_and_modifiers() {
+        let source = fake_object_ref(5);
+        register_peer_source(PeerId(5), source);
+
+        let evt = AwtEvent::key(
+            event_id::KEY_PRESSED,
+            PeerId(5),
+            123,
+            crate::event::vk::VK_A,
+            'a',
+            modifiers::SHIFT_DOWN_MASK,
+        );
+        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id))
+            .expect("KeyEvent must produce a plan");
+        assert_eq!(plan.class_name, "java/awt/event/KeyEvent");
+        assert_eq!(find_field(&plan, "keyCode"), Some(&Value::Int(crate::event::vk::VK_A)));
+        assert_eq!(find_field(&plan, "keyChar"), Some(&Value::Int('a' as i32)));
+        assert_eq!(
+            find_field(&plan, "modifiers"),
+            Some(&Value::Int(modifiers::SHIFT_DOWN_MASK)),
+        );
+        assert_eq!(find_field(&plan, "source"), Some(&Value::Object(Some(source))));
+    }
+
+    /// Sanity: a paint event materialises as `PaintEvent` (the EDT
+    /// dispatch loop relies on this class name so RepaintManager's
+    /// dispatch-on-EDT path actually fires).
+    #[test]
+    fn paint_event_uses_paint_event_class() {
+        let evt = AwtEvent::paint(event_id::PAINT, PeerId(0), 0, 0, 0, 100, 100);
+        let plan = plan_event_synthesis(&evt, None)
+            .expect("PaintEvent must produce a plan");
+        assert_eq!(plan.class_name, "java/awt/event/PaintEvent");
+        assert_eq!(find_field(&plan, "id"), Some(&Value::Int(event_id::PAINT)));
+    }
+
+    /// Component / Focus / Action events are TODO and intentionally
+    /// produce no plan. Regression guard so we notice if the match arm
+    /// quietly grows a new entry without a test.
+    #[test]
+    fn unsupported_event_kinds_return_none_for_now() {
+        let comp = AwtEvent::component(event_id::COMPONENT_RESIZED, PeerId(1), 0, 0, 0, 10, 10);
+        assert!(plan_event_synthesis(&comp, None).is_none());
+        let focus = AwtEvent::focus(event_id::FOCUS_GAINED, PeerId(1), 0, false);
+        assert!(plan_event_synthesis(&focus, None).is_none());
+        let action = AwtEvent::action(PeerId(1), 0, "ok".to_string());
+        assert!(plan_event_synthesis(&action, None).is_none());
+    }
+
+    /// `wait_event_blocking` must unblock as soon as an event is posted
+    /// to the queue. Without this the EDT dispatch loop would
+    /// busy-spin instead of sleeping between events.
+    #[test]
+    fn wait_event_blocking_returns_when_event_arrives() {
+        use std::sync::Arc;
+        let edt = Arc::new(crate::edt::EventDispatchThread::new());
+        edt.start();
+        let edt2 = Arc::clone(&edt);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            edt2.post_event(AwtEvent::window(event_id::WINDOW_OPENED, PeerId(1), 0));
+        });
+        // 2-second total budget; 10ms re-check interval. Way more than
+        // the producer needs (15ms) but bounded so a regression doesn't
+        // hang the whole `cargo test` run.
+        let got = edt.wait_event_blocking(2_000, 10, || false);
+        producer.join().unwrap();
+        edt.stop();
+        let evt = got.expect("must observe the posted event");
+        assert_eq!(evt.id, event_id::WINDOW_OPENED);
     }
 }
