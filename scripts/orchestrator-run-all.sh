@@ -161,7 +161,15 @@ if [ -d "$APPS/batch4" ]; then
         [ -n "$FMCP" ] && run batch4_freemind 15 -c "$FMCP" "-Dfreemind.base.dir=$APPS/batch4/freemind_ext" freemind.main.FreeMindStarter
     fi
     if [ -f "$APPS/batch4/nexus-main.jar" ] && [ -f "$APPS/batch4/karaf-main.jar" ]; then
-        run batch4_nexus 15 -c "$APPS/batch4/nexus-main.jar;$APPS/batch4/karaf-main.jar;$APPS/batch4/osgi-core.jar" org.sonatype.nexus.karaf.NexusMain
+        mkdir -p "$APPS/batch4/karaf-base/etc" "$APPS/batch4/karaf-base/data"
+        run batch4_nexus 15 \
+            -c "$APPS/batch4/nexus-main.jar;$APPS/batch4/karaf-main.jar;$APPS/batch4/osgi-core.jar" \
+            "-Dkaraf.base=$APPS/batch4/karaf-base" \
+            "-Dkaraf.home=$APPS/batch4/karaf-base" \
+            "-Dkaraf.data=$APPS/batch4/karaf-base/data" \
+            "-Dkaraf.etc=$APPS/batch4/karaf-base/etc" \
+            "-Djava.io.tmpdir=$APPS/batch4/karaf-base/tmp" \
+            org.sonatype.nexus.karaf.NexusMain
     fi
 fi
 

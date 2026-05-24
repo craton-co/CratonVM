@@ -80,6 +80,17 @@ const CN_CORE_CONTEXT_FACTORY: &str = "org/apache/logging/log4j/core/impl/Log4jC
 const CN_SIMPLE_CONTEXT_FACTORY: &str =
     "org/apache/logging/log4j/simple/SimpleLoggerContextFactory";
 const CN_LOGGER_CONTEXT_FACTORY: &str = "org/apache/logging/log4j/spi/LoggerContextFactory";
+/// log4j-core `Configuration` impls that callers (notably ES's
+/// `Loggers.setLevel`) reach via
+/// `core.LoggerContext.getConfiguration().getLoggerConfig(name)`. We hand
+/// out a synthetic `NullConfiguration` (the log4j-core "no config" type)
+/// and pair it with no-op natives on the `Configuration` interface so
+/// the receiver call resolves without NPE'ing on uninitialised state.
+const CN_NULL_CONFIGURATION: &str = "org/apache/logging/log4j/core/config/NullConfiguration";
+const CN_DEFAULT_CONFIGURATION: &str = "org/apache/logging/log4j/core/config/DefaultConfiguration";
+const CN_ABSTRACT_CONFIGURATION: &str = "org/apache/logging/log4j/core/config/AbstractConfiguration";
+const CN_CONFIGURATION: &str = "org/apache/logging/log4j/core/config/Configuration";
+const CN_LOGGER_CONFIG: &str = "org/apache/logging/log4j/core/config/LoggerConfig";
 
 /// Build a synthetic `LoggerContextFactory`. Prefers log4j-core's
 /// `Log4jContextFactory`, falling back to `SimpleLoggerContextFactory`
@@ -117,6 +128,32 @@ fn build_logger_context(ctx: &mut dyn NativeContext) -> ObjectRef {
         return crate::alloc_concurrent_synthetic(ctx, CN_CORE_LOGGER_CONTEXT, 16);
     }
     crate::alloc_concurrent_synthetic(ctx, CN_SIMPLE_LOGGER_CONTEXT, 16)
+}
+
+/// Build a synthetic `Configuration` instance. Prefers
+/// `NullConfiguration` (the log4j-core "no config" subclass) since its
+/// `getLoggerConfig` semantics most closely match our no-op contract.
+/// Falls back to `DefaultConfiguration`, then `AbstractConfiguration`
+/// when neither resolves on the classpath.
+fn build_configuration(ctx: &mut dyn NativeContext) -> ObjectRef {
+    for cls in [CN_NULL_CONFIGURATION, CN_DEFAULT_CONFIGURATION, CN_ABSTRACT_CONFIGURATION] {
+        if ctx.class_id_by_name(cls).is_some() || ctx.ensure_class_initialized(cls).is_ok() {
+            return crate::alloc_concurrent_synthetic(ctx, cls, 32);
+        }
+    }
+    // Last resort: the interface itself.
+    crate::alloc_concurrent_synthetic(ctx, CN_CONFIGURATION, 8)
+}
+
+/// Build a synthetic `LoggerConfig`. Used as the return value from
+/// `Configuration.getLoggerConfig(String)` so callers that chain
+/// `.setLevel(level)` (e.g. `org.elasticsearch.common.logging.Loggers
+/// .setLevel`) find a non-null receiver. The shim natives registered on
+/// `LoggerConfig` make every subsequent mutator a no-op, matching the
+/// "logging silently swallows everything" contract of the rest of this
+/// module.
+fn build_logger_config(ctx: &mut dyn NativeContext) -> ObjectRef {
+    crate::alloc_concurrent_synthetic(ctx, CN_LOGGER_CONFIG, 16)
 }
 
 /// Build a synthetic `Logger` carrying just the supplied logger name
@@ -573,6 +610,169 @@ pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
         native_get_context_0,
     );
 
+    // core.LoggerContext mutators — Spark's `Logging.initializeLogging`
+    // casts the result of `LogManager.getContext(false)` to
+    // `core.LoggerContext` and then calls `reconfigure()V` /
+    // `setConfigLocation(URI)V` on it. Our synthetic instance has every
+    // instance field (notably `externalMap` and `configLocation`) left
+    // null because `alloc_concurrent_synthetic` bypasses the real ctor.
+    // The real `reconfigure(URI)` bytecode reads `externalMap.get(...)`
+    // and trips `NullPointerException: Cannot invoke get on null` at
+    // `LoggerContext.java:686` — the canonical Spark boot failure under
+    // CratonVM. No-op these mutators so the synthetic context silently
+    // accepts the reconfigure request (the rest of the pipeline is
+    // already no-op'd via the SimpleLogger / core.Logger surface).
+    registry.register(CN_CORE_LOGGER_CONTEXT, "reconfigure", "()V", native_log_void);
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "reconfigure",
+        "(Ljava/net/URI;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "reconfigure",
+        "(Lorg/apache/logging/log4j/core/config/Configuration;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "setConfigLocation",
+        "(Ljava/net/URI;)V",
+        native_log_void,
+    );
+    registry.register(CN_CORE_LOGGER_CONTEXT, "updateLoggers", "()V", native_log_void);
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "updateLoggers",
+        "(Lorg/apache/logging/log4j/core/config/Configuration;)V",
+        native_log_void,
+    );
+    registry.register(CN_CORE_LOGGER_CONTEXT, "start", "()V", native_log_void);
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "start",
+        "(Lorg/apache/logging/log4j/core/config/Configuration;)V",
+        native_log_void,
+    );
+    registry.register(CN_CORE_LOGGER_CONTEXT, "stop", "()V", native_log_void);
+    registry.register(CN_CORE_LOGGER_CONTEXT, "close", "()V", native_log_void);
+    registry.register(CN_CORE_LOGGER_CONTEXT, "terminate", "()V", native_log_void);
+
+    // `core.LoggerContext.getConfiguration()` — Elasticsearch's
+    // `org.elasticsearch.common.logging.Loggers.setLevel(Logger, Level,
+    // List)` does:
+    //   ctx = LoggerContext.getContext(false)            // our shim
+    //   cfg = ctx.getConfiguration()                     // returned null
+    //   lc  = cfg.getLoggerConfig(logger.getName())      // NPE here
+    //   lc.setLevel(level)
+    // The synthetic LoggerContext we hand out from `LogManager.getContext`
+    // has `configuration` slot = null because `alloc_concurrent_synthetic`
+    // bypasses the real ctor. Return a synthetic `NullConfiguration` so
+    // the chain proceeds; `Configuration.getLoggerConfig` is then routed
+    // to our native below.
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "getConfiguration",
+        "()Lorg/apache/logging/log4j/core/config/Configuration;",
+        |ctx, _args| Ok(Some(Value::Object(Some(build_configuration(ctx))))),
+    );
+    registry.register(
+        CN_CORE_LOGGER_CONTEXT,
+        "setConfiguration",
+        "(Lorg/apache/logging/log4j/core/config/Configuration;)Lorg/apache/logging/log4j/core/config/Configuration;",
+        |_ctx, args| Ok(Some(args.get(1).cloned().unwrap_or(Value::Object(None)))),
+    );
+
+    // `Configuration.getLoggerConfig(String) -> LoggerConfig` — register
+    // on every concrete Configuration impl we hand out so dispatch
+    // (invokeinterface) lands on the native ahead of the real bytecode,
+    // which would read uninitialised `loggerConfigs` map fields on the
+    // synthetic instance and NPE. Each native returns the same shape:
+    // a synthetic `LoggerConfig` carrying just enough state for
+    // `setLevel` to succeed (the setter is also a no-op below).
+    for cls in [
+        CN_NULL_CONFIGURATION,
+        CN_DEFAULT_CONFIGURATION,
+        CN_ABSTRACT_CONFIGURATION,
+        CN_CONFIGURATION,
+    ] {
+        registry.register(
+            cls,
+            "getLoggerConfig",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/core/config/LoggerConfig;",
+            |ctx, _args| Ok(Some(Value::Object(Some(build_logger_config(ctx))))),
+        );
+        // `getName` — return empty string (the LoggerConfig identifier
+        // isn't consulted further down the chain).
+        registry.register(cls, "getName", "()Ljava/lang/String;", |ctx, _args| {
+            let s = ctx.create_string("");
+            Ok(Some(Value::Object(Some(s))))
+        });
+        // No-op ctor/clinit so the synthetic-alloc path doesn't trip on
+        // the heavy real ctor (which reads PluginManager state etc.).
+        registry.register(cls, "<init>", "()V", native_log_void);
+        registry.register(cls, "<clinit>", "()V", native_log_void);
+    }
+
+    // `LoggerConfig.setLevel(Level) -> void` and the companion accessors
+    // ES / Spark touch immediately after `getLoggerConfig`. All no-op so
+    // the synthetic LoggerConfig silently accepts level changes.
+    //
+    // `addAppender(Appender, Level, Filter)V` is reached from
+    // `AbstractConfiguration.setToDefault` during the log4j default-config
+    // bootstrap path (ES `configureStatusLogger` → DefaultConfigurationBuilder
+    // .build → setToDefault → LoggerConfig.addAppender). The real method body
+    // reads `getfield appenders; AppenderControlArraySet.add(...)` and trips
+    // `NullPointerException: Cannot invoke add on null` on our synthetic
+    // instance whose `appenders` slot is null. Same for `removeAppender`,
+    // `setParent`, `setLogEventFactory`, `setAdditive` — all mutators that
+    // read uninitialised instance fields on the synthetic.
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "setLevel",
+        "(Lorg/apache/logging/log4j/Level;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "getLevel",
+        "()Lorg/apache/logging/log4j/Level;",
+        native_logger_get_level,
+    );
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "addAppender",
+        "(Lorg/apache/logging/log4j/core/Appender;Lorg/apache/logging/log4j/Level;Lorg/apache/logging/log4j/core/Filter;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "removeAppender",
+        "(Ljava/lang/String;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "setParent",
+        "(Lorg/apache/logging/log4j/core/config/LoggerConfig;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "setLogEventFactory",
+        "(Lorg/apache/logging/log4j/core/impl/LogEventFactory;)V",
+        native_log_void,
+    );
+    registry.register(
+        CN_LOGGER_CONFIG,
+        "setAdditive",
+        "(Z)V",
+        native_log_void,
+    );
+    registry.register(CN_LOGGER_CONFIG, "<init>", "()V", native_log_void);
+    registry.register(CN_LOGGER_CONFIG, "<clinit>", "()V", native_log_void);
+
     // --- SimpleLogger no-op surface -----------------------------------
     register_simple_logger_methods(registry);
 
@@ -652,12 +852,34 @@ pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
 /// either void or `false` so the caller treats the level as disabled and
 /// produces no further log activity.
 fn register_simple_logger_methods(registry: &mut NativeMethodRegistry) {
-    // For each class (concrete log4j-core / simple-logger receivers
-    // AND the shared abstract base, in case dispatch falls through the
-    // vtable to AbstractLogger).
-    for cls in [CN_SIMPLE_LOGGER, CN_CORE_LOGGER, CN_ABSTRACT_LOGGER] {
-        // <init> no-op so allocation+construct paths don't NPE on the
-        // real ctor's MessageFactory / PropertiesUtil chain.
+    // <init> no-ops are intentionally NOT registered on AbstractLogger.
+    // Subclasses such as `org.apache.logging.log4j.status.StatusLogger`
+    // call `super(name, messageFactory)` via `invokespecial`, which lands
+    // on `AbstractLogger.<init>(String, MessageFactory)V`. That real ctor
+    // sets the `messageFactory` field (falling back to
+    // `createDefaultMessageFactory()` when the arg is null). If we replace
+    // it with a no-op, the field stays null and every later
+    // `logMessage(...)` overload tripping `getfield messageFactory;
+    // invokeinterface newMessage` NPEs with "Cannot invoke newMessage on
+    // null". That's the canonical Elasticsearch boot failure under
+    // CratonVM: `StatusLogger.<clinit>` builds the singleton, super-ctor
+    // is no-op'd, the resulting `STATUS_LOGGER` field is half-init'd, and
+    // log4j-core's `AbstractConfiguration.initialize` chain (which logs
+    // via that singleton) NPEs at `AbstractLogger.java:2051`.
+    //
+    // The original motivation for the no-op (avoid running heavy ctor
+    // bytecode on synthetic instances) doesn't actually apply: our
+    // synthetic-alloc helper (`alloc_concurrent_synthetic`) never invokes
+    // any `<init>`. The only callers of these ctors are real bytecode
+    // paths whose contract requires the field assignment.
+    //
+    // We still register the no-ops on the concrete subclasses
+    // (`SimpleLogger`, `core.Logger`) because their `<init>` overloads
+    // have different signatures than the ones registered below (the
+    // concrete-ctor descriptors don't match any of `()V`, `(String)V`,
+    // `(String, MessageFactory)V`), so these are effectively dead
+    // registrations kept for defensive symmetry only.
+    for cls in [CN_SIMPLE_LOGGER, CN_CORE_LOGGER] {
         registry.register(cls, "<init>", "()V", native_log_void);
         registry.register(cls, "<init>", "(Ljava/lang/String;)V", native_log_void);
         registry.register(
@@ -666,7 +888,12 @@ fn register_simple_logger_methods(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;Lorg/apache/logging/log4j/message/MessageFactory;)V",
             native_log_void,
         );
+    }
 
+    // The accessor / log / isEnabled surface still applies to all three
+    // classes including AbstractLogger (vtable fallthrough for synthetic
+    // instances).
+    for cls in [CN_SIMPLE_LOGGER, CN_CORE_LOGGER, CN_ABSTRACT_LOGGER] {
         // Accessors.
         registry.register(cls, "getName", "()Ljava/lang/String;", native_logger_get_name);
         registry.register(

@@ -766,7 +766,10 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/UnaryOperator;)V",
         native_al_replace_all,
     );
-    r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
+    // NOTE: `ArrayList.stream()` intentionally NOT bridged — let the real-JDK
+    // `AbstractCollection.stream()` default method run so we get a proper
+    // `ReferencePipeline$Head` instead of a synthetic `Stream`-interface
+    // instance.
 }
 
 pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3586,7 +3589,8 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/function/Consumer;)V",
             native_hs_for_each,
         );
-        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
+        // NOTE: `HashSet.stream()` intentionally NOT bridged — let real-JDK
+        // default method run.
         r.register(
             c,
             "addAll",
@@ -4134,13 +4138,64 @@ fn native_iterator_remove_dispatcher(
         "java/util/HashMap$KeyItr" => native_map_key_itr_remove(ctx, args),
         "java/util/ArrayList$Itr" => native_al_itr_remove(ctx, args),
         _ => {
-            // No class-specific override exists; preserve the JDK default
-            // semantics by throwing `UnsupportedOperationException("remove")`.
-            // Matching the exact message keeps caller-introspection code
-            // (e.g. `Throwable.getMessage` checks) working unchanged.
-            Err(iter_remove_unsupported())
+            // The receiver is not one of our synthetic iterator classes. The
+            // force-native registration on `java/util/Iterator.remove()V`
+            // intercepts EVERY interface-typed `it.remove()` call site, so
+            // we land here for any real-JDK iterator too (e.g.
+            // `java/util/HashMap$KeyIterator`, returned by the real-JDK
+            // `HashSet.iterator()` running in real-bytecode mode). For those
+            // we MUST delegate back to the receiver class's own bytecode
+            // body — `MXBeanSupport.findMXBeanInterface` iterates a real
+            // `HashSet<Class<?>>` and calls `it.remove()` to prune
+            // candidate interfaces; throwing UOE unconditionally tears the
+            // MXBean introspection down with `NotCompliantMBeanException`
+            // (observed booting WildFly 39 / Keycloak 16).
+            //
+            // Walk the receiver's superclass chain (NOT its interfaces —
+            // the JDK `java.util.Iterator.remove()V` default body is itself
+            // a UOE thrower we want to bypass) and check whether any
+            // concrete class declares a non-abstract `remove()V`. If yes,
+            // call it via `invoke_special` on the receiver class (the
+            // shared impl's `find_method_recursive` runs the chain-walk
+            // phase first and lands on the override before the interface
+            // default ever gets a look-in). If no concrete override exists
+            // anywhere on the chain, preserve the JDK semantics by throwing
+            // `UnsupportedOperationException("remove")`.
+            if receiver_class_has_concrete_remove(ctx, cid) {
+                ctx.invoke_special(&name, "remove", "()V", args)
+            } else {
+                Err(iter_remove_unsupported())
+            }
         }
     }
+}
+
+/// Returns `true` if `class_id` or any class on its superclass chain (excluding
+/// interfaces) declares a non-abstract `remove()V` method. Used by
+/// [`native_iterator_remove_dispatcher`] to decide whether falling through to
+/// the receiver class's own bytecode is safe — if no concrete override exists,
+/// `find_method_recursive` would resolve through the interface closure to
+/// `java.util.Iterator.remove()V`'s default body, which itself throws
+/// `UnsupportedOperationException` (and risks re-entering the dispatcher via
+/// the registered native on the interface CP class).
+fn receiver_class_has_concrete_remove(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
+    // `MethodAccessFlags::ABSTRACT == 0x0400` (see `reader/src/class_access_flags.rs`).
+    // Re-encoded as a literal here to avoid pulling the `cratonvm_reader` crate
+    // into `native-collections` solely for the flag constant.
+    const ACC_ABSTRACT: u16 = 0x0400;
+    let mut current = Some(class_id);
+    while let Some(cid) = current {
+        for m in ctx.declared_methods(cid) {
+            if m.name == "remove"
+                && m.descriptor == "()V"
+                && (m.access_flags & ACC_ABSTRACT) == 0
+            {
+                return true;
+            }
+        }
+        current = ctx.superclass_of(cid);
+    }
+    false
 }
 
 /// Build the JDK-default `UnsupportedOperationException("remove")` that
@@ -6437,58 +6492,11 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     make_stream(ctx, &combined)
 }
 
-fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return make_stream(ctx, &[]),
-    };
-    let (data, size) = al_state(ctx, this);
-    let elements: Vec<Value> = match data {
-        Some(d) => (0..size as usize)
-            .map(|i| ctx.get_array_element(d, i))
-            .collect(),
-        // Foreign collection (not ArrayList-shaped): the interface-level
-        // `stream` registration caught e.g. a Guava `Maps$Values`. Walk
-        // its real iterator instead of returning an empty stream.
-        None => collection_elements_generic(ctx, this),
-    };
-    make_stream(ctx, &elements)
-}
-
-fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return make_stream(ctx, &[]),
-    };
-    let backing = match hs_backing_map(ctx, this) {
-        Some(m) => m,
-        None => return make_stream(ctx, &[]),
-    };
-    let keys = map_collect_keys(ctx, backing);
-    make_stream(ctx, &keys)
-}
-
-// TreeSet.stream() — snapshot of sorted elements (also serves TreeMap.keySet()
-// since native_tm_key_set returns a synthetic TreeSet). Real JDK's
-// TreeSet.spliterator() goes through TreeMap.keySpliteratorFor(), which requires
-// the JDK's `root`/`size` red-black tree fields populated by put(); our
-// synthetic layout does not provide those, so without this override the stream
-// is empty (observed: `m.keySet().stream().count()` returned 0 for a 3-entry
-// TreeMap, which broke Keycloak FeatureOptions.<clinit>).
-fn native_ts_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return make_stream(ctx, &[]),
-    };
-    let (data_opt, size, _) = ts_state(ctx, this);
-    let elements: Vec<Value> = match data_opt {
-        Some(d) => (0..size as usize)
-            .map(|i| ctx.get_array_element(d, i))
-            .collect(),
-        None => Vec::new(),
-    };
-    make_stream(ctx, &elements)
-}
+// NOTE: `native_al_stream` / `native_hs_stream` / `native_ts_stream` /
+// `native_unmod_stream` were removed when the synthetic `Stream` shim was
+// disabled (see docs/jvm-no-synthetic-stubs.md). The real-JDK default method
+// `AbstractCollection.stream()` now runs instead, producing a proper
+// `ReferencePipeline$Head`.
 
 // -- Intermediate operations --
 
@@ -8895,12 +8903,12 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         native_al_iterator,
     );
     registry.register("java/util/Collection", "size", "()I", native_al_size);
-    registry.register(
-        "java/util/Collection",
-        "stream",
-        "()Ljava/util/stream/Stream;",
-        native_al_stream,
-    );
+    // NOTE: `Collection.stream()` intentionally NOT bridged — see
+    // docs/jvm-no-synthetic-stubs.md. The previous bridge returned a synthetic
+    // `java/util/stream/Stream` object (an interface!), causing
+    // `AbstractMethodError` when real-JDK code invoked any method on it
+    // (e.g. `forEachOrdered`). Letting the real default method run produces a
+    // proper `ReferencePipeline$Head`.
     registry.register("java/util/Collection", "isEmpty", "()Z", native_al_is_empty);
     registry.register(
         "java/util/Collection",
@@ -8936,12 +8944,8 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         native_al_iterator,
     );
     registry.register("java/util/List", "isEmpty", "()Z", native_al_is_empty);
-    registry.register(
-        "java/util/List",
-        "stream",
-        "()Ljava/util/stream/Stream;",
-        native_al_stream,
-    );
+    // NOTE: `List.stream()` intentionally NOT bridged (see Collection.stream
+    // note above).
     registry.register(
         "java/util/List",
         "toArray",
@@ -16301,7 +16305,8 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         native_ts_sub_set,
     );
     registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
-    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+    // NOTE: `TreeSet.stream()` intentionally NOT bridged — let real-JDK
+    // default method run.
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";
@@ -18243,7 +18248,8 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "(Ljava/util/function/Consumer;)V",
             native_unmod_for_each,
         );
-        r.register(c, "stream", "()Ljava/util/stream/Stream;", native_unmod_stream);
+        // NOTE: unmodifiable-wrapper `stream()` intentionally NOT bridged —
+        // let real-JDK default method run.
         r.register(
             c,
             "spliterator",
@@ -18550,10 +18556,6 @@ fn native_unmod_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_unmod_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     unmod_delegate(ctx, args, "forEach", "(Ljava/util/function/Consumer;)V")
-}
-
-fn native_unmod_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    unmod_delegate(ctx, args, "stream", "()Ljava/util/stream/Stream;")
 }
 
 fn native_unmod_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23265,7 +23267,8 @@ mod tests {
         assert!(r.find(c, "sort", "(Ljava/util/Comparator;)V").is_some(), "AL sort");
         assert!(r.find(c, "removeIf", "(Ljava/util/function/Predicate;)Z").is_some(), "AL removeIf");
         assert!(r.find(c, "replaceAll", "(Ljava/util/function/UnaryOperator;)V").is_some(), "AL replaceAll");
-        assert!(r.find(c, "stream", "()Ljava/util/stream/Stream;").is_some(), "AL stream");
+        // `stream()` intentionally NOT registered — see docs/jvm-no-synthetic-stubs.md.
+        assert!(r.find(c, "stream", "()Ljava/util/stream/Stream;").is_none(), "AL stream must be absent");
     }
 
     // -----------------------------------------------------------------------
