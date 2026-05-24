@@ -10646,7 +10646,7 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             loop {
                 match ctx.class_name_of_id(cur) {
                     Some(n) if n == "java/util/LinkedHashMap" => {
-                        cratonvm_native_collections::clone_lhm_overlay(ctx, this, clone_ref);
+                        cratonvm_native_collections::clone_lhm_overlay(this, clone_ref);
                         break;
                     }
                     Some(n) if n == "java/lang/Object" => break,
@@ -22016,6 +22016,15 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 }.into()),
             };
             let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            // ByteBufferAsCharBuffer{B,L} fallback — see `charAt(I)C` below.
+            let cid = ctx.class_id_of_object(this);
+            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cname == "java/nio/ByteBufferAsCharBufferB"
+                || cname == "java/nio/ByteBufferAsCharBufferL"
+            {
+                let ch = bbacb_char_at(ctx, this, idx)?;
+                return Ok(Some(Value::Int(ch as i32)));
+            }
             let (arr, _pos, lim, off) = match cb_state(ctx, this) {
                 Some(s) => s,
                 None => return Err(RuntimeError::IllegalStateException {
@@ -22053,6 +22062,192 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             cb_set_pos(ctx, this, pos + 1);
             Ok(Some(Value::Object(Some(this))))
         });
+        // ByteBufferAsCharBuffer{B,L} — the JDK's view-buffer class
+        // created by `HeapByteBuffer.asCharBuffer()`. Unlike our
+        // synthetic CharBuffer (slot 0 = char[] / `hb` set), the JDK
+        // class stores the underlying ByteBuffer in `bb` and reads
+        // chars by decoding 2 bytes at a time from `bb.hb`. The CharBuffer
+        // base class's `hb` is left null, so the abstract-class natives
+        // above (which only know about `hb`) cannot service these
+        // instances. Register dedicated natives for both endianness
+        // variants that read `bb.hb` (byte[]) directly. Without this,
+        // icu4j's `ICUResourceBundleReader.getStringV2` chain
+        // (`bytes.asCharBuffer().charAt(I)` /
+        // `bytes.asCharBuffer().subSequence(...).toString()`) trips
+        // `IllegalStateException("CharBuffer has no backing array")`.
+        fn bbacb_read_underlying_bytes(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+        ) -> Option<(ObjectRef, i32, i32, i32, bool)> {
+            // `bb` is the underlying ByteBuffer (Ljava/nio/ByteBuffer;).
+            let bb_obj = match ctx.get_field_by_name(this, "bb") {
+                Value::Object(Some(o)) => o,
+                _ => return None,
+            };
+            // `bb.hb` is the byte[] backing store.
+            let byte_arr = match ctx.get_field_by_name(bb_obj, "hb") {
+                Value::Object(Some(a)) => a,
+                _ => match ctx.get_field(bb_obj, 0) {
+                    Value::Object(Some(a)) => a,
+                    _ => return None,
+                },
+            };
+            let pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 1) { Value::Int(v) => v, _ => 0 },
+            };
+            let lim = match ctx.get_field_by_name(this, "limit") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 2) { Value::Int(v) => v, _ => 0 },
+            };
+            // address / byte_offset — the JDK uses `bb.offset()` + 2*index.
+            let bb_off = match ctx.get_field_by_name(bb_obj, "offset") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            // Class name suffix tells us endianness: `B` = big-endian,
+            // `L` = little-endian.
+            let cid = ctx.class_id_of_object(this);
+            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+            let big_endian = cname.ends_with('B');
+            Some((byte_arr, pos, lim, bb_off, big_endian))
+        }
+
+        fn bbacb_char_at(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+            idx: i32,
+        ) -> Result<u16, RuntimeError> {
+            let (byte_arr, pos, lim, bb_off, big_endian) =
+                bbacb_read_underlying_bytes(ctx, this).ok_or(RuntimeError::IllegalStateException {
+                    message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
+                })?;
+            let real = pos + idx;
+            if idx < 0 || real >= lim {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("charAt index: {idx}"),
+                });
+            }
+            let byte_idx = (bb_off + 2 * real) as usize;
+            let hi = ctx.get_array_element(byte_arr, byte_idx).as_int().unwrap_or(0) & 0xFF;
+            let lo = ctx.get_array_element(byte_arr, byte_idx + 1).as_int().unwrap_or(0) & 0xFF;
+            let ch = if big_endian { ((hi << 8) | lo) as u16 } else { ((lo << 8) | hi) as u16 };
+            Ok(ch)
+        }
+
+        for bbacb in &["java/nio/ByteBufferAsCharBufferB", "java/nio/ByteBufferAsCharBufferL"] {
+            registry.register(bbacb, "charAt", "(I)C", |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Err(RuntimeError::NullPointerException {
+                        message: Some("ByteBufferAsCharBuffer.charAt(I) on null".into()),
+                    }.into()),
+                };
+                let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+                let ch = bbacb_char_at(ctx, this, idx)?;
+                Ok(Some(Value::Int(ch as i32)))
+            });
+            registry.register(bbacb, "get", "(I)C", |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Err(RuntimeError::NullPointerException {
+                        message: Some("ByteBufferAsCharBuffer.get(I) on null".into()),
+                    }.into()),
+                };
+                let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+                let ch = bbacb_char_at(ctx, this, idx)?;
+                Ok(Some(Value::Int(ch as i32)))
+            });
+            registry.register(bbacb, "get", "()C", |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Err(RuntimeError::NullPointerException {
+                        message: Some("ByteBufferAsCharBuffer.get() on null".into()),
+                    }.into()),
+                };
+                let pos = match ctx.get_field_by_name(this, "position") {
+                    Value::Int(v) => v,
+                    _ => 0,
+                };
+                let ch = bbacb_char_at(ctx, this, 0)?;
+                ctx.set_field_by_name(this, "position", Value::Int(pos + 1));
+                Ok(Some(Value::Int(ch as i32)))
+            });
+            // hasArray() — BBACB has no char[] backing array; return false.
+            registry.register(bbacb, "hasArray", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+            // subSequence(II) — return a fresh CharBuffer with copied chars.
+            // The JDK returns a slice of the same BBACB type, but copying
+            // into a flat char[] backed CharBuffer is sufficient for
+            // `subSequence(...).toString()` and `subSequence(...).charAt(i)`.
+            registry.register(
+                bbacb,
+                "subSequence",
+                "(II)Ljava/nio/CharBuffer;",
+                |ctx, args| {
+                    let this = match args.first() {
+                        Some(Value::Object(Some(o))) => *o,
+                        _ => return Err(RuntimeError::NullPointerException {
+                            message: Some("ByteBufferAsCharBuffer.subSequence on null".into()),
+                        }.into()),
+                    };
+                    let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                    let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+                    let (byte_arr, pos, lim, bb_off, big_endian) =
+                        bbacb_read_underlying_bytes(ctx, this).ok_or(
+                            RuntimeError::IllegalStateException {
+                                message: "ByteBufferAsCharBuffer: missing underlying bb.hb".into(),
+                            },
+                        )?;
+                    let _ = lim;
+                    let n = (end - start).max(0) as usize;
+                    let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, n);
+                    for i in 0..n {
+                        let real = pos + start + i as i32;
+                        let bi = (bb_off + 2 * real) as usize;
+                        let hi = ctx.get_array_element(byte_arr, bi).as_int().unwrap_or(0) & 0xFF;
+                        let lo = ctx.get_array_element(byte_arr, bi + 1).as_int().unwrap_or(0) & 0xFF;
+                        let ch = if big_endian { (hi << 8) | lo } else { (lo << 8) | hi };
+                        ctx.set_array_element(chars_arr, i, Value::Int(ch));
+                    }
+                    let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+                    ctx.set_field_by_name(buf, "hb", Value::Object(Some(chars_arr)));
+                    ctx.set_field_by_name(buf, "offset", Value::Int(0));
+                    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
+                    ctx.set_field_by_name(buf, "position", Value::Int(0));
+                    ctx.set_field_by_name(buf, "limit", Value::Int(n as i32));
+                    ctx.set_field_by_name(buf, "capacity", Value::Int(n as i32));
+                    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+                    ctx.set_field(buf, 0, Value::Object(Some(chars_arr)));
+                    ctx.set_field(buf, 1, Value::Int(0));
+                    ctx.set_field(buf, 2, Value::Int(n as i32));
+                    ctx.set_field(buf, 3, Value::Int(n as i32));
+                    ctx.set_field(buf, 4, Value::Int(-1));
+                    Ok(Some(Value::Object(Some(buf))))
+                },
+            );
+            // toString() — read all chars between pos..lim.
+            registry.register(bbacb, "toString", "()Ljava/lang/String;", |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+                };
+                let (byte_arr, pos, lim, bb_off, big_endian) = match bbacb_read_underlying_bytes(ctx, this) {
+                    Some(s) => s,
+                    None => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+                };
+                let mut chars: Vec<u16> = Vec::new();
+                for i in pos..lim {
+                    let bi = (bb_off + 2 * i) as usize;
+                    let hi = ctx.get_array_element(byte_arr, bi).as_int().unwrap_or(0) & 0xFF;
+                    let lo = ctx.get_array_element(byte_arr, bi + 1).as_int().unwrap_or(0) & 0xFF;
+                    let ch = if big_endian { ((hi << 8) | lo) as u16 } else { ((lo << 8) | hi) as u16 };
+                    chars.push(ch);
+                }
+                let s = String::from_utf16_lossy(&chars);
+                Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+            });
+        }
+
         // charAt(I)C — for CharSequence interop.
         registry.register(cb, "charAt", "(I)C", |ctx, args| {
             let this = match args.first() {
@@ -22062,6 +22257,19 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 }.into()),
             };
             let idx = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
+            // If the receiver is a ByteBufferAsCharBuffer{B,L}, read
+            // chars by decoding 2 bytes at a time from the underlying
+            // ByteBuffer's `hb`. JDK creates BBACB instances from
+            // `HeapByteBuffer.asCharBuffer()`; their CharBuffer.hb is
+            // null and our cb_state would otherwise fail.
+            let cid = ctx.class_id_of_object(this);
+            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cname == "java/nio/ByteBufferAsCharBufferB"
+                || cname == "java/nio/ByteBufferAsCharBufferL"
+            {
+                let ch = bbacb_char_at(ctx, this, idx)?;
+                return Ok(Some(Value::Int(ch as i32)));
+            }
             let (arr, pos, lim, off) = match cb_state(ctx, this) {
                 Some(s) => s,
                 None => return Err(RuntimeError::IllegalStateException {

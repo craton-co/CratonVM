@@ -1886,9 +1886,24 @@ impl SharedVm {
             .unwrap_or_else(|| ".".to_string());
         sys_props.insert("java.home".to_string(), java_home_val.clone());
 
-        // java.class.path — join VmConfig classpath with platform separator.
-        // Fall back to $CLASSPATH env var, then empty string.
-        let class_path_val = if !config.classpath.is_empty() {
+        // java.class.path — match the HotSpot contract:
+        //   * `-jar <FILE>` launch  ->  `java.class.path = <FILE>` (the
+        //     bare user-supplied jar path, NOT the manifest-expanded
+        //     transitive classpath). Liberty/Quarkus boot launchers do
+        //     `new JarFile(new File(System.getProperty("java.class.path")))`
+        //     and then `.getManifest().getMainAttributes()` — if we joined
+        //     all expanded entries here, that File wouldn't exist as a
+        //     jar and `getManifest()` would return null, producing the
+        //     "Cannot invoke getMainAttributes on null" NPE seen in 21
+        //     wlp tool jars (ws-schemagen, ws-wsimport, ws-featureUtility,
+        //     ...). The full transitive classpath is still wired into
+        //     the class loader via `config.classpath`, so resolution of
+        //     manifest `Class-Path:` siblings is unaffected.
+        //   * `-classpath <CP>` / `<class>` launch  ->  joined cp string.
+        //   * No cp configured  ->  fall back to $CLASSPATH env, then "".
+        let class_path_val = if let Some(jar) = config.launcher_jar.as_deref() {
+            jar.to_string()
+        } else if !config.classpath.is_empty() {
             let sep = if cfg!(windows) { ";" } else { ":" };
             config.classpath.join(sep)
         } else {

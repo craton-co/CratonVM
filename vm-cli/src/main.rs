@@ -1136,6 +1136,14 @@ fn run() -> Result<()> {
         .with_verbose_gc(args.verbose_gc)
         .with_skip_verification(args.noverify);
 
+    // Record the user-supplied `-jar` path so `java.class.path` is set
+    // to the bare jar (HotSpot contract), not the manifest-expanded
+    // transitive classpath. See `VmConfig::launcher_jar` for the full
+    // rationale — Liberty/Quarkus boot launchers reflect on this.
+    if let Some(jar) = args.jar.as_deref() {
+        config = config.with_launcher_jar(jar.to_string());
+    }
+
     if let Some(mode) = xverify_mode {
         config = config.with_xverify_mode(mode);
     }

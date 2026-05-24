@@ -1222,13 +1222,37 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     use cratonvm_types::ArrayElementType;
     let arr = ctx.new_array(ArrayElementType::Byte, cap);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    bb_write_hb(ctx, buf, arr, cap as i32);
+    buf
+}
+
+/// Initialise a synthetic ByteBuffer so BOTH the indexed-slot layout
+/// (BB_ARRAY/BB_POS/...) AND the real-JDK named fields (`hb`, `offset`,
+/// `position`, `limit`, `capacity`, `mark`) point at the same byte[].
+/// Without the by-name writes, JDK bytecode that reads `hb` directly
+/// (e.g. `ByteBuffer.hasArray`, `ByteBuffer.array`) sees null because
+/// the indexed slot 0 landed on Buffer.mark (int descriptor → Object
+/// coerced to Int by descriptor-aware set_field).
+pub(crate) fn bb_write_hb(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    arr: ObjectRef,
+    cap: i32,
+) {
+    ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
+    ctx.set_field_by_name(buf, "offset", Value::Int(0));
+    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
+    ctx.set_field_by_name(buf, "position", Value::Int(0));
+    ctx.set_field_by_name(buf, "limit", Value::Int(cap));
+    ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
+    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // Synthetic-mode indexed fallback.
     ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
     ctx.set_field(buf, BB_POS, Value::Int(0));
-    ctx.set_field(buf, BB_LIMIT, Value::Int(cap as i32));
-    ctx.set_field(buf, BB_CAP, Value::Int(cap as i32));
+    ctx.set_field(buf, BB_LIMIT, Value::Int(cap));
+    ctx.set_field(buf, BB_CAP, Value::Int(cap));
     ctx.set_field(buf, BB_MARK, Value::Int(-1));
     ctx.set_field(buf, BB_ORDER, Value::Int(0));
-    buf
 }
 
 #[inline]
@@ -1249,6 +1273,12 @@ fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
 }
 #[inline]
 fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
+    // Prefer the real-JDK `hb` field — when the JDK ByteBuffer class
+    // is loaded, the indexed slot 0 lands on Buffer.mark (int
+    // descriptor) and any Object write was coerced to Int(low_bits).
+    if let Value::Object(Some(a)) = ctx.get_field_by_name(buf, "hb") {
+        return Some(a);
+    }
     match ctx.get_field(buf, BB_ARRAY) {
         Value::Object(Some(a)) => Some(a),
         _ => None,
@@ -1972,7 +2002,59 @@ s2_view_buf_fn!(s2_bb_as_long_buffer,   "java/nio/LongBuffer",   8);
 s2_view_buf_fn!(s2_bb_as_short_buffer,  "java/nio/ShortBuffer",  2);
 s2_view_buf_fn!(s2_bb_as_float_buffer,  "java/nio/FloatBuffer",  4);
 s2_view_buf_fn!(s2_bb_as_double_buffer, "java/nio/DoubleBuffer", 8);
-s2_view_buf_fn!(s2_bb_as_char_buffer,   "java/nio/CharBuffer",   2);
+
+/// `ByteBuffer.asCharBuffer()` — the view returned MUST have its backing
+/// store stored in the real-JDK `hb` field so JDK bytecode that reads
+/// `hb` (e.g. `CharBuffer.hasArray`, `CharBuffer.array`) sees a non-null
+/// char[]. The previous indexed-only write (`set_field(vb, BB_ARRAY, …)`)
+/// hit the real-JDK Buffer.mark slot — descriptor coercion (`I`) turned
+/// the Object reference into Int(low_bits_of_ptr), so when icu4j
+/// invoked `CharBuffer.subSequence(...).toString()` on the view, the
+/// JDK bytecode read a null `hb` and threw IllegalStateException
+/// "CharBuffer has no backing array" (icu4j-68.2 / icu4j-70.1).
+///
+/// The byte storage is also transcoded eagerly into a freshly-allocated
+/// char[] using the source ByteBuffer's byte order — the previous
+/// shim left slot 0 pointing at the byte[] source, which our native
+/// `charAt` interpreted as one char per byte (truncated UTF-16
+/// high bytes to zero).
+fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let pos = s2_bb_pos(ctx, this) as usize;
+    let lim = s2_bb_limit(ctx, this) as usize;
+    let order = s2_bb_order(ctx, this); // 0 = BIG_ENDIAN, 1 = LITTLE_ENDIAN
+    let rem_bytes = lim.saturating_sub(pos);
+    let rem_chars = rem_bytes / 2;
+    // Transcode bytes → chars using the source ByteBuffer's byte order.
+    let chars_arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, rem_chars);
+    if let Some(src) = s2_bb_arr(ctx, this) {
+        for i in 0..rem_chars {
+            let hi = ctx.get_array_element(src, pos + 2 * i).as_int().unwrap_or(0) & 0xFF;
+            let lo = ctx.get_array_element(src, pos + 2 * i + 1).as_int().unwrap_or(0) & 0xFF;
+            let ch = if order == 1 { (lo << 8) | hi } else { (hi << 8) | lo };
+            ctx.set_array_element(chars_arr, i, Value::Int(ch));
+        }
+    }
+    let vb = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 6);
+    // Write to BOTH indexed slot 0 (synthetic-mode layout used by our
+    // own CharBuffer natives) AND the real-JDK `hb` field by name (so
+    // JDK bytecode reading `hb` / `hasArray` / `array` sees the char[]).
+    ctx.set_field_by_name(vb, "hb", Value::Object(Some(chars_arr)));
+    ctx.set_field_by_name(vb, "offset", Value::Int(0));
+    ctx.set_field_by_name(vb, "isReadOnly", Value::Int(0));
+    ctx.set_field_by_name(vb, "position", Value::Int(0));
+    ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
+    ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
+    ctx.set_field_by_name(vb, "mark", Value::Int(-1));
+    // Synthetic-mode fallback (older paths still indexed-slot based).
+    ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
+    ctx.set_field(vb, BB_POS, Value::Int(0));
+    ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
+    ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
+    ctx.set_field(vb, BB_MARK, Value::Int(-1));
+    ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    Ok(Some(Value::Object(Some(vb))))
+}
 
 fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     use cratonvm_types::ArrayElementType;
@@ -2040,12 +2122,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let arr = obj_arg(args, 0)?;
         let len = ctx.array_length(arr) as i32;
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
-        ctx.set_field(buf, BB_POS, Value::Int(0));
-        ctx.set_field(buf, BB_LIMIT, Value::Int(len));
-        ctx.set_field(buf, BB_CAP, Value::Int(len));
-        ctx.set_field(buf, BB_MARK, Value::Int(-1));
-        ctx.set_field(buf, BB_ORDER, Value::Int(0));
+        bb_write_hb(ctx, buf, arr, len);
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "wrap", "([BII)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -2054,12 +2131,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let cap = ctx.array_length(arr) as i32;
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
+        bb_write_hb(ctx, buf, arr, cap);
+        // Override position/limit set by bb_write_hb.
+        ctx.set_field_by_name(buf, "position", Value::Int(off));
+        ctx.set_field_by_name(buf, "limit", Value::Int((off + len).min(cap)));
         ctx.set_field(buf, BB_POS, Value::Int(off));
         ctx.set_field(buf, BB_LIMIT, Value::Int((off + len).min(cap)));
-        ctx.set_field(buf, BB_CAP, Value::Int(cap));
-        ctx.set_field(buf, BB_MARK, Value::Int(-1));
-        ctx.set_field(buf, BB_ORDER, Value::Int(0));
         Ok(Some(Value::Object(Some(buf))))
     });
 
@@ -2508,23 +2585,37 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             }
         }
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        ctx.set_field(buf, BB_ARRAY, Value::Object(Some(new_arr)));
-        ctx.set_field(buf, BB_POS,   Value::Int(0));
-        ctx.set_field(buf, BB_LIMIT, Value::Int(rem as i32));
-        ctx.set_field(buf, BB_CAP,   Value::Int(rem as i32));
-        ctx.set_field(buf, BB_MARK,  Value::Int(-1));
+        bb_write_hb(ctx, buf, new_arr, rem as i32);
+        ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
         ctx.set_field(buf, BB_ORDER, ctx.get_field(this, BB_ORDER));
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "duplicate", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let buf  = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+        // Mirror BOTH the indexed slots and the real-JDK `hb` field so the
+        // duplicate appears equivalent through both access paths.
+        if let Some(src_arr) = s2_bb_arr(ctx, this) {
+            let cap = s2_bb_cap(ctx, this);
+            bb_write_hb(ctx, buf, src_arr, cap);
+            ctx.set_field_by_name(buf, "position", ctx.get_field(this, BB_POS));
+            ctx.set_field_by_name(buf, "limit", ctx.get_field(this, BB_LIMIT));
+            ctx.set_field_by_name(buf, "mark", ctx.get_field(this, BB_MARK));
+        }
         for f in 0..6 { ctx.set_field(buf, f, ctx.get_field(this, f)); }
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let buf  = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+        if let Some(src_arr) = s2_bb_arr(ctx, this) {
+            let cap = s2_bb_cap(ctx, this);
+            bb_write_hb(ctx, buf, src_arr, cap);
+            ctx.set_field_by_name(buf, "position", ctx.get_field(this, BB_POS));
+            ctx.set_field_by_name(buf, "limit", ctx.get_field(this, BB_LIMIT));
+            ctx.set_field_by_name(buf, "mark", ctx.get_field(this, BB_MARK));
+            ctx.set_field_by_name(buf, "isReadOnly", Value::Int(1));
+        }
         for f in 0..6 { ctx.set_field(buf, f, ctx.get_field(this, f)); }
         Ok(Some(Value::Object(Some(buf))))
     });

@@ -594,6 +594,18 @@ mod crossbeam_compat {
     pub struct SendError<T>(pub T);
     pub struct RecvError;
 
+    impl<T> std::fmt::Display for SendError<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("send on closed channel")
+        }
+    }
+
+    impl<T> std::fmt::Debug for SendError<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("SendError(<closed>)")
+        }
+    }
+
     impl<T> Sender<T> {
         pub fn send(&self, t: T) -> Result<(), SendError<T>> {
             let mut g = self.0.state.lock().unwrap();

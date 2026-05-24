@@ -6553,21 +6553,33 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     let proc = "java/lang/Process";
 
     // --- ProcessBuilder constructors ---
+    // Write to BOTH the indexed slot (synthetic-mode `PB_FIELD_COMMAND`)
+    // and the real-JDK `command` field by name, so any JDK bytecode that
+    // reads `command` (e.g. fragments still using bytecode after our
+    // <init> shim) sees the same value as our `start()` native.
     r.register(pb, "<init>", "(Ljava/util/List;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        ctx.set_field_by_name(this, "command", args[1]);
         ctx.set_field(this, PB_FIELD_COMMAND, args[1]);
         Ok(None)
     });
 
     r.register(pb, "<init>", "([Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        ctx.set_field_by_name(this, "command", args[1]);
         ctx.set_field(this, PB_FIELD_COMMAND, args[1]);
         Ok(None)
     });
 
     r.register(pb, "command", "()Ljava/util/List;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PB_FIELD_COMMAND)))
+        // Prefer the real-JDK named field so bytecode `setCommand` and
+        // our native writes stay in sync; fall back to the indexed slot
+        // for synthetic-mode receivers.
+        match ctx.get_field_by_name(this, "command") {
+            Value::Object(Some(o)) => Ok(Some(Value::Object(Some(o)))),
+            _ => Ok(Some(ctx.get_field(this, PB_FIELD_COMMAND))),
+        }
     });
 
     r.register(
@@ -6576,6 +6588,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "(Ljava/util/List;)Ljava/lang/ProcessBuilder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            ctx.set_field_by_name(this, "command", args[1]);
             ctx.set_field(this, PB_FIELD_COMMAND, args[1]);
             Ok(Some(Value::Object(Some(this))))
         },
@@ -6601,40 +6614,83 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     r.register(pb, "start", "()Ljava/lang/Process;", |ctx, args| {
         let this = obj_arg(args, 0)?;
 
-        // --- Extract command strings from the command field ---
-        // The command field can be either a List (ArrayList) or a String[]
-        let cmd_val = ctx.get_field(this, PB_FIELD_COMMAND);
+        // --- Extract command strings from the `command` field ---
+        // Three cases are possible:
+        //
+        //  (1) Our `<init>([Ljava/lang/String;)V` shim ran — slot 0 holds
+        //      the raw String[] verbatim. Detect via `heap_kind_of ==
+        //      Array`.
+        //
+        //  (2) The real-JDK `<init>([Ljava/lang/String;)V` bytecode ran
+        //      (e.g. because the receiver class disagreed with our
+        //      registration, or our shim wasn't installed yet) — slot 0
+        //      holds an ArrayList. The ArrayList's `elementData` field
+        //      is the backing Object[]; its `size` field is the live
+        //      element count. Read both by NAME, not by slot index, so
+        //      we don't pick up AbstractList.modCount (slot 0) by
+        //      accident — that was the immediate trigger of
+        //      `[ARRAY-LEN-GUARD] non-array object class=java/util/
+        //      ArrayList` from `org/aesh/terminal/utils/InfoCmp.
+        //      getInfoCmp` (wildfly-39 / keycloak-16 jboss-cli-client.jar).
+        //
+        //  (3) `command(List)` was called and the List is some other
+        //      `Collection` (e.g. unmodifiable). Best-effort: walk it as
+        //      an ArrayList via the named fields; if `elementData` /
+        //      `size` aren't present (synthetic ArrayList) fall back to
+        //      slot-1-as-size.
+        // Prefer real-JDK `command` field (slot 0 may have been
+        // descriptor-coerced if the field is declared with a primitive
+        // type ancestor) — match the read path with the write path.
+        let cmd_val = match ctx.get_field_by_name(this, "command") {
+            Value::Object(Some(o)) => Value::Object(Some(o)),
+            _ => ctx.get_field(this, PB_FIELD_COMMAND),
+        };
         let mut cmd_strings: Vec<String> = Vec::new();
 
-        match cmd_val {
-            Value::Object(Some(cmd_obj)) => {
-                // Try ArrayList layout first: field 0 = Object[] data, field 1 = Int size
-                let size_val = ctx.get_field(cmd_obj, 1);
-                match size_val {
-                    Value::Int(size) if size > 0 => {
-                        // ArrayList: field 0 is the backing array
-                        if let Value::Object(Some(data_arr)) = ctx.get_field(cmd_obj, 0) {
-                            for i in 0..(size as usize) {
-                                if let Value::Object(Some(s)) = ctx.get_array_element(data_arr, i) {
-                                    cmd_strings.push(ctx.read_string(s).unwrap_or_default());
-                                }
-                            }
-                        }
+        if let Value::Object(Some(cmd_obj)) = cmd_val {
+            use cratonvm_types::ObjectKind;
+            if ctx.heap_kind_of(cmd_obj) == ObjectKind::Array {
+                // Case (1): raw String[] — iterate elements.
+                let len = ctx.array_length(cmd_obj);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, i) {
+                        cmd_strings.push(ctx.read_string(s).unwrap_or_default());
                     }
+                }
+            } else {
+                // Case (2) / (3): treat as List. Prefer real-JDK named
+                // fields; fall back to slot indices for the synthetic
+                // ArrayList layout (data_array=0, size=1).
+                let size_by_name = match ctx.get_field_by_name(cmd_obj, "size") {
+                    Value::Int(v) => Some(v),
+                    _ => None,
+                };
+                let data_by_name = match ctx.get_field_by_name(cmd_obj, "elementData") {
+                    Value::Object(Some(a)) => Some(a),
+                    _ => None,
+                };
+                let (size, data_arr) = match (size_by_name, data_by_name) {
+                    (Some(sz), Some(arr)) => (sz, Some(arr)),
                     _ => {
-                        // Try as raw String[] array
-                        let len = ctx.array_length(cmd_obj);
-                        if len > 0 {
-                            for i in 0..len {
-                                if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, i) {
-                                    cmd_strings.push(ctx.read_string(s).unwrap_or_default());
-                                }
-                            }
+                        // Synthetic ArrayList fallback (data=slot0, size=slot1).
+                        let sz = ctx.get_field(cmd_obj, 1).as_int().unwrap_or(0);
+                        let arr = match ctx.get_field(cmd_obj, 0) {
+                            Value::Object(Some(a)) => Some(a),
+                            _ => None,
+                        };
+                        (sz, arr)
+                    }
+                };
+                if let Some(data) = data_arr {
+                    let len = ctx.array_length(data);
+                    let n = (size as usize).min(len);
+                    for i in 0..n {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(data, i) {
+                            cmd_strings.push(ctx.read_string(s).unwrap_or_default());
                         }
                     }
                 }
             }
-            _ => {}
         }
 
         if cmd_strings.is_empty() {
@@ -17313,6 +17369,52 @@ const CB_FIELD_LIMIT: usize = 2;
 const CB_FIELD_CAPACITY: usize = 3;
 const CB_FIELD_MARK: usize = 4;
 
+/// Initialise a freshly-allocated synthetic CharBuffer so BOTH the
+/// indexed-slot layout (used by our own natives) AND the real-JDK
+/// `hb` / `position` / `limit` / `capacity` / `mark` / `offset` /
+/// `isReadOnly` fields (used by JDK bytecode that wasn't overridden)
+/// reference the same backing char[]. Without the by-name writes the
+/// JDK bytecode for `hasArray` / `array` / `subSequence` reads a null
+/// `hb` (uninitialised real-JDK field) and throws "no backing array"
+/// — observed on icu4j-68.2 / icu4j-70.1 going through
+/// `CharBuffer.subSequence(...).toString()` in `ICUResourceBundleReader.
+/// getStringV2`.
+pub(crate) fn cb_write_hb(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    arr: ObjectRef,
+    len_chars: i32,
+) {
+    // Real-JDK field names: `hb` (char[]), `offset` (int),
+    // `isReadOnly` (boolean) on CharBuffer; `mark` / `position` /
+    // `limit` / `capacity` (int) on Buffer.
+    ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
+    ctx.set_field_by_name(buf, "offset", Value::Int(0));
+    ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
+    ctx.set_field_by_name(buf, "position", Value::Int(0));
+    ctx.set_field_by_name(buf, "limit", Value::Int(len_chars));
+    ctx.set_field_by_name(buf, "capacity", Value::Int(len_chars));
+    ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // Synthetic-mode indexed fallback (older callers).
+    ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
+    ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
+    ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(len_chars));
+    ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(len_chars));
+    ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+}
+
+/// Read the backing char[] from a CharBuffer, honouring both the
+/// real-JDK `hb` field and the synthetic indexed slot.
+fn cb_read_hb(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(buf, "hb") {
+        Value::Object(Some(a)) => Some(a),
+        _ => match ctx.get_field(buf, CB_FIELD_ARRAY) {
+            Value::Object(Some(a)) => Some(a),
+            _ => None,
+        },
+    }
+}
+
 pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     let cb = "java/nio/CharBuffer";
     r.register(cb, "allocate", "(I)Ljava/nio/CharBuffer;", |ctx, args| {
@@ -17330,11 +17432,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         };
         let len = ctx.array_length(arr);
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
-        ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
-        ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
-        ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(len as i32));
-        ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(len as i32));
-        ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+        cb_write_hb(ctx, buf, arr, len as i32);
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(
@@ -17352,10 +17450,76 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 ctx.set_array_element(arr, i, Value::Int(ch as i32));
             }
             let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+            cb_write_hb(ctx, buf, arr, chars.len() as i32);
+            Ok(Some(Value::Object(Some(buf))))
+        },
+    );
+    // hasArray()Z — JDK bytecode reads `hb != null && !isReadOnly`.
+    // Mirror that with a robust slot/name lookup so synthetic-mode
+    // CharBuffers (where slot 0 may have been overwritten by
+    // descriptor-coerced int writes against Buffer.mark) still
+    // report true. Without this, icu4j's `b16BitUnits.subSequence(
+    // start, end).toString()` reads a null `hb` and throws
+    // `IllegalStateException("CharBuffer has no backing array")`.
+    r.register(cb, "hasArray", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(if cb_read_hb(ctx, this).is_some() { 1 } else { 0 })))
+    });
+    r.register(cb, "arrayOffset", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        match ctx.get_field_by_name(this, "offset") {
+            Value::Int(v) => Ok(Some(Value::Int(v))),
+            _ => Ok(Some(Value::Int(0))),
+        }
+    });
+    // subSequence(II)Ljava/nio/CharBuffer; — abstract on CharBuffer, so
+    // an unbacked synthetic instance would AbstractMethodError. Allocate
+    // a fresh CharBuffer with the same backing array and adjusted
+    // position/limit (start..end relative to current position).
+    r.register(
+        cb,
+        "subSequence",
+        "(II)Ljava/nio/CharBuffer;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let arr = match cb_read_hb(ctx, this) {
+                Some(a) => a,
+                None => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "CharBuffer.subSequence: no backing array".into(),
+                    }
+                    .into())
+                }
+            };
+            let cur_pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, CB_FIELD_POS) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                },
+            };
+            let cur_off = match ctx.get_field_by_name(this, "offset") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let new_pos = cur_pos + start;
+            let new_lim = cur_pos + end;
+            // Allocate a fresh CharBuffer pointing at the same char[]
+            // — JDK's HeapCharBuffer.subSequence does the same.
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+            ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
+            ctx.set_field_by_name(buf, "offset", Value::Int(cur_off));
+            ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
+            ctx.set_field_by_name(buf, "position", Value::Int(new_pos));
+            ctx.set_field_by_name(buf, "limit", Value::Int(new_lim));
+            ctx.set_field_by_name(buf, "capacity", Value::Int(new_lim));
+            ctx.set_field_by_name(buf, "mark", Value::Int(-1));
             ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
-            ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
-            ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(chars.len() as i32));
-            ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(chars.len() as i32));
+            ctx.set_field(buf, CB_FIELD_POS, Value::Int(new_pos));
+            ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(new_lim));
+            ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(new_lim));
             ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
             Ok(Some(Value::Object(Some(buf))))
         },
@@ -17530,31 +17694,44 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     });
     r.register(cb, "array", "()[C", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, CB_FIELD_ARRAY)))
+        match cb_read_hb(ctx, this) {
+            Some(a) => Ok(Some(Value::Object(Some(a)))),
+            None => Err(RuntimeError::IllegalStateException {
+                message: "CharBuffer.array: no backing array".into(),
+            }
+            .into()),
+        }
     });
     r.register(cb, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        eprintln!("[DBG] CharBuffer.toString() native called, class_id_of_object={:?}", ctx.class_id_of_object(this));
-        let pos = match ctx.get_field(this, CB_FIELD_POS) {
+        let pos = match ctx.get_field_by_name(this, "position") {
+            Value::Int(v) => v as usize,
+            _ => match ctx.get_field(this, CB_FIELD_POS) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            },
+        };
+        let lim = match ctx.get_field_by_name(this, "limit") {
+            Value::Int(v) => v as usize,
+            _ => match ctx.get_field(this, CB_FIELD_LIMIT) {
+                Value::Int(v) => v as usize,
+                _ => 0,
+            },
+        };
+        let off = match ctx.get_field_by_name(this, "offset") {
             Value::Int(v) => v as usize,
             _ => 0,
         };
-        let lim = match ctx.get_field(this, CB_FIELD_LIMIT) {
-            Value::Int(v) => v as usize,
-            _ => 0,
-        };
-        eprintln!("[DBG] pos={} lim={}", pos, lim);
-        let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {
-            Value::Object(Some(a)) => a,
-            other => {
-                eprintln!("[DBG] field0 not Object: {:?}, returning empty", other);
+        let arr = match cb_read_hb(ctx, this) {
+            Some(a) => a,
+            None => {
                 let s = ctx.create_string("");
                 return Ok(Some(Value::Object(Some(s))));
             }
         };
         let mut chars = Vec::new();
         for i in pos..lim {
-            if let Value::Int(ch) = ctx.get_array_element(arr, i) {
+            if let Value::Int(ch) = ctx.get_array_element(arr, i + off) {
                 chars.push(ch as u16);
             }
         }
@@ -17582,11 +17759,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
 fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
-    ctx.set_field(buf, CB_FIELD_ARRAY, Value::Object(Some(arr)));
-    ctx.set_field(buf, CB_FIELD_POS, Value::Int(0));
-    ctx.set_field(buf, CB_FIELD_LIMIT, Value::Int(cap as i32));
-    ctx.set_field(buf, CB_FIELD_CAPACITY, Value::Int(cap as i32));
-    ctx.set_field(buf, CB_FIELD_MARK, Value::Int(-1));
+    cb_write_hb(ctx, buf, arr, cap as i32);
     buf
 }
 

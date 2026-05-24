@@ -29,6 +29,24 @@ pub struct VmConfig {
     /// The application classpath entries to search for classes (`-classpath`).
     pub classpath: Vec<String>,
 
+    /// When the VM was launched with `-jar <FILE>`, the user-supplied jar
+    /// path as a single string. The full search classpath (this jar plus
+    /// any manifest `Class-Path` entries) is still recorded in
+    /// [`Self::classpath`] so the class loader can resolve sibling jars,
+    /// but the `java.class.path` system property is set to *only* this
+    /// value — matching the HotSpot contract that a `-jar` launch reports
+    /// the bare jar path, not the resolved transitive classpath.
+    ///
+    /// Liberty/Quarkus boot launchers (e.g.
+    /// `com.ibm.ws.kernel.boot.cmdline.UtilityMain`) call
+    /// `new JarFile(new File(System.getProperty("java.class.path")))`
+    /// and then `getManifest().getMainAttributes()`. If `java.class.path`
+    /// were a `;`-joined list, `new File(list)` would not point at a
+    /// real jar, `getManifest()` would return null, and the
+    /// `NullPointerException: Cannot invoke getMainAttributes on null`
+    /// seen in 21 wlp tool jars would fire.
+    pub launcher_jar: Option<String>,
+
     /// The boot classpath entries (rt.jar, etc.). If empty, auto-discovered
     /// from `java_home` or the `JAVA_HOME` environment variable.
     pub boot_classpath: Vec<String>,
@@ -284,6 +302,7 @@ impl Default for VmConfig {
                 .filter(|n| *n >= 64 && *n <= 65536)
                 .unwrap_or(1024),
             classpath: Vec::new(),
+            launcher_jar: None,
             boot_classpath: Vec::new(),
             ext_classpath: Vec::new(),
             java_home: None,
@@ -362,6 +381,15 @@ impl VmConfig {
 
     pub fn with_classpath(mut self, classpath: Vec<String>) -> Self {
         self.classpath = classpath;
+        self
+    }
+
+    /// Record the user-supplied `-jar <FILE>` path. See
+    /// [`Self::launcher_jar`] for the rationale (HotSpot reports
+    /// `-jar <FILE>` as `java.class.path = <FILE>`, not the
+    /// resolved transitive manifest classpath).
+    pub fn with_launcher_jar(mut self, jar: String) -> Self {
+        self.launcher_jar = Some(jar);
         self
     }
 
