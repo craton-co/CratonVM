@@ -1,6 +1,13 @@
-//! Real cryptographic primitive implementations (software-based, no external crate dependencies).
+//! Real cryptographic primitive implementations.
 //!
 //! Phase 19.2 — AES (ECB/CBC/GCM), SHA-2 (256/384/512), HMAC, HKDF, SecureRandom.
+//!
+//! C18 — AES and AES-GCM are now constant-time, backed by the RustCrypto
+//! `aes` and `aes-gcm` crates already in `Cargo.toml`. The previous
+//! in-tree FIPS-197 core (256-byte S-box tables + bit-loop GHASH) was a
+//! textbook cache-timing oracle (Bernstein 2005) and has been deleted.
+//! SHA-2 / HMAC / HKDF / RSA / ECDSA / Ed25519 / X.509 / PKCS#12
+//! parsers remain in-tree as before.
 
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -34,278 +41,89 @@ impl std::fmt::Display for CryptoError {
 }
 
 // ============================================================================
-// AES S-Box and Inverse S-Box
+// AES — Constant-Time RustCrypto Backend (C18)
 // ============================================================================
+//
+// The legacy hand-rolled AES core (256-byte SBOX/InvSBOX, ShiftRows,
+// MixColumns, gf_mul) was a textbook cache-timing oracle (Bernstein
+// 2005). The hand-rolled GHASH `gf128_mul` had the same data-dependent
+// branch hazard on the AES-GCM auth tag. All of that has been replaced
+// with the RustCrypto `aes` / `aes-gcm` crates (already in Cargo.toml).
+// The public call surface (`Aes::key_expansion`/`encrypt_block`/
+// `decrypt_block`, `AesKey { nr, .. }`) is preserved so the in-tree
+// `AesEcb`/`AesCbc`/`AesGcm` wrappers and `jca/cipher.rs` keep compiling
+// without changes.
 
-const SBOX: [u8; 256] = [
-    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
-    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
-    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
-    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
-    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
-    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
-    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
-    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
-    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
-    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
-    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
-    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
-    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
-    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
-    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
-    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
-];
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::generic_array::GenericArray;
 
-const INV_SBOX: [u8; 256] = [
-    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
-    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
-    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
-    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
-    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
-    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
-    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
-    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
-    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
-    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
-    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
-    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
-    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
-    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
-    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
-    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
-];
+/// AES expanded-key state, parameterised over the three NIST key sizes.
+/// Each variant owns a fully-initialised RustCrypto cipher; cloning is
+/// cheap (a few hundred bytes of pre-expanded round keys).
+#[derive(Clone, Debug)]
+pub enum AesCipher {
+    Aes128(aes::Aes128),
+    Aes192(aes::Aes192),
+    Aes256(aes::Aes256),
+}
 
-/// AES round constant (Rcon)
-const RCON: [u8; 11] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
-
-// ============================================================================
-// AES Key and Core Operations
-// ============================================================================
-
+/// AES key handle. `nr` (number of rounds: 10/12/14) is preserved for
+/// API back-compat with the legacy struct — `crypto_impl`'s own tests
+/// inspect it.
 #[derive(Clone, Debug)]
 pub struct AesKey {
-    pub key_bytes: Vec<u8>,
-    pub round_keys: Vec<[u8; 16]>,
+    pub cipher: AesCipher,
     pub nr: usize,
 }
 
 pub struct Aes;
 
 impl Aes {
-    /// Expand a 128/192/256-bit key into round keys.
+    /// Construct an AES key handle. Rejects any key length other than
+    /// 128/192/256 bits — matches the JCA contract for SecretKeySpec.
     pub fn key_expansion(key: &[u8]) -> Result<AesKey, CryptoError> {
-        let nk = match key.len() {
-            16 => 4,
-            24 => 6,
-            32 => 8,
+        let (cipher, nr) = match key.len() {
+            16 => (
+                AesCipher::Aes128(aes::Aes128::new(GenericArray::from_slice(key))),
+                10,
+            ),
+            24 => (
+                AesCipher::Aes192(aes::Aes192::new(GenericArray::from_slice(key))),
+                12,
+            ),
+            32 => (
+                AesCipher::Aes256(aes::Aes256::new(GenericArray::from_slice(key))),
+                14,
+            ),
             other => return Err(CryptoError::InvalidKeyLength(other)),
         };
-        let nr = nk + 6; // 10, 12, or 14
-        let nb = 4;
-        let total_words = nb * (nr + 1); // 44, 52, or 60
-
-        let mut w = vec![0u32; total_words];
-
-        // Copy key into first nk words
-        for i in 0..nk {
-            w[i] = u32::from_be_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
-        }
-
-        for i in nk..total_words {
-            let mut temp = w[i - 1];
-            if i % nk == 0 {
-                // RotWord + SubWord + Rcon
-                temp = Self::sub_word(Self::rot_word(temp)) ^ ((RCON[i / nk] as u32) << 24);
-            } else if nk > 6 && i % nk == 4 {
-                temp = Self::sub_word(temp);
-            }
-            w[i] = w[i - nk] ^ temp;
-        }
-
-        // Convert words to round key blocks
-        let mut round_keys = Vec::with_capacity(nr + 1);
-        for r in 0..=nr {
-            let mut rk = [0u8; 16];
-            for j in 0..4 {
-                let bytes = w[r * 4 + j].to_be_bytes();
-                rk[4 * j..4 * j + 4].copy_from_slice(&bytes);
-            }
-            round_keys.push(rk);
-        }
-
-        Ok(AesKey {
-            key_bytes: key.to_vec(),
-            round_keys,
-            nr,
-        })
+        Ok(AesKey { cipher, nr })
     }
 
-    fn rot_word(w: u32) -> u32 {
-        w.rotate_left(8)
-    }
-
-    fn sub_word(w: u32) -> u32 {
-        let b = w.to_be_bytes();
-        u32::from_be_bytes([SBOX[b[0] as usize], SBOX[b[1] as usize], SBOX[b[2] as usize], SBOX[b[3] as usize]])
-    }
-
-    /// Encrypt a single 16-byte block.
+    /// Encrypt a single 16-byte block, constant-time.
     pub fn encrypt_block(key: &AesKey, input: &[u8; 16]) -> [u8; 16] {
-        let mut state = *input;
-
-        add_round_key(&mut state, &key.round_keys[0]);
-
-        for round in 1..key.nr {
-            sub_bytes(&mut state);
-            shift_rows(&mut state);
-            mix_columns(&mut state);
-            add_round_key(&mut state, &key.round_keys[round]);
+        let mut block = GenericArray::clone_from_slice(input);
+        match &key.cipher {
+            AesCipher::Aes128(c) => c.encrypt_block(&mut block),
+            AesCipher::Aes192(c) => c.encrypt_block(&mut block),
+            AesCipher::Aes256(c) => c.encrypt_block(&mut block),
         }
-
-        // Final round (no mix_columns)
-        sub_bytes(&mut state);
-        shift_rows(&mut state);
-        add_round_key(&mut state, &key.round_keys[key.nr]);
-
-        state
+        let mut out = [0u8; 16];
+        out.copy_from_slice(block.as_slice());
+        out
     }
 
-    /// Decrypt a single 16-byte block.
+    /// Decrypt a single 16-byte block, constant-time.
     pub fn decrypt_block(key: &AesKey, input: &[u8; 16]) -> [u8; 16] {
-        let mut state = *input;
-
-        add_round_key(&mut state, &key.round_keys[key.nr]);
-
-        for round in (1..key.nr).rev() {
-            inv_shift_rows(&mut state);
-            inv_sub_bytes(&mut state);
-            add_round_key(&mut state, &key.round_keys[round]);
-            inv_mix_columns(&mut state);
+        let mut block = GenericArray::clone_from_slice(input);
+        match &key.cipher {
+            AesCipher::Aes128(c) => c.decrypt_block(&mut block),
+            AesCipher::Aes192(c) => c.decrypt_block(&mut block),
+            AesCipher::Aes256(c) => c.decrypt_block(&mut block),
         }
-
-        // Final round (no inv_mix_columns)
-        inv_shift_rows(&mut state);
-        inv_sub_bytes(&mut state);
-        add_round_key(&mut state, &key.round_keys[0]);
-
-        state
-    }
-}
-
-// ============================================================================
-// AES Round Functions
-// ============================================================================
-
-/// S-box substitution on each byte.
-pub fn sub_bytes(state: &mut [u8; 16]) {
-    for b in state.iter_mut() {
-        *b = SBOX[*b as usize];
-    }
-}
-
-/// Inverse S-box substitution.
-fn inv_sub_bytes(state: &mut [u8; 16]) {
-    for b in state.iter_mut() {
-        *b = INV_SBOX[*b as usize];
-    }
-}
-
-/// Shift rows — state is column-major: index = row + 4*col
-pub fn shift_rows(state: &mut [u8; 16]) {
-    // Row 0: no shift
-    // Row 1: shift left by 1
-    let tmp = state[1];
-    state[1] = state[5];
-    state[5] = state[9];
-    state[9] = state[13];
-    state[13] = tmp;
-    // Row 2: shift left by 2
-    let (t0, t1) = (state[2], state[6]);
-    state[2] = state[10];
-    state[6] = state[14];
-    state[10] = t0;
-    state[14] = t1;
-    // Row 3: shift left by 3 (= shift right by 1)
-    let tmp = state[15];
-    state[15] = state[11];
-    state[11] = state[7];
-    state[7] = state[3];
-    state[3] = tmp;
-}
-
-/// Inverse shift rows.
-fn inv_shift_rows(state: &mut [u8; 16]) {
-    // Row 1: shift right by 1
-    let tmp = state[13];
-    state[13] = state[9];
-    state[9] = state[5];
-    state[5] = state[1];
-    state[1] = tmp;
-    // Row 2: shift right by 2
-    let (t0, t1) = (state[2], state[6]);
-    state[2] = state[10];
-    state[6] = state[14];
-    state[10] = t0;
-    state[14] = t1;
-    // Row 3: shift right by 3 (= shift left by 1)
-    let tmp = state[3];
-    state[3] = state[7];
-    state[7] = state[11];
-    state[11] = state[15];
-    state[15] = tmp;
-}
-
-/// Multiply in GF(2^8) with irreducible polynomial x^8 + x^4 + x^3 + x + 1.
-fn gf_mul(mut a: u8, mut b: u8) -> u8 {
-    let mut result: u8 = 0;
-    for _ in 0..8 {
-        if b & 1 != 0 {
-            result ^= a;
-        }
-        let hi = a & 0x80;
-        a <<= 1;
-        if hi != 0 {
-            a ^= 0x1b;
-        }
-        b >>= 1;
-    }
-    result
-}
-
-/// Mix columns — operates on each 4-byte column.
-pub fn mix_columns(state: &mut [u8; 16]) {
-    for col in 0..4 {
-        let i = col * 4;
-        let s0 = state[i];
-        let s1 = state[i + 1];
-        let s2 = state[i + 2];
-        let s3 = state[i + 3];
-        state[i]     = gf_mul(2, s0) ^ gf_mul(3, s1) ^ s2 ^ s3;
-        state[i + 1] = s0 ^ gf_mul(2, s1) ^ gf_mul(3, s2) ^ s3;
-        state[i + 2] = s0 ^ s1 ^ gf_mul(2, s2) ^ gf_mul(3, s3);
-        state[i + 3] = gf_mul(3, s0) ^ s1 ^ s2 ^ gf_mul(2, s3);
-    }
-}
-
-/// Inverse mix columns.
-fn inv_mix_columns(state: &mut [u8; 16]) {
-    for col in 0..4 {
-        let i = col * 4;
-        let s0 = state[i];
-        let s1 = state[i + 1];
-        let s2 = state[i + 2];
-        let s3 = state[i + 3];
-        state[i]     = gf_mul(0x0e, s0) ^ gf_mul(0x0b, s1) ^ gf_mul(0x0d, s2) ^ gf_mul(0x09, s3);
-        state[i + 1] = gf_mul(0x09, s0) ^ gf_mul(0x0e, s1) ^ gf_mul(0x0b, s2) ^ gf_mul(0x0d, s3);
-        state[i + 2] = gf_mul(0x0d, s0) ^ gf_mul(0x09, s1) ^ gf_mul(0x0e, s2) ^ gf_mul(0x0b, s3);
-        state[i + 3] = gf_mul(0x0b, s0) ^ gf_mul(0x0d, s1) ^ gf_mul(0x09, s2) ^ gf_mul(0x0e, s3);
-    }
-}
-
-/// XOR state with round key.
-pub fn add_round_key(state: &mut [u8; 16], round_key: &[u8; 16]) {
-    for i in 0..16 {
-        state[i] ^= round_key[i];
+        let mut out = [0u8; 16];
+        out.copy_from_slice(block.as_slice());
+        out
     }
 }
 
@@ -426,31 +244,47 @@ pub struct AesGcmOutput {
 pub struct AesGcm;
 
 impl AesGcm {
+    /// Encrypt with AES-GCM. `nonce` MUST be the canonical 96-bit IV.
+    /// Returns `(ciphertext, tag)` split into the legacy `AesGcmOutput`
+    /// shape; callers that want the JDK wire format concatenate
+    /// `ciphertext || tag` themselves (`jca/cipher.rs` does so).
     pub fn encrypt(key: &AesKey, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> AesGcmOutput {
-        // H = AES_K(0^128)
-        let h = Aes::encrypt_block(key, &[0u8; 16]);
+        use aes_gcm::{aead::AeadInPlace, AesGcm as AesGcmAead, Aes128Gcm, Aes256Gcm};
+        use aes::cipher::consts::U12;
+        // aes-gcm 0.10 ships type aliases for AES-128/256 only; spell
+        // out the AES-192 variant explicitly.
+        type Aes192Gcm = AesGcmAead<aes::Aes192, U12>;
 
-        // J0 = nonce || 0x00000001
-        let mut j0 = [0u8; 16];
-        j0[..12].copy_from_slice(nonce);
-        j0[15] = 1;
+        let nonce_arr = aes_gcm::Nonce::<U12>::from_slice(nonce);
+        let mut buf = plaintext.to_vec();
 
-        // Encrypt plaintext with CTR starting at J0 + 1
-        let ciphertext = Self::gctr(key, &j0, plaintext);
+        let tag_arr = match &key.cipher {
+            AesCipher::Aes128(c) => {
+                let gcm = Aes128Gcm::from(c.clone());
+                gcm.encrypt_in_place_detached(nonce_arr, aad, &mut buf)
+                    .expect("AES-128-GCM detached encrypt: buffer never grows")
+            }
+            AesCipher::Aes192(c) => {
+                let gcm: Aes192Gcm = c.clone().into();
+                gcm.encrypt_in_place_detached(nonce_arr, aad, &mut buf)
+                    .expect("AES-192-GCM detached encrypt: buffer never grows")
+            }
+            AesCipher::Aes256(c) => {
+                let gcm = Aes256Gcm::from(c.clone());
+                gcm.encrypt_in_place_detached(nonce_arr, aad, &mut buf)
+                    .expect("AES-256-GCM detached encrypt: buffer never grows")
+            }
+        };
 
-        // Compute tag
-        let ghash_val = ghash(&h, aad, &ciphertext);
-        let tag_input = j0;
-        // Encrypt J0 to get the tag mask
-        let encrypted_j0 = Aes::encrypt_block(key, &tag_input);
         let mut tag = [0u8; 16];
-        for i in 0..16 {
-            tag[i] = ghash_val[i] ^ encrypted_j0[i];
-        }
-
-        AesGcmOutput { ciphertext, tag }
+        tag.copy_from_slice(tag_arr.as_slice());
+        AesGcmOutput { ciphertext: buf, tag }
     }
 
+    /// Verify-then-decrypt with AES-GCM. Returns
+    /// `Err(AuthenticationFailed)` if the tag or ciphertext is
+    /// tampered. The constant-time tag check lives inside
+    /// `aes_gcm`'s `decrypt_in_place_detached`.
     pub fn decrypt(
         key: &AesKey,
         nonce: &[u8; 12],
@@ -458,127 +292,27 @@ impl AesGcm {
         aad: &[u8],
         tag: &[u8; 16],
     ) -> Result<Vec<u8>, CryptoError> {
-        let h = Aes::encrypt_block(key, &[0u8; 16]);
+        use aes_gcm::{aead::AeadInPlace, AesGcm as AesGcmAead, Aes128Gcm, Aes256Gcm};
+        use aes::cipher::consts::U12;
+        type Aes192Gcm = AesGcmAead<aes::Aes192, U12>;
 
-        let mut j0 = [0u8; 16];
-        j0[..12].copy_from_slice(nonce);
-        j0[15] = 1;
+        let nonce_arr = aes_gcm::Nonce::<U12>::from_slice(nonce);
+        let tag_arr = aes_gcm::Tag::<aes::cipher::consts::U16>::from_slice(tag);
+        let mut buf = ciphertext.to_vec();
 
-        // Verify tag first
-        let ghash_val = ghash(&h, aad, ciphertext);
-        let encrypted_j0 = Aes::encrypt_block(key, &j0);
-        let mut computed_tag = [0u8; 16];
-        for i in 0..16 {
-            computed_tag[i] = ghash_val[i] ^ encrypted_j0[i];
-        }
-
-        // Constant-time comparison
-        let mut diff = 0u8;
-        for i in 0..16 {
-            diff |= computed_tag[i] ^ tag[i];
-        }
-        if diff != 0 {
-            return Err(CryptoError::AuthenticationFailed);
-        }
-
-        // Decrypt
-        Ok(Self::gctr(key, &j0, ciphertext))
-    }
-
-    /// GCTR mode: CTR encryption starting from counter = cb + 1
-    fn gctr(key: &AesKey, j0: &[u8; 16], data: &[u8]) -> Vec<u8> {
-        if data.is_empty() {
-            return Vec::new();
-        }
-        let mut counter = *j0;
-        let mut out = Vec::with_capacity(data.len());
-
-        for chunk in data.chunks(16) {
-            // Increment counter (big-endian 32-bit in last 4 bytes)
-            Self::inc32(&mut counter);
-            let keystream = Aes::encrypt_block(key, &counter);
-            for (i, &b) in chunk.iter().enumerate() {
-                out.push(b ^ keystream[i]);
+        let res = match &key.cipher {
+            AesCipher::Aes128(c) => Aes128Gcm::from(c.clone())
+                .decrypt_in_place_detached(nonce_arr, aad, &mut buf, tag_arr),
+            AesCipher::Aes192(c) => {
+                let gcm: Aes192Gcm = c.clone().into();
+                gcm.decrypt_in_place_detached(nonce_arr, aad, &mut buf, tag_arr)
             }
-        }
-        out
+            AesCipher::Aes256(c) => Aes256Gcm::from(c.clone())
+                .decrypt_in_place_detached(nonce_arr, aad, &mut buf, tag_arr),
+        };
+        res.map_err(|_| CryptoError::AuthenticationFailed)?;
+        Ok(buf)
     }
-
-    fn inc32(counter: &mut [u8; 16]) {
-        let mut c = u32::from_be_bytes([counter[12], counter[13], counter[14], counter[15]]);
-        c = c.wrapping_add(1);
-        counter[12..16].copy_from_slice(&c.to_be_bytes());
-    }
-}
-
-/// GHASH: Galois field multiplication for GCM.
-pub fn ghash(h: &[u8; 16], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
-    let mut y = [0u8; 16];
-
-    // Process AAD
-    ghash_process_blocks(&mut y, h, aad);
-
-    // Process ciphertext
-    ghash_process_blocks(&mut y, h, ciphertext);
-
-    // Append lengths (in bits, big-endian 64-bit each)
-    let aad_bits = (aad.len() as u64) * 8;
-    let ct_bits = (ciphertext.len() as u64) * 8;
-    let mut len_block = [0u8; 16];
-    len_block[..8].copy_from_slice(&aad_bits.to_be_bytes());
-    len_block[8..].copy_from_slice(&ct_bits.to_be_bytes());
-    xor_block(&mut y, &len_block);
-    y = gf128_mul(&y, h);
-
-    y
-}
-
-fn ghash_process_blocks(y: &mut [u8; 16], h: &[u8; 16], data: &[u8]) {
-    let full_blocks = data.len() / 16;
-    for i in 0..full_blocks {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(&data[i * 16..(i + 1) * 16]);
-        xor_block(y, &block);
-        *y = gf128_mul(y, h);
-    }
-    // Remaining partial block (zero-padded)
-    let rem = data.len() % 16;
-    if rem > 0 {
-        let mut block = [0u8; 16];
-        block[..rem].copy_from_slice(&data[full_blocks * 16..]);
-        xor_block(y, &block);
-        *y = gf128_mul(y, h);
-    }
-}
-
-fn xor_block(a: &mut [u8; 16], b: &[u8; 16]) {
-    for i in 0..16 {
-        a[i] ^= b[i];
-    }
-}
-
-/// Multiply two 128-bit blocks in GF(2^128) with the GCM polynomial.
-fn gf128_mul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
-    let mut z = [0u8; 16];
-    let mut v = *y;
-
-    for i in 0..128 {
-        let byte_idx = i / 8;
-        let bit_idx = 7 - (i % 8);
-        if (x[byte_idx] >> bit_idx) & 1 == 1 {
-            xor_block(&mut z, &v);
-        }
-        // Shift V right by 1 and conditionally XOR with R (0xe1 << 120)
-        let lsb = v[15] & 1;
-        for j in (1..16).rev() {
-            v[j] = (v[j] >> 1) | (v[j - 1] << 7);
-        }
-        v[0] >>= 1;
-        if lsb == 1 {
-            v[0] ^= 0xe1;
-        }
-    }
-    z
 }
 
 // ============================================================================
@@ -3648,7 +3382,7 @@ mod tests {
         let key = from_hex("2b7e151628aed2a6abf7158809cf4f3c");
         let aes_key = Aes::key_expansion(&key).unwrap();
         assert_eq!(aes_key.nr, 10);
-        assert_eq!(aes_key.round_keys.len(), 11);
+        assert!(matches!(aes_key.cipher, AesCipher::Aes128(_)));
     }
 
     #[test]
@@ -3656,7 +3390,7 @@ mod tests {
         let key = from_hex("8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b");
         let aes_key = Aes::key_expansion(&key).unwrap();
         assert_eq!(aes_key.nr, 12);
-        assert_eq!(aes_key.round_keys.len(), 13);
+        assert!(matches!(aes_key.cipher, AesCipher::Aes192(_)));
     }
 
     #[test]
@@ -3664,7 +3398,7 @@ mod tests {
         let key = from_hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
         let aes_key = Aes::key_expansion(&key).unwrap();
         assert_eq!(aes_key.nr, 14);
-        assert_eq!(aes_key.round_keys.len(), 15);
+        assert!(matches!(aes_key.cipher, AesCipher::Aes256(_)));
     }
 
     #[test]
@@ -3883,6 +3617,85 @@ mod tests {
         let pt = AesGcm::decrypt(&aes_key, &nonce_arr, &output.ciphertext, aad, &output.tag).unwrap();
         assert_eq!(pt, plaintext);
     }
+    // -----------------------------------------------------------------------
+    // C18 — NIST SP 800-38D AES-128-GCM Known-Answer Tests
+    //
+    // Vectors lifted from NIST SP 800-38D Appendix B, Test Case 3 —
+    // the canonical AES-128-GCM KAT also reproduced in RFC 5288 and
+    // every published GCM reference implementation. Proves the
+    // RustCrypto-backed `AesGcm::{encrypt, decrypt}` matches the
+    // bit-for-bit ciphertext + tag, and that a tampered tag is
+    // rejected with `AuthenticationFailed`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn c18_nist_aes128_gcm_test_case_3_encrypt() {
+        // K  = feffe9928665731c6d6a8f9467308308
+        // P  = d9313225..f391aafd255 (64 bytes)
+        // IV = cafebabefacedbaddecaf888 (12 bytes)
+        // A  = (empty)
+        // C  = 42831ec2..73f5985
+        // T  = 4d5c2af327cd64a62cf35abd2ba6fab4
+        let key = from_hex("feffe9928665731c6d6a8f9467308308");
+        let iv  = from_hex("cafebabefacedbaddecaf888");
+        let pt  = from_hex(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da\
+             2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525\
+             b16aedf5aa0de657ba637b391aafd255",
+        );
+        let aad: Vec<u8> = Vec::new();
+        let expected_ct = from_hex(
+            "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e0\
+             35c17e2329aca12e21d514b25466931c7d8f6a5aac84aa05\
+             1ba30b396a0aac973d58e091473f5985",
+        );
+        let expected_tag = from_hex("4d5c2af327cd64a62cf35abd2ba6fab4");
+
+        let aes_key = Aes::key_expansion(&key).unwrap();
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&iv);
+        let out = AesGcm::encrypt(&aes_key, &nonce, &pt, &aad);
+        assert_eq!(hex(&out.ciphertext), hex(&expected_ct), "AES-128-GCM ciphertext");
+        assert_eq!(hex(&out.tag), hex(&expected_tag), "AES-128-GCM tag");
+    }
+
+    #[test]
+    fn c18_nist_aes128_gcm_test_case_3_decrypt_and_auth_fail() {
+        // Same vector — decrypt direction, plus an explicit
+        // AuthenticationFailed proof on a tampered tag.
+        let key = from_hex("feffe9928665731c6d6a8f9467308308");
+        let iv  = from_hex("cafebabefacedbaddecaf888");
+        let ct  = from_hex(
+            "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e0\
+             35c17e2329aca12e21d514b25466931c7d8f6a5aac84aa05\
+             1ba30b396a0aac973d58e091473f5985",
+        );
+        let aad: Vec<u8> = Vec::new();
+        let tag_bytes = from_hex("4d5c2af327cd64a62cf35abd2ba6fab4");
+        let expected_pt = from_hex(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da\
+             2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525\
+             b16aedf5aa0de657ba637b391aafd255",
+        );
+
+        let aes_key = Aes::key_expansion(&key).unwrap();
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&iv);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&tag_bytes);
+
+        let pt = AesGcm::decrypt(&aes_key, &nonce, &ct, &aad, &tag)
+            .expect("NIST Test Case 3 decrypt must succeed");
+        assert_eq!(hex(&pt), hex(&expected_pt), "AES-128-GCM plaintext");
+
+        // Tamper the high bit of the tag — auth must fail.
+        let mut bad_tag = tag;
+        bad_tag[0] ^= 0x80;
+        let res = AesGcm::decrypt(&aes_key, &nonce, &ct, &aad, &bad_tag);
+        assert!(matches!(res, Err(CryptoError::AuthenticationFailed)),
+            "AES-128-GCM with tampered tag must return AuthenticationFailed, got {:?}", res);
+    }
+
 
     // -----------------------------------------------------------------------
     // HMAC Tests (RFC 4231 test vectors)
@@ -4089,59 +3902,6 @@ mod tests {
     fn pkcs7_unpad_invalid() {
         assert!(pkcs7_unpad(&[]).is_err());
         assert!(pkcs7_unpad(&[0u8; 16]).is_err()); // pad byte = 0 is invalid
-    }
-
-    // -----------------------------------------------------------------------
-    // GF(2^8) multiplication test
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn gf_mul_known_values() {
-        assert_eq!(gf_mul(0x57, 0x83), 0xc1);
-        assert_eq!(gf_mul(0x57, 0x13), 0xfe);
-        assert_eq!(gf_mul(0x01, 0x01), 0x01);
-        assert_eq!(gf_mul(0x00, 0xff), 0x00);
-    }
-
-    // -----------------------------------------------------------------------
-    // Sub bytes / Shift rows / Mix columns unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sub_bytes_known() {
-        let mut state = [0x00u8; 16];
-        sub_bytes(&mut state);
-        assert!(state.iter().all(|&b| b == 0x63)); // SBOX[0] = 0x63
-    }
-
-    #[test]
-    fn shift_rows_inverse() {
-        let original = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let mut state = original;
-        shift_rows(&mut state);
-        inv_shift_rows(&mut state);
-        assert_eq!(state, original);
-    }
-
-    #[test]
-    fn mix_columns_inverse() {
-        let original = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10];
-        let mut state = original;
-        mix_columns(&mut state);
-        inv_mix_columns(&mut state);
-        assert_eq!(state, original);
-    }
-
-    #[test]
-    fn add_round_key_self_inverse() {
-        let mut state = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-                         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-        let original = state;
-        let rk = [0xff; 16];
-        add_round_key(&mut state, &rk);
-        add_round_key(&mut state, &rk);
-        assert_eq!(state, original);
     }
 
     // -----------------------------------------------------------------------
