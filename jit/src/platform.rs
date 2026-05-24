@@ -6,11 +6,15 @@
 //! - **Windows:** `VirtualAlloc` with `PAGE_READWRITE`, then `VirtualProtect`
 //!   to `PAGE_EXECUTE_READ` when code is finalized.
 //! - **Linux/FreeBSD:** `mmap` with `PROT_READ | PROT_WRITE`, then `mprotect`
-//!   to `PROT_READ | PROT_EXEC`.
+//!   to `PROT_READ | PROT_EXEC`. On aarch64 we additionally flush the
+//!   instruction cache via the compiler builtin `__clear_cache` before the
+//!   RW→RX flip, because ARM's I-cache and D-cache are not coherent (unlike
+//!   x86-64, which is automatically coherent and needs no flush).
 //! - **macOS ARM64 (Apple Silicon):** Hardware-enforced W^X — memory cannot be
 //!   writable and executable simultaneously. Must allocate as RW, write code,
 //!   then flip to RX via `mprotect`. Apple provides `pthread_jit_write_protect_np`
 //!   for per-thread fast toggling on JIT pages allocated with `MAP_JIT`.
+//!   I-cache flush uses Apple's `sys_icache_invalidate`.
 
 /// Errors that can occur during JIT memory operations.
 #[derive(Debug)]
@@ -324,12 +328,62 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
     }
 
+    // ARM64 (Linux/FreeBSD) has split, non-coherent I-cache and D-cache.
+    // After writing instructions via the data path we MUST flush the range
+    // before allowing execution, otherwise the CPU may fetch stale bytes
+    // (or even predecoded garbage) for every JIT-compiled method.
+    //
+    // We do this BEFORE flipping to PROT_EXEC: while the page is still RW
+    // there is no chance of an instruction fetch racing the flush, and on
+    // Linux `__clear_cache` does not require execute permission.
+    //
+    // x86-64 has coherent I-cache/D-cache (Intel SDM Vol.3 §11.6, AMD APM
+    // Vol.2 §7.6.1) and only requires a serialising instruction on the
+    // executing thread (any branch suffices). No explicit flush needed.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "freebsd")
+    ))]
+    unsafe {
+        flush_icache_range_aarch64(ptr, size);
+    }
+
     let ret = unsafe { mprotect(ptr, size, PROT_READ | PROT_EXEC) };
     if ret != 0 {
         Err(JitError::ProtectFailed(ret))
     } else {
         Ok(())
     }
+}
+
+/// Flush a range of CPU instruction cache lines covering `[ptr, ptr+size)`.
+///
+/// Required on aarch64 Linux/FreeBSD where the data cache (used by the
+/// JIT writer) and the instruction cache (used by the fetch unit) are
+/// not coherent. macOS-arm64 uses `sys_icache_invalidate` (see the
+/// macOS block above); Apple's libc is the only one that exposes it.
+///
+/// Implementation: we link the compiler builtin `__clear_cache`. On
+/// aarch64 GCC and clang this expands to the correct sequence of
+/// `DC CVAU` + `DSB ISH` + `IC IVAU` (per-line, using `CTR_EL0` to
+/// determine cache line size) + `DSB ISH` + `ISB`. The symbol is
+/// supplied by libgcc on GNU targets and by compiler-rt on FreeBSD;
+/// both are linked by default when building a Rust binary that uses
+/// the standard library.
+///
+/// Signature follows the GCC builtin: `void __clear_cache(char *begin,
+/// char *end)`. End is *exclusive*.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "freebsd")
+))]
+unsafe fn flush_icache_range_aarch64(ptr: *mut u8, size: usize) {
+    extern "C" {
+        fn __clear_cache(begin: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
+    }
+    let begin = ptr as *mut core::ffi::c_char;
+    let end = ptr.add(size) as *mut core::ffi::c_char;
+    __clear_cache(begin, end);
 }
 
 #[cfg(all(not(target_os = "windows"), not(all(target_os = "macos", target_arch = "aarch64"))))]
@@ -424,5 +478,45 @@ mod tests {
         assert!(format!("{}", e).contains("allocation"));
         let e2 = JitError::ProtectFailed(-1);
         assert!(format!("{}", e2).contains("-1"));
+    }
+
+    /// End-to-end check that `make_executable` flushes the icache on
+    /// aarch64 so a freshly-written function actually executes.
+    ///
+    /// We allocate a page, write a single `RET` instruction (0xD65F03C0
+    /// little-endian on aarch64 = `ret`), finalize via `make_executable`
+    /// (which on Linux/FreeBSD aarch64 also runs `__clear_cache`), then
+    /// transmute the pointer to a `fn()` and call it. On x86-64 hosts
+    /// this test is compiled out; on macOS aarch64 it exercises the
+    /// existing `sys_icache_invalidate` path, which is a useful
+    /// regression guard too.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "freebsd", target_os = "macos")
+    ))]
+    #[test]
+    fn aarch64_icache_flush_executes_fresh_code() {
+        let size = 4096;
+        let ptr = alloc_executable(size).expect("alloc_executable failed");
+
+        // aarch64 `ret` = 0xD65F03C0, little-endian byte sequence
+        // 0xC0 0x03 0x5F 0xD6.
+        unsafe {
+            *ptr.add(0) = 0xC0;
+            *ptr.add(1) = 0x03;
+            *ptr.add(2) = 0x5F;
+            *ptr.add(3) = 0xD6;
+        }
+
+        make_executable(ptr, size).expect("make_executable failed");
+
+        // Jump to the freshly-written code. If the icache was not
+        // flushed the CPU may fetch zero bytes (UDF) or stale data
+        // and trap; a clean flush makes this a no-op call that
+        // returns normally.
+        let f: extern "C" fn() = unsafe { std::mem::transmute(ptr) };
+        f();
+
+        free_executable(ptr, size);
     }
 }
