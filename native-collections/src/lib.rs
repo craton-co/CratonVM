@@ -17038,6 +17038,13 @@ fn native_chm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): ConcurrentHashMap.put rejects null keys and null values per JDK spec.
+    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17073,6 +17080,13 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key/value.
+    if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap does not permit null keys or values".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17091,6 +17105,15 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key and null mappingFunction.
+    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.computeIfAbsent: null key or mappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17109,6 +17132,15 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key and null remappingFunction.
+    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.compute: null key or remappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17128,6 +17160,18 @@ fn native_chm_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let func = args.get(3).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key, null value, and null remappingFunction.
+    if matches!(key, Value::Object(None))
+        || matches!(value, Value::Object(None))
+        || matches!(func, Value::Object(None))
+    {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.merge: null key, value, or remappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17413,6 +17457,13 @@ fn native_chm_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key/value.
+    if matches!(key, Value::Object(None)) || matches!(new_val, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap.replace: null key or value".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
@@ -17440,6 +17491,16 @@ fn native_chm_replace_kv(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+    // C24 (HIGH): JDK rejects null key/old/new.
+    if matches!(key, Value::Object(None))
+        || matches!(old_val, Value::Object(None))
+        || matches!(new_val, Value::Object(None))
+    {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("ConcurrentHashMap.replace(k,old,new): nulls not permitted".to_string()),
+        }
+        .into());
+    }
     let hash = chm_key_hash(ctx, &key)?;
     match chm_segment_for(ctx, this, hash) {
         Some(seg) => {
