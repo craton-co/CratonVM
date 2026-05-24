@@ -97,10 +97,16 @@ fn emit_wait_site_frames(thread_id: ThreadId) {
 //                                       (try_thin_recursive_lock)
 //   THIN_LOCKED(self) --CAS--> THIN_LOCKED(self, recursion-1) or NEUTRAL
 //                                       (try_thin_unlock)
-//   NEUTRAL / THIN_LOCKED --store--> INFLATED(&Monitor)
-//                                       (inflate)
+//   NEUTRAL / THIN_LOCKED --CAS--> INFLATED(&Monitor)
+//                                       (MonitorTable::inflate_locked)
 //
-// The `inflate` path is the only one that allocates a `Monitor`.
+// The inflation path is the only one that allocates a `Monitor`. It must
+// publish the mark word via `compare_exchange` against the observed
+// pre-inflation mark, *not* an unconditional store, to avoid clobbering a
+// concurrent CAS (e.g. another thread releasing a thin lock back to
+// NEUTRAL). `MonitorTable::inflate_locked` enforces this; the bare
+// `inflate_unchecked` helper (kept for diagnostics / future reuse) is
+// `pub(crate)` and documented as unsafe in that respect.
 
 /// Attempt thin-lock acquisition via a single CAS on the mark word.
 ///
@@ -198,7 +204,24 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
     }
 }
 
-/// Inflate a thin lock (or a neutral mark) to a heap-allocated `Monitor`.
+/// Inflate a thin lock (or a neutral mark) to a heap-allocated `Monitor`
+/// **without** CAS-protecting the publish. Visibility is restricted to the
+/// crate so that the only legitimate caller is `MonitorTable::inflate_locked`,
+/// which holds the registry mutex and performs its own `compare_exchange`
+/// against the observed mark word before/instead of calling this helper.
+///
+/// # Safety / correctness contract
+///
+/// This helper publishes the new mark word via an **unconditional**
+/// `store(Release)`. That is only sound when the caller has *already
+/// confirmed*, via CAS, that the mark word still holds the value it observed
+/// — otherwise this store will silently clobber a concurrent CAS (e.g. a
+/// thin-lock owner releasing back to NEUTRAL, or another thread's earlier
+/// inflation publishing a different `Arc<Monitor>`), corrupting the lock
+/// state machine. The bare helper is therefore named `_unchecked` and is
+/// not part of the public API; new call sites must instead use
+/// `MonitorTable::inflate_locked`, which routes inflation through the
+/// registry mutex and performs the CAS publish itself.
 ///
 /// If `current_owner` is `Some((tid, recursion))`, the new monitor is
 /// pre-acquired by that thread with the given entry count, atomically
@@ -210,7 +233,10 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
 /// the `Monitor` alive (e.g. by stashing an `Arc<Monitor>` in
 /// `MonitorTable::monitors`) so that the GC remap path can find it.
 #[inline]
-pub fn inflate(
+#[allow(dead_code)] // retained for future direct inflation paths; the in-tree
+                    // inflation goes through `MonitorTable::inflate_locked`,
+                    // which inlines the same logic under its registry mutex.
+pub(crate) fn inflate_unchecked(
     header: &ObjectHeader,
     monitor: Arc<Monitor>,
     current_owner: Option<(u32, u8)>,
@@ -226,6 +252,9 @@ pub fn inflate(
     // has at least pointer alignment); the low 2 bits are therefore zero and
     // safe to use as the state tag.
     let new_mark = ObjectHeader::make_inflated(raw as usize);
+    // NOTE: unconditional store — see the function-level doc for the
+    // CAS-correctness contract. Direct callers outside
+    // `MonitorTable::inflate_locked` will violate the lock state machine.
     header.mark_word.store(new_mark, Ordering::Release);
     raw
 }
@@ -319,11 +348,12 @@ impl Monitor {
 
     /// Pre-acquire this monitor for `thread_id` at the given entry count.
     ///
-    /// Used exclusively by the inflation handoff (`inflate`) to atomically
-    /// transfer ownership from the thin-lock representation to a freshly
-    /// created `Monitor`. The monitor must be brand new (no other thread can
-    /// observe it yet because the mark word still points at the thin state),
-    /// so this is a pure local initialization — no condvar signalling needed.
+    /// Used exclusively by the inflation handoff (`inflate_unchecked` /
+    /// `MonitorTable::inflate_locked`) to atomically transfer ownership
+    /// from the thin-lock representation to a freshly created `Monitor`.
+    /// The monitor must be brand new (no other thread can observe it yet
+    /// because the mark word still points at the thin state), so this is
+    /// a pure local initialization — no condvar signalling needed.
     pub(crate) fn enter_with_recursion(&self, thread_id: ThreadId, entry_count: u32) {
         debug_assert!(entry_count >= 1, "entry_count must be at least 1");
         let mut state = self.state.lock();
@@ -630,7 +660,22 @@ impl MonitorTable {
     /// Re-snapshots the mark word under the registry mutex so that the
     /// pre-acquire reflects reality at publish time (avoiding stale
     /// `current_owner` data from a CAS-loser caller).
-    fn inflate_locked(&self, obj_ref: ObjectRef, header: &ObjectHeader) -> Arc<Monitor> {
+    ///
+    /// Returns `Err(IllegalStateException)` only on the pathological case
+    /// where the mark word reads `INFLATED` but the registry has no entry
+    /// for the object. Under correct concurrent operation this is
+    /// impossible — every INFLATED publish in this module CAS-flips the
+    /// mark word **and** inserts into `self.monitors` under the same
+    /// registry mutex (see C8 / C9). The Err variant therefore signals
+    /// memory corruption or a non-conforming inflation path; previously
+    /// this case silently leaked the original `Arc<Monitor>` and broke
+    /// per-object identity (a thread that already held the old monitor
+    /// would re-enter a fresh unowned monitor → eventual IMSE on exit).
+    fn inflate_locked(
+        &self,
+        obj_ref: ObjectRef,
+        header: &ObjectHeader,
+    ) -> Result<Arc<Monitor>, MethodCallFailed> {
         let key = obj_ref.as_ptr() as usize;
         let mut monitors = self.monitors.lock();
         loop {
@@ -638,18 +683,28 @@ impl MonitorTable {
             match ObjectHeader::mark_state(cur) {
                 s if s == types::MARK_INFLATED => {
                     if let Some(m) = monitors.get(&key).cloned() {
-                        return m;
+                        return Ok(m);
                     }
-                    // Inflated mark but no registry entry — pathological;
-                    // replace with a fresh monitor (the old one is
-                    // unreachable and will leak, but correctness is
-                    // preserved).
-                    let monitor = Arc::new(Monitor::new());
-                    let new_mark =
-                        ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
-                    header.mark_word.store(new_mark, Ordering::Release);
-                    monitors.insert(key, monitor.clone());
-                    return monitor;
+                    // Inflated mark but no registry entry — pathological.
+                    // We hold `self.monitors.lock()` and every legitimate
+                    // INFLATED publish in this module inserts under that
+                    // same mutex, so this branch is unreachable under
+                    // correct concurrent operation. Refuse to recover by
+                    // synthesising a fresh monitor: doing so would leak
+                    // the prior `Arc<Monitor>` *and* break per-object
+                    // identity (any thread that already held the old
+                    // monitor would re-enter a fresh unowned monitor and
+                    // later raise IMSE on exit). Surface the invariant
+                    // violation as a runtime error so the caller decides
+                    // whether to abort or unwind.
+                    return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                        RuntimeError::IllegalStateException {
+                            message: format!(
+                                "monitor mark inflated but registry entry missing \
+                                 (data race or memory corruption) at obj={key:#x}"
+                            ),
+                        },
+                    )));
                 }
                 s if s == types::MARK_THIN_LOCKED => {
                     let owner = ObjectHeader::thin_lock_owner(cur);
@@ -675,7 +730,7 @@ impl MonitorTable {
                         .is_ok()
                     {
                         monitors.insert(key, monitor.clone());
-                        return monitor;
+                        return Ok(monitor);
                     }
                     // CAS lost; loop to re-snapshot. The pre-acquired Monitor
                     // is dropped (no other reference exists yet).
@@ -697,7 +752,7 @@ impl MonitorTable {
                         .is_ok()
                     {
                         monitors.insert(key, monitor.clone());
-                        return monitor;
+                        return Ok(monitor);
                     }
                     // CAS lost — retry.
                 }
@@ -744,7 +799,13 @@ impl MonitorTable {
                         return;
                     }
                     // Lost the race again → inflate to avoid livelock.
-                    let m = self.inflate_locked(obj_ref, header);
+                    // `inflate_locked` only Errs on the impossible "mark
+                    // INFLATED but registry empty" invariant violation; panic
+                    // here surfaces the corruption rather than the previous
+                    // silent-leak recovery (see C8).
+                    let m = self
+                        .inflate_locked(obj_ref, header)
+                        .expect("monitor inflation invariant: registry/mark-word desync");
                     m.enter(thread_id);
                     return;
                 }
@@ -766,7 +827,9 @@ impl MonitorTable {
                                     // re-entrant acquisitions. Now bump once
                                     // more via reentrant `enter` to record the
                                     // current attempted acquisition.
-                                    let m = self.inflate_locked(obj_ref, header);
+                                    let m = self
+                                        .inflate_locked(obj_ref, header)
+                                        .expect("monitor inflation invariant: registry/mark-word desync");
                                     m.enter(thread_id);
                                     return;
                                 }
@@ -783,7 +846,9 @@ impl MonitorTable {
                         // if the inflated monitor is owned by the other
                         // thread we will block until they release through
                         // the heavyweight path.
-                        let m = self.inflate_locked(obj_ref, header);
+                        let m = self
+                            .inflate_locked(obj_ref, header)
+                            .expect("monitor inflation invariant: registry/mark-word desync");
                         m.enter(thread_id);
                         return;
                     }
@@ -794,15 +859,23 @@ impl MonitorTable {
                         m.enter(thread_id);
                         return;
                     }
-                    // Registry miss (should not happen): re-inflate.
-                    let m = self.inflate_locked(obj_ref, header);
+                    // Registry miss (should not happen): re-inflate. The
+                    // window between the inflating thread's mark-word CAS
+                    // and its registry insert is closed by the registry
+                    // mutex inside `inflate_locked`, so this branch only
+                    // fires on a true invariant violation — see C8.
+                    let m = self
+                        .inflate_locked(obj_ref, header)
+                        .expect("monitor inflation invariant: registry/mark-word desync");
                     m.enter(thread_id);
                     return;
                 }
                 _ => {
                     // Reserved state 0b11 — should never occur. Fall back to
                     // inflation as the safest recovery.
-                    let m = self.inflate_locked(obj_ref, header);
+                    let m = self
+                        .inflate_locked(obj_ref, header)
+                        .expect("monitor inflation invariant: registry/mark-word desync");
                     m.enter(thread_id);
                     return;
                 }
@@ -894,7 +967,14 @@ impl MonitorTable {
     /// monitor that the JFR consumer is interested in — the JFR-enabled gate
     /// means we're already on the cold path.
     pub fn set_jfr_enter_recorded(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
-        let monitor = self.ensure_inflated(obj_ref, thread_id);
+        // The only failure mode `ensure_inflated` can surface is the
+        // pathological "mark INFLATED but registry empty" invariant
+        // violation from `inflate_locked` (C8). This API is `()`-returning
+        // (the JFR consumer has no error channel here), so we panic to
+        // surface the corruption rather than silently leak as before.
+        let monitor = self
+            .ensure_inflated(obj_ref, thread_id)
+            .expect("monitor inflation invariant: registry/mark-word desync");
         monitor.set_jfr_enter_recorded(thread_id);
     }
 
@@ -915,13 +995,21 @@ impl MonitorTable {
     /// transferred atomically.
     ///
     /// Used by `wait`/`notify`/`notifyAll`, which require a heavyweight
-    /// monitor (thin locks have no condvars).
-    fn ensure_inflated(&self, obj_ref: ObjectRef, _thread_id: ThreadId) -> Arc<Monitor> {
+    /// monitor (thin locks have no condvars). Propagates the
+    /// `Err(IllegalStateException)` that `inflate_locked` raises on the
+    /// pathological "INFLATED mark but missing registry entry" case (see
+    /// C8) so callers can surface it as a normal runtime error rather
+    /// than a silent leak.
+    fn ensure_inflated(
+        &self,
+        obj_ref: ObjectRef,
+        _thread_id: ThreadId,
+    ) -> Result<Arc<Monitor>, MethodCallFailed> {
         let header = header_of(obj_ref);
         let cur = header.mark_word.load(Ordering::Acquire);
         if ObjectHeader::mark_state(cur) == types::MARK_INFLATED {
             if let Some(m) = self.lookup_inflated(obj_ref) {
-                return m;
+                return Ok(m);
             }
         }
         // `inflate_locked` re-snapshots the mark word under its registry
@@ -943,7 +1031,7 @@ impl MonitorTable {
         timeout_ms: Option<u64>,
         interrupted: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<bool, MethodCallFailed> {
-        let monitor = self.ensure_inflated(obj_ref, thread_id);
+        let monitor = self.ensure_inflated(obj_ref, thread_id)?;
         monitor
             .wait(thread_id, timeout_ms, interrupted)
             .map_err(|MonitorError::NotOwner| {
@@ -961,7 +1049,7 @@ impl MonitorTable {
     ///
     /// Wakes one thread waiting on this monitor. The calling thread must own it.
     pub fn notify(&self, obj_ref: ObjectRef, thread_id: ThreadId) -> Result<(), MethodCallFailed> {
-        let monitor = self.ensure_inflated(obj_ref, thread_id);
+        let monitor = self.ensure_inflated(obj_ref, thread_id)?;
         monitor.notify(thread_id).map_err(|MonitorError::NotOwner| {
             MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::IllegalMonitorStateException {
@@ -981,7 +1069,7 @@ impl MonitorTable {
         obj_ref: ObjectRef,
         thread_id: ThreadId,
     ) -> Result<(), MethodCallFailed> {
-        let monitor = self.ensure_inflated(obj_ref, thread_id);
+        let monitor = self.ensure_inflated(obj_ref, thread_id)?;
         monitor
             .notify_all(thread_id)
             .map_err(|MonitorError::NotOwner| {
