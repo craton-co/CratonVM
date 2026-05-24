@@ -1,13 +1,16 @@
 [package]
 name = "cratonvm-cli"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Command-line launcher for the CratonVM"
+documentation = "https://docs.rs/cratonvm-cli"
 readme = "../README.md"
 
 [[bin]]

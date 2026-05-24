@@ -1,12 +1,15 @@
 [package]
 name = "cratonvm-native-api"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Native method API for CratonVM — NativeContext trait and registry"
+documentation = "https://docs.rs/cratonvm-native-api"
 readme = "../README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

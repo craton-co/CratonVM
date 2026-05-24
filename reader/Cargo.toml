@@ -1,13 +1,16 @@
 [package]
 name = "cratonvm-reader"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Java .class file parser for the CratonVM project"
+documentation = "https://docs.rs/cratonvm-reader"
 readme = "../README.md"
 
 [dependencies]

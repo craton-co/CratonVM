@@ -1,12 +1,15 @@
 [package]
 name = "cratonvm-classloading"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Class loading subsystem for CratonVM"
+documentation = "https://docs.rs/cratonvm-classloading"
 readme = "../README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

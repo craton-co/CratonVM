@@ -1,11 +1,14 @@
 [package]
 name = "jit-cuda"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Java bytecode → PTX lowering for CratonVM GPU offload"
+documentation = "https://docs.rs/jit-cuda"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

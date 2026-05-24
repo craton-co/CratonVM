@@ -1,5 +1,5 @@
 [workspace]
-members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu", "gc", "vm", "vm-cli", "jfr"]
+members = ["reader", "types", "native-api", "native-collections", "native-io", "native-builtins", "native-awt", "jit-api", "jit", "jit-cuda", "cuda-bridge", "classloading", "craton-gpu", "gc", "vm", "vm-cli", "jfr", "fuzz"]
 resolver = "2"
 
 [workspace.package]

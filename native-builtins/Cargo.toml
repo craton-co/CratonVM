@@ -1,12 +1,15 @@
 [package]
 name = "cratonvm-native-builtins"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Java core native methods for CratonVM (java.lang.*)"
+documentation = "https://docs.rs/cratonvm-native-builtins"
 readme = "../README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

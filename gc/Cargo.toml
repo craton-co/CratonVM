@@ -1,12 +1,15 @@
 [package]
 name = "cratonvm-gc"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Garbage collector and memory management for CratonVM"
+documentation = "https://docs.rs/cratonvm-gc"
 readme = "../README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
