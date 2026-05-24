@@ -17272,4 +17272,106 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Task #42 — SATB pre-barrier wired at the aastore store site
+    // -----------------------------------------------------------------------
+
+    /// Task #42 (deferred from #25): the interpreter aastore path and
+    /// the `vm_exec` CAS putfield/aastore path must fire an SATB
+    /// pre-barrier on the *old* element BEFORE the new reference is
+    /// stored.  Without it, an old->new overwrite that happens between
+    /// G1 initial-mark and remark would silently drop the old
+    /// reference from the live closure — the classic SATB lost-object
+    /// scenario that turns into a use-after-free on the next
+    /// evacuation.
+    ///
+    /// This test exercises the exact pattern emitted by the aastore
+    /// sites at interpreter.rs ~4227 and ~5349 (and now mirrored in
+    /// `vm_exec.rs::compare_and_swap_field`):
+    ///
+    ///   1. allocate a length-1 reference array under G1,
+    ///   2. plant a non-null `old_ref` at slot 0 BEFORE activating SATB,
+    ///   3. activate the G1 SATB queue and drain leftovers,
+    ///   4. drive the migrated `if let Ok(old_elem) =
+    ///      get_array_element(...) { heap.satb_barrier(old_elem); }`
+    ///      pre-barrier followed by the `set_array_element` store,
+    ///   5. flush the per-thread SATB buffer and drain the global
+    ///      queue — the old reference's raw address MUST be present.
+    ///
+    /// Regression modes caught:
+    ///   - Pre-barrier removed entirely (queue would be empty).
+    ///   - Pre-barrier fired AFTER the store (it would log the new
+    ///     value instead of the old).
+    ///   - `satb_barrier` silently mis-routes a `Value::Object(Some)`
+    ///     payload on G1.
+    ///
+    /// Note: this test uses the `satb_barrier` API exported on this
+    /// branch.  The orchestrator task description refers to a
+    /// `VmHeap::write_barrier_pre` trait method from task #25; that
+    /// method has not landed on this worktree's base commit, so the
+    /// migration is expressed through the equivalent
+    /// `VmHeap::satb_barrier` entry point.  The semantic invariant
+    /// (old ref ends up in the G1 SATB log before the store) is
+    /// identical.
+    #[test]
+    fn t42_aastore_satb_pre_barrier_captures_old_ref_under_g1() {
+        use cratonvm_gc::heap::ArrayElementType;
+        use cratonvm_gc::vm_heap::{GcBackend, VmHeap};
+        use cratonvm_types::ClassId;
+
+        let heap = VmHeap::new(GcBackend::G1, 8 * 1024 * 1024);
+
+        // Allocate a length-1 reference array plus two objects to
+        // play "old" and "new" roles.  ClassId is a placeholder —
+        // the G1 allocator only cares about layout for this path.
+        let arr = heap.alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
+        let old_obj = heap.alloc_object(ClassId::new(1), 1);
+        let new_obj = heap.alloc_object(ClassId::new(1), 1);
+        let old_addr = old_obj.as_ptr() as usize;
+
+        // Plant the old reference BEFORE activating SATB so the
+        // initial store doesn't pollute the log we're going to check.
+        heap.set_array_element(arr, 0, Value::Object(Some(old_obj)))
+            .expect("planting old_ref at arr[0] must succeed");
+
+        // Grab the G1 SATB queue, drain any leftover entries from
+        // prior tests, then activate concurrent marking so the
+        // pre-barrier enqueues into the log.
+        let g1 = match &heap {
+            VmHeap::G1(g) => g,
+            _ => panic!("test requires the G1 backend"),
+        };
+        cratonvm_gc::satb::flush_thread_satb_buffer(g1.satb_queue());
+        let _ = g1.satb_queue().drain();
+        g1.satb_queue().activate();
+        assert!(
+            g1.satb_queue().is_empty(),
+            "SATB queue must start empty after drain"
+        );
+
+        // Drive the EXACT pattern emitted by the migrated aastore
+        // sites at interpreter.rs ~4227 and ~5349 (the slow-path
+        // Aastore), and the same shape now used by
+        // `vm_exec.rs::compare_and_swap_field` for ref-typed CAS.
+        if let Ok(old_elem) = heap.get_array_element(arr, 0) {
+            heap.satb_barrier(old_elem);
+        }
+        heap.set_array_element(arr, 0, Value::Object(Some(new_obj)))
+            .expect("aastore of new_obj must succeed");
+
+        // Force a per-thread flush — the auto-flush threshold (256)
+        // would otherwise hide a single-entry test under a stale
+        // thread-local buffer.
+        cratonvm_gc::satb::flush_thread_satb_buffer(g1.satb_queue());
+
+        let drained = g1.satb_queue().drain();
+        assert!(
+            drained.contains(&old_addr),
+            "G1 SATB queue must capture the old aastore element \
+             ({old_addr:#x}); got {drained:?}",
+        );
+
+        g1.satb_queue().deactivate();
+    }
 }

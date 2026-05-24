@@ -3092,6 +3092,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.shared.heap.get_field_volatile(obj, index)
             };
             if values_equal_for_cas(&current, &expected) {
+                // Task #42 (deferred from #25): SATB pre-barrier on
+                // the CAS-putfield / CAS-aastore path.  Without it,
+                // a successful CAS that overwrites an old ref slot
+                // between G1 initial-mark and remark would silently
+                // drop the old reference from the live closure —
+                // the same lost-object scenario the interpreter's
+                // putfield/aastore paths already guard against. We
+                // dispatch through `VmHeap::satb_barrier` (the
+                // available API on this branch); `satb_barrier`
+                // short-circuits on null and on non-Object payloads,
+                // so primitive `Unsafe.compareAndSwapInt/Long` and
+                // null→x CAS pays effectively nothing.  Fires
+                // strictly BEFORE the store to preserve SATB
+                // (pre, store, post) ordering. On a non-G1
+                // generational backend the call is also a cheap
+                // tag-test no-op.
+                self.shared.heap.satb_barrier(current);
                 if is_array {
                     let _ = self.shared.heap.set_array_element(obj, index, new_val);
                 } else if let Some(desc) = descriptor {
