@@ -24,6 +24,8 @@
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 
+use crate::class_reader_error::ClassReaderError;
+
 /// A zero-copy view into a shared `Arc<[u8]>` buffer.
 ///
 /// Cloning a `ByteView` is a single atomic refcount bump on the parent
@@ -42,11 +44,20 @@ impl ByteView {
     /// # Panics
     ///
     /// Panics if `range.start > range.end`, or if `range.end` exceeds
-    /// `source.len()`. The class-file hot path always passes ranges that
-    /// were validated by a preceding `read_bytes` bounds check, so this
-    /// panic is never reached in practice. Callers that cannot guarantee
-    /// the range is in bounds must use [`ByteView::try_new`] instead,
-    /// which returns `None` rather than panicking.
+    /// `source.len()`. This constructor is retained for static fixtures
+    /// (tests, hand-built buffers) where the range is provably in bounds
+    /// at compile time. Any call site that derives the range from
+    /// untrusted bytes — class-file payload offsets, attribute lengths,
+    /// `body_offset + buf.position()` arithmetic, etc. — MUST use
+    /// [`ByteView::try_new`] instead so an OOB range surfaces as a
+    /// [`ClassReaderError`] rather than aborting the process.
+    ///
+    /// A round-11 off-by-`buf.position()` bug shipped a panic via this
+    /// constructor that was only caught by a regression test; the
+    /// runtime-offset call sites in `attribute.rs` have since been moved
+    /// to `try_new` for defense-in-depth.
+    #[deprecated(note = "prefer try_new for runtime-derived offsets")]
+    #[track_caller]
     #[inline]
     pub fn new(source: Arc<[u8]>, range: Range<usize>) -> Self {
         assert!(range.start <= range.end, "ByteView range start > end");
@@ -64,17 +75,30 @@ impl ByteView {
     }
 
     /// Checked constructor: construct a view into `source[range]`, or
-    /// return `None` if the range is malformed (`start > end`) or falls
-    /// outside `source`.
+    /// return [`ClassReaderError::InvalidClassData`] if the range is
+    /// malformed (`start > end`) or falls outside `source`.
     ///
     /// Use this instead of [`ByteView::new`] whenever the range is not
-    /// already known to be in bounds — it never panics.
+    /// already known to be in bounds — it never panics. The reader
+    /// hot path in `attribute.rs` (StackMapTable entries, Code bytecode,
+    /// Unknown attribute data) uses this constructor so a malformed
+    /// class file produces an error instead of aborting the process.
     #[inline]
-    pub fn try_new(source: Arc<[u8]>, range: Range<usize>) -> Option<Self> {
+    pub fn try_new(
+        source: Arc<[u8]>,
+        range: Range<usize>,
+    ) -> Result<Self, ClassReaderError> {
         if range.start > range.end || range.end > source.len() {
-            return None;
+            return Err(ClassReaderError::InvalidClassData {
+                message: format!(
+                    "ByteView range {}..{} out of bounds for source of length {}",
+                    range.start,
+                    range.end,
+                    source.len()
+                ),
+            });
         }
-        Some(Self {
+        Ok(Self {
             source,
             start: range.start,
             end: range.end,
@@ -88,17 +112,27 @@ impl ByteView {
     #[inline]
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         let len = bytes.len();
-        Self::new(Arc::from(bytes), 0..len)
+        let source: Arc<[u8]> = Arc::from(bytes);
+        Self {
+            source,
+            start: 0,
+            end: len,
+        }
     }
 
     /// Build a view from a borrowed slice — copies once into a fresh
     /// `Arc<[u8]>`. Convenience for test fixtures; production code on
-    /// the reader hot path should use [`ByteView::new`] with the shared
-    /// class-file buffer.
+    /// the reader hot path should use [`ByteView::try_new`] with the
+    /// shared class-file buffer.
     #[inline]
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();
-        Self::new(Arc::from(bytes), 0..len)
+        let source: Arc<[u8]> = Arc::from(bytes);
+        Self {
+            source,
+            start: 0,
+            end: len,
+        }
     }
 
     /// Empty view — does not allocate.
@@ -249,7 +283,8 @@ mod tests {
     fn new_view_shares_parent_arc() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
         let strong_before = Arc::strong_count(&parent);
-        let view = ByteView::new(Arc::clone(&parent), 2..6);
+        let view = ByteView::try_new(Arc::clone(&parent), 2..6)
+            .expect("in-bounds range");
         assert_eq!(Arc::strong_count(&parent), strong_before + 1);
         assert_eq!(view.as_bytes(), &[3u8, 4, 5, 6][..]);
         assert_eq!(view.len(), 4);
@@ -289,7 +324,8 @@ mod tests {
     #[test]
     fn to_arc_returns_independent_arc() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
-        let view = ByteView::new(Arc::clone(&parent), 1..3);
+        let view = ByteView::try_new(Arc::clone(&parent), 1..3)
+            .expect("in-bounds range");
         let owned: Arc<[u8]> = view.to_arc();
         assert_eq!(&*owned, &[2u8, 3][..]);
         // owned is decoupled from parent.
@@ -300,24 +336,47 @@ mod tests {
 
     #[test]
     #[should_panic]
+    #[allow(deprecated)]
     fn new_panics_on_out_of_bounds_range() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3]);
         let _ = ByteView::new(parent, 0..10);
     }
 
     #[test]
-    fn try_new_returns_none_for_invalid_ranges() {
+    fn try_new_returns_err_for_invalid_ranges() {
         let parent: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
-        // Out-of-bounds end.
-        assert!(ByteView::try_new(Arc::clone(&parent), 0..10).is_none());
+        // Out-of-bounds end produces an InvalidClassData error rather
+        // than panicking — this is the primary contract that lets the
+        // reader's hot path tolerate malformed offsets.
+        let err = ByteView::try_new(Arc::clone(&parent), 0..10).unwrap_err();
+        match err {
+            ClassReaderError::InvalidClassData { message } => {
+                assert!(
+                    message.contains("out of bounds"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected InvalidClassData, got {other:?}"),
+        }
         // Inverted range.
-        assert!(ByteView::try_new(Arc::clone(&parent), 3..1).is_none());
+        assert!(ByteView::try_new(Arc::clone(&parent), 3..1).is_err());
         // Valid range succeeds and yields the expected slice.
         let v = ByteView::try_new(Arc::clone(&parent), 1..3)
             .expect("in-bounds range");
         assert_eq!(v.as_bytes(), &[2u8, 3][..]);
         // Whole-buffer and empty-at-end ranges are valid.
-        assert!(ByteView::try_new(Arc::clone(&parent), 0..4).is_some());
-        assert!(ByteView::try_new(parent, 4..4).is_some());
+        assert!(ByteView::try_new(Arc::clone(&parent), 0..4).is_ok());
+        assert!(ByteView::try_new(parent, 4..4).is_ok());
+    }
+
+    /// Direct OOB test required by the soundness task: passing an
+    /// `offset > buf.len()` must return Err (never panic).
+    #[test]
+    fn try_new_offset_past_end_returns_err() {
+        let buf: Arc<[u8]> = Arc::from(vec![0u8; 4]);
+        let err = ByteView::try_new(Arc::clone(&buf), 5..5).unwrap_err();
+        assert!(matches!(err, ClassReaderError::InvalidClassData { .. }));
+        let err = ByteView::try_new(buf, 2..100).unwrap_err();
+        assert!(matches!(err, ClassReaderError::InvalidClassData { .. }));
     }
 }
