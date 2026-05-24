@@ -240,7 +240,7 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
         return Err("missing [0] EXPLICIT wrapper for SignedData");
     }
     let signed_data_seq = read_seq_strict(ctx0.content)?;
-    let mut sd = Cursor::new(signed_data_seq);
+    let mut sd = Cursor::new(&signed_data_seq);
 
     // SignedData ::= SEQUENCE {
     //     version             CMSVersion,
@@ -268,7 +268,7 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
 
     // signerInfos SET OF SignerInfo.
     let signer_infos = sd.read_set()?;
-    let signer_infos = split_set_or_seq(signer_infos, MAX_DEPTH)?;
+    let signer_infos = split_set_or_seq(&signer_infos, MAX_DEPTH)?;
     let first_si = signer_infos
         .into_iter()
         .next()
@@ -284,7 +284,7 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
     //     unsignedAttrs [1]  IMPLICIT UnsignedAttributes OPTIONAL
     // }
     let signer_info = read_seq_strict(&first_si)?;
-    let mut si = Cursor::new(signer_info);
+    let mut si = Cursor::new(&signer_info);
     let _si_version = si.read_integer()?;
     let sid_raw = si.read_seq_raw()?;
     let digest_alg_seq = si.read_seq_raw()?;
@@ -308,13 +308,13 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
     let mut got_message_digest: Option<Vec<u8>> = None;
     for attr_tlv in attrs {
         let attr_seq = read_seq_strict(&attr_tlv)?;
-        let mut a = Cursor::new(attr_seq);
+        let mut a = Cursor::new(&attr_seq);
         let attr_oid = a.read_oid()?;
         let attr_values = a.read_set()?;
         match attr_oid.as_str() {
             OID_CONTENT_TYPE => {
                 // SET OF OID containing pkcs7-data.
-                let mut v = Cursor::new(attr_values);
+                let mut v = Cursor::new(&attr_values);
                 let inner = v.read_oid()?;
                 if inner != OID_DATA {
                     return Err("contentType attribute is not pkcs7-data");
@@ -323,7 +323,7 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
             }
             OID_MESSAGE_DIGEST => {
                 // SET OF OCTET STRING.
-                let mut v = Cursor::new(attr_values);
+                let mut v = Cursor::new(&attr_values);
                 let (octet_tlv, _) = v.read_tlv()?;
                 if octet_tlv.tag != TAG_OCTET_STRING {
                     return Err("messageDigest attribute value is not OCTET STRING");
@@ -428,7 +428,7 @@ fn principal_from_sid(sid_seq: Vec<u8>) -> Option<String> {
         let atv_blobs = split_set_or_seq(rdn_tlv.content, MAX_DEPTH).ok()?;
         if let Some(first) = atv_blobs.first() {
             let atv = read_seq_strict(first).ok()?;
-            let mut a = Cursor::new(atv);
+            let mut a = Cursor::new(&atv);
             let oid = a.read_oid().ok()?;
             let (val_tlv, _) = a.read_tlv().ok()?;
             let value = match std::str::from_utf8(val_tlv.content) {
