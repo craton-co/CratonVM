@@ -48,12 +48,29 @@ fn dbg_dopriv_enabled() -> bool {
 
 static SECURITY_MANAGER: Mutex<Option<ObjectRef>> = Mutex::new(None);
 
-fn get_security_manager() -> Option<ObjectRef> {
+/// Read the currently-installed `java.lang.SecurityManager` reference, if
+/// any. Exposed at crate scope so security-sensitive native entry points
+/// (e.g. `ProcessBuilder.start`, `Runtime.exec*`) can consult it before
+/// invoking the underlying host syscall — see `lang_system::check_exec_or_throw`.
+pub(crate) fn get_security_manager() -> Option<ObjectRef> {
     *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn set_security_manager(sm: Option<ObjectRef>) {
     *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = sm;
+}
+
+/// Override the SecurityManager singleton for tests. Lets unit tests
+/// install a synthetic SM object so they can exercise the checkExec
+/// gating path without going through `System.setSecurityManager`.
+///
+/// Returns the previous value so callers can restore it on tear-down.
+#[cfg(test)]
+pub(crate) fn set_security_manager_for_test(sm: Option<ObjectRef>) -> Option<ObjectRef> {
+    let mut guard = SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = *guard;
+    *guard = sm;
+    prev
 }
 
 // ---------------------------------------------------------------------------

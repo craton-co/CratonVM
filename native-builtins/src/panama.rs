@@ -35,6 +35,19 @@ const MAX_CSTR_LEN: usize = 4096;
 ///
 /// TODO: wire this to a real per-module `--enable-native-access` check once
 /// `NativeContext` exposes the caller module's native-access permission.
+///
+/// AUDIT TODO (HIGH security, tracked separately from the `ProcessBuilder.start`
+/// / `Runtime.exec*` gate added in `lang_system::check_exec_or_throw`):
+/// Panama downcalls bypass `SecurityManager.checkExec`. A Java caller with a
+/// valid function-pointer address for `execve` / `posix_spawn` / `CreateProcessW`
+/// can spawn host processes through [`validated_fn_ptr`] without ever transiting
+/// `ProcessBuilder.start` or `Runtime.exec`. The current coarse
+/// `NATIVE_ACCESS_ENABLED` flag is process-wide rather than per-call and offers
+/// no per-syscall granularity. Solving this needs:
+///   (a) symbol-resolution at downcall time so we can recognise spawn-family
+///       libc/Win32 entry points, or
+///   (b) sandboxing the entire process at the OS level (seccomp / AppContainer).
+/// Not blocking here — separate task.
 static NATIVE_ACCESS_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 

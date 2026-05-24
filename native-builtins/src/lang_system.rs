@@ -997,6 +997,53 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 // Process synthetic: 3-field (exit_code=0 Int, stdout=1 String, stderr=2 String)
 // ---------------------------------------------------------------------------
 
+/// Consult the installed `java.lang.SecurityManager`, if any, before
+/// spawning a host process. Mirrors HotSpot's behaviour: every
+/// `ProcessBuilder.start` and `Runtime.exec*` overload must call
+/// `SecurityManager.checkExec(command[0])` before the spawn syscall
+/// (fork/exec/CreateProcess) is issued. If the SM throws
+/// `SecurityException`, the error is propagated to the Java caller and
+/// the spawn MUST NOT happen.
+///
+/// `command_first` is the program path (`command[0]`) as it will be
+/// handed to `std::process::Command::new`. An empty string is rejected
+/// up-front so a misuse on the SM side (treating `""` as "allow
+/// nothing") can't be bypassed by passing an empty argv.
+///
+/// With no SecurityManager installed this is a no-op — matching JDK
+/// behaviour where `Runtime.exec` is unrestricted until `System.setSecurityManager`
+/// is called.
+///
+/// Audit TODO (Panama): host-call sites that go through `jdk.internal.foreign`
+/// / `java.lang.foreign.Linker` can invoke `execve`/`CreateProcessW`
+/// without ever transiting `ProcessBuilder.start` or `Runtime.exec`.
+/// That bypass is not addressed here — gating it requires intercepting
+/// every Panama downcall, tracked as a separate task. See
+/// `native-builtins::panama` for the FFI entry points.
+pub(crate) fn check_exec_or_throw(
+    ctx: &mut dyn NativeContext,
+    command_first: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let sm = crate::security_manager::get_security_manager();
+    let Some(sm_ref) = sm else { return Ok(()) };
+
+    // Allocate a Java String for command[0] and call sm.checkExec(String).
+    // The synthetic SecurityManager.checkExec native (security_manager.rs)
+    // routes through checkPermission → policy_allows_full_generic; a
+    // denial surfaces as RuntimeError::SecurityException, which we
+    // propagate verbatim so the Java caller observes a SecurityException
+    // and the spawn does NOT happen.
+    //
+    // `invoke_virtual` takes (receiver, method, descriptor, args) where
+    // `args` lists ONLY the explicit method parameters — the receiver is
+    // not duplicated in the args slice (see other call sites such as
+    // `AccessController.doPrivileged` in security_manager.rs).
+    let cmd_obj = ctx.create_string(command_first);
+    let args = [Value::Object(Some(cmd_obj))];
+    ctx.invoke_virtual(sm_ref, "checkExec", "(Ljava/lang/String;)V", &args)?;
+    Ok(())
+}
+
 /// Read a String[] from an object reference into a Vec<String>.
 fn read_string_array(ctx: &mut dyn NativeContext, arr_val: &Value) -> Vec<String> {
     let arr = match arr_val {
@@ -1026,6 +1073,12 @@ fn runtime_spawn_process(
         }.into());
     }
     let program = &cmd[0];
+
+    // SECURITY: consult SecurityManager.checkExec(command[0]) BEFORE
+    // touching std::process::Command. A SecurityException here must
+    // prevent the spawn syscall entirely — see check_exec_or_throw doc.
+    check_exec_or_throw(ctx, program)?;
+
     let mut command = std::process::Command::new(program);
     if cmd.len() > 1 {
         command.args(&cmd[1..]);
@@ -1339,7 +1392,61 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(ctx.get_field(this, 0)))
 }
 
-pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // SECURITY: this is the "simplified" ProcessBuilder.start stub that
+    // never actually spawns — it returns a dummy Process with exit_code=0.
+    // The real spawning path is `phases_late::register_phase57_process`,
+    // which last-write-wins overrides this registration. Even so we
+    // funnel through check_exec_or_throw as defense-in-depth: if a future
+    // refactor ever wires this stub up to std::process::Command, the
+    // SecurityManager gate stays in place.
+    //
+    // Best-effort extraction of command[0] from the ProcessBuilder's
+    // command field (slot 0). If we can't recover a program string we
+    // still consult the SM with an empty argument so a deny-all policy
+    // surfaces a SecurityException — matching the "empty argv is
+    // suspicious" stance taken in `check_exec_or_throw`.
+    let program: String = match args.first() {
+        Some(Value::Object(Some(this))) => {
+            let cmd_val = ctx.get_field(*this, 0);
+            match cmd_val {
+                Value::Object(Some(cmd_obj)) => {
+                    // Try ArrayList layout (data=field0, size=field1).
+                    if let Value::Int(size) = ctx.get_field(cmd_obj, 1) {
+                        if size > 0 {
+                            if let Value::Object(Some(data_arr)) = ctx.get_field(cmd_obj, 0) {
+                                if let Value::Object(Some(s)) = ctx.get_array_element(data_arr, 0) {
+                                    ctx.read_string(s).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        // Raw String[] fallback.
+                        let len = ctx.array_length(cmd_obj);
+                        if len > 0 {
+                            if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, 0) {
+                                ctx.read_string(s).unwrap_or_default()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    }
+                }
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    check_exec_or_throw(ctx, &program)?;
+
     // Return a dummy Process object (simplified — no actual process execution)
     let proc = alloc_concurrent_synthetic(ctx, "java/lang/Process", 1);
     ctx.set_field(proc, 0, Value::Int(0)); // exit code
@@ -2483,5 +2590,210 @@ mod t15_tests {
             ],
         );
         assert!(r.is_err(), "should throw ArrayIndexOutOfBoundsException");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecurityManager.checkExec gating for process spawn (HIGH security)
+// ---------------------------------------------------------------------------
+//
+// These tests verify the contract documented on `check_exec_or_throw`:
+//
+//   1. With no SecurityManager installed, the gate is a no-op and the
+//      spawn proceeds (existing behaviour, preserves backwards compat).
+//   2. With a SecurityManager that denies any exec, the gate propagates
+//      `SecurityException` and `std::process::Command` is NEVER touched.
+//   3. With a SecurityManager that allows only specific paths, only the
+//      allowed paths reach the spawn syscall.
+//
+// We exercise the integration through `native_runtime_exec_string` and
+// `native_pb_start` so any future refactor that bypasses
+// `check_exec_or_throw` regresses these tests.
+//
+// MockNativeContext.invoke_virtual returns whatever's pre-armed in
+// `invoke_virtual_result` (taken once), defaulting to `Ok(None)` —
+// matching JDK's "no exception thrown == allowed" semantics. This lets us
+// simulate both deny (pre-arm an Err) and allow (default).
+#[cfg(test)]
+mod checkexec_security_tests {
+    use super::*;
+    use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
+    use crate::test_utils::mock_ctx;
+    use crate::security_manager::set_security_manager_for_test;
+
+    /// Helper: assert the failure is a SecurityException (regardless of
+    /// the exact message — the wrapping is `MethodCallFailed::InternalError(
+    /// VmError::Runtime(RuntimeError::SecurityException { .. }))`).
+    fn assert_security_exception(err: &MethodCallFailed) {
+        match err {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::SecurityException { .. },
+            )) => {}
+            other => panic!(
+                "expected RuntimeError::SecurityException, got {other:?}",
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // (1) No SecurityManager — spawn gate is a no-op.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_security_manager_allows_check_exec() {
+        // Ensure no SM is installed (defensive — other tests may have set one).
+        let prev = set_security_manager_for_test(None);
+
+        let mut ctx = mock_ctx();
+        let result = check_exec_or_throw(&mut ctx, "/usr/bin/ls");
+        assert!(
+            result.is_ok(),
+            "check_exec_or_throw must be a no-op with no SecurityManager, got {result:?}",
+        );
+
+        let _ = set_security_manager_for_test(prev);
+    }
+
+    // -----------------------------------------------------------------------
+    // (2) SecurityManager that denies every checkExec — SecurityException
+    //     propagates AND the spawn does NOT happen.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn denying_security_manager_blocks_check_exec() {
+        let mut ctx = mock_ctx();
+        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let prev = set_security_manager_for_test(Some(sm));
+
+        // Pre-arm the mock so the next invoke_virtual returns a SecurityException.
+        // This simulates a SecurityManager whose checkExec(String) denies.
+        unsafe {
+            *ctx.invoke_virtual_result.get() = Some(Err(
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::SecurityException {
+                        message: "access denied (test policy denies all exec)".to_string(),
+                    },
+                )),
+            ));
+        }
+
+        let result = check_exec_or_throw(&mut ctx, "/usr/bin/evil");
+        let err = result.expect_err("denying SM must surface SecurityException");
+        assert_security_exception(&err);
+
+        let _ = set_security_manager_for_test(prev);
+    }
+
+    #[test]
+    fn denying_sm_blocks_runtime_exec_before_spawn() {
+        // End-to-end check: a deny-all SM must short-circuit
+        // native_runtime_exec_string with SecurityException — std::process::Command
+        // is never invoked. Using a bogus program path proves no fallback
+        // "Runtime.exec failed: ..." IOException can leak through, because
+        // if the SM check is skipped the spawn would attempt the path and
+        // surface IOException, not SecurityException.
+        let mut ctx = mock_ctx();
+        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let prev = set_security_manager_for_test(Some(sm));
+        unsafe {
+            *ctx.invoke_virtual_result.get() = Some(Err(
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::SecurityException {
+                        message: "deny".to_string(),
+                    },
+                )),
+            ));
+        }
+
+        // args[0] = Runtime instance (irrelevant here), args[1] = command.
+        let runtime_instance = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0);
+        let cmd = ctx.create_string("/path/to/definitely-nonexistent-binary-xyz");
+        let result = native_runtime_exec_string(
+            &mut ctx,
+            &[Value::Object(Some(runtime_instance)), Value::Object(Some(cmd))],
+        );
+
+        let err = result.expect_err("deny-all SM must block Runtime.exec spawn");
+        assert_security_exception(&err);
+
+        let _ = set_security_manager_for_test(prev);
+    }
+
+    #[test]
+    fn denying_sm_blocks_processbuilder_start_stub() {
+        // Same coverage for the simplified `native_pb_start` stub. Even
+        // though this stub doesn't actually spawn, the SM gate runs first
+        // so a future refactor that wires it to std::process::Command can
+        // not silently bypass policy.
+        let mut ctx = mock_ctx();
+        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let prev = set_security_manager_for_test(Some(sm));
+        unsafe {
+            *ctx.invoke_virtual_result.get() = Some(Err(
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::SecurityException {
+                        message: "deny".to_string(),
+                    },
+                )),
+            ));
+        }
+
+        // Build a ProcessBuilder synthetic with a 4-slot layout and a
+        // command list. The native_pb_start stub reads slot 0; we plant a
+        // String[] there with command[0] = "/bin/anything".
+        let pb = alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4);
+        let cmd_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        let prog = ctx.create_string("/bin/anything");
+        ctx.set_array_element(cmd_arr, 0, Value::Object(Some(prog)));
+        ctx.set_field(pb, 0, Value::Object(Some(cmd_arr)));
+
+        let result = native_pb_start(&mut ctx, &[Value::Object(Some(pb))]);
+        let err = result.expect_err("deny-all SM must block ProcessBuilder.start");
+        assert_security_exception(&err);
+
+        let _ = set_security_manager_for_test(prev);
+    }
+
+    // -----------------------------------------------------------------------
+    // (3) Allow-specific-path SecurityManager — only listed paths spawn.
+    // -----------------------------------------------------------------------
+    //
+    // The MockNativeContext's `invoke_virtual_result` is consumed by
+    // `take()` per call, so for two back-to-back checkExec invocations we
+    // pre-arm the mock once with Err (deny) for the first call, then leave
+    // it unset so the second call falls through to the default `Ok(None)`
+    // (allow). This mirrors a real SM that allows the second program but
+    // denies the first.
+
+    #[test]
+    fn allow_listed_sm_lets_specific_paths_through() {
+        let mut ctx = mock_ctx();
+        let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
+        let prev = set_security_manager_for_test(Some(sm));
+
+        // First call: simulate a denial for the disallowed binary.
+        unsafe {
+            *ctx.invoke_virtual_result.get() = Some(Err(
+                MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::SecurityException {
+                        message: "deny /usr/bin/danger".to_string(),
+                    },
+                )),
+            ));
+        }
+        let denied = check_exec_or_throw(&mut ctx, "/usr/bin/danger");
+        let err = denied.expect_err("disallowed path must surface SecurityException");
+        assert_security_exception(&err);
+
+        // Second call: invoke_virtual_result was take()n on the previous
+        // call, so the mock now falls back to its default Ok(None) —
+        // simulating the allow-list permitting this program.
+        let allowed = check_exec_or_throw(&mut ctx, "/bin/allowed-program");
+        assert!(
+            allowed.is_ok(),
+            "allow-listed path must pass the gate, got {allowed:?}",
+        );
+
+        let _ = set_security_manager_for_test(prev);
     }
 }

@@ -6699,6 +6699,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
             }.into());
         }
 
+        // SECURITY: gate the spawn on SecurityManager.checkExec(command[0]).
+        // Must happen BEFORE std::process::Command is touched so a denial
+        // surfaces as a SecurityException with no fork/exec syscall issued.
+        // See `lang_system::check_exec_or_throw` for the contract.
+        crate::lang_system::check_exec_or_throw(ctx, &cmd_strings[0])?;
+
         // --- Extract optional working directory from File field ---
         let work_dir: Option<String> = match ctx.get_field(this, PB_FIELD_DIRECTORY) {
             Value::Object(Some(file_obj)) => {
