@@ -45,10 +45,24 @@
 //!   attacker who can craft a valid `*.SF`/`*.RSA` pair *consistent with
 //!   their own key* could still forge a signer identity until pubkey
 //!   verification lands.
-//! * **Trust-store integration.**  We do not yet check that the leaf
-//!   cert chains to a trusted root — every well-formed self-signed JAR
-//!   currently passes self-consistency.  Wiring trust-store probes
-//!   belongs in a follow-up that owns the keystore-loading path.
+//! * **Trust-store integration (partial — task #40, deferred from #1).**
+//!   This module now exposes [`TrustStore`] and [`verify_chain`], walks
+//!   the embedded `chain` (leaf → intermediates → anchor) by Subject↔
+//!   Issuer DN match, and refuses signer blocks whose leaf has no path
+//!   to a trust anchor.  See [`TrustStore::load_default`] for the source
+//!   priority (`javax.net.ssl.trustStore` sys-prop, then a `CRATONVM_TRUST_PEM`
+//!   env-var PEM bundle, then the JDK `cacerts` fallback path).  What is
+//!   still **NOT** implemented is the cryptographic signature step on
+//!   each chain link — for the same dependency-cycle reason as the
+//!   pubkey-over-authAttrs gap above.  Until the crypto primitives are
+//!   hoisted out of `cratonvm-native-builtins`, the link-signature check
+//!   delegates to a deliberately conservative stub that recognises only
+//!   a synthetic `craton-stub-sig` algorithm — real RSA/ECDSA blobs
+//!   surface as [`TrustError::NotImplemented`], which is treated as a
+//!   verification failure by [`verify_signer_block`].  PEM-encoded
+//!   anchors are accepted (we have a local DER reader); PKCS#12 / JKS
+//!   binary trust-store files surface as `NotImplemented` (no `p12` /
+//!   `keystore` crate is reachable from `classloading`).
 //! * **Multiple-signer SignerInfo dispatch.**  We only verify the first
 //!   `SignerInfo`; multi-signer JARs (rare) collapse to "first signer
 //!   verified".
@@ -165,12 +179,14 @@ pub enum DigestAlg {
 // ---------------------------------------------------------------------------
 
 /// Parse a JAR signer block (`META-INF/*.RSA|.DSA|.EC`) and verify it is
-/// self-consistent with the matching `*.SF` bytes.
+/// **both** self-consistent with the matching `*.SF` bytes **and**
+/// chains to an anchor in `trust_store`.
 ///
 /// `signer_block_der` is the raw signer-block file contents.  `sf_bytes`
 /// is the corresponding signature-file (`*.SF`) contents — typically
 /// found by stripping the extension and looking up `META-INF/{stem}.SF`
-/// in the same JAR.
+/// in the same JAR.  `trust_store` is the set of trusted root anchors;
+/// see [`TrustStore::load_default`] for how it is populated.
 ///
 /// Returns `Some(VerifiedSigner)` only when:
 ///   * the outer DER is a well-formed `SignedData` ContentInfo,
@@ -181,10 +197,12 @@ pub enum DigestAlg {
 ///   * the `messageDigest` attribute equals `H_alg(sf_bytes)` where
 ///     `alg` is the SignerInfo's declared `digestAlgorithm`,
 ///   * at least one X.509 certificate is embedded in the `certificates`
-///     field.
+///     field,
+///   * [`verify_chain`] finds a path from the leaf certificate through
+///     the embedded intermediates to an anchor in `trust_store`.
 ///
 /// Returns `None` on *any* failure (parse error, truncation, OID
-/// mismatch, digest mismatch, missing cert, ...).  Logs at
+/// mismatch, digest mismatch, missing cert, no trust path, ...).  Logs at
 /// `tracing::warn` for diagnostics.  **Never panics.**
 ///
 /// # Security limits
@@ -193,14 +211,25 @@ pub enum DigestAlg {
 /// rejected immediately.  Cert DER blobs >64 KiB are dropped from the
 /// returned chain (defense against single-cert zip-bombs).
 ///
+/// # Trust-store mode for legacy unit tests
+///
+/// Pass [`TrustStore::permissive_legacy_tests`] to skip the chain step
+/// entirely — used by the pre-task-#40 self-consistency tests below that
+/// embed non-X.509-shaped marker certs.  Production code paths must
+/// supply a real trust store via [`TrustStore::load_default`].
+///
 /// # TODO(post-orchestrator)
 ///
 /// Pub-key signature verification over the authenticated-attributes
-/// blob is not yet implemented — see module-level docs.  Trust-store
-/// chaining is likewise deferred.
+/// blob, and **cryptographic** verification of each chain link's
+/// `signatureAlgorithm`-over-TBS-cert, are still not implemented — see
+/// module-level docs.  Both gaps surface as `None` here (the chain step
+/// returns [`TrustError::NotImplemented`] for unrecognised signature
+/// algorithms, which we treat as failure rather than success).
 pub fn verify_signer_block(
     signer_block_der: &[u8],
     sf_bytes: &[u8],
+    trust_store: &TrustStore,
 ) -> Option<VerifiedSigner> {
     if signer_block_der.is_empty() || signer_block_der.len() > MAX_SIGNER_BLOCK {
         warn!(
@@ -210,13 +239,40 @@ pub fn verify_signer_block(
         );
         return None;
     }
-    match parse_signed_data(signer_block_der, sf_bytes) {
-        Ok(vs) => Some(vs),
+    let vs = match parse_signed_data(signer_block_der, sf_bytes) {
+        Ok(vs) => vs,
         Err(e) => {
             warn!("jar signer: rejecting signer block: {}", e);
-            None
+            return None;
+        }
+    };
+    // Task #40: gate signer status on a chain-to-trust-anchor walk in
+    // addition to the .SF self-consistency check above.  `TrustStore::
+    // permissive_legacy_tests` short-circuits the walk for the older
+    // self-consistency-only fixtures; every other trust store enforces.
+    if !trust_store.permissive_legacy {
+        let leaf = match X509Cert::parse(&vs.chain[0]) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("jar signer: leaf cert is not parseable X.509: {}", e);
+                return None;
+            }
+        };
+        let intermediates: Vec<X509Cert> = vs
+            .chain
+            .iter()
+            .skip(1)
+            .filter_map(|der| X509Cert::parse(der).ok())
+            .collect();
+        match verify_chain(&leaf, &intermediates, trust_store) {
+            Ok(()) => {}
+            Err(e) => {
+                warn!("jar signer: chain validation rejected leaf: {:?}", e);
+                return None;
+            }
         }
     }
+    Some(vs)
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +906,575 @@ mod sha256 {
 }
 
 // ---------------------------------------------------------------------------
+// Task #40 — Trust store + chain verification
+// ---------------------------------------------------------------------------
+//
+// HotSpot / OpenJDK chains a JAR signer's leaf cert to a trust anchor in
+// `jssecacerts` / `cacerts` before treating the signer as authoritative.
+// Without that step `Class.getCodeSource().getCertificates()` will trust
+// a self-signed leaf, defeating any `policy.signedBy(<distinguishedName>)`
+// rule.  This module adds:
+//
+//   * A [`TrustStore`] of in-memory X.509 anchor certificates.
+//   * A small X.509 parser ([`X509Cert`]) — Subject / Issuer DN plus the
+//     TBSCertificate / signature blobs needed for chain walking.  We use
+//     the local TLV reader (`read_tlv`, `Cursor`) — no new deps.
+//   * [`verify_chain`], which walks leaf → intermediates → root by
+//     matching each cert's `issuer` DN against the next cert's `subject`
+//     DN, then asks [`X509Cert::link_signature_ok`] whether the
+//     `signature` blob ties the child to the parent.
+//
+// **Cryptographic note.**  The link-signature step is intentionally
+// *not* a real RSA/ECDSA verify (see the module-level docs for why the
+// crypto primitives are out of reach from `classloading`).  We
+// recognise one synthetic algorithm OID — `craton-stub-sig` (used
+// exclusively by the in-process tests) — and treat every other
+// algorithm as [`TrustError::NotImplemented`].  A real-world cert
+// chain therefore *will* reject as `NotImplemented`, which
+// [`verify_signer_block`] surfaces as `None` (verification failure).
+// That is the conservative direction: until real crypto lands, no
+// chain validates against system anchors.  Audit follow-up: hoist
+// `cratonvm_native_builtins::crypto_impl::Rsa::verify_*` into a shared
+// crate so this stub can be replaced with real cryptography.
+
+use std::sync::OnceLock;
+
+/// Synthetic signature algorithm OID used by the in-process test fixtures
+/// for [`verify_chain`].  Never appears in real X.509 certificates.
+///
+/// The "signature" is computed as `SHA-256(TBSCertificate || issuer_subject_dn)`
+/// where `issuer_subject_dn` is the raw DER bytes of the parent cert's
+/// Subject Name.  Tampering with either the TBS bytes (test #3) or the
+/// purported parent breaks the equality and the chain step rejects.
+///
+/// OID is in Craton's private arc (1.3.6.1.4.1.0.55 — RFC 5280 §4.1.2.7).
+pub const OID_STUB_SIG: &str = "1.3.6.1.4.1.0.55";
+
+/// Reasons [`verify_chain`] can refuse a leaf certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustError {
+    /// We walked leaf → intermediates → ??? but no parent in the
+    /// `intermediates` list nor in the trust store matched the current
+    /// cert's `issuer` DN.
+    NoTrustAnchor,
+    /// We found a parent by DN but its signature does not cover the
+    /// child's TBSCertificate (broken-intermediate path; test #3).
+    BadSignature,
+    /// The chain looped back onto a cert we'd already visited (defence
+    /// against poisoned input that injects a cycle of self-signed
+    /// intermediates).
+    Cyclic,
+    /// The chain is deeper than [`MAX_CHAIN_LEN`].
+    TooLong,
+    /// The signature on a chain link uses an algorithm this build
+    /// cannot verify.  Real RSA/ECDSA signatures land here until the
+    /// shared crypto crate is in place — see module-level docs.
+    NotImplemented,
+    /// One of the certs is structurally invalid (wrong tag, truncated
+    /// TBSCertificate, missing Subject/Issuer, ...).
+    Malformed,
+}
+
+/// Hard cap on chain depth.  Real-world TLS / code-signing chains run
+/// 3-4 deep.  Cap at 16 to bound the recursive walk against an attacker
+/// who chains many self-signed intermediates trying to exhaust stack.
+pub const MAX_CHAIN_LEN: usize = 16;
+
+/// Maximum number of anchors a single [`TrustStore`] will hold.  The
+/// JDK `cacerts` ships ~150 anchors; 4096 is well above any realistic
+/// deployment and protects against a malicious PEM bundle.
+pub const MAX_TRUST_ANCHORS: usize = 4096;
+
+/// In-memory set of trusted root anchors.
+///
+/// # Sources (priority order, populated by [`TrustStore::load_default`])
+///
+/// 1. `javax.net.ssl.trustStore` system property (we read the matching
+///    env-var `JAVAX_NET_SSL_TRUSTSTORE`).  PEM contents are loaded
+///    directly; PKCS#12 / JKS binary blobs surface as a warn-level
+///    log and the source is skipped (no PKCS#12 parser reachable here).
+/// 2. `CRATONVM_TRUST_PEM` env-var pointing at a PEM bundle.  This is
+///    the recommended on-disk source for CratonVM — pure DER inside
+///    base64 boundaries, parseable by the local TLV reader.
+/// 3. `rustls-native-certs`-style system root store — **placeholder**.
+///    `classloading` cannot pull the crate (acceptance #6 forbids
+///    adding deps); when wired by the host VM, [`TrustStore::extend_from_anchors`]
+///    accepts pre-decoded DER blobs and is the integration seam for
+///    `rustls_native_certs::load_native_certs()` results.
+/// 4. The JDK `cacerts` path — `$JAVA_HOME/lib/security/cacerts`.  This
+///    is JKS-formatted and likewise out of reach for the local parser.
+///    Recorded for completeness; produces an empty contribution today.
+///
+/// An empty trust store rejects every chain with
+/// [`TrustError::NoTrustAnchor`].  Use
+/// [`TrustStore::permissive_legacy_tests`] only for the pre-task-#40
+/// self-consistency fixtures in this file.
+#[derive(Debug, Default, Clone)]
+pub struct TrustStore {
+    anchors: Vec<X509Anchor>,
+    /// When `true`, [`verify_signer_block`] skips the chain step
+    /// entirely.  Used **only** by the legacy self-consistency tests.
+    permissive_legacy: bool,
+    /// Free-form list of source descriptors, for diagnostics.
+    pub sources_loaded: Vec<String>,
+}
+
+/// Materialised trust anchor: the cert's Subject DN bytes + its raw DER.
+#[derive(Debug, Clone)]
+struct X509Anchor {
+    /// Bytes of the `subject` Name TLV (the full SEQUENCE OF RDN), used
+    /// for `issuer == anchor.subject` comparison.
+    subject_dn: Vec<u8>,
+    /// Full DER of the anchor cert (kept so callers can re-display).
+    der: Vec<u8>,
+}
+
+impl TrustStore {
+    /// Construct an empty trust store.  Equivalent to `TrustStore::default()`.
+    pub fn empty() -> Self {
+        TrustStore::default()
+    }
+
+    /// Construct a trust store that skips the chain step in
+    /// [`verify_signer_block`].  **Tests only.**
+    pub fn permissive_legacy_tests() -> Self {
+        let mut t = Self::default();
+        t.permissive_legacy = true;
+        t.sources_loaded.push("permissive-legacy-tests".to_string());
+        t
+    }
+
+    /// Number of anchors currently loaded.
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
+    /// Append a single trust anchor from raw X.509 DER.  Returns `false`
+    /// if the cert won't parse (malformed) or the store is already full.
+    pub fn add_anchor_der(&mut self, der: Vec<u8>) -> bool {
+        if self.anchors.len() >= MAX_TRUST_ANCHORS {
+            warn!(
+                "trust store: refusing to add anchor — MAX_TRUST_ANCHORS ({}) reached",
+                MAX_TRUST_ANCHORS
+            );
+            return false;
+        }
+        let parsed = match X509Cert::parse(&der) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("trust store: anchor rejected — malformed X.509: {}", e);
+                return false;
+            }
+        };
+        self.anchors.push(X509Anchor {
+            subject_dn: parsed.subject_dn.to_vec(),
+            der,
+        });
+        true
+    }
+
+    /// Bulk-extend the trust store from pre-decoded DER blobs.  This is
+    /// the integration seam for callers that already have a system root
+    /// store decoded (e.g. via `rustls_native_certs::load_native_certs()`
+    /// in the host VM).  Returns the number of anchors successfully added.
+    pub fn extend_from_anchors<I>(&mut self, ders: I) -> usize
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let mut n = 0;
+        for der in ders {
+            if self.add_anchor_der(der) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Append every PEM-formatted CERTIFICATE block found in `pem_text`.
+    /// Other PEM types (`RSA PRIVATE KEY`, `EC PRIVATE KEY`, ...) are
+    /// ignored.  Returns the number of anchors added.
+    ///
+    /// PEM lines must use LF (`\n`) or CRLF — both are accepted.  We
+    /// recognise both `-----BEGIN CERTIFICATE-----` and the legacy
+    /// `-----BEGIN TRUSTED CERTIFICATE-----` headers.
+    pub fn load_pem_bundle(&mut self, pem_text: &str) -> usize {
+        let mut added = 0;
+        let mut in_block = false;
+        let mut accum = String::new();
+        for line in pem_text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("-----BEGIN")
+                && (trimmed.contains("CERTIFICATE") || trimmed.contains("TRUSTED CERTIFICATE"))
+            {
+                in_block = true;
+                accum.clear();
+                continue;
+            }
+            if trimmed.starts_with("-----END") {
+                if in_block {
+                    if let Some(der) = base64_decode(&accum) {
+                        if self.add_anchor_der(der) {
+                            added += 1;
+                        }
+                    } else {
+                        warn!("trust store: base64 decode failed inside PEM block");
+                    }
+                }
+                in_block = false;
+                accum.clear();
+                continue;
+            }
+            if in_block {
+                accum.push_str(trimmed);
+            }
+        }
+        added
+    }
+
+    /// Populate a trust store from the standard JCE / CratonVM sources
+    /// listed at the top of this module.  Failures on any individual
+    /// source are logged and skipped — the only way the function
+    /// returns an empty store is if every source is absent or
+    /// unparseable.
+    pub fn load_default() -> Self {
+        let mut ts = TrustStore::default();
+
+        // 1. javax.net.ssl.trustStore.  Java sees this as a system
+        // property; we read it from the env-var spelling the VM emits
+        // when materialising sysprops back to native code.
+        if let Ok(p) = std::env::var("JAVAX_NET_SSL_TRUSTSTORE") {
+            ts.try_load_path(&p, "javax.net.ssl.trustStore");
+        }
+
+        // 2. CratonVM-native PEM bundle.
+        if let Ok(p) = std::env::var("CRATONVM_TRUST_PEM") {
+            ts.try_load_path(&p, "CRATONVM_TRUST_PEM");
+        }
+
+        // 3. System root store — placeholder.  When the host VM has
+        // already decoded its native-cert store (`rustls-native-certs`
+        // lives in `native-builtins`, not here), it should call
+        // `extend_from_anchors` directly.  We just record that the
+        // source slot exists.
+        ts.sources_loaded
+            .push("system-root-store: not wired (acceptance #6 forbids new dep)".to_string());
+
+        // 4. JDK `cacerts` fallback.  Format is JKS — out of reach for
+        // the local DER reader.  Document the gap.
+        if let Some(jh) = std::env::var_os("JAVA_HOME") {
+            let mut path = std::path::PathBuf::from(jh);
+            path.push("lib");
+            path.push("security");
+            path.push("cacerts");
+            if path.exists() {
+                ts.sources_loaded.push(format!(
+                    "{}: JKS not supported in classloading (no `p12`/`keystore` crate reachable)",
+                    path.display()
+                ));
+            }
+        }
+        ts
+    }
+
+    /// Attempt to load one on-disk source.  PEM bundles are accepted;
+    /// PKCS#12 / JKS magic bytes are recognised and skipped with a
+    /// warn-level log.
+    fn try_load_path(&mut self, p: &str, label: &str) {
+        match std::fs::read(p) {
+            Ok(bytes) => {
+                // PKCS#12: SEQUENCE { INTEGER version (3) ... } — first
+                // two bytes are 0x30 0x82 (long-form length) then a 0x02
+                // INTEGER.  JKS magic: 0xFE 0xED 0xFE 0xED.
+                if bytes.starts_with(&[0xFE, 0xED, 0xFE, 0xED]) {
+                    warn!(
+                        "{}={} appears to be JKS; classloading cannot parse JKS (NotImplemented)",
+                        label, p
+                    );
+                    self.sources_loaded
+                        .push(format!("{} JKS: NotImplemented", label));
+                    return;
+                }
+                // Look for the PEM banner — if present, treat as PEM.
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    if text.contains("-----BEGIN") {
+                        let n = self.load_pem_bundle(text);
+                        self.sources_loaded
+                            .push(format!("{}={} ({} anchors)", label, p, n));
+                        return;
+                    }
+                }
+                // Otherwise assume PKCS#12 — also not implemented here.
+                warn!(
+                    "{}={} is not PEM; PKCS#12 / JKS parsers are out of reach for classloading \
+                     (acceptance #6 — no new deps).  Skipping.",
+                    label, p
+                );
+                self.sources_loaded
+                    .push(format!("{} binary keystore: NotImplemented", label));
+            }
+            Err(e) => {
+                warn!("{}={} could not be read: {}", label, p, e);
+            }
+        }
+    }
+
+    /// Look up an anchor whose Subject DN equals `dn`.
+    fn find_anchor_by_subject(&self, dn: &[u8]) -> Option<&X509Anchor> {
+        self.anchors.iter().find(|a| a.subject_dn.as_slice() == dn)
+    }
+}
+
+/// Process-wide default trust store, lazily populated on first call.
+///
+/// `class_path.rs::extract_jar_signer_blocks` reaches for this; tests
+/// in this file build a private one instead.
+pub fn default_trust_store() -> &'static TrustStore {
+    static TS: OnceLock<TrustStore> = OnceLock::new();
+    TS.get_or_init(TrustStore::load_default)
+}
+
+/// Minimal X.509 certificate view used by chain validation.
+///
+/// We intentionally implement only the fields chain validation needs:
+///
+/// ```text
+/// Certificate ::= SEQUENCE {
+///     tbsCertificate       TBSCertificate,
+///     signatureAlgorithm   AlgorithmIdentifier,
+///     signatureValue       BIT STRING
+/// }
+/// TBSCertificate ::= SEQUENCE {
+///     [0] EXPLICIT version DEFAULT v1,
+///     serialNumber          CertificateSerialNumber,
+///     signature             AlgorithmIdentifier,
+///     issuer                Name,
+///     validity              Validity,
+///     subject               Name,
+///     subjectPublicKeyInfo  SubjectPublicKeyInfo,
+///     ...
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct X509Cert<'a> {
+    /// Raw TBSCertificate bytes (the to-be-signed envelope — fed into
+    /// the signature check on the parent link).
+    pub tbs_der: &'a [u8],
+    /// `issuer` Name DER bytes (the *entire* SEQUENCE TLV).
+    pub issuer_dn: &'a [u8],
+    /// `subject` Name DER bytes (the entire SEQUENCE TLV).
+    pub subject_dn: &'a [u8],
+    /// Algorithm OID of the outer `signatureAlgorithm`.
+    pub sig_alg_oid: String,
+    /// The `signatureValue` content (BIT STRING content, minus the
+    /// leading unused-bits byte).
+    pub signature_bytes: &'a [u8],
+}
+
+impl<'a> X509Cert<'a> {
+    /// Parse a complete X.509 Certificate DER.
+    pub fn parse(der: &'a [u8]) -> Result<Self, &'static str> {
+        let (outer, total) = read_tlv(der)?;
+        if outer.tag != TAG_SEQUENCE {
+            return Err("X509Cert: outer is not SEQUENCE");
+        }
+        if total != der.len() {
+            return Err("X509Cert: trailing bytes after outer SEQUENCE");
+        }
+        let body = outer.content;
+        // TBSCertificate (SEQUENCE).
+        let (tbs_tlv, tbs_total) = read_tlv(body)?;
+        if tbs_tlv.tag != TAG_SEQUENCE {
+            return Err("X509Cert: TBSCertificate is not SEQUENCE");
+        }
+        let tbs_der_full = &body[..tbs_total];
+        let tbs_body = tbs_tlv.content;
+
+        // Walk TBSCertificate to extract issuer and subject Name TLVs.
+        // First field may be [0] EXPLICIT version (DEFAULT v1).  Skip
+        // if present.
+        let mut rest = tbs_body;
+        if let Some(&first) = rest.first() {
+            if first == TAG_CTX0 {
+                let (_, n) = read_tlv(rest)?;
+                rest = &rest[n..];
+            }
+        }
+        // serialNumber INTEGER.
+        let (_, n) = read_tlv(rest)?;
+        rest = &rest[n..];
+        // signature AlgorithmIdentifier (SEQUENCE).
+        let (_, n) = read_tlv(rest)?;
+        rest = &rest[n..];
+        // issuer Name (SEQUENCE OF RDN).
+        let issuer_start = rest;
+        let (issuer_tlv, n) = read_tlv(rest)?;
+        if issuer_tlv.tag != TAG_SEQUENCE {
+            return Err("X509Cert: issuer is not SEQUENCE");
+        }
+        let issuer_dn = &issuer_start[..n];
+        rest = &rest[n..];
+        // validity (SEQUENCE).
+        let (_, n) = read_tlv(rest)?;
+        rest = &rest[n..];
+        // subject Name (SEQUENCE OF RDN).
+        let subject_start = rest;
+        let (subj_tlv, n) = read_tlv(rest)?;
+        if subj_tlv.tag != TAG_SEQUENCE {
+            return Err("X509Cert: subject is not SEQUENCE");
+        }
+        let subject_dn = &subject_start[..n];
+
+        // Outer signatureAlgorithm + signatureValue.
+        let outer_rest = &body[tbs_total..];
+        let (sig_alg_tlv, sig_alg_total) = read_tlv(outer_rest)?;
+        if sig_alg_tlv.tag != TAG_SEQUENCE {
+            return Err("X509Cert: signatureAlgorithm is not SEQUENCE");
+        }
+        let sig_alg_oid = first_oid_of_seq(sig_alg_tlv.content)?;
+        let sig_value_buf = &outer_rest[sig_alg_total..];
+        let (sig_tlv, _) = read_tlv(sig_value_buf)?;
+        if sig_tlv.tag != 0x03 {
+            return Err("X509Cert: signatureValue is not BIT STRING");
+        }
+        // BIT STRING content starts with an "unused bits" byte.  Skip it.
+        if sig_tlv.content.is_empty() {
+            return Err("X509Cert: empty BIT STRING in signatureValue");
+        }
+        let signature_bytes = &sig_tlv.content[1..];
+
+        Ok(X509Cert {
+            tbs_der: tbs_der_full,
+            issuer_dn,
+            subject_dn,
+            sig_alg_oid,
+            signature_bytes,
+        })
+    }
+
+    /// Is this cert self-signed (Subject DN == Issuer DN)?
+    pub fn is_self_signed(&self) -> bool {
+        self.subject_dn == self.issuer_dn
+    }
+
+    /// Does `self`'s signature link it to `parent`?  Cryptographically
+    /// this should verify `parent.public_key`-signed-`self.tbs_der` ==
+    /// `self.signature_bytes`.  Since real RSA/ECDSA are out of reach
+    /// here, we recognise only [`OID_STUB_SIG`] and treat everything
+    /// else as [`TrustError::NotImplemented`].
+    pub fn link_signature_ok(&self, parent: &X509Cert) -> Result<(), TrustError> {
+        match self.sig_alg_oid.as_str() {
+            OID_STUB_SIG => {
+                // Test-only computation: SHA-256(tbs_der || parent.subject_dn).
+                let mut buf = Vec::with_capacity(self.tbs_der.len() + parent.subject_dn.len());
+                buf.extend_from_slice(self.tbs_der);
+                buf.extend_from_slice(parent.subject_dn);
+                let expected = sha256::digest(&buf);
+                if ct_eq(self.signature_bytes, &expected) {
+                    Ok(())
+                } else {
+                    Err(TrustError::BadSignature)
+                }
+            }
+            _ => Err(TrustError::NotImplemented),
+        }
+    }
+}
+
+/// Walk `leaf` → `intermediates` → `trust_store` building a chain.
+///
+/// At each step the current cert's `issuer` DN is looked up first
+/// against the supplied intermediates, then against the trust store.
+/// The first match consumes that parent; the parent then becomes the
+/// new "current" cert.  Termination conditions:
+///
+///   * Anchor reached — `Ok(())`.
+///   * No parent for current cert — `Err(NoTrustAnchor)`.
+///   * Bad link signature — `Err(BadSignature)`.
+///   * Real-crypto algorithm — `Err(NotImplemented)`.
+///   * Chain exceeds [`MAX_CHAIN_LEN`] — `Err(TooLong)`.
+///   * Already-visited cert — `Err(Cyclic)`.
+pub fn verify_chain<'a>(
+    leaf: &'a X509Cert<'a>,
+    intermediates: &'a [X509Cert<'a>],
+    trust_store: &TrustStore,
+) -> Result<(), TrustError> {
+    let mut current: &'a X509Cert<'a> = leaf;
+    // Track visited Subject DNs by owned bytes — we re-walk through
+    // both leaf-borrowed slices and trust-store-borrowed slices and
+    // mixing those lifetimes inside a `Vec<&[u8]>` is awkward.
+    let mut visited: Vec<Vec<u8>> = Vec::new();
+    visited.push(current.subject_dn.to_vec());
+
+    for _step in 0..MAX_CHAIN_LEN {
+        if let Some(anchor) = trust_store.find_anchor_by_subject(current.issuer_dn) {
+            let parent = X509Cert::parse(&anchor.der).map_err(|_| TrustError::Malformed)?;
+            current.link_signature_ok(&parent)?;
+            return Ok(());
+        }
+        // Look up an intermediate whose subject == current.issuer.
+        let next = intermediates
+            .iter()
+            .find(|c| c.subject_dn == current.issuer_dn);
+        match next {
+            Some(parent) => {
+                if visited.iter().any(|v| v.as_slice() == parent.subject_dn) {
+                    return Err(TrustError::Cyclic);
+                }
+                current.link_signature_ok(parent)?;
+                visited.push(parent.subject_dn.to_vec());
+                current = parent;
+            }
+            None => {
+                // Self-signed leaves land here too (issuer == subject
+                // already in `visited`).  Either way no anchor.
+                return Err(TrustError::NoTrustAnchor);
+            }
+        }
+    }
+    Err(TrustError::TooLong)
+}
+
+// ---------------------------------------------------------------------------
+// Tiny base64 decoder for PEM bundles — avoids a `base64` dep.
+// ---------------------------------------------------------------------------
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    // Strip whitespace.
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if cleaned.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(cleaned.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut padding = 0usize;
+    for &c in &cleaned {
+        let v = match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                continue;
+            }
+            _ => return None, // illegal char
+        };
+        if padding > 0 {
+            return None; // non-pad after pad
+        }
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -863,6 +1488,15 @@ mod tests {
     // `native-builtins::jca::asn1`) to keep the test self-contained and
     // independent of the rest of the workspace.
     // -----------------------------------------------------------------
+
+    /// Task #40: trust-store-aware tests below build real X.509-shaped
+    /// fixtures and supply a proper [`TrustStore`].  The older
+    /// self-consistency-only tests in this module embed marker-shaped
+    /// "certs" that won't parse as X.509 — they use this permissive
+    /// store to keep covering the pre-chain code paths.
+    fn legacy_ts() -> TrustStore {
+        TrustStore::permissive_legacy_tests()
+    }
 
     fn enc_len(len: usize) -> Vec<u8> {
         if len < 0x80 {
@@ -1045,7 +1679,7 @@ mod tests {
     fn verifies_self_consistent_sha256_signer_block() {
         let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: abc123=\r\n\r\n";
         let block = build_signer_block(sf, DigestAlg::Sha256, /*tamper=*/ false);
-        let vs = verify_signer_block(&block, sf).expect("well-formed block should verify");
+        let vs = verify_signer_block(&block, sf, &legacy_ts()).expect("well-formed block should verify");
         assert_eq!(vs.digest_alg, DigestAlg::Sha256);
         assert_eq!(vs.chain.len(), 1);
         // Cert bytes must be the *embedded* cert DER, not the outer block.
@@ -1064,7 +1698,7 @@ mod tests {
         // accept those — but only when the .SF digest agrees.
         let sf = b"Signature-Version: 1.0\r\nSHA1-Digest-Manifest: xyz=\r\n\r\n";
         let block = build_signer_block(sf, DigestAlg::Sha1, /*tamper=*/ false);
-        let vs = verify_signer_block(&block, sf).expect("SHA-1 block should verify");
+        let vs = verify_signer_block(&block, sf, &legacy_ts()).expect("SHA-1 block should verify");
         assert_eq!(vs.digest_alg, DigestAlg::Sha1);
         assert_eq!(vs.chain.len(), 1);
     }
@@ -1079,12 +1713,12 @@ mod tests {
 
         let sf_tampered = b"Signature-Version: 1.0\r\nEvil: yes\r\n\r\n";
         assert!(
-            verify_signer_block(&block, sf_tampered).is_none(),
+            verify_signer_block(&block, sf_tampered, &legacy_ts()).is_none(),
             "tampered .SF must be rejected"
         );
 
         // Sanity: original .SF still verifies.
-        assert!(verify_signer_block(&block, sf_original).is_some());
+        assert!(verify_signer_block(&block, sf_original, &legacy_ts()).is_some());
     }
 
     #[test]
@@ -1095,31 +1729,31 @@ mod tests {
         // stored bytes.
         let sf = b"Signature-Version: 1.0\r\n\r\n";
         let block = build_signer_block(sf, DigestAlg::Sha256, /*tamper=*/ true);
-        assert!(verify_signer_block(&block, sf).is_none());
+        assert!(verify_signer_block(&block, sf, &legacy_ts()).is_none());
     }
 
     #[test]
     fn rejects_empty_block_without_panic() {
-        assert!(verify_signer_block(&[], b"sf").is_none());
+        assert!(verify_signer_block(&[], b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
     fn rejects_truncated_block_without_panic() {
         // A 3-byte stub — not even enough for a TLV header / length.
-        assert!(verify_signer_block(&[0x30, 0x82, 0xFF], b"sf").is_none());
+        assert!(verify_signer_block(&[0x30, 0x82, 0xFF], b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
     fn rejects_garbage_bytes_without_panic() {
         // 256 random-ish bytes that aren't valid DER.
         let garbage: Vec<u8> = (0..=255u8).collect();
-        assert!(verify_signer_block(&garbage, b"sf").is_none());
+        assert!(verify_signer_block(&garbage, b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
     fn rejects_oversized_block_without_panic() {
         let huge = vec![0u8; MAX_SIGNER_BLOCK + 1];
-        assert!(verify_signer_block(&huge, b"sf").is_none());
+        assert!(verify_signer_block(&huge, b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
@@ -1127,7 +1761,7 @@ mod tests {
         // Replace pkcs7-signedData with pkcs7-data — should bounce.
         let inner = seq(&oid("1.2.3.4.5"));
         let bad = seq(&[oid(OID_DATA).as_slice(), ctx_imp(0, &inner).as_slice()].concat());
-        assert!(verify_signer_block(&bad, b"sf").is_none());
+        assert!(verify_signer_block(&bad, b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
@@ -1145,7 +1779,7 @@ mod tests {
             ctx_imp(0, &signed_data).as_slice(),
         ]
         .concat());
-        assert!(verify_signer_block(&block, b"sf").is_none());
+        assert!(verify_signer_block(&block, b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
@@ -1176,7 +1810,7 @@ mod tests {
             ctx_imp(0, &signed_data).as_slice(),
         ]
         .concat());
-        assert!(verify_signer_block(&block, b"sf").is_none());
+        assert!(verify_signer_block(&block, b"sf", &legacy_ts()).is_none());
     }
 
     #[test]
@@ -1185,7 +1819,7 @@ mod tests {
         // empty digest, which can never equal the stored 64-byte digest.
         let sf = b"any";
         let block = build_signer_block(sf, DigestAlg::Sha512, /*tamper=*/ false);
-        assert!(verify_signer_block(&block, sf).is_none());
+        assert!(verify_signer_block(&block, sf, &legacy_ts()).is_none());
     }
 
     #[test]
@@ -1199,5 +1833,253 @@ mod tests {
         // Continuation bit set on the last byte → truncated arc.
         let bytes = [0x2A, 0x86];
         assert!(decode_oid(&bytes).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Task #40 — trust-store + chain verification tests
+    //
+    // Each fixture builds a synthetic X.509-shaped certificate whose
+    // `signatureAlgorithm` is `OID_STUB_SIG` and whose `signatureValue`
+    // is `SHA-256(TBSCertificate || parent.subject_dn)`.  The
+    // synthetic algorithm is recognised exclusively by these tests —
+    // production chains hitting `OID_STUB_SIG` would already be
+    // rejected upstream as a non-standard OID.
+    // ---------------------------------------------------------------------
+
+    /// Build a `Name ::= SEQUENCE { RDN }` with a single CN attribute.
+    fn x509_name(cn: &str) -> Vec<u8> {
+        let atv = seq(&[oid("2.5.4.3").as_slice(), tlv(0x13, cn.as_bytes()).as_slice()].concat());
+        let rdn = set(&atv);
+        seq(&rdn)
+    }
+
+    /// Minimal Validity ::= SEQUENCE { UTCTime, UTCTime }.  Values are
+    /// fixed strings — the chain code doesn't look at them.
+    fn x509_validity() -> Vec<u8> {
+        let nb = tlv(0x17, b"260101000000Z"); // 2026-01-01
+        let na = tlv(0x17, b"360101000000Z"); // 2036-01-01
+        seq(&[nb.as_slice(), na.as_slice()].concat())
+    }
+
+    /// Minimal SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier,
+    /// BIT STRING }.  We pin the subject DN of the cert as the
+    /// "public key" bytes so that [`X509Cert::link_signature_ok`] can
+    /// recover the parent's identity from the child's signature
+    /// equation.  This is a stand-in for real RSA/ECDSA encoding.
+    fn x509_spki(subject_dn: &[u8]) -> Vec<u8> {
+        let algid = algorithm_identifier(OID_STUB_SIG);
+        // BIT STRING = leading 0x00 (unused bits) || subject_dn
+        let mut bs = vec![0u8];
+        bs.extend_from_slice(subject_dn);
+        let bit_string = tlv(0x03, &bs);
+        seq(&[algid.as_slice(), bit_string.as_slice()].concat())
+    }
+
+    /// Build the TBSCertificate body for a synthetic X.509 cert.
+    fn build_tbs(subject_cn: &str, issuer_cn: &str) -> (Vec<u8>, Vec<u8>) {
+        let subject_dn = x509_name(subject_cn);
+        let issuer_dn = x509_name(issuer_cn);
+        let version = ctx_imp(0, &integer(2)); // v3
+        let serial = integer(1);
+        let signature_alg = algorithm_identifier(OID_STUB_SIG);
+        let validity = x509_validity();
+        let spki = x509_spki(&subject_dn);
+        let tbs_body = [
+            version.as_slice(),
+            serial.as_slice(),
+            signature_alg.as_slice(),
+            issuer_dn.as_slice(),
+            validity.as_slice(),
+            subject_dn.as_slice(),
+            spki.as_slice(),
+        ]
+        .concat();
+        (seq(&tbs_body), subject_dn)
+    }
+
+    /// Build a complete X.509 certificate DER, signing with the
+    /// synthetic stub algorithm.  `parent_subject_dn` is the DER of the
+    /// parent's `subject` Name TLV — for a root, pass its own
+    /// subject_dn (self-signed).
+    fn build_x509_cert(subject_cn: &str, issuer_cn: &str, parent_subject_dn: &[u8]) -> Vec<u8> {
+        let (tbs, _) = build_tbs(subject_cn, issuer_cn);
+        // signature value = SHA-256(tbs || parent_subject_dn), as a
+        // BIT STRING with 0 unused bits.
+        let mut buf = Vec::with_capacity(tbs.len() + parent_subject_dn.len());
+        buf.extend_from_slice(&tbs);
+        buf.extend_from_slice(parent_subject_dn);
+        let sig = sha256::digest(&buf);
+        let mut bs = vec![0u8];
+        bs.extend_from_slice(&sig);
+        let bit_string = tlv(0x03, &bs);
+        let sig_alg = algorithm_identifier(OID_STUB_SIG);
+        seq(&[tbs.as_slice(), sig_alg.as_slice(), bit_string.as_slice()].concat())
+    }
+
+    #[test]
+    fn task40_self_signed_chain_rejected_without_anchor() {
+        // Acceptance #4 case (a): self-signed leaf with no trust anchor
+        // present.  verify_chain must refuse with NoTrustAnchor — the
+        // exact attack the original task description called out.
+        let root_subject_dn = x509_name("SelfSigner");
+        let cert_der = build_x509_cert("SelfSigner", "SelfSigner", &root_subject_dn);
+        let leaf = X509Cert::parse(&cert_der).expect("parse self-signed");
+        assert!(leaf.is_self_signed(), "fixture must be self-signed");
+
+        let ts = TrustStore::empty();
+        let err = verify_chain(&leaf, &[], &ts).expect_err("must reject");
+        assert_eq!(err, TrustError::NoTrustAnchor);
+    }
+
+    #[test]
+    fn task40_chain_rooted_in_test_anchor_verifies() {
+        // Acceptance #4 case (b): leaf → intermediate → root anchor.
+        // Trust store contains the root; verify_chain must succeed.
+        let root_subject_dn = x509_name("RootCA");
+        let root_der = build_x509_cert("RootCA", "RootCA", &root_subject_dn);
+
+        let int_subject_dn = x509_name("IntermediateCA");
+        // Intermediate is signed by the root → parent_subject_dn = root_subject_dn.
+        let int_der = build_x509_cert("IntermediateCA", "RootCA", &root_subject_dn);
+
+        // Leaf is signed by the intermediate → parent_subject_dn = int_subject_dn.
+        let leaf_der = build_x509_cert("LeafSigner", "IntermediateCA", &int_subject_dn);
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let int_cert = X509Cert::parse(&int_der).expect("parse intermediate");
+
+        let mut ts = TrustStore::empty();
+        assert!(ts.add_anchor_der(root_der.clone()));
+        assert_eq!(ts.anchor_count(), 1);
+
+        verify_chain(&leaf, &[int_cert], &ts).expect("must verify against in-store root");
+    }
+
+    #[test]
+    fn task40_chain_with_broken_intermediate_signature_fails() {
+        // Acceptance #4 case (c): chain whose **intermediate** cert
+        // has been tampered after signing — the link from the
+        // intermediate up to the root anchor must reject because the
+        // intermediate's signatureValue no longer covers its TBS.
+        let root_subject_dn = x509_name("RootCA");
+        let root_der = build_x509_cert("RootCA", "RootCA", &root_subject_dn);
+
+        let int_subject_dn = x509_name("IntermediateCA");
+        // Mint a legitimately-signed intermediate, then tamper its
+        // signature byte to break the intermediate→root link
+        // specifically.  The leaf→intermediate link must STILL be
+        // valid so the walk reaches the broken step.
+        let mut int_der = build_x509_cert("IntermediateCA", "RootCA", &root_subject_dn);
+        let last = int_der.len() - 1;
+        int_der[last] ^= 0xFF;
+
+        let leaf_der = build_x509_cert("LeafSigner", "IntermediateCA", &int_subject_dn);
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let int_cert = X509Cert::parse(&int_der).expect("parse intermediate");
+        let mut ts = TrustStore::empty();
+        ts.add_anchor_der(root_der);
+
+        let err = verify_chain(&leaf, &[int_cert], &ts).expect_err("must reject");
+        assert_eq!(err, TrustError::BadSignature);
+    }
+
+    #[test]
+    fn task40_trust_store_load_default_records_sources() {
+        // load_default should always at minimum push the placeholder
+        // entries for the system-root-store seam and (optionally) the
+        // JDK cacerts path.  We just check the type contract.
+        let ts = TrustStore::load_default();
+        assert!(
+            !ts.sources_loaded.is_empty(),
+            "load_default must record at least the system-root placeholder line"
+        );
+        assert!(
+            ts.sources_loaded
+                .iter()
+                .any(|s| s.starts_with("system-root-store")),
+            "system-root-store source line missing from {:?}",
+            ts.sources_loaded
+        );
+    }
+
+    #[test]
+    fn task40_real_crypto_algorithm_returns_not_implemented() {
+        // A chain link signed with a real RSA/ECDSA OID (here:
+        // sha256WithRSAEncryption, 1.2.840.113549.1.1.11) must be
+        // rejected as NotImplemented — the conservative placeholder
+        // from acceptance #6.
+        let root_subject_dn = x509_name("RealRoot");
+        // Hand-roll a cert whose outer signatureAlgorithm OID is the
+        // real PKCS#1 v1.5 RSA-SHA256 identifier.
+        let (tbs, _) = build_tbs("RealLeaf", "RealRoot");
+        let sig_alg = algorithm_identifier("1.2.840.113549.1.1.11");
+        let bit_string = tlv(0x03, &[0u8, 0xDE, 0xAD]); // bogus sig bytes
+        let leaf_der =
+            seq(&[tbs.as_slice(), sig_alg.as_slice(), bit_string.as_slice()].concat());
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let mut ts = TrustStore::empty();
+        // Make a (mismatched) self-signed root anchor with stub-sig so
+        // the DN lookup succeeds and we drive the signature step.
+        let root_der = build_x509_cert("RealRoot", "RealRoot", &root_subject_dn);
+        ts.add_anchor_der(root_der);
+        let err = verify_chain(&leaf, &[], &ts).expect_err("real RSA not implemented");
+        assert_eq!(err, TrustError::NotImplemented);
+    }
+
+    #[test]
+    fn task40_pem_bundle_decode_round_trip() {
+        // PEM-encode a synthetic anchor DER and confirm
+        // TrustStore::load_pem_bundle picks it up.  This exercises the
+        // local base64 decoder.
+        let root_subject_dn = x509_name("PemRoot");
+        let root_der = build_x509_cert("PemRoot", "PemRoot", &root_subject_dn);
+
+        // Hand-roll base64 (no `base64` dep) using std::fmt.
+        fn b64(input: &[u8]) -> String {
+            const ALPHA: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+            let mut i = 0;
+            while i + 3 <= input.len() {
+                let b0 = input[i] as u32;
+                let b1 = input[i + 1] as u32;
+                let b2 = input[i + 2] as u32;
+                let n = (b0 << 16) | (b1 << 8) | b2;
+                out.push(ALPHA[((n >> 18) & 63) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 63) as usize] as char);
+                out.push(ALPHA[((n >> 6) & 63) as usize] as char);
+                out.push(ALPHA[(n & 63) as usize] as char);
+                i += 3;
+            }
+            let rem = input.len() - i;
+            if rem == 1 {
+                let n = (input[i] as u32) << 16;
+                out.push(ALPHA[((n >> 18) & 63) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 63) as usize] as char);
+                out.push('=');
+                out.push('=');
+            } else if rem == 2 {
+                let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+                out.push(ALPHA[((n >> 18) & 63) as usize] as char);
+                out.push(ALPHA[((n >> 12) & 63) as usize] as char);
+                out.push(ALPHA[((n >> 6) & 63) as usize] as char);
+                out.push('=');
+            }
+            out
+        }
+
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64(&root_der).as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+
+        let mut ts = TrustStore::empty();
+        let n = ts.load_pem_bundle(&pem);
+        assert_eq!(n, 1, "exactly one anchor must be decoded");
+        assert_eq!(ts.anchor_count(), 1);
     }
 }

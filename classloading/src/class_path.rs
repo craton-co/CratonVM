@@ -1678,11 +1678,16 @@ impl ClassPath {
                 Err(_) => continue,
             };
 
-            // Verify self-consistency. On success, push every cert in
-            // the chain — leaf first. On failure we silently drop the
-            // block; the JAR ends up reported as unsigned for that
-            // signer (matching the HotSpot "fails verify" behaviour).
-            if let Some(vs) = crate::jar_signer::verify_signer_block(&block, &sf_bytes) {
+            // Verify self-consistency AND chain to trust-store anchor.
+            // Task #40 wires the process-wide default trust store into
+            // this gate — a JAR whose leaf doesn't chain to any anchor
+            // (including every self-signed signer) ends up reported as
+            // unsigned, matching the HotSpot "fails verify" behaviour.
+            // On failure we silently drop the block.
+            let trust_store = crate::jar_signer::default_trust_store();
+            if let Some(vs) =
+                crate::jar_signer::verify_signer_block(&block, &sf_bytes, trust_store)
+            {
                 for cert in vs.chain {
                     out.push(cert);
                 }
