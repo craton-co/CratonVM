@@ -62,6 +62,21 @@ struct EventCuda {
     device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
 }
 
+// # Safety
+//
+// AUDIT 2026-05-24 (C32, SOUND-1): `EventCuda` holds a raw
+// `sys::CUevent` (`*mut CUevent_st`) and an `Arc<CudaDevice>`. The
+// CUDA driver permits using a CUevent from any thread that has the
+// owning primary context bound. `Event::new` binds the current
+// thread (`event.rs:106`) and `EventCuda::drop` re-binds before
+// destruction (`event.rs:76`), so creation and teardown are sound.
+// However, the cross-thread-callable methods (`Event::synchronize`,
+// `Event::query`, and `Stream::record_event`/`wait_event` from a
+// worker thread) do NOT call `bind_to_thread` — they assume the
+// caller's thread is already bound to the device the event was
+// created on. Driving an event from an unbound thread is undefined
+// per the CUDA driver model. See `DeviceContext`'s `# Safety`
+// paragraph in `lib.rs` for the bridge-wide caller contract.
 #[cfg(feature = "cuda")]
 unsafe impl Send for EventCuda {}
 #[cfg(feature = "cuda")]

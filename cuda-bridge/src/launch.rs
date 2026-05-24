@@ -47,22 +47,25 @@ impl DeviceModule {
 
         #[cfg(feature = "cuda")]
         {
-            // CUDA-MERGE-NOTE (2026-05-20): the bridge's `backend_cuda`
-            // backend was ported to cudarc 0.13, which does not expose a
-            // raw-`CUstream` launch helper (`launch_on_raw_stream`). The
-            // explicit-stream submission path was never completed against
-            // that API. Until a raw-stream launch helper lands, delegate
-            // to the context's standard compute-stream launch
-            // (`DeviceModuleInner::launch_raw`); the kernel still runs and
-            // is correctly ordered, it just shares the context's compute
-            // stream rather than `stream`'s. The `StreamOp::Launch` record
-            // below keeps the op log faithful for callers that inspect it.
+            // AUDIT 2026-05-24 (C32 stream-port fix): the previous
+            // implementation honestly admitted this routed every
+            // explicit-stream launch back through the context's
+            // *compute* stream, breaking every per-stream contract
+            // the README advertised. cudarc 0.13's `LaunchAsync::
+            // launch_on_stream` does take a `&CudaStream`, so the
+            // user-supplied `Stream`'s inner `Arc<CudaStream>` (via
+            // `Stream::cuda_stream_arc()`) can be passed straight
+            // through. `backend_cuda::DeviceModuleInner::
+            // launch_raw_on_stream` is the new entry point that
+            // does the marshalling + launch on a caller-supplied
+            // cudarc stream rather than `&ctx.compute`.
             //
-            // `DeviceModule(backend::DeviceModuleInner)` exposes its sole
-            // field with module-private visibility; `launch.rs` is a child
-            // of the crate root and so sees it.
+            // `DeviceModule(backend::DeviceModuleInner)` exposes its
+            // sole field with module-private visibility; `launch.rs`
+            // is a child of the crate root and so sees it.
             let module: &crate::backend_cuda::DeviceModuleInner = &self.0;
-            module.launch_raw(ctx.inner(), kernel, cfg, args)?;
+            let cuda_stream = stream.cuda_stream_arc();
+            module.launch_raw_on_stream(ctx.inner(), cuda_stream, kernel, cfg, args)?;
             stream.record_op(StreamOp::Launch {
                 kernel: kernel.to_string(),
                 grid: cfg.grid,
