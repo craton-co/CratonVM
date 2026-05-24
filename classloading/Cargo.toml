@@ -3,6 +3,7 @@ name = "cratonvm-classloading"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Class loading subsystem for CratonVM"
 readme = "README.md"
@@ -11,11 +12,11 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-cratonvm-types = { path = "../types" }
-cratonvm-reader = { path = "../reader" }
-cratonvm-native-api = { path = "../native-api" }
-cratonvm-jit-api = { path = "../jit-api" }
-cratonvm-jit = { path = "../jit" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+cratonvm-jit = { path = "../jit", version = "0.3.0" }
 tracing.workspace = true
 parking_lot.workspace = true
 zip.workspace = true

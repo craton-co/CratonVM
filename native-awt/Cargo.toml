@@ -3,6 +3,7 @@ name = "cratonvm-native-awt"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "AWT/Swing/Java2D native peer implementation for CratonVM"
 readme = "README.md"
@@ -14,8 +15,8 @@ categories.workspace = true
 default = []
 
 [dependencies]
-cratonvm-types = { path = "../types" }
-cratonvm-native-api = { path = "../native-api" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 # Round-7 cross-cutting Fix 3: cap trace!/debug! at compile time in release.
 tracing = { version = "0.1", features = ["release_max_level_info"] }
 parking_lot.workspace = true

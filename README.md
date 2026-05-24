@@ -176,7 +176,7 @@ cargo fmt --all --check
 
 ## Architecture
 
-The workspace has 17 member crates:
+The workspace has 17 member crates plus a `fuzz` harness (18 Cargo.toml files in total):
 
 ```
 cratonvm/
@@ -197,6 +197,7 @@ cratonvm/
   jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
+  fuzz/                - libfuzzer harness (out-of-workspace, nightly-only)
 ```
 
 - **Bytecode interpreter** — fast-path dispatch with 140+ opcodes

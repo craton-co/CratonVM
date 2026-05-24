@@ -3,6 +3,7 @@ name = "cratonvm-native-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Native method API for CratonVM — NativeContext trait and registry"
 readme = "README.md"
@@ -17,7 +18,7 @@ categories.workspace = true
 test-mock = []
 
 [dependencies]
-cratonvm-types = { path = "../types" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
 parking_lot.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 native-tls = "0.2"

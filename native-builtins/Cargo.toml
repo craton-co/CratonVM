@@ -3,6 +3,7 @@ name = "cratonvm-native-builtins"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Java core native methods for CratonVM (java.lang.*)"
 readme = "README.md"
@@ -29,10 +30,10 @@ experimental-aot = []
 gpu-offload = []
 
 [dependencies]
-cratonvm-types = { path = "../types" }
-cratonvm-native-api = { path = "../native-api" }
-cratonvm-native-collections = { path = "../native-collections" }
-cratonvm-reader = { path = "../reader" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-native-collections = { path = "../native-collections", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
 regex = "1"
 # Fallback regex engine for Java patterns that use features the `regex` crate
 # does not support: lookaround `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`,
@@ -112,7 +113,7 @@ thiserror.workspace = true
 # T19_H10: real `Class.getPackage()` reads the source jar's manifest via the
 # launcher's ClassPath::read_jar_manifest API. Was previously a dev-dep but
 # the production code path needs it at runtime.
-cratonvm-classloading = { path = "../classloading" }
+cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
 
 [dev-dependencies]
 # Used by AOT + GraalVM tests for per-test tempdir isolation so

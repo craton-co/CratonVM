@@ -3,6 +3,7 @@ name = "cratonvm-jit-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "JIT compiler API types for CratonVM"
 readme = "README.md"
@@ -11,8 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-cratonvm-types = { path = "../types" }
-cratonvm-reader = { path = "../reader" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
 
 [features]
 default = []

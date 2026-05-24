@@ -3,6 +3,7 @@ name = "jit-cuda"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Java bytecode → PTX lowering for CratonVM GPU offload"
 readme = "README.md"
@@ -11,14 +12,14 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-cratonvm-reader = { path = "../reader" }
-cratonvm-types = { path = "../types" }
-cratonvm-jit-api = { path = "../jit-api" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
 # `craton-gpu` is pulled in purely so cargo schedules its build script
 # BEFORE ours and exposes the `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*`
 # env vars (via its `links = "craton-gpu-annotations"` declaration) to
 # our build.rs. The Rust code in this crate does not call into it.
-craton-gpu = { path = "../craton-gpu" }
+craton-gpu = { path = "../craton-gpu", version = "0.3.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

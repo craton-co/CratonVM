@@ -3,6 +3,7 @@ name = "cratonvm-native-io"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Java I/O native methods for CratonVM"
 readme = "README.md"
@@ -17,8 +18,8 @@ categories.workspace = true
 synthetic-jdk = []
 
 [dependencies]
-cratonvm-types = { path = "../types" }
-cratonvm-native-api = { path = "../native-api" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 parking_lot.workspace = true
 # Round-8 cross-cutting Bug 3: pin `zip` to the workspace entry so this
 # crate and any future workspace consumer share one resolution. See the

@@ -102,7 +102,8 @@ We will acknowledge receipt and aim to provide an initial response within 7 days
 
 ## Supported Versions
 
-| Version | Supported          |
-|---------|--------------------|
-| 0.2.x   | Yes (current)     |
-| 0.1.x   | Security fixes only |
+| Version | Supported           |
+|---------|---------------------|
+| 0.3.x   | Yes (current)       |
+| 0.2.x   | End-of-life         |
+| 0.1.x   | End-of-life         |

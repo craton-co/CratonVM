@@ -3,6 +3,7 @@ name = "cuda-bridge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 description = "Thin CUDA Driver API bridge for CratonVM GPU offload"
 readme = "README.md"

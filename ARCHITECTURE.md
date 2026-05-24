@@ -5,7 +5,7 @@ If you want to contribute, this is the place to start.
 
 ## Crate Layout
 
-The workspace has 17 member crates:
+The workspace has 17 member crates plus a `fuzz` harness (18 Cargo.toml files in total):
 
 ```
 cratonvm/
@@ -26,6 +26,7 @@ cratonvm/
   jfr/                 cratonvm-jfr                 Java Flight Recorder
   vm/                  cratonvm-vm                  VM runtime engine
   vm-cli/              cratonvm-cli                 CLI entry point
+  fuzz/                cratonvm-fuzz                libfuzzer harness (out-of-workspace, nightly-only)
 ```
 
 **Dependency flow:**
@@ -59,7 +60,7 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~323,000+ LoC across 17 crates). It contains six
+The VM is the core of the project (~323,000+ LoC across 17 workspace member crates plus a `fuzz` harness — 18 Cargo.toml files in total). It contains six
 major subsystems (several now extracted into their own crates):
 
 ### Runtime (`vm/src/runtime/`)

@@ -3,6 +3,7 @@ name = "cratonvm-vm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -39,22 +40,22 @@ experimental-t19-diag = []
 gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cratonvm-native-builtins/gpu-offload", "dep:bytemuck"]
 
 [dependencies]
-cratonvm-reader = { path = "../reader" }
-cratonvm-types = { path = "../types" }
-cratonvm-native-api = { path = "../native-api" }
-cratonvm-native-collections = { path = "../native-collections" }
-cratonvm-native-io = { path = "../native-io" }
-cratonvm-native-builtins = { path = "../native-builtins" }
-cratonvm-jit-api = { path = "../jit-api" }
-cratonvm-jit = { path = "../jit" }
-cratonvm-classloading = { path = "../classloading" }
-cratonvm-gc = { path = "../gc" }
-cratonvm-jfr = { path = "../jfr" }
-cratonvm-native-awt = { path = "../native-awt" }
+cratonvm-reader = { path = "../reader", version = "0.3.0" }
+cratonvm-types = { path = "../types", version = "0.3.0" }
+cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-native-collections = { path = "../native-collections", version = "0.3.0" }
+cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
+cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0" }
+cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
+cratonvm-jit = { path = "../jit", version = "0.3.0" }
+cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
+cratonvm-gc = { path = "../gc", version = "0.3.0" }
+cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
+cratonvm-native-awt = { path = "../native-awt", version = "0.3.0" }
 # Optional, only pulled in by the `gpu-offload` feature. See the feature
 # table above. With `gpu-offload` off, these crates are not linked.
-cuda-bridge = { path = "../cuda-bridge", optional = true }
-jit-cuda = { path = "../jit-cuda", optional = true }
+cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true }
+jit-cuda = { path = "../jit-cuda", version = "0.3.0", optional = true }
 bytemuck = { version = "1.16", optional = true }
 thiserror.workspace = true
 tracing.workspace = true
