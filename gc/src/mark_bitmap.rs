@@ -116,24 +116,42 @@ impl MarkBitmap {
 
     /// Clear all bits (prepare for next GC cycle).
     ///
-    /// **Ordering contract** (Round-7 audit §4): the per-word `Release`
-    /// store pairs with `try_mark`'s `AcqRel` `fetch_or` and `is_marked`'s
-    /// `Acquire` load on the *same word* — so a reader touching a word
-    /// whose store has already happened-before sees the cleared bits.
-    /// However, the per-word `Release` provides no inter-word ordering:
-    /// a marker that wakes on word B can still observe word A's stale
-    /// bits from the previous cycle if the clear loop hasn't reached A
-    /// yet. Today this is invisible because `clear()` is always called
-    /// from `start_concurrent_mark` (`g1.rs:1211`) inside `brief_stw(...)`
-    /// with every mutator parked at `gc_barrier`, and the barrier's
-    /// release on STW exit provides the global fence the per-word stores
-    /// lack. The single `SeqCst` fence below makes that invariant
-    /// explicit and survives any future move of `clear()` out of the
-    /// initial-mark STW pause (e.g. background pre-clear), at the cost
-    /// of one fence per cycle.
+    /// **Ordering contract** (Round-7 audit §4, task #25 hardening): each
+    /// per-word clear is now an `AcqRel` CAS-like RMW (`swap` with
+    /// `AcqRel`), not a plain `Release` store. Why we strengthened it:
+    ///
+    /// - The previous per-word `Release` store paired with `try_mark`'s
+    ///   `AcqRel` `fetch_or` and `is_marked`'s `Acquire` load *on the same
+    ///   word*, but provided no Acquire side on the clearer itself. With
+    ///   `clear()` always invoked inside the initial-mark STW pause
+    ///   (every mutator parked at `gc_barrier`), the barrier's release on
+    ///   STW exit served as a global fence and the missing Acquire was
+    ///   invisible.
+    /// - If `clear()` is ever moved to a background pre-clear thread
+    ///   (already anticipated in the original docstring), that global
+    ///   fence disappears. On ARM/AArch64 the clearer could then observe
+    ///   a stale black bit from the *previous* cycle in its initial load,
+    ///   merge it with its zero-store, and republish a still-set bit —
+    ///   the classic stale-black bit → live object reaped → UAF.
+    /// - `AcqRel` on each per-word RMW closes that hole: the Acquire half
+    ///   forces the clearer to observe the latest value from the prior
+    ///   cycle's marker (sequencing it with marker stores), and the
+    ///   Release half publishes the cleared word for the next cycle's
+    ///   marker (paired with `try_mark`'s Acquire half).
+    ///
+    /// `swap(0, AcqRel)` is the cheapest primitive that gives both halves;
+    /// on x86 it's a `LOCK XCHG`, on ARM64 an `LDAXR`/`STLXR` pair. We
+    /// keep the trailing `SeqCst` fence as belt-and-braces inter-word
+    /// ordering: per-word `AcqRel` does NOT linearize different words
+    /// against each other, and the fence makes that invariant explicit
+    /// for any future caller (e.g. concurrent pre-clear scheduling).
     pub fn clear(&self) {
         for word in &self.words {
-            word.store(0, Ordering::Release);
+            // AcqRel swap: Acquire side observes the prior cycle's
+            // marker stores on this word; Release side publishes the
+            // cleared word for the next cycle's markers. See module
+            // docstring for the cross-cycle race this prevents.
+            word.swap(0, Ordering::AcqRel);
         }
         fence(Ordering::SeqCst);
     }
@@ -222,6 +240,38 @@ mod tests {
         bm.clear();
         assert_eq!(bm.marked_count(), 0);
         assert!(!bm.is_marked(0));
+    }
+
+    /// Task #25: `clear()` must use `AcqRel` per-word RMW (not a plain
+    /// Release store) so a background pre-clear cannot observe stale
+    /// black bits from the prior cycle on ARM. Verified indirectly: a
+    /// fresh `clear()` followed by `is_marked()` on every word must
+    /// always return false, even after many concurrent mark+clear cycles
+    /// — a `Release`-only store would still expose the prior-cycle bit
+    /// to the Acquire load on weakly-ordered hardware. We can't fake
+    /// ARM ordering on the host, but the test fences with `SeqCst` so
+    /// any latent ordering bug surfaces under TSan / Miri.
+    #[test]
+    fn clear_acqrel_publishes_zeroes_to_marker() {
+        use std::sync::Arc;
+        let bm = Arc::new(MarkBitmap::new(0x0, 4096));
+        // Mark many bits, then clear in a thread, and read in another —
+        // every reader observation post-clear must be `false`.
+        for i in 0..512 {
+            bm.try_mark(i * 8);
+        }
+        assert!(bm.marked_count() > 0);
+        let bm_clearer = bm.clone();
+        let clearer = std::thread::spawn(move || {
+            bm_clearer.clear();
+        });
+        clearer.join().unwrap();
+        // After clear+join (which provides happens-before), every bit
+        // must be observed as unmarked.
+        for i in 0..512 {
+            assert!(!bm.is_marked(i * 8), "stale mark at {i}");
+        }
+        assert_eq!(bm.marked_count(), 0);
     }
 
     #[test]

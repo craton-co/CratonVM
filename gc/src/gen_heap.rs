@@ -3425,6 +3425,15 @@ impl GarbageCollector for GenerationalHeap {
         self.write_barrier(obj, stored_value)
     }
 
+    /// Task #25: route through the inherent `satb_barrier` so the
+    /// concurrent old-gen marker sees the about-to-be-overwritten ref.
+    /// `satb_barrier` early-outs on the `is_marking_active()` check when
+    /// concurrent mark is idle.
+    #[inline]
+    fn write_barrier_pre(&self, _slot: *mut ObjectRef, old: ObjectRef) {
+        self.satb_barrier(Value::Object(Some(old)));
+    }
+
     fn allocated_bytes(&self) -> usize {
         self.allocated_bytes()
     }

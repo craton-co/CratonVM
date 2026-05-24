@@ -92,6 +92,47 @@ pub fn wait_for_gpu_critical_drain() {
 #[inline(always)]
 pub fn wait_for_gpu_critical_drain() {}
 
+// ─── Task #25: SATB triad-ordering debug assertion ───────────────────────
+//
+// In debug builds, every `write_barrier_pre` call arms a per-thread
+// sentinel that the next `write_barrier` call clears. If `write_barrier`
+// observes the sentinel still armed at the start of the *next*
+// `write_barrier_pre` (i.e. two pre-barriers with no intervening post),
+// it means a store path called `write_barrier_pre` and then forgot to
+// follow up with the matching post-store `write_barrier` — the exact
+// shape of the SATB-without-post bug. The sentinel is `thread_local`
+// and entirely compiled out in release builds, so the production hot
+// path is unchanged.
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static PENDING_PRE_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+#[inline]
+fn arm_pending_pre_barrier() {
+    PENDING_PRE_BARRIER.with(|f| {
+        // If we are arming AGAIN without an intervening `write_barrier`,
+        // a previous (pre, store, post) triad was left incomplete. The
+        // assertion catches missing post-store calls without crashing
+        // release builds.
+        debug_assert!(
+            !f.get(),
+            "write_barrier_pre called twice with no intervening write_barrier — \
+             SATB triad order violated; missing post-store barrier somewhere on \
+             the prior reference store"
+        );
+        f.set(true);
+    });
+}
+
+#[cfg(debug_assertions)]
+#[inline]
+fn clear_pending_pre_barrier() {
+    PENDING_PRE_BARRIER.with(|f| f.set(false));
+}
+
 /// Unified heap wrapping either GenerationalHeap or G1Collector.
 ///
 /// Provides the same API surface as `GenerationalHeap` so existing call sites
@@ -377,6 +418,12 @@ impl VmHeap {
     }
 
     pub fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        // Task #25: this path fires the inherent write_barrier inside
+        // `set_field`, which doesn't go through `VmHeap::write_barrier`
+        // and would leave the triad sentinel armed. Clear it here so
+        // the (pre, store-via-set_field) sequence closes cleanly.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_field(obj, index, value))
     }
 
@@ -385,6 +432,11 @@ impl VmHeap {
     }
 
     pub fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        // Task #25: see `set_field` comment — also closes the triad
+        // since `set_field_volatile` likewise routes through the
+        // inherent write_barrier, bypassing `VmHeap::write_barrier`.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_field_volatile(obj, index, value))
     }
 
@@ -481,6 +533,11 @@ impl VmHeap {
     }
 
     pub fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        // Task #25: closes the triad sentinel (same rationale as
+        // `set_field`); ref-array stores also route through the
+        // inherent write_barrier.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_array_element(obj, index, value))
     }
 
@@ -570,9 +627,44 @@ impl VmHeap {
     }
 
     pub fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
+        // Task #25 debug-triad assertion: if this thread recently fired
+        // a `write_barrier_pre` (post-store sequence), the matching
+        // `write_barrier` MUST follow within the same logical store —
+        // the SATB / card-marking invariants depend on (pre, store,
+        // post) being co-located. We clear the flag here so the next
+        // pre-barrier starts a fresh triad. The flag is per-thread and
+        // updated only under `debug_assertions`, so release builds pay
+        // nothing.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         match self {
             VmHeap::Generational(h) => h.write_barrier(obj, stored_value),
             VmHeap::G1(h) => h.write_barrier(obj, stored_value),
+        }
+    }
+
+    /// Task #25: SATB pre-store barrier dispatched through the
+    /// `GarbageCollector::write_barrier_pre` trait method. Call BEFORE
+    /// overwriting a heap-managed reference slot. `old` is the value
+    /// that will be lost; concurrent marking treats it as a root for
+    /// the remainder of the cycle.
+    ///
+    /// `slot` is reserved for future debug triad-assertions and may be
+    /// `null_mut()` if the caller only has the value (e.g. SATB log
+    /// drain rebroadcasts).
+    #[inline]
+    pub fn write_barrier_pre(&self, slot: *mut ObjectRef, old: ObjectRef) {
+        // Task #25: arm the per-thread triad sentinel. Cleared on the
+        // matching `write_barrier`. Debug-only — release builds elide.
+        #[cfg(debug_assertions)]
+        arm_pending_pre_barrier();
+        match self {
+            VmHeap::Generational(h) => {
+                <GenerationalHeap as GarbageCollector>::write_barrier_pre(h, slot, old)
+            }
+            VmHeap::G1(h) => {
+                <G1Collector as GarbageCollector>::write_barrier_pre(h, slot, old)
+            }
         }
     }
 

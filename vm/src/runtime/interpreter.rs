@@ -6455,9 +6455,20 @@ fn execute_instruction(
                 );
             }
 
-            // SATB barrier: log old value before overwriting (for concurrent GC)
+            // Task #25 SATB triad: route the pre-barrier through the
+            // new `GarbageCollector::write_barrier_pre` trait method via
+            // `VmHeap::write_barrier_pre` so the debug-build triad
+            // ordering assertion fires (and so non-SATB collectors pay
+            // genuinely zero cost, not even a `Value` match). We still
+            // need the old `Value` for the pre-store check, but only
+            // call the trait method on the ref-typed case — primitives
+            // and nulls don't enter SATB.
             let old_value = shared.heap.get_field(obj_ref, field.field_index);
-            shared.heap.satb_barrier(old_value);
+            if let Value::Object(Some(old_ref)) = old_value {
+                shared
+                    .heap
+                    .write_barrier_pre(std::ptr::null_mut(), old_ref);
+            }
             if field.is_volatile {
                 shared
                     .heap
@@ -6465,7 +6476,12 @@ fn execute_instruction(
             } else {
                 shared.heap.set_field(obj_ref, field.field_index, value);
             }
-            // write_barrier fires automatically inside set_field / set_field_volatile
+            // write_barrier fires automatically inside set_field / set_field_volatile.
+            // TODO(orchestrator): migrate the remaining `heap.satb_barrier(...)`
+            // call sites (interpreter aastore lines ~4093/5164/5961, JIT
+            // putfield_object / aastore_object in jit/helpers.rs, the
+            // `vm_exec` putfield path) to use `write_barrier_pre` so the
+            // debug-build triad assertion covers every reference store.
         }
 
         // -- Method invocation (slow path) --

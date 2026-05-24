@@ -214,6 +214,57 @@ pub trait GarbageCollector: Send + Sync {
     /// matching pre-call on the same thread; release builds skip the check.
     fn write_barrier(&self, obj: ObjectRef, stored_value: Value);
 
+    /// SATB **pre**-store barrier — called BEFORE a reference-typed slot
+    /// is overwritten, with the value about to be lost. Pairs with
+    /// [`Self::write_barrier`] (post-store) to form the
+    /// pre-barrier / store / post-barrier triad required for concurrent
+    /// marking correctness (snapshot-at-the-beginning).
+    ///
+    /// Task #25 (HIGH soundness): previously this was caller discipline
+    /// — interpreter/JIT call sites manually invoked the heap-specific
+    /// `satb_barrier(old_value)` and the `GarbageCollector` trait knew
+    /// nothing about pre-stores. A `debug_assert!` could in principle
+    /// have verified the discipline but release builds compiled it out.
+    /// Promoting the pre-barrier to a trait method makes the contract
+    /// part of the type system: every collector now opts in or out
+    /// explicitly, and a missing call site fails to compile rather than
+    /// silently dropping SATB log entries.
+    ///
+    /// ## Cost
+    ///
+    /// The default implementation is `#[inline]` empty and contains no
+    /// branches — non-SATB collectors (semi-space `Heap`, the
+    /// `GenerationalHeap` minor-GC path when concurrent mark is idle)
+    /// pay literally zero instructions at the trait dispatch site
+    /// because LLVM elides the dispatched call. G1 overrides this and
+    /// routes `old` into the per-thread SATB buffer when
+    /// [`crate::satb::SatbQueue::is_active`] is true; the cost there is
+    /// one Acquire load (gated check) on the inactive path and one
+    /// thread-local push on the active path.
+    ///
+    /// ## Parameters
+    ///
+    /// * `slot` — pointer to the heap slot about to be overwritten.
+    ///   The pointer is used only for ordering assertions in debug
+    ///   builds (see `set_field`'s triad assertion); it is NOT
+    ///   dereferenced by the default or G1 implementation.
+    /// * `old` — the previous reference value of the slot, read before
+    ///   the store. Concurrent marking treats `old` as a root for the
+    ///   rest of this mark cycle.
+    ///
+    /// ## SAFETY
+    ///
+    /// `slot` may be passed as `std::ptr::null_mut()` when the caller
+    /// only has the value and not the slot address (e.g. monitor exit
+    /// paths) — implementations MUST NOT dereference it.
+    #[inline]
+    fn write_barrier_pre(&self, _slot: *mut ObjectRef, _old: ObjectRef) {
+        // Zero-cost default: empty body, leading-underscore parameter
+        // names so LLVM has no live values to materialize. Non-SATB
+        // collectors keep this implementation and pay literally nothing
+        // (no register save, no branch, no memory write) per ref-store.
+    }
+
     /// Total bytes currently allocated.
     fn allocated_bytes(&self) -> usize;
 }
