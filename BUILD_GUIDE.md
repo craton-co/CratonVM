@@ -11,7 +11,7 @@ CratonVM is a Java Virtual Machine written entirely in Rust with a custom x86-64
 - **~3,100+ native method** registrations
 - **~7,200 lines** of JIT compiler code (custom x86-64)
 - Dependencies: `thiserror 2`, `bitflags 2`, `tracing 0.1`, `clap 4`, `cesu8`, `strum`, `bitfield-struct`, `regex`, `parking_lot`, `zip`, `libloading`, `indexmap`
-- Minimum Rust: 1.75, Edition 2021
+- Minimum Rust: 1.77, Edition 2021
 
 ---
 
@@ -19,7 +19,7 @@ CratonVM is a Java Virtual Machine written entirely in Rust with a custom x86-64
 
 1. **Rust toolchain** — install via [rustup.rs](https://rustup.rs)
    ```
-   rustc --version    # 1.75+ required
+   rustc --version    # 1.77+ required
    cargo --version
    ```
 

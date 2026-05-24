@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Security hardening: checked arithmetic throughout GC and JIT.
 
 ### Changed
+- MSRV bumped to 1.77 (was 1.75).
 - Updated benchmark numbers against JDK 25.0.1 C2: QuickBench 1.50x, Fannkuch 1.57x, N-Body 20x (down from 464x interpreter-only).
 - Added Binary Trees (CLBG) benchmark, exposing a GC allocation bottleneck (23.3x ratio).
 - N-Body and Fannkuch-Redux benchmarks now run to completion with correct results.

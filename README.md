@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml/badge.svg)](https://github.com/craton-co/cratonvm/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.77%2B-orange.svg)](https://www.rust-lang.org/)
 
 A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
 
@@ -148,7 +148,7 @@ cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
 
 ## Building from Source
 
-Requires **Rust 1.75+** and optionally **JDK 17+** (for compiling test Java classes).
+Requires **Rust 1.77+** and optionally **JDK 17+** (for compiling test Java classes).
 
 ```bash
 git clone https://github.com/craton-co/cratonvm.git
