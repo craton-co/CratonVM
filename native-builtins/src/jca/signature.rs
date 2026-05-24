@@ -32,8 +32,12 @@
 //! |  4   | `key_id`    Long  | crypto_impl handle from KPG    |
 //!
 //! The actual `update(byte[])` payload lives in a process-wide side
-//! table keyed on `Signature` pointer identity — see
-//! `crypto_impl::sig_data_*`.
+//! table keyed on `NativeContext::identity_hash_code(this)` — see
+//! `crypto_impl::sig_data_{append,take,clear}_h`.  Identity-hash-code keys
+//! survive GC compaction (`HashCodeTable::update_after_gc` in
+//! `gc/src/compact_header.rs`).  Pre-C18 the table was keyed on
+//! `this.as_ptr() as u64`; a compaction silently orphaned the entry and
+//! `sign()` returned a signature over `b""`.
 
 #![allow(clippy::collapsible_if)]
 
@@ -202,10 +206,6 @@ fn alloc_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     arr
 }
 
-fn sig_id(this: ObjectRef) -> u64 {
-    this.as_ptr() as u64
-}
-
 fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
     if let Some(kid) = get_sig_keyid(this) {
         if kid != 0 {
@@ -235,13 +235,38 @@ fn append_data(ctx: &mut dyn NativeContext, this: ObjectRef, data: &[u8]) {
         _ => 0,
     };
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(cur + data.len() as i32));
-    crypto_impl::sig_data_append(sig_id(this), data);
+    let key = ctx.identity_hash_code(this);
+    crypto_impl::sig_data_append_h(key, data);
 }
 
-fn take_data(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+/// Remove the receiver's accumulated payload from the side table.
+///
+/// Returns `Err(IllegalStateException)` when the side-table entry is
+/// missing — i.e. the receiver was never `init*`-ed through this
+/// registrar (so `clear_data` never seeded an empty buffer).  Should
+/// also catch any future regression to a GC-orphaning key scheme.
+/// `clear_data` (called from `sig_init_sign` / `sig_init_verify`) seeds
+/// an empty buffer, so a normal `init → sign` with no intervening
+/// `update()` still resolves to `Ok(Vec::new())`.  A silent empty-buffer
+/// fallback at this layer would have produced a valid-looking signature
+/// over `b""` — precisely the failure mode C18 fixes.
+fn take_data(ctx: &mut dyn NativeContext, this: ObjectRef)
+    -> Result<Vec<u8>, cratonvm_types::error::MethodCallFailed>
+{
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     ctx.set_field(this, base + SIG_OFF_PENDING, Value::Int(0));
-    crypto_impl::sig_data_take(sig_id(this))
+    let key = ctx.identity_hash_code(this);
+    crypto_impl::sig_data_take_h(key).ok_or_else(|| {
+        RuntimeError::IllegalStateException {
+            message: "Signature payload missing post-GC or init*() never called".into(),
+        }
+        .into()
+    })
+}
+
+fn clear_data(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let key = ctx.identity_hash_code(this);
+    crypto_impl::sig_data_clear_h(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +338,7 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         set_sig_keyid(this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
     }
-    crypto_impl::sig_data_clear(sig_id(this));
+    clear_data(ctx, this);
     Ok(None)
 }
 
@@ -328,7 +353,7 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         set_sig_keyid(this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
     }
-    crypto_impl::sig_data_clear(sig_id(this));
+    clear_data(ctx, this);
     Ok(None)
 }
 
@@ -393,7 +418,11 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         _ => -1,
     });
     let key_id = key_id_of(ctx, this);
-    let data = take_data(ctx, this);
+    // C18: surface a missing payload as IllegalStateException rather than
+    // silently signing/verifying `b""` (the pre-fix raw-pointer keying
+    // could orphan the buffer after GC compaction and the empty-fallback
+    // produced an apparent success).
+    let data = take_data(ctx, this)?;
 
     let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
     let arr = alloc_byte_array(ctx, &sig_bytes);
@@ -418,7 +447,11 @@ fn sig_sign_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => -1,
     });
     let key_id = key_id_of(ctx, this);
-    let data = take_data(ctx, this);
+    // C18: surface a missing payload as IllegalStateException rather than
+    // silently signing/verifying `b""` (the pre-fix raw-pointer keying
+    // could orphan the buffer after GC compaction and the empty-fallback
+    // produced an apparent success).
+    let data = take_data(ctx, this)?;
     let sig_bytes = sign_dispatch(alg, key_id, &data).unwrap_or_default();
 
     let off = match args.get(2) {
@@ -456,7 +489,11 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         _ => -1,
     });
     let key_id = key_id_of(ctx, this);
-    let data = take_data(ctx, this);
+    // C18: surface a missing payload as IllegalStateException rather than
+    // silently signing/verifying `b""` (the pre-fix raw-pointer keying
+    // could orphan the buffer after GC compaction and the empty-fallback
+    // produced an apparent success).
+    let data = take_data(ctx, this)?;
     let provided = match args.get(1) {
         Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
         _ => Vec::new(),
@@ -484,7 +521,11 @@ fn sig_verify_off_len(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => -1,
     });
     let key_id = key_id_of(ctx, this);
-    let data = take_data(ctx, this);
+    // C18: surface a missing payload as IllegalStateException rather than
+    // silently signing/verifying `b""` (the pre-fix raw-pointer keying
+    // could orphan the buffer after GC compaction and the empty-fallback
+    // produced an apparent success).
+    let data = take_data(ctx, this)?;
 
     let off = match args.get(2) {
         Some(Value::Int(n)) => *n as usize,
