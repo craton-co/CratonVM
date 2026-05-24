@@ -8,7 +8,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Command-line launcher for the CratonVM"
-readme = "../README.md"
+readme = "README.md"
 
 [[bin]]
 name = "cratonvm"

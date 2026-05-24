@@ -8,7 +8,7 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Java Virtual Machine implementation in Rust"
-readme = "../README.md"
+readme = "README.md"
 
 [features]
 # NEW-11: `synthetic-jdk` is intentionally NOT in the default feature set.
