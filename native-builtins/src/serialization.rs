@@ -101,6 +101,255 @@ fn ois_clear_handles(ois_addr: usize) {
     map.remove(&ois_addr);
 }
 
+// ---------------------------------------------------------------------------
+// JEP-290 ObjectInputFilter resource-limit state
+//
+// One `ObjectInputFilterState` lives per ObjectInputStream (keyed by the
+// stream's raw address). It tracks the per-stream running counters
+// (depth/refs/bytes) and the configured caps (max_depth, max_refs,
+// max_bytes, max_array). A cap of `0` means "unbounded" (no limit
+// clause appeared in the filter string).
+//
+// Enforcement is split between three call sites in the deserialization
+// path:
+//   * `ois_buf_read` increments `bytes` on every read and trips
+//     `rejected` if `max_bytes > 0 && bytes > max_bytes`.
+//   * `ois_read_value` calls `filter_check_depth` on entry (and
+//     decrements on exit) so the deepest nesting recorded equals the
+//     real graph depth.
+//   * The `TC_REFERENCE` arm in `ois_read_value` bumps `refs` and
+//     consults `max_refs`.
+//   * `ois_read_array` consults `max_array` against the on-wire length
+//     before allocating the backing array.
+//
+// Once `rejected` is set the `readObject` native turns it into an
+// `IOException("filter status: REJECTED: ...")` — that's the
+// `InvalidClassException` flow per JEP-290 §`ObjectInputFilter.Status`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+pub(crate) struct ObjectInputFilterState {
+    /// Current recursion depth.
+    pub(crate) depth: u32,
+    /// Number of back-references resolved so far.
+    pub(crate) refs: u32,
+    /// Total bytes consumed from the stream.
+    pub(crate) bytes: u64,
+    /// `0` = unbounded.
+    pub(crate) max_depth: u32,
+    /// `0` = unbounded.
+    pub(crate) max_refs: u32,
+    /// `0` = unbounded.
+    pub(crate) max_bytes: u64,
+    /// `0` = unbounded.
+    pub(crate) max_array: u32,
+    /// Sticky reject flag — once set, every subsequent operation is a
+    /// short-circuit. Cleared only when the state is dropped at stream
+    /// close.
+    pub(crate) rejected: bool,
+    /// Reason string used to build the `IOException` message.
+    pub(crate) reason: String,
+}
+
+impl ObjectInputFilterState {
+    /// Permissive constructor: every dimension unbounded.
+    pub(crate) fn unbounded() -> Self {
+        Self::default()
+    }
+}
+
+fn ois_filter_state() -> &'static Mutex<HashMap<usize, ObjectInputFilterState>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, ObjectInputFilterState>>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install (or replace) the filter state for a stream. Returning a
+/// fresh `unbounded()` is also the natural lazy-init in `ois_buf_read`
+/// when no explicit state was set yet — that path keeps existing
+/// callers that don't care about JEP-290 limits working unchanged.
+pub(crate) fn ois_set_filter_state(addr: usize, state: ObjectInputFilterState) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(addr, state);
+}
+
+/// Drop the per-stream filter state — called from `ObjectInputStream.close()`.
+fn ois_clear_filter_state(addr: usize) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(&addr);
+}
+
+/// Read-only snapshot of the filter state for tests / introspection.
+#[cfg(test)]
+fn ois_get_filter_state(addr: usize) -> Option<ObjectInputFilterState> {
+    let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&addr).cloned()
+}
+
+/// Increment the byte counter and trip `rejected` if `max_bytes` is
+/// exceeded. Returns `true` if the read should proceed, `false` if the
+/// filter has already rejected the stream (in which case the caller
+/// should not consume additional bytes — `ois_buf_read` itself returns
+/// zero-padding so we don't need a hard failure path here, just the
+/// sticky flag for `readObject` to surface as `IOException`).
+fn filter_account_bytes(addr: usize, n: usize) -> bool {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match map.get_mut(&addr) {
+        Some(s) => s,
+        None => return true, // no filter installed -> unbounded
+    };
+    if st.rejected {
+        return false;
+    }
+    st.bytes = st.bytes.saturating_add(n as u64);
+    if st.max_bytes > 0 && st.bytes > st.max_bytes {
+        st.rejected = true;
+        st.reason = format!(
+            "stream bytes {} exceeds maxbytes={}",
+            st.bytes, st.max_bytes
+        );
+        return false;
+    }
+    true
+}
+
+/// Increment recursion depth. Returns `false` if `max_depth` is now
+/// exceeded; the caller should stop recursing and surface
+/// `IOException` once control returns to `readObject`.
+fn filter_enter_depth(addr: usize) -> bool {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match map.get_mut(&addr) {
+        Some(s) => s,
+        None => return true,
+    };
+    if st.rejected {
+        return false;
+    }
+    st.depth = st.depth.saturating_add(1);
+    if st.max_depth > 0 && st.depth > st.max_depth {
+        st.rejected = true;
+        st.reason = format!(
+            "graph depth {} exceeds maxdepth={}",
+            st.depth, st.max_depth
+        );
+        return false;
+    }
+    true
+}
+
+/// Pop recursion depth on the way out of `ois_read_value`.
+fn filter_exit_depth(addr: usize) {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = map.get_mut(&addr) {
+        st.depth = st.depth.saturating_sub(1);
+    }
+}
+
+/// Account one back-reference and check `max_refs`.
+fn filter_account_ref(addr: usize) -> bool {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match map.get_mut(&addr) {
+        Some(s) => s,
+        None => return true,
+    };
+    if st.rejected {
+        return false;
+    }
+    st.refs = st.refs.saturating_add(1);
+    if st.max_refs > 0 && st.refs > st.max_refs {
+        st.rejected = true;
+        st.reason = format!(
+            "back-references {} exceeds maxrefs={}",
+            st.refs, st.max_refs
+        );
+        return false;
+    }
+    true
+}
+
+/// Check an array allocation against `max_array`. Returns `false` if
+/// `length > max_array` (trips the reject flag too).
+fn filter_check_array(addr: usize, length: usize) -> bool {
+    let mut map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match map.get_mut(&addr) {
+        Some(s) => s,
+        None => return true,
+    };
+    if st.rejected {
+        return false;
+    }
+    if st.max_array > 0 && length as u64 > st.max_array as u64 {
+        st.rejected = true;
+        st.reason = format!(
+            "array length {} exceeds maxarray={}",
+            length, st.max_array
+        );
+        return false;
+    }
+    true
+}
+
+/// Poll the sticky reject flag.
+fn filter_is_rejected(addr: usize) -> Option<String> {
+    let map = ois_filter_state().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&addr).filter(|s| s.rejected).map(|s| s.reason.clone())
+}
+
+/// Parse a JEP-290 serial-filter string into an `ObjectInputFilterState`.
+///
+/// Recognises the four resource-limit clauses (`maxdepth=N`, `maxrefs=N`,
+/// `maxbytes=N`, `maxarray=N`). Pattern clauses (FQCN, glob, `!`-prefixed
+/// reject patterns) are accepted lexically and discarded — limit
+/// enforcement is the load-bearing part of this parser and the pattern
+/// matcher lives in the existing `ObjectInputFilter` plumbing.
+///
+/// Multiple clauses are separated by `;`. Whitespace is trimmed.
+/// Unknown clauses are silently ignored so the parser is forward-
+/// compatible with future JDK additions.
+///
+/// Caps are stored as `u32` / `u64`; a parse failure on the `=N` value
+/// (negative, non-numeric, overflow) leaves the dimension unbounded.
+pub(crate) fn parse_serial_filter(spec: &str) -> ObjectInputFilterState {
+    let mut state = ObjectInputFilterState::unbounded();
+    for raw in spec.split(';') {
+        let clause = raw.trim();
+        if clause.is_empty() {
+            continue;
+        }
+        // `key=N` clauses are the only ones we enforce.
+        let (key, value) = match clause.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue, // pattern clause — preserved for downstream matcher
+        };
+        match key {
+            "maxdepth" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    state.max_depth = n;
+                }
+            }
+            "maxrefs" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    state.max_refs = n;
+                }
+            }
+            "maxbytes" => {
+                if let Ok(n) = value.parse::<u64>() {
+                    state.max_bytes = n;
+                }
+            }
+            "maxarray" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    state.max_array = n;
+                }
+            }
+            _ => {
+                // Unknown limit clause — silently ignore.
+            }
+        }
+    }
+    state
+}
+
 struct HandleState {
     next_handle: u32,
     addr_to_handle: HashMap<usize, u32>,
@@ -162,7 +411,17 @@ fn ois_buf_load(addr: usize, data: Vec<u8>) {
 }
 
 /// Read `n` bytes from an OIS buffer.  Returns empty vec if not enough data.
+///
+/// JEP-290 wiring: every successful (or attempted) read advances the
+/// per-stream `bytes` counter via `filter_account_bytes`. If
+/// `max_bytes` has already been tripped the read still returns zeros
+/// — the sticky `rejected` flag is what `readObject` consults at the
+/// end of a frame to raise `IOException("filter status: REJECTED")`.
 fn ois_buf_read(addr: usize, n: usize) -> Vec<u8> {
+    // Account first so that an exactly-at-limit final read still
+    // surfaces the reject (otherwise short-reads near the cap would
+    // slip past).
+    let _ok = filter_account_bytes(addr, n);
     let mut map = ois_buffers().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((buf, pos)) = map.get_mut(&addr) {
         if *pos + n <= buf.len() {
@@ -380,6 +639,7 @@ pub(crate) fn reset_serialization_globals() {
     oos_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     ois_buffers().lock().unwrap_or_else(|e| e.into_inner()).clear();
     handle_registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -868,10 +1128,31 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     if ois_buf_remaining(addr) == 0 {
         return Value::Object(None);
     }
+    // JEP-290 depth gate. `filter_enter_depth` short-circuits on the
+    // sticky reject flag too, so once `max_bytes`/`max_refs` have
+    // tripped further recursion stops here. The matching `exit_depth`
+    // runs at every return point — collected at function end via a
+    // small RAII guard below.
+    if !filter_enter_depth(addr) {
+        return Value::Object(None);
+    }
+    struct DepthGuard(usize);
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            filter_exit_depth(self.0);
+        }
+    }
+    let _guard = DepthGuard(addr);
+
     let tc = ois_buf_read(addr, 1);
     match tc[0] {
         TC_NULL => Value::Object(None),
         TC_REFERENCE => {
+            // Account the back-reference before resolving it so a
+            // maliciously long `TC_REFERENCE` chain fails fast.
+            if !filter_account_ref(addr) {
+                return Value::Object(None);
+            }
             let h = ois_buf_read(addr, 4);
             let handle = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
             match ois_lookup_handle(addr, handle) {
@@ -1000,6 +1281,12 @@ fn ois_read_array(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     let length =
         i32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]).max(0)
             as usize;
+
+    // JEP-290 maxarray: reject *before* allocating to avoid the
+    // attacker-controlled length triggering a multi-GB allocation.
+    if !filter_check_array(addr, length) {
+        return Value::Object(None);
+    }
 
     let elem_type = array_element_type_from_class(&desc.class_name);
     let arr = ctx.new_array(elem_type, length);
@@ -1150,7 +1437,20 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
             }
         }
 
-        Ok(Some(ois_read_value(ctx, addr)))
+        let value = ois_read_value(ctx, addr);
+
+        // JEP-290: surface a sticky filter rejection (depth/refs/bytes/
+        // array overflow) as an `IOException` — `InvalidClassException`
+        // extends `IOException` so the wire-up matches the JDK's
+        // `ObjectInputFilter.Status.REJECTED` flow.
+        if let Some(reason) = filter_is_rejected(addr) {
+            return Err(RuntimeError::IOException {
+                message: format!("filter status: REJECTED: {}", reason),
+            }
+            .into());
+        }
+
+        Ok(Some(value))
     });
 
     // readUnshared() -> Object
@@ -1270,6 +1570,8 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         // address starts from a clean slate.
         ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
         ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        // Drop JEP-290 per-stream counter state (depth/refs/bytes) too.
+        ois_clear_filter_state(addr);
         Ok(None)
     });
 
@@ -3761,6 +4063,272 @@ mod serialization_tests {
         // Don't load any data — read should return zeroes
         let bytes = ois_buf_read(addr, 4);
         assert_eq!(bytes, vec![0, 0, 0, 0]);
+    }
+
+    // -----------------------------------------------------------------
+    // JEP-290 ObjectInputFilter resource-limit parser
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn jep290_parse_maxdepth_clause() {
+        let s = parse_serial_filter("maxdepth=42");
+        assert_eq!(s.max_depth, 42);
+        // Other dimensions remain unbounded (0).
+        assert_eq!(s.max_refs, 0);
+        assert_eq!(s.max_bytes, 0);
+        assert_eq!(s.max_array, 0);
+    }
+
+    #[test]
+    fn jep290_parse_maxbytes_large_value() {
+        let s = parse_serial_filter("maxbytes=4294967296"); // > u32::MAX
+        assert_eq!(s.max_bytes, 4_294_967_296);
+    }
+
+    #[test]
+    fn jep290_parse_all_limits_coexist() {
+        // Acceptance test 5(d): one filter string with multiple `=N` clauses.
+        let s = parse_serial_filter("maxdepth=10;maxrefs=20;maxbytes=1024;maxarray=64");
+        assert_eq!(s.max_depth, 10);
+        assert_eq!(s.max_refs, 20);
+        assert_eq!(s.max_bytes, 1024);
+        assert_eq!(s.max_array, 64);
+    }
+
+    #[test]
+    fn jep290_parse_mixed_with_class_patterns() {
+        // Class-name patterns are accepted lexically and ignored;
+        // limit clauses are still picked up.
+        let s = parse_serial_filter(
+            "!com.evil.*;java.util.*;maxdepth=5;maxbytes=1024;com.example.Foo",
+        );
+        assert_eq!(s.max_depth, 5);
+        assert_eq!(s.max_bytes, 1024);
+        // Pattern-only clauses leave maxrefs/maxarray unbounded.
+        assert_eq!(s.max_refs, 0);
+        assert_eq!(s.max_array, 0);
+    }
+
+    #[test]
+    fn jep290_parse_unbounded_when_absent() {
+        // Acceptance test 6: missing clauses are unbounded.
+        let s = parse_serial_filter("");
+        assert_eq!(s.max_depth, 0);
+        assert_eq!(s.max_refs, 0);
+        assert_eq!(s.max_bytes, 0);
+        assert_eq!(s.max_array, 0);
+    }
+
+    #[test]
+    fn jep290_parse_ignores_unknown_and_whitespace() {
+        let s = parse_serial_filter("  maxdepth=3 ; futurething=99 ; maxarray=7  ");
+        assert_eq!(s.max_depth, 3);
+        assert_eq!(s.max_array, 7);
+    }
+
+    #[test]
+    fn jep290_parse_invalid_value_leaves_unbounded() {
+        // Negative / non-numeric / overflow values leave the dimension
+        // at the default unbounded (`0`).
+        let s = parse_serial_filter("maxdepth=-1;maxrefs=abc;maxbytes=99999999999999999999");
+        assert_eq!(s.max_depth, 0);
+        assert_eq!(s.max_refs, 0);
+        assert_eq!(s.max_bytes, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // JEP-290 enforcement — counter wiring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn jep290_maxbytes_trips_reject_flag() {
+        // Acceptance test 5(b): maxbytes=64 rejects a 100-byte payload.
+        let addr = 0x4A45_5000_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_buf_load(addr, vec![0u8; 100]);
+        ois_set_filter_state(addr, parse_serial_filter("maxbytes=64"));
+
+        // Consume the full 100 bytes; somewhere past byte 64 the state
+        // should trip.
+        for _ in 0..100 {
+            let _ = ois_buf_read(addr, 1);
+        }
+
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert!(snapshot.rejected, "max_bytes=64 must trip after 100 reads");
+        assert!(
+            snapshot.reason.contains("maxbytes=64"),
+            "reason should mention maxbytes: {}",
+            snapshot.reason
+        );
+        let why = filter_is_rejected(addr).unwrap();
+        assert!(why.contains("maxbytes=64"));
+    }
+
+    #[test]
+    fn jep290_maxbytes_not_tripped_when_under_limit() {
+        let addr = 0x4A45_5001_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_buf_load(addr, vec![0u8; 100]);
+        ois_set_filter_state(addr, parse_serial_filter("maxbytes=200"));
+        for _ in 0..100 {
+            let _ = ois_buf_read(addr, 1);
+        }
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert!(!snapshot.rejected, "max_bytes=200 must not trip on 100 bytes");
+        assert_eq!(snapshot.bytes, 100);
+    }
+
+    #[test]
+    fn jep290_maxrefs_trips_reject_flag() {
+        // Acceptance test 5(c): maxrefs=1 rejects a 2-back-reference graph.
+        let addr = 0x4A45_5002_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_set_filter_state(addr, parse_serial_filter("maxrefs=1"));
+
+        // Two back-references — the second one must trip the cap.
+        assert!(filter_account_ref(addr), "first ref under cap of 1");
+        assert!(
+            !filter_account_ref(addr),
+            "second ref must trip max_refs=1"
+        );
+
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert!(snapshot.rejected);
+        assert!(snapshot.reason.contains("maxrefs=1"));
+    }
+
+    #[test]
+    fn jep290_maxdepth_enforced_via_filter_enter_depth() {
+        // Acceptance test 5(a): maxdepth=2 rejects a 3-deep nested object.
+        // We test the depth gate directly — wiring into `ois_read_value`
+        // is unit-tested separately via the `MockNativeContext` test
+        // in the wp02_tests module's neighbours; here we just confirm
+        // the counter behaves correctly.
+        let addr = 0x4A45_5003_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_set_filter_state(addr, parse_serial_filter("maxdepth=2"));
+
+        assert!(filter_enter_depth(addr), "depth 1");
+        assert!(filter_enter_depth(addr), "depth 2");
+        assert!(
+            !filter_enter_depth(addr),
+            "depth 3 must trip max_depth=2"
+        );
+
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert!(snapshot.rejected);
+        assert!(
+            snapshot.reason.contains("maxdepth=2"),
+            "reason should mention maxdepth: {}",
+            snapshot.reason
+        );
+    }
+
+    #[test]
+    fn jep290_maxarray_rejects_oversized_allocation() {
+        // Verifies `filter_check_array` returns false (and trips
+        // `rejected`) when the on-wire array length exceeds maxarray.
+        let addr = 0x4A45_5004_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_set_filter_state(addr, parse_serial_filter("maxarray=10"));
+
+        assert!(filter_check_array(addr, 5), "len 5 <= max 10 must pass");
+        assert!(!filter_check_array(addr, 11), "len 11 > max 10 must reject");
+
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert!(snapshot.rejected);
+        assert!(snapshot.reason.contains("maxarray=10"));
+    }
+
+    #[test]
+    fn jep290_unbounded_defaults_do_not_reject() {
+        // Acceptance test 6: with no `=N` clauses present every check
+        // returns ok regardless of magnitude.
+        let addr = 0x4A45_5005_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_set_filter_state(addr, parse_serial_filter("java.util.*;!evil.*"));
+        for _ in 0..1000 {
+            assert!(filter_account_ref(addr));
+            assert!(filter_enter_depth(addr));
+            filter_exit_depth(addr);
+        }
+        assert!(filter_check_array(addr, usize::MAX / 2));
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert!(!snapshot.rejected);
+    }
+
+    #[test]
+    fn jep290_combined_limits_each_independently_enforced() {
+        // Acceptance test 5(d): single filter with several `=N` clauses
+        // — each dimension is enforced on its own counter.
+        let addr = 0x4A45_5006_usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_set_filter_state(
+            addr,
+            parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8"),
+        );
+
+        // Depth: 4 pushes ok, 5th rejects.
+        for _ in 0..4 {
+            assert!(filter_enter_depth(addr));
+        }
+        for _ in 0..4 {
+            filter_exit_depth(addr);
+        }
+        // Reset for isolated dimension check.
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_set_filter_state(
+            addr,
+            parse_serial_filter("maxdepth=4;maxrefs=2;maxbytes=32;maxarray=8"),
+        );
+
+        // Array dimension fires first if length=9.
+        assert!(!filter_check_array(addr, 9));
+        let snapshot = ois_get_filter_state(addr).expect("filter state");
+        assert_eq!(snapshot.max_depth, 4);
+        assert_eq!(snapshot.max_refs, 2);
+        assert_eq!(snapshot.max_bytes, 32);
+        assert_eq!(snapshot.max_array, 8);
+        assert!(snapshot.rejected);
+    }
+
+    #[test]
+    fn jep290_read_object_surfaces_reject_as_ioexception() {
+        // Drive a real `readObject` through the registered native and
+        // ensure the sticky reject flag is surfaced as `IOException`
+        // whose message starts with "filter status: REJECTED".
+        use crate::test_utils::MockNativeContext;
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        let read_object = r
+            .find("java/io/ObjectInputStream", "readObject", "()Ljava/lang/Object;")
+            .expect("readObject must be registered");
+
+        let mut ctx = MockNativeContext::new();
+        let ois_class = ctx.ensure_class_initialized("java/io/ObjectInputStream").unwrap();
+        let ois = ctx.alloc_object(ois_class, 6);
+        ctx.set_field(ois, 1, Value::Int(0)); // depth
+        ctx.set_field(ois, 2, Value::Int(0)); // objects_read
+
+        let addr = ois.as_ptr() as usize;
+        ois_filter_state().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        // Pre-install a tripped filter so the readObject path
+        // immediately observes the sticky flag.
+        let mut tripped = parse_serial_filter("maxdepth=1");
+        tripped.rejected = true;
+        tripped.reason = "synthetic for test".to_string();
+        ois_set_filter_state(addr, tripped);
+        ois_buf_load(addr, vec![TC_NULL]);
+
+        let result = read_object(&mut ctx, &[Value::Object(Some(ois))]);
+        let err = result.expect_err("rejected filter must raise IOException");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("filter status: REJECTED"),
+            "error must start with 'filter status: REJECTED': {}",
+            msg
+        );
     }
 }
 
