@@ -529,12 +529,29 @@ impl ReferenceProcessor {
     }
 
     /// Remove entries whose `Reference` object has itself been collected.
+    ///
+    /// `soft_refs` is indexed by position into [`Self::soft_ref_lru_index`]
+    /// (keyed `(last_access_time_ms, idx) -> idx`); after `retain` shrinks
+    /// the Vec the old indices are stale and would index out of bounds in
+    /// `process_soft_refs`. We rebuild the LRU index from scratch by
+    /// re-walking the surviving entries so the `(timestamp, idx)` keys and
+    /// stored values reflect the new positions.
     pub fn remove_collected(&mut self, is_live: &dyn Fn(usize) -> bool) {
         self.soft_refs.retain(|e| is_live(e.reference_obj));
         self.weak_refs.retain(|e| is_live(e.reference_obj));
         self.phantom_refs.retain(|e| is_live(e.reference_obj));
         self.cleaner_refs.retain(|e| is_live(e.reference_obj));
         self.finalizer_refs.retain(|e| is_live(e.reference_obj));
+
+        // Rebuild soft_ref_lru_index to match the shrunk soft_refs Vec.
+        // Without this, surviving (timestamp, old_idx) keys would point
+        // past the new soft_refs.len(), causing a panic when
+        // process_soft_refs indexes the BTreeMap-returned `idx`.
+        self.soft_ref_lru_index.clear();
+        for (new_idx, entry) in self.soft_refs.iter().enumerate() {
+            self.soft_ref_lru_index
+                .insert((entry.last_access_time_ms, new_idx), new_idx);
+        }
     }
 
     /// Return reference_obj addresses of all entries whose referent was cleared.

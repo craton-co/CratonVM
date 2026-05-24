@@ -284,31 +284,43 @@ impl VmHeap {
     /// The caller must hold a live root to `obj` (or the GC must be
     /// stopped) so the header read is against a valid object. The
     /// returned `ObjectRef` points into the same heap region.
+    ///
+    /// # Backend compatibility
+    ///
+    /// All current `VmHeap` backends (`Heap`, `GenerationalHeap`,
+    /// `G1Collector`) allocate objects with the **full** 32-byte
+    /// `ObjectHeader` layout — none of them use the compact 64-bit
+    /// header format. This barrier therefore reads
+    /// `ObjectHeader.forwarding_ptr` directly. Decoding the first 8
+    /// bytes of a full header as a `CompactHeader` would alias the
+    /// `forwarding_ptr` bit-pattern onto unrelated header fields
+    /// (`_padding`, `identity_hash_code`, `array_length`) and could
+    /// cause `is_forwarded` to spuriously fire. A backend that adopts
+    /// compact headers in the future MUST update this method (and
+    /// gate the alternate decode path on the appropriate cfg).
     #[inline]
     pub fn load_and_forward(&self, obj: ObjectRef) -> ObjectRef {
-        // Fast path: read the header once, check the forwarded bit,
-        // and return the original pointer when unforwarded.
-        let header = self.get_compact_header(obj);
+        // SAFETY: the caller guarantees `obj` is a live root. Every
+        // current backend lays out `ObjectHeader` at offset 0 of the
+        // ObjectRef pointer with `forwarding_ptr` at the documented
+        // structural offset; reading the field is well-formed.
+        let header = unsafe { &*(obj.as_ptr() as *const crate::heap::ObjectHeader) };
         if !header.is_forwarded() {
             return obj;
         }
-        // Slow path: extract the forwarding target and return the
-        // corresponding ObjectRef. The forwarded address is always
-        // 8-byte aligned and within the same heap arena as the
-        // original object.
-        let addr = header.forwarding_ptr();
-        if addr == 0 {
-            // Defensive fallback: a zero forwarding pointer means
-            // either an uninitialized header or a concurrent-GC
-            // race we didn't anticipate. Returning the original
-            // pointer is always safe because the original object
-            // still exists in memory until the evacuation epoch
-            // ends; the barrier just loses the optimization.
+        let addr = header.forwarding_address();
+        if addr.is_null() {
+            // Defensive fallback (shouldn't happen — is_forwarded()
+            // already checks for a non-null pointer — but kept for
+            // belt-and-braces against concurrent-GC races we did not
+            // anticipate). Returning the original pointer is always
+            // safe because the original object still exists in memory
+            // until the evacuation epoch ends.
             return obj;
         }
-        // SAFETY: the forwarding pointer was installed by the GC
-        // and points at a valid object header within this heap.
-        unsafe { ObjectRef::from_raw(addr as *mut u8) }
+        // SAFETY: the forwarding pointer was installed by the GC and
+        // points at a valid object header within this heap.
+        unsafe { ObjectRef::from_raw(addr) }
     }
 
     /// Read the compact header for an object. Thin wrapper over the

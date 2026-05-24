@@ -47,6 +47,97 @@ impl Default for MetaspaceConfig {
     }
 }
 
+/// Errors returned by [`MetaspaceConfig::validate`].
+///
+/// Surfaced via [`Metaspace::new`] (which returns `Result`) so a malformed
+/// configuration is rejected at construction time rather than silently
+/// distorting the GC-trigger heuristic that reads the ratios.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaspaceConfigError {
+    /// `min_free_ratio > max_free_ratio` — the GC-after-collection target
+    /// window is inverted; the trigger heuristic cannot satisfy both bounds.
+    InvertedFreeRatio { min: f64, max: f64 },
+    /// A free-ratio value is not within `[0.0, 1.0]` (or is NaN).
+    RatioOutOfRange { name: &'static str, value: f64 },
+    /// `small_chunk_size`, `medium_chunk_size`, or `initial_chunk_size` is
+    /// zero, or the size tiers are not non-decreasing
+    /// (`small <= medium <= initial`).
+    InvalidChunkSizes {
+        small: usize,
+        medium: usize,
+        initial: usize,
+    },
+}
+
+impl std::fmt::Display for MetaspaceConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvertedFreeRatio { min, max } => write!(
+                f,
+                "MetaspaceConfig: min_free_ratio ({min}) > max_free_ratio ({max})"
+            ),
+            Self::RatioOutOfRange { name, value } => write!(
+                f,
+                "MetaspaceConfig: {name} = {value} is outside [0.0, 1.0]"
+            ),
+            Self::InvalidChunkSizes {
+                small,
+                medium,
+                initial,
+            } => write!(
+                f,
+                "MetaspaceConfig: chunk sizes invalid (small={small}, medium={medium}, initial={initial}); require 0 < small <= medium <= initial"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetaspaceConfigError {}
+
+impl MetaspaceConfig {
+    /// Validate the configuration. Returns `Err` if any bound is inverted,
+    /// any ratio is out of `[0.0, 1.0]`, or the chunk-size tiers are not
+    /// non-decreasing. Called automatically by [`Metaspace::new`].
+    pub fn validate(&self) -> Result<(), MetaspaceConfigError> {
+        // Ratios first: catch NaN via `!(0.0..=1.0).contains(&v)` (NaN
+        // returns false for every comparison).
+        if !(0.0..=1.0).contains(&self.min_free_ratio) {
+            return Err(MetaspaceConfigError::RatioOutOfRange {
+                name: "min_free_ratio",
+                value: self.min_free_ratio,
+            });
+        }
+        if !(0.0..=1.0).contains(&self.max_free_ratio) {
+            return Err(MetaspaceConfigError::RatioOutOfRange {
+                name: "max_free_ratio",
+                value: self.max_free_ratio,
+            });
+        }
+        if self.min_free_ratio > self.max_free_ratio {
+            return Err(MetaspaceConfigError::InvertedFreeRatio {
+                min: self.min_free_ratio,
+                max: self.max_free_ratio,
+            });
+        }
+
+        // Chunk sizes: every tier must be non-zero and non-decreasing.
+        if self.small_chunk_size == 0
+            || self.medium_chunk_size == 0
+            || self.initial_chunk_size == 0
+            || self.small_chunk_size > self.medium_chunk_size
+            || self.medium_chunk_size > self.initial_chunk_size
+        {
+            return Err(MetaspaceConfigError::InvalidChunkSizes {
+                small: self.small_chunk_size,
+                medium: self.medium_chunk_size,
+                initial: self.initial_chunk_size,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chunk types & chunks
 // ---------------------------------------------------------------------------
@@ -163,8 +254,16 @@ pub struct Metaspace {
 }
 
 impl Metaspace {
-    pub fn new(config: MetaspaceConfig) -> Self {
-        Self {
+    /// Construct a `Metaspace` with the given configuration.
+    ///
+    /// Returns `Err(MetaspaceConfigError)` if the configuration fails
+    /// validation (inverted free-ratio bounds, ratio outside `[0.0, 1.0]`,
+    /// zero / non-monotone chunk sizes). Callers using the canonical
+    /// `MetaspaceConfig::default()` may prefer [`Metaspace::with_default`]
+    /// for the common case where validation cannot fail.
+    pub fn new(config: MetaspaceConfig) -> Result<Self, MetaspaceConfigError> {
+        config.validate()?;
+        Ok(Self {
             config,
             chunks: Vec::new(),
             total_capacity: 0,
@@ -172,7 +271,20 @@ impl Metaspace {
             high_water_mark: 0,
             next_chunk_id: 1,
             gc_count: 0,
-        }
+        })
+    }
+
+    /// Convenience constructor using [`MetaspaceConfig::default`].
+    ///
+    /// The default config is statically known to pass validation, so this
+    /// constructor is infallible (`.unwrap()`-free at call sites). Prefer
+    /// [`Metaspace::new`] when callers need explicit config control and
+    /// must handle the validation error path.
+    pub fn with_default() -> Self {
+        // The Default impl is engineered to always validate. If a future
+        // edit breaks that invariant this expect will fire at first use.
+        Self::new(MetaspaceConfig::default())
+            .expect("MetaspaceConfig::default() must always validate")
     }
 
     /// Determine chunk type from size.
@@ -571,7 +683,7 @@ mod tests {
 
     #[test]
     fn allocate_small() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let alloc = ms.allocate(128, 1).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(alloc.size, 128);
@@ -581,7 +693,7 @@ mod tests {
 
     #[test]
     fn allocate_fits_existing_chunk() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let a1 = ms.allocate(100, 1).unwrap();
         let a2 = ms.allocate(200, 1).unwrap();
         // Should reuse the same chunk.
@@ -595,7 +707,7 @@ mod tests {
     fn allocate_new_chunk_when_full() {
         let mut cfg = MetaspaceConfig::default();
         cfg.small_chunk_size = 256;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         let a1 = ms.allocate(256, 1).unwrap(); // fills the small chunk
         let a2 = ms.allocate(64, 1).unwrap(); // needs a new chunk
         assert_ne!(a1.chunk_id, a2.chunk_id);
@@ -604,7 +716,7 @@ mod tests {
 
     #[test]
     fn allocate_different_loaders_get_different_chunks() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let a1 = ms.allocate(64, 1).unwrap();
         let a2 = ms.allocate(64, 2).unwrap();
         assert_ne!(a1.chunk_id, a2.chunk_id);
@@ -612,7 +724,7 @@ mod tests {
 
     #[test]
     fn allocate_medium_chunk() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let alloc = ms.allocate(8192, 1).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(ms.chunks[0].chunk_type, ChunkType::Medium);
@@ -620,7 +732,7 @@ mod tests {
 
     #[test]
     fn allocate_large_chunk() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let alloc = ms.allocate(128 * 1024, 1).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(ms.chunks[0].chunk_type, ChunkType::Large);
@@ -628,7 +740,7 @@ mod tests {
 
     #[test]
     fn allocate_humongous_chunk() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let alloc = ms.allocate(512 * 1024, 1).unwrap();
         assert_eq!(alloc.offset, 0);
         assert_eq!(ms.chunks[0].chunk_type, ChunkType::Humongous);
@@ -642,7 +754,7 @@ mod tests {
         let mut cfg = MetaspaceConfig::default();
         cfg.max_metaspace_size = 1024;
         cfg.small_chunk_size = 512;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         ms.allocate(256, 1).unwrap(); // 512-byte chunk
         ms.allocate(256, 2).unwrap(); // 512-byte chunk -> total_capacity = 1024
         let err = ms.allocate(256, 3).unwrap_err();
@@ -660,7 +772,7 @@ mod tests {
         let mut cfg = MetaspaceConfig::default();
         cfg.max_metaspace_size = 4096;
         cfg.small_chunk_size = 4096;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         ms.allocate(4096, 1).unwrap();
         assert_eq!(ms.total_capacity, 4096);
     }
@@ -669,7 +781,7 @@ mod tests {
 
     #[test]
     fn free_loader_metaspace_basic() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(512, 1).unwrap();
         ms.allocate(256, 1).unwrap();
         let freed = ms.free_loader_metaspace(1);
@@ -682,7 +794,7 @@ mod tests {
 
     #[test]
     fn free_loader_does_not_affect_other_loaders() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(512, 1).unwrap();
         ms.allocate(256, 2).unwrap();
         ms.free_loader_metaspace(1);
@@ -692,7 +804,7 @@ mod tests {
 
     #[test]
     fn free_nonexistent_loader_is_noop() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(128, 1).unwrap();
         let freed = ms.free_loader_metaspace(999);
         assert_eq!(freed.chunks_freed, 0);
@@ -705,7 +817,7 @@ mod tests {
     fn reuse_freed_chunk() {
         let mut cfg = MetaspaceConfig::default();
         cfg.small_chunk_size = 4096;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         ms.allocate(1024, 1).unwrap();
         ms.free_loader_metaspace(1);
         // Now allocate for loader 2 — should reuse the free chunk.
@@ -721,7 +833,7 @@ mod tests {
     fn should_trigger_gc_below_threshold() {
         let mut cfg = MetaspaceConfig::default();
         cfg.gc_threshold = 1024;
-        let ms = Metaspace::new(cfg);
+        let ms = Metaspace::new(cfg).unwrap();
         assert!(!ms.should_trigger_gc());
     }
 
@@ -730,14 +842,14 @@ mod tests {
         let mut cfg = MetaspaceConfig::default();
         cfg.gc_threshold = 256;
         cfg.small_chunk_size = 4096;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         ms.allocate(256, 1).unwrap();
         assert!(ms.should_trigger_gc());
     }
 
     #[test]
     fn trigger_gc_reclaims_free_chunks() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(512, 1).unwrap();
         ms.allocate(256, 2).unwrap();
         ms.free_loader_metaspace(1);
@@ -753,7 +865,7 @@ mod tests {
     fn trigger_gc_updates_threshold() {
         let mut cfg = MetaspaceConfig::default();
         cfg.gc_threshold = 100;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         ms.allocate(64, 1).unwrap();
         ms.free_loader_metaspace(1);
         let result = ms.trigger_gc();
@@ -763,7 +875,7 @@ mod tests {
 
     #[test]
     fn trigger_gc_increments_count() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.trigger_gc();
         ms.trigger_gc();
         assert_eq!(ms.gc_count, 2);
@@ -773,7 +885,7 @@ mod tests {
     fn trigger_gc_merges_consecutive_same_loader_chunks() {
         let mut cfg = MetaspaceConfig::default();
         cfg.small_chunk_size = 128;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         // Force two chunks for same loader by filling the first.
         ms.allocate(128, 1).unwrap();
         ms.allocate(64, 1).unwrap();
@@ -789,7 +901,7 @@ mod tests {
 
     #[test]
     fn high_water_mark_tracks_peak() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(1024, 1).unwrap();
         ms.allocate(2048, 2).unwrap();
         let peak = ms.high_water_mark;
@@ -801,7 +913,7 @@ mod tests {
 
     #[test]
     fn get_stats_basic() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(256, 1).unwrap();
         let stats = ms.get_stats();
         assert!(stats.committed > 0);
@@ -814,7 +926,7 @@ mod tests {
 
     #[test]
     fn get_stats_with_free_chunks() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(128, 1).unwrap();
         ms.allocate(128, 2).unwrap();
         ms.free_loader_metaspace(1);
@@ -826,7 +938,7 @@ mod tests {
 
     #[test]
     fn chunk_type_classification() {
-        let ms = Metaspace::new(MetaspaceConfig::default());
+        let ms = Metaspace::with_default();
         assert_eq!(ms.chunk_type_for_size(1024), ChunkType::Small);
         assert_eq!(ms.chunk_type_for_size(4096), ChunkType::Small);
         assert_eq!(ms.chunk_type_for_size(8192), ChunkType::Medium);
@@ -995,7 +1107,7 @@ mod tests {
 
     #[test]
     fn integration_allocate_and_track() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let mut reg = MetaspaceRegistry::new();
 
         reg.register_loader(1, "bootstrap".into());
@@ -1011,7 +1123,7 @@ mod tests {
 
     #[test]
     fn integration_loader_gc_cycle() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let mut reg = MetaspaceRegistry::new();
 
         reg.register_loader(1, "webapp".into());
@@ -1033,7 +1145,7 @@ mod tests {
     fn integration_multiple_loaders_partial_gc() {
         let mut cfg = MetaspaceConfig::default();
         cfg.gc_threshold = 1024;
-        let mut ms = Metaspace::new(cfg);
+        let mut ms = Metaspace::new(cfg).unwrap();
         let mut reg = MetaspaceRegistry::new();
 
         reg.register_loader(1, "boot".into());
@@ -1058,14 +1170,14 @@ mod tests {
 
     #[test]
     fn allocate_zero_size() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let alloc = ms.allocate(0, 1).unwrap();
         assert_eq!(alloc.size, 0);
     }
 
     #[test]
     fn free_loader_twice_is_safe() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         ms.allocate(128, 1).unwrap();
         ms.free_loader_metaspace(1);
         let freed = ms.free_loader_metaspace(1);
@@ -1074,9 +1186,87 @@ mod tests {
 
     #[test]
     fn gc_on_empty_metaspace() {
-        let mut ms = Metaspace::new(MetaspaceConfig::default());
+        let mut ms = Metaspace::with_default();
         let result = ms.trigger_gc();
         assert_eq!(result.chunks_freed, 0);
         assert_eq!(result.bytes_reclaimed, 0);
+    }
+
+    // -- MetaspaceConfig validation ----------------------------------------
+
+    #[test]
+    fn config_default_validates() {
+        assert!(MetaspaceConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn config_inverted_free_ratio_rejected() {
+        let cfg = MetaspaceConfig {
+            min_free_ratio: 0.9,
+            max_free_ratio: 0.4,
+            ..MetaspaceConfig::default()
+        };
+        match Metaspace::new(cfg).unwrap_err() {
+            MetaspaceConfigError::InvertedFreeRatio { .. } => {}
+            other => panic!("expected InvertedFreeRatio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_ratio_out_of_range_rejected() {
+        let cfg = MetaspaceConfig {
+            min_free_ratio: -0.1,
+            ..MetaspaceConfig::default()
+        };
+        assert!(matches!(
+            Metaspace::new(cfg).unwrap_err(),
+            MetaspaceConfigError::RatioOutOfRange { name: "min_free_ratio", .. }
+        ));
+
+        let cfg2 = MetaspaceConfig {
+            max_free_ratio: 1.5,
+            ..MetaspaceConfig::default()
+        };
+        assert!(matches!(
+            Metaspace::new(cfg2).unwrap_err(),
+            MetaspaceConfigError::RatioOutOfRange { name: "max_free_ratio", .. }
+        ));
+    }
+
+    #[test]
+    fn config_nan_ratio_rejected() {
+        let cfg = MetaspaceConfig {
+            min_free_ratio: f64::NAN,
+            ..MetaspaceConfig::default()
+        };
+        assert!(matches!(
+            Metaspace::new(cfg).unwrap_err(),
+            MetaspaceConfigError::RatioOutOfRange { .. }
+        ));
+    }
+
+    #[test]
+    fn config_inverted_chunk_sizes_rejected() {
+        let cfg = MetaspaceConfig {
+            small_chunk_size: 8192,
+            medium_chunk_size: 4096,
+            ..MetaspaceConfig::default()
+        };
+        assert!(matches!(
+            Metaspace::new(cfg).unwrap_err(),
+            MetaspaceConfigError::InvalidChunkSizes { .. }
+        ));
+    }
+
+    #[test]
+    fn config_zero_chunk_size_rejected() {
+        let cfg = MetaspaceConfig {
+            small_chunk_size: 0,
+            ..MetaspaceConfig::default()
+        };
+        assert!(matches!(
+            Metaspace::new(cfg).unwrap_err(),
+            MetaspaceConfigError::InvalidChunkSizes { .. }
+        ));
     }
 }
