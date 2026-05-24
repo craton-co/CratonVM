@@ -52,6 +52,63 @@ use cratonvm_types::error::{ClassFileError, LinkageError, VmError};
 /// [`ClassManager::set_class_bytes_cache_cap`].
 pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
 
+/// Storage type for the `(loader_id, class_name) → ClassId` index.
+///
+/// C34 audit fix (HIGH): switched from `rustc_hash::FxHashMap`
+/// (std HashMap) to `hashbrown::HashMap` so the hot-path lookup helper
+/// [`loaded_classes_probe`] can use the stable `raw_entry` API to probe
+/// a `(ClassLoaderId, &str)` key against the stored
+/// `(ClassLoaderId, Arc<str>)` key without allocating a fresh
+/// `Arc<str>` per call. Insert / remove / iter sites are API-compatible
+/// (hashbrown's `HashMap` is the implementation underlying std's).
+type LoadedClassesMap =
+    hashbrown::HashMap<(ClassLoaderId, Arc<str>), ClassId, crate::fx_hash::FxBuildHasher>;
+
+/// Hash a borrowed `(ClassLoaderId, &str)` lookup key against the given
+/// `FxBuildHasher`, producing a hash byte-identical to what the owned
+/// `(ClassLoaderId, Arc<str>)` storage key would produce.
+///
+/// Soundness: the tuple `Hash` impl walks each field in order; `Arc<str>`
+/// derefs to `str` and `Hash for str` walks the same bytes as a `&str`,
+/// so the borrowed and owned forms yield identical hashes.
+#[inline]
+fn hash_loaded_classes_key(
+    hasher: &crate::fx_hash::FxBuildHasher,
+    loader_id: ClassLoaderId,
+    name: &str,
+) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = hasher.build_hasher();
+    loader_id.hash(&mut h);
+    name.hash(&mut h);
+    h.finish()
+}
+
+/// Zero-allocation probe into [`LoadedClassesMap`] by borrowed
+/// `(ClassLoaderId, &str)` key. Returns `Some(class_id)` on hit.
+///
+/// C34 audit fix (HIGH): replaces the round-9-CRIT-2-half-fixed pattern
+/// of `Arc::from(name)` (or `intern_arc(name)`) followed by `HashMap::get`
+/// — both of which paid a per-call allocation (`Arc::from`) or a global
+/// pool lock (`intern_arc`) on every dynamic dispatch / `Class.forName`
+/// / `Constant_Class` resolution. Uses hashbrown's stable `raw_entry`
+/// API to compute the hash once and walk the bucket via a custom
+/// equality closure: cache hit costs a hash + one or two pointer / byte
+/// comparisons, with no `Arc<str>` ever materialised.
+#[inline]
+fn loaded_classes_probe(
+    map: &LoadedClassesMap,
+    loader_id: ClassLoaderId,
+    name: &str,
+) -> Option<ClassId> {
+    let hash = hash_loaded_classes_key(map.hasher(), loader_id, name);
+    map.raw_entry()
+        .from_hash(hash, |(k_loader, k_name)| {
+            *k_loader == loader_id && k_name.as_ref() == name
+        })
+        .map(|(_, &id)| id)
+}
+
 /// Adapter implementing [`ClassHierarchy`] over the `ClassManager`'s
 /// `ClassStore` + name-to-id index. Used by the verifier (Pass 2 / Pass 3)
 /// during `define_class_with_options`.
@@ -66,7 +123,7 @@ pub const DEFAULT_CLASS_BYTES_CACHE_CAP: usize = 16 * 1024 * 1024;
 /// verification is simply dropped.
 struct ClassStoreHierarchy<'a> {
     class_store: &'a ClassStore,
-    loaded_classes: &'a FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
+    loaded_classes: &'a LoadedClassesMap,
     /// The class currently being verified (not yet in `class_store`).
     in_flight: Option<&'a Class>,
 }
@@ -80,15 +137,22 @@ impl<'a> ClassStoreHierarchy<'a> {
                 return Some(inflight.id);
             }
         }
-        // Probe with `Arc<str>` to match the storage map's key type.
-        let probe: Arc<str> = Arc::from(name);
+        // C34 audit fix (HIGH): zero-allocation probe. The previous
+        // `Arc::from(name)` minted a fresh `Arc<str>` on EVERY lookup
+        // (round-9 CRIT-2 carry — class lookup happens at every dynamic
+        // dispatch / `Class.forName` / `Constant_Class` resolution; Spring
+        // cold start measured >100k hits). With hashbrown's `raw_entry`
+        // API we hash the borrowed `(loader_id, &str)` tuple directly and
+        // probe the bucket using a custom equality closure — no `Arc<str>`
+        // is allocated unless we are about to insert.
+        //
         // Round 9 audit fix (HIGH #6): iterate over the canonical
         // `BUILTIN_LOADER_DELEGATION_CHAIN` constant instead of re-inlining
         // the same 3-element array (Bootstrap, Extension, Application).
         // Adding a new built-in loader (e.g. JEP-261 platform loader) now
         // only requires editing the constant in `loaders.rs`.
         for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-            if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
+            if let Some(id) = loaded_classes_probe(self.loaded_classes, *loader_id, name) {
                 return Some(id);
             }
         }
@@ -765,7 +829,13 @@ pub struct ClassManager {
     /// could not coexist through that map. `get_loaded_class_id` now
     /// walks this `(ClassLoaderId, Arc<str>)`-keyed map directly, which
     /// is collision-free (full name comparison) and loader-aware.
-    loaded_classes: FxHashMap<(ClassLoaderId, Arc<str>), ClassId>,
+    ///
+    /// C34 audit fix (HIGH): `hashbrown::HashMap` (not `std::HashMap`) so
+    /// hot lookup paths can probe `(loader_id, &str)` via `raw_entry`
+    /// without minting a fresh `Arc<str>` per call. Insert / remove sites
+    /// retain the std HashMap API surface — hashbrown's `HashMap` is the
+    /// underlying implementation of std's anyway.
+    loaded_classes: LoadedClassesMap,
 
     /// JPMS module registry: descriptors, package map, readability graph.
     pub module_registry: ModuleRegistry,
@@ -1168,7 +1238,7 @@ impl ClassManager {
             bootstrap,
             extension,
             application,
-            loaded_classes: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            loaded_classes: hashbrown::HashMap::with_capacity_and_hasher(256, Default::default()),
             module_registry,
             class_bytes_cache: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             class_bytes_cache_fifo: std::collections::VecDeque::with_capacity(128),
@@ -1258,14 +1328,17 @@ impl ClassManager {
     /// loaders are then linearly scanned (rare path — only relevant once
     /// `URLClassLoader`-style user loaders are wired up).
     pub fn get_loaded_class_id(&self, name: &str) -> Option<ClassId> {
-        // Probe the three built-in loaders first with a single Arc
-        // allocation (refcount-shared across all three lookups).
-        let probe: Arc<str> = Arc::from(name);
+        // C34 audit fix (HIGH): zero-allocation probe via
+        // `loaded_classes_probe` (hashbrown `raw_entry`). Previously this
+        // minted a fresh `Arc<str>` per probe (round-9 CRIT-2 carry) —
+        // Spring cold start hits this >100k times, so the per-call
+        // allocation was visible on `perf top`.
+        //
         // Round 9 audit fix (HIGH #6): iterate over the canonical
         // `BUILTIN_LOADER_DELEGATION_CHAIN` constant rather than re-inlining
         // the (Bootstrap, Extension, Application) array.
         for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-            if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&probe))) {
+            if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
                 return Some(id);
             }
         }
@@ -1276,9 +1349,7 @@ impl ClassManager {
         // "no user loaders" case at zero extra work.
         if !self.user_loaders.is_empty() {
             for loader_id in &self.user_loaders {
-                if let Some(&id) =
-                    self.loaded_classes.get(&(*loader_id, Arc::clone(&probe)))
-                {
+                if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
                     return Some(id);
                 }
             }
@@ -2087,12 +2158,13 @@ impl ClassManager {
             .clone()
             .unwrap_or_else(|| class_file.this_class.to_string());
         if !options.allow_redefine && !options.hidden {
-            // T10.9.E: probe key uses `Arc::from(&str)`. The hot insert path
-            // below builds a real `Arc<str>` from `class.name` (the
-            // pool-interned name); the rare duplicate-define probe pays one
-            // allocation, same as the prior `clone()` of the String preview.
-            let key = (loader_id, Arc::<str>::from(stored_name_preview.as_str()));
-            if self.loaded_classes.contains_key(&key) {
+            // C34 audit fix (HIGH): zero-allocation probe via the
+            // borrowed-key helper. The hot insert path below still
+            // builds a real `Arc<str>` from `class.name` (the
+            // pool-interned name); the duplicate-define probe now pays
+            // zero extra allocation regardless of how many classes the
+            // loader has defined.
+            if loaded_classes_probe(&self.loaded_classes, loader_id, &stored_name_preview).is_some() {
                 return Err(VmError::Linkage(
                     LinkageError::IncompatibleClassChangeError {
                         message: format!(
@@ -2424,11 +2496,13 @@ impl ClassManager {
             // composite key — two hidden classes with the same internal
             // name in different loaders are fine.
             //
-            // T10.9.E: this loop's per-iteration cost is dominated by the
-            // `format!` building a fresh suffixed name; one extra
-            // `Arc::from(&str)` per probe is in the noise.
+            // C34 audit fix (HIGH): borrowed-key `raw_entry` probe — no
+            // `Arc::from(&str)` per iteration. The dominant per-iteration
+            // cost remains the `format!` building the suffixed name, but
+            // the cumulative allocation tax across the loop (and across
+            // every hidden-class define) is now zero.
             let mut probe_name = stored_name.clone();
-            while self.loaded_classes.contains_key(&(loader_id, Arc::<str>::from(probe_name.as_str()))) {
+            while loaded_classes_probe(&self.loaded_classes, loader_id, &probe_name).is_some() {
                 self.hidden_name_counter = self.hidden_name_counter.wrapping_add(1);
                 probe_name = format!("{}/0x{:x}", stored_name, self.hidden_name_counter);
             }
@@ -3975,17 +4049,15 @@ impl ClassManager {
         // Application.
 
         for key in &keys {
-            // Round 8 audit fix (HIGH #6): route through `intern_arc` so
-            // we share the global pool's Arc with the original class
-            // registration — the `loaded_classes` keys were inserted as
-            // `intern_arc(...)` results, so `Arc::ptr_eq` hits before
-            // any byte comparison. The previous `Arc::from(&str)` minted
-            // a *fresh* Arc per probe, forcing the HashMap to fall
-            // through to a full `str` comparison on every loader-tuple
-            // lookup.
-            let arc_key: Arc<str> = cratonvm_types::intern_arc(key.as_str());
+            // C34 audit fix (HIGH): zero-allocation borrowed-key probe.
+            // Previously Round 8 audit fix (HIGH #6) routed through
+            // `intern_arc` to share the pool Arc with the original
+            // registration — that avoided the byte comparison but still
+            // paid a global-pool RwLock read per probe. The hashbrown
+            // `raw_entry` path here pays neither an allocation nor a
+            // pool lock; the bucket walk does a direct `&str` comparison.
             for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-                if let Some(&id) = self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key))) {
+                if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
                     if let Some(class) = self.get_class(id) {
                         if class.hidden {
                             continue;
@@ -4009,13 +4081,10 @@ impl ClassManager {
         // the set is empty and we skip the inner loop entirely.
         if !self.user_loaders.is_empty() {
             for key in &keys {
-                // Round 8 audit fix (HIGH #6): same intern_arc routing as
-                // the builtin loaders loop above.
-                let arc_key: Arc<str> = cratonvm_types::intern_arc(key.as_str());
+                // C34 audit fix (HIGH): zero-allocation borrowed-key probe
+                // (same rationale as the builtin loaders loop above).
                 for loader_id in &self.user_loaders {
-                    if let Some(&id) =
-                        self.loaded_classes.get(&(*loader_id, Arc::clone(&arc_key)))
-                    {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
                         if let Some(class) = self.get_class(id) {
                             if class.hidden {
                                 continue;
@@ -4032,12 +4101,13 @@ impl ClassManager {
     /// Find a class by name within a specific loader's namespace, with delegation
     /// fallback to the standard loader chain (Bootstrap → Extension → Application).
     pub fn find_class_by_name_in_loader(&self, name: &str, loader_id: ClassLoaderId) -> Option<ClassId> {
-        // Check the specific loader first.
-        // Round 8 audit fix (HIGH #6): use `intern_arc` so the key
-        // shares the global pool Arc with the original registration —
-        // `Arc::ptr_eq` hits before any byte comparison. Previously
-        // `Arc::<str>::from(name)` minted a fresh Arc per probe.
-        if let Some(&id) = self.loaded_classes.get(&(loader_id, cratonvm_types::intern_arc(name))) {
+        // C34 audit fix (HIGH): zero-allocation borrowed-key probe.
+        // Previously Round 8 audit fix (HIGH #6) used `intern_arc` so the
+        // probe Arc shared the global pool with the original
+        // registration — saving the byte comparison but still paying a
+        // global RwLock read. The hashbrown `raw_entry` path here pays
+        // neither.
+        if let Some(id) = loaded_classes_probe(&self.loaded_classes, loader_id, name) {
             return Some(id);
         }
         // Delegate to parent chain
