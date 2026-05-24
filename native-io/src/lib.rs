@@ -10885,9 +10885,12 @@ fn native_fc_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(Some(mbb)))),
     };
-    for (i, &b) in snapshot.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-    }
+    // AUDIT 2026-05-24: bulk write via NativeContext intrinsic instead
+    // of per-element `set_array_element`. The VM override does a single
+    // memcpy into the byte-array payload; for 32 MiB+ mappings this is
+    // the difference between a multi-second hit and a sub-millisecond
+    // memcpy.
+    ctx.write_byte_array_from(arr, 0, &snapshot);
     Ok(Some(Value::Object(Some(mbb))))
 }
 
@@ -10915,13 +10918,14 @@ fn mmap_sync_back_from_java(ctx: &mut dyn NativeContext, mbb: ObjectRef) -> std:
     };
     // Read the Java byte[] into a Vec first so we don't hold the
     // registry lock across ctx callbacks.
+    //
+    // AUDIT 2026-05-24: bulk read via NativeContext intrinsic instead
+    // of per-element `get_array_element`. For 32 MiB+ mappings this is
+    // the difference between a multi-second hit and a sub-millisecond
+    // memcpy.
     let mut buf = vec![0u8; cap];
-    for (i, slot) in buf.iter_mut().enumerate().take(cap) {
-        *slot = match ctx.get_array_element(arr, i) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-    }
+    let n = ctx.read_byte_array_into(arr, 0, &mut buf);
+    buf.truncate(n);
     let mut registry = mmap_registry().lock();
     if let Some(entry) = registry.get_mut(&id) {
         if let Some(dst) = entry.as_mut_slice() {

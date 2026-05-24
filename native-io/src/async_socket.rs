@@ -927,7 +927,7 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let host_str = ctx.create_string(&addr);
         ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
     }
-    if let Err(_) = job_sender().send(Job::Connect {
+    if let Err(e) = job_sender().send(Job::Connect {
         id,
         addr,
         handler,
@@ -936,6 +936,14 @@ fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         // park a `F_CONNECTED = 0` reset on connect failure.
         channel: Some(this),
     }) {
+        // 2026-05-24: previously swallowed with `Err(_)`; the caller
+        // and the user-visible CompletionHandler had no way to
+        // distinguish "channel just closed" from any other failure.
+        // Log the structured error and surface it.
+        eprintln!(
+            "native-io: aio_asc_connect: job channel closed; \
+             CompletionHandler will not fire (id={id}, err={e})"
+        );
         return Err(ioex("connect: aio worker pool unavailable"));
     }
     // Mark connected synchronously since the JDK Java code expects to
@@ -1040,7 +1048,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         }
         return Ok(Some(Value::Object(None)));
     }
-    if let Err(_) = job_sender().send(Job::Read {
+    if let Err(e) = job_sender().send(Job::Read {
         id,
         len: length as usize,
         bb_addr: addr,
@@ -1050,6 +1058,10 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         handler,
         attachment,
     }) {
+        eprintln!(
+            "native-io: aio_asc_read: job channel closed; \
+             CompletionHandler will not fire (id={id}, err={e})"
+        );
         return Err(ioex("read: aio worker pool unavailable"));
     }
     Ok(Some(Value::Object(None)))
@@ -1079,13 +1091,17 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         return Ok(Some(Value::Object(None)));
     }
-    if let Err(_) = job_sender().send(Job::Write {
+    if let Err(e) = job_sender().send(Job::Write {
         id,
         data,
         bb_obj: bb,
         handler,
         attachment,
     }) {
+        eprintln!(
+            "native-io: aio_asc_write: job channel closed; \
+             CompletionHandler will not fire (id={id}, err={e})"
+        );
         return Err(ioex("write: aio worker pool unavailable"));
     }
     Ok(Some(Value::Object(None)))
@@ -1137,11 +1153,15 @@ fn aio_assc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let attachment = obj_or_none(args, 1);
     let handler = obj_or_none(args, 2);
     let id = read_aio_id(ctx, this).ok_or_else(|| ioex("accept: not bound"))?;
-    if let Err(_) = job_sender().send(Job::Accept {
+    if let Err(e) = job_sender().send(Job::Accept {
         id,
         handler,
         attachment,
     }) {
+        eprintln!(
+            "native-io: aio_assc_accept: job channel closed; \
+             CompletionHandler will not fire (id={id}, err={e})"
+        );
         return Err(ioex("accept: aio worker pool unavailable"));
     }
     Ok(Some(Value::Object(None)))

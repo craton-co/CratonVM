@@ -254,17 +254,39 @@ fn native_fc_map0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// `unmap0(long addr, long size) -> int` — drops the mapping at
 /// `addr`, releasing the OS pages. Returns 0 on success.
 ///
-/// `size` is ignored: we look up by base address since each
-/// mapping owns its own `Mmap`/`MmapMut` whose `Drop` calls
-/// `munmap` / `UnmapViewOfFile`.
+/// We look up by base address since each mapping owns its own
+/// `Mmap`/`MmapMut` whose `Drop` calls `munmap` / `UnmapViewOfFile`,
+/// so the kernel-side reclamation does not need `size`. We still
+/// honour `size` as a defensive check: if the JDK shim passes a
+/// `size` that disagrees with the size we recorded at `map0`-time,
+/// log a warning (the shim is buggy or a malicious caller is
+/// passing fabricated metadata). We then proceed to drop the
+/// registered entry — the real mapping length wins because the
+/// `Mmap` holder carries it.
 fn native_fc_unmap0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = long_arg(args, 0) as usize;
+    let size = long_arg(args, 1);
     if addr == 0 {
         // Tolerate a null unmap — matches JDK behavior where unmap
         // on an already-released buffer is a no-op.
         return Ok(Some(Value::Int(0)));
     }
     let mut reg = mmap_registry().lock();
+    // Defensive check: warn if the caller's claimed size doesn't
+    // match what we recorded at map0. This catches buggy JDK shims
+    // and adversarial callers that fabricate metadata. The drop
+    // path is still correct (the holder knows its true length),
+    // so we proceed regardless.
+    if let Some(entry) = reg.get(&addr) {
+        let true_len = entry.len() as i64;
+        if size > 0 && size != true_len {
+            eprintln!(
+                "native-io: FileChannelImpl.unmap0(addr=0x{addr:x}, size={size}) \
+                 disagrees with recorded mapping length {true_len}; proceeding \
+                 with true length (possible JDK shim bug or fabricated metadata)"
+            );
+        }
+    }
     // Drop here unmaps. If the address isn't in the registry we
     // still return 0 (the JDK may double-unmap on cleaner races,
     // and there is no harm in absorbing those).
@@ -553,11 +575,34 @@ fn transfer_via_sendfile(
     // Destination might be a regular file too (e.g. file-to-file
     // copy via FileChannel). If it's a socket we'd ideally use
     // TcpStream::as_raw_fd, but for now restrict to file dst.
+    //
+    // AUDIT 2026-05-24: this `clone_file` may return Err for either
+    //   (a) "destination is not a regular file" — e.g. a socket or
+    //       pipe entry in the FdTable that has no underlying `File`
+    //       handle to clone, OR
+    //   (b) "destination IS a regular file but its FdTable entry is
+    //       a wrapper (RWStream, BufWriter-wrapped, etc.) that
+    //       `clone_file` cannot dup without breaking buffering."
+    // In both cases the *correct* behaviour is to fall back to the
+    // userspace loop, so we collapse the distinction here. The
+    // userspace path handles all destination kinds correctly; the
+    // only cost is the missed sendfile zero-copy optimisation. We
+    // log the kind that triggered the fallback so future debugging
+    // can tell sockets-as-dst apart from file-but-not-cloneable.
     let dst_file = match ctx.fd_table().clone_file(dst_fd) {
         Ok(f) => f,
-        Err(_) => {
-            // Non-file destination — let the caller use the
-            // userspace fallback.
+        Err(e) => {
+            // Distinguish (a) vs (b) by inspecting the error string:
+            // we don't have a public "is_regular_file" probe, but
+            // `clone_file` already failed — `e` carries the kind hint.
+            // We surface that diagnostically without changing control
+            // flow.
+            eprintln!(
+                "native-io: transferTo0: sendfile fast-path declined \
+                 (dst_fd={dst_fd}, clone_file err='{e}'); falling \
+                 back to userspace copy. This is a correctness no-op \
+                 — only a perf regression."
+            );
             return Ok(None);
         }
     };
