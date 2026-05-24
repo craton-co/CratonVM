@@ -1049,6 +1049,71 @@ impl MonitorTable {
         f()
     }
 
+    /// Test-only inspection helper: return the current owner `ThreadId` of
+    /// the monitor for `obj_ref`, or `None` if the monitor is currently
+    /// unowned.
+    ///
+    /// For the thin-lock fast path the answer is derived from the mark word
+    /// directly (no allocation, no inflation). For the inflated path we look
+    /// up the registered `Arc<Monitor>` and read its owner field under the
+    /// monitor's state mutex. Returns `None` if the object has never been
+    /// entered.
+    ///
+    /// Used by `vm/tests/monitor_stress.rs` to assert the final monitor
+    /// state after a multi-threaded stress run completes. Not on the hot
+    /// path of the interpreter / native dispatch.
+    pub fn current_owner(&self, obj_ref: ObjectRef) -> Option<ThreadId> {
+        let header = header_of(obj_ref);
+        let mark = header.mark_word.load(Ordering::Acquire);
+        match ObjectHeader::mark_state(mark) {
+            s if s == types::MARK_THIN_LOCKED => {
+                Some(ThreadId(u64::from(ObjectHeader::thin_lock_owner(mark))))
+            }
+            s if s == types::MARK_INFLATED => {
+                let key = obj_ref.as_ptr() as usize;
+                let monitor = {
+                    let monitors = self.monitors.lock();
+                    monitors.get(&key).cloned()
+                };
+                monitor.and_then(|m| {
+                    let st = m.state.lock();
+                    st.owner
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Test-only inspection helper: return the current re-entry count of
+    /// the monitor for `obj_ref`. Returns `0` if the monitor is unowned,
+    /// has never been entered, or is currently in the NEUTRAL mark state.
+    ///
+    /// Thin-locked monitors report `recursion + 1` (the mark word encodes
+    /// the *additional* recursive acquires beyond the initial one, so a
+    /// freshly thin-locked object has recursion=0 / entry_count=1).
+    /// Inflated monitors report the raw `entry_count` field.
+    ///
+    /// Used by `vm/tests/monitor_stress.rs` to assert balanced
+    /// enter/exit pairs after multi-threaded contention.
+    pub fn entry_count(&self, obj_ref: ObjectRef) -> u32 {
+        let header = header_of(obj_ref);
+        let mark = header.mark_word.load(Ordering::Acquire);
+        match ObjectHeader::mark_state(mark) {
+            s if s == types::MARK_THIN_LOCKED => {
+                u32::from(ObjectHeader::thin_lock_recursion(mark)) + 1
+            }
+            s if s == types::MARK_INFLATED => {
+                let key = obj_ref.as_ptr() as usize;
+                let monitor = {
+                    let monitors = self.monitors.lock();
+                    monitors.get(&key).cloned()
+                };
+                monitor.map_or(0, |m| m.state.lock().entry_count)
+            }
+            _ => 0,
+        }
+    }
+
     /// Remap monitor keys after GC has moved objects.
     ///
     /// Takes a mapping from old pointer addresses to new pointer addresses.
