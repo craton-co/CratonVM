@@ -19,5 +19,13 @@ cratonvm-types = { path = "../types" }
 cratonvm-native-api = { path = "../native-api" }
 parking_lot.workspace = true
 
+[dev-dependencies]
+# Behavioural-coverage integration tests in `tests/` build a heap-backed
+# `MockCtx` against the `NativeContext` trait surface. The `test-mock`
+# feature pulls in the lightweight `test_mock::MockNativeContext` fixture
+# from `cratonvm-native-api` so tests can also exercise trait default-impl
+# methods directly (e.g. `atomic_fetch_add_int`) without re-rolling them.
+cratonvm-native-api = { path = "../native-api", features = ["test-mock"] }
+
 [lints]
 workspace = true
