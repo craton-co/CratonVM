@@ -2656,6 +2656,7 @@ impl GarbageCollector for G1Collector {
 
     fn collect_garbage(
         &self,
+        _stw: &crate::collector::StopTheWorldToken,
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
@@ -2969,6 +2970,13 @@ mod tests {
     struct NoopMonitors;
     impl MonitorCleanup for NoopMonitors {
         fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+    }
+
+    /// Test-only `StopTheWorldToken`. Single-threaded test harness, so the
+    /// STW invariant is trivially satisfied.
+    #[inline]
+    fn stw() -> crate::collector::StopTheWorldToken {
+        crate::collector::StopTheWorldToken::new()
     }
 
     fn small_config() -> G1CollectorConfig {
@@ -3604,7 +3612,7 @@ mod tests {
         gc.set_field(obj, 0, Value::Int(123));
 
         let mut roots = vec![obj];
-        let result = gc.collect_garbage(&mut roots, &NoopMonitors);
+        let result = gc.collect_garbage(&stw(), &mut roots, &NoopMonitors);
 
         assert!(result.stats.objects_copied >= 1);
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(123));
@@ -3924,7 +3932,7 @@ mod tests {
         assert!(!allocated.is_empty());
 
         // GC with all objects rooted — they move to survivor/old but still fill the heap
-        gc.collect_garbage(&mut allocated, &NoopMonitors);
+        gc.collect_garbage(&stw(), &mut allocated, &NoopMonitors);
 
         // Keep allocating until we're full again (GC freed Eden → moved to Survivor)
         loop {
@@ -3935,7 +3943,7 @@ mod tests {
         }
 
         // Now truly OOM with all roots held
-        gc.collect_garbage(&mut allocated, &NoopMonitors);
+        gc.collect_garbage(&stw(), &mut allocated, &NoopMonitors);
 
         // Fill again
         loop {
@@ -3993,7 +4001,7 @@ mod tests {
         }
         // Allocate in a new region by doing a collect first to free space
         let mut roots = vec![obj1];
-        gc.collect_garbage(&mut roots, &NoopMonitors);
+        gc.collect_garbage(&stw(), &mut roots, &NoopMonitors);
         let obj2 = gc.alloc_object(ClassId::new(1), 1);
 
         // Store obj2 ref in obj1 — triggers write barrier

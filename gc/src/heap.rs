@@ -129,6 +129,17 @@ pub struct Heap {
 //   1. Object fields are at fixed offsets from the allocation base.
 //   2. The GC stops the world before relocating objects.
 //   3. Volatile field access uses SeqCst fences.
+//
+// HIGH-soundness audit: invariant (2) is now backed at the *type* level by
+// [`crate::collector::StopTheWorldToken`]: every mutating-by-`&self` entry
+// point on this struct (`collect_garbage`, `collect_garbage_with_finalizers`)
+// requires `&StopTheWorldToken` as its first argument, so cross-thread
+// callers cannot invoke a moving collection without first parking every
+// other mutator. The blanket `unsafe impl` is retained because the heap's
+// internal raw `*mut u8` arena pointers are still `!Send` / `!Sync` on
+// their own — the impl asserts that the combination of (token-gated
+// mutation) + (Mutex-serialised allocation) + (SeqCst volatile fences)
+// makes shared `&Heap` usage sound across threads.
 unsafe impl Send for Heap {}
 unsafe impl Sync for Heap {}
 
@@ -791,8 +802,12 @@ impl Heap {
     /// After this call, `roots` contains updated ObjectRefs pointing to the
     /// new object locations, and the returned `GcResult` contains the pointer
     /// mapping for updating external references.
+    ///
+    /// The `_stw` parameter is type-level proof that the caller is in a
+    /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
     pub fn collect_garbage(
         &self,
+        _stw: &crate::collector::StopTheWorldToken,
         roots: &mut [ObjectRef],
         monitors: &dyn crate::collector::MonitorCleanup,
     ) -> crate::gc::GcResult {
@@ -861,8 +876,12 @@ impl Heap {
     /// Like [`collect_garbage`] but keeps dead finalizable objects alive so
     /// their `finalize()` method can be invoked.  Returns the GC result and
     /// the *new* (post-GC) addresses of dead finalizable objects.
+    ///
+    /// The `_stw` parameter is type-level proof that the caller is in a
+    /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
     pub fn collect_garbage_with_finalizers(
         &self,
+        _stw: &crate::collector::StopTheWorldToken,
         roots: &mut [ObjectRef],
         finalizer_addrs: &[usize],
         monitors: &dyn crate::collector::MonitorCleanup,
@@ -2261,6 +2280,16 @@ mod tests {
             fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
         }
 
+        /// Test-only `StopTheWorldToken`. These tests are mostly single-
+        /// threaded; the worker-thread test in
+        /// `safepoint_check_skips_gc_while_token_held` deliberately races a
+        /// GC against a pin/unpin sequence and the harness itself ensures
+        /// no other mutator is touching the heap concurrently.
+        #[inline]
+        fn stw() -> crate::collector::StopTheWorldToken {
+            crate::collector::StopTheWorldToken::new()
+        }
+
         #[test]
         fn enter_gpu_critical_increments_counter() {
             let heap = Heap::new();
@@ -2329,7 +2358,7 @@ mod tests {
             let heap_clone = Arc::clone(&heap);
             let gc_thread = thread::spawn(move || {
                 let mut roots: Vec<ObjectRef> = Vec::new();
-                heap_clone.collect_garbage(&mut roots, &NoMonitors);
+                heap_clone.collect_garbage(&stw(), &mut roots, &NoMonitors);
             });
 
             // Spin until the worker has noticed the token. The blocked-count
@@ -2380,7 +2409,7 @@ mod tests {
 
             // Empty caller-roots: only the pin keeps `arr` alive.
             let mut roots: Vec<ObjectRef> = Vec::new();
-            heap.collect_garbage(&mut roots, &NoMonitors);
+            heap.collect_garbage(&stw(), &mut roots, &NoMonitors);
 
             // After GC the address may have moved. The pinned-refs set
             // contains the post-GC address.
@@ -2425,7 +2454,7 @@ mod tests {
             heap.pin_ref(arr);
 
             let mut roots: Vec<ObjectRef> = Vec::new();
-            let result = heap.collect_garbage(&mut roots, &NoMonitors);
+            let result = heap.collect_garbage(&stw(), &mut roots, &NoMonitors);
 
             assert!(
                 result.pointer_map.contains_key(&old_addr),

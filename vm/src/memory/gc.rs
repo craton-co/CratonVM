@@ -343,6 +343,12 @@ mod tests {
         Heap::with_capacity(8 * 1024)
     }
 
+    /// Test-only `StopTheWorldToken`. Single-threaded test harness.
+    #[inline]
+    fn stw() -> cratonvm_gc::collector::StopTheWorldToken {
+        cratonvm_gc::collector::StopTheWorldToken::new()
+    }
+
     #[test]
     fn gc_basic_copy_single_object() {
         let heap = small_heap();
@@ -385,7 +391,7 @@ mod tests {
         heap.set_field(obj, 1, Value::Long(100));
 
         let mut roots = vec![obj];
-        let result = heap.collect_garbage(&mut roots, &monitor_table);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitor_table);
 
         assert_eq!(result.stats.objects_copied, 1);
         assert_eq!(roots.len(), 1);
@@ -409,7 +415,7 @@ mod tests {
         monitor_table.enter(obj, tid);
 
         let mut roots = vec![obj];
-        let _result = heap.collect_garbage(&mut roots, &monitor_table);
+        let _result = heap.collect_garbage(&stw(), &mut roots, &monitor_table);
 
         let new_obj = roots[0];
         assert_ne!(new_obj.as_ptr(), obj.as_ptr());
@@ -470,7 +476,7 @@ mod tests {
         let old_ptr = obj.as_ptr();
 
         let mut roots = vec![obj, obj, obj];
-        let result = heap.collect_garbage(&mut roots, &monitor_table);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitor_table);
 
         thread.frames[0].update_local_refs(&result.pointer_map);
         thread.frames[0]

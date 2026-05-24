@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use cratonvm_gc::collector::MonitorCleanup;
+use cratonvm_gc::collector::{MonitorCleanup, StopTheWorldToken};
 use cratonvm_gc::g1::G1CollectorConfig;
 use cratonvm_gc::reference::{ReferenceProcessor, ReferenceType};
 use cratonvm_gc::{G1Collector, GenerationalHeap};
@@ -25,6 +25,13 @@ use cratonvm_types::{ClassId, Value};
 struct NoMonitors;
 impl MonitorCleanup for NoMonitors {
     fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+}
+
+/// Test-only `StopTheWorldToken`. Integration tests are single-threaded;
+/// no other mutator exists, so the STW invariant is trivially satisfied.
+#[inline]
+fn stw() -> StopTheWorldToken {
+    StopTheWorldToken::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -48,7 +55,7 @@ fn rh1_promotion_stats_bump_across_cycles() {
     assert_eq!(before.bytes_promoted, 0);
 
     for _ in 0..4 {
-        let _ = heap.collect_garbage(&mut roots, &NoMonitors);
+        let _ = heap.collect_garbage(&stw(), &mut roots, &NoMonitors);
     }
 
     let after = heap.stats().snapshot();
@@ -82,7 +89,7 @@ fn rh1_promoted_objects_survive_further_gcs() {
     heap.set_field(roots[0], 0, Value::Int(42));
 
     for _ in 0..5 {
-        let _ = heap.collect_garbage(&mut roots, &NoMonitors);
+        let _ = heap.collect_garbage(&stw(), &mut roots, &NoMonitors);
     }
 
     // Still reachable; identity hash unchanged; payload intact.
@@ -95,7 +102,7 @@ fn rh1_promoted_objects_survive_further_gcs() {
     // Double-free guard: allocating again and running a GC must not
     // crash or mis-relocate.
     let _fresh = heap.alloc_object(class_id, 0);
-    let _ = heap.collect_garbage(&mut roots, &NoMonitors);
+    let _ = heap.collect_garbage(&stw(), &mut roots, &NoMonitors);
 }
 
 // ---------------------------------------------------------------------------

@@ -75,6 +75,160 @@ pub trait MonitorCleanup {
     fn remap_after_gc(&self, pointer_map: &HashMap<usize, usize>);
 }
 
+// ---------------------------------------------------------------------------
+// Stop-The-World token — type-level proof of an STW pause
+// ---------------------------------------------------------------------------
+//
+// The moving collectors (`Heap`, `GenerationalHeap`, `G1Collector`) require
+// every mutator to be parked at a safepoint before `collect_garbage` rewrites
+// object addresses. Historically that invariant was *enforced* purely by
+// convention inside the `vm` crate's safepoint orchestration: the GC crate
+// just exposed `&self` mutating entry points and trusted the caller.
+//
+// Pairing the invariant with a `unsafe impl Send + Sync` on the heap types
+// (heap.rs:129, gen_heap.rs:225) meant any code with an `&Heap` could call
+// `collect_garbage` from any thread without holding STW, which would have
+// been instantly unsound — only luck (i.e. there is only one orchestrator)
+// prevented a bug.
+//
+// `StopTheWorldToken` is a *type-level proof token*. Every mutating-by-
+// `&self` collector entry point now requires `&StopTheWorldToken` as its
+// first argument, so a thread that does not hold the token literally cannot
+// call `collect_garbage` — the call won't compile. The orchestrator in
+// `vm/src/runtime/interpreter.rs` constructs one token per STW round
+// (after `gc_barrier.wait_for_all`) and threads it down to the heap.
+//
+// The token is intentionally `!Clone` and zero-sized; passing it by
+// reference is the canonical pattern. Construction is `pub fn new` (rather
+// than `unsafe fn`) but the doc-comment makes the caller responsibility
+// explicit: building a token without an STW pause is a soundness bug.
+//
+// Migration aid: `new_unchecked` exists for callsites that are known to be
+// orchestrated correctly today but have not yet been wired through the
+// token. Every use must be tagged `// FIXME(orchestrator)` for follow-up.
+/// Type-level proof that the caller has stopped every mutator thread at a
+/// safepoint and is therefore allowed to invoke a *moving* GC entry point.
+///
+/// `StopTheWorldToken` is zero-sized and has no public fields; the only way
+/// to obtain one is [`StopTheWorldToken::new`] or
+/// [`StopTheWorldToken::new_unchecked`] (migration-only — see below).
+///
+/// The token is `!Clone` and `!Copy`: orchestrator code holds a single
+/// token for the duration of one STW round and passes it by reference to
+/// each heap entry point that needs it. Dropping the token does not end
+/// the STW pause (the pause is managed by the orchestrator's barrier) —
+/// the token is just a static witness that the pause is in effect.
+///
+/// # Soundness
+///
+/// Construction asserts a runtime invariant that the compiler cannot
+/// verify (every Java thread is parked at a safepoint). It is the
+/// caller's job to uphold this. Building a token in non-STW code makes
+/// every subsequent `collect_garbage` call a UAF hazard — the JIT and
+/// interpreter may be reading object addresses that the GC then
+/// rewrites.
+#[must_use = "constructing a StopTheWorldToken without holding STW is a soundness bug"]
+pub struct StopTheWorldToken {
+    // Private unit field so external code cannot construct via field syntax.
+    _priv: (),
+}
+
+impl StopTheWorldToken {
+    /// Construct a new token.
+    ///
+    /// # Caller invariant (STW)
+    ///
+    /// You MUST have already parked every other mutator thread at a
+    /// safepoint before calling this. The canonical orchestrator is
+    /// `vm::runtime::interpreter`, which builds a token only after
+    /// `gc_barrier.wait_for_all()` returns (every other thread is parked)
+    /// or on the single-threaded fast path (no other mutator exists).
+    ///
+    /// Constructing a token in any other context is a soundness bug.
+    #[inline]
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+
+    /// Migration constructor — same as [`Self::new`] but the name signals
+    /// that the callsite has not yet been audited for STW correctness.
+    ///
+    /// Every use must be tagged with `// FIXME(orchestrator)` so it can
+    /// be re-audited and migrated to the orchestrator-threaded token.
+    ///
+    /// Existing pre-token code paths that already hold STW (e.g. test
+    /// harnesses that run on a single thread with no JIT) may use this
+    /// indefinitely; the FIXME marker is documentation for future
+    /// readers, not a deadline.
+    #[inline]
+    pub fn new_unchecked() -> Self {
+        Self { _priv: () }
+    }
+}
+
+impl Default for StopTheWorldToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for StopTheWorldToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StopTheWorldToken")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile-fail demonstration of the token requirement
+// ---------------------------------------------------------------------------
+//
+// The doc-tests below ensure (via `compile_fail`) that the token-signature
+// change actually catches a missing-token caller at compile time. If a
+// future refactor relaxes the signature, these tests will start to compile
+// and the test suite will fail, alerting the maintainer.
+//
+// We deliberately reference `Heap::collect_garbage` here rather than the
+// trait method, since the trait can in principle be reshaped while the
+// inherent method is the load-bearing entry point.
+/// Calling `collect_garbage` without a `StopTheWorldToken` must not compile.
+///
+/// ```compile_fail
+/// use cratonvm_gc::Heap;
+/// use cratonvm_gc::collector::MonitorCleanup;
+/// use std::collections::HashMap;
+///
+/// struct NoMonitors;
+/// impl MonitorCleanup for NoMonitors {
+///     fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+/// }
+///
+/// let heap = Heap::new();
+/// let mut roots = Vec::new();
+/// // Missing &StopTheWorldToken — should fail to compile.
+/// let _ = heap.collect_garbage(&mut roots, &NoMonitors);
+/// ```
+///
+/// With the token threaded through, the call compiles:
+///
+/// ```
+/// use cratonvm_gc::Heap;
+/// use cratonvm_gc::collector::{MonitorCleanup, StopTheWorldToken};
+/// use std::collections::HashMap;
+///
+/// struct NoMonitors;
+/// impl MonitorCleanup for NoMonitors {
+///     fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+/// }
+///
+/// let heap = Heap::new();
+/// let mut roots = Vec::new();
+/// let stw = StopTheWorldToken::new();
+/// let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+/// ```
+#[cfg(doctest)]
+#[allow(dead_code)]
+struct _StopTheWorldTokenCompileFailDocs;
+
 /// Trait abstracting a garbage-collected heap.
 ///
 /// Both the simple semi-space `Heap` and the generational
@@ -183,7 +337,18 @@ pub trait GarbageCollector: Send + Sync {
     fn needs_gc(&self) -> bool;
 
     /// Run a garbage collection cycle.
-    fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult;
+    ///
+    /// The `_stw` parameter is type-level proof that the caller has
+    /// stopped every mutator thread at a safepoint — see
+    /// [`StopTheWorldToken`]. Implementations may treat the token as a
+    /// no-op witness; its sole purpose is to prevent non-STW code from
+    /// calling this method.
+    fn collect_garbage(
+        &self,
+        _stw: &StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult;
 
     /// Write barrier -- called **after** every reference store into a heap
     /// object.

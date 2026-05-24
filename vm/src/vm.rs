@@ -59530,12 +59530,14 @@ mod tests {
         let heap = VmHeap::new(GcBackend::Generational, 256 * 1024); // 256 KB
         let monitors = crate::threading::monitor::MonitorTable::new();
         let mut roots: Vec<ObjectRef> = Vec::new();
+        // Single-threaded test — no other mutator exists.
+        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         for _ in 0..2000 {
             match heap.try_alloc_object(ClassId::new(0), 4) {
                 Some(_obj) => {} // ephemeral РІР‚вЂќ don't root
                 None => {
                     // GC and retry
-                    let _result = heap.collect_garbage(&mut roots, &monitors);
+                    let _result = heap.collect_garbage(&stw, &mut roots, &monitors);
                     let _obj = heap.try_alloc_object(ClassId::new(0), 4)
                         .expect("alloc should succeed after GC");
                 }
@@ -59588,11 +59590,13 @@ mod tests {
         let heap = VmHeap::new(GcBackend::Generational, 256 * 1024); // 256 KB
         let monitors = crate::threading::monitor::MonitorTable::new();
         let mut kept: Vec<ObjectRef> = Vec::new();
+        // Single-threaded test — no other mutator exists.
+        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         for i in 0..500 {
             let obj = match heap.try_alloc_object(ClassId::new(0), 2) {
                 Some(obj) => obj,
                 None => {
-                    heap.collect_garbage(&mut kept, &monitors);
+                    heap.collect_garbage(&stw, &mut kept, &monitors);
                     heap.try_alloc_object(ClassId::new(0), 2)
                         .expect("alloc after GC should succeed")
                 }

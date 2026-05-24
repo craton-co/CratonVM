@@ -116,7 +116,11 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // Single-threaded fast path: no barrier needed
             let gc_start = std::time::Instant::now();
             let mut roots = collect_roots(shared, thread);
-            let result = shared.heap.collect_garbage(&mut roots, &shared.monitors);
+            // STW invariant: single-threaded path means this thread is
+            // the only mutator — every other thread is implicitly
+            // "parked" (it doesn't exist). Construct the token directly.
+            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // Truncation-checked: as_millis returns u128 but GC duration fits u64
@@ -184,7 +188,10 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
                 roots.extend(snapshot_roots);
 
-                let result = shared.heap.collect_garbage(&mut roots, &shared.monitors);
+                // STW invariant: `gc_barrier.wait_for_all()` returned, so
+                // every mutator has parked at its safepoint poll.
+                let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+                let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
                 process_references_after_gc(shared, &result.pointer_map);
 
                 // Update shared VM state (statics, string pool, etc.)
@@ -235,7 +242,9 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     let alive_count = shared.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
-        let result = shared.heap.collect_garbage(&mut roots, &shared.monitors);
+        // STW invariant: single-threaded fast path — see `maybe_gc`.
+        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+        let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
@@ -248,7 +257,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
-            let result = shared.heap.collect_garbage(&mut roots, &shared.monitors);
+            // STW invariant: `wait_for_all()` returned — every mutator
+            // has parked at its safepoint poll.
+            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+            let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             shared.gc_barrier.complete_gc(result.pointer_map);
@@ -282,8 +294,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     let alive_count = shared.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
+        // STW invariant: single-threaded fast path — see `maybe_gc`.
+        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
-            &mut roots, &fin_addrs, &shared.monitors,
+            &stw, &mut roots, &fin_addrs, &shared.monitors,
         );
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
@@ -297,8 +311,11 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             let mut roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
+            // STW invariant: `wait_for_all()` returned — every mutator
+            // has parked at its safepoint poll.
+            let stw = cratonvm_gc::collector::StopTheWorldToken::new();
             let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
-                &mut roots, &fin_addrs, &shared.monitors,
+                &stw, &mut roots, &fin_addrs, &shared.monitors,
             );
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);

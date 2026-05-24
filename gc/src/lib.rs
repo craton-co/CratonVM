@@ -52,7 +52,7 @@ pub mod vm_heap;
 #[cfg(feature = "zgc")]
 pub mod zgc;
 
-pub use collector::{GarbageCollector, MonitorCleanup};
+pub use collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 pub use gc::{
     install_class_info_hook, install_gc_finish_hook, install_gc_start_hook, resolve_class_info,
     ClassInfoHook, JvmtiGcHook,

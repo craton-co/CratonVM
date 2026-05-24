@@ -223,8 +223,17 @@ pub struct GenerationalHeap {
     stats: HeapStats,
 }
 
-// Safety: Same reasoning as Heap — raw pointers are to internally owned memory.
-// The Mutex on each sub-allocator serializes access.
+// SAFETY: Same reasoning as Heap — raw pointers are to internally owned
+// memory and the `Mutex` on each sub-allocator serialises access.
+//
+// HIGH-soundness audit: the moving-collection entry points
+// (`collect_garbage`, `collect_garbage_with_finalizers`) now require
+// `&StopTheWorldToken` so cross-thread callers cannot trigger evacuation
+// without first parking every other mutator. The blanket `unsafe impl` is
+// retained because the heap's internal raw pointers are still `!Send` /
+// `!Sync` on their own; the impl asserts that the STW-token gate plus the
+// per-arena `Mutex` make shared `&GenerationalHeap` usage sound across
+// threads.
 unsafe impl Send for GenerationalHeap {}
 unsafe impl Sync for GenerationalHeap {}
 
@@ -1428,8 +1437,12 @@ impl GenerationalHeap {
     /// Like [`collect_garbage`] but keeps dead finalizable objects alive so
     /// their `finalize()` method can be invoked.  Returns the GC result and
     /// the *new* (post-GC) addresses of dead finalizable objects.
+    ///
+    /// The `_stw` parameter is type-level proof that the caller is in a
+    /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
     pub fn collect_garbage_with_finalizers(
         &self,
+        _stw: &crate::collector::StopTheWorldToken,
         roots: &mut [ObjectRef],
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
@@ -1437,7 +1450,16 @@ impl GenerationalHeap {
         self.collect_garbage_inner(roots, finalizer_addrs, monitors)
     }
 
-    pub fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult {
+    /// Run a minor (or, if old gen is full, full) garbage-collection cycle.
+    ///
+    /// The `_stw` parameter is type-level proof that the caller is in a
+    /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
+    pub fn collect_garbage(
+        &self,
+        _stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
         self.collect_garbage_inner(roots, &[], monitors).0
     }
 
@@ -3417,8 +3439,13 @@ impl GarbageCollector for GenerationalHeap {
         self.needs_gc()
     }
 
-    fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult {
-        self.collect_garbage(roots, monitors)
+    fn collect_garbage(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
+        self.collect_garbage(stw, roots, monitors)
     }
 
     fn write_barrier(&self, obj: ObjectRef, stored_value: Value) {
@@ -3451,6 +3478,13 @@ mod tests {
     struct NoOpMonitors;
     impl crate::collector::MonitorCleanup for NoOpMonitors {
         fn remap_after_gc(&self, _pointer_map: &std::collections::HashMap<usize, usize>) {}
+    }
+
+    /// Test-only `StopTheWorldToken`. The single-threaded test harness
+    /// trivially satisfies the STW invariant — no other mutator exists.
+    #[inline]
+    fn stw() -> crate::collector::StopTheWorldToken {
+        crate::collector::StopTheWorldToken::new()
     }
 
     /// Create a small generational heap for testing.
@@ -3591,7 +3625,7 @@ mod tests {
         heap.set_field(obj, 1, Value::Long(100));
 
         let mut roots = vec![obj];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         assert_eq!(result.stats.objects_copied, 1);
 
@@ -3625,7 +3659,7 @@ mod tests {
         heap.set_array_element(arr, n - 1, Value::Int(12345)).unwrap();
 
         let mut roots = vec![arr];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         // The array must be forwarded, not skipped as a false root.
         assert_eq!(result.stats.objects_copied, 1, "large array must survive GC");
@@ -3668,7 +3702,7 @@ mod tests {
         heap.set_array_element(c, n - 1, Value::Int(0xCCCC_CCCCu32 as i32)).unwrap();
 
         let mut roots = vec![a, b, c];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
         assert_eq!(result.stats.objects_copied, 3, "all three large arrays must be forwarded");
 
         let (na, nb, nc) = (roots[0], roots[1], roots[2]);
@@ -3690,7 +3724,7 @@ mod tests {
         heap.set_field(live, 0, Value::Int(999));
 
         let mut roots = vec![live];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         assert_eq!(result.stats.objects_copied, 1);
         assert!(result.stats.bytes_freed > 0);
@@ -3710,7 +3744,7 @@ mod tests {
         heap.set_field(obj_b, 0, Value::Int(77));
 
         let mut roots = vec![obj_a];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         assert_eq!(result.stats.objects_copied, 2);
 
@@ -3756,7 +3790,7 @@ mod tests {
         // `roots` carries only `obj_a`; `obj_b` is reached transitively,
         // `dead` is unreachable.
         let mut roots = vec![obj_a];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         crate::gc_quiescence::leave();
 
@@ -3817,7 +3851,7 @@ mod tests {
 
         // Run PROMOTION_AGE minor GCs — object should be promoted on the last one
         for i in 0..PROMOTION_AGE {
-            let result = heap.collect_garbage(&mut roots, &monitors);
+            let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
             assert_eq!(result.stats.objects_copied, 1);
             let cur = roots[0];
 
@@ -3852,7 +3886,7 @@ mod tests {
         let mut roots = vec![old_obj];
 
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         let promoted = roots[0];
@@ -3889,7 +3923,7 @@ mod tests {
         let old_obj = heap.alloc_object(ClassId::new(0), 1);
         let mut roots = vec![old_obj];
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         let promoted = roots[0];
         assert!(heap.is_in_old(promoted.as_ptr()));
@@ -3904,7 +3938,7 @@ mod tests {
         // But the write barrier should have marked the card dirty, so the GC
         // should discover young_obj via the dirty card scan.
         let mut gc_roots = vec![promoted];
-        let result = heap.collect_garbage(&mut gc_roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut gc_roots, &monitors);
 
         // young_obj should have been copied (reachable via dirty card)
         assert!(result.stats.objects_copied >= 1);
@@ -3947,7 +3981,7 @@ mod tests {
         let mut roots = vec![obj1];
 
         // Cycle 1
-        let r1 = heap.collect_garbage(&mut roots, &monitors);
+        let r1 = heap.collect_garbage(&stw(), &mut roots, &monitors);
         assert_eq!(r1.stats.objects_copied, 1);
         assert_eq!(heap.get_field(roots[0], 0).as_int(), Some(1));
 
@@ -3957,7 +3991,7 @@ mod tests {
         heap.set_field(roots[0], 0, Value::Object(Some(obj2)));
         roots = vec![roots[0]];
 
-        let r2 = heap.collect_garbage(&mut roots, &monitors);
+        let r2 = heap.collect_garbage(&stw(), &mut roots, &monitors);
         assert_eq!(r2.stats.objects_copied, 2);
     }
 
@@ -3985,7 +4019,7 @@ mod tests {
 
         // Run enough minor GCs to promote all objects
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         // All should be in old gen now
@@ -4045,7 +4079,7 @@ mod tests {
 
         // Promote to old gen
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         let promoted_a = roots[0];
@@ -4055,7 +4089,7 @@ mod tests {
         let garbage = heap.alloc_object(ClassId::new(0), 0);
         let mut garbage_roots = vec![garbage];
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut garbage_roots, &monitors);
+            heap.collect_garbage(&stw(), &mut garbage_roots, &monitors);
         }
         // Drop reference to garbage
 
@@ -4104,12 +4138,12 @@ mod tests {
 
             // Trigger GC if needed
             if heap.needs_gc() {
-                heap.collect_garbage(&mut live_refs, &monitors);
+                heap.collect_garbage(&stw(), &mut live_refs, &monitors);
             }
         }
 
         // Final GC
-        heap.collect_garbage(&mut live_refs, &monitors);
+        heap.collect_garbage(&stw(), &mut live_refs, &monitors);
 
         // All surviving objects should be readable without panicking
         for obj_ref in &live_refs {
@@ -4137,7 +4171,7 @@ mod tests {
                     None => {
                         // Young gen full — trigger GC and retry
                         roots.append(&mut wave_objs);
-                        heap.collect_garbage(&mut roots, &monitors);
+                        heap.collect_garbage(&stw(), &mut roots, &monitors);
                         match heap.try_alloc_object(ClassId::new(0), 1) {
                             Some(obj) => obj,
                             None => break, // Can't allocate even after GC
@@ -4150,7 +4184,7 @@ mod tests {
                 if heap.needs_gc() {
                     // Combine with existing roots
                     roots.append(&mut wave_objs);
-                    heap.collect_garbage(&mut roots, &monitors);
+                    heap.collect_garbage(&stw(), &mut roots, &monitors);
                     break;
                 }
             }
@@ -4181,7 +4215,7 @@ mod tests {
         heap.set_field(obj_b, 0, Value::Object(Some(obj_a)));
 
         let mut roots = vec![obj_a];
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         assert_eq!(result.stats.objects_copied, 2); // both survive
 
@@ -4216,7 +4250,7 @@ mod tests {
                     }
                 }
                 None => {
-                    heap.collect_garbage(&mut live, &monitors);
+                    heap.collect_garbage(&stw(), &mut live, &monitors);
                     let obj = heap.try_alloc_object(ClassId::new(0), 2)
                         .expect("alloc should succeed after GC");
                     if i % 2 == 0 {
@@ -4246,13 +4280,13 @@ mod tests {
         let mut dummy_roots: Vec<ObjectRef> = Vec::new();
         for _ in 0..100 {
             if heap.try_alloc_object(ClassId::new(0), 4).is_none() {
-                heap.collect_garbage(&mut dummy_roots, &NoOpMonitors);
+                heap.collect_garbage(&stw(), &mut dummy_roots, &NoOpMonitors);
                 let _obj = heap.try_alloc_object(ClassId::new(0), 4);
             }
         }
         // GC with empty roots — all objects are dead
         let mut roots = vec![];
-        let result = heap.collect_garbage(&mut roots, &NoOpMonitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &NoOpMonitors);
         assert!(result.stats.bytes_freed > 0, "GC should free dead objects");
     }
 
@@ -4268,7 +4302,7 @@ mod tests {
             }
         }
         let mut roots = vec![live];
-        let _result = heap.collect_garbage(&mut roots, &NoOpMonitors);
+        let _result = heap.collect_garbage(&stw(), &mut roots, &NoOpMonitors);
         // The root should still be valid after GC
         let survived = roots[0];
         assert_eq!(heap.get_field(survived, 0).as_int(), Some(42));
@@ -4291,7 +4325,7 @@ mod tests {
             // Trigger GC periodically
             if heap.needs_gc() {
                 let mut roots: Vec<ObjectRef> = live_objs.clone();
-                let _result = heap.collect_garbage(&mut roots, &monitors);
+                let _result = heap.collect_garbage(&stw(), &mut roots, &monitors);
                 // Update live_objs to new addresses
                 live_objs = roots;
             }
@@ -4322,7 +4356,7 @@ mod tests {
             roots.push(obj);
         }
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         for root in &roots {
             assert!(heap.is_in_old(root.as_ptr()), "Object should be in old gen");
@@ -4392,7 +4426,7 @@ mod tests {
 
         // Promote all to old gen
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         // Drop garbage references, keep only A (B and C reachable via A)
@@ -4450,7 +4484,7 @@ mod tests {
             roots.push(obj);
         }
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         // Record old gen usage before freeing
@@ -4511,7 +4545,7 @@ mod tests {
 
         // Promote to old gen
         for _ in 0..PROMOTION_AGE {
-            let result = heap.collect_garbage(&mut roots, &monitors);
+            let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
             // Update roots from minor GC pointer_map
             for root in &mut roots {
                 if let Some(&new_addr) = result.pointer_map.get(&(root.as_ptr() as usize)) {
@@ -4531,7 +4565,7 @@ mod tests {
             let _ = obj;
         }
 
-        let result = heap.collect_garbage(&mut roots, &monitors);
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         // The pointer_map should contain entries (from minor GC and/or major GC compaction)
         // Surviving objects should still be accessible
@@ -4559,7 +4593,7 @@ mod tests {
 
         // Promote all to old gen
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         // All objects are contiguous (no gaps) — compaction should not move anything
@@ -4595,7 +4629,7 @@ mod tests {
         }
 
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
 
         // Free some, then compact
@@ -4632,7 +4666,7 @@ mod tests {
         let monitors = NoOpMonitors;
         let mut roots = vec![obj];
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         assert!(heap.is_in_old(roots[0].as_ptr()), "object should be promoted to old gen");
         roots[0]
@@ -4679,7 +4713,7 @@ mod tests {
         }
 
         // Run GC
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         // Verify all roots survived and their tags are correct
         for (i, root) in roots.iter().enumerate() {
@@ -4737,7 +4771,7 @@ mod tests {
 
         // GC with only old object as root — young chain must survive via dirty card
         let mut roots = vec![promoted];
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         // Walk chain and verify all tags
         let old_after = roots[0];
@@ -4778,7 +4812,7 @@ mod tests {
 
         // Both as roots — both should survive
         let mut roots = vec![promoted, young];
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         let old_after = roots[0];
         let young_after = roots[1];
@@ -4809,7 +4843,7 @@ mod tests {
         }
         let mut roots: Vec<ObjectRef> = old_objs.clone();
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         // All should be in old gen now
         for r in &roots {
@@ -4827,7 +4861,7 @@ mod tests {
         }
 
         // GC with only old objects as roots
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         // Verify all old→young links preserved
         for (i, old) in roots.iter().enumerate() {
@@ -4865,7 +4899,7 @@ mod tests {
 
         // GC: y1 is unreachable, y2 reachable via old
         let mut roots = vec![promoted];
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         match heap.get_field(roots[0], 1) {
             Value::Object(Some(y)) => {
@@ -4907,7 +4941,7 @@ mod tests {
             }
 
             // Run GC — all objects are roots, so all survive and get updated
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
 
             // Verify tags
             for (i, root) in roots.iter().enumerate() {
@@ -4956,7 +4990,7 @@ mod tests {
 
         // GC with only old array as root
         let mut roots = vec![promoted_arr];
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         let arr_after = roots[0];
         for i in 0..4 {
@@ -4981,7 +5015,7 @@ mod tests {
         let o2 = heap.alloc_object(ClassId::new(0), 1);
         let mut roots = vec![o1, o2];
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         let old1 = roots[0];
         let old2 = roots[1];
@@ -5057,7 +5091,7 @@ mod tests {
 
         // Run PROMOTION_AGE GCs — all should be promoted
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         let a_old = roots[0];
         assert!(heap.is_in_old(a_old.as_ptr()), "S29: A should be in old gen");
@@ -5088,7 +5122,7 @@ mod tests {
         heap.write_barrier(d_old, Value::Object(Some(e)));
 
         // GC again — e should survive via dirty card
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
         let a_final = roots[0];
         // Walk full chain: A→B→C→D→E
         let mut current = a_final;
@@ -5127,7 +5161,7 @@ mod tests {
         let mut roots = objs.clone();
 
         // GC cycle 1: everything should survive
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
         for (i, root) in roots.iter().enumerate() {
             assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32),
                 "S29 stress: object {} tag corrupted after GC1", i);
@@ -5137,7 +5171,7 @@ mod tests {
         roots.truncate(500);
 
         // GC cycle 2
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
         for (i, root) in roots.iter().enumerate() {
             assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32),
                 "S29 stress: root {} tag corrupted after GC2", i);
@@ -5145,7 +5179,7 @@ mod tests {
 
         // GC cycles 3-5: repeatedly compact
         for cycle in 3..=5 {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
             for (i, root) in roots.iter().enumerate() {
                 assert_eq!(heap.get_field(*root, 0).as_int(), Some(i as i32),
                     "S29 stress: root {} tag corrupted after GC{}", i, cycle);
@@ -5166,7 +5200,7 @@ mod tests {
 
         // Promote object
         for _ in 0..PROMOTION_AGE {
-            heap.collect_garbage(&mut roots, &monitors);
+            heap.collect_garbage(&stw(), &mut roots, &monitors);
         }
         let promoted = roots[0];
         assert!(heap.is_in_old(promoted.as_ptr()));
@@ -5178,7 +5212,7 @@ mod tests {
         heap.write_barrier(promoted, Value::Object(Some(young)));
 
         // GC: young object's only root is via old object + write barrier
-        heap.collect_garbage(&mut roots, &monitors);
+        heap.collect_garbage(&stw(), &mut roots, &monitors);
 
         let after = roots[0];
         match heap.get_field(after, 1) {

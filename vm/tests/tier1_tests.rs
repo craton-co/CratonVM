@@ -1036,9 +1036,11 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
     // survives. The heap's internal mark counter would double-count
     // an object only if the marking pass enqueued it twice.
     if shared.heap.needs_gc() {
+        // Single-threaded test harness — no other mutator exists.
+        let stw = cratonvm_gc::collector::StopTheWorldToken::new();
         let _ = shared
             .heap
-            .collect_garbage(&mut roots, &shared.monitors);
+            .collect_garbage(&stw, &mut roots, &shared.monitors);
     }
     // After GC, every root must still point into the live heap.
     let after: std::collections::HashSet<usize> =

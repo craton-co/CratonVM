@@ -598,29 +598,42 @@ impl VmHeap {
         }
     }
 
-    pub fn collect_garbage(&self, roots: &mut [ObjectRef], monitors: &dyn MonitorCleanup) -> GcResult {
+    /// Run a garbage collection cycle.
+    ///
+    /// The `stw` parameter is type-level proof that the caller is in a
+    /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
+    pub fn collect_garbage(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
         match self {
-            VmHeap::Generational(h) => h.collect_garbage(roots, monitors),
-            VmHeap::G1(h) => h.collect_garbage(roots, monitors),
+            VmHeap::Generational(h) => h.collect_garbage(stw, roots, monitors),
+            VmHeap::G1(h) => h.collect_garbage(stw, roots, monitors),
         }
     }
 
     /// GC with finalizer-aware resurrection (semispace only; G1 falls back
     /// to normal collect since `is_addr_live` handles non-collected regions).
+    ///
+    /// The `stw` parameter is type-level proof that the caller is in a
+    /// stop-the-world phase — see [`crate::collector::StopTheWorldToken`].
     pub fn collect_garbage_with_finalizers(
         &self,
+        stw: &crate::collector::StopTheWorldToken,
         roots: &mut [ObjectRef],
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         match self {
             VmHeap::Generational(h) => {
-                h.collect_garbage_with_finalizers(roots, finalizer_addrs, monitors)
+                h.collect_garbage_with_finalizers(stw, roots, finalizer_addrs, monitors)
             }
             VmHeap::G1(h) => {
                 // G1's is_addr_live handles this correctly — dead finalizable
                 // objects in non-collected regions are still accessible.
-                let result = h.collect_garbage(roots, monitors);
+                let result = h.collect_garbage(stw, roots, monitors);
                 (result, Vec::new())
             }
         }

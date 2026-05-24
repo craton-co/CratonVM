@@ -607,7 +607,18 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // Young gen full — trigger GC from JIT context
         if let Some((thread, _guard)) = jit_thread_mut() {
             let mut roots = crate::memory::roots::collect_roots(vm, thread);
-            let result = heap.collect_garbage(&mut roots, &vm.monitors);
+            // FIXME(orchestrator): this JIT-helper path triggers a moving
+            // collection without going through `gc_barrier.request_stw()`
+            // / `wait_for_all()`, so other mutator threads are NOT
+            // guaranteed to be parked when `collect_garbage` rewrites
+            // object addresses. Pre-token code shared this latent
+            // soundness gap; the migration constructor preserves
+            // behavior 1:1 while making the site visible to grep.
+            // Follow-up: route this through the interpreter's
+            // `maybe_gc_forced` orchestrator (which does request_stw +
+            // wait_for_all) instead of calling the heap directly.
+            let stw = cratonvm_gc::collector::StopTheWorldToken::new_unchecked();
+            let result = heap.collect_garbage(&stw, &mut roots, &vm.monitors);
             crate::memory::gc::update_all_roots(vm, thread, &result.pointer_map);
         }
     }

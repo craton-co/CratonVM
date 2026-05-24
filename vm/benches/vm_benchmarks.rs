@@ -372,7 +372,9 @@ fn bench_gc_cycle(c: &mut Criterion) {
                 roots.push(obj);
             }
             if shared.heap.needs_gc() {
-                let _ = shared.heap.collect_garbage(&mut roots, &shared.monitors);
+                // Single-threaded benchmark — no other mutator exists.
+                let stw = cratonvm_gc::collector::StopTheWorldToken::new();
+                let _ = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
             }
             black_box(&roots);
         });
