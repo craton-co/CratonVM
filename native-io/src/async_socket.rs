@@ -293,9 +293,22 @@ fn handle_job(job: Job) -> Result<(), String> {
             attachment,
             channel,
         } => {
-            let result = match addr.parse::<SocketAddr>() {
-                Ok(sa) => TcpStream::connect_timeout(&sa, Duration::from_secs(30)),
-                Err(_) => TcpStream::connect(&addr),
+            // Task #16: route through the shared outbound-policy hook so
+            // the async path matches the blocking-NIO path's SSRF posture.
+            // The configured connect timeout (default 30 s) is honoured by
+            // `policy_connect`. Policy denials surface as a "connect failed"
+            // completion identical to a hard connect error — the JDK's
+            // `AsynchronousSocketChannel.connect` already wraps that as a
+            // failed `Future`.
+            let result = match crate::outbound_policy::policy_connect(&addr) {
+                Ok(s) => Ok(s),
+                Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("connect denied by outbound policy: {reason}"),
+                    ))
+                }
+                Err(crate::outbound_policy::PolicyConnectError::Io(e)) => Err(e),
             };
             match result {
                 Ok(stream) => {
