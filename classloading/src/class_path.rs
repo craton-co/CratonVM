@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+// T1.8.2 follow-up — production-code panic gate. The class-path
+// loader is on the startup-critical path; a panic here would
+// terminate the entire VM before user code even starts. We gate the
+// lint on `not(test)` so the test module (which legitimately uses
+// `.unwrap()`/`.expect()` for fixture construction) is unaffected.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+    )
+)]
+
 use cratonvm_types::error::ClassFileError;
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -891,15 +904,33 @@ impl ClassPath {
                     Self::extract_fat_jar_entries(path, &mut archive, &manifest, entries);
                     // Also add the outer JAR itself (for classes at the root,
                     // e.g. the Spring Boot launcher classes in org/springframework/boot/loader/).
+                    //
+                    // T1.8.2 follow-up (MED #32): we previously `.unwrap()`'d
+                    // the re-open. The first `ZipArchive::new` succeeded on
+                    // the same byte buffer, so in practice this can only
+                    // fail if the underlying `Vec<u8>` is somehow corrupted
+                    // between the two opens — but a panic here would kill
+                    // the VM before any user code runs. Fat-JAR entries
+                    // we already pushed remain valid; we just skip the
+                    // root-classes entry and log.
                     let mr = manifest.multi_release;
                     let data = archive.into_inner().into_inner();
-                    let reloaded = ZipArchive::new(Cursor::new(data)).unwrap();
-                    entries.push(ClassPathEntry::JarFile {
-                        path: path.to_path_buf(),
-                        archive: Mutex::new(reloaded),
-                        multi_release: mr,
-                        versions_cache: Mutex::new(None),
-                    });
+                    match ZipArchive::new(Cursor::new(data)) {
+                        Ok(reloaded) => {
+                            entries.push(ClassPathEntry::JarFile {
+                                path: path.to_path_buf(),
+                                archive: Mutex::new(reloaded),
+                                multi_release: mr,
+                                versions_cache: Mutex::new(None),
+                            });
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Failed to re-open fat JAR {} for root-class entry: {e}",
+                                path.display()
+                            );
+                        }
+                    }
                 } else {
                     let mr = manifest.multi_release;
                     debug!("Loaded JAR: {}", path.display());
@@ -4198,5 +4229,77 @@ Implementation-Version: 999.999\n";
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes[0], b"foo.BarImpl\n");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- T1.8.2 follow-up (MED #32): fat-JAR re-open path no longer panics --
+
+    /// Regression test: a malformed/truncated archive must NOT panic via the
+    /// previous `.unwrap()` on the fat-JAR re-open path. Feeding raw garbage
+    /// fails the very first `ZipArchive::new` and pushes no entries.
+    #[test]
+    fn load_jar_data_with_truncated_bytes_does_not_panic() {
+        // Eight bytes that are not a valid zip central directory.
+        let garbage: Vec<u8> = b"\x00\x01\x02\x03\x04\x05\x06\x07".to_vec();
+        let mut entries: Vec<ClassPathEntry> = Vec::new();
+        let path = Path::new("truncated.jar");
+
+        // The fix removed `.unwrap()` on re-open; the first open also
+        // fails here, exercising the broader no-panic contract.
+        ClassPath::load_jar_data(path, garbage, &mut entries);
+
+        assert!(
+            entries.is_empty(),
+            "expected no entries from malformed archive, got {}",
+            entries.len()
+        );
+    }
+
+    /// Regression test: a fat JAR header that contains a Spring-Boot manifest
+    /// but is truncated after the central-directory probe must not panic on
+    /// the re-open path either. We construct a fat JAR, mangle the trailing
+    /// bytes after the in-memory buffer has been built, and confirm load
+    /// proceeds without panicking.
+    #[test]
+    fn fat_jar_corrupted_after_first_open_does_not_panic() {
+        // Build a valid fat JAR in memory.
+        let mut buf = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+            zip.write_all(
+                b"Manifest-Version: 1.0\r\n\
+                  Main-Class: org.springframework.boot.loader.JarLauncher\r\n\
+                  Start-Class: com.example.App\r\n\
+                  Spring-Boot-Classes: BOOT-INF/classes/\r\n\
+                  Spring-Boot-Lib: BOOT-INF/lib/\r\n",
+            )
+            .unwrap();
+            zip.start_file("BOOT-INF/classes/com/example/App.class", opts)
+                .unwrap();
+            zip.write_all(b"\xCA\xFE\xBA\xBE_app").unwrap();
+            zip.finish().unwrap();
+        }
+
+        // Sanity: a pristine fat JAR loads fine and pushes >=1 entry.
+        let mut ok_entries: Vec<ClassPathEntry> = Vec::new();
+        ClassPath::load_jar_data(Path::new("ok.jar"), buf.clone(), &mut ok_entries);
+        assert!(
+            !ok_entries.is_empty(),
+            "pristine fat JAR should push at least the BOOT-INF entries"
+        );
+
+        // Truncate the buffer mid-central-directory. The first open in
+        // `load_jar_data` may still succeed for some inputs, but in either
+        // case the re-open path (formerly `.unwrap()`) must not panic.
+        let mut truncated = buf.clone();
+        if truncated.len() > 32 {
+            truncated.truncate(truncated.len() - 32);
+        }
+        let mut entries: Vec<ClassPathEntry> = Vec::new();
+        ClassPath::load_jar_data(Path::new("corrupt.jar"), truncated, &mut entries);
+        // No assertion on entry count: the contract is "does not panic".
     }
 }
