@@ -22,6 +22,7 @@ apps/**/*.tar.gz
 *.class
 !test_classes/**/*.class
 !demo/**/*.class
+!vm-cli/tests/resources/**/*.class
 
 # JAR files (benchmark dependencies — download separately)
 bench/*.jar

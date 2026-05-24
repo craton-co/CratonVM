@@ -63,5 +63,14 @@ gpu = ["dep:cuda-bridge", "cratonvm-vm/gpu-offload"]
 # As above, plus the real CUDA driver bindings via cudarc.
 gpu-driver = ["gpu", "cuda-bridge/cuda"]
 
+# End-to-end integration tests under `tests/cli_*.rs` build the binary via
+# `env!("CARGO_BIN_EXE_cratonvm")`, copy committed `.class` fixtures from
+# `tests/resources/` into a per-test temp directory (via `tempfile`), and
+# assemble synthetic JARs on the fly (via the workspace-pinned `zip` crate).
+# Neither dep is in the regular dependency set — they only live in tests.
+[dev-dependencies]
+tempfile = "3"
+zip.workspace = true
+
 [lints]
 workspace = true
