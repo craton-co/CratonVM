@@ -322,6 +322,14 @@ impl Tlab {
         let data_bytes = tail - HEADER_SIZE;
         // data_bytes is a multiple of 8; (n*4 + 7) & !7 == n*4 iff n is even.
         // data_bytes/4 is even because data_bytes is a multiple of 8 → length fits exactly.
+        // If a future change to HEADER_SIZE breaks the 8-multiple invariant
+        // we want to fail loudly here, not silently corrupt memory by writing
+        // past the synthetic array's payload.
+        debug_assert_eq!(
+            data_bytes % 8,
+            0,
+            "tail filler assumes 8-aligned data_bytes (tail={tail}, HEADER_SIZE={HEADER_SIZE})"
+        );
         let length = (data_bytes / 4) as u32;
         let header = ObjectHeader::new(
             class_id,

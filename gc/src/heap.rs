@@ -658,6 +658,18 @@ impl Heap {
     ///
     /// This is a structural guard: it lets callers reject a stale or garbage
     /// stored pointer before dereferencing it as an `ObjectHeader`.
+    ///
+    /// LOCK-ORDER: this method touches both `from_space` and `to_space` and
+    /// must follow the global heap convention — `from_space` is acquired
+    /// before `to_space` everywhere in this crate (see `collect_garbage`,
+    /// `lock_spaces`, `swap_spaces`). To stay safe against a concurrent
+    /// collector that has already taken one or both locks, both acquisitions
+    /// use `try_lock`: on contention the check returns `false` ("not provably
+    /// valid"), which is sound because callers treat a `false` answer as
+    /// "skip the unboxing fast path and just return the raw value". This
+    /// avoids the latent deadlock that would otherwise occur if a mutator
+    /// invoked `get_array_element_unboxing` against a stale autobox wrapper
+    /// while the collector held `from_space.lock()`.
     fn is_valid_heap_object(&self, obj: ObjectRef) -> bool {
         let addr = obj.as_ptr() as usize;
         // Object headers are always 8-byte aligned; a real object pointer
@@ -666,8 +678,22 @@ impl Heap {
             return false;
         }
         let raw = obj.as_ptr() as *const u8;
-        // Region check: must land inside one of the two semi-spaces.
-        self.from_space.lock().contains(raw) || self.to_space.lock().contains(raw)
+        // Region check: must land inside one of the two semi-spaces. Use
+        // `try_lock` (not `lock`) so a mutator that races a collector that
+        // already holds either arena mutex degrades to "not provably valid"
+        // rather than deadlocking.
+        if let Some(from) = self.from_space.try_lock() {
+            if from.contains(raw) {
+                return true;
+            }
+        } else {
+            return false;
+        }
+        if let Some(to) = self.to_space.try_lock() {
+            to.contains(raw)
+        } else {
+            false
+        }
     }
 
     /// Set an array element at the given index.
