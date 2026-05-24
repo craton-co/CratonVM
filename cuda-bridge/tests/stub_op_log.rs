@@ -10,20 +10,24 @@
 //! it is only compiled in stub mode — under the real `cuda` feature
 //! the op log doesn't exist and these surfaces hit the driver.
 //!
-//! Per the Phase 2 spec, every test starts with a `probe()`-or-return
-//! prelude:
+//! Run with `cargo test -p cuda-bridge` (the default build). Under
+//! `--features cuda` this file is excluded from the build; the
+//! corresponding driver-bound behaviour is verified by a separate
+//! GPU-required suite (`gpu-it`).
 //!
-//! - In stub mode `DeviceContext::probe()` returns `Err(NoDriver)`,
-//!   so on the no-GPU dev box every test early-returns *without*
-//!   exercising the body. That is intentional. The point is that the
-//!   tests compile in stub mode and will start exercising the op log
-//!   on a future GPU box (or once a stub-friendly context constructor
-//!   is wired up upstream). The op log itself is exercised by the
-//!   per-file unit tests inside `stream.rs` / `event.rs`.
-//!
-//! - This is option (b) from the spec; option (a) (a `pub fn for_test`
-//!   gated by a feature flag) is left to the discretion of Items
-//!   P2-1 / P2-2.
+//! Why these tests don't gate on `DeviceContext::probe()`:
+//! historically the suite started every test with a `probe()`-or-return
+//! prelude that — on the no-GPU dev box — caused every body to
+//! early-return without exercising the op log. That made the suite
+//! look like an integration suite that executed nothing on default CI.
+//! The stub backend is purely an in-memory event recorder: it does not
+//! need a real GPU, and its async surfaces (`Stream::new`,
+//! `Event::new`, `DeviceBuffer::{from,to}_host_async`,
+//! `DeviceModule::{from_ptx,launch_on_stream}`) all return `Ok` in
+//! stub mode and record the corresponding `StreamOp` variants. So we
+//! drive them directly here via the public
+//! [`cuda_bridge::DeviceContext::stub_for_testing`] constructor and
+//! assert on the exact recorded sequence.
 
 #![cfg(not(feature = "cuda"))]
 
@@ -31,35 +35,25 @@ use cuda_bridge::{
     DeviceBuffer, DeviceContext, DeviceModule, Event, KernelArgs, LaunchConfig, Stream, StreamOp,
 };
 
-// PHASE2-GUESS: the spec snippet `DeviceContext::probe()` implies an
-// inherent `probe` constructor on `DeviceContext` that returns
-// `Result<Self>`. The current crate exposes a free `probe()` function
-// returning `DeviceCaps`; Items P2-1..P2-5 are expected to add an
-// inherent `DeviceContext::probe()` that mirrors the spec wording.
-// If that constructor is named differently upstream, this prelude is
-// the single place to fix.
-macro_rules! ctx_or_return {
-    () => {
-        match DeviceContext::probe() {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("[stub_op_log] skipping: no DeviceContext.probe in stub mode");
-                return;
-            }
-        }
-    };
+/// Build a stub `DeviceContext` for the integration tests.
+///
+/// Wraps `DeviceContext::stub_for_testing()` — a stub-only public
+/// constructor for tests of the op-log surface — in a single helper
+/// so the test bodies read naturally.
+fn ctx() -> DeviceContext {
+    DeviceContext::stub_for_testing()
 }
 
 /// Test 1: `DeviceBuffer::from_host_async` records a single
 /// `UploadAsync` op with the correct byte count.
 #[test]
 fn upload_async_records_byte_count() {
-    let ctx = ctx_or_return!();
-    let stream = Stream::new(&ctx).expect("Stream::new in stub mode after probe succeeded");
+    let ctx = ctx();
+    let stream = Stream::new(&ctx).expect("Stream::new in stub mode");
 
     let host = [1.0_f32; 16];
     let _buf = DeviceBuffer::<f32>::from_host_async(&ctx, &host, &stream)
-        .expect("from_host_async in stub mode after probe succeeded");
+        .expect("from_host_async in stub mode");
 
     let ops = stream.ops();
     assert_eq!(
@@ -80,20 +74,14 @@ fn upload_async_records_byte_count() {
 /// with the correct kernel name and launch geometry.
 #[test]
 fn launch_on_stream_records_kernel_name() {
-    let ctx = ctx_or_return!();
-    let stream = Stream::new(&ctx).expect("Stream::new in stub mode after probe succeeded");
+    let ctx = ctx();
+    let stream = Stream::new(&ctx).expect("Stream::new in stub mode");
 
-    // The synthetic empty PTX may or may not load in stub mode. The
-    // spec says: if module creation fails, early-return.
-    let module = match DeviceModule::from_ptx(&ctx, "", &[]) {
-        Ok(m) => m,
-        Err(_) => {
-            eprintln!(
-                "[stub_op_log] skipping launch_on_stream test: DeviceModule::from_ptx failed"
-            );
-            return;
-        }
-    };
+    // Stub `from_ptx` returns an inert `DeviceModule` — the stub
+    // `launch_on_stream` branch only records a `StreamOp::Launch`
+    // and never touches the module, so an inert fixture is enough
+    // to exercise the op-log surface here.
+    let module = DeviceModule::from_ptx(&ctx, "", &[]).expect("from_ptx in stub mode");
 
     let cfg = LaunchConfig {
         grid: (10, 1, 1),
@@ -104,21 +92,17 @@ fn launch_on_stream_records_kernel_name() {
 
     module
         .launch_on_stream(&ctx, "my_kernel", &cfg, args, &stream)
-        .expect("launch_on_stream in stub mode after module loaded");
+        .expect("launch_on_stream in stub mode");
 
     let ops = stream.ops();
-    let found = ops.iter().any(|op| match op {
-        StreamOp::Launch {
-            kernel,
-            grid,
-            block,
-        } => kernel == "my_kernel" && *grid == (10, 1, 1) && *block == (256, 1, 1),
-        _ => false,
-    });
-    assert!(
-        found,
-        "expected a Launch {{ kernel: \"my_kernel\", grid: (10,1,1), block: (256,1,1) }} in op log, got {:?}",
-        ops
+    assert_eq!(
+        ops.as_slice(),
+        &[StreamOp::Launch {
+            kernel: "my_kernel".into(),
+            grid: (10, 1, 1),
+            block: (256, 1, 1),
+        }],
+        "expected a single Launch op for 'my_kernel'"
     );
 }
 
@@ -126,10 +110,10 @@ fn launch_on_stream_records_kernel_name() {
 /// matching `EventRecord` / `EventWait` ops with the same event id.
 #[test]
 fn event_record_and_wait() {
-    let ctx = ctx_or_return!();
-    let s1 = Stream::new(&ctx).expect("Stream::new (s1) in stub mode after probe succeeded");
-    let s2 = Stream::new(&ctx).expect("Stream::new (s2) in stub mode after probe succeeded");
-    let ev = Event::new(&ctx).expect("Event::new in stub mode after probe succeeded");
+    let ctx = ctx();
+    let s1 = Stream::new(&ctx).expect("Stream::new (s1) in stub mode");
+    let s2 = Stream::new(&ctx).expect("Stream::new (s2) in stub mode");
+    let ev = Event::new(&ctx).expect("Event::new in stub mode");
 
     s1.record_event(&ev).expect("record_event");
     s2.wait_event(&ev).expect("wait_event");
@@ -163,6 +147,13 @@ fn event_record_and_wait() {
         recorded_id, waited_id,
         "event ids in EventRecord (s1) and EventWait (s2) must match"
     );
+    // And the same id must be the event's own id (the op-log captures
+    // exactly that field).
+    assert_eq!(
+        recorded_id,
+        ev.id(),
+        "captured event_id must equal Event::id()"
+    );
 }
 
 /// Test 4: a three-stage pipeline exercising every stream op kind.
@@ -174,25 +165,19 @@ fn event_record_and_wait() {
 /// sequence (with `event_id` matched up between the two streams).
 #[test]
 fn three_stage_pipeline() {
-    let ctx = ctx_or_return!();
-    let s1 = Stream::new(&ctx).expect("Stream::new (s1) in stub mode after probe succeeded");
-    let s2 = Stream::new(&ctx).expect("Stream::new (s2) in stub mode after probe succeeded");
-    let ev = Event::new(&ctx).expect("Event::new in stub mode after probe succeeded");
+    let ctx = ctx();
+    let s1 = Stream::new(&ctx).expect("Stream::new (s1) in stub mode");
+    let s2 = Stream::new(&ctx).expect("Stream::new (s2) in stub mode");
+    let ev = Event::new(&ctx).expect("Event::new in stub mode");
 
     // Allocate A and upload on s1.
     let host_a = [1.0_f32; 16]; // 16 × 4 = 64 bytes
     let buf_a = DeviceBuffer::<f32>::from_host_async(&ctx, &host_a, &s1)
         .expect("from_host_async A on s1");
 
-    // Load a synthetic module for f and g. If module creation fails
-    // in stub mode, early-return — the spec says it's acceptable.
-    let module = match DeviceModule::from_ptx(&ctx, "", &[]) {
-        Ok(m) => m,
-        Err(_) => {
-            eprintln!("[stub_op_log] skipping three_stage_pipeline: from_ptx failed");
-            return;
-        }
-    };
+    // Stub `from_ptx` succeeds — we just need a `DeviceModule` so
+    // `launch_on_stream` can record `Launch` ops on the streams.
+    let module = DeviceModule::from_ptx(&ctx, "", &[]).expect("from_ptx in stub mode");
 
     // launch f(A) on s1.
     let cfg = LaunchConfig::elementwise(16);

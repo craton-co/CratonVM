@@ -8,9 +8,31 @@ allocation, memcpy, and kernel launch.
 
 | Cargo features  | What you get                                                                 |
 | --------------- | ---------------------------------------------------------------------------- |
-| _none_          | Crate compiles; every entry point returns `DeviceError::NoDriver`.           |
+| _none_          | Crate compiles; every driver-bound entry point returns `DeviceError::NoDriver`. The Phase 2 op-log surfaces (`Stream`, `Event`, `from_host_async`, `to_host_async`, `launch_on_stream`) succeed and record into the in-memory `Vec<StreamOp>` so callers (and tests) can exercise the API without a driver. |
 | `cuda`          | Real driver bindings via `cudarc`. Requires CUDA Toolkit 12.x.               |
 | `gpu-it`        | Enables `cuda` plus tests that launch real kernels (need an attached GPU).   |
+
+## How to run tests
+
+```
+# Stub-backend suite — runs by default on a no-GPU host. Exercises
+# the in-memory op-log surface end-to-end (`tests/stub_op_log.rs`),
+# the per-module unit tests, and the no-driver contract for the
+# synchronous entry points.
+cargo test -p cuda-bridge
+
+# Real-driver compile check (no kernels launched). CI runs this so
+# `backend_cuda.rs` doesn't silently rot against cudarc API changes.
+cargo check -p cuda-bridge --features cuda
+
+# Driver-bound integration tests that launch actual kernels. Require
+# an attached NVIDIA GPU and the CUDA toolkit installed.
+cargo test -p cuda-bridge --features gpu-it
+```
+
+The `cuda` feature compiles `backend_cuda.rs` instead of `backend_stub.rs`;
+under that build the op log is empty (the driver owns the queue) and the
+stub-only `DeviceContext::stub_for_testing` constructor is not exposed.
 
 ## CUDA toolkit version
 
@@ -75,8 +97,17 @@ stream.synchronize()?;          // block until all three steps done
 
 `from_host_async`, `to_host_async`, and `launch_on_stream` mirror the
 synchronous variants but enqueue work onto the given stream instead of the
-context's default stream. The host-side slices passed to the async memcpy
-helpers must outlive the stream synchronization point.
+context's default stream.
+
+**Host-buffer lifetime.** Despite the `_async` suffix, the host-side memcpy
+in both `from_host_async` and `to_host_async` is *itself synchronous* under
+the hood (the cuda backend uses cudarc's `htod_sync_copy` / `cuCtxSynchronize`
++ `dtoh_sync_copy_into`). The host slice is fully consumed before the call
+returns, so `host` / `dst` only need to be borrowed for the duration of the
+call — they do **not** need to outlive a subsequent `stream.synchronize()`.
+The "async" in the name refers to how the *kernel launches* on `stream` are
+ordered against these copies via the dependency events the backend records
+internally, not to the host-side memcpy itself.
 
 ### `Event`
 

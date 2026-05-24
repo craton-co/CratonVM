@@ -81,15 +81,15 @@ impl DeviceModule {
 
 // ── Tests (stub mode only) ──────────────────────────────────────────
 //
-// PHASE2-CUDA-TODO: these tests need a stub-mode `DeviceModule`
-// fixture and a stub-mode `DeviceContext` fixture that don't exist
-// yet. `DeviceModule::from_ptx` and `DeviceContext::new` both return
-// `NoDriver` in stub mode, so we cannot drive the call without
-// additional test plumbing from a sibling item. The bodies are kept
-// as ignored stubs documenting the intended assertions.
+// Both tests drive `DeviceModule::launch_on_stream` against an inert
+// stub module produced by `DeviceModule::from_ptx` (which returns
+// `Ok` in stub mode) on a `DeviceContext` built via
+// `DeviceContext::stub_for_testing`, and assert on the recorded
+// `StreamOp::Launch` payload directly.
 #[cfg(all(test, not(feature = "cuda")))]
 mod tests {
     use super::*;
+    use crate::{DeviceContext, DeviceModule, KernelArgs, Stream};
 
     fn sample_cfg() -> LaunchConfig {
         LaunchConfig {
@@ -100,14 +100,43 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "PHASE2-CUDA-TODO: needs DeviceModule::for_test() / DeviceContext::for_test() fixtures"]
     fn launch_on_stream_records_kernel_name() {
-        let _ = sample_cfg();
+        let ctx = DeviceContext::stub_for_testing();
+        let stream = Stream::new(&ctx).expect("Stream::new stub");
+        let module = DeviceModule::from_ptx(&ctx, "", &[]).expect("from_ptx stub");
+        let cfg = sample_cfg();
+        module
+            .launch_on_stream(&ctx, "vector_add", &cfg, KernelArgs::new(), &stream)
+            .expect("launch_on_stream stub");
+        let ops = stream.ops();
+        let kernel = ops
+            .iter()
+            .find_map(|op| match op {
+                StreamOp::Launch { kernel, .. } => Some(kernel.clone()),
+                _ => None,
+            })
+            .expect("expected a Launch op in the stream log");
+        assert_eq!(kernel, "vector_add");
     }
 
     #[test]
-    #[ignore = "PHASE2-CUDA-TODO: needs DeviceModule::for_test() / DeviceContext::for_test() fixtures"]
     fn launch_on_stream_records_grid_and_block() {
-        let _ = sample_cfg();
+        let ctx = DeviceContext::stub_for_testing();
+        let stream = Stream::new(&ctx).expect("Stream::new stub");
+        let module = DeviceModule::from_ptx(&ctx, "", &[]).expect("from_ptx stub");
+        let cfg = sample_cfg();
+        module
+            .launch_on_stream(&ctx, "k", &cfg, KernelArgs::new(), &stream)
+            .expect("launch_on_stream stub");
+        let (grid, block) = stream
+            .ops()
+            .iter()
+            .find_map(|op| match op {
+                StreamOp::Launch { grid, block, .. } => Some((*grid, *block)),
+                _ => None,
+            })
+            .expect("expected a Launch op in the stream log");
+        assert_eq!(grid, cfg.grid);
+        assert_eq!(block, cfg.block);
     }
 }

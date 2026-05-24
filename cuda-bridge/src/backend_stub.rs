@@ -31,13 +31,26 @@ impl DeviceContextInner {
 pub(crate) struct DeviceModuleInner;
 
 impl DeviceModuleInner {
+    /// Stub `from_ptx`: produces an inert `DeviceModuleInner` that
+    /// carries no driver state.
+    ///
+    /// Returning `Ok` here is a deliberate exception to the "every
+    /// fallible entry point returns `NoDriver`" rule, mirroring
+    /// `Stream::new`'s op-log-friendly stub behaviour. The module is
+    /// only useful as a `&self` receiver for
+    /// `DeviceModule::launch_on_stream`, whose stub branch records a
+    /// `StreamOp::Launch` and never touches the module — so an inert
+    /// fixture is sufficient to exercise the op-log integration tests
+    /// in `tests/stub_op_log.rs` without a real driver. The
+    /// driver-bound `DeviceModule::launch_raw` (synchronous, no
+    /// stream) still returns `NoDriver` via `launch_raw` below.
     pub(crate) fn from_ptx(
         _ctx: &DeviceContextInner,
         _ptx: &str,
         _module_name: &str,
         _kernel_names: &[&str],
     ) -> Result<Self> {
-        Err(DeviceError::NoDriver)
+        Ok(Self)
     }
 
     pub(crate) fn launch_raw(

@@ -23,11 +23,19 @@
 //!   tests to run on machines without CUDA.
 //!
 //! Construction note: `Stream::new` takes a `&DeviceContext`. In stub
-//! mode `DeviceContext::new` itself returns `NoDriver`, so the public
-//! constructor here can only ever be reached via the `cuda` backend in
-//! real use. To let the stub-mode unit tests (and downstream items'
-//! tests) build a `Stream` without going through `DeviceContext`, we
-//! expose a `#[cfg(test)] for_test()` constructor on the stub backend.
+//! mode `DeviceContext::new` itself returns `NoDriver`, so production
+//! code paths only reach `Stream::new` via the `cuda` backend.
+//! Stub-mode tests have two entry points:
+//!
+//! - Crate-internal unit tests (`#[cfg(test)]`) use the
+//!   [`Stream::for_test`] constructor below — no `DeviceContext`
+//!   required.
+//! - Integration tests under `tests/` use the public
+//!   [`crate::DeviceContext::stub_for_testing`] constructor to obtain
+//!   a stub `&DeviceContext` and then call `Stream::new(&ctx)`
+//!   normally; the public stub-mode `Stream::new` ignores the
+//!   `&DeviceContext` argument (it only exists for API parity with
+//!   the cuda backend) and returns `Ok` with a fresh logging stream.
 
 use crate::{DeviceContext, Result};
 
