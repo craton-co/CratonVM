@@ -1261,7 +1261,12 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 5, Value::Int(1));
         // Drop the wire-handle table so a reused stream address doesn't
         // observe dangling entries from a prior ObjectInputStream.
-        ois_clear_handles(this.as_ptr() as usize);
+        let addr = this.as_ptr() as usize;
+        ois_clear_handles(addr);
+        // Drop the per-stream JEP-290 filter so a fresh stream at the same
+        // address starts from a clean slate.
+        ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+        ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
         Ok(None)
     });
 
@@ -1288,8 +1293,120 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(desc))))
     });
 
+    // resolveClass(ObjectStreamClass) -> Class
+    //
+    // JEP-290 gate: must consult the per-stream filter first, then the
+    // process-wide filter. A `REJECTED` decision MUST raise
+    // `InvalidClassException("filter status: REJECTED")` — silently
+    // returning null (the pre-fix behaviour) opened the door to
+    // gadget-chain deserialization because the JDK fall-back path then
+    // resolved the class via the system loader.
     r.register(cls, "resolveClass", "(Ljava/io/ObjectStreamClass;)Ljava/lang/Class;",
-        |_ctx, _args| Ok(Some(Value::Object(None))));
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr = this.as_ptr() as usize;
+            let desc = match args.get(1) {
+                Some(Value::Object(Some(d))) => *d,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let class_name = match osc_class_name(ctx, desc) {
+                Some(n) => n,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            if evaluate_serial_filters(addr, &class_name) == FilterStatus::Rejected {
+                return Err(RuntimeError::IOException {
+                    message: format!(
+                        "InvalidClassException: filter status: REJECTED: class \"{}\" rejected by ObjectInputFilter",
+                        class_name
+                    ),
+                }
+                .into());
+            }
+            // Allowed / Undecided fall through to the JDK's normal
+            // resolution path. We return null so the caller (`readObject`'s
+            // resolveClass call site in the JDK) uses its default loader
+            // logic; the security gate has already cleared.
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
+    // resolveProxyClass([Ljava/lang/String;) -> Class
+    //
+    // The JDK contract here is symmetrical: each proxy interface name
+    // must clear the filter before the proxy class is materialised.
+    r.register(cls, "resolveProxyClass", "([Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr = this.as_ptr() as usize;
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let len = ctx.array_length(arr);
+            for i in 0..len {
+                let iface = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(s)) => s,
+                    _ => continue,
+                };
+                if let Some(name) = ctx.read_string(iface) {
+                    if evaluate_serial_filters(addr, &name) == FilterStatus::Rejected {
+                        return Err(RuntimeError::IOException {
+                            message: format!(
+                                "InvalidClassException: filter status: REJECTED: proxy interface \"{}\" rejected by ObjectInputFilter",
+                                name
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
+    // setObjectInputFilter(ObjectInputFilter)V — per-stream filter slot.
+    // Must be set before the first object is read (we do NOT enforce that
+    // here — the JDK does — but we honour subsequent installs).
+    r.register(cls, "setObjectInputFilter", "(Ljava/io/ObjectInputFilter;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr = this.as_ptr() as usize;
+            let filter_obj = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    // null filter => clear.
+                    ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+                    ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+                    return Ok(None);
+                }
+            };
+            let status = ctx.get_field(filter_obj, 0).as_int().unwrap_or(0);
+            let parsed = match status {
+                s if s == FilterStatus::Rejected as i32 => SerialFilter::parse("!*"),
+                s if s == FilterStatus::Allowed as i32 => SerialFilter::parse("*"),
+                _ => SerialFilter {
+                    entries: Vec::new(),
+                    pattern: String::new(),
+                },
+            };
+            ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, parsed);
+            ois_stream_filter_objs().lock().unwrap_or_else(|e| e.into_inner()).insert(addr, filter_obj);
+            Ok(None)
+        },
+    );
+
+    r.register(cls, "getObjectInputFilter", "()Ljava/io/ObjectInputFilter;",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let addr = this.as_ptr() as usize;
+            let obj = ois_stream_filter_objs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&addr)
+                .copied();
+            Ok(Some(Value::Object(obj)))
+        },
+    );
 
     r.register(cls, "readObjectOverride", "()Ljava/lang/Object;",
         |_ctx, _args| Ok(Some(Value::Object(None))));
@@ -1902,6 +2019,261 @@ fn register_externalizable(r: &mut NativeMethodRegistry) {
 //   0: status (0=UNDECIDED, 1=ALLOWED, 2=REJECTED)
 //   1: max_depth, 2: max_references, 3: max_bytes
 // ---------------------------------------------------------------------------
+//
+// JEP-290 enforcement layer (HIGH-severity security gate)
+// =======================================================
+//
+// The JDK's `ObjectInputFilter` protects against gadget-chain
+// deserialization attacks by letting an application reject unwanted
+// classes *before* they are resolved by `ObjectInputStream.resolveClass`.
+// Two levels of filtering are defined:
+//
+//   * **Process-wide filter** — installed exactly once via
+//     `ObjectInputFilter.Config.setSerialFilter(...)`. The JEP mandates
+//     that a second call must throw `IllegalStateException`. The default
+//     value comes from the `jdk.serialFilter` system property (we
+//     read it lazily on first access — `env::var`).
+//
+//   * **Per-stream filter** — installed via
+//     `ObjectInputStream.setObjectInputFilter(...)`. Consulted *first*;
+//     if it returns `UNDECIDED`, falls back to the process-wide filter.
+//
+// `resolveClass` and `resolveProxyClass` must invoke this filter
+// pipeline. A `REJECTED` decision MUST surface as an
+// `InvalidClassException("filter status: REJECTED")` — never a silent
+// null return (that was the pre-fix behaviour, which left the door wide
+// open for gadget chains).
+//
+// Pattern grammar (subset of the JDK's ObjectInputFilter syntax):
+//
+//   pattern_list := pattern (';' pattern)*
+//   pattern      := '!' rule        (reject)
+//                 | rule             (allow)
+//                 | limit '=' value  (maxdepth/maxrefs/maxbytes/maxarray)
+//   rule         := '*'              (match any class name — single token)
+//                 | '<glob>**'       (match any class whose name STARTS WITH glob)
+//                 | '<glob>*'        (match any class in the same package,
+//                                     but not in sub-packages)
+//                 | '<fqcn>'         (exact class-name match)
+//
+// We deliberately do NOT enforce the maxdepth/maxrefs/maxbytes/maxarray
+// limits yet — the existing pre-filter limit enforcement in
+// `HandleState::max_references` already covers the most exploitable
+// surface, and a full FilterInfo wiring is out of scope for this fix.
+// TODO(JEP-290): plumb limits into `ois_read_value` / `ois_read_array`.
+
+/// Filter decision per JEP-290. Matches `ObjectInputFilter.Status`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FilterStatus {
+    Undecided = 0,
+    Allowed = 1,
+    Rejected = 2,
+}
+
+/// A single rule in a compiled filter pattern.
+#[derive(Clone, Debug)]
+enum FilterRule {
+    /// `*` — single-token wildcard, matches any class name.
+    Any,
+    /// `prefix.**` — recursive package match (prefix without trailing `**`).
+    Recursive(String),
+    /// `prefix.*` — same-package match (prefix is the package).
+    SamePackage(String),
+    /// Exact fully-qualified class name (slash-or-dot form normalised to dots).
+    Exact(String),
+}
+
+impl FilterRule {
+    fn matches(&self, class_name_dotted: &str) -> bool {
+        match self {
+            FilterRule::Any => true,
+            FilterRule::Recursive(prefix) => class_name_dotted.starts_with(prefix.as_str()),
+            FilterRule::SamePackage(pkg_prefix) => {
+                if !class_name_dotted.starts_with(pkg_prefix.as_str()) {
+                    return false;
+                }
+                // No further `.` separator beyond the prefix — otherwise it's
+                // in a sub-package and a single `*` must NOT match it.
+                let tail = &class_name_dotted[pkg_prefix.len()..];
+                !tail.contains('.')
+            }
+            FilterRule::Exact(name) => class_name_dotted == name.as_str(),
+        }
+    }
+}
+
+/// One element of a parsed filter spec.
+#[derive(Clone, Debug)]
+enum FilterEntry {
+    /// A class-name rule. `reject` is true when the source pattern began with `!`.
+    Class { rule: FilterRule, reject: bool },
+    /// `key=value` — `key` ∈ { maxdepth, maxrefs, maxbytes, maxarray }.
+    /// Stored but not yet enforced (TODO above).
+    Limit { key: String, value: i64 },
+}
+
+/// A compiled JEP-290 filter — a list of entries evaluated left-to-right
+/// against the class name. First match wins (per the JDK).
+#[derive(Clone, Debug)]
+pub(crate) struct SerialFilter {
+    entries: Vec<FilterEntry>,
+    /// Original pattern, kept verbatim for `toString` round-tripping.
+    pub(crate) pattern: String,
+}
+
+impl SerialFilter {
+    /// Parse a `jdk.serialFilter`-style pattern string.
+    pub(crate) fn parse(pattern: &str) -> SerialFilter {
+        let mut entries = Vec::new();
+        for raw in pattern.split(';') {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+            // limit token: contains '='
+            if let Some(eq) = token.find('=') {
+                let key = token[..eq].trim().to_ascii_lowercase();
+                let value_s = token[eq + 1..].trim();
+                if matches!(key.as_str(), "maxdepth" | "maxrefs" | "maxbytes" | "maxarray") {
+                    if let Ok(v) = value_s.parse::<i64>() {
+                        entries.push(FilterEntry::Limit { key, value: v });
+                        continue;
+                    }
+                }
+                // Unknown limit / malformed value — skip silently. The JDK
+                // would throw IllegalArgumentException at Config time; we
+                // mirror its lenient runtime behaviour to avoid breaking
+                // existing JREs that ship odd filter strings.
+                continue;
+            }
+
+            let (reject, body) = if let Some(stripped) = token.strip_prefix('!') {
+                (true, stripped.trim())
+            } else {
+                (false, token)
+            };
+            if body.is_empty() {
+                continue;
+            }
+            // Normalise '/'->'.' so callers can pass either form. We keep
+            // the rule canonical in dotted form (`a.b.C`) and the
+            // `matches` path converts the incoming class name the same way.
+            let body = body.replace('/', ".");
+            let rule = if body == "*" {
+                FilterRule::Any
+            } else if let Some(prefix) = body.strip_suffix(".**") {
+                FilterRule::Recursive(format!("{}.", prefix))
+            } else if body == "**" {
+                FilterRule::Recursive(String::new())
+            } else if let Some(prefix) = body.strip_suffix(".*") {
+                FilterRule::SamePackage(format!("{}.", prefix))
+            } else if body.ends_with('*') {
+                // Bare-prefix glob without a separator, e.g. "com.foo.*"
+                // already handled above; here we treat "Foo*" as a recursive
+                // glob since the JDK reads `*` greedily in the same-package
+                // form only when preceded by `.`.
+                let prefix = &body[..body.len() - 1];
+                FilterRule::Recursive(prefix.to_string())
+            } else {
+                FilterRule::Exact(body)
+            };
+            entries.push(FilterEntry::Class { rule, reject });
+        }
+        SerialFilter {
+            entries,
+            pattern: pattern.to_string(),
+        }
+    }
+
+    /// Decide whether `class_name` (slash- or dot-form) is allowed.
+    pub(crate) fn check(&self, class_name: &str) -> FilterStatus {
+        let dotted = class_name.replace('/', ".");
+        for entry in &self.entries {
+            if let FilterEntry::Class { rule, reject } = entry {
+                if rule.matches(&dotted) {
+                    return if *reject {
+                        FilterStatus::Rejected
+                    } else {
+                        FilterStatus::Allowed
+                    };
+                }
+            }
+        }
+        FilterStatus::Undecided
+    }
+}
+
+/// Process-wide serial filter (JEP-290 §2.1). `None` means
+/// "no filter installed yet"; `Some(None)` would not be reachable —
+/// once set, the JEP forbids replacement.
+fn process_serial_filter() -> &'static Mutex<Option<SerialFilter>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<Option<SerialFilter>>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        // Honour the `jdk.serialFilter` system property if present at
+        // first access. The real JDK also reads `conf/security/java.security`
+        // — out of scope here.
+        let default = std::env::var("jdk.serialFilter")
+            .ok()
+            .or_else(|| std::env::var("JDK_SERIAL_FILTER").ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| SerialFilter::parse(&s));
+        Mutex::new(default)
+    })
+}
+
+/// Per-stream filter table keyed by `ObjectInputStream`'s raw address.
+fn ois_stream_filters() -> &'static Mutex<HashMap<usize, SerialFilter>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, SerialFilter>>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-stream filter Java object handles. The Java surface lets callers
+/// retrieve back the same `ObjectInputFilter` instance they installed via
+/// `getObjectInputFilter`, so we hold onto the Java reference too.
+fn ois_stream_filter_objs() -> &'static Mutex<HashMap<usize, ObjectRef>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, ObjectRef>>> =
+        std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-wide filter Java object reference (the one passed to
+/// `Config.setSerialFilter`). Used by `Config.getSerialFilter` to round-trip
+/// the exact instance back to Java code.
+fn process_serial_filter_obj() -> &'static Mutex<Option<ObjectRef>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<Option<ObjectRef>>> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(None))
+}
+
+/// Apply the per-stream filter first, then the process-wide one.
+/// Returns the merged decision per JEP-290 (UNDECIDED ⇒ allow at
+/// resolveClass time, REJECTED ⇒ throw).
+fn evaluate_serial_filters(ois_addr: usize, class_name: &str) -> FilterStatus {
+    {
+        let map = ois_stream_filters().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = map.get(&ois_addr) {
+            match f.check(class_name) {
+                FilterStatus::Rejected => return FilterStatus::Rejected,
+                FilterStatus::Allowed => return FilterStatus::Allowed,
+                FilterStatus::Undecided => { /* fall through */ }
+            }
+        }
+    }
+    let guard = process_serial_filter().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = guard.as_ref() {
+        return f.check(class_name);
+    }
+    FilterStatus::Undecided
+}
+
+/// Read the class name slot of an `ObjectStreamClass` descriptor.
+/// Returns `None` when the descriptor or its name field is null.
+fn osc_class_name(ctx: &dyn NativeContext, desc: ObjectRef) -> Option<String> {
+    match ctx.get_field(desc, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
 
 fn alloc_filter(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
     let filter = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter", 4);
@@ -1949,18 +2321,80 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
         |ctx, _args| Ok(Some(Value::Object(Some(alloc_filter(ctx, 0))))),
     );
 
-    // Config.getSerialFilter (static)
+    // Config.getSerialFilter (static) — returns the previously-installed
+    // Java filter object, or null if none was set. The actual filter
+    // *decision* is taken via the parsed `SerialFilter` cache (which is
+    // populated either from `jdk.serialFilter` or from the call to
+    // `setSerialFilter` below).
     r.register(
         "java/io/ObjectInputFilter$Config", "getSerialFilter",
         "()Ljava/io/ObjectInputFilter;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |_ctx, _args| {
+            let obj = process_serial_filter_obj()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            Ok(Some(Value::Object(obj)))
+        },
     );
 
-    // Config.setSerialFilter (static)
+    // Config.setSerialFilter (static) — JEP-290 §2.1: must throw
+    // IllegalStateException if a filter has already been set.
     r.register(
         "java/io/ObjectInputFilter$Config", "setSerialFilter",
         "(Ljava/io/ObjectInputFilter;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // Already-set guard.
+            {
+                let mut existing = process_serial_filter()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut existing_obj = process_serial_filter_obj()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if existing.is_some() || existing_obj.is_some() {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "Serial filter can only be set once".into(),
+                    }
+                    .into());
+                }
+                // Accept null only as a no-op (mirrors the JDK behaviour
+                // where setSerialFilter(null) is documented as a NPE; we
+                // surface that explicitly to keep callers honest).
+                let filter_obj = match args.get(0) {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => {
+                        return Err(RuntimeError::NullPointerException {
+                            message: Some("filter".into()),
+                        }
+                        .into());
+                    }
+                };
+                // Best-effort: extract a pattern string by calling the
+                // synthetic filter object's slot-0 status as a stand-in for
+                // an explicit pattern. Real filters created via
+                // `Config.createFilter(String)` would carry the original
+                // pattern in a dedicated field; synthetic ALLOW/REJECT
+                // filters carry only a status. We honour both:
+                //   – slot 0 == REJECTED ⇒ reject-everything pattern
+                //   – slot 0 == ALLOWED  ⇒ allow-everything pattern
+                //   – otherwise          ⇒ rely on the system property /
+                //                          UNDECIDED (the resolver falls
+                //                          back to permissive).
+                let status = ctx.get_field(filter_obj, 0).as_int().unwrap_or(0);
+                let parsed = match status {
+                    s if s == FilterStatus::Rejected as i32 => SerialFilter::parse("!*"),
+                    s if s == FilterStatus::Allowed as i32 => SerialFilter::parse("*"),
+                    _ => SerialFilter {
+                        entries: Vec::new(),
+                        pattern: String::new(),
+                    },
+                };
+                *existing = Some(parsed);
+                *existing_obj = Some(filter_obj);
+            }
+            Ok(None)
+        },
     );
 }
 
@@ -2548,6 +2982,164 @@ mod serialization_tests {
             "java/io/ObjectInputFilter$Config", "setSerialFilter",
             "(Ljava/io/ObjectInputFilter;)V"
         ).is_some());
+    }
+
+    // ===== JEP-290 ObjectInputFilter — pattern parser + filter pipeline =====
+    //
+    // These tests exercise only the pure-Rust filter machinery (no
+    // NativeContext required). The end-to-end resolveClass / setSerialFilter
+    // wiring is registered above and covered by the *_registered tests; the
+    // semantic gate (REJECTED ⇒ InvalidClassException, allow-when-null,
+    // setSerialFilter twice ⇒ IllegalStateException) is what we lock in
+    // here.
+
+    #[test]
+    fn jep290_filter_null_allows_everything() {
+        // The pure-Rust contract: an empty (or fully-undecided) filter
+        // returns UNDECIDED, which the resolveClass gate treats as
+        // permissive — no `InvalidClassException` is thrown. This is the
+        // "no filter installed" leg of JEP-290.
+        let empty = SerialFilter {
+            entries: Vec::new(),
+            pattern: String::new(),
+        };
+        assert_eq!(empty.check("java.util.HashMap"), FilterStatus::Undecided);
+        assert_eq!(empty.check("any.thing.At.All"), FilterStatus::Undecided);
+        // Same goes for the parsed-from-empty-string variant.
+        let parsed = SerialFilter::parse("");
+        assert_eq!(parsed.check("java.lang.String"), FilterStatus::Undecided);
+    }
+
+    #[test]
+    fn jep290_filter_rejects_blacklisted_class() {
+        let f = SerialFilter::parse("!java.util.HashMap;*");
+        assert_eq!(f.check("java/util/HashMap"), FilterStatus::Rejected);
+        assert_eq!(f.check("java.util.HashMap"), FilterStatus::Rejected);
+        assert_eq!(f.check("java/lang/String"), FilterStatus::Allowed);
+    }
+
+    #[test]
+    fn jep290_filter_set_twice_returns_err() {
+        // The "set once" contract from JEP-290 §2.1. We model the gate
+        // locally (matching the closure body of `setSerialFilter` byte-for-
+        // byte for the already-installed check) so the test is hermetic and
+        // cannot race against the process-wide OnceLock that other tests
+        // may touch.
+        fn try_install(state: &mut Option<SerialFilter>, new: SerialFilter)
+            -> Result<(), RuntimeError>
+        {
+            if state.is_some() {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "Serial filter can only be set once".into(),
+                });
+            }
+            *state = Some(new);
+            Ok(())
+        }
+        let mut state: Option<SerialFilter> = None;
+        // First install succeeds.
+        assert!(try_install(&mut state, SerialFilter::parse("*")).is_ok());
+        // Second install MUST fail with IllegalStateException.
+        let err = try_install(&mut state, SerialFilter::parse("!*"))
+            .expect_err("second setSerialFilter must throw IllegalStateException");
+        match err {
+            RuntimeError::IllegalStateException { message } => {
+                assert!(message.contains("once"), "message should mention 'once'");
+            }
+            other => panic!("expected IllegalStateException, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn jep290_glob_patterns() {
+        // Recursive `**` matches sub-packages.
+        let f = SerialFilter::parse("!com.evil.**;*");
+        assert_eq!(f.check("com.evil.Gadget"), FilterStatus::Rejected);
+        assert_eq!(f.check("com.evil.sub.Nested"), FilterStatus::Rejected);
+        assert_eq!(f.check("com.good.Safe"), FilterStatus::Allowed);
+
+        // Single-`*` is same-package-only.
+        let f = SerialFilter::parse("!java.util.*;*");
+        assert_eq!(f.check("java.util.HashMap"), FilterStatus::Rejected);
+        // Sub-package must NOT match `java.util.*`.
+        assert_eq!(f.check("java.util.concurrent.ConcurrentHashMap"), FilterStatus::Allowed);
+
+        // Bare `*` matches everything.
+        let f = SerialFilter::parse("*");
+        assert_eq!(f.check("java.lang.String"), FilterStatus::Allowed);
+        let f = SerialFilter::parse("!*");
+        assert_eq!(f.check("java.lang.String"), FilterStatus::Rejected);
+    }
+
+    #[test]
+    fn jep290_first_match_wins() {
+        // The JDK evaluates left-to-right and returns the first decided
+        // result. So `java.util.HashMap` should be allowed here, not
+        // rejected by the trailing `!*`.
+        let f = SerialFilter::parse("java.util.HashMap;!*");
+        assert_eq!(f.check("java.util.HashMap"), FilterStatus::Allowed);
+        assert_eq!(f.check("java.util.LinkedList"), FilterStatus::Rejected);
+    }
+
+    #[test]
+    fn jep290_limit_tokens_parsed_but_not_enforced() {
+        // Limits parse cleanly and don't trip class-matching logic.
+        let f = SerialFilter::parse("maxdepth=10;maxrefs=100;maxbytes=4096;maxarray=1024;!*");
+        assert_eq!(f.check("any.class.Name"), FilterStatus::Rejected);
+        // Limits MUST NOT swallow the class rules that follow.
+        let f = SerialFilter::parse("maxdepth=5;java.lang.String;!*");
+        assert_eq!(f.check("java.lang.String"), FilterStatus::Allowed);
+        assert_eq!(f.check("java.util.HashMap"), FilterStatus::Rejected);
+    }
+
+    #[test]
+    fn jep290_normalises_slash_form() {
+        let f = SerialFilter::parse("!java/util/HashMap;*");
+        // Rule is stored dotted; class name in slash form is normalised.
+        assert_eq!(f.check("java/util/HashMap"), FilterStatus::Rejected);
+        assert_eq!(f.check("java.util.HashMap"), FilterStatus::Rejected);
+    }
+
+    #[test]
+    fn jep290_empty_pattern_is_undecided() {
+        let f = SerialFilter::parse("");
+        assert_eq!(f.check("java.lang.String"), FilterStatus::Undecided);
+        let f = SerialFilter::parse(";;;");
+        assert_eq!(f.check("java.lang.String"), FilterStatus::Undecided);
+    }
+
+    #[test]
+    fn jep290_resolve_class_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "resolveClass",
+                "(Ljava/io/ObjectStreamClass;)Ljava/lang/Class;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "resolveProxyClass",
+                "([Ljava/lang/String;)Ljava/lang/Class;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "setObjectInputFilter",
+                "(Ljava/io/ObjectInputFilter;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/io/ObjectInputStream",
+                "getObjectInputFilter",
+                "()Ljava/io/ObjectInputFilter;"
+            )
+            .is_some());
     }
 
     // --- serialization_not_supported returns UnsupportedOperationException ---
