@@ -156,6 +156,13 @@ impl DeviceContext {
     pub(crate) fn inner(&self) -> &backend::DeviceContextInner {
         &self.0
     }
+
+    /// Stub-only test constructor for `tests/stub_op_log.rs`.
+    /// Compiled out when the `cuda` feature is on.
+    #[cfg(not(feature = "cuda"))]
+    pub fn stub_for_testing() -> Self {
+        Self(backend::DeviceContextInner)
+    }
 }
 
 /// Process-wide kernel-name interner.
