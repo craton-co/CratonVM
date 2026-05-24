@@ -263,6 +263,36 @@ pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) ->
     }
 }
 
+/// Decide whether a class is eligible to skip Pass 3 (bytecode) verification.
+///
+/// SECURITY (HIGH): the predicate MUST require BOTH
+/// (a) the defining loader is the bootstrap loader, AND
+/// (b) the class lives in a trusted JDK package prefix (`java/`, `jdk/`,
+///     `sun/`, `com/sun/`).
+///
+/// Gating on the name alone would let a user classpath define
+/// `java/lang/EvilString` (or any other class in a trusted prefix) and
+/// bypass Pass 3 entirely. Combined with the interpreter's
+/// `_unchecked` operand-stack helpers, an unverified class in a
+/// trusted-prefix package can corrupt the operand stack and escape the
+/// VM sandbox. JVMS В§5.3.1 reserves `java.*` for the bootstrap loader
+/// in the spec, but CratonVM may still observe a non-bootstrap loader
+/// defining such a class if the bytes are presented; we simply refuse
+/// to take the verifier shortcut for it.
+///
+/// The skip itself is justified for *real* bootstrap classes: they are
+/// loaded from jimage and have already been verified by javac/jlink, so
+/// re-running Pass 3 just pays cost without finding anything.
+#[inline]
+fn verifier_skip_eligible(class: &Class) -> bool {
+    let is_bootstrap_loaded = class.loader_id == cratonvm_types::ClassLoaderId::Bootstrap;
+    let has_trusted_prefix = class.name.starts_with("java/")
+        || class.name.starts_with("jdk/")
+        || class.name.starts_with("sun/")
+        || class.name.starts_with("com/sun/");
+    is_bootstrap_loaded && has_trusted_prefix
+}
+
 /// Full class initialization sequence (JVM spec 5.5).
 fn initialize_class_shared(
     shared: &SharedVm,
@@ -309,11 +339,7 @@ fn initialize_class_shared(
                 // from jimage (they're pre-verified by javac/jlink).
                 // This matches HotSpot's behavior: -Xverify:none for
                 // java.base, -Xverify:remote for application classes.
-                let is_jdk_class = class.name.starts_with("java/")
-                    || class.name.starts_with("jdk/")
-                    || class.name.starts_with("sun/")
-                    || class.name.starts_with("com/sun/");
-                if !is_jdk_class {
+                if !verifier_skip_eligible(class) {
                     let hierarchy = ClassStoreHierarchy { store };
                     // Pass 2 вЂ” structural verification.
                     let structural =
@@ -2547,5 +2573,173 @@ mod tests {
         // PLAIN_LONG: no ConstantValue attribute, must remain Long(0) (zero
         // default for a J descriptor) вЂ” not Object(None) and not Int(0).
         assert_eq!(slots[5], Value::Long(0), "PLAIN_LONG default");
+    }
+
+    // -----------------------------------------------------------------------
+    // verifier_skip_eligible — HIGH-severity security gate
+    //
+    // The Pass 2/3 verifier may only be skipped when BOTH (a) the class
+    // was loaded by the bootstrap loader AND (b) its name is in a
+    // trusted JDK prefix. A user-classpath class that merely *names*
+    // itself `java/...` must NOT bypass verification: combined with the
+    // interpreter's `_unchecked` operand-stack helpers, an unverified
+    // trusted-name class is a sandbox escape.
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal `Class` with the given name + loader id for predicate
+    /// and end-to-end tests. Uses FINAL+ABSTRACT (a JVMS Г‚В§4.1
+    /// "cannot be both" violation) so that if structural verification
+    /// runs it will surface a `LinkageError::ClassFormatError`.
+    fn make_malformed_class(
+        name: &str,
+        loader_id: cratonvm_types::ClassLoaderId,
+    ) -> Class {
+        use cratonvm_reader::class_access_flags::ClassAccessFlags;
+        use cratonvm_reader::class_file_version::ClassFileVersion;
+        use cratonvm_reader::constant_pool::ConstantPool;
+        Class {
+            id: crate::classloading::ClassId::new(0),
+            loader_id,
+            name: Arc::from(name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: ConstantPool::new(vec![]),
+            // FINAL + ABSTRACT is rejected by verify_class_access_flags.
+            access_flags: ClassAccessFlags::PUBLIC
+                | ClassAccessFlags::FINAL
+                | ClassAccessFlags::ABSTRACT,
+            superclass: None,
+            interfaces: vec![],
+            fields: vec![],
+            methods: vec![],
+            first_field_index: 0,
+            num_total_fields: 0,
+            bootstrap_methods: vec![],
+            signature: None,
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: false,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        }
+    }
+
+    #[test]
+    fn skip_predicate_user_classpath_java_lang_evil_string_is_not_eligible() {
+        // User classpath defining a `java/lang/EvilString`: loader is
+        // Application, name has a trusted prefix — predicate MUST refuse.
+        let c = make_malformed_class(
+            "java/lang/EvilString",
+            cratonvm_types::ClassLoaderId::Application,
+        );
+        assert!(
+            !verifier_skip_eligible(&c),
+            "user-classpath java/lang/EvilString must NOT skip verification"
+        );
+    }
+
+    #[test]
+    fn skip_predicate_bootstrap_java_lang_string_is_eligible() {
+        // Real bootstrap-loaded JDK class: skip is the documented
+        // perf invariant (HotSpot -Xverify:remote behaviour).
+        let c =
+            make_malformed_class("java/lang/String", cratonvm_types::ClassLoaderId::Bootstrap);
+        assert!(
+            verifier_skip_eligible(&c),
+            "bootstrap-loaded java/lang/String must remain eligible for skip"
+        );
+    }
+
+    #[test]
+    fn skip_predicate_bootstrap_application_class_is_not_eligible() {
+        // Untrusted prefix even though loaded by bootstrap: skip refuses.
+        let c =
+            make_malformed_class("com/example/Foo", cratonvm_types::ClassLoaderId::Bootstrap);
+        assert!(!verifier_skip_eligible(&c));
+    }
+
+    #[test]
+    fn skip_predicate_user_defined_loader_trusted_prefix_is_not_eligible() {
+        // Defensive: a UserDefined(_) loader claiming a trusted prefix
+        // also must NOT bypass verification.
+        let c = make_malformed_class(
+            "sun/misc/EvilUnsafe",
+            cratonvm_types::ClassLoaderId::UserDefined(7),
+        );
+        assert!(!verifier_skip_eligible(&c));
+    }
+
+    #[test]
+    fn end_to_end_user_classpath_trusted_name_triggers_verifier() {
+        // End-to-end: install a FINAL+ABSTRACT class named
+        // `java/lang/EvilString` with loader=Application into a real
+        // ClassStore and run `ensure_class_initialized_shared`.
+        // Verification MUST run and surface a Linkage error
+        // (`ClassFormatError` from `verify_class_access_flags`).
+        use crate::classloading::ClassLoaderId;
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let class_id = {
+            let mut cm = shared.class_manager.write();
+            let id = cm.class_store.next_id();
+            let mut c = make_malformed_class("java/lang/EvilString", ClassLoaderId::Application);
+            c.id = id;
+            cm.class_store.add(c);
+            id
+        };
+        let result = ensure_class_initialized_shared(&shared, &mut thread, class_id);
+        let err = result.expect_err("verifier MUST reject user-classpath java/lang/EvilString");
+        match err {
+            MethodCallFailed::InternalError(VmError::Linkage(_)) => { /* expected */ }
+            other => panic!(
+                "expected MethodCallFailed::InternalError(VmError::Linkage), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn end_to_end_bootstrap_trusted_name_still_skips_verifier() {
+        // End-to-end: same malformed shape, but loader=Bootstrap and
+        // name in `java/`. The skip is the documented perf invariant вЂ”
+        // initialization must succeed (verification is bypassed and
+        // structural checks that would have flagged FINAL+ABSTRACT
+        // never run).
+        use crate::classloading::{ClassLoaderId, ClassState};
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let class_id = {
+            let mut cm = shared.class_manager.write();
+            let id = cm.class_store.next_id();
+            let mut c = make_malformed_class("java/lang/String", ClassLoaderId::Bootstrap);
+            c.id = id;
+            cm.class_store.add(c);
+            id
+        };
+        let result = ensure_class_initialized_shared(&shared, &mut thread, class_id);
+        assert!(
+            result.is_ok(),
+            "bootstrap-loaded java/lang/String must remain skip-eligible; got {result:?}"
+        );
+        // Sanity: the class must have reached `Initialized` (no
+        // <clinit>, no superclass — full init runs to completion only
+        // because verification was skipped).
+        let cm = shared.class_manager.read();
+        let final_state = cm.get_class(class_id).map(|c| c.state);
+        assert_eq!(
+            final_state,
+            Some(ClassState::Initialized),
+            "expected Initialized after skip, got {final_state:?}"
+        );
     }
 }
