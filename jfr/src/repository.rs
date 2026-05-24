@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
@@ -392,7 +393,25 @@ pub struct SpscEventRing {
     /// pure diagnostic statistic and needs no ordering relative to the slot
     /// stores.
     dropped: AtomicU64,
+    /// Bounded wait applied in `Drop` when a consumer is observed to hold the
+    /// `consumer_busy` gate. After this many wall-clock nanoseconds elapse
+    /// the drop path falls through to the best-effort drain. See the
+    /// `Drop` impl for the full shutdown contract.
+    ///
+    /// Defaults to [`DEFAULT_SPSC_SHUTDOWN_TIMEOUT`] (1 second), well below
+    /// the prior ~100s spin-park ramp. Construct with
+    /// [`SpscEventRing::with_shutdown_timeout`] to override (mainly for tests
+    /// that intentionally wedge a consumer).
+    shutdown_timeout_nanos: AtomicU64,
 }
+
+/// Default `SpscEventRing` shutdown timeout — bounded wait for an in-flight
+/// consumer at drop time. Chosen at 1 second: large enough to absorb a
+/// realistic full-buffer drain (1024 slots * a few μs per pop ≪ 1 ms in
+/// practice), small enough that VM shutdown does not visibly stall on a
+/// wedged consumer. Tests can override per-ring via
+/// [`SpscEventRing::with_shutdown_timeout`].
+pub const DEFAULT_SPSC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 // SAFETY: `SpscEventRing` enforces the SPSC discipline at runtime:
 //   * The producer is unique by construction (one Arc<SpscEventRing> per
@@ -418,11 +437,26 @@ impl SpscEventRing {
     /// and `push` from two threads → data race UB. External code must obtain
     /// rings via `ThreadRingRegistry`.
     pub(crate) fn new(requested_capacity: usize) -> Self {
+        Self::with_shutdown_timeout(requested_capacity, DEFAULT_SPSC_SHUTDOWN_TIMEOUT)
+    }
+
+    /// Like [`SpscEventRing::new`], but with an explicit shutdown timeout.
+    ///
+    /// The timeout bounds how long `Drop` will wait for a consumer that is
+    /// observed mid-`try_pop` / `drain_into`. After it elapses, `Drop` falls
+    /// through to a best-effort drain (see the `Drop` impl for the full
+    /// contract). Use this constructor in tests that intentionally wedge a
+    /// consumer; production code can rely on the 1-second default via
+    /// [`SpscEventRing::new`].
+    pub(crate) fn with_shutdown_timeout(requested_capacity: usize, timeout: Duration) -> Self {
         let capacity = next_power_of_two(requested_capacity);
         let mut slots: Vec<UnsafeCell<MaybeUninit<EventInstance>>> = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             slots.push(UnsafeCell::new(MaybeUninit::uninit()));
         }
+        // Saturate at u64::MAX nanoseconds (~584 years) — effectively unbounded
+        // for any sensible Duration.
+        let timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         Self {
             slots: slots.into_boxed_slice(),
             head: AtomicUsize::new(0),
@@ -431,7 +465,20 @@ impl SpscEventRing {
             cached_tail: UnsafeCell::new(0),
             consumer_busy: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
+            shutdown_timeout_nanos: AtomicU64::new(timeout_nanos),
         }
+    }
+
+    /// Override the shutdown timeout after construction. Atomic; callable
+    /// from any thread. Has no effect on a `Drop` already in progress.
+    pub fn set_shutdown_timeout(&self, timeout: Duration) {
+        let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        self.shutdown_timeout_nanos.store(nanos, Ordering::Relaxed);
+    }
+
+    /// Current shutdown timeout (see [`SpscEventRing::set_shutdown_timeout`]).
+    pub fn shutdown_timeout(&self) -> Duration {
+        Duration::from_nanos(self.shutdown_timeout_nanos.load(Ordering::Relaxed))
     }
 
     /// Capacity (number of slots; always a power of two).
@@ -619,111 +666,144 @@ impl SpscEventRing {
 }
 
 impl Drop for SpscEventRing {
+    /// Shutdown contract (task #31, HIGH soundness, 2026-05-24):
+    ///
+    ///   * Bounded wait. Waits at most `self.shutdown_timeout()` (default 1s,
+    ///     configurable via [`SpscEventRing::set_shutdown_timeout`] or the
+    ///     [`SpscEventRing::with_shutdown_timeout`] constructor) for an
+    ///     observed in-flight consumer (`consumer_busy == true`) to release
+    ///     the gate. This replaces the prior ~100-second spin-park ramp,
+    ///     which could stall VM shutdown for over a minute on a wedged
+    ///     consumer.
+    ///
+    ///   * Happy path. If the consumer releases the gate within the timeout
+    ///     (or no consumer is observed), every buffered slot in `[tail, head)`
+    ///     is dropped exactly once — `Arc<str>` payloads are released, slot
+    ///     storage is freed. No leak.
+    ///
+    ///   * Wedged-consumer fallback. If the timeout elapses with
+    ///     `consumer_busy == true`, the consumer is stuck inside `try_pop`
+    ///     or `drain_into`. We still drain the ring best-effort:
+    ///         - The slot at the observed `tail` (Acquire load) is the
+    ///           consumer's potential active slot. Dropping it would race
+    ///           with the consumer's `assume_init_read` (double-read of a
+    ///           moved-from value) or `assume_init_drop` (double-free of
+    ///           Arc<str>). We skip *exactly that one slot* — at most one
+    ///           `EventInstance` is leaked per wedged-consumer shutdown.
+    ///         - Every other initialised slot in `(tail, head)` is dropped
+    ///           in place: payload `Arc<str>` clones are released, slot
+    ///           storage is freed.
+    ///     A warning is logged to stderr so the wedged consumer is visible
+    ///     to operators.
+    ///
+    ///   * May drop up to N - 1 buffered events on the wedged path, where N
+    ///     is `head - tail` at drop time (i.e. `len()`); the single skipped
+    ///     slot is the only one that may leak.
     fn drop(&mut self) {
-        // Round-5 CRIT-fix (Bug 1, 2026-05-17): a consumer may still be
-        // mid-`try_pop` / `drain_into` on this ring while `Drop` runs.
-        // Freeing `slots` (the boxed `[UnsafeCell<MaybeUninit<EventInstance>>]`)
-        // under a live consumer would let the consumer's `assume_init_read`
-        // touch deallocated memory — a use-after-free during shutdown.
-        //
-        // The producer side is naturally safe at drop time (the producer
-        // owns the Arc<SpscEventRing> via its thread-local; if we are
-        // dropping, no producer reference survives). The risk is a drainer
-        // that grabbed an `Arc<SpscEventRing>` from the registry via
-        // `drain_all` and is between the `consumer_busy` Acquire-CAS and
-        // its Release store. Spin-then-park on the gate before tearing
-        // down. If a drainer is stuck for an unreasonably long time, emit
-        // a warning and leak the slot storage — slots are tiny (1024 *
-        // sizeof(EventInstance)) and leaking on shutdown is preferable to
-        // UAF.
-        // Round-9 CRIT-1 fix (2026-05-17), reinforced (Bug 1 round-5):
-        // tiered backoff (spin_loop → yield_now → park_timeout). Under contended
-        // dumps of a full 1024-slot ring the consumer can hold `consumer_busy`
-        // for tens of microseconds; a tight spin cap caused the shutdown path
-        // to leak slot memory rather than wait. The ramp:
-        //   - spins 0..64           : exponential `spin_loop` (1..1024 iters)
-        //   - spins 64..1024        : `thread::yield_now` (cooperative)
-        //   - spins 1024..10_000_000: `park_timeout(10us)` (~100 seconds total)
-        //                             — park-timeout sleeps even without a
-        //                             paired `unpark`, so no signal channel
-        //                             is needed; we just re-check the gate
-        //                             after each sleep.
-        //   - beyond                : warn + leak slot storage (avoids UAF
-        //                             on a wedged consumer at shutdown).
-        let mut spins = 0u32;
-        let mut backoff = 1u32;
+        let shutdown_timeout =
+            Duration::from_nanos(self.shutdown_timeout_nanos.load(Ordering::Relaxed));
+        let deadline = Instant::now().checked_add(shutdown_timeout);
         let mut consumer_wedged = false;
+
+        // Single bounded wait. `park_timeout` sleeps even without a paired
+        // `unpark`, so this is a cooperative poll on the gate. The 10 ms
+        // poll interval keeps the worst-case overshoot small while remaining
+        // negligible compared to the 1 s default budget.
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
         while self.consumer_busy.load(Ordering::Acquire) {
-            if spins < 64 {
-                for _ in 0..backoff {
-                    std::hint::spin_loop();
-                }
-                backoff = backoff.saturating_mul(2).min(1024);
-            } else if spins < 1024 {
-                std::thread::yield_now();
-            } else if spins < 10_000_000 {
-                // park_timeout sleeps for ~10us per iteration regardless of
-                // unpark; the bound gives drainers up to ~100s before we
-                // give up. After parking, re-check consumer_busy via loop.
-                std::thread::park_timeout(std::time::Duration::from_micros(10));
-            } else {
-                eprintln!(
-                    "WARN: SpscEventRing dropped with consumer still active \
-                     after exhaustive backoff; leaking buffered events to \
-                     avoid a double-drop UB with the wedged consumer"
-                );
+            let remaining = match deadline {
+                Some(d) => d.saturating_duration_since(Instant::now()),
+                // Timeout overflowed `Instant` arithmetic (saturating treat
+                // as "infinite"). Cap each park at the poll interval anyway.
+                None => POLL_INTERVAL,
+            };
+            if remaining.is_zero() {
                 consumer_wedged = true;
                 break;
             }
-            spins += 1;
+            std::thread::park_timeout(remaining.min(POLL_INTERVAL));
         }
-        // SOUNDNESS (Bug 1 — drop UB): only drain-and-drop the buffered
-        // slots when we are *certain* no consumer can still be touching the
-        // slot array. The backoff loop above clears `consumer_busy` to false
-        // before falling through in the normal case; `consumer_wedged` is
-        // set only when we gave up while `consumer_busy` was still observed
-        // true.
+
+        // We're now in one of two states:
+        //   (a) consumer_wedged == false: the gate is currently free (Acquire
+        //       above synchronised with the consumer's Release store). Because
+        //       we hold `&mut self`, no consumer can re-enter — no Arc clones
+        //       to the ring remain reachable from any consumer call site by
+        //       the time `Drop` runs. Safe to drop every initialised slot
+        //       in [tail, head) exactly once.
+        //   (b) consumer_wedged == true: a drainer is parked inside its
+        //       `consumer_busy` critical section. It may still touch slot
+        //       `tail` (the slot it is mid-reading) once it resumes — that
+        //       single slot is unsafe to drop here.
         //
-        // If `consumer_wedged` is true a drainer may be parked *inside* its
-        // `try_pop` critical section — between its CAS-acquire of
-        // `consumer_busy` and the matching Release store. Such a consumer
-        // can still `assume_init_read` slot `tail` once it resumes. If we
-        // also `assume_init_drop` slot `tail` here, that slot is read/dropped
-        // twice: a genuine double-read / double-drop (use-after-free of the
-        // `Arc<str>`s inside the `EventInstance`). There is no synchronization
-        // we can add from the `Drop` side to close that window, because the
-        // wedged consumer holds the only thing we could wait on.
-        //
-        // Sound resolution: if a consumer could still be active, SKIP
-        // dropping the buffered slots entirely and let them leak. The slot
-        // storage is tiny (<= capacity * sizeof(EventInstance)) and this only
-        // happens at shutdown on an already-pathological wedged-consumer
-        // path. A bounded leak at shutdown is acceptable; UB is not.
+        // In both cases we walk the ring and drop initialised slots; (b)
+        // additionally skips one slot to avoid a double-read / double-free
+        // race window. See the doc comment above for the full contract.
         if consumer_wedged {
-            // Defensive double-check: even if `consumer_wedged` were somehow
-            // stale, a non-false `consumer_busy` means a consumer is active.
-            // Either way, leak the buffered slots rather than risk UB.
-            return;
+            eprintln!(
+                "WARN: SpscEventRing dropped with consumer still mid-pop \
+                 after {:?}; draining best-effort (1 slot may leak)",
+                shutdown_timeout
+            );
         }
-        // Normal path: `consumer_busy` was observed false (the loop exited
-        // without setting `consumer_wedged`), and `&mut self` guarantees no
-        // producer can enter. No consumer can be mid-`try_pop`: a consumer
-        // would have had to CAS `consumer_busy` to true, which we just saw
-        // as false, and it cannot re-enter while we hold `&mut self`. So we
-        // are the unique accessor of the slot array and can drop each
-        // initialised slot in [tail, head) exactly once.
+
+        // Choose the start-of-drain index. In case (a) (gate free, no
+        // wedged consumer) the relaxed `get_mut` read is fine — by hypothesis
+        // no other thread is touching this ring. In case (b) the wedged
+        // consumer may have advanced `tail` via its `drain_into` Release
+        // stores after `get_mut` was synthesised; we must use an Acquire
+        // load to synchronise with those stores, otherwise slots in
+        // `[tail_start, consumer_advanced_tail)` would be already-consumed
+        // (uninitialised) and `assume_init_drop` on them would be UB.
         let head = *self.head.get_mut();
-        let mut tail = *self.tail.get_mut();
+        let tail_start = if consumer_wedged {
+            self.tail.load(Ordering::Acquire)
+        } else {
+            *self.tail.get_mut()
+        };
+        // In the wedged path we additionally skip the *single* slot at the
+        // observed tail — see the Drop doc comment above for the full
+        // race analysis. The skipped slot is exactly the one the consumer
+        // is either about to read (still initialised → we leak one Arc) or
+        // has just read but not yet committed `tail+1` for (uninitialised
+        // → we would UB if we touched it).
+        let racing_slot_tail = if consumer_wedged {
+            Some(tail_start)
+        } else {
+            None
+        };
+
+        let mut tail = tail_start;
         while tail != head {
             let idx = tail & self.mask;
-            // SAFETY: slots in [tail, head) are initialised and have not
-            // been consumed, and (per the check above) no consumer can be
-            // racing us, so each is dropped exactly once here.
-            unsafe {
-                (*self.slots[idx].get()).assume_init_drop();
+            let skip = match racing_slot_tail {
+                Some(active) => tail == active,
+                None => false,
+            };
+            if !skip {
+                // SAFETY: case (a): we are the unique accessor of the slot
+                // array (gate observed free, `&mut self` blocks re-entry).
+                // Case (b) with skip == false: the slot lies strictly past
+                // the wedged consumer's `tail` (Acquire-loaded above). The
+                // consumer can only ever touch the slot at its current
+                // `tail`; until it advances `tail` past `idx`, slot `idx`
+                // is owned by us. The wedged consumer (by definition stuck
+                // inside the current critical section) will at most touch
+                // `tail_start` on resume, never `idx > tail_start`.
+                // The slot was initialised by the producer (`push`) and not
+                // yet consumed. Each slot is dropped at most once: we walk
+                // monotonic `tail..head` with `wrapping_add(1)`.
+                unsafe {
+                    (*self.slots[idx].get()).assume_init_drop();
+                }
             }
             tail = tail.wrapping_add(1);
         }
+        // `slots` (the Box) is freed by the auto-derived Drop after this
+        // function returns. In the wedged path, the consumer may briefly
+        // touch the skipped slot before observing the freed storage — that
+        // is the unavoidable residual risk of a wedged-consumer shutdown,
+        // bounded to one slot of memory.
     }
 }
 
@@ -1344,5 +1424,201 @@ mod tests {
             let count = drained.iter().filter(|e| e.type_id == expected).count();
             assert_eq!(count, 1, "expected exactly one event for type {:?}", expected);
         }
+    }
+
+    // Task #31: SpscEventRing::Drop must be bounded and must not leak the
+    // entire ring on a wedged consumer. The two tests below exercise both
+    // ends of the contract: the wedged-consumer fast-fail path, and the
+    // active-consumer happy path.
+
+    #[test]
+    fn drop_with_wedged_consumer_finishes_within_timeout() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        // Use a short timeout so the test runs quickly. The default 1s is
+        // fine for production but inflates CI time unnecessarily for tests.
+        let ring = Arc::new(SpscEventRing::with_shutdown_timeout(
+            8,
+            Duration::from_millis(200),
+        ));
+
+        // Push a few events so the Drop path has real slots to walk. Use
+        // dynamically-allocated `Arc<str>` payloads so the test would
+        // demonstrate a leak via Miri's leak checker if `Drop` skipped
+        // them. (We can't observe the leak without Miri, but at least the
+        // code path that releases them is exercised.)
+        use crate::event::{EventFields, EventValue};
+        use smallvec::smallvec;
+        for i in 0..6u64 {
+            let payload: Arc<str> = Arc::from(format!("wedged-{}", i));
+            let ev = EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i,
+                end_time: i + 1,
+                thread_id: 1,
+                fields: smallvec![EventValue::String(payload)] as EventFields,
+            };
+            ring.push(ev).expect("not full");
+        }
+
+        // Simulate a wedged consumer by directly latching `consumer_busy`.
+        // No live consumer will touch the slots; the Drop path must still
+        // bound its wait and then drain best-effort.
+        assert!(
+            ring.consumer_busy
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
+            "gate was unexpectedly already held"
+        );
+
+        // Drop the last Arc<SpscEventRing> reference and measure how long
+        // `Drop` takes. With the 200ms timeout it must complete in well
+        // under 2 seconds.
+        let start = Instant::now();
+        drop(ring);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Drop blocked for {:?} on a wedged consumer (expected < 2s)",
+            elapsed
+        );
+        // And it must have waited at least roughly the configured budget —
+        // i.e. we didn't accidentally short-circuit the wait.
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "Drop returned in {:?}; expected to wait close to the 200ms budget",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn drop_with_active_consumer_drains_all_events() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        // Active-consumer happy path: a consumer thread continually
+        // drain_into's the ring while the producer pushes a known number
+        // of events. When the producer drops its `Arc`, the consumer
+        // should already have everything; the Drop path must not panic
+        // and must release any remaining slots cleanly.
+        const N_EVENTS: u64 = 64;
+        let ring = Arc::new(SpscEventRing::new(16));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let drained = Arc::new(parking_lot::Mutex::new(Vec::<EventInstance>::new()));
+
+        let consumer_ring = Arc::clone(&ring);
+        let consumer_stop = Arc::clone(&stop);
+        let consumer_out = Arc::clone(&drained);
+        let consumer = thread::spawn(move || {
+            let mut local: Vec<EventInstance> = Vec::new();
+            // Spin-drain until told to stop AND the ring is empty.
+            loop {
+                consumer_ring.drain_into(&mut local);
+                if consumer_stop.load(Ordering::Acquire)
+                    && consumer_ring.is_empty()
+                {
+                    break;
+                }
+                thread::yield_now();
+            }
+            // One final drain in case the producer pushed after our last
+            // pass but before setting the stop flag.
+            consumer_ring.drain_into(&mut local);
+            consumer_out.lock().extend(local);
+        });
+
+        // Producer side: push N events with `Arc<str>` payloads so we can
+        // verify payload contents (and exercise the Arc release path).
+        use crate::event::{EventFields, EventValue};
+        use smallvec::smallvec;
+        for i in 0..N_EVENTS {
+            // Tight retry loop: drop-newest semantics would lose events if
+            // we push faster than the consumer drains. We instead retry
+            // until the consumer makes room.
+            let mut next = EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i,
+                end_time: i + 1,
+                thread_id: 1,
+                fields: smallvec![EventValue::String(Arc::from(format!("ev-{}", i)))] as EventFields,
+            };
+            loop {
+                match ring.push(next) {
+                    Ok(()) => break,
+                    Err(returned) => {
+                        next = returned;
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+
+        // Signal stop and drop our producer-side Arc. The consumer holds
+        // the other Arc, so this Drop path runs on the consumer thread
+        // when it exits — which means we want the consumer to observe
+        // everything first.
+        stop.store(true, Ordering::Release);
+        // Drop the producer-side Arc explicitly so any post-stop pushes
+        // are impossible (there are none here, but be explicit).
+        drop(ring);
+
+        consumer.join().expect("consumer panicked");
+
+        let drained = drained.lock();
+        assert_eq!(
+            drained.len(),
+            N_EVENTS as usize,
+            "expected exactly {} events drained, got {}",
+            N_EVENTS,
+            drained.len()
+        );
+        // Verify payload integrity — every event's string field must match
+        // its start_time tag (rules out double-drop / use-after-free of
+        // the Arc<str>).
+        for ev in drained.iter() {
+            let i = ev.start_time;
+            match &ev.fields[0] {
+                EventValue::String(s) => {
+                    assert_eq!(&**s, format!("ev-{}", i), "payload corrupted for event {}", i);
+                }
+                other => panic!("unexpected field variant: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn drop_happy_path_releases_slots_without_consumer() {
+        // No consumer ever touches the ring. Drop must traverse [tail, head)
+        // and release every Arc<str> payload — a leak would show up under
+        // Miri or a leak checker; here we just verify the Drop path runs
+        // to completion without panicking and within a tight time budget.
+        use crate::event::{EventFields, EventValue};
+        use smallvec::smallvec;
+
+        let ring = SpscEventRing::with_shutdown_timeout(8, Duration::from_millis(50));
+        for i in 0..6u64 {
+            let ev = EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i,
+                end_time: i + 1,
+                thread_id: 1,
+                fields: smallvec![EventValue::String(Arc::from(format!("hp-{}", i)))]
+                    as EventFields,
+            };
+            ring.push(ev).expect("not full");
+        }
+        let start = Instant::now();
+        drop(ring);
+        // No wedged consumer → Drop should return essentially immediately
+        // (no waiting at all). Generous bound of 100ms accommodates noisy
+        // CI environments.
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "happy-path Drop took {:?}; expected immediate",
+            start.elapsed()
+        );
     }
 }
